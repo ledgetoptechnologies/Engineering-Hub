@@ -58,3 +58,19 @@ async def test_limit_is_bounded_and_spoofed_sender_is_ignored(client):
                            json={"sender": "codex", "recipient": "codex", "message_type": "x", "body": {}})
     assert response.status_code == 201
     assert response.json()["sender"] == "hermes"
+
+
+@pytest.mark.asyncio
+async def test_reject_requires_claim_and_records_reason(client):
+    headers_h = {"Authorization": "Bearer h-token"}
+    headers_c = {"Authorization": "Bearer c-token"}
+    sent = await client.post("/api/messages", headers=headers_h,
+                             json={"recipient": "codex", "message_type": "task", "body": {}})
+    message_id = sent.json()["id"]
+    assert (await client.post(f"/api/messages/{message_id}/reject", headers=headers_c,
+                              json={"reason": "not applicable"})).status_code == 409
+    assert (await client.post(f"/api/messages/{message_id}/claim", headers=headers_c)).status_code == 200
+    rejected = await client.post(f"/api/messages/{message_id}/reject", headers=headers_c,
+                                 json={"reason": "not applicable"})
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
