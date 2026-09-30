@@ -3,13 +3,31 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .api import Service
 from .database import InvalidTransition, MessageError, NotFound, message_dict
 
 
 def build_mcp(service: Service) -> FastMCP:
-    mcp = FastMCP("agent-message-bus", stateless_http=False, json_response=True)
+    import os
+
+    allowed_hosts = [
+        value.strip()
+        for value in os.environ.get(
+            "AGENT_BUS_ALLOWED_HOSTS",
+            "127.0.0.1:8765,127.0.0.1,localhost:8765,localhost,192.168.60.92:8765,192.168.60.92",
+        ).split(",")
+        if value.strip()
+    ]
+    mcp = FastMCP(
+        "agent-message-bus",
+        stateless_http=False,
+        json_response=True,
+        host=os.environ.get("AGENT_BUS_CONTAINER_HOST", "0.0.0.0"),
+        port=int(os.environ.get("AGENT_BUS_PORT", "8765")),
+        transport_security=TransportSecuritySettings(allowed_hosts=allowed_hosts),
+    )
 
     def authenticated(ctx: Context) -> str:
         request = ctx.request_context.request
