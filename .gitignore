@@ -10,4 +10,5 @@ data/
 *.sqlite3
 *.sqlite3-*
 audit.jsonl
+tests/.test-data/
 .DS_Store
