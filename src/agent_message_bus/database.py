@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+STATUSES = {"pending", "claimed", "acknowledged", "rejected"}
+AGENTS = {"hermes", "codex"}
+PRIORITIES = {"low", "normal", "high", "urgent"}
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+@dataclass(frozen=True)
+class Message:
+    id: str
+    sender: str
+    recipient: str
+    message_type: str
+    priority: str
+    body: Any
+    status: str
+    correlation_id: str | None
+    requires_user_approval: bool
+    created_at: str
+    claimed_by: str | None = None
+    claim_expires_at: str | None = None
+    acknowledged_at: str | None = None
+    rejected_at: str | None = None
+    rejection_reason: str | None = None
+
+
+class MessageError(ValueError):
+    pass
+
+
+class NotFound(MessageError):
+    pass
+
+
+class InvalidTransition(MessageError):
+    pass
+
+
+class MessageRepository:
+    def __init__(self, path: str | Path, lease_seconds: int = 600):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lease_seconds = max(1, int(lease_seconds))
+        self._lock = threading.RLock()
+        self.initialize()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
+        return conn
+
+    def initialize(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(Path(__file__).with_name("schema.sql").read_text())
+            conn.execute("PRAGMA journal_mode = WAL")
+
+    @staticmethod
+    def _validate_agent(agent: str) -> None:
+        if agent not in AGENTS:
+            raise MessageError("invalid agent")
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> Message:
+        return Message(
+            id=row["id"], sender=row["sender"], recipient=row["recipient"],
+            message_type=row["message_type"], priority=row["priority"],
+            body=json.loads(row["body_json"]), status=row["status"],
+            correlation_id=row["correlation_id"],
+            requires_user_approval=bool(row["requires_user_approval"]),
+            created_at=row["created_at"], claimed_by=row["claimed_by"],
+            claim_expires_at=row["claim_expires_at"], acknowledged_at=row["acknowledged_at"],
+            rejected_at=row["rejected_at"], rejection_reason=row["rejection_reason"],
+        )
+
+    def insert(self, *, sender: str, recipient: str, message_type: str, body: Any,
+               priority: str = "normal", correlation_id: str | None = None,
+               requires_user_approval: bool = False) -> Message:
+        self._validate_agent(sender); self._validate_agent(recipient)
+        if sender == recipient: raise MessageError("sender and recipient must differ")
+        if not message_type or priority not in PRIORITIES: raise MessageError("invalid message type or priority")
+        message_id = str(uuid.uuid4()); created = iso(now_utc())
+        with self._lock, self.connect() as conn:
+            conn.execute("""INSERT INTO messages
+                (id,sender,recipient,message_type,priority,body_json,correlation_id,requires_user_approval,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
+                json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id,
+                int(requires_user_approval), created))
+            return self.get(message_id, conn=conn)
+
+    def get(self, message_id: str, *, conn: sqlite3.Connection | None = None) -> Message:
+        owned = conn is None
+        connection = conn or self.connect()
+        try:
+            row = connection.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+            if row is None: raise NotFound("message not found")
+            return self._from_row(row)
+        finally:
+            if owned: connection.close()
+
+    def list_for_recipient(self, recipient: str, *, status: str = "pending", limit: int = 50) -> list[Message]:
+        self._validate_agent(recipient)
+        if status not in STATUSES: raise MessageError("invalid status")
+        limit = min(max(1, int(limit)), 100)
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM messages WHERE recipient=? AND status=? ORDER BY created_at LIMIT ?",
+                                (recipient, status, limit)).fetchall()
+            return [self._from_row(row) for row in rows]
+
+    def claim(self, message_id: str, agent: str) -> Message:
+        self._validate_agent(agent); expires = iso(now_utc() + timedelta(seconds=self.lease_seconds))
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+            if row is None: conn.rollback(); raise NotFound("message not found")
+            if row["recipient"] != agent: conn.rollback(); raise InvalidTransition("message belongs to another recipient")
+            eligible = row["status"] == "pending" or (row["status"] == "claimed" and row["claim_expires_at"] and parse_time(row["claim_expires_at"]) <= now_utc())
+            if not eligible: conn.rollback(); raise InvalidTransition("message is not claimable")
+            conn.execute("UPDATE messages SET status='claimed',claimed_by=?,claim_expires_at=? WHERE id=?", (agent, expires, message_id))
+            conn.commit(); return self.get(message_id, conn=conn)
+
+    def acknowledge(self, message_id: str, agent: str) -> Message:
+        return self._finish(message_id, agent, "acknowledged", None)
+
+    def reject(self, message_id: str, agent: str, reason: str) -> Message:
+        if not reason: raise MessageError("rejection reason is required")
+        return self._finish(message_id, agent, "rejected", reason)
+
+    def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> Message:
+        self._validate_agent(agent); timestamp = iso(now_utc())
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+            if row is None: conn.rollback(); raise NotFound("message not found")
+            if row["recipient"] != agent or row["status"] != "claimed" or row["claimed_by"] != agent:
+                conn.rollback(); raise InvalidTransition("message is not claimed by this agent")
+            if status == "acknowledged":
+                conn.execute("UPDATE messages SET status=?,acknowledged_at=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, message_id))
+            else:
+                conn.execute("UPDATE messages SET status=?,rejected_at=?,rejection_reason=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, reason, message_id))
+            conn.commit(); return self.get(message_id, conn=conn)
+
+    def cleanup(self, *, acknowledged_days: int = 30, rejected_days: int = 90) -> dict[str, int]:
+        acknowledged_days = max(1, int(acknowledged_days)); rejected_days = max(1, int(rejected_days)); current = now_utc()
+        a_cutoff = iso(current - timedelta(days=acknowledged_days)); r_cutoff = iso(current - timedelta(days=rejected_days))
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            a = conn.execute("DELETE FROM messages WHERE status='acknowledged' AND acknowledged_at < ?", (a_cutoff,)).rowcount
+            r = conn.execute("DELETE FROM messages WHERE status='rejected' AND rejected_at < ?", (r_cutoff,)).rowcount
+            conn.commit(); return {"acknowledged_deleted": a, "rejected_deleted": r}
+
+    def expire_claims(self) -> int:
+        with self._lock, self.connect() as conn:
+            return conn.execute("UPDATE messages SET status='pending',claimed_by=NULL,claim_expires_at=NULL WHERE status='claimed' AND claim_expires_at <= ?", (iso(now_utc()),)).rowcount
+
+
+def message_dict(message: Message) -> dict[str, Any]:
+    return asdict(message)
