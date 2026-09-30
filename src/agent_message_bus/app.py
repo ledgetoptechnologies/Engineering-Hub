@@ -13,6 +13,7 @@ from .audit import AuditLog
 from .auth import AuthSettings
 from .database import MessageRepository
 from .mcp_server import build_mcp
+from .retention import cleanup
 
 
 class MCPAuthMiddleware(BaseHTTPMiddleware):
@@ -41,6 +42,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     repository = MessageRepository(db_path, lease_seconds=int(os.environ.get("CLAIM_LEASE_SECONDS", "600")))
     audit = AuditLog(audit_path)
     service = Service(repository, audit, auth, policy_from_env())
+    cleanup(repository, service.policy)
     mcp = build_mcp(service)
     app = mcp.streamable_http_app()  # Base app preserves FastMCP's session-manager lifespan.
     app.add_middleware(MCPAuthMiddleware, auth=auth)
