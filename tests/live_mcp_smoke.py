@@ -17,6 +17,10 @@ async def mcp_call(url: str, token: str, name: str, arguments: dict):
         async with streamable_http_client(url, http_client=http) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                tools = await session.list_tools()
+                expected = ["send_message", "receive_messages", "claim_message", "ack_message", "reject_message", "get_message"]
+                if [tool.name for tool in tools.tools] != expected:
+                    raise RuntimeError(f"unexpected MCP tools: {[tool.name for tool in tools.tools]}")
                 result = await session.call_tool(name, arguments)
                 if getattr(result, "isError", False):
                     raise RuntimeError(f"MCP tool failed: {name}")
