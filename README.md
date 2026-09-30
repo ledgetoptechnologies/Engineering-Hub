@@ -4,7 +4,7 @@ A small local FastAPI and FastMCP Streamable HTTP service for reliable Hermes/Co
 
 ## Scope and safety
 
-This repository is independent of VaultBridge. It does not modify Hermes cron, Codex configuration, the VaultBridge deployment, or any existing vault data. The initial deployment binds to loopback. LAN deployment is documented separately and must use both bearer authentication and an application IP allowlist.
+This repository is independent of VaultBridge. It does not modify Hermes cron, Codex configuration, the VaultBridge deployment, or any existing vault data. The test deployment uses Docker host networking so the application can enforce real client IPs, binds on the Hermes host, and uses both bearer authentication and an application IP allowlist. LAN exposure is limited to the explicitly approved Codex source IP; there is no public tunnel or DNS.
 
 ## Development
 

@@ -3,10 +3,11 @@ services:
     build: .
     restart: unless-stopped
     user: "${AGENT_BUS_UID:-1000}:${AGENT_BUS_GID:-1000}"
+    # Host networking preserves the real client IP for AGENT_BUS_ALLOWED_IPS.
+    # The service still binds only to the host address configured in .env.
+    network_mode: host
     env_file:
       - .env
-    ports:
-      - "127.0.0.1:${AGENT_BUS_PORT:-8765}:${AGENT_BUS_PORT:-8765}"
     volumes:
       - ./data:/var/lib/agent-message-bus
     healthcheck:

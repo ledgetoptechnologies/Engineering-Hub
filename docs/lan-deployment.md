@@ -1,17 +1,55 @@
 # Restricted LAN deployment
 
-The tested phase binds Docker's published port to `127.0.0.1`. Do not change this until localhost tests, live MCP tests, restart durability, authentication, retention, and backup/restore checks pass.
+The local test service is running on the Hermes host at `192.168.60.92:8765`.
 
-For an approved LAN phase, bind the host port only to the selected Hermes interface and set `AGENT_BUS_ALLOWED_IPS=192.168.60.92,192.168.20.151`. The application checks `request.client.host` for both REST and MCP. Keep the host firewall restricted to those two source addresses and port 8765. Do not open the whole VLAN, expose TrueNAS, add Cloudflare, configure a tunnel, or publish DNS.
+Docker uses `network_mode: host` so the application sees the real client IP. The service binds to `0.0.0.0` at the host level, but the application allowlist is:
 
-The compose file uses a container bind of `0.0.0.0` so Docker port publishing works; the host-side port mapping is the exposure boundary. Local `.env.example` intentionally publishes only to host loopback. A future LAN compose override should set the host-side published address explicitly after reviewing the actual interface.
+```text
+127.0.0.1,192.168.20.151
+```
 
-Example review-only commands (do not apply firewall changes without separate approval):
+The host firewall allows TCP/8765 only from `192.168.20.151` (Beau's main rig/Codex). Local Hermes checks use `127.0.0.1`. Bearer authentication is still required for all REST and MCP operations, including health-independent message operations.
+
+No public DNS, Cloudflare exposure, tunnel, TrueNAS deployment, or whole-VLAN firewall rule is configured.
+
+## Codex connection
+
+MCP endpoint:
+
+```text
+http://192.168.60.92:8765/mcp
+```
+
+Health endpoint:
+
+```text
+http://192.168.60.92:8765/health
+```
+
+Codex must use its separate `CODEX_TOKEN` as an HTTP bearer token. The token must be transferred through a secure local mechanism and must not be committed, pasted into GitHub, or placed in command-line history.
+
+## Verification commands
+
+From the Hermes host:
 
 ```bash
 ss -ltnp | grep ':8765'
 curl -fsS http://127.0.0.1:8765/health
-# From 192.168.60.92 and 192.168.20.151 only, test health and authenticated MCP.
 ```
 
-Record the exact firewall command and output in the deployment change record. Plain HTTP must remain inside the trusted LAN; public exposure and TLS termination are out of scope for this local build.
+Expected: a listener on `0.0.0.0:8765` and health JSON with `"ok":true`.
+
+From Beau's main rig, verify TCP reachability and authenticated MCP. An unauthenticated request must fail; a request using the Codex token must initialize and list exactly these tools:
+
+```text
+send_message
+receive_messages
+claim_message
+ack_message
+reject_message
+get_message
+```
+
+If Codex cannot connect, check the Hermes-host UFW rule, the main-rig source IP, and that the service remains bound to `0.0.0.0:8765`. Do not open the port to an entire VLAN without explicit approval.
+
+Plain HTTP is acceptable only inside the trusted LAN. Public exposure and TLS termination remain out of scope for this testing phase.

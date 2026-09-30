@@ -6,12 +6,13 @@ import yaml
 ROOT = Path(__file__).parents[1]
 
 
-def test_compose_has_localhost_binding_and_persistent_data_mount():
+def test_compose_uses_host_networking_for_real_ip_allowlist_and_persistent_data_mount():
     config = yaml.safe_load((ROOT / "compose.yaml").read_text())
     service = config["services"]["agent-message-bus"]
     assert service["restart"] == "unless-stopped"
     assert "./data:/var/lib/agent-message-bus" in service["volumes"]
-    assert service["ports"][0].startswith("127.0.0.1:")
+    assert service["network_mode"] == "host"
+    assert "ports" not in service
     assert service["user"]
 
 
