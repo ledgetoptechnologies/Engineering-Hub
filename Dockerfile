@@ -6,7 +6,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY docker/entrypoint.sh /usr/local/bin/agent-message-bus-entrypoint
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir fastapi uvicorn[standard] mcp pydantic \
+    && pip install --no-cache-dir fastapi uvicorn[standard] mcp pydantic python-multipart \
     && pip install --no-cache-dir . \
     && chmod 0555 /usr/local/bin/agent-message-bus-entrypoint \
     && useradd --system --uid 10001 --create-home agentbus

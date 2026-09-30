@@ -21,3 +21,13 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status_created ON messages (recipient, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_claim_expiry ON messages (status, claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_messages_retention ON messages (status, acknowledged_at, rejected_at);
+
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    sha256 TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_files_updated_at ON files (updated_at);

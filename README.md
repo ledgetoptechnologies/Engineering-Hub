@@ -18,6 +18,10 @@ Configuration is read from environment variables; see `.env.example`. Use long, 
 
 REST health is available at `/health`. Authenticated message routes are under `/api/messages`; MCP Streamable HTTP is at `/mcp`.
 
+Authenticated Hermes/Codex clients can upload multipart artifacts to `POST /api/files` with a `path` form field and `file` part, list them with `GET /api/files`, read metadata with `GET /api/files/{path}` (or `/metadata`), and stream bytes with `GET /api/files/{path}/download`. Paths are relative to `AGENT_BUS_FILE_ROOT` (default `data/files`) and cannot traverse or follow symlinks. Only the admin token can delete files with `DELETE /api/files/{path}`. File metadata (size, SHA-256, content type, and timestamps) is stored in the message-bus SQLite database.
+
+See [`docs/file-management.md`](docs/file-management.md) for the endpoint contract and path-safety details.
+
 ## Docker
 
 ```bash
@@ -32,7 +36,7 @@ HERMES_TOKEN=... CODEX_TOKEN=... uv run python tests/live_mcp_smoke.py --url htt
 
 The live smoke test lists all six MCP tools, performs a Hermes-to-Codex send/receive/claim/ack round trip, verifies REST state and invalid-token rejection, and prints `MCP smoke test passed`. A separate restart check should verify that both an acknowledged row and a newly pending row survive container restart.
 
-Runtime data is persisted only in `./data`, mounted as `/var/lib/agent-message-bus`. No VaultBridge directory is mounted.
+Runtime data is persisted only in `./data`, including the `files` artifact root, mounted as `/var/lib/agent-message-bus`. No VaultBridge directory is mounted.
 
 ## Future integration
 

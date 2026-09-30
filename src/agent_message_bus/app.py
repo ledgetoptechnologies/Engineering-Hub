@@ -12,6 +12,7 @@ from .api import Service, policy_from_env, router
 from .audit import AuditLog
 from .auth import AuthSettings
 from .database import MessageRepository
+from .files import FileRepository
 from .mcp_server import build_mcp
 from .retention import cleanup
 
@@ -35,13 +36,15 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 
 
 def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | None = None,
-               auth: AuthSettings | None = None):
+               auth: AuthSettings | None = None, file_root: str | Path | None = None):
     db_path = db_path or os.environ.get("AGENT_BUS_DB", "data/messages.sqlite3")
     audit_path = audit_path or os.environ.get("AGENT_BUS_AUDIT", "data/audit.jsonl")
+    file_root = file_root or os.environ.get("AGENT_BUS_FILE_ROOT", "data/files")
     auth = auth or AuthSettings.from_env()
     repository = MessageRepository(db_path, lease_seconds=int(os.environ.get("CLAIM_LEASE_SECONDS", "600")))
+    files = FileRepository(db_path, file_root)
     audit = AuditLog(audit_path)
-    service = Service(repository, audit, auth, policy_from_env())
+    service = Service(repository, audit, auth, policy_from_env(), files)
     cleanup(repository, service.policy)
     mcp = build_mcp(service)
     app = mcp.streamable_http_app()  # Base app preserves FastMCP's session-manager lifespan.
@@ -60,7 +63,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         except Exception:
             db_status = "error"
         return StarletteJSONResponse({"ok": db_status == "ok", "database": db_status,
-                                      "schema_version": 1,
+                                      "schema_version": 2,
                                       "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid")})
 
     # Keep this before the catch-all REST mount.
@@ -68,6 +71,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     app.state.repository = repository
     app.state.audit = audit
     app.state.service = service
+    app.state.files = files
     return app
 
 

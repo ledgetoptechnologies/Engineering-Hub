@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .audit import AuditLog
 from .auth import AuthSettings
 from .database import InvalidTransition, MessageError, MessageRepository, NotFound, message_dict
+from .files import FileError, FileNotFound, FilePathError, FileRepository, file_dict
 from .retention import RetentionPolicy, cleanup
 
 
@@ -27,8 +29,8 @@ class RejectRequest(BaseModel):
 
 class Service:
     def __init__(self, repository: MessageRepository, audit: AuditLog, auth: AuthSettings,
-                 policy: RetentionPolicy):
-        self.repository, self.audit, self.auth, self.policy = repository, audit, auth, policy
+                 policy: RetentionPolicy, files: FileRepository | None = None):
+        self.repository, self.audit, self.auth, self.policy, self.files = repository, audit, auth, policy, files
 
     def audit_message(self, operation: str, agent: str, message: Any, result: str = "ok") -> None:
         self.audit.append(operation=operation, agent=agent, message_id=getattr(message, "id", None),
@@ -41,6 +43,11 @@ def router(service: Service) -> APIRouter:
 
     def agent(request: Request) -> str: return service.auth.agent(request)
     def admin(request: Request) -> str: return service.auth.admin(request)
+
+    def file_repository() -> FileRepository:
+        if service.files is None:
+            raise HTTPException(503, "file service is not configured")
+        return service.files
 
     @api.post("/messages", status_code=201)
     def send(payload: MessageCreate, sender: str = Depends(agent)):
@@ -96,6 +103,53 @@ def router(service: Service) -> APIRouter:
         result = cleanup(service.repository, service.policy)
         service.audit.append(operation="cleanup", agent="admin", result="ok")
         return result
+
+    @api.post("/files", status_code=201)
+    async def upload_file(path: str = Form(...), file: UploadFile = File(...),
+                          identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
+        try:
+            metadata = await files.save_upload(path, file)
+        except FilePathError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except FileError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        service.audit.append(operation="file_upload", agent=identity, result="ok")
+        return file_dict(metadata)
+
+    @api.get("/files")
+    def list_files(_identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
+        return {"files": [file_dict(metadata) for metadata in files.list()]}
+
+    @api.get("/files/{file_path:path}/download")
+    def download_file(file_path: str, _identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
+        try:
+            metadata, fd = files.open_for_read(file_path)
+        except (FileNotFound, FilePathError) as exc:
+            raise HTTPException(404, "file not found") from exc
+        filename = metadata.path.rsplit("/", 1)[-1].replace('"', "")
+        return StreamingResponse(
+            files.iter_fd(fd), media_type=metadata.content_type,
+            headers={"Content-Length": str(metadata.size),
+                     "Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @api.get("/files/{file_path:path}/metadata")
+    @api.get("/files/{file_path:path}")
+    def get_file(file_path: str, _identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
+        try:
+            return file_dict(files.get(file_path))
+        except (FileNotFound, FilePathError) as exc:
+            raise HTTPException(404, "file not found") from exc
+
+    @api.delete("/files/{file_path:path}", status_code=204)
+    def delete_file(file_path: str, _admin: str = Depends(admin), files: FileRepository = Depends(file_repository)):
+        try:
+            files.delete(file_path)
+        except FileNotFound as exc:
+            raise HTTPException(404, "file not found") from exc
+        except FilePathError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return None
 
     return api
 

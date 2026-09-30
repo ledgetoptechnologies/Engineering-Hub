@@ -8,6 +8,10 @@ services:
     network_mode: host
     env_file:
       - .env
+    environment:
+      # Keep artifacts on the persistent ./data bind mount even if an older
+      # .env does not yet define the new setting.
+      AGENT_BUS_FILE_ROOT: "${AGENT_BUS_FILE_ROOT:-/var/lib/agent-message-bus/files}"
     volumes:
       - ./data:/var/lib/agent-message-bus
     healthcheck:
