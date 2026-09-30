@@ -1,0 +1,8 @@
+**/.venv
+**/.git
+**/__pycache__
+**/.pytest_cache
+.env
+data
+*.sqlite3
+*.jsonl
