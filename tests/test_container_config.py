@@ -23,3 +23,14 @@ def test_env_example_has_separate_tokens_and_required_paths():
                 "AGENT_BUS_FILE_ROOT", "CLAIM_LEASE_SECONDS"):
         assert f"{key}=" in text
     assert "HERMES_TOKEN=CODEX_TOKEN" not in text
+
+
+def test_truenas_uses_apps_identity_and_preserves_local_persistent_database():
+    config = yaml.safe_load((ROOT / "compose.truenas.yaml").read_text())
+    service = config["services"]["agent-message-bus"]
+    assert service["user"] == "568:568"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["pull_policy"] == "always"
+    assert service["volumes"] == ["/mnt/POOL_NAME/apps/internal-mcp:/var/lib/agent-message-bus"]
+    assert service["environment"]["AGENT_BUS_DB"] == "/var/lib/agent-message-bus/messages.sqlite3"
