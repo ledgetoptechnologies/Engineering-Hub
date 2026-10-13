@@ -1,0 +1,29 @@
+name: Verify published package
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: read
+jobs:
+  verify-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read back published image and revision
+        env:
+          EXPECTED_REVISION: a2c0849bc3bec05000d8c140f8af0919b7810bf2
+        run: |
+          docker pull ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0
+          actual=$(docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          test "$actual" = "$EXPECTED_REVISION"
+          docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 --format '{{json .RepoDigests}}' > published-digest.json
+          docker run --rm --entrypoint python ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 -c "from importlib.metadata import version; assert version('agent-message-bus') == '0.2.0'; print('Published package 0.2.0 and revision verified')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-image-verification
+          path: published-digest.json
