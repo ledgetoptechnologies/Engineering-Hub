@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from .audit import AuditLog
 from .auth import AuthSettings
 from .database import InvalidTransition, MessageError, MessageRepository, NotFound, message_dict
-from .files import FileError, FileNotFound, FilePathError, FileRepository, file_dict
+from .files import FileConflict, FileError, FileIntegrityError, FileTooLarge, FileNotFound, FilePathError, FileRepository, file_dict
 from .retention import RetentionPolicy, cleanup
 
 
@@ -32,8 +32,9 @@ class RejectRequest(BaseModel):
 
 class Service:
     def __init__(self, repository: MessageRepository, audit: AuditLog, auth: AuthSettings,
-                 policy: RetentionPolicy, files: FileRepository | None = None):
+                 policy: RetentionPolicy, files: FileRepository | None = None, semantic: Any = None):
         self.repository, self.audit, self.auth, self.policy, self.files = repository, audit, auth, policy, files
+        self.semantic = semantic
 
     def audit_message(self, operation: str, agent: str, message: Any, result: str = "ok",
                       request: Request | None = None) -> None:
@@ -139,9 +140,14 @@ def router(service: Service) -> APIRouter:
 
     @api.post("/files", status_code=201)
     async def upload_file(request: Request, path: str = Form(...), file: UploadFile = File(...),
+                          expected_version: int = Form(default=0, ge=0),
                           identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
         try:
-            metadata = await files.save_upload(path, file)
+            metadata = await files.save_upload(path, file, author=identity, expected_version=expected_version)
+        except FileConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except FileTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
         except FilePathError as exc:
             raise HTTPException(400, str(exc)) from exc
         except FileError as exc:
@@ -151,13 +157,19 @@ def router(service: Service) -> APIRouter:
         return file_dict(metadata)
 
     @api.get("/files")
-    def list_files(_identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
-        return {"files": [file_dict(metadata) for metadata in files.list()]}
+    def list_files(prefix: str | None = None, after: str | None = None,
+                   limit: int = Query(default=100, ge=1, le=999),
+                   _identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
+        entries = files.list(prefix=prefix, after=after, limit=limit + 1)
+        page = [file_dict(metadata) for metadata in entries[:limit]]
+        return {"files": page, "next_after": page[-1]["path"] if len(entries) > limit else None}
 
     @api.get("/files/{file_path:path}/download")
     def download_file(file_path: str, _identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
         try:
             metadata, fd = files.open_for_read(file_path)
+        except FileIntegrityError as exc:
+            raise HTTPException(409, "file integrity verification failed") from exc
         except (FileNotFound, FilePathError) as exc:
             raise HTTPException(404, "file not found") from exc
         filename = metadata.path.rsplit("/", 1)[-1].replace('"', "")
@@ -176,9 +188,12 @@ def router(service: Service) -> APIRouter:
             raise HTTPException(404, "file not found") from exc
 
     @api.delete("/files/{file_path:path}", status_code=204)
-    def delete_file(file_path: str, _admin: str = Depends(admin), files: FileRepository = Depends(file_repository)):
+    def delete_file(file_path: str, expected_version: int = Query(ge=1),
+                    _admin: str = Depends(admin), files: FileRepository = Depends(file_repository)):
         try:
-            files.delete(file_path)
+            files.delete(file_path, expected_version=expected_version)
+        except FileConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         except FileNotFound as exc:
             raise HTTPException(404, "file not found") from exc
         except FilePathError as exc:

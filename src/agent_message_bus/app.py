@@ -20,6 +20,7 @@ from .database import MessageRepository
 from .files import FileRepository
 from .mcp_server import build_mcp
 from .retention import cleanup
+from .semantic import SemanticIndex
 
 
 class OperationalLoggingMiddleware(BaseHTTPMiddleware):
@@ -56,7 +57,7 @@ class OperationalLoggingMiddleware(BaseHTTPMiddleware):
                 "request_id": request_id,
                 "correlation_id": correlation_id,
                 "method": request.method,
-                "path": request.url.path,
+                "path": "/api/files/{path}" if request.url.path.startswith("/api/files/") else request.url.path,
                 "status_code": response.status_code if response is not None else 500,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             }
@@ -102,7 +103,8 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     repository = MessageRepository(db_path, lease_seconds=int(os.environ.get("CLAIM_LEASE_SECONDS", "600")))
     files = FileRepository(db_path, file_root)
     audit = AuditLog(audit_path)
-    service = Service(repository, audit, auth, policy_from_env(), files)
+    semantic = SemanticIndex(db_path, file_root)
+    service = Service(repository, audit, auth, policy_from_env(), files, semantic)
     cleanup(repository, service.policy)
     mcp = build_mcp(service)
     app = mcp.streamable_http_app()  # Base app preserves FastMCP's session-manager lifespan.
@@ -123,7 +125,8 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
             db_status = "error"
         return StarletteJSONResponse({"ok": db_status == "ok", "database": db_status,
                                       "schema_version": 2,
-                                      "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid")})
+                                      "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid"),
+                                      "semantic": {"state": "enabled" if semantic.enabled else "disabled"}})
 
     # Keep this before the catch-all REST mount.
     app.routes.insert(0, __import__("starlette.routing", fromlist=["Route"]).Route("/health", health, methods=["GET"]))

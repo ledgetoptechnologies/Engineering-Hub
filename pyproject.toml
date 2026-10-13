@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-message-bus"
-version = "0.2.0"
+version = "0.3.0"
 description = "Authenticated shared message and knowledge bus for Hermes, Codex, and Claude Code"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "mcp>=1.8,<2",
   "pydantic>=2.7,<3",
   "python-multipart>=0.0.9,<1",
+  "fastembed>=0.9,<1",
 ]
 
 [project.optional-dependencies]

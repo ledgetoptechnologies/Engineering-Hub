@@ -1,9 +1,15 @@
 name: Verify published package
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        default: '0.3.0'
+      revision:
+        required: true
 permissions:
   contents: read
-  packages: write
+  packages: read
 jobs:
   verify-package:
     runs-on: ubuntu-latest
@@ -14,26 +20,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Read back published image and revision
+      - name: Read back immutable release and stable
         env:
-          EXPECTED_REVISION: a2c0849bc3bec05000d8c140f8af0919b7810bf2
+          VERSION: ${{ inputs.version }}
+          EXPECTED_REVISION: ${{ inputs.revision }}
         run: |
-          docker pull ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0
-          actual=$(docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
-          test "$actual" = "$EXPECTED_REVISION"
-          docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 --format '{{json .RepoDigests}}' > published-digest.json
-          docker run --rm --entrypoint python ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 -c "from importlib.metadata import version; assert version('agent-message-bus') == '0.2.0'; print('Published package 0.2.0 and revision verified')"
-      - name: Promote verified release to stable and read back
-        run: |
-          source=ghcr.io/ledgetoptechnologies/internal-mcp@sha256:3418b3706bb3dfc5ecd712ddb2b06592b471ef43f634ed8f28864ffe64237930
-          docker buildx imagetools create --tag ghcr.io/ledgetoptechnologies/internal-mcp:stable "$source"
-          docker pull ghcr.io/ledgetoptechnologies/internal-mcp:stable
-          revision=$(docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:stable --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
-          test "$revision" = a2c0849bc3bec05000d8c140f8af0919b7810bf2
-          docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:stable --format '{{json .RepoDigests}}' > stable-digest.json
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          for tag in "$VERSION" stable; do
+            image="ghcr.io/ledgetoptechnologies/internal-mcp:$tag"
+            docker pull "$image"
+            actual=$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+            test "$actual" = "$EXPECTED_REVISION"
+            docker image inspect "$image" --format '{{json .RepoDigests}}' > "$tag-digest.json"
+            docker run --rm --network none --read-only --user 568:568 --entrypoint python -e EXPECTED_VERSION="$VERSION" "$image" -c "import os; from importlib.metadata import version; assert version('agent-message-bus') == os.environ['EXPECTED_VERSION']; from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5',cache_dir='/opt/fastembed-cache',local_files_only=True,providers=['CPUExecutionProvider'],threads=2); assert len(list(model.embed(['semantic package verification']))[0])==384; print('Package and offline model verified')"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: published-image-verification
-          path: |
-            published-digest.json
-            stable-digest.json
+          path: '*-digest.json'

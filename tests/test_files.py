@@ -42,7 +42,7 @@ async def test_authenticated_multipart_upload_list_metadata_and_download(file_cl
 
     listed = await client.get("/api/files", headers=headers)
     assert listed.status_code == 200
-    assert listed.json() == {"files": [metadata]}
+    assert listed.json() == {"files": [metadata], "next_after": None}
 
     details = await client.get("/api/files/reports/result.txt", headers=headers)
     assert details.status_code == 200
@@ -70,7 +70,7 @@ async def test_file_authentication_and_admin_only_delete(file_client):
     assert (await client.get("/api/files", headers={"Authorization": "Bearer c-token"})).status_code == 200
     assert (await client.delete("/api/files/one.bin", headers={"Authorization": "Bearer h-token"})).status_code == 401
 
-    deleted = await client.delete("/api/files/one.bin", headers={"Authorization": "Bearer a-token"})
+    deleted = await client.delete("/api/files/one.bin?expected_version=1", headers={"Authorization": "Bearer a-token"})
     assert deleted.status_code == 204
     assert (await client.get("/api/files/one.bin", headers={"Authorization": "Bearer c-token"})).status_code == 404
 

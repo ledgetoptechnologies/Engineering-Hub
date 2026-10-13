@@ -17,7 +17,8 @@ def test_mcp_exposes_exact_lifecycle_tools_and_schemas(tmp_path):
     assert [tool.name for tool in tools] == ["send_message", "receive_messages", "claim_message",
                                               "ack_message", "reject_message", "get_message",
                                               "knowledge_put", "knowledge_get", "knowledge_list",
-                                              "knowledge_search"]
+                                              "knowledge_search", "semantic_search", "semantic_status",
+                                              "file_put", "file_get", "file_list", "file_history"]
     send = tools[0]
     assert "recipient" in send.parameters["properties"]
     assert "body" in send.parameters["properties"]

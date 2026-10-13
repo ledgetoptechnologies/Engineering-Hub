@@ -10,11 +10,18 @@ RUN python -m pip install --no-cache-dir uv==0.11.17
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN uv sync --locked --no-default-groups --no-editable
+# Resolve the pinned CPU ONNX sentence model during image build. Runtime model loading
+# uses local_files_only=True and the baked cache, so the read-only container never
+# requires model downloads or model-cache writes.
+RUN mkdir -p /opt/fastembed-cache \
+    && /opt/venv/bin/python -c "from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed-cache', providers=['CPUExecutionProvider'], threads=2); list(model.embed(['Agent Bus semantic model image preparation.']))" \
+    && chmod -R a+rX /opt/fastembed-cache
 
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1 \
     PATH="/opt/venv/bin:${PATH}"
 ARG VCS_REF=unknown
 ARG VERSION=unknown
@@ -26,6 +33,7 @@ LABEL org.opencontainers.image.title="Agent Message Bus" \
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/fastembed-cache /opt/fastembed-cache
 COPY docker/entrypoint.sh /usr/local/bin/agent-message-bus-entrypoint
 RUN groupadd --system --gid 10001 agentbus \
     && useradd --system --uid 10001 --gid agentbus --create-home agentbus \
