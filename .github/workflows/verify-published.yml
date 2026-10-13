@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  packages: read
+  packages: write
 jobs:
   verify-package:
     runs-on: ubuntu-latest
@@ -23,7 +23,17 @@ jobs:
           test "$actual" = "$EXPECTED_REVISION"
           docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 --format '{{json .RepoDigests}}' > published-digest.json
           docker run --rm --entrypoint python ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0 -c "from importlib.metadata import version; assert version('agent-message-bus') == '0.2.0'; print('Published package 0.2.0 and revision verified')"
+      - name: Promote verified release to stable and read back
+        run: |
+          source=ghcr.io/ledgetoptechnologies/internal-mcp@sha256:3418b3706bb3dfc5ecd712ddb2b06592b471ef43f634ed8f28864ffe64237930
+          docker buildx imagetools create --tag ghcr.io/ledgetoptechnologies/internal-mcp:stable "$source"
+          docker pull ghcr.io/ledgetoptechnologies/internal-mcp:stable
+          revision=$(docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:stable --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          test "$revision" = a2c0849bc3bec05000d8c140f8af0919b7810bf2
+          docker image inspect ghcr.io/ledgetoptechnologies/internal-mcp:stable --format '{{json .RepoDigests}}' > stable-digest.json
       - uses: actions/upload-artifact@v4
         with:
           name: published-image-verification
-          path: published-digest.json
+          path: |
+            published-digest.json
+            stable-digest.json

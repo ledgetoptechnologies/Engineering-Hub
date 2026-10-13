@@ -2,7 +2,9 @@
 # Keep this service on a local TrueNAS interface and local ZFS dataset only.
 services:
   agent-message-bus:
-    image: "ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0"
+    image: "ghcr.io/ledgetoptechnologies/internal-mcp:stable"
+    # Pull on Compose up/redeploy, not Docker restart.
+    pull_policy: always
     restart: unless-stopped
     network_mode: host
     user: "10001:10001"
