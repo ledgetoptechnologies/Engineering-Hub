@@ -1,0 +1,47 @@
+# Prebuilt-image deployment for TrueNAS SCALE. No build context is required.
+# Keep this service on a local TrueNAS interface and local ZFS dataset only.
+services:
+  agent-message-bus:
+    image: "ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0"
+    restart: unless-stopped
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Bind only to the TrueNAS LAN interface. Change this if its address differs.
+      AGENT_BUS_CONTAINER_HOST: "192.168.50.80"
+      AGENT_BUS_PORT: "8765"
+      AGENT_BUS_DB: "/var/lib/agent-message-bus/messages.sqlite3"
+      AGENT_BUS_AUDIT: "/var/lib/agent-message-bus/audit.jsonl"
+      AGENT_BUS_FILE_ROOT: "/var/lib/agent-message-bus/files"
+      # Replace with the actual source IPs. Do not use an empty allowlist or an entire VLAN.
+      AGENT_BUS_ALLOWED_IPS: "192.168.60.92,192.168.20.151"
+      AGENT_BUS_ALLOWED_HOSTS: "192.168.50.80:8765,192.168.50.80,localhost:8765,localhost,127.0.0.1:8765,127.0.0.1"
+      CLAIM_LEASE_SECONDS: "600"
+      ACK_RETENTION_DAYS: "30"
+      REJECT_RETENTION_DAYS: "90"
+      # Replace each placeholder with a different random secret before starting the app.
+      HERMES_TOKEN: "REPLACE_WITH_UNIQUE_HERMES_TOKEN"
+      CODEX_TOKEN: "REPLACE_WITH_UNIQUE_CODEX_TOKEN"
+      CLAUDE_TOKEN: "REPLACE_WITH_UNIQUE_CLAUDE_TOKEN"
+      ADMIN_TOKEN: "REPLACE_WITH_UNIQUE_ADMIN_TOKEN"
+    volumes:
+      # Replace POOL_NAME with a local ZFS pool/dataset path; never use an SMB/NFS mount.
+      - "/mnt/POOL_NAME/apps/internal-mcp:/var/lib/agent-message-bus"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,os,urllib.request; host=os.environ.get('AGENT_BUS_CONTAINER_HOST','127.0.0.1'); url='http://'+host+':'+os.environ.get('AGENT_BUS_PORT','8765')+'/health'; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url,timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

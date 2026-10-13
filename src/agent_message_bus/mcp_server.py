@@ -7,6 +7,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from .api import Service
 from .database import InvalidTransition, MessageError, NotFound, message_dict
+from .knowledge import KnowledgeRepository, entry_dict, search_result_dict
 
 
 def build_mcp(service: Service) -> FastMCP:
@@ -33,17 +34,20 @@ def build_mcp(service: Service) -> FastMCP:
         request = ctx.request_context.request
         return service.auth.agent(request)
 
+    knowledge = KnowledgeRepository(service.repository.path)
+
     @mcp.tool()
     def send_message(recipient: str, message_type: str, body: Any, priority: str = "normal",
-                     correlation_id: str | None = None, requires_user_approval: bool = False,
-                     ctx: Context | None = None) -> dict[str, Any]:
+                     correlation_id: str | None = None, in_reply_to: str | None = None,
+                     requires_user_approval: bool = False, ctx: Context | None = None) -> dict[str, Any]:
         """Send one addressed message to the other agent."""
         if ctx is None: raise ValueError("request context required")
         sender = authenticated(ctx)
         message = service.repository.insert(sender=sender, recipient=recipient, message_type=message_type,
                                             body=body, priority=priority, correlation_id=correlation_id,
+                                            in_reply_to=in_reply_to,
                                             requires_user_approval=requires_user_approval)
-        service.audit_message("send", sender, message)
+        service.audit_message("send", sender, message, request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()
@@ -60,7 +64,7 @@ def build_mcp(service: Service) -> FastMCP:
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
         message = service.repository.claim(message_id, identity)
-        service.audit_message("claim", identity, message)
+        service.audit_message("claim", identity, message, request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()
@@ -69,7 +73,7 @@ def build_mcp(service: Service) -> FastMCP:
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
         message = service.repository.acknowledge(message_id, identity)
-        service.audit_message("acknowledge", identity, message)
+        service.audit_message("acknowledge", identity, message, request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()
@@ -78,7 +82,7 @@ def build_mcp(service: Service) -> FastMCP:
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
         message = service.repository.reject(message_id, identity, reason)
-        service.audit_message("reject", identity, message)
+        service.audit_message("reject", identity, message, request=ctx.request_context.request)
         return message_dict(message)
 
     @mcp.tool()
@@ -89,5 +93,49 @@ def build_mcp(service: Service) -> FastMCP:
         message = service.repository.get(message_id)
         if message.recipient != identity: raise NotFound("message not found")
         return message_dict(message)
+
+    @mcp.tool(name="knowledge_put")
+    def knowledge_put(project: str, path: str, title: str, content: str, expected_version: int,
+                      ctx: Context | None = None) -> dict[str, Any]:
+        """Create or compare-and-swap update a shared project/path document.
+
+        Use expected_version=0 to create a new document; updates must provide
+        the version returned by knowledge_get/list/search. Content is limited
+        to 64 KiB of UTF-8 text.
+        """
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        entry = knowledge.put(project=project, path=path, title=title, content=content,
+                              author=identity, expected_version=expected_version)
+        request = ctx.request_context.request
+        service.audit.append(operation="knowledge_put", agent=identity, result="ok",
+                             correlation_id=getattr(request.state, "correlation_id", None),
+                             request_id=getattr(request.state, "request_id", None))
+        return entry_dict(entry)
+
+    @mcp.tool(name="knowledge_get")
+    def knowledge_get(project: str, path: str, ctx: Context | None = None) -> dict[str, Any]:
+        """Read one shared knowledge document and verify its SHA-256 digest."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        return entry_dict(knowledge.get(project, path))
+
+    @mcp.tool(name="knowledge_list")
+    def knowledge_list(project: str, path_prefix: str | None = None, limit: int = 50,
+                       ctx: Context | None = None) -> dict[str, Any]:
+        """List shared knowledge metadata in a project, optionally by path prefix."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        entries = knowledge.list(project=project, path_prefix=path_prefix, limit=limit)
+        return {"documents": [entry_dict(entry, include_content=False) for entry in entries]}
+
+    @mcp.tool(name="knowledge_search")
+    def knowledge_search(query: str, project: str | None = None, limit: int = 20,
+                         ctx: Context | None = None) -> dict[str, Any]:
+        """Find shared knowledge matching every case-insensitive query term."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        entries = knowledge.search(query=query, project=project, limit=limit)
+        return {"results": [search_result_dict(entry, query) for entry in entries]}
 
     return mcp

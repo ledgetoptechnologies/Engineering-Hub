@@ -1,25 +1,28 @@
-# Current integration inventory
+# Current integration inventory (operator-reported)
+
+This page records the integration facts supplied for the packaging work. They were not independently verified against the remote hosts. The repository checkout and the live staging service are separate; this work does not change either system.
 
 ## Hermes
 
-- Watcher: `~/.hermes/scripts/vault_bridge_watcher.py`.
-- Cron job: `8ca807033aa2`.
-- Interval: every five minutes.
-- Watched path: `Hermes/Inbox/` only; path/mtime fingerprints suppress the agent on `NO_CHANGE`.
-- Direction: the intended inbox-only design is Hermes writing to `Codex/Inbox/` and Codex writing to `Hermes/Inbox/`; outboxes are not part of the new design.
-- Existing integration state: the VaultBridge watcher and cron remain unchanged during this build.
+- The operator reports an `agent_bus_watcher.py` entry associated with reference `b7a1b3d63138`; the exact local path/scheduler semantics are not asserted here.
+- The existing Hermes stdio bridge replies only to Codex and exposes five tools. It is not the shared HTTP MCP service and does not provide shared-knowledge integration.
+- No live watcher, cron, bridge, Hermes config, or inbox state was modified.
 
-## Codex
+## Codex and Claude Code
 
-Codex runs on Beau's main rig and is not assumed to be continuously powered on. A future watcher must be restart-safe and should run as a Windows Scheduled Task or equivalent, starting at boot/logon and polling approximately every five minutes. Pending bus messages remain durable until Codex claims and acknowledges them.
+- Both run on the Windows machine at `192.168.20.151` (per operator handoff).
+- There is no Codex config or Claude CLI on the Hermes host; do not treat the Hermes host as their client machine.
+- No existing Codex/Claude configuration was changed. See [`three-agent-integration.md`](three-agent-integration.md) for example client-side setup.
 
-## Network facts
+## Service addresses and deployment boundary
 
-- Hermes host: `192.168.60.92`.
-- TrueNAS/VaultBridge: `192.168.50.80`.
-- Beau's main rig/Codex: `192.168.20.151`.
-- The first bus phase binds to loopback. A later LAN phase may bind to `0.0.0.0` only with application allowlisting for the two explicit client IPs and a host firewall rule. No public tunnel, Cloudflare route, DNS record, or whole-VLAN exposure is part of this repository.
+- A staging bus at `192.168.50.90:8765` was reported healthy for ten days; this task did not probe it and its host has no checkout of this repository.
+- The prepared TrueNAS Compose sample targets the separate host/interface `192.168.50.80`; it is not deployed.
+- Reported client source IPs for the sample allowlist: Hermes `192.168.60.92`, Codex/Claude Windows host `192.168.20.151`. Confirm before using.
+- Restrict LAN access at both the application allowlist and host/router firewall. No public tunnel, DNS record, or whole-VLAN exposure is part of this packaging task.
 
-## Files and systems that must remain unchanged
+## Shared knowledge and wake-up limits
 
-Do not modify the current VaultBridge deployment, its Markdown notes, or its semantic index. Do not modify `~/.hermes/scripts/vault_bridge_watcher.py`, Hermes cron job `8ca807033aa2`, Hermes configuration, Codex configuration, or any existing inbox files during local acceptance. The bus uses its own `data/` directory and does not mount unrelated host paths.
+The current checkout implements `knowledge_put`, `knowledge_get`, `knowledge_list`, and `knowledge_search`; verify discovery from the exact release image before relying on them. Writes are version-checked, search is literal substring matching, and each enabled agent can access the same knowledge set, so do not store secrets there. These tools are not connected to the reported staging host by this task and do not synchronize agent memory. MCP registration does not wake an idle agent. The optional `scripts/wake_daemon.py` is a separate long-poll service and was not installed or configured; enabling it requires explicit approval. See [`wake-daemon.md`](wake-daemon.md) and [`three-agent-integration.md`](three-agent-integration.md).
+
+Keep the retained [`vaultbridge-audit.md`](vaultbridge-audit.md) as historical audit evidence. It is not a description of the new service's live state.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -10,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 STATUSES = {"pending", "claimed", "acknowledged", "rejected"}
-AGENTS = {"hermes", "codex"}
+AGENTS = {"hermes", "codex", "claude"}
 PRIORITIES = {"low", "normal", "high", "urgent"}
+MAX_CORRELATED_HOPS = 6
 
 
 def now_utc() -> datetime:
@@ -36,6 +38,8 @@ class Message:
     body: Any
     status: str
     correlation_id: str | None
+    in_reply_to: str | None
+    hop_count: int
     requires_user_approval: bool
     created_at: str
     claimed_by: str | None = None
@@ -74,8 +78,87 @@ class MessageRepository:
 
     def initialize(self) -> None:
         with self.connect() as conn:
+            self._migrate_messages(conn)
             conn.executescript(Path(__file__).with_name("schema.sql").read_text())
             conn.execute("PRAGMA journal_mode = WAL")
+
+    @staticmethod
+    def _migration_table_sql() -> str:
+        return """CREATE TABLE messages__migration (
+            id TEXT PRIMARY KEY,
+            sender TEXT NOT NULL CHECK (sender IN ('hermes', 'codex', 'claude')),
+            recipient TEXT NOT NULL CHECK (recipient IN ('hermes', 'codex', 'claude')),
+            message_type TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+            body_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'acknowledged', 'rejected')),
+            correlation_id TEXT,
+            in_reply_to TEXT,
+            hop_count INTEGER NOT NULL DEFAULT 0 CHECK (hop_count BETWEEN 0 AND 6),
+            requires_user_approval INTEGER NOT NULL DEFAULT 0 CHECK (requires_user_approval IN (0, 1)),
+            created_at TEXT NOT NULL,
+            claimed_by TEXT,
+            claim_expires_at TEXT,
+            acknowledged_at TEXT,
+            rejected_at TEXT,
+            rejection_reason TEXT
+        )"""
+
+    @staticmethod
+    def _allows_agent(table_sql: str, column: str, agent: str) -> bool:
+        match = re.search(
+            rf"CHECK\s*\(\s*{column}\s+IN\s*\(([^)]*)\)\s*\)",
+            table_sql,
+            re.IGNORECASE,
+        )
+        return bool(match and re.search(rf"'{re.escape(agent)}'", match.group(1), re.IGNORECASE))
+
+    def _migrate_messages(self, conn: sqlite3.Connection) -> None:
+        table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone()
+        if table is None:
+            return
+        table_sql = table["sql"] or ""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        needs_migration = (
+            not self._allows_agent(table_sql, "sender", "claude")
+            or not self._allows_agent(table_sql, "recipient", "claude")
+            or not {"in_reply_to", "hop_count"}.issubset(columns)
+        )
+        if not needs_migration:
+            return
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Preserve user-created indexes and triggers as well as the built-in indexes.
+            objects = conn.execute(
+                "SELECT type, sql FROM sqlite_master "
+                "WHERE tbl_name='messages' AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+            ).fetchall()
+            old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+            target_columns = (
+                "id", "sender", "recipient", "message_type", "priority", "body_json", "status",
+                "correlation_id", "in_reply_to", "hop_count", "requires_user_approval", "created_at",
+                "claimed_by", "claim_expires_at", "acknowledged_at", "rejected_at", "rejection_reason",
+            )
+            select_expressions = [
+                column if column in old_columns else ("NULL" if column == "in_reply_to" else "0")
+                for column in target_columns
+            ]
+            conn.execute(self._migration_table_sql())
+            conn.execute(
+                f"INSERT INTO messages__migration ({','.join(target_columns)}) "
+                f"SELECT {','.join(select_expressions)} FROM messages"
+            )
+            conn.execute("DROP TABLE messages")
+            conn.execute("ALTER TABLE messages__migration RENAME TO messages")
+            for obj in objects:
+                conn.execute(obj["sql"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _validate_agent(agent: str) -> None:
@@ -88,7 +171,8 @@ class MessageRepository:
             id=row["id"], sender=row["sender"], recipient=row["recipient"],
             message_type=row["message_type"], priority=row["priority"],
             body=json.loads(row["body_json"]), status=row["status"],
-            correlation_id=row["correlation_id"],
+            correlation_id=row["correlation_id"], in_reply_to=row["in_reply_to"],
+            hop_count=row["hop_count"],
             requires_user_approval=bool(row["requires_user_approval"]),
             created_at=row["created_at"], claimed_by=row["claimed_by"],
             claim_expires_at=row["claim_expires_at"], acknowledged_at=row["acknowledged_at"],
@@ -97,18 +181,40 @@ class MessageRepository:
 
     def insert(self, *, sender: str, recipient: str, message_type: str, body: Any,
                priority: str = "normal", correlation_id: str | None = None,
-               requires_user_approval: bool = False) -> Message:
+               requires_user_approval: bool = False, in_reply_to: str | None = None) -> Message:
         self._validate_agent(sender); self._validate_agent(recipient)
         if sender == recipient: raise MessageError("sender and recipient must differ")
         if not message_type or priority not in PRIORITIES: raise MessageError("invalid message type or priority")
         message_id = str(uuid.uuid4()); created = iso(now_utc())
         with self._lock, self.connect() as conn:
-            conn.execute("""INSERT INTO messages
-                (id,sender,recipient,message_type,priority,body_json,correlation_id,requires_user_approval,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
-                json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id,
-                int(requires_user_approval), created))
-            return self.get(message_id, conn=conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                hop_count = 0
+                if in_reply_to is not None:
+                    parent = conn.execute(
+                        "SELECT sender, recipient, hop_count FROM messages WHERE id=?", (in_reply_to,)
+                    ).fetchone()
+                    if parent is None:
+                        raise MessageError("parent message not found")
+                    if parent["recipient"] != sender:
+                        raise MessageError("sender must match parent recipient")
+                    if parent["sender"] != recipient:
+                        raise MessageError("recipient must be the parent sender peer")
+                    hop_count = parent["hop_count"] + 1
+                    if hop_count > MAX_CORRELATED_HOPS:
+                        raise MessageError(f"correlated message hop limit is {MAX_CORRELATED_HOPS}")
+                conn.execute("""INSERT INTO messages
+                    (id,sender,recipient,message_type,priority,body_json,correlation_id,in_reply_to,hop_count,
+                     requires_user_approval,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
+                    json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id, in_reply_to,
+                    hop_count, int(requires_user_approval), created))
+                message = self.get(message_id, conn=conn)
+                conn.commit()
+                return message
+            except Exception:
+                conn.rollback()
+                raise
 
     def get(self, message_id: str, *, conn: sqlite3.Connection | None = None) -> Message:
         owned = conn is None
@@ -120,13 +226,17 @@ class MessageRepository:
         finally:
             if owned: connection.close()
 
-    def list_for_recipient(self, recipient: str, *, status: str = "pending", limit: int = 50) -> list[Message]:
+    def list_for_recipient(self, recipient: str, *, status: str = "pending", limit: int = 50,
+                           actionable_only: bool = False) -> list[Message]:
         self._validate_agent(recipient)
         if status not in STATUSES: raise MessageError("invalid status")
         limit = min(max(1, int(limit)), 100)
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM messages WHERE recipient=? AND status=? ORDER BY created_at LIMIT ?",
-                                (recipient, status, limit)).fetchall()
+            sql = "SELECT * FROM messages WHERE recipient=? AND status=?"
+            params: list[Any] = [recipient, status]
+            if actionable_only:
+                sql += " AND lower(message_type) IN ('task', 'request')"
+            rows = conn.execute(sql + " ORDER BY created_at LIMIT ?", (*params, limit)).fetchall()
             return [self._from_row(row) for row in rows]
 
     def claim(self, message_id: str, agent: str) -> Message:

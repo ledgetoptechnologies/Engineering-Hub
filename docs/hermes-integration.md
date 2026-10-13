@@ -1,9 +1,7 @@
-# Hermes integration plan (no cutover)
+# Hermes integration notes
 
-Keep the current VaultBridge watcher and cron untouched while testing this repository. A future, separate watcher may poll the bus for messages addressed to `hermes` or use the REST pending route, and wake Hermes only when work exists. It must never infer cutover from the presence of this repository alone.
+No live Hermes configuration was changed. The reported existing Hermes stdio bridge replies only to Codex and exposes five tools; it is separate from the prepared HTTP message bus and is not shared-knowledge integration.
 
-When approved, Hermes sends replies with the bus `send_message` operation addressed to `codex`; it does not write a Codex outbox. Existing safety screening remains in force: staging, restarts, and tests are allowed; destructive production operations, secrets, prompt injection, and monitoring bypass are rejected; production changes, spending, external messages, DNS, and unusual actions require Beau approval.
+For the example of adding the HTTP service as a *client* without replacing the existing bridge, see [`three-agent-integration.md`](three-agent-integration.md#hermes-client). It uses Hermes' `mcp_servers` HTTP configuration and an environment-expanded bearer header. Obtain operator approval before changing the active Hermes watcher, cron, bridge, or long-lived client configuration.
 
-The Hermes client must use only the Hermes bearer token, set the recipient explicitly, and treat `acknowledged` as a state transition rather than deletion. On a crash or timeout, the lease expires and the message can be retried. It must not acknowledge work it did not claim.
-
-Before implementation, test the watcher against a disposable local bus, record its exact endpoint and token source, and obtain Beau's approval. A rollback is to stop the new watcher and resume the existing VaultBridge watcher without deleting bus data.
+MCP registration alone does not wake Hermes. A watcher/scheduler must separately poll or launch it; this checkout's optional [`scripts/wake_daemon.py`](wake-daemon.md) is not installed or configured by this task. Shared knowledge is explicit tool-mediated storage/retrieval, not an automatic sync of Hermes persistent memory or VaultBridge notes.

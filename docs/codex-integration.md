@@ -1,9 +1,5 @@
-# Codex integration plan (no cutover)
+# Codex integration notes
 
-Codex uses recipient `codex` and sends replies to recipient `hermes`. It must use only the Codex bearer token and cannot read messages addressed to Hermes. The Windows watcher must be a Scheduled Task or equivalent that starts at boot/logon and polls every five minutes or on the approved schedule.
+Codex runs on the Windows client at `192.168.20.151` per operator handoff. No Codex settings were modified by this packaging task. Use the copy/paste Windows PowerShell and TOML instructions in [`three-agent-integration.md`](three-agent-integration.md#codex-on-windows-powershell); they target `~/.codex/config.toml`, use a separate bearer token, and do not put the secret in the TOML file.
 
-Codex is not assumed to be online continuously. The bus keeps pending messages in SQLite until a Codex process claims them. A client crash leaves the finite claim lease to expire; the message then becomes retryable. A successful acknowledgement is durable and is retained before cleanup. Codex replies through the bus, not `Hermes/Inbox/` and not an outbox, only after cutover approval.
-
-The watcher should use a bounded receive limit, claim before work, reject with a concise reason when it cannot process a message, and acknowledge only after the requested work has completed. It should handle 401, connection failure, and duplicate claim responses without deleting local state. Store tokens outside the repository and never put them in task arguments or logs.
-
-Before cutover, run the two-client live smoke test, restart the service, verify pending delivery, test token isolation, and document the Windows task name and rollback command. Existing Codex configuration remains unchanged in this phase.
+MCP settings do not start an idle Codex process. The client must be running to use the tools, or a separately approved Windows watcher/scheduled task must start and poll it. Do not claim shared notes or automatic memory sync until the released knowledge tools are visible and explicitly exercised.

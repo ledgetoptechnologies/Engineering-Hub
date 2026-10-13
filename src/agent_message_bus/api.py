@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -20,6 +22,7 @@ class MessageCreate(BaseModel):
     body: Any
     priority: str = "normal"
     correlation_id: str | None = None
+    in_reply_to: str | None = None
     requires_user_approval: bool = False
 
 
@@ -32,10 +35,17 @@ class Service:
                  policy: RetentionPolicy, files: FileRepository | None = None):
         self.repository, self.audit, self.auth, self.policy, self.files = repository, audit, auth, policy, files
 
-    def audit_message(self, operation: str, agent: str, message: Any, result: str = "ok") -> None:
-        self.audit.append(operation=operation, agent=agent, message_id=getattr(message, "id", None),
-                          recipient=getattr(message, "recipient", None), result=result,
-                          correlation_id=getattr(message, "correlation_id", None))
+    def audit_message(self, operation: str, agent: str, message: Any, result: str = "ok",
+                      request: Request | None = None) -> None:
+        correlation_id = getattr(message, "correlation_id", None)
+        if correlation_id is None or self.auth.identity_for(correlation_id):
+            correlation_id = getattr(request.state, "correlation_id", None) if request else None
+        self.audit.append(
+            operation=operation, agent=agent, message_id=getattr(message, "id", None),
+            recipient=getattr(message, "recipient", None), result=result,
+            correlation_id=correlation_id,
+            request_id=getattr(request.state, "request_id", None) if request else None,
+        )
 
 
 def router(service: Service) -> APIRouter:
@@ -50,11 +60,11 @@ def router(service: Service) -> APIRouter:
         return service.files
 
     @api.post("/messages", status_code=201)
-    def send(payload: MessageCreate, sender: str = Depends(agent)):
+    def send(payload: MessageCreate, request: Request, sender: str = Depends(agent)):
         try:
             message = service.repository.insert(sender=sender, **payload.model_dump())
         except MessageError as exc: raise HTTPException(400, str(exc)) from exc
-        service.audit_message("send", sender, message)
+        service.audit_message("send", sender, message, request=request)
         return message_dict(message)
 
     @api.get("/messages")
@@ -64,6 +74,28 @@ def router(service: Service) -> APIRouter:
         try: result = service.repository.list_for_recipient(identity, status=status, limit=limit)
         except MessageError as exc: raise HTTPException(400, str(exc)) from exc
         return {"messages": [message_dict(message) for message in result]}
+
+    @api.get("/messages/wait")
+    async def wait_for_messages(timeout: float = Query(default=30.0, ge=0, le=60),
+                                actionable_only: bool = Query(default=False),
+                                identity: str = Depends(agent)):
+        """Wait for pending messages addressed to the identity; optionally skip non-actionable messages."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                await asyncio.to_thread(service.repository.expire_claims)
+                messages = await asyncio.to_thread(
+                    service.repository.list_for_recipient, identity, status="pending", limit=50,
+                    actionable_only=actionable_only,
+                )
+            except MessageError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            if messages:
+                return {"messages": [message_dict(message) for message in messages]}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"messages": []}
+            await asyncio.sleep(min(0.75, remaining))
 
     @api.get("/messages/{message_id}")
     def get(message_id: str, request: Request):
@@ -79,7 +111,7 @@ def router(service: Service) -> APIRouter:
         try: message = service.repository.claim(message_id, identity)
         except NotFound as exc: raise HTTPException(404, str(exc)) from exc
         except InvalidTransition as exc: raise HTTPException(409, str(exc)) from exc
-        service.audit_message("claim", identity, message); return message_dict(message)
+        service.audit_message("claim", identity, message, request=request); return message_dict(message)
 
     @api.post("/messages/{message_id}/ack")
     def ack(message_id: str, request: Request):
@@ -87,7 +119,7 @@ def router(service: Service) -> APIRouter:
         try: message = service.repository.acknowledge(message_id, identity)
         except NotFound as exc: raise HTTPException(404, str(exc)) from exc
         except InvalidTransition as exc: raise HTTPException(409, str(exc)) from exc
-        service.audit_message("acknowledge", identity, message); return message_dict(message)
+        service.audit_message("acknowledge", identity, message, request=request); return message_dict(message)
 
     @api.post("/messages/{message_id}/reject")
     def reject(message_id: str, payload: RejectRequest, request: Request):
@@ -96,16 +128,17 @@ def router(service: Service) -> APIRouter:
         except NotFound as exc: raise HTTPException(404, str(exc)) from exc
         except InvalidTransition as exc: raise HTTPException(409, str(exc)) from exc
         except MessageError as exc: raise HTTPException(400, str(exc)) from exc
-        service.audit_message("reject", identity, message); return message_dict(message)
+        service.audit_message("reject", identity, message, request=request); return message_dict(message)
 
     @api.post("/admin/cleanup")
     def run_cleanup(request: Request, _admin: str = Depends(admin)):
         result = cleanup(service.repository, service.policy)
-        service.audit.append(operation="cleanup", agent="admin", result="ok")
+        service.audit.append(operation="cleanup", agent="admin", result="ok",
+                             correlation_id=request.state.correlation_id, request_id=request.state.request_id)
         return result
 
     @api.post("/files", status_code=201)
-    async def upload_file(path: str = Form(...), file: UploadFile = File(...),
+    async def upload_file(request: Request, path: str = Form(...), file: UploadFile = File(...),
                           identity: str = Depends(agent), files: FileRepository = Depends(file_repository)):
         try:
             metadata = await files.save_upload(path, file)
@@ -113,7 +146,8 @@ def router(service: Service) -> APIRouter:
             raise HTTPException(400, str(exc)) from exc
         except FileError as exc:
             raise HTTPException(400, str(exc)) from exc
-        service.audit.append(operation="file_upload", agent=identity, result="ok")
+        service.audit.append(operation="file_upload", agent=identity, result="ok",
+                             correlation_id=request.state.correlation_id, request_id=request.state.request_id)
         return file_dict(metadata)
 
     @api.get("/files")

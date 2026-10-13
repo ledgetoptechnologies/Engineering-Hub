@@ -2,7 +2,7 @@
 
 The bus stores artifact bytes under `AGENT_BUS_FILE_ROOT` (default `data/files`) and stores metadata in the same SQLite database as messages. Docker maps this root to `/var/lib/agent-message-bus/files`, inside the persistent `./data` bind mount.
 
-All file routes require `Authorization: Bearer ...`. Hermes and Codex tokens can upload, list, inspect metadata, and download. The admin token can delete; it is not an agent token and cannot use the agent routes.
+All file routes require an enabled agent bearer token (Hermes or Codex, and Claude Code only when Claude auth is enabled in the running image). The admin token can delete; it is separate from agent tokens and cannot use agent routes.
 
 ## Endpoints
 

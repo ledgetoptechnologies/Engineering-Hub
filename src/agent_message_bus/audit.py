@@ -4,11 +4,14 @@ import hashlib
 import json
 import logging
 import threading
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+request_id_context: ContextVar[str | None] = ContextVar("request_id", default=None)
+correlation_id_context: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
 
 class AuditLog:
@@ -19,10 +22,14 @@ class AuditLog:
         self.last_error: str | None = None
 
     def append(self, *, operation: str, agent: str, message_id: str | None = None,
-               recipient: str | None = None, result: str = "ok", correlation_id: str | None = None) -> None:
+               recipient: str | None = None, result: str = "ok", correlation_id: str | None = None,
+               request_id: str | None = None) -> None:
+        request_id = request_id if request_id is not None else request_id_context.get()
+        correlation_id = correlation_id if correlation_id is not None else correlation_id_context.get()
         record: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                                   "operation": operation, "agent": agent, "message_id": message_id,
-                                  "recipient": recipient, "result": result, "correlation_id": correlation_id}
+                                  "recipient": recipient, "result": result, "correlation_id": correlation_id,
+                                  "request_id": request_id}
         with self._lock:
             try:
                 previous = ""
@@ -36,9 +43,17 @@ class AuditLog:
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
                 self.last_error = None
+                log.info(json.dumps({"event": "lifecycle.audit", **{
+                    key: record[key] for key in (
+                        "timestamp", "operation", "agent", "message_id", "recipient", "result",
+                        "correlation_id", "request_id",
+                    )
+                }}, sort_keys=True, separators=(",", ":")))
             except Exception as exc:  # audit must not break successful work
                 self.last_error = str(exc)
-                log.exception("audit log append failed")
+                log.error(json.dumps({"event": "audit.write_failed", "operation": operation,
+                                      "agent": agent, "exception_type": type(exc).__name__},
+                                     sort_keys=True, separators=(",", ":")))
 
     def verify(self) -> bool:
         previous = ""

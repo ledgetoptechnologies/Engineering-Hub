@@ -1,20 +1,16 @@
-# Safe cutover checklist
+# Safe integration / cutover checklist
 
-Cutover is not part of the local build. Beau must explicitly approve any live Hermes or Codex configuration change.
+No publish, deployment, watcher change, or client configuration change is part of the packaging task. An operator must explicitly approve any live cutover.
 
-- [ ] `uv run pytest -q` passes.
-- [ ] Docker Compose parses and the image starts.
-- [ ] Health, REST, and live MCP tests pass with separate tokens.
-- [ ] Hermes cannot read Codex-addressed messages and Codex cannot read Hermes-addressed messages.
-- [ ] Sender identity is derived from the bearer token, not a request field.
-- [ ] Duplicate claims are prevented; expired claims are retryable.
-- [ ] Acknowledgement is not deletion.
-- [ ] Retention deletes only old acknowledged/rejected rows and never pending or claimed rows.
-- [ ] Audit verification passes and records contain no tokens or full bodies.
-- [ ] Container restart preserves an acknowledged message and a new pending message.
-- [ ] SQLite backup and restore has been tested with the service stopped or a consistent snapshot method.
-- [ ] LAN binding, application IP allowlist, and host firewall rules are reviewed; no public exposure exists.
-- [ ] A manual rollback to the current VaultBridge watcher is written and rehearsed.
-- [ ] Beau approves changing either agent's live configuration.
-
-Rollback: stop the new watcher/client, leave bus data intact for diagnosis, and resume the existing VaultBridge watcher. Do not delete or migrate VaultBridge notes as a rollback action.
+- [ ] `uv run pytest -q` passes and both Compose files validate.
+- [ ] Build the image and verify a healthy non-root container; record its immutable digest.
+- [ ] Preserve the private GHCR visibility and confirm TrueNAS has only the required `read:packages` access.
+- [ ] Use a local ZFS dataset for DB/WAL/SHM, audit, and artifacts; verify permissions for UID/GID `10001` and backup/restore.
+- [ ] Review host-interface binding, exact agent source-IP allowlist, and host/router firewall. Do not enable public exposure.
+- [ ] Test each supported agent with its own token; verify invalid tokens fail and one agent cannot access another agent's messages.
+- [ ] Discover MCP tools from the actual released image instead of assuming fixed tool names/counts.
+- [ ] If shared-knowledge tools are present, test a disposable note and verify explicit write/read behavior. Do not describe this as automatic long-term-memory or vault synchronization.
+- [ ] Verify an idle Codex/Claude/Hermes process is not woken solely by server registration. The optional `scripts/wake_daemon.py` is a separate, unconfigured integration and requires explicit approval before service installation.
+- [ ] Restart the service and verify database, audit, message, and file persistence.
+- [ ] Keep the existing Hermes watcher/stdio bridge intact until a separate cutover is approved; record a rollback plan that resumes the known-good integration without deleting data.
+- [ ] Get operator approval before changing live agent configuration or enabling a watcher/scheduled task.
