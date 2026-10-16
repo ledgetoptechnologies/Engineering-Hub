@@ -2,13 +2,19 @@
 
 A self-hosted, authenticated MCP Streamable HTTP service for Hermes, Codex, and Claude Code. It provides durable agent messaging, shared-file storage, audit records, and (when included in a release) shared-knowledge tools. SQLite and artifacts live in the service's persistent data directory.
 
-This repository prepares a private GHCR container package and a TrueNAS SCALE Compose deployment. **This change does not publish, deploy, or alter any agent configuration.** See the integration guide for the reported current state and what MCP does—and does not—connect automatically.
+This repository builds a private GHCR container package and a TrueNAS SCALE Compose deployment. Publication, deployment and client wake behavior are separate verification gates; source changes alone do not prove any of them.
+
+## Messaging and feedback
+
+v0.4.0 adds a durable recipient-only cursor notification feed through REST and MCP, preserving the legacy wait contract. Initialize with `since_now=true`, then save and resume with `after=next_cursor`; `after=0` replays retained history. See [auto-wake v1](docs/auto-wake-v1.md).
+
+The shared bug/improvement/info inbox supports idempotent submission, filtered pagination, revision-checked status changes and attributed evidence history. Reports are review items, never automatic execution requests. See [feedback tools](docs/feedback.md). Session connectors and full task/resource fencing are separate integrations, not guarantees provided by the notification feed.
 
 ## Security boundaries
 
 - The local `compose.yaml` example binds to loopback only. The TrueNAS file binds to one LAN interface and allows only listed client IPs.
 - Use a distinct bearer token for every enabled agent and keep the admin token separate.
-- The TrueNAS sample binds to one host interface, uses an application source-IP allowlist, runs as UID/GID `10001`, and drops Linux capabilities.
+- The TrueNAS sample binds to one host interface, uses an application source-IP allowlist, runs as UID/GID `568:568`, and drops Linux capabilities.
 - Keep SQLite, its WAL/SHM sidecars, the audit log, and files together on a local ZFS dataset. Do not put SQLite WAL on SMB/NFS.
 - The current package/repository are private. GHCR package visibility is not changed by this workflow. TrueNAS needs authorized `read:packages` access to pull a private image.
 - Do not expose the endpoint through public DNS, a public tunnel, or a whole-VLAN firewall rule.
@@ -38,16 +44,16 @@ The live smoke test discovers the server's tools and exercises message delivery,
 
 ## GHCR image
 
-`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.2.0` runs the same gates and publishes:
+`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.4.0` runs the same gates and publishes:
 
-- `ghcr.io/ledgetoptechnologies/internal-mcp:0.2.0`
+- `ghcr.io/ledgetoptechnologies/internal-mcp:0.4.0`
 - `ghcr.io/ledgetoptechnologies/internal-mcp:sha-<full-commit-sha>`
 
-There is intentionally no mutable `latest` tag. Protect `v*` Git refs and do not move/rebuild a release tag; pin a digest for a deployment that needs content-addressed immutability. The workflow uses the repository-scoped `GITHUB_TOKEN` with `packages: write` and publishes OCI source, version, and revision labels. GitHub leaves a first-published package private by default; this project keeps that visibility.
+Stable releases also publish the moving `stable` tag; there is intentionally no mutable `latest` tag. Protect `v*` Git refs and do not move/rebuild a release tag; pin a digest for a deployment that needs content-addressed immutability. The workflow uses the repository-scoped `GITHUB_TOKEN` with `packages: write` and publishes OCI source, version, and revision labels. GitHub leaves a first-published package private by default; this project keeps that visibility.
 
 ## TrueNAS SCALE
 
-Use [`compose.truenas.yaml`](compose.truenas.yaml) as a prebuilt-image compose file (no `build:` block). Before installing, follow [`docs/truenas-deployment.md`](docs/truenas-deployment.md): authenticate TrueNAS to the private package, create a local ZFS data path, set its ownership to UID/GID `10001`, replace all four secret placeholders, and adjust the LAN bind and client allowlist to the real addresses. Do not deploy until the `0.2.0` package has actually been published and the operator approves the cutover.
+Use [`compose.truenas.yaml`](compose.truenas.yaml) as a prebuilt-image compose file (no `build:` block). Before installing, follow [`docs/truenas-deployment.md`](docs/truenas-deployment.md): authenticate TrueNAS to the private package, create a local ZFS data path, set its ownership to UID/GID `568:568`, replace all four secret placeholders, and adjust the LAN bind and client allowlist to the real addresses. For updates, preserve the installed volume mapping and tokens exactly. Verify the selected package is published and back up the existing SQLite database and file objects before pulling/redeploying. A container restart alone does not fetch a newer image.
 
 ## Three-agent integration
 

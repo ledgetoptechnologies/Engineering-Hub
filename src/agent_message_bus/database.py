@@ -80,7 +80,31 @@ class MessageRepository:
         with self.connect() as conn:
             self._migrate_messages(conn)
             conn.executescript(Path(__file__).with_name("schema.sql").read_text())
-            conn.execute("PRAGMA journal_mode = WAL")
+            self._migrate_delivery_sequence(conn)
+
+    @staticmethod
+    def _migrate_delivery_sequence(conn: sqlite3.Connection) -> None:
+        """Idempotently assign stable order without updating legacy message rows."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("""INSERT INTO message_delivery_sequence (message_id)
+                SELECT m.id FROM messages AS m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM message_delivery_sequence AS d WHERE d.message_id = m.id
+                ) ORDER BY m.created_at, m.id""")
+            head = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='message_delivery_sequence'"
+            ).fetchone()
+            head_value = int(head[0]) if head is not None else 0
+            max_mapping = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM message_delivery_sequence"
+            ).fetchone()[0]
+            if head_value < max_mapping or head_value < 0:
+                raise MessageError("delivery sequence high-water mark is inconsistent")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _migration_table_sql() -> str:
@@ -209,6 +233,7 @@ class MessageRepository:
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
                     json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id, in_reply_to,
                     hop_count, int(requires_user_approval), created))
+                conn.execute("INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,))
                 message = self.get(message_id, conn=conn)
                 conn.commit()
                 return message
@@ -238,6 +263,57 @@ class MessageRepository:
                 sql += " AND lower(message_type) IN ('task', 'request')"
             rows = conn.execute(sql + " ORDER BY created_at LIMIT ?", (*params, limit)).fetchall()
             return [self._from_row(row) for row in rows]
+
+    @staticmethod
+    def _delivery_head(conn: sqlite3.Connection) -> int:
+        # Both scalar reads must share one statement snapshot. Two autocommit
+        # SELECTs can straddle a concurrent message commit and falsely flag corruption.
+        row = conn.execute("""SELECT
+            (SELECT seq FROM sqlite_sequence WHERE name='message_delivery_sequence'),
+            (SELECT COALESCE(MAX(seq), 0) FROM message_delivery_sequence)
+        """).fetchone()
+        try:
+            head = int(row[0]) if row[0] is not None else 0
+            max_mapping = int(row[1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MessageError("delivery sequence high-water mark is inconsistent") from exc
+        if head < max_mapping or head < 0:
+            raise MessageError("delivery sequence high-water mark is inconsistent")
+        return head
+
+    def delivery_head(self) -> int:
+        with self.connect() as conn:
+            return self._delivery_head(conn)
+
+    def oldest_available_seq(self) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute("""SELECT MIN(d.seq) FROM message_delivery_sequence AS d
+                INNER JOIN messages AS m ON m.id=d.message_id""").fetchone()
+            return int(row[0]) if row is not None and row[0] is not None else None
+
+    def sequence_for(self, message_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT seq FROM message_delivery_sequence WHERE message_id=?", (message_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("message delivery sequence not found")
+            return int(row[0])
+
+    def list_after(self, recipient: str, *, after: int, limit: int = 50) -> tuple[list[dict[str, Any]], int]:
+        """Return retained recipient messages after a global exclusive delivery cursor."""
+        self._validate_agent(recipient)
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise MessageError("after must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise MessageError("limit must be between 1 and 100")
+        with self.connect() as conn:
+            rows = conn.execute("""SELECT m.*, d.seq FROM message_delivery_sequence AS d
+                INNER JOIN messages AS m ON m.id=d.message_id
+                WHERE m.recipient=? AND d.seq>? ORDER BY d.seq ASC LIMIT ?""",
+                (recipient, after, limit)).fetchall()
+            page = [{**message_dict(self._from_row(row)), "seq": int(row["seq"])} for row in rows]
+            return page, int(rows[-1]["seq"]) if rows else after
 
     def claim(self, message_id: str, agent: str) -> Message:
         self._validate_agent(agent); expires = iso(now_utc() + timedelta(seconds=self.lease_seconds))

@@ -7,9 +7,10 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .api import Service
+from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, message_dict
 from .files import file_dict
+from .feedback import FeedbackError, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .knowledge import KnowledgeRepository, entry_dict, search_result_dict
 
 
@@ -60,6 +61,24 @@ def build_mcp(service: Service) -> FastMCP:
         identity = authenticated(ctx)
         messages = service.repository.list_for_recipient(identity, status="pending", limit=limit)
         return {"messages": [message_dict(message) for message in messages]}
+
+    @mcp.tool()
+    async def wait_for_messages(after: int | None = None, since_now: bool = False,
+                                fields: str = "pointer", limit: int = 50, timeout: float = 30.0,
+                                ctx: Context | None = None) -> dict[str, Any]:
+        """Wait for recipient-only cursor notifications; pointer mode never includes message bodies.
+
+        Use after=0 to replay retained history, or since_now=true to snapshot the current
+        global head once and receive only later commits. Cursor mode never claims or
+        acknowledges messages. Pointer subjects are untrusted, bounded hints.
+        """
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        return await wait_for_message_feed(
+            service.repository, identity, after=after, since_now=since_now,
+            fields=fields, limit=limit, timeout=timeout,
+            secrets=_known_auth_secrets(service.auth),
+        )
 
     @mcp.tool()
     def claim_message(message_id: str, ctx: Context | None = None) -> dict[str, Any]:
@@ -272,5 +291,64 @@ def build_mcp(service: Service) -> FastMCP:
             raise ValueError("limit must be 1-100")
         entries = storage().history(qualified_path(project, path), limit=limit)
         return {"versions": [metadata_dict(item, project) for item in entries]}
+
+    @mcp.tool(name="feedback_submit")
+    def submit_feedback(kind: str, title: str, description: str, project: str = "agent-bus",
+                        severity: str = "normal", client_request_id: str | None = None,
+                        ctx: Context | None = None) -> dict[str, Any]:
+        """Record a shared bug, improvement or info item for review, not automatic execution.
+
+        No passwords or tokens. A per-author client_request_id makes retries idempotent.
+        """
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        try:
+            report = service.feedback.submit(identity, kind, title, description, project, severity, client_request_id)
+        except FeedbackError as exc:
+            raise ValueError(f"{exc.code}: {exc.safe_message}") from exc
+        service.audit_feedback("feedback_submit", identity, ctx.request_context.request)
+        return feedback_dict(report)
+
+    @mcp.tool(name="feedback_get")
+    def get_feedback(feedback_id: str, after_revision: int = 0, history_limit: int = 20,
+                     ctx: Context | None = None) -> dict[str, Any]:
+        """Read a shared feedback report and a bounded page of attributed revision evidence."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        try:
+            report, history = service.feedback.get_with_history(
+                feedback_id, after_revision=after_revision, limit=history_limit)
+            last = history[-1].revision if history else after_revision
+            return {"feedback": feedback_dict(report), "history": [feedback_revision_dict(x) for x in history],
+                    "next_revision": last if last < report.revision else None}
+        except FeedbackError as exc:
+            raise ValueError(f"{exc.code}: {exc.safe_message}") from exc
+
+    @mcp.tool(name="feedback_list")
+    def list_feedback(kind: str | None = None, status: str | None = None, project: str | None = None,
+                      severity: str | None = None, author: str | None = None, limit: int = 50,
+                      after: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
+        """List the shared review inbox with explicit status/project filters and cursor pagination."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        filters = {key: value for key, value in {"kind": kind, "status": status, "project": project,
+                   "severity": severity, "author": author}.items() if value is not None}
+        try:
+            return feedback_page_dict(service.feedback.list(filters, limit=limit, after=after), include_text=True)
+        except FeedbackError as exc:
+            raise ValueError(f"{exc.code}: {exc.safe_message}") from exc
+
+    @mcp.tool(name="feedback_update")
+    def update_feedback(feedback_id: str, expected_revision: int, status: str, note: str = "",
+                        ctx: Context | None = None) -> dict[str, Any]:
+        """CAS-update status/evidence as the author or Hermes maintainer. Never grants execution approval."""
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        try:
+            report = service.feedback.update(feedback_id, identity, expected_revision, status, note)
+        except FeedbackError as exc:
+            raise ValueError(f"{exc.code}: {exc.safe_message}") from exc
+        service.audit_feedback("feedback_update", identity, ctx.request_context.request)
+        return feedback_dict(report)
 
     return mcp

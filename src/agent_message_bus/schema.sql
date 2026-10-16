@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS messages (
     rejected_at TEXT,
     rejection_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS message_delivery_sequence (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE
+);
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status_created ON messages (recipient, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_claim_expiry ON messages (status, claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_messages_retention ON messages (status, acknowledged_at, rejected_at);

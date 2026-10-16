@@ -29,13 +29,14 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 SCRATCH = REPO.parent
-IMAGE = "agent-message-bus:collaboration-candidate"
+IMAGE = "agent-message-bus:collaboration-v040-smoke"
 CONTAINER_PORT = 8765
 FILE_LIMIT = 64 * 1024 * 1024
 EXPECTED_TOOLS = {
     "ack_message", "claim_message", "file_get", "file_history", "file_list", "file_put",
     "get_message", "knowledge_get", "knowledge_list", "knowledge_put", "knowledge_search",
     "receive_messages", "reject_message", "semantic_search", "semantic_status", "send_message",
+    "wait_for_messages", "feedback_submit", "feedback_get", "feedback_list", "feedback_update",
 }
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "for", "from", "how",
@@ -385,13 +386,13 @@ def main() -> int:
             labels = json.loads(labels_text)
             safe_existing_candidate = (
                 labels.get("org.opencontainers.image.revision") == evidence["git_head"]
-                and labels.get("org.opencontainers.image.version") == "collaboration-candidate"
+                and labels.get("org.opencontainers.image.version") == "collaboration-v040-smoke"
             )
         check("candidate_image_tag_safe_to_build", safe_existing_candidate,
               {"tag_was_preexisting": previous_id is not None})
         evidence["candidate_image_before"] = previous_id
         build = run(["docker", "build", "--tag", IMAGE, "--build-arg", f"VCS_REF={evidence['git_head']}",
-                     "--build-arg", "VERSION=collaboration-candidate", "."], timeout=900)
+                     "--build-arg", "VERSION=collaboration-v040-smoke", "."], timeout=900)
         check("docker_build_candidate", build.returncode == 0)
         image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE])
         check("candidate_image_tag_present", image_id.returncode == 0 and image_id.stdout.startswith("sha256:"))
@@ -422,7 +423,7 @@ def main() -> int:
         for identity in ("hermes", "codex", "claude"):
             client = MCPClient(base_url, tokens[identity], identity)
             names = client.initialize()
-            check(f"mcp_initialize_tools_{identity}", set(names) == EXPECTED_TOOLS and len(names) == 16,
+            check(f"mcp_initialize_tools_{identity}", set(names) == EXPECTED_TOOLS and len(names) == len(EXPECTED_TOOLS),
                   {"tool_count": len(names), "tool_names_sha256": sha256("\n".join(names).encode())})
             clients[identity] = client
             tool_counts[identity] = len(names)
@@ -676,7 +677,7 @@ def main() -> int:
         check("container_restart_health", restart_health.get("ok") is True)
         after_restart = MCPClient(base_url, tokens["claude"], "claude")
         restart_tools = after_restart.initialize()
-        check("mcp_reinitialize_after_restart", set(restart_tools) == EXPECTED_TOOLS and len(restart_tools) == 16)
+        check("mcp_reinitialize_after_restart", set(restart_tools) == EXPECTED_TOOLS and len(restart_tools) == len(EXPECTED_TOOLS))
         persisted_knowledge = after_restart.call("knowledge_get", {"project": project, "path": knowledge_path})
         persisted_file = after_restart.call("file_get", {"project": project, "path": file_path})
         persisted_binary = after_restart.call("file_get", {"project": project, "path": binary_path, "encoding": "base64"})
@@ -750,7 +751,7 @@ def main() -> int:
         check("restored_container_health", restored_health.get("ok") is True)
         restored = MCPClient(base_url, tokens["hermes"], "hermes")
         restored_names = restored.initialize()
-        check("restored_mcp_initialize_tools", set(restored_names) == EXPECTED_TOOLS and len(restored_names) == 16)
+        check("restored_mcp_initialize_tools", set(restored_names) == EXPECTED_TOOLS and len(restored_names) == len(EXPECTED_TOOLS))
         restored_knowledge = restored.call("knowledge_get", {"project": project, "path": knowledge_path})
         restored_file = restored.call("file_get", {"project": project, "path": file_path})
         restored_binary = restored.call("file_get", {"project": project, "path": binary_path, "encoding": "base64"})

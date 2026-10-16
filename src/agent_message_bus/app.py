@@ -8,7 +8,11 @@ import time
 import uuid
 from pathlib import Path
 
+from importlib.metadata import version
+
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
@@ -57,7 +61,9 @@ class OperationalLoggingMiddleware(BaseHTTPMiddleware):
                 "request_id": request_id,
                 "correlation_id": correlation_id,
                 "method": request.method,
-                "path": "/api/files/{path}" if request.url.path.startswith("/api/files/") else request.url.path,
+                "path": ("/api/files/{path}" if request.url.path.startswith("/api/files/")
+                         else "/api/feedback/{id}" if request.url.path.startswith("/api/feedback/")
+                         else request.url.path),
                 "status_code": response.status_code if response is not None else 500,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             }
@@ -113,6 +119,12 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
 
     # FastAPI owns the REST dependency/validation layer, while the MCP app remains the root ASGI app.
     rest = FastAPI(title="Agent Message Bus REST", docs_url=None, redoc_url=None)
+    @rest.exception_handler(RequestValidationError)
+    async def safe_feedback_validation(request, exc):
+        if request.url.path.startswith("/api/feedback"):
+            return JSONResponse({"detail": {"code": "invalid_feedback", "message": "feedback input is invalid"}}, status_code=422)
+        return await request_validation_exception_handler(request, exc)
+
     rest.include_router(router(service))
     app.mount("/", rest)
 
@@ -124,7 +136,8 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         except Exception:
             db_status = "error"
         return StarletteJSONResponse({"ok": db_status == "ok", "database": db_status,
-                                      "schema_version": 2,
+                                      "schema_version": 3,
+                                      "version": version("agent-message-bus"),
                                       "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid"),
                                       "semantic": {"state": "enabled" if semantic.enabled else "disabled"}})
 

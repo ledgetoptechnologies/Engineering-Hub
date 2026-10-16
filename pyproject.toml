@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-message-bus"
-version = "0.3.0"
+version = "0.4.0"
 description = "Authenticated shared message and knowledge bus for Hermes, Codex, and Claude Code"
 requires-python = ">=3.12"
 dependencies = [
@@ -24,7 +24,7 @@ test = [
 ]
 
 [tool.setuptools.package-data]
-agent_message_bus = ["schema.sql"]
+agent_message_bus = ["schema.sql", "feedback_schema.sql"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

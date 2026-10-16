@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
+import re
 import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import AuditLog
 from .auth import AuthSettings
 from .database import InvalidTransition, MessageError, MessageRepository, NotFound, message_dict
 from .files import FileConflict, FileError, FileIntegrityError, FileTooLarge, FileNotFound, FilePathError, FileRepository, file_dict
+from .feedback import FeedbackError, FeedbackRepository, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .retention import RetentionPolicy, cleanup
 
 
@@ -30,11 +33,34 @@ class RejectRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class FeedbackSubmit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str
+    title: str
+    description: str
+    project: str = "agent-bus"
+    severity: str = "normal"
+    client_request_id: str | None = None
+
+
+class FeedbackUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(strict=True, ge=1)
+    status: str
+    note: str = ""
+
+
 class Service:
     def __init__(self, repository: MessageRepository, audit: AuditLog, auth: AuthSettings,
                  policy: RetentionPolicy, files: FileRepository | None = None, semantic: Any = None):
         self.repository, self.audit, self.auth, self.policy, self.files = repository, audit, auth, policy, files
         self.semantic = semantic
+        self.feedback = FeedbackRepository(repository.path)
+
+    def audit_feedback(self, operation: str, agent: str, request: Request | None = None) -> None:
+        # Report descriptions, titles, notes and client-supplied identifiers are never audit fields.
+        self.audit.append(operation=operation, agent=agent, result="ok",
+                          request_id=getattr(request.state, "request_id", None) if request else None)
 
     def audit_message(self, operation: str, agent: str, message: Any, result: str = "ok",
                       request: Request | None = None) -> None:
@@ -47,6 +73,102 @@ class Service:
             correlation_id=correlation_id,
             request_id=getattr(request.state, "request_id", None) if request else None,
         )
+
+
+_SUBJECT_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}"),
+    re.compile(r"(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*\S+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+)
+
+
+def _known_auth_secrets(auth: AuthSettings) -> tuple[str, ...]:
+    return tuple(value for value in (auth.hermes_token, auth.codex_token, auth.claude_token, auth.admin_token)
+                 if isinstance(value, str) and value)
+
+
+def _safe_subject(body: Any, secrets: tuple[str, ...]) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    subject = body.get("subject")
+    if not isinstance(subject, str):
+        return None
+    subject = subject.strip()
+    if not subject or len(subject) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in subject):
+        return None
+    if any(secret in subject for secret in secrets):
+        return None
+    if any(pattern.search(subject) for pattern in _SUBJECT_SECRET_PATTERNS):
+        return None
+    return subject
+
+
+def _cursor_pointer(message: dict[str, Any], secrets: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "id": message["id"],
+        "seq": message["seq"],
+        "sender": message["sender"],
+        "recipient": message["recipient"],
+        "message_type": message["message_type"],
+        "priority": message["priority"],
+        "correlation_id": message["correlation_id"],
+        "in_reply_to": message["in_reply_to"],
+        "hop_count": message["hop_count"],
+        "requires_user_approval": message["requires_user_approval"],
+        "created_at": message["created_at"],
+        "subject": _safe_subject(message["body"], secrets),
+    }
+
+
+def validate_cursor_wait_args(*, after: int | None, since_now: bool, fields: str,
+                              limit: int, timeout: float) -> None:
+    if after is not None and (isinstance(after, bool) or not isinstance(after, int) or after < 0):
+        raise ValueError("after must be a non-negative integer")
+    if not isinstance(since_now, bool):
+        raise ValueError("since_now must be a boolean")
+    if after is not None and since_now:
+        raise ValueError("after and since_now cannot be combined")
+    if not isinstance(fields, str) or fields not in {"pointer", "full"}:
+        raise ValueError("fields must be pointer or full")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("timeout must be between 0 and 60 seconds")
+    try:
+        timeout_value = float(timeout)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("timeout must be between 0 and 60 seconds") from exc
+    if not math.isfinite(timeout_value) or not 0 <= timeout_value <= 60:
+        raise ValueError("timeout must be between 0 and 60 seconds")
+
+
+async def wait_for_message_feed(repository: MessageRepository, recipient: str, *, after: int | None,
+                               since_now: bool, fields: str, limit: int, timeout: float,
+                               secrets: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Poll the durable sidecar cursor; every database operation leaves the event loop free."""
+    validate_cursor_wait_args(after=after, since_now=since_now, fields=fields, limit=limit, timeout=timeout)
+    head = await asyncio.to_thread(repository.delivery_head)
+    if since_now:
+        cursor = head
+    else:
+        cursor = 0 if after is None else after
+        if cursor > head:
+            raise MessageError("after exceeds current delivery sequence head")
+
+    deadline = time.monotonic() + float(timeout)
+    while True:
+        messages, next_cursor = await asyncio.to_thread(
+            repository.list_after, recipient, after=cursor, limit=limit
+        )
+        oldest = await asyncio.to_thread(repository.oldest_available_seq)
+        if messages:
+            if fields == "pointer":
+                messages = [_cursor_pointer(message, secrets) for message in messages]
+            return {"messages": messages, "next_cursor": next_cursor, "oldest_available_seq": oldest}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"messages": [], "next_cursor": cursor, "oldest_available_seq": oldest}
+        await asyncio.sleep(min(0.75, remaining))
 
 
 def router(service: Service) -> APIRouter:
@@ -79,24 +201,44 @@ def router(service: Service) -> APIRouter:
     @api.get("/messages/wait")
     async def wait_for_messages(timeout: float = Query(default=30.0, ge=0, le=60),
                                 actionable_only: bool = Query(default=False),
+                                after: int | None = Query(default=None, ge=0),
+                                since_now: bool = Query(default=False),
+                                fields: str = Query(default="pointer"),
+                                limit: int = Query(default=50),
                                 identity: str = Depends(agent)):
-        """Wait for pending messages addressed to the identity; optionally skip non-actionable messages."""
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                await asyncio.to_thread(service.repository.expire_claims)
-                messages = await asyncio.to_thread(
-                    service.repository.list_for_recipient, identity, status="pending", limit=50,
-                    actionable_only=actionable_only,
-                )
-            except MessageError as exc:
-                raise HTTPException(400, str(exc)) from exc
-            if messages:
-                return {"messages": [message_dict(message) for message in messages]}
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return {"messages": []}
-            await asyncio.sleep(min(0.75, remaining))
+        """Wait for legacy pending messages or use the durable cursor notification feed."""
+        # Keep the historical contract untouched unless an explicit cursor mode is selected.
+        if after is None and not since_now:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    await asyncio.to_thread(service.repository.expire_claims)
+                    messages = await asyncio.to_thread(
+                        service.repository.list_for_recipient, identity, status="pending", limit=50,
+                        actionable_only=actionable_only,
+                    )
+                except MessageError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if messages:
+                    return {"messages": [message_dict(message) for message in messages]}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"messages": []}
+                await asyncio.sleep(min(0.75, remaining))
+
+        try:
+            validate_cursor_wait_args(after=after, since_now=since_now, fields=fields,
+                                      limit=limit, timeout=timeout)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        try:
+            return await wait_for_message_feed(
+                service.repository, identity, after=after, since_now=since_now,
+                fields=fields, limit=limit, timeout=timeout,
+                secrets=_known_auth_secrets(service.auth),
+            )
+        except MessageError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @api.get("/messages/{message_id}")
     def get(message_id: str, request: Request):
@@ -199,6 +341,49 @@ def router(service: Service) -> APIRouter:
         except FilePathError as exc:
             raise HTTPException(400, str(exc)) from exc
         return None
+
+    @api.post("/feedback", status_code=201)
+    def submit_feedback(payload: FeedbackSubmit, request: Request, identity: str = Depends(agent)):
+        try:
+            report = service.feedback.submit(actor=identity, **payload.model_dump())
+        except FeedbackError as exc:
+            raise HTTPException(exc.status_code, {"code": exc.code, "message": exc.safe_message}) from exc
+        service.audit_feedback("feedback_submit", identity, request)
+        return feedback_dict(report)
+
+    @api.get("/feedback")
+    def list_feedback(request: Request, kind: str | None = None, status: str | None = None,
+                      project: str | None = None, severity: str | None = None, author: str | None = None,
+                      limit: int = Query(default=50, ge=1, le=100), after: str | None = None,
+                      _identity: str = Depends(agent)):
+        filters = {key: value for key, value in {"kind": kind, "status": status, "project": project,
+                   "severity": severity, "author": author}.items() if value is not None}
+        try:
+            return feedback_page_dict(service.feedback.list(filters, limit=limit, after=after), include_text=True)
+        except FeedbackError as exc:
+            raise HTTPException(exc.status_code, {"code": exc.code, "message": exc.safe_message}) from exc
+
+    @api.get("/feedback/{feedback_id}")
+    def get_feedback(feedback_id: str, after_revision: int = Query(default=0, ge=0),
+                     history_limit: int = Query(default=20, ge=1, le=100), _identity: str = Depends(agent)):
+        try:
+            report, history = service.feedback.get_with_history(
+                feedback_id, after_revision=after_revision, limit=history_limit)
+            last = history[-1].revision if history else after_revision
+            return {"feedback": feedback_dict(report), "history": [feedback_revision_dict(x) for x in history],
+                    "next_revision": last if last < report.revision else None}
+        except FeedbackError as exc:
+            raise HTTPException(exc.status_code, {"code": exc.code, "message": exc.safe_message}) from exc
+
+    @api.patch("/feedback/{feedback_id}")
+    def update_feedback(feedback_id: str, payload: FeedbackUpdate, request: Request,
+                        identity: str = Depends(agent)):
+        try:
+            report = service.feedback.update(feedback_id, actor=identity, **payload.model_dump())
+        except FeedbackError as exc:
+            raise HTTPException(exc.status_code, {"code": exc.code, "message": exc.safe_message}) from exc
+        service.audit_feedback("feedback_update", identity, request)
+        return feedback_dict(report)
 
     return api
 
