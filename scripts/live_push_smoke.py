@@ -68,7 +68,7 @@ async def main(image):
             await codex.subscribe_resource(uri)
             head=payload(await hermes.call_tool('wait_for_messages',{'since_now':True,'timeout':0}))['next_cursor']
             info=payload(await hermes.call_tool('bus_info',{'topic':'commands'}))
-            check('live_bus_info_catalog_version_and_features',info['version']=='0.5.0' and info['tool_count']==22 and info['native_push']['subscriptions_enabled'] is True)
+            check('live_bus_info_catalog_version_and_features',info['version']=='0.5.1' and info['tool_count']==22 and info['native_push']['subscriptions_enabled'] is True)
             check('live_bus_info_includes_own_command_schema',any(t['name']=='bus_info' and 'input_schema' in t for t in info['commands']))
             first=payload(await hermes.call_tool('send_message',{'recipient':'codex','message_type':'INFO','body':{'private':'container-private-fixture'}}))
             notice=await asyncio.wait_for(events.get(),5)

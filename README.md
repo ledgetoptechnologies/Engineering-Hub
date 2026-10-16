@@ -6,7 +6,7 @@ This repository builds a private GHCR container package and a TrueNAS SCALE Comp
 
 ## Native event-driven MCP push
 
-v0.5.0 adds recipient-scoped MCP resource subscriptions over persistent server-sent events. Native Linux filesystem events reconcile committed SQLite WAL changes; there are no periodic inbox queries or model checks. Clients subscribe before catch-up, then read their cursor only on actual notifications or reconnection. See [native MCP push](docs/mcp-push.md). A host/session connector is still required to turn a notification into agent execution.
+v0.5.1 adds recipient-scoped MCP resource subscriptions over persistent server-sent events. Native Linux filesystem events reconcile committed SQLite WAL changes; there are no periodic inbox queries or model checks. Clients subscribe before catch-up, then read their cursor only on actual notifications or reconnection. See [native MCP push](docs/mcp-push.md). A host/session connector is still required to turn a notification into agent execution.
 
 ## Help and discovery
 
@@ -52,9 +52,9 @@ The live smoke test discovers the server's tools and exercises message delivery,
 
 ## GHCR image
 
-`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.5.0` runs the same gates and publishes:
+`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.5.1` runs the same gates and publishes:
 
-- `ghcr.io/ledgetoptechnologies/internal-mcp:0.5.0`
+- `ghcr.io/ledgetoptechnologies/internal-mcp:0.5.1`
 - `ghcr.io/ledgetoptechnologies/internal-mcp:sha-<full-commit-sha>`
 
 Stable releases also publish the moving `stable` tag; there is intentionally no mutable `latest` tag. Protect `v*` Git refs and do not move/rebuild a release tag; pin a digest for a deployment that needs content-addressed immutability. The workflow uses the repository-scoped `GITHUB_TOKEN` with `packages: write` and publishes OCI source, version, and revision labels. GitHub leaves a first-published package private by default; this project keeps that visibility.
