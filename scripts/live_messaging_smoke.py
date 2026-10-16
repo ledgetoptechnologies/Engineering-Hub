@@ -35,7 +35,7 @@ EXPECTED_TOOLS = {
     "ack_message", "claim_message", "file_get", "file_history", "file_list", "file_put",
     "get_message", "knowledge_get", "knowledge_list", "knowledge_put", "knowledge_search",
     "receive_messages", "reject_message", "semantic_search", "semantic_status", "send_message",
-    "wait_for_messages", "feedback_submit", "feedback_get", "feedback_list", "feedback_update",
+    "wait_for_messages", "feedback_submit", "feedback_get", "feedback_list", "feedback_update", "bus_info",
 }
 POINTER_KEYS = {
     "id", "seq", "sender", "recipient", "message_type", "priority", "correlation_id",

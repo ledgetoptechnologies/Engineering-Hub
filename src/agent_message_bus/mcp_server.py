@@ -1,21 +1,166 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import json
 from typing import Any
+from urllib.parse import parse_qsl
 
+from mcp import types
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.lowlevel import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import AnyUrl
 
 from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, message_dict
 from .files import file_dict
 from .feedback import FeedbackError, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .knowledge import KnowledgeRepository, entry_dict, search_result_dict
+from .push import BASE_RESOURCE_URI, PushPublisher
 
 
-def build_mcp(service: Service) -> FastMCP:
+_INBOX_TEMPLATE = "agentbus://inbox/{recipient}?after={cursor}"
+_MAX_CURSOR = (1 << 63) - 1
+_MAX_PAGE_SIZE = 100
+_DEFAULT_PAGE_SIZE = 50
+
+
+def _install_inbox_resources(mcp: FastMCP, service: Service, publisher: PushPublisher) -> None:
+    """Install native resource handlers on FastMCP's existing low-level server.
+
+    FastMCP 1.30 has no subscribe/unsubscribe decorator. Keep access to its
+    private server object confined here and fail fast if its required SDK
+    surface changes; tools and the existing ASGI lifespan remain untouched.
+    """
+    server = getattr(mcp, "_mcp_server", None)
+    required = ("list_resources", "list_resource_templates", "read_resource",
+                "subscribe_resource", "unsubscribe_resource", "get_capabilities")
+    if not isinstance(server, Server) or any(not callable(getattr(server, name, None)) for name in required):
+        raise RuntimeError("installed MCP SDK lacks the guarded resource-subscription server API")
+    request_handlers = getattr(server, "request_handlers", None)
+    if not isinstance(request_handlers, dict):
+        raise RuntimeError("installed MCP SDK request-handler registry changed")
+
+    def identity() -> str:
+        return service.auth.agent(server.request_context.request)
+
+    @server.list_resources()
+    async def list_inbox_resources() -> list[types.Resource]:
+        recipient = identity()
+        existing = await mcp.list_resources()
+        return [*existing, types.Resource(
+            uri=AnyUrl(BASE_RESOURCE_URI.format(recipient)),
+            name="Authenticated recipient inbox",
+            description="Recipient-only durable message cursor resource; read with an after cursor.",
+            mimeType="application/json",
+        )]
+
+    @server.list_resource_templates()
+    async def list_inbox_templates() -> list[types.ResourceTemplate]:
+        existing = await mcp.list_resource_templates()
+        return [*existing, types.ResourceTemplate(
+            uriTemplate=_INBOX_TEMPLATE,
+            name="Recipient inbox cursor page",
+            description="Read a bounded page of messages addressed to the authenticated recipient.",
+            mimeType="application/json",
+        )]
+
+    def parse_inbox_uri(uri: AnyUrl, recipient: str) -> tuple[int, int]:
+        if (uri.scheme != "agentbus" or uri.host != "inbox" or uri.path != f"/{recipient}"
+                or uri.fragment or uri.username or uri.password or uri.port is not None):
+            raise ValueError("unknown inbox resource")
+        try:
+            values = parse_qsl(uri.query or "", keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise ValueError("invalid inbox cursor query") from exc
+        if len({key for key, _ in values}) != len(values):
+            raise ValueError("duplicate inbox query parameter")
+        params = dict(values)
+        if set(params) - {"after", "limit"}:
+            raise ValueError("unsupported inbox query parameter")
+
+        def decimal(name: str, default: int, maximum: int) -> int:
+            value = params.get(name)
+            if value is None:
+                return default
+            if not value or not value.isascii() or not value.isdigit():
+                raise ValueError(f"invalid {name} value")
+            number = int(value)
+            if number > maximum:
+                raise ValueError(f"{name} is out of range")
+            return number
+
+        after = decimal("after", 0, _MAX_CURSOR)
+        limit = decimal("limit", _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE)
+        if not 1 <= limit <= _MAX_PAGE_SIZE:
+            raise ValueError(f"limit must be between 1 and {_MAX_PAGE_SIZE}")
+        return after, limit
+
+    @server.read_resource()
+    async def read_inbox(uri: AnyUrl):
+        if uri.scheme != "agentbus" or uri.host != "inbox":
+            return await mcp.read_resource(uri)
+        recipient = identity()
+        if uri.path != f"/{recipient}":
+            raise ValueError("resource belongs to another authenticated recipient")
+        after, limit = parse_inbox_uri(uri, recipient)
+        messages, next_cursor = await asyncio.to_thread(
+            service.repository.list_after, recipient, after=after, limit=limit
+        )
+        payload = json.dumps({"messages": messages, "next_cursor": next_cursor},
+                             separators=(",", ":"), ensure_ascii=False)
+        return [ReadResourceContents(content=payload, mime_type="application/json")]
+
+    @server.subscribe_resource()
+    async def subscribe_inbox(uri: AnyUrl) -> None:
+        recipient = identity()
+        expected = BASE_RESOURCE_URI.format(recipient)
+        if str(uri) != expected:
+            raise ValueError("subscription must target the authenticated recipient inbox URI")
+        request = server.request_context.request
+        session_id = request.headers.get("mcp-session-id")
+        await publisher.subscribe(session_id or "", recipient, server.request_context.session)
+
+    @server.unsubscribe_resource()
+    async def unsubscribe_inbox(uri: AnyUrl) -> None:
+        recipient = identity()
+        expected = BASE_RESOURCE_URI.format(recipient)
+        if str(uri) != expected:
+            raise ValueError("subscription must target the authenticated recipient inbox URI")
+        session_id = server.request_context.request.headers.get("mcp-session-id")
+        if not session_id:
+            raise ValueError("MCP session id required")
+        await publisher.unsubscribe(session_id, recipient)
+
+    original_get_capabilities = server.get_capabilities
+
+    def get_capabilities(notification_options, experimental_capabilities):
+        capabilities = original_get_capabilities(notification_options, experimental_capabilities)
+        supports_subscribe = publisher.enabled and all(
+            handler in request_handlers for handler in (
+                types.ListResourcesRequest, types.ReadResourceRequest,
+                types.SubscribeRequest, types.UnsubscribeRequest,
+            )
+        )
+        if supports_subscribe and capabilities.resources is not None:
+            capabilities.resources = types.ResourcesCapability(
+                subscribe=True,
+                listChanged=notification_options.resources_changed,
+            )
+        return capabilities
+
+    # Instance-level wrapper is deliberately tiny: preserve FastMCP's handler
+    # assembly and lifespan while correcting the SDK's hard-coded subscribe=False.
+    server.get_capabilities = get_capabilities
+
+
+def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) -> FastMCP:
     import os
+
+    push_publisher = push_publisher or PushPublisher()
 
     allowed_hosts = [
         value.strip()
@@ -351,4 +496,13 @@ def build_mcp(service: Service) -> FastMCP:
         service.audit_feedback("feedback_update", identity, ctx.request_context.request)
         return feedback_dict(report)
 
+    @mcp.tool(name="bus_info")
+    async def info(topic: str = "overview", ctx: Context | None = None) -> dict[str, Any]:
+        """Read live version, features, command schemas/examples and changes. Topics: overview, commands, messaging, push, feedback, changes, worker. Never executes examples."""
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        from .info import bus_help
+        return bus_help(topic, identity, await mcp.list_tools(), push_publisher)
+
+    _install_inbox_resources(mcp, service, push_publisher)
     return mcp
