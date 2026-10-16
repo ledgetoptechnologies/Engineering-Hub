@@ -16,7 +16,7 @@ async def test_bus_info_live_catalog_help_and_authentication(tmp_path):
     tools={t.name:t for t in server._tool_manager.list_tools()}
     info=tools['bus_info'].fn
     overview=await info(ctx=context('codex'))
-    assert overview['version']=='0.5.1'
+    assert overview['version']=='0.5.2'
     assert overview['tool_count']==len(tools)==22
     assert set(overview['tools'])==set(tools)
     assert overview['native_push']['subscriptions_enabled'] is False

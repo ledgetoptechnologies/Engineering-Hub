@@ -308,6 +308,11 @@ class MessageRepository:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise MessageError("limit must be between 1 and 100")
         with self.connect() as conn:
+            # Validate against the durable global head, not recipient MAX(seq).
+            # One read transaction keeps validation and paging on one snapshot.
+            conn.execute("BEGIN")
+            if after > self._delivery_head(conn):
+                raise MessageError("after exceeds current delivery sequence head")
             rows = conn.execute("""SELECT m.*, d.seq FROM message_delivery_sequence AS d
                 INNER JOIN messages AS m ON m.id=d.message_id
                 WHERE m.recipient=? AND d.seq>? ORDER BY d.seq ASC LIMIT ?""",

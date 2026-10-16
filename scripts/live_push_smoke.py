@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 import httpx
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl
 
 logging.disable(logging.CRITICAL)
@@ -67,8 +68,14 @@ async def main(image):
         async with client('codex',events) as codex,client('hermes') as hermes:
             await codex.subscribe_resource(uri)
             head=payload(await hermes.call_tool('wait_for_messages',{'since_now':True,'timeout':0}))['next_cursor']
+            try:
+                await hermes.read_resource(AnyUrl('agentbus://inbox/hermes?after=999999&limit=3'))
+            except McpError as exc:
+                check('future_cursor_rejected_in_real_container', 'after exceeds current delivery sequence head' in str(exc))
+            else:
+                check('future_cursor_rejected_in_real_container', False)
             info=payload(await hermes.call_tool('bus_info',{'topic':'commands'}))
-            check('live_bus_info_catalog_version_and_features',info['version']=='0.5.1' and info['tool_count']==22 and info['native_push']['subscriptions_enabled'] is True)
+            check('live_bus_info_catalog_version_and_features',info['version']=='0.5.2' and info['tool_count']==22 and info['native_push']['subscriptions_enabled'] is True)
             check('live_bus_info_includes_own_command_schema',any(t['name']=='bus_info' and 'input_schema' in t for t in info['commands']))
             first=payload(await hermes.call_tool('send_message',{'recipient':'codex','message_type':'INFO','body':{'private':'container-private-fixture'}}))
             notice=await asyncio.wait_for(events.get(),5)
