@@ -29,6 +29,20 @@ CREATE INDEX IF NOT EXISTS idx_messages_claim_expiry ON messages (status, claim_
 CREATE INDEX IF NOT EXISTS idx_messages_retention ON messages (status, acknowledged_at, rejected_at);
 CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to ON messages (in_reply_to);
 
+-- Tombstones are retained indefinitely so request IDs cannot silently become reusable.
+-- Do not add a foreign key to messages: cleanup must preserve this receipt after pruning.
+CREATE TABLE IF NOT EXISTS send_idempotency (
+    sender TEXT NOT NULL CHECK (sender IN ('hermes', 'codex', 'claude')),
+    client_request_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    recipient TEXT NOT NULL CHECK (recipient IN ('hermes', 'codex', 'claude')),
+    created_at TEXT NOT NULL,
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    fingerprint_version INTEGER NOT NULL CHECK (fingerprint_version >= 1),
+    fingerprint TEXT NOT NULL,
+    PRIMARY KEY (sender, client_request_id)
+);
+
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
     size INTEGER NOT NULL CHECK (size >= 0),

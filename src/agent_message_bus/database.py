@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -14,6 +15,8 @@ STATUSES = {"pending", "claimed", "acknowledged", "rejected"}
 AGENTS = {"hermes", "codex", "claude"}
 PRIORITIES = {"low", "normal", "high", "urgent"}
 MAX_CORRELATED_HOPS = 6
+SEND_FINGERPRINT_VERSION = 1
+CLIENT_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
 
 
 def now_utc() -> datetime:
@@ -59,6 +62,39 @@ class NotFound(MessageError):
 
 class InvalidTransition(MessageError):
     pass
+
+
+class SendConflict(MessageError):
+    """A request ID was already used for a semantically different send."""
+
+
+class SendReplayUnavailable(MessageError):
+    """A matching send receipt remains, but its message was pruned."""
+
+
+def _validate_client_request_id(client_request_id: str) -> None:
+    if not isinstance(client_request_id, str) or CLIENT_REQUEST_ID_PATTERN.fullmatch(client_request_id) is None:
+        raise MessageError("invalid client request id")
+
+
+def _send_fingerprint(*, recipient: str, message_type: str, body: Any, priority: str,
+                      correlation_id: str | None, in_reply_to: str | None,
+                      requires_user_approval: bool) -> str:
+    canonical = {
+        "recipient": recipient,
+        "message_type": message_type,
+        "body": body,
+        "priority": priority,
+        "correlation_id": correlation_id,
+        "in_reply_to": in_reply_to,
+        "requires_user_approval": bool(requires_user_approval),
+    }
+    try:
+        payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise MessageError("send payload is not valid JSON data") from None
+    return hashlib.sha256(b"agent-message-bus/send/v1:" + payload).hexdigest()
 
 
 class MessageRepository:
@@ -205,14 +241,71 @@ class MessageRepository:
 
     def insert(self, *, sender: str, recipient: str, message_type: str, body: Any,
                priority: str = "normal", correlation_id: str | None = None,
-               requires_user_approval: bool = False, in_reply_to: str | None = None) -> Message:
-        self._validate_agent(sender); self._validate_agent(recipient)
-        if sender == recipient: raise MessageError("sender and recipient must differ")
-        if not message_type or priority not in PRIORITIES: raise MessageError("invalid message type or priority")
-        message_id = str(uuid.uuid4()); created = iso(now_utc())
+               requires_user_approval: bool = False, in_reply_to: str | None = None,
+               client_request_id: str | None = None) -> Message:
+        message, _replayed = self.insert_with_outcome(
+            sender=sender, recipient=recipient, message_type=message_type, body=body,
+            priority=priority, correlation_id=correlation_id,
+            requires_user_approval=requires_user_approval, in_reply_to=in_reply_to,
+            client_request_id=client_request_id,
+        )
+        return message
+
+    def insert_with_outcome(self, *, sender: str, recipient: str, message_type: str, body: Any,
+                            priority: str = "normal", correlation_id: str | None = None,
+                            requires_user_approval: bool = False, in_reply_to: str | None = None,
+                            client_request_id: str | None = None) -> tuple[Message, bool]:
+        """Return (message, replayed) from the same transaction, never a racy preflight check."""
+        self._validate_agent(sender)
+        fingerprint = None
+        if client_request_id is not None:
+            _validate_client_request_id(client_request_id)
+        else:
+            self._validate_agent(recipient)
+            if sender == recipient: raise MessageError("sender and recipient must differ")
+            if not message_type or priority not in PRIORITIES:
+                raise MessageError("invalid message type or priority")
+
+        message_id = str(uuid.uuid4())
+        created = iso(now_utc())
         with self._lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if client_request_id is not None:
+                    receipt = conn.execute("""SELECT message_id, fingerprint_version, fingerprint
+                        FROM send_idempotency WHERE sender=? AND client_request_id=?""",
+                        (sender, client_request_id)).fetchone()
+                    if receipt is not None:
+                        try:
+                            fingerprint = _send_fingerprint(
+                                recipient=recipient, message_type=message_type, body=body, priority=priority,
+                                correlation_id=correlation_id, in_reply_to=in_reply_to,
+                                requires_user_approval=requires_user_approval,
+                            )
+                        except MessageError:
+                            raise SendConflict(
+                                "client request id conflicts with an earlier send"
+                            ) from None
+                        if (receipt["fingerprint_version"] != SEND_FINGERPRINT_VERSION
+                                or receipt["fingerprint"] != fingerprint):
+                            raise SendConflict("client request id conflicts with an earlier send")
+                        retained = conn.execute("SELECT * FROM messages WHERE id=?",
+                                                (receipt["message_id"],)).fetchone()
+                        if retained is None:
+                            raise SendReplayUnavailable("original send message is no longer retained")
+                        conn.commit()
+                        return self._from_row(retained), True
+                    fingerprint = _send_fingerprint(
+                        recipient=recipient, message_type=message_type, body=body, priority=priority,
+                        correlation_id=correlation_id, in_reply_to=in_reply_to,
+                        requires_user_approval=requires_user_approval,
+                    )
+
+                self._validate_agent(recipient)
+                if sender == recipient: raise MessageError("sender and recipient must differ")
+                if not message_type or priority not in PRIORITIES:
+                    raise MessageError("invalid message type or priority")
+
                 hop_count = 0
                 if in_reply_to is not None:
                     parent = conn.execute(
@@ -233,13 +326,47 @@ class MessageRepository:
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
                     json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id, in_reply_to,
                     hop_count, int(requires_user_approval), created))
-                conn.execute("INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,))
+                conn.execute(
+                    "INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,)
+                )
+                if client_request_id is not None:
+                    seq = conn.execute("SELECT seq FROM message_delivery_sequence WHERE message_id=?",
+                                       (message_id,)).fetchone()[0]
+                    conn.execute("""INSERT INTO send_idempotency
+                        (sender, client_request_id, message_id, recipient, created_at, seq,
+                         fingerprint_version, fingerprint)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (sender, client_request_id, message_id, recipient, created, seq,
+                         SEND_FINGERPRINT_VERSION, fingerprint))
                 message = self.get(message_id, conn=conn)
                 conn.commit()
-                return message
+                return message, False
             except Exception:
                 conn.rollback()
                 raise
+
+    def get_send_receipt(self, sender: str, client_request_id: str) -> dict[str, Any]:
+        self._validate_agent(sender)
+        _validate_client_request_id(client_request_id)
+        with self.connect() as conn:
+            row = conn.execute("""SELECT r.message_id, r.sender, r.recipient, r.created_at, r.seq,
+                    m.status
+                FROM send_idempotency AS r
+                LEFT JOIN messages AS m ON m.id=r.message_id
+                WHERE r.sender=? AND r.client_request_id=?""",
+                (sender, client_request_id)).fetchone()
+        if row is None:
+            raise NotFound("send receipt not found")
+        retained = row["status"] is not None
+        return {
+            "message_id": row["message_id"],
+            "sender": row["sender"],
+            "recipient": row["recipient"],
+            "created_at": row["created_at"],
+            "seq": row["seq"],
+            "status": row["status"] if retained else "pruned",
+            "retained": retained,
+        }
 
     def get(self, message_id: str, *, conn: sqlite3.Connection | None = None) -> Message:
         owned = conn is None

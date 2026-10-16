@@ -26,6 +26,7 @@ from .database import MessageRepository
 from .files import FileRepository
 from .mcp_server import build_mcp
 from .push import PushPublisher
+from .presence import MCPStreamPresenceMiddleware
 from .sqlite_events import MessageCursorReader, SQLiteEventSource, native_event_support
 from .retention import cleanup
 from .semantic import SemanticIndex
@@ -104,6 +105,10 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
                     return JSONResponse({"detail": "MCP session not found"}, status_code=404)
             elif request.method in {"GET", "DELETE"}:
                 return JSONResponse({"detail": "MCP session not found"}, status_code=404)
+
+            if request.method == "GET":
+                request.state.mcp_presence_agent = identity
+                request.state.mcp_presence_session_id = session_id
 
             response = await call_next(request)
             if request.method == "POST":
@@ -212,6 +217,9 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     app.router.lifespan_context = application_lifespan
     app.add_middleware(MCPAuthMiddleware, auth=auth, push_publisher=push_publisher)
     app.add_middleware(OperationalLoggingMiddleware, auth=auth)
+    # This pure ASGI observer is outermost so it sees the actual response start,
+    # body writes, and disconnect completion beyond BaseHTTPMiddleware wrappers.
+    app.add_middleware(MCPStreamPresenceMiddleware, publisher=push_publisher)
 
     # FastAPI owns the REST dependency/validation layer, while the MCP app remains the root ASGI app.
     rest = FastAPI(title="Agent Message Bus REST", docs_url=None, redoc_url=None)
@@ -245,7 +253,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
                 push_health["state"] = "failed"
         return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] != "failed",
                                       "database": db_status,
-                                      "schema_version": 3,
+                                      "schema_version": 4,
                                       "version": version("agent-message-bus"),
                                       "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid"),
                                       "semantic": {"state": "enabled" if semantic.enabled else "disabled"},

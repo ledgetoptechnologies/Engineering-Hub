@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import uuid
 from concurrent.futures import Future
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.session import ServerSession
@@ -22,6 +24,14 @@ class SubscriptionLimit(RuntimeError):
 
 class SubscriptionsUnavailable(RuntimeError):
     """Raised while no complete post-commit event source is enabled."""
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_text(value: datetime | None) -> str | None:
+    return value.isoformat().replace("+00:00", "Z") if value is not None else None
 
 
 class PushPublisher:
@@ -45,9 +55,12 @@ class PushPublisher:
         self._source_failure: str | None = None
         self.max_subscriptions = max_subscriptions
         self._subscribers: dict[tuple[str, str], ServerSession] = {}
+        self._subscription_since: dict[tuple[str, str], datetime] = {}
+        self._subscription_generations: dict[tuple[str, str], object] = {}
+        self._presence_streams: dict[str, dict[str, Any]] = {}
         # A bool per in-flight subscription is a bounded dirty bit: multiple
         # commits collapse to one follow-up invalidation, never a dropped edge.
-        self._pending: dict[tuple[str, str], tuple[ServerSession, bool]] = {}
+        self._pending: dict[tuple[str, str], tuple[object, bool]] = {}
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduled_lock = threading.Lock()
@@ -104,6 +117,8 @@ class PushPublisher:
         async with self._lock:
             targets = list(self._subscribers.items())
             self._subscribers.clear()
+            self._subscription_since.clear()
+            self._subscription_generations.clear()
             self._pending.clear()
         async def notify(key, session):
             try:
@@ -139,13 +154,20 @@ class PushPublisher:
         async with self._lock:
             if key not in self._subscribers and len(self._subscribers) >= self.max_subscriptions:
                 raise SubscriptionLimit("active MCP subscription limit reached")
+            self._subscription_since.setdefault(key, _utc_now())
             self._subscribers[key] = session
+            # Every successful registration fences earlier in-flight sends, even
+            # when the SDK reuses the same ServerSession object.
+            self._subscription_generations[key] = object()
+            self._pending.pop(key, None)
 
     async def unsubscribe(self, session_id: str, recipient: str) -> None:
         self._validate_recipient(recipient)
         key = (session_id, BASE_RESOURCE_URI.format(recipient))
         async with self._lock:
             self._subscribers.pop(key, None)
+            self._subscription_since.pop(key, None)
+            self._subscription_generations.pop(key, None)
             self._pending.pop(key, None)
 
     async def drop_session(self, session_id: str | None) -> None:
@@ -155,7 +177,83 @@ class PushPublisher:
             for key in tuple(self._subscribers):
                 if key[0] == session_id:
                     self._subscribers.pop(key, None)
+                    self._subscription_since.pop(key, None)
+                    self._subscription_generations.pop(key, None)
                     self._pending.pop(key, None)
+
+    async def open_presence_stream(self, session_id: str, agent: str) -> str:
+        """Record an authorized persistent MCP GET stream observed at the ASGI boundary."""
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("MCP session id required")
+        self._validate_presence_agent(agent)
+        token = uuid.uuid4().hex
+        async with self._lock:
+            self._presence_streams[token] = {
+                "session_id": session_id,
+                "agent": agent,
+                "connected_since": _utc_now(),
+                "last_stream_write_at": None,
+            }
+        return token
+
+    async def record_presence_stream_write(self, token: str) -> None:
+        async with self._lock:
+            stream = self._presence_streams.get(token)
+            if stream is not None:
+                stream["last_stream_write_at"] = _utc_now()
+
+    async def close_presence_stream(self, token: str) -> None:
+        async with self._lock:
+            self._presence_streams.pop(token, None)
+
+    async def presence_status(self) -> dict[str, Any]:
+        """Return transport-only presence observed by this server process."""
+        async with self._lock:
+            observed_at = _utc_now()
+            streams = tuple(self._presence_streams.values())
+            streams_by_agent: dict[str, list[dict[str, Any]]] = {agent: [] for agent in AGENTS}
+            active_session_agents: dict[str, str] = {}
+            for stream in streams:
+                streams_by_agent[stream["agent"]].append(stream)
+                active_session_agents[stream["session_id"]] = stream["agent"]
+            subscriptions: dict[str, list[datetime]] = {agent: [] for agent in AGENTS}
+            if self.enabled:
+                for key in self._subscribers:
+                    since = self._subscription_since.get(key)
+                    agent = active_session_agents.get(key[0])
+                    if since is not None and agent is not None:
+                        subscriptions[agent].append(since)
+
+            agents = []
+            for agent in sorted(AGENTS):
+                agent_streams = streams_by_agent[agent]
+                subscription_times = subscriptions[agent]
+                agents.append({
+                    "agent": agent,
+                    "active_streams": len(agent_streams),
+                    "inbox_subscriptions": len(subscription_times),
+                    "subscribed": bool(subscription_times),
+                    "connected_since": _utc_text(min(
+                        (stream["connected_since"] for stream in agent_streams), default=None
+                    )),
+                    "subscribed_since": _utc_text(min(subscription_times, default=None)),
+                    "last_stream_write_at": _utc_text(max(
+                        (stream["last_stream_write_at"] for stream in agent_streams
+                         if stream["last_stream_write_at"] is not None), default=None
+                    )),
+                })
+            return {
+                "observed_at": _utc_text(observed_at),
+                "scope": "this_server_process",
+                "native_push_available": self.enabled,
+                "semantics": "Transport observation only; not chat readiness, message reading, delivery, or approval.",
+                "agents": agents,
+            }
+
+    @staticmethod
+    def _validate_presence_agent(agent: Any) -> None:
+        if not isinstance(agent, str) or agent not in AGENTS:
+            raise ValueError("invalid authenticated agent")
 
     async def publish_committed(self, recipient: str) -> int:
         """Publish recipient-only invalidations after a successful commit."""
@@ -164,25 +262,26 @@ class PushPublisher:
             return 0
         uri = BASE_RESOURCE_URI.format(recipient)
         async with self._lock:
-            targets: list[tuple[tuple[str, str], ServerSession]] = []
+            targets: list[tuple[tuple[str, str], ServerSession, object]] = []
             for key, session in self._subscribers.items():
                 if key[1] != uri:
                     continue
+                generation = self._subscription_generations[key]
                 pending = self._pending.get(key)
-                if pending is not None and pending[0] is session:
-                    self._pending[key] = (session, True)
+                if pending is not None and pending[0] is generation:
+                    self._pending[key] = (generation, True)
                     self.coalesced_notifications += 1
                     continue
-                self._pending[key] = (session, False)
-                targets.append((key, session))
+                self._pending[key] = (generation, False)
+                targets.append((key, session, generation))
 
-        async def notify(key: tuple[str, str], session: ServerSession) -> int:
+        async def notify(key: tuple[str, str], session: ServerSession, generation: object) -> int:
             sent = 0
             while True:
                 async with self._lock:
-                    if self._subscribers.get(key) is not session:
+                    if self._subscription_generations.get(key) is not generation:
                         pending = self._pending.get(key)
-                        if pending is not None and pending[0] is session:
+                        if pending is not None and pending[0] is generation:
                             self._pending.pop(key, None)
                         return sent
                 try:
@@ -190,27 +289,30 @@ class PushPublisher:
                     sent += 1
                     self.sent_notifications += 1
                 except Exception:
-                    # A stale session is not allowed to block another recipient
-                    # or turn a successful database write into a failed response.
+                    # Neither failed nor successful old sends may mutate a newer
+                    # registration, including one reusing the same SDK session.
                     async with self._lock:
-                        if self._subscribers.get(key) is session:
+                        if self._subscription_generations.get(key) is generation:
                             self._subscribers.pop(key, None)
+                            self._subscription_since.pop(key, None)
+                            self._subscription_generations.pop(key, None)
                         pending = self._pending.get(key)
-                        if pending is not None and pending[0] is session:
+                        if pending is not None and pending[0] is generation:
                             self._pending.pop(key, None)
                     return sent
                 async with self._lock:
                     pending = self._pending.get(key)
-                    if self._subscribers.get(key) is not session or pending is None or pending[0] is not session:
+                    if (self._subscription_generations.get(key) is not generation
+                            or pending is None or pending[0] is not generation):
                         return sent
                     if pending[1]:
-                        self._pending[key] = (session, False)
+                        self._pending[key] = (generation, False)
                         continue
                     self._pending.pop(key, None)
                     return sent
 
-        # At most max_subscriptions notification workers can exist at once.
-        results = await asyncio.gather(*(notify(key, session) for key, session in targets))
+        # Each current registration has at most one notification worker.
+        results = await asyncio.gather(*(notify(key, session, generation) for key, session, generation in targets))
         return sum(results)
 
     def publish_committed_from_thread(self, recipient: str) -> bool:

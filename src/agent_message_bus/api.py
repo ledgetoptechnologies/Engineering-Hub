@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import AuditLog
 from .auth import AuthSettings
-from .database import InvalidTransition, MessageError, MessageRepository, NotFound, message_dict
+from .database import InvalidTransition, MessageError, MessageRepository, NotFound, SendConflict, SendReplayUnavailable, message_dict
 from .files import FileConflict, FileError, FileIntegrityError, FileTooLarge, FileNotFound, FilePathError, FileRepository, file_dict
 from .feedback import FeedbackError, FeedbackRepository, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .retention import RetentionPolicy, cleanup
@@ -27,6 +27,7 @@ class MessageCreate(BaseModel):
     correlation_id: str | None = None
     in_reply_to: str | None = None
     requires_user_approval: bool = False
+    client_request_id: str | None = Field(default=None, strict=True)
 
 
 class RejectRequest(BaseModel):
@@ -185,10 +186,32 @@ def router(service: Service) -> APIRouter:
     @api.post("/messages", status_code=201)
     def send(payload: MessageCreate, request: Request, sender: str = Depends(agent)):
         try:
-            message = service.repository.insert(sender=sender, **payload.model_dump())
+            message, replayed = service.repository.insert_with_outcome(sender=sender, **payload.model_dump())
+        except SendConflict as exc: raise HTTPException(409, str(exc)) from exc
+        except SendReplayUnavailable as exc: raise HTTPException(410, str(exc)) from exc
         except MessageError as exc: raise HTTPException(400, str(exc)) from exc
-        service.audit_message("send", sender, message, request=request)
+        service.audit_message("send", sender, message, result="replayed" if replayed else "ok", request=request)
         return message_dict(message)
+
+    @api.get("/presence")
+    async def presence_status(_identity: str = Depends(agent)):
+        publisher = getattr(service, "push_publisher", None)
+        if publisher is None:
+            raise HTTPException(503, "presence observer unavailable")
+        return await publisher.presence_status()
+
+    @api.get("/message-receipts")
+    def get_send_receipt(request: Request, client_request_id: str, sender: str = Depends(agent)):
+        """Return metadata for this authenticated sender's keyed send, never an inbox body."""
+        try:
+            receipt = service.repository.get_send_receipt(sender, client_request_id)
+        except NotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except MessageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        service.audit.append(operation="send_receipt", agent=sender, result="ok",
+                             request_id=getattr(request.state, "request_id", None))
+        return receipt
 
     @api.get("/messages")
     def receive(request: Request, status: str = "pending", limit: int = 50, recipient: str | None = None):

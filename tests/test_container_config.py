@@ -34,3 +34,10 @@ def test_truenas_uses_apps_identity_and_preserves_local_persistent_database():
     assert service["pull_policy"] == "always"
     assert service["volumes"] == ["/mnt/POOL_NAME/apps/internal-mcp:/var/lib/agent-message-bus"]
     assert service["environment"]["AGENT_BUS_DB"] == "/var/lib/agent-message-bus/messages.sqlite3"
+
+
+def test_container_entrypoint_disables_raw_query_access_logs():
+    import shlex
+    entrypoint = ROOT / 'docker' / 'entrypoint.sh'
+    assert entrypoint.is_file(), 'the source archive must include the Docker entrypoint'
+    assert '--no-access-log' in shlex.split(entrypoint.read_text(), comments=True)

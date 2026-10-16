@@ -75,9 +75,10 @@ async def main(image):
             else:
                 check('future_cursor_rejected_in_real_container', False)
             info=payload(await hermes.call_tool('bus_info',{'topic':'commands'}))
-            check('live_bus_info_catalog_version_and_features',info['version']=='0.5.2' and info['tool_count']==22 and info['native_push']['subscriptions_enabled'] is True)
+            check('live_bus_info_catalog_version_and_features',info['version']=='0.6.0' and info['tool_count']==24 and info['native_push']['subscriptions_enabled'] is True)
             check('live_bus_info_includes_own_command_schema',any(t['name']=='bus_info' and 'input_schema' in t for t in info['commands']))
-            first=payload(await hermes.call_tool('send_message',{'recipient':'codex','message_type':'INFO','body':{'private':'container-private-fixture'}}))
+            send_args={'recipient':'codex','message_type':'INFO','body':{'private':'container-private-fixture'},'client_request_id':'native-key-'+ident}
+            first=payload(await hermes.call_tool('send_message',send_args))
             notice=await asyncio.wait_for(events.get(),5)
             check('actual_recipient_uri_notification',notice['method']=='notifications/resources/updated' and notice['params']['uri']==str(uri))
             wire=json.dumps(notice)
@@ -85,7 +86,61 @@ async def main(image):
             page=payload(await codex.read_resource(AnyUrl(f'{uri}?after={head}&limit=100')))
             check('push_followed_by_authoritative_cursor_read',len(page['messages'])==1 and page['messages'][0]['id']==first['id'])
             cursor=page['next_cursor']
+            presence=payload(await hermes.call_tool('presence_status',{}))
+            peer=next(row for row in presence['agents'] if row['agent']=='codex')
+            check('presence_intersects_actual_sse_and_subscription',peer['subscribed'] and peer['active_streams']>=1 and peer['inbox_subscriptions']==1)
+            check('presence_has_no_session_or_token_details',all(value not in json.dumps(presence) for value in [*tokens.values(),'session_id','thread_id']))
+            replay=payload(await hermes.call_tool('send_message',send_args))
+            check('keyed_replay_returns_identical_message',replay==first)
+            receipt=payload(await hermes.call_tool('get_send_receipt',{'client_request_id':send_args['client_request_id']}))
+            check('sender_private_receipt_matches_original_sequence',receipt['message_id']==first['id'] and receipt['seq']==cursor and 'body' not in receipt and 'fingerprint' not in receipt)
+            forbidden=await codex.call_tool('get_send_receipt',{'client_request_id':send_args['client_request_id']})
+            check('recipient_cannot_lookup_sender_receipt',forbidden.isError)
+            conflict=await hermes.call_tool('send_message',{**send_args,'priority':'urgent'})
+            check('changed_keyed_payload_conflicts',conflict.isError and 'send_conflict' in str(conflict.content))
+            replay_page=payload(await codex.read_resource(AnyUrl(f'{uri}?after={cursor}&limit=100')))
+            check('replay_does_not_advance_delivery_sequence',replay_page['messages']==[] and replay_page['next_cursor']==cursor)
+            try:
+                await asyncio.wait_for(events.get(),0.3)
+            except asyncio.TimeoutError:
+                duplicate_notice=False
+            else:
+                duplicate_notice=True
+            check('replay_emits_no_second_resource_notification',not duplicate_notice)
+            async with httpx.AsyncClient(timeout=30) as http:
+                private_receipt=await http.get(url+'/api/message-receipts',headers={'Authorization':'Bearer '+tokens['hermes']},params={'client_request_id':send_args['client_request_id']})
+                check('real_rest_receipt_query_is_private_metadata',private_receipt.status_code==200 and private_receipt.json()['message_id']==first['id'] and 'body' not in private_receipt.json())
+                args={**send_args,'client_request_id':'concurrent-key-'+ident}
+                results=await asyncio.gather(*(http.post(url+'/api/messages',headers={'Authorization':'Bearer '+tokens['hermes']},json=args) for _ in range(50)))
+                check('fifty_real_http_writers_converge',all(r.status_code==201 for r in results) and len({r.json()['id'] for r in results})==1)
+            await asyncio.wait_for(events.get(),5)
+            concurrent_page=payload(await codex.read_resource(AnyUrl(f'{uri}?after={cursor}&limit=100')))
+            check('concurrent_writers_create_one_durable_delivery',len(concurrent_page['messages'])==1 and concurrent_page['messages'][0]['id']==results[0].json()['id'])
+            cursor=concurrent_page['next_cursor']
+            # Send a complete real HTTP request, but deliberately never consume its
+            # response. The independent recipient notification proves the commit.
+            lost_args={**send_args,'client_request_id':'discarded-response-'+ident}
+            encoded=json.dumps(lost_args).encode('utf-8')
+            _reader,writer=await asyncio.open_connection('127.0.0.1',port)
+            request=(f'POST /api/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n'
+                     f'Authorization: Bearer {tokens["hermes"]}\r\nContent-Type: application/json\r\n'
+                     f'Content-Length: {len(encoded)}\r\nConnection: close\r\n\r\n').encode('ascii')+encoded
+            try:
+                writer.write(request);await writer.drain()
+                await asyncio.wait_for(events.get(),5)
+            finally:
+                writer.close();await writer.wait_closed()
+            lost_page=payload(await codex.read_resource(AnyUrl(f'{uri}?after={cursor}&limit=100')))
+            check('commit_proven_without_sender_consuming_http_response',len(lost_page['messages'])==1)
+            lost_id=lost_page['messages'][0]['id'];cursor=lost_page['next_cursor']
             await codex.unsubscribe_resource(uri)
+            unbound=payload(await hermes.call_tool('presence_status',{}))
+            peer=next(row for row in unbound['agents'] if row['agent']=='codex')
+            check('unsubscribe_not_confused_with_stream_disconnect',not peer['subscribed'] and peer['inbox_subscriptions']==0 and peer['active_streams']>=1)
+        async with httpx.AsyncClient(timeout=10) as http:
+            closed=(await http.get(url+'/api/presence',headers={'Authorization':'Bearer '+tokens['hermes']})).json()
+            check('closed_sdk_sessions_are_not_reported_active',all(row['active_streams']==0 and not row['subscribed'] for row in closed['agents']))
+            check('unauthenticated_presence_rejected',(await http.get(url+'/api/presence')).status_code==401)
         headers={'Authorization':'Bearer '+tokens['codex'],'Accept':'application/json, text/event-stream'}
         async with httpx.AsyncClient(timeout=25) as http:
             response=await http.post(url+'/mcp',headers=headers,json={'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-11-25','capabilities':{},'clientInfo':{'name':'restart-keepalive-fixture','version':'1'}}})
@@ -115,6 +170,19 @@ async def main(image):
             page=payload(await codex.read_resource(AnyUrl(f'{uri}?after={cursor}&limit=100')))
             check('fresh_initialize_subscribe_saved_cursor_catches_up',[m['id'] for m in page['messages']]==[missed])
             await codex.unsubscribe_resource(uri)
+        async with client('hermes') as hermes:
+            receipt=payload(await hermes.call_tool('get_send_receipt',{'client_request_id':send_args['client_request_id']}))
+            check('receipt_survives_actual_container_restart',receipt['message_id']==first['id'] and receipt['retained'])
+            replay=payload(await hermes.call_tool('send_message',send_args))
+            check('post_restart_retry_recovers_original_commit',replay['id']==first['id'])
+            lost_receipt=payload(await hermes.call_tool('get_send_receipt',{'client_request_id':lost_args['client_request_id']}))
+            recovered=payload(await hermes.call_tool('send_message',lost_args))
+            check('discarded_response_reconciled_after_restart',lost_receipt['message_id']==lost_id and recovered['id']==lost_id)
+            missing=await hermes.call_tool('get_send_receipt',{'client_request_id':'unseen-key-'+ident})
+            check('missing_sender_receipt_does_not_disclose_payload',missing.isError and 'container-private-fixture' not in str(missing.content))
+        logs=await asyncio.to_thread(helper.run,['docker','logs',container],timeout=30)
+        wire_logs=logs.stdout+logs.stderr
+        check('keyed_send_errors_and_replays_do_not_log_keys_or_bodies',all(value not in wire_logs for value in [*tokens.values(),send_args['client_request_id'],lost_args['client_request_id'],'container-private-fixture']))
         evidence['result']='passed'
     except BaseException as exc:
         evidence['result']='failed';evidence['error']=type(exc).__name__+': '+str(exc)[:300]

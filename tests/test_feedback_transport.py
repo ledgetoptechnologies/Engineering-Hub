@@ -54,7 +54,7 @@ def test_rest_feedback_roundtrip_permissions_idempotency_and_audit(app, caplog):
         assert page2['history'][0]['note'] == 'private-evidence-marker' and page2['next_revision'] is None
         assert client.get('/api/messages', headers=headers('hermes')).json()['messages'] == []
         health = client.get('/health').json()
-        assert health['version'] == '0.5.2' and health['schema_version'] == 3
+        assert health['version'] == '0.6.0' and health['schema_version'] == 4
     logs = app.state.audit.path.read_text() + caplog.text
     assert 'private-report-marker' not in logs and 'private-evidence-marker' not in logs
     assert 'feedback_submit' in logs and 'feedback_update' in logs

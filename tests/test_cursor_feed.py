@@ -265,7 +265,7 @@ def test_mcp_exposes_async_cursor_wait_without_removing_existing_tools(tmp_path)
     tools = build_mcp_tools(service)
     names = {tool.name for tool in tools}
     assert {"feedback_submit", "feedback_get", "feedback_list", "feedback_update", "wait_for_messages"} <= names
-    assert len(names) == 22
+    assert len(names) == 24
     assert "wait_for_messages" in names
     tool = next(tool for tool in tools if tool.name == "wait_for_messages")
     assert set(tool.parameters["properties"]) >= {"after", "since_now", "fields", "limit", "timeout"}

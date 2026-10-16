@@ -15,7 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyUrl
 
 from .api import Service, _known_auth_secrets, wait_for_message_feed
-from .database import InvalidTransition, MessageError, NotFound, message_dict
+from .database import InvalidTransition, MessageError, NotFound, SendConflict, SendReplayUnavailable, message_dict
 from .files import file_dict
 from .feedback import FeedbackError, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .knowledge import KnowledgeRepository, entry_dict, search_result_dict
@@ -160,7 +160,8 @@ def _install_inbox_resources(mcp: FastMCP, service: Service, publisher: PushPubl
 def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) -> FastMCP:
     import os
 
-    push_publisher = push_publisher or PushPublisher()
+    push_publisher = push_publisher or getattr(service, "push_publisher", None) or PushPublisher()
+    service.push_publisher = push_publisher
 
     allowed_hosts = [
         value.strip()
@@ -188,16 +189,51 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
     @mcp.tool()
     def send_message(recipient: str, message_type: str, body: Any, priority: str = "normal",
                      correlation_id: str | None = None, in_reply_to: str | None = None,
-                     requires_user_approval: bool = False, ctx: Context | None = None) -> dict[str, Any]:
-        """Send one addressed message to the other agent."""
+                     requires_user_approval: bool = False, client_request_id: str | None = None,
+                     ctx: Context | None = None) -> dict[str, Any]:
+        """Send one addressed message. Reuse a sender-scoped client_request_id only for the identical send.
+
+        Identical keyed retries return the original retained message; changed payloads conflict.
+        An expired original is never recreated. This deduplicates acceptance, not agent execution.
+        """
         if ctx is None: raise ValueError("request context required")
         sender = authenticated(ctx)
-        message = service.repository.insert(sender=sender, recipient=recipient, message_type=message_type,
-                                            body=body, priority=priority, correlation_id=correlation_id,
-                                            in_reply_to=in_reply_to,
-                                            requires_user_approval=requires_user_approval)
-        service.audit_message("send", sender, message, request=ctx.request_context.request)
+        try:
+            message, replayed = service.repository.insert_with_outcome(sender=sender, recipient=recipient, message_type=message_type,
+                                                body=body, priority=priority, correlation_id=correlation_id,
+                                                in_reply_to=in_reply_to,
+                                                requires_user_approval=requires_user_approval,
+                                                client_request_id=client_request_id)
+        except SendConflict as exc:
+            raise ValueError("send_conflict: " + str(exc)) from exc
+        except SendReplayUnavailable as exc:
+            raise ValueError("send_replay_unavailable: " + str(exc)) from exc
+        service.audit_message("send", sender, message, result="replayed" if replayed else "ok", request=ctx.request_context.request)
         return message_dict(message)
+
+    @mcp.tool()
+    def get_send_receipt(client_request_id: str, ctx: Context | None = None) -> dict[str, Any]:
+        """Read metadata for the authenticated sender's keyed send. Never reads another inbox/body.
+
+        Status is message lifecycle metadata, not approval or proof of task completion.
+        Missing and other-sender keys are indistinguishable. Pruned keys remain reserved.
+        """
+        if ctx is None: raise ValueError("request context required")
+        sender = authenticated(ctx)
+        receipt = service.repository.get_send_receipt(sender, client_request_id)
+        service.audit.append(operation="send_receipt", agent=sender, result="ok")
+        return receipt
+
+    @mcp.tool()
+    async def presence_status(ctx: Context | None = None) -> dict[str, Any]:
+        """Read this server's active authenticated SSE streams and live inbox subscriptions.
+
+        Transport observations only: not chat readiness, receipt, task completion or approval.
+        No client/session identifiers are exposed; no database or heartbeat polling is used.
+        """
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        return await push_publisher.presence_status()
 
     @mcp.tool()
     def receive_messages(limit: int = 50, ctx: Context | None = None) -> dict[str, Any]:
@@ -498,11 +534,14 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
 
     @mcp.tool(name="bus_info")
     async def info(topic: str = "overview", ctx: Context | None = None) -> dict[str, Any]:
-        """Read live version, features, command schemas/examples and changes. Topics: overview, commands, messaging, push, feedback, changes, worker. Never executes examples."""
+        """Read live version, features, command schemas/examples and changes. Topics: overview, commands, messaging, push, presence, recovery, feedback, changes, worker. Never executes examples."""
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
         from .info import bus_help
-        return bus_help(topic, identity, await mcp.list_tools(), push_publisher)
+        result = bus_help(topic, identity, await mcp.list_tools(), push_publisher)
+        if topic in {"overview", "presence", "push"}:
+            result["presence"] = await push_publisher.presence_status()
+        return result
 
     _install_inbox_resources(mcp, service, push_publisher)
     return mcp

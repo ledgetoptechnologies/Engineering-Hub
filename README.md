@@ -4,13 +4,17 @@ A self-hosted, authenticated MCP Streamable HTTP service for Hermes, Codex, and 
 
 This repository builds a private GHCR container package and a TrueNAS SCALE Compose deployment. Publication, deployment and client wake behavior are separate verification gates; source changes alone do not prove any of them.
 
+## Safe sends and connection visibility
+
+v0.6.0 adds optional sender-scoped `client_request_id` deduplication, private `get_send_receipt` reconciliation, and server-observed `presence_status`. Presence distinguishes an open native SSE stream/subscription from chat readiness or a read receipt. Existing keyless sends and native-only delivery remain compatible. See [safe sends, receipts and presence](docs/safe-sends-and-presence.md).
+
 ## Native event-driven MCP push
 
-v0.5.2 adds recipient-scoped MCP resource subscriptions over persistent server-sent events. Native Linux filesystem events reconcile committed SQLite WAL changes; there are no periodic inbox queries or model checks. Clients subscribe before catch-up, then read their cursor only on actual notifications or reconnection. See [native MCP push](docs/mcp-push.md). A host/session connector is still required to turn a notification into agent execution.
+Native delivery uses recipient-scoped MCP resource subscriptions over persistent server-sent events. Native Linux filesystem events reconcile committed SQLite WAL changes; there are no periodic inbox queries or model checks. Clients subscribe before catch-up, then read their cursor only on actual notifications or reconnection. See [native MCP push](docs/mcp-push.md). A host/session connector is still required to turn a notification into agent execution.
 
 ## Help and discovery
 
-Call `bus_info()` for the live version, features and tool list. Use `bus_info(topic="commands")` for actual argument schemas, or choose `messaging`, `push`, `feedback`, `changes` or `worker` for examples and limits. This is read-only and never executes its examples. A client may map `/info` or `/bus-info` to this tool; the server does not override built-in client slash commands.
+Call `bus_info()` for the live version, features and tool list. Use `bus_info(topic="commands")` for actual argument schemas, or choose `messaging`, `push`, `presence`, `recovery`, `feedback`, `changes` or `worker` for examples and limits. This is read-only and never executes its examples. A client may map `/info` or `/bus-info` to this tool; the server does not override built-in client slash commands.
 
 ## Messaging and feedback
 
@@ -52,7 +56,7 @@ The live smoke test discovers the server's tools and exercises message delivery,
 
 ## GHCR image
 
-`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.5.2` runs the same gates and publishes:
+`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.6.0` runs the same gates and publishes:
 
 - `ghcr.io/ledgetoptechnologies/internal-mcp:0.5.2`
 - `ghcr.io/ledgetoptechnologies/internal-mcp:sha-<full-commit-sha>`
