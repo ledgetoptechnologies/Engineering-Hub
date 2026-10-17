@@ -26,7 +26,7 @@ class CommandRequest(_WireModel):
     artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     candidate_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     policy_revision: int = Field(gt=0)
-    fencing_generation: int = Field(gt=0)
+    fencing_generation: int = Field(gt=0, le=2**63 - 1)
 
     @field_validator("command_id")
     @classmethod

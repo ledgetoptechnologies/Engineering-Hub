@@ -38,6 +38,8 @@ a durable increasing per-target fence. No shell, Docker socket, download URL or
 live application driver is accepted.
 
 The executor client sends one typed command and verifies every echoed field.
+Fence generations are strict positive integers bounded to SQLite's signed 64-bit
+maximum, `9223372036854775807`; larger values are rejected before HTTP submission.
 Timeouts, malformed responses and uncertain outcomes do not retry. A durable
 advance lock prevents competing controllers. A hard crash can leave that lock
 reserved; there is deliberately no automatic expiry or takeover. Inspect the

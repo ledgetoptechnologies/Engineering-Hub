@@ -35,10 +35,15 @@ def result(request, **changes):
     ("policy_revision", True), ("fencing_generation", False),
     ("policy_revision", "1"), ("fencing_generation", 1.0),
     ("policy_revision", 0), ("fencing_generation", -1), ("actor", "hermes"),
+    ("fencing_generation", 2**63),
 ])
 def test_strict_command_fields_reject_unsafe_or_coerced_values(field, value):
     with pytest.raises(ValidationError):
         command(**{field: value})
+
+
+def test_command_fence_accepts_exact_sqlite_positive_integer_maximum():
+    assert command(fencing_generation=2**63 - 1).fencing_generation == 9223372036854775807
 
 
 @pytest.mark.parametrize("origin", [
