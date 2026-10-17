@@ -10,21 +10,34 @@ from agent_message_bus.auth import AuthSettings
 from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
+from engineering_hub.container_pilot_manifest import PilotManifest
 from engineering_hub.container_pilot_client import ContainerPilotClient
 from engineering_hub.dispatcher import StagingDispatcher
 from engineering_hub.fixture_workflow import FixtureWorkflow
 from engineering_hub.repository import HubError, HubRepository
+from tests.test_hub_container_pilot_manifest import make_manifest_data
 
 BASE = '/api/hub/v1'
 PILOT = BASE + '/container-pilot/runs'
 COMMIT = 'a' * 40
 IMAGE = 'sha256:' + 'b' * 64
 ROLLBACK = 'sha256:' + 'c' * 64
-MANIFEST = 'sha256:' + 'd' * 64
 SECRET = 'synthetic-pilot-only-secret'
 CODEX = {'Authorization': 'Bearer fixture-codex'}
 CLAUDE = {'Authorization': 'Bearer fixture-claude'}
 HERMES = {'Authorization': 'Bearer fixture-hermes'}
+
+
+def pilot_manifest():
+    data = make_manifest_data()
+    data['candidate']['image_config_id'] = IMAGE
+    data['candidate']['source_commit'] = COMMIT
+    data['rollback']['image_config_id'] = ROLLBACK
+    data['rollback']['source_commit'] = 'f' * 40
+    return PilotManifest.from_bytes(json.dumps(data).encode('utf-8'))
+
+
+MANIFEST = pilot_manifest().digest()
 
 
 def prepare(tmp_path, *, fail_health=False):
@@ -53,7 +66,7 @@ def prepare(tmp_path, *, fail_health=False):
 
     adapter = ContainerPilotClient('https://pilot-adapter.test', SECRET,
                                   transport=httpx.MockTransport(transport))
-    target = ContainerPilotTarget(IMAGE, COMMIT, MANIFEST, ROLLBACK, 'f' * 40)
+    target = ContainerPilotTarget.from_manifest(pilot_manifest())
     workflow = ContainerPilotWorkflow(repo, adapter, [target])
     return SimpleNamespace(settings=settings, repo=repo, adapter=adapter, target=target,
                            workflow=workflow, commands=commands)

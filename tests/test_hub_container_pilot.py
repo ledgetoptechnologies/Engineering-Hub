@@ -1,24 +1,48 @@
 """Controller unit tests with typed simulated evidence, not a real Docker pilot."""
 import asyncio
 from dataclasses import replace
+import hashlib
 import json
 import uuid
 
 import pytest
 
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
+from engineering_hub.container_pilot_manifest import PilotManifest
 from engineering_hub.container_pilot_client import (
     ContainerPilotEvidence, ContainerPilotRequest, ContainerPilotResponse,
 )
 from engineering_hub.repository import HubError, HubRepository
+from tests.test_hub_container_pilot_manifest import make_manifest_data
 
 
 COMMIT = 'a' * 40
 IMAGE = 'sha256:' + 'b' * 64
-MANIFEST = 'sha256:' + 'c' * 64
 ROLLBACK_IMAGE = 'sha256:' + 'd' * 64
 PRINCIPAL = 'executor:container-pilot'
 ACTIONS = ['deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback']
+
+
+def test_noncanonical_direct_binding_cannot_poison_canonical_restart(repo, target):
+    pretty = json.dumps(json.loads(target.canonical_manifest), indent=2)
+    altered = replace(target, canonical_manifest=pretty)
+    with pytest.raises(HubError, match='container_pilot_manifest_unverified'):
+        ContainerPilotWorkflow(repo, FakeClient(), [altered])
+    ContainerPilotWorkflow(repo, FakeClient(), [target])
+    reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
+    ContainerPilotWorkflow(reopened, FakeClient(), [target])
+
+
+def pilot_manifest():
+    data = make_manifest_data()
+    data['candidate']['image_config_id'] = IMAGE
+    data['candidate']['source_commit'] = COMMIT
+    data['rollback']['image_config_id'] = ROLLBACK_IMAGE
+    data['rollback']['source_commit'] = 'f' * 40
+    return PilotManifest.from_bytes(json.dumps(data).encode('utf-8'))
+
+
+MANIFEST = pilot_manifest().digest()
 
 
 class FakeClient:
@@ -56,7 +80,7 @@ def repo(tmp_path):
 
 @pytest.fixture
 def target():
-    return ContainerPilotTarget(IMAGE, COMMIT, MANIFEST, ROLLBACK_IMAGE, 'f' * 40)
+    return ContainerPilotTarget.from_manifest(pilot_manifest())
 
 
 def reviewed_task(repo, key='pilot'):
@@ -429,3 +453,82 @@ async def test_legacy_four_column_unknown_row_migrates_without_resend_or_evidenc
     assert row['payload'] == payload
     assert row['state'] == 'unknown'
     assert row['response_json'] is None
+
+
+def pilot_tables(repo):
+    with repo._connection() as db:
+        return db.execute("SELECT name,sql FROM sqlite_master WHERE name LIKE 'hub_container_pilot_%' ORDER BY name").fetchall()
+
+
+def test_digest_only_legacy_binding_rejected_before_tables_or_client_io(repo):
+    client = FakeClient()
+    legacy = ContainerPilotTarget(IMAGE, COMMIT, MANIFEST, ROLLBACK_IMAGE, 'f' * 40)
+    before = pilot_tables(repo)
+    with pytest.raises(HubError, match='container_pilot_manifest_unverified'):
+        ContainerPilotWorkflow(repo, client, [legacy])
+    assert pilot_tables(repo) == before == []
+    assert client.submissions == [] and client.inspections == []
+    assert repo.list_runs() == []
+
+
+@pytest.mark.parametrize('tamper', ['unknown_field', 'unknown_field_rehashed', 'wrong_schema',
+                                  'invalid_json', 'digest_mismatch', 'runtime_changed_without_digest'])
+def test_tampered_full_manifest_rejected_before_tables_or_client_io(repo, target, tamper):
+    data = json.loads(target.canonical_manifest)
+    if tamper in {'unknown_field', 'unknown_field_rehashed'}:
+        data['caller_authority'] = 'deploy-anything'
+    elif tamper == 'wrong_schema':
+        data['schema_version'] = 'unrecognized'
+    elif tamper == 'runtime_changed_without_digest':
+        prior = data['runtime']['resources']['pids_limit']
+        data['runtime']['resources']['pids_limit'] = 48 if prior != 48 else 64
+    canonical = '{' if tamper == 'invalid_json' else json.dumps(data)
+    changes = {'canonical_manifest': canonical}
+    if tamper == 'unknown_field_rehashed':
+        changes['manifest_digest'] = 'sha256:' + hashlib.sha256(canonical.encode()).hexdigest()
+    if tamper == 'digest_mismatch':
+        changes['manifest_digest'] = 'sha256:' + '0' * 64
+    changed = replace(target, **changes)
+    client = FakeClient()
+    before = pilot_tables(repo)
+    with pytest.raises(HubError, match='container_pilot_manifest_'):
+        ContainerPilotWorkflow(repo, client, [changed])
+    assert pilot_tables(repo) == before == []
+    assert client.submissions == [] and client.inspections == []
+
+
+def test_constructor_pins_complete_canonical_manifest_before_any_run(repo, target):
+    client = FakeClient()
+    ContainerPilotWorkflow(repo, client, [target])
+    with repo._connection() as db:
+        rows = db.execute('SELECT manifest_digest,binding FROM hub_container_pilot_manifest_views').fetchall()
+    assert len(rows) == 1 and rows[0]['manifest_digest'] == MANIFEST
+    pinned = json.loads(rows[0]['binding'])
+    assert pinned['canonical_manifest'] == target.canonical_manifest
+    assert PilotManifest.from_bytes(pinned['canonical_manifest'].encode()).digest() == MANIFEST
+    assert json.loads(pinned['canonical_manifest']) == json.loads(pilot_manifest().canonical_bytes())
+    assert repo.list_runs() == [] and client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_changed_runtime_policy_has_new_digest_and_cannot_advance_old_run(repo, target):
+    _, run = ready_run(repo, target)
+    changed_data = json.loads(target.canonical_manifest)
+    original_cpu = changed_data['runtime']['resources']['cpu_millicores']
+    changed_data['runtime']['resources']['cpu_millicores'] = 500 if original_cpu != 500 else 1000
+    changed_manifest = PilotManifest.from_bytes(json.dumps(changed_data).encode())
+    changed_target = ContainerPilotTarget.from_manifest(changed_manifest)
+    assert changed_target.manifest_digest != target.manifest_digest
+    assert changed_target.artifact_digest == target.artifact_digest
+    assert changed_target.candidate_commit == target.candidate_commit
+    client = FakeClient()
+    workflow = ContainerPilotWorkflow(repo, client, [changed_target])
+    with pytest.raises(HubError, match='container_pilot_manifest_mismatch'):
+        await workflow.advance(run['id'])
+    assert client.submissions == [] and client.inspections == []
+    assert repo.get_run(run['id'])['status'] == 'pending'
+    assert repo.get_run(run['id'])['execution_manifest_digest'] == MANIFEST
+    with repo._connection() as db:
+        rows = db.execute('SELECT manifest_digest,binding FROM hub_container_pilot_manifest_views').fetchall()
+    assert {row['manifest_digest'] for row in rows} == {MANIFEST, changed_target.manifest_digest}
+    assert json.loads(next(row['binding'] for row in rows if row['manifest_digest'] == MANIFEST))['canonical_manifest'] == target.canonical_manifest

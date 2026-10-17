@@ -5,12 +5,13 @@ The manifest digest is not an agent approval or proof of image provenance. Host
 acceptance must independently validate that manifest and actual Docker effects.
 Fixture actions, manifests and ledgers are deliberately not reused here.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import re
 import uuid
 
 from .container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
+from .container_pilot_manifest import PilotManifest
 from .repository import HubError
 
 
@@ -29,6 +30,40 @@ class ContainerPilotTarget:
     target_id: str = 'engineering-hub:staging'
     policy_revision: int = 1
     driver: str = 'container_pilot_v1'
+    canonical_manifest: str | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_manifest(cls, manifest):
+        if type(manifest) is not PilotManifest:
+            raise ValueError('validated_pilot_manifest_required')
+        canonical = manifest.canonical_bytes()
+        verified = PilotManifest.from_bytes(canonical)
+        return cls(verified.candidate.image_config_id, verified.candidate.source_commit,
+                   verified.digest(), verified.rollback.image_config_id,
+                   verified.rollback.source_commit, target_id=verified.target_id,
+                   policy_revision=verified.policy_revision,
+                   canonical_manifest=canonical.decode('utf-8'))
+
+    def validated_manifest(self):
+        if not isinstance(self.canonical_manifest, str):
+            raise HubError('container_pilot_manifest_unverified', 403)
+        try:
+            manifest = PilotManifest.from_bytes(self.canonical_manifest.encode('utf-8'))
+            if manifest.canonical_bytes().decode('utf-8') != self.canonical_manifest:
+                raise ValueError('canonical_pilot_manifest_required')
+            matches = (manifest.digest() == self.manifest_digest
+                       and manifest.candidate.image_config_id == self.artifact_digest
+                       and manifest.candidate.source_commit == self.candidate_commit
+                       and manifest.rollback.image_config_id == self.rollback_image_config_id
+                       and manifest.rollback.source_commit == self.rollback_commit
+                       and manifest.target_id == self.target_id
+                       and manifest.policy_revision == self.policy_revision
+                       and manifest.driver.id == self.driver)
+        except Exception:
+            raise HubError('container_pilot_manifest_unverified', 403) from None
+        if not matches:
+            raise HubError('container_pilot_manifest_changed', 409)
+        return manifest
 
     def __post_init__(self):
         if self.driver != 'container_pilot_v1' or self.policy_revision != 1:
@@ -62,6 +97,8 @@ class ContainerPilotWorkflow:
             raise ValueError('execution_identity_required')
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
             raise ValueError('invalid_pilot_targets')
+        for target in targets:
+            target.validated_manifest()
         self.repo, self.client = repo, client
         self.targets = {target.target_id: target for target in targets}
         if len(self.targets) != len(targets) or any(not isinstance(t, ContainerPilotTarget) for t in targets):
@@ -97,6 +134,8 @@ class ContainerPilotWorkflow:
     def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id, *, client_request_id=None):
         task = self.repo.get_task(task_id)
         target = self.targets.get(target_id)
+        if target is not None:
+            target.validated_manifest()
         if (target is None or task['project'] != 'engineering-hub'
                 or artifact_digest != target.artifact_digest
                 or task['candidate_commit'] != target.candidate_commit):
@@ -107,6 +146,8 @@ class ContainerPilotWorkflow:
 
     def _target(self, run):
         target = self.targets.get(run['target'])
+        if target is not None:
+            target.validated_manifest()
         if (target is None or run['artifact_digest'] != target.artifact_digest
                 or run['commit'] != target.candidate_commit
                 or run['policy_revision'] != target.policy_revision

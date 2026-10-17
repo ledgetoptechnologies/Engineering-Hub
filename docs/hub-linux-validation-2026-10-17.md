@@ -141,3 +141,30 @@ retrieved the canonical report from shared knowledge at
 `agent-bus/engineering-hub/acceptance/aed6cb8-fixture-container.md`, version 1,
 SHA-256 `0e4b86bee2395a3f8ddaf0f21e6cedd001367a0cd8edac4b5929f62fef14f9fc`.
 This is peer-run exact-source container evidence, not a root-run application pilot.
+
+## Complete manifest and image-identity source validation
+
+The next frozen source overlay, based on `eaffa9a`, passed **1,051 Linux tests in
+57.46 seconds**, with only the existing Starlette deprecation and no resource
+warnings. The validation image selection was
+`sha256:d7e1dd2858f0f5935c915b13669c4cff3cf1f83e97dff5d3f3b286d317ef891b`
+(OCI index, not an image-config digest). It includes the full shared manifest
+schema, mandatory canonical-manifest controller binding and read-only identity
+helper/tests. Isolation and private tmpfs match the preceding full suite; the
+test container was removed after exit. The source archive build also passed,
+and current OpenAPI/TypeScript fixture checks remain green.
+
+Root separately reran 298 Windows pilot/manifest/client tests and all 37 image-
+identity unit tests. Independent functional review found noncanonical direct
+binding text could poison a formatting-only restart comparison; the controller
+now rejects it before binding and a canonical restart regression passes. No
+default service, provider, watcher, credential or daemon configuration changed.
+
+Root's actual read-only local-image probe returned zero and verified the three
+distinct metadata digests documented in the pilot contract. The helper streams
+bounded archive metadata, extracts no files and skips layer authentication. That
+result is not build provenance, daemon admission, a deployed container or actual
+pilot evidence. The full manifest schema similarly proves policy syntax and
+digest binding—not backup consistency, secret resolution or host enforcement.
+Actual application rollout/rollback, OAuth and live topic integration remain
+unfulfilled acceptance gates.
