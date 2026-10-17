@@ -90,7 +90,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/AutonomyDTO"
+                }
               }
             }
           }
@@ -198,7 +200,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/EventStatusDTO"
+                }
               }
             }
           }
@@ -232,7 +236,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/HealthDTO"
+                }
               }
             }
           }
@@ -248,7 +254,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/OverviewDTO"
+                }
               }
             }
           }
@@ -264,7 +272,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListDTO"
+                }
               }
             }
           }
@@ -280,7 +290,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/AgentListDTO"
+                }
               }
             }
           }
@@ -296,7 +308,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskListDTO"
+                }
               }
             }
           }
@@ -320,7 +334,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
               }
             }
           },
@@ -357,7 +373,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
               }
             }
           },
@@ -404,7 +422,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
               }
             }
           },
@@ -451,7 +471,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
               }
             }
           },
@@ -498,7 +520,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
               }
             }
           },
@@ -524,7 +548,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionListDTO"
+                }
               }
             }
           }
@@ -548,7 +574,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionDTO"
+                }
               }
             }
           },
@@ -595,7 +623,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionDTO"
+                }
               }
             }
           },
@@ -631,7 +661,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/PauseDTO"
+                }
               }
             }
           },
@@ -657,7 +689,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RunListDTO"
+                }
               }
             }
           }
@@ -681,7 +715,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
               }
             }
           },
@@ -718,7 +754,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
               }
             }
           },
@@ -738,6 +776,57 @@
   },
   "components": {
     "schemas": {
+      "AgentDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Id"
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport"
+          },
+          "chat_readiness": {
+            "type": "string",
+            "title": "Chat Readiness"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "transport",
+          "chat_readiness",
+          "reason"
+        ],
+        "title": "AgentDTO"
+      },
+      "AgentListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "AgentListDTO"
+      },
       "Answer": {
         "properties": {
           "expected_revision": {
@@ -760,6 +849,56 @@
         ],
         "title": "Answer"
       },
+      "AutonomyDTO": {
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "not_started",
+              "native_source_unavailable",
+              "active",
+              "stopped",
+              "failed"
+            ],
+            "title": "State"
+          },
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/DispatchReceiptDTO"
+            },
+            "type": "array",
+            "title": "Receipts"
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DispatchResultDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "configured",
+          "state",
+          "running",
+          "receipts"
+        ],
+        "title": "AutonomyDTO"
+      },
       "Candidate": {
         "properties": {
           "expected_revision": {
@@ -781,6 +920,299 @@
         ],
         "title": "Candidate"
       },
+      "CapabilitiesDTO": {
+        "properties": {
+          "production": {
+            "type": "boolean",
+            "title": "Production"
+          },
+          "host_dispatch": {
+            "type": "boolean",
+            "title": "Host Dispatch"
+          },
+          "github_merge": {
+            "type": "boolean",
+            "title": "Github Merge"
+          },
+          "processing": {
+            "type": "boolean",
+            "title": "Processing"
+          },
+          "fixture_dispatch": {
+            "type": "boolean",
+            "title": "Fixture Dispatch"
+          },
+          "merge_gate_strength": {
+            "type": "string",
+            "const": "not_enforced",
+            "title": "Merge Gate Strength"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "production",
+          "host_dispatch",
+          "github_merge",
+          "processing",
+          "fixture_dispatch",
+          "merge_gate_strength"
+        ],
+        "title": "CapabilitiesDTO"
+      },
+      "DecisionDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Options"
+          },
+          "protected": {
+            "type": "boolean",
+            "title": "Protected"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "answered"
+            ],
+            "title": "Status"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "execution_authorization": {
+            "type": "boolean",
+            "const": false,
+            "title": "Execution Authorization"
+          },
+          "answered_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^human:[1-9][0-9]{0,19}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answered By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "project",
+          "title",
+          "options",
+          "protected",
+          "status",
+          "answer",
+          "execution_authorization"
+        ],
+        "title": "DecisionDTO"
+      },
+      "DecisionListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "DecisionListDTO"
+      },
+      "DispatchReceiptDTO": {
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Sequence"
+          },
+          "entity_id": {
+            "type": "string",
+            "title": "Entity Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "reserved",
+              "running",
+              "needs_reconciliation",
+              "succeeded",
+              "rolled_back",
+              "deferred",
+              "skipped"
+            ],
+            "title": "State"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "attempt_head": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Attempt Head"
+          },
+          "needs_reconciliation": {
+            "type": "boolean",
+            "title": "Needs Reconciliation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sequence",
+          "entity_id",
+          "revision",
+          "state",
+          "run_id",
+          "reason",
+          "attempt_head",
+          "needs_reconciliation"
+        ],
+        "title": "DispatchReceiptDTO"
+      },
+      "DispatchResultDTO": {
+        "properties": {
+          "examined": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Examined"
+          },
+          "dispatched": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Dispatched"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          },
+          "more": {
+            "type": "boolean",
+            "title": "More"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "examined",
+          "dispatched",
+          "cursor",
+          "paused",
+          "more"
+        ],
+        "title": "DispatchResultDTO"
+      },
+      "EventStatusDTO": {
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "observer_epoch": {
+            "type": "string",
+            "title": "Observer Epoch"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "available",
+          "reason",
+          "observer_epoch",
+          "cursor"
+        ],
+        "title": "EventStatusDTO"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -793,6 +1225,27 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HealthDTO": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true,
+            "title": "Ok"
+          },
+          "service": {
+            "type": "string",
+            "const": "engineering-hub-control",
+            "title": "Service"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ok",
+          "service"
+        ],
+        "title": "HealthDTO"
       },
       "NewDecision": {
         "properties": {
@@ -897,6 +1350,68 @@
         ],
         "title": "NewTask"
       },
+      "OverviewDTO": {
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectDTO"
+            },
+            "type": "array",
+            "title": "Projects"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/TaskDTO"
+            },
+            "type": "array",
+            "title": "Tasks"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionDTO"
+            },
+            "type": "array",
+            "title": "Decisions"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunDTO"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentDTO"
+            },
+            "type": "array",
+            "title": "Agents"
+          },
+          "autonomy": {
+            "$ref": "#/components/schemas/AutonomyDTO"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/CapabilitiesDTO"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "paused",
+          "projects",
+          "tasks",
+          "decisions",
+          "runs",
+          "agents",
+          "autonomy",
+          "capabilities"
+        ],
+        "title": "OverviewDTO"
+      },
       "Pause": {
         "properties": {
           "paused": {
@@ -910,6 +1425,101 @@
           "paused"
         ],
         "title": "Pause"
+      },
+      "PauseDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "const": "pause",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "paused"
+        ],
+        "title": "PauseDTO"
+      },
+      "ProjectDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "environment": {
+            "type": "string",
+            "const": "staging",
+            "title": "Environment"
+          },
+          "executor_enabled": {
+            "type": "boolean",
+            "title": "Executor Enabled"
+          },
+          "health": {
+            "type": "string",
+            "title": "Health"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "environment",
+          "executor_enabled",
+          "health",
+          "reason"
+        ],
+        "title": "ProjectDTO"
+      },
+      "ProjectListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "ProjectListDTO"
       },
       "PublicReachability": {
         "properties": {
@@ -1135,6 +1745,37 @@
         ],
         "title": "Review"
       },
+      "ReviewDTO": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Actor"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "verdict": {
+            "type": "string",
+            "const": "approve",
+            "title": "Verdict"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "commit",
+          "verdict"
+        ],
+        "title": "ReviewDTO"
+      },
       "Revision": {
         "properties": {
           "expected_revision": {
@@ -1149,6 +1790,323 @@
           "expected_revision"
         ],
         "title": "Revision"
+      },
+      "RunDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Artifact Digest"
+          },
+          "policy_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Policy Revision"
+          },
+          "review": {
+            "$ref": "#/components/schemas/ReviewDTO"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "held"
+            ],
+            "title": "Status"
+          },
+          "command_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command Id"
+          },
+          "fencing_generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Fencing Generation"
+          },
+          "created_by": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Created By"
+          },
+          "execution_actor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^executor:[a-z][a-z0-9-]{0,63}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Actor"
+          },
+          "execution_manifest_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Manifest Digest"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEventDTO"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "task_id",
+          "project",
+          "target",
+          "commit",
+          "artifact_digest",
+          "policy_revision",
+          "review",
+          "status",
+          "command_id",
+          "fencing_generation",
+          "created_by",
+          "execution_actor",
+          "execution_manifest_digest",
+          "events"
+        ],
+        "title": "RunDTO"
+      },
+      "RunEventDTO": {
+        "properties": {
+          "event": {
+            "type": "string",
+            "enum": [
+              "running",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "held"
+            ],
+            "title": "Event"
+          },
+          "actor": {
+            "type": "string",
+            "pattern": "^executor:[a-z][a-z0-9-]{0,63}$",
+            "title": "Actor"
+          },
+          "command_id": {
+            "type": "string",
+            "title": "Command Id"
+          },
+          "fencing_generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Fencing Generation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "event",
+          "actor",
+          "command_id",
+          "fencing_generation"
+        ],
+        "title": "RunEventDTO"
+      },
+      "RunListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "RunListDTO"
+      },
+      "TaskDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "assigned",
+              "claimed",
+              "in_review",
+              "verified"
+            ],
+            "title": "Status"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "candidate_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Commit"
+          },
+          "review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repair_count": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Repair Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "project",
+          "title",
+          "status",
+          "owner",
+          "candidate_commit",
+          "review",
+          "repair_count"
+        ],
+        "title": "TaskDTO"
+      },
+      "TaskListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TaskDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "TaskListDTO"
       },
       "TopicPreflight": {
         "properties": {

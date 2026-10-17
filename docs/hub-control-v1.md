@@ -139,12 +139,15 @@ until reconciled. Topic readiness remains advisory, separate from durable mail,
 claiming work, executing work and completing it.
 
 Local verification on 2026-10-17: production Vite/TypeScript build, eight API-client
-unit tests, twelve real-Edge Playwright tests, and the network-disabled container
-smoke passed. The Hub Python suite passed 366 tests with two Windows-specific
+unit tests, twenty real-Edge Playwright tests, and the network-disabled container
+smoke passed. The Hub Python suite passed 377 tests with two Windows-specific
 skips. Browser tests mock private API data and exercise real native browser fetch,
 Origin/cookies/CSRF, stale-response handling, distinct peer expiry deadlines,
 topic switching, invalidation coalescing, conflict recovery and session expiry.
 They do not establish a real GitHub OAuth callback or live registry attachment.
+Public REST responses now use strict DTOs in the published OpenAPI contract.
+`python scripts/check_hub_ui_contract.py` validates actual TypeScript overview and
+topic fixtures against the Python response models without a server or credentials.
 
 Keep the control DB on local storage on its host, not an SMB SQLite WAL path.
 Use SQLite's backup API for a coherent backup while running, or stop all writers

@@ -85,7 +85,7 @@ export function createDemoOverview(now = new Date()): Overview {
     })),
     autonomy: {
       configured: false,
-      state: "demo_not_running",
+      state: "disabled",
       running: false,
       receipts: [],
     },

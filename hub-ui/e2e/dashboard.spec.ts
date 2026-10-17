@@ -13,16 +13,14 @@ async function mockLive(
   const overview = createDemoOverview(NOW);
   const requests: Request[] = [];
   let overviewReads = 0;
-  await page
-    .context()
-    .addCookies([
-      {
-        name: "hub_session",
-        value: "fixture-browser-session",
-        url: ORIGIN,
-        httpOnly: true,
-      },
-    ]);
+  await page.context().addCookies([
+    {
+      name: "hub_session",
+      value: "fixture-browser-session",
+      url: ORIGIN,
+      httpOnly: true,
+    },
+  ]);
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request();
     requests.push(request);
@@ -191,6 +189,13 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await expect(page.getByRole("status")).toContainText(
     "Demo only; no server changed.",
   );
+  await expect(page.getByRole("radio", { checked: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Record decision", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("radio", { name: "NAS-backed small fixture", exact: true })
+    .check();
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
@@ -394,7 +399,7 @@ test("changing topic clears previous peers before the next snapshot arrives", as
   await expect(page.locator(".peer-row")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "New task", exact: true }),
-  ).toBeDisabled();
+  ).toBeEnabled();
   release();
   await expect(page.locator(".peer-row")).toHaveCount(3);
   await expect(
@@ -452,12 +457,14 @@ for (const lost of ["error", "source_unavailable"] as const) {
     await expect(
       page.getByRole("button", { name: "New task", exact: true }),
     ).toBeDisabled();
+    // Evidence may be retained as Unknown or cleared entirely. Neither path
+    // may restore a verified route from a response that crossed disconnection.
     await expect(
-      page
-        .locator(".peer-row")
-        .filter({ hasText: "Codex" })
-        .getByText("Unknown", { exact: true }),
-    ).toBeVisible();
+      page.locator(".peer-row").getByText("Reachable", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(".peer-row").getByText("Queued", { exact: true }),
+    ).toHaveCount(0);
   });
 }
 
@@ -536,6 +543,9 @@ test("conflicting decision disables writes until explicit refresh without echoin
   );
   await page.goto("/");
   await page
+    .getByRole("radio", { name: "NAS-backed small fixture", exact: true })
+    .check();
+  await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
   await expect(page.getByRole("alert")).toHaveText(
@@ -566,6 +576,9 @@ test("expired human session removes loaded private records and cannot fall back 
     }),
   );
   await page.goto("/");
+  await page
+    .getByRole("radio", { name: "NAS-backed small fixture", exact: true })
+    .check();
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
@@ -608,4 +621,265 @@ test("expired task submission closes its private draft rather than leaving a sig
   ).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.locator("textarea")).toHaveCount(0);
+});
+
+test("protected decision requires explicit choice and separate confirmation; cancel sends nothing", async ({
+  page,
+}) => {
+  const mock = await mockLive(page);
+  const decision = mock.overview.decisions[0];
+  decision.protected = true;
+  decision.revision = 17;
+  decision.title = "Choose the protected fixture review outcome";
+  await page.goto("/");
+  const record = page.getByRole("button", {
+    name: "Record decision",
+    exact: true,
+  });
+  await expect(record).toBeDisabled();
+  await expect(page.getByRole("radio", { checked: true })).toHaveCount(0);
+  await page
+    .getByRole("radio", { name: "Wait for local disk inspection", exact: true })
+    .check();
+  await record.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Confirm protected decision",
+    exact: true,
+  });
+  await expect(dialog).toContainText(decision.title);
+  await expect(dialog).toContainText("Wait for local disk inspection");
+  await expect(dialog).toContainText(
+    "It does not grant permission to execute or deploy.",
+  );
+  expect(
+    mock.requests.filter((request) => request.method() === "POST"),
+  ).toHaveLength(0);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(
+    mock.requests.filter((request) => request.method() === "POST"),
+  ).toHaveLength(0);
+  await record.click();
+  await page
+    .getByRole("dialog", { name: "Confirm protected decision", exact: true })
+    .getByRole("button", { name: "Confirm decision", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toHaveText(
+    "Decision recorded, not an execution grant.",
+  );
+  const writes = mock.requests.filter((request) => request.method() === "POST");
+  expect(writes).toHaveLength(1);
+  expect(new URL(writes[0].url()).pathname).toBe(
+    "/api/hub/v1/decisions/demo-decision-storage/answer",
+  );
+  expect(writes[0].postDataJSON()).toEqual({
+    expected_revision: 17,
+    answer: "Wait for local disk inspection",
+  });
+  expect(mock.overview.runs).toEqual([]);
+});
+
+for (const status of [422, 503]) {
+  test(`topic ${status} clears old readiness but leaves fresh workspace operations usable`, async ({
+    page,
+  }) => {
+    await page.clock.install({ time: NOW });
+    await mockLive(page);
+    await page.route(
+      "**/api/hub/v1/topics/unavailable-fixture-topic/peers",
+      (route) =>
+        route.fulfill({
+          status,
+          contentType: "application/json",
+          body: JSON.stringify({
+            detail: {
+              code: status === 422 ? "invalid_topic" : "service_unavailable",
+              private: "private-topic-error",
+            },
+          }),
+        }),
+    );
+    await page.goto("/");
+    await expect(
+      page
+        .locator(".peer-row")
+        .filter({ hasText: "Codex" })
+        .getByText("Reachable", { exact: true }),
+    ).toBeVisible();
+    await page.getByLabel("TOPIC ROOT").fill("unavailable-fixture-topic");
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await expect(page.locator("#agents").getByRole("alert")).toHaveText(
+      "Topic status unavailable. Check the topic and retry; workspace records remain available.",
+    );
+    await expect(page.locator(".peer-row")).toHaveCount(0);
+    await expect(page.getByText("private-topic-error")).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "New task", exact: true }),
+    ).toBeEnabled();
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page
+      .getByLabel("What needs to happen?")
+      .fill(`Workspace survives topic ${status}`);
+    await page
+      .getByRole("button", { name: "Assign task", exact: true })
+      .click();
+    await expect(
+      page.getByText(`Workspace survives topic ${status}`, { exact: true }),
+    ).toBeVisible();
+  });
+}
+
+for (const status of [401, 403]) {
+  test(`topic ${status} fails closed globally rather than keeping private workspace records`, async ({
+    page,
+  }) => {
+    await mockLive(page);
+    await page.route(
+      "**/api/hub/v1/topics/denied-fixture-topic/peers",
+      (route) =>
+        route.fulfill({
+          status,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: { code: "forbidden" } }),
+        }),
+    );
+    await page.goto("/");
+    await expect(
+      page.getByRole("heading", { name: "Needs Beau", exact: true }),
+    ).toBeVisible();
+    await page.getByLabel("TOPIC ROOT").fill("denied-fixture-topic");
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Needs Beau", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("Verify the isolated Viewer staging candidate"),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "New task", exact: true }),
+    ).toBeDisabled();
+    await expect(page.locator(".peer-row")).toHaveCount(0);
+  });
+}
+
+test("live profile displays the authenticated principal and GitHub identity, not a hardcoded person", async ({
+  page,
+}) => {
+  await mockLive(page);
+  await page.goto("/");
+  await expect(
+    page.locator(".profile").getByText("human:42", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".profile").getByText("GitHub ID 42", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".profile").getByText("Beau", { exact: true }),
+  ).toHaveCount(0);
+});
+
+test("a pending topic request does not hold fresh workspace records or human actions hostage", async ({
+  page,
+}) => {
+  await mockLive(page);
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  await page.route("**/api/hub/v1/topics/*/peers", async (route) => {
+    entered();
+    await waiting;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(createDemoTopic("auto-wake-v1-test", NOW)),
+    });
+  });
+  try {
+    await page.goto("/");
+    await pending;
+    await expect(
+      page.getByRole("heading", { name: "Needs Beau", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Verify the isolated Viewer staging candidate", {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "New task", exact: true }),
+    ).toBeEnabled();
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page
+      .getByLabel("What needs to happen?")
+      .fill("Task created while topic evidence is pending");
+    await page
+      .getByRole("button", { name: "Assign task", exact: true })
+      .click();
+    await expect(
+      page.getByText("Task created while topic evidence is pending", {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  } finally {
+    release();
+  }
+});
+
+test("late topic authentication failure closes an already-open private task draft", async ({
+  page,
+}) => {
+  await mockLive(page);
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  await page.route("**/api/hub/v1/topics/*/peers", async (route) => {
+    entered();
+    await waiting;
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: { code: "sign_in_required" } }),
+    });
+  });
+  try {
+    await page.goto("/");
+    await pending;
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page
+      .getByLabel("What needs to happen?")
+      .fill("Private draft before topic-session revocation");
+    await expect(
+      page.getByRole("dialog", { name: "Assign a task", exact: true }),
+    ).toBeVisible();
+    release();
+    await expect(
+      page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
+    ).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.locator("textarea")).toHaveCount(0);
+    await expect(
+      page.getByRole("heading", { name: "Needs Beau", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("Verify the isolated Viewer staging candidate"),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "New task", exact: true }),
+    ).toBeDisabled();
+  } finally {
+    release();
+  }
 });

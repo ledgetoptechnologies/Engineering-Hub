@@ -24,6 +24,11 @@ from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
 from .events import NativeHubEventFeed
 from .autonomy import StagingRuntime
+from .dto import (
+    AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
+    HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO,
+    TaskDTO, TaskListDTO,
+)
 
 PROJECTS = (
     ("engineering-hub", "Engineering Hub"), ("3d-viewer", "3D Viewer"),
@@ -225,7 +230,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def agent(request: Request):
         return settings.agent_auth.agent(request)
 
-    @app.get('/api/hub/v1/autonomy')
+    @app.get('/api/hub/v1/autonomy', response_model=AutonomyDTO, response_model_exclude_unset=True)
     def autonomy_status(request: Request):
         actor(request)
         return autonomy_for()
@@ -241,7 +246,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return TopicPreflight.model_validate_json(json.dumps(preflight_for(topic, recipient)))
 
-    @app.get('/api/hub/v1/events/status')
+    @app.get('/api/hub/v1/events/status', response_model=EventStatusDTO)
     def event_status(request: Request):
         actor(request)
         return feed.status
@@ -278,13 +283,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                  "reason": "live_presence_adapter_not_configured"}
                 for name in ("hermes", "codex", "claude")]
 
-    @app.get("/health")
+    @app.get("/health", response_model=HealthDTO)
     def health():
         # Control service liveness is not host, agent or deployment readiness.
         repo.get_paused()
         return {"ok": True, "service": "engineering-hub-control"}
 
-    @app.get("/api/hub/v1/overview")
+    @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     def overview(request: Request):
         actor(request)
         return {"paused": repo.get_paused(), "projects": projects(),
@@ -295,69 +300,69 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                  "fixture_dispatch": fixture_workflow is not None,
                                  "merge_gate_strength": "not_enforced"}}
 
-    @app.get("/api/hub/v1/projects")
+    @app.get("/api/hub/v1/projects", response_model=ProjectListDTO)
     def list_projects(request: Request):
         actor(request)
         return {"items": projects()}
 
-    @app.get("/api/hub/v1/agents")
+    @app.get("/api/hub/v1/agents", response_model=AgentListDTO)
     def list_agents(request: Request):
         actor(request)
         return {"items": agents()}
 
-    @app.get("/api/hub/v1/tasks")
+    @app.get("/api/hub/v1/tasks", response_model=TaskListDTO)
     def list_tasks(request: Request):
         actor(request)
         return {"items": repo.list_tasks()}
 
-    @app.post("/api/hub/v1/tasks", status_code=201)
+    @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO)
     def create_task(payload: NewTask, request: Request):
         return repo.create_task(human(request, mutation=True), payload.project,
                                 payload.title, payload.client_request_id)
 
-    @app.get("/api/hub/v1/tasks/{task_id}")
+    @app.get("/api/hub/v1/tasks/{task_id}", response_model=TaskDTO)
     def get_task(task_id: str, request: Request):
         actor(request)
         return repo.get_task(task_id)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/claim")
+    @app.post("/api/hub/v1/tasks/{task_id}/claim", response_model=TaskDTO)
     def claim(task_id: str, payload: Revision, request: Request):
         return repo.claim_task(agent(request), task_id, payload.expected_revision)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/candidate")
+    @app.post("/api/hub/v1/tasks/{task_id}/candidate", response_model=TaskDTO)
     def candidate(task_id: str, payload: Candidate, request: Request):
         return repo.set_candidate(agent(request), task_id, payload.expected_revision, payload.commit)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/review")
+    @app.post("/api/hub/v1/tasks/{task_id}/review", response_model=TaskDTO)
     def review(task_id: str, payload: Review, request: Request):
         return repo.review_task(agent(request), task_id, payload.expected_revision,
                                 payload.commit, payload.verdict)
 
-    @app.get("/api/hub/v1/decisions")
+    @app.get("/api/hub/v1/decisions", response_model=DecisionListDTO, response_model_exclude_unset=True)
     def list_decisions(request: Request):
         actor(request)
         return {"items": repo.list_decisions()}
 
-    @app.post("/api/hub/v1/decisions", status_code=201)
+    @app.post("/api/hub/v1/decisions", status_code=201, response_model=DecisionDTO, response_model_exclude_unset=True)
     def create_decision(payload: NewDecision, request: Request):
         return repo.create_decision(actor(request, mutation=True), payload.project,
                                     payload.title, payload.options, payload.protected)
 
-    @app.post("/api/hub/v1/decisions/{decision_id}/answer")
+    @app.post("/api/hub/v1/decisions/{decision_id}/answer", response_model=DecisionDTO, response_model_exclude_unset=True)
     def answer(decision_id: str, payload: Answer, request: Request):
         return repo.answer_decision(human(request, mutation=True), decision_id,
                                     payload.expected_revision, payload.answer)
 
-    @app.post("/api/hub/v1/pause")
+    @app.post("/api/hub/v1/pause", response_model=PauseDTO)
     def pause(payload: Pause, request: Request):
         return repo.set_pause(human(request, mutation=True), payload.paused)
 
-    @app.get("/api/hub/v1/runs")
+    @app.get("/api/hub/v1/runs", response_model=RunListDTO)
     def list_runs(request: Request):
         actor(request)
         return {"items": repo.list_runs()}
 
-    @app.post("/api/hub/v1/runs", status_code=201)
+    @app.post("/api/hub/v1/runs", status_code=201, response_model=RunDTO)
     def create_run(payload: NewRun, request: Request):
         identity = agent(request)
         # Remains fail-closed until operator-owned manifests and an actual
@@ -367,7 +372,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return fixture_workflow.create_run(identity, payload.task_id, payload.expected_revision,
                                            payload.artifact_digest, payload.target)
 
-    @app.post("/api/hub/v1/runs/{run_id}/dispatch")
+    @app.post("/api/hub/v1/runs/{run_id}/dispatch", response_model=RunDTO)
     async def dispatch(run_id: str, request: Request):
         identity = agent(request)
         if fixture_workflow is None:

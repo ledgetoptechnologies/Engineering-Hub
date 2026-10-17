@@ -148,6 +148,7 @@ export function HubApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [data, setData] = useState<Overview | null>(null);
   const [peers, setPeers] = useState<TopicSnapshot | null>(null);
+  const [topicError, setTopicError] = useState("");
   const [events, setEvents] = useState<EventsStatus | null>(null);
   const [topic, setTopic] = useState("auto-wake-v1-test");
   const [topicDraft, setTopicDraft] = useState(topic);
@@ -163,8 +164,40 @@ export function HubApp() {
   const [taskTitle, setTaskTitle] = useState("");
   const [taskProject, setTaskProject] = useState<ProjectId>("engineering-hub");
   const [pauseChoice, setPauseChoice] = useState<boolean | null>(null);
+  const [decisionChoices, setDecisionChoices] = useState<
+    Record<string, { revision: number; answer: string }>
+  >({});
+  const [protectedChoice, setProtectedChoice] = useState<{
+    id: string;
+    revision: number;
+    title: string;
+    answer: string;
+  } | null>(null);
   const requests = useRef(0);
   const taskRequest = useRef<{ payload: string; key: string } | null>(null);
+
+  const clearPrivateWorkspace = useCallback(() => {
+    // Also fence late reads from a request whose identity is no longer valid.
+    requests.current++;
+    setSession(null);
+    setData(null);
+    setPeers(null);
+    setEvents(null);
+    setTopicError("");
+    setLoading(false);
+    setStale(true);
+    setNewTask(false);
+    setTaskTitle("");
+    setTaskProject("engineering-hub");
+    taskRequest.current = null;
+    setPauseChoice(null);
+    setDecisionChoices({});
+    setProtectedChoice(null);
+    setProject("all");
+    // Clear the editable draft without changing the applied topic: changing it
+    // would trigger another refresh and could immediately undo fail-closed UI.
+    setTopicDraft("");
+  }, []);
 
   const refresh = useCallback(
     async (canVerify: () => boolean = () => true) => {
@@ -175,18 +208,43 @@ export function HubApp() {
         if (request !== requests.current) return false;
         setSession(nextSession);
         if (!nextSession.authenticated) {
-          setData(null);
-          setPeers(null);
+          clearPrivateWorkspace();
           return false;
         }
-        const [overview, snapshot, status] = await Promise.all([
+        setPeers(null);
+        setTopicError("");
+        // Topic evidence is independent of workspace records. A slow or hung
+        // observer must not hold overview loading or the human task controls.
+        void client.getTopic(topic).then(
+          (snapshot) => {
+            if (request !== requests.current) return;
+            if (!canVerify()) return; // A disconnected SSE generation cannot revive readiness.
+            setPeers(snapshot);
+            setTopicError("");
+          },
+          (error) => {
+            if (request !== requests.current) return;
+            setPeers(null);
+            if (
+              error instanceof HubApiError &&
+              [401, 403].includes(error.status)
+            ) {
+              setNotice(errorText(error));
+              setNoticeError(true);
+              clearPrivateWorkspace();
+            } else {
+              setTopicError(
+                "Topic status unavailable. Check the topic and retry; workspace records remain available.",
+              );
+            }
+          },
+        );
+        const [overview, status] = await Promise.all([
           client.getOverview(),
-          client.getTopic(topic),
           client.getEventsStatus(),
         ]);
         if (request !== requests.current) return false;
         setData(overview);
-        setPeers(snapshot);
         setEvents(status);
         setStale(!canVerify());
         if (!status.available && canVerify())
@@ -197,17 +255,15 @@ export function HubApp() {
         setNotice(errorText(error));
         setNoticeError(true);
         setStale(true);
-        if (error instanceof HubApiError && error.status === 401) {
-          setSession(null);
-          setData(null);
-          setPeers(null);
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+          clearPrivateWorkspace();
         }
         return false;
       } finally {
         if (request === requests.current) setLoading(false);
       }
     },
-    [client, topic, demo],
+    [client, topic, demo, clearPrivateWorkspace],
   );
   useEffect(() => {
     void refresh();
@@ -330,13 +386,8 @@ export function HubApp() {
         [401, 403, 409].includes(error.status)
       ) {
         setStale(true);
-        if (error.status === 401) {
-          requests.current++;
-          setSession(null);
-          setData(null);
-          setPeers(null);
-          setNewTask(false);
-          setPauseChoice(null);
+        if ([401, 403].includes(error.status)) {
+          clearPrivateWorkspace();
         }
       }
       return false;
@@ -347,6 +398,41 @@ export function HubApp() {
   const writable = Boolean(
     session?.authenticated && data && !loading && !working && !(stale && !demo),
   );
+  useEffect(() => {
+    // A selected answer is bound to the exact current decision revision.
+    // Any stale workspace invalidates both intent and pending confirmation.
+    setDecisionChoices((previous) => {
+      if (stale || !data) return Object.keys(previous).length ? {} : previous;
+      const valid = Object.fromEntries(
+        Object.entries(previous).filter(([id, choice]) =>
+          data.decisions.some(
+            (item) =>
+              item.id === id &&
+              item.status === "open" &&
+              item.revision === choice.revision &&
+              item.options.includes(choice.answer),
+          ),
+        ),
+      );
+      return Object.keys(valid).length === Object.keys(previous).length
+        ? previous
+        : valid;
+    });
+    setProtectedChoice((previous) => {
+      if (!previous) return null;
+      return !stale &&
+        data?.decisions.some(
+          (item) =>
+            item.id === previous.id &&
+            item.status === "open" &&
+            item.revision === previous.revision &&
+            item.title === previous.title &&
+            item.options.includes(previous.answer),
+        )
+        ? previous
+        : null;
+    });
+  }, [stale, data]);
   const openDecisions =
     data?.decisions.filter(
       (item) =>
@@ -373,7 +459,7 @@ export function HubApp() {
     event.preventDefault();
     if (topicDraft !== topic) {
       setPeers(null);
-      setStale(true);
+      setTopicError("");
       setTopic(topicDraft);
     } else void refresh();
   }
@@ -404,15 +490,39 @@ export function HubApp() {
     decision: Decision,
   ) {
     event.preventDefault();
-    const answer = new FormData(event.currentTarget).get("answer") as string;
-    await mutate(
-      () =>
-        client.answerDecision(
-          decision.id,
-          decision.revision,
-          answer,
-          session!.csrf_token!,
-        ),
+    const choice = decisionChoices[decision.id];
+    if (
+      !writable ||
+      !choice ||
+      choice.revision !== decision.revision ||
+      !decision.options.includes(choice.answer)
+    )
+      return;
+    if (decision.protected) {
+      setProtectedChoice({
+        id: decision.id,
+        revision: decision.revision,
+        title: decision.title,
+        answer: choice.answer,
+      });
+      return;
+    }
+    await submitDecision(decision.id, decision.revision, choice.answer);
+  }
+  async function submitDecision(id: string, revision: number, answer: string) {
+    if (
+      !writable ||
+      !data?.decisions.some(
+        (item) =>
+          item.id === id &&
+          item.revision === revision &&
+          item.status === "open" &&
+          item.options.includes(answer),
+      )
+    )
+      return false;
+    return mutate(
+      () => client.answerDecision(id, revision, answer, session!.csrf_token!),
       "Decision recorded, not an execution grant.",
     );
   }
@@ -436,7 +546,10 @@ export function HubApp() {
             className={project === "all" ? "nav-item selected" : "nav-item"}
             onClick={() => setProject("all")}
           >
-            <Icon kind="grid" /> Overview <span className="nav-arrow">↗</span>
+            <Icon kind="grid" /> Overview{" "}
+            <span className="nav-arrow" aria-hidden="true">
+              ↗
+            </span>
           </button>
           <a className="nav-item" href="#work">
             <Icon kind="folder" /> Assigned work
@@ -467,21 +580,30 @@ export function HubApp() {
             <span className="dot" /> Staging, not production
             <p>Processing workloads stay separate.</p>
           </div>
-          <div className="profile">
-            <span className="avatar">{demo ? "D" : "BK"}</span>
+          <div
+            className="profile"
+            title={
+              session?.authenticated
+                ? `${session.actor ?? "Authorized operator"} · GitHub ID ${session.github_id ?? "unknown"}`
+                : "Sign-in required"
+            }
+          >
+            <span className="avatar" aria-hidden="true">
+              {demo ? "D" : session?.authenticated ? "GH" : "—"}
+            </span>
             <div>
               <strong>
                 {demo
                   ? "Demo workspace"
                   : session?.authenticated
-                    ? "Beau"
+                    ? session.actor
                     : "Private workspace"}
               </strong>
               <small>
                 {demo
                   ? "Sample data only"
                   : session?.authenticated
-                    ? "Authorized operator"
+                    ? `GitHub ID ${session.github_id ?? "unknown"}`
                     : "Sign-in required"}
               </small>
             </div>
@@ -683,14 +805,27 @@ export function HubApp() {
                         <legend className="sr-only">
                           Answer for {decision.title}
                         </legend>
-                        {decision.options.map((option, index) => (
+                        {decision.options.map((option) => (
                           <label className="radio-option" key={option}>
                             <input
                               type="radio"
                               name="answer"
                               value={option}
                               required
-                              defaultChecked={index === 0}
+                              checked={
+                                decisionChoices[decision.id]?.revision ===
+                                  decision.revision &&
+                                decisionChoices[decision.id]?.answer === option
+                              }
+                              onChange={() =>
+                                setDecisionChoices((previous) => ({
+                                  ...previous,
+                                  [decision.id]: {
+                                    revision: decision.revision,
+                                    answer: option,
+                                  },
+                                }))
+                              }
                             />
                             <span>{option}</span>
                           </label>
@@ -701,7 +836,15 @@ export function HubApp() {
                               ? "Protected request · not an execution grant"
                               : "Records a decision. Does not deploy."}
                           </span>
-                          <button type="submit" className="dark-button">
+                          <button
+                            type="submit"
+                            className="dark-button"
+                            disabled={
+                              !writable ||
+                              decisionChoices[decision.id]?.revision !==
+                                decision.revision
+                            }
+                          >
                             Record decision <Icon kind="arrow" />
                           </button>
                         </div>
@@ -890,6 +1033,11 @@ export function HubApp() {
                     </button>
                   </div>
                 </form>
+                {topicError && (
+                  <p role="alert" className="notice error">
+                    {topicError}
+                  </p>
+                )}
                 <div className="peer-list">
                   {peers?.items.map((peer) => {
                     const state = peerState(peer);
@@ -908,6 +1056,14 @@ export function HubApp() {
                                 : state === "reachable"
                                   ? "Exact-topic route verified"
                                   : pretty(state)}
+                          </small>
+                          <small>
+                            {pretty(peer.reason)}
+                            {state !== peer.status
+                              ? !demo && stale
+                                ? " · Snapshot unverified"
+                                : " · Evidence expired"
+                              : ""}
                           </small>
                         </div>
                         <Badge
@@ -956,6 +1112,43 @@ export function HubApp() {
           </>
         )}
       </main>
+      {protectedChoice && (
+        <Modal
+          title="Confirm protected decision"
+          onClose={() => setProtectedChoice(null)}
+        >
+          <p className="modal-copy">
+            This records your decision only. It does not grant permission to
+            execute or deploy.
+          </p>
+          <h3>{protectedChoice.title}</h3>
+          <p className="modal-copy">
+            Selected answer: <strong>{protectedChoice.answer}</strong>
+          </p>
+          <div className="modal-actions">
+            <button
+              className="secondary"
+              onClick={() => setProtectedChoice(null)}
+            >
+              Cancel
+            </button>
+            <button
+              className="primary"
+              disabled={!writable}
+              onClick={async () => {
+                const ok = await submitDecision(
+                  protectedChoice.id,
+                  protectedChoice.revision,
+                  protectedChoice.answer,
+                );
+                if (ok) setProtectedChoice(null);
+              }}
+            >
+              Confirm decision
+            </button>
+          </div>
+        </Modal>
+      )}
       {newTask && (
         <Modal title="Assign a task" onClose={() => setNewTask(false)}>
           <form onSubmit={(event) => void saveTask(event)}>

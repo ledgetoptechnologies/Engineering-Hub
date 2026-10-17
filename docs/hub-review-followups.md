@@ -13,13 +13,19 @@ Claude reply: `b3b39d37-ec24-4e91-bc50-b9fd78fc7f6d`, 2026-10-17.
 - F3: display actual authenticated actor/GitHub numeric identity, not a hardcoded
   operator identity.
 
-F1–F3 were assigned to the UI implementation and independent browser QA agents.
-Their completion requires source review and regression evidence, not assignment.
+F1–F3 were implemented and reviewed locally, with twenty real-Edge regressions
+passing. This includes a hanging topic request not blocking fresh overview actions,
+late topic authentication failure removing a private draft, exact protected-choice
+confirmation and cancellation, and actual operator identity. Claude's re-review of
+the correction commit is still pending; no pilot authorization is implied.
 
 ## Remaining contract and integration work
 
-- G1: typed response models/schema coverage for overview, task, decision and run;
-  verify browser types and fixtures against actual server responses to prevent drift.
+- G1: strict public response DTOs and schema coverage for overview, task, decision,
+  run and related records are implemented. Nine Python tests exercise actual
+  persisted states and private-field rejection. `scripts/check_hub_ui_contract.py`
+  validates the actual TypeScript overview/topic fixtures against those models.
+  TypeScript interfaces remain handwritten, not automatically generated.
 - G2: protected execution grants are intentionally unavailable. Current decision
   answers have `execution_authorization=false`. Action/target/artifact/expiry/nonce
   binding is needed before any future protected execution feature; do not call the
