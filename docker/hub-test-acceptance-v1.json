@@ -1,15 +1,35 @@
 {
-  "executor_source_commit": "7bdc3d406209208e81604e303f6e6e39e8d459b3",
-  "hub_source_commit": "10c8b3772ae9ccbd840da2bc170e8e61ef926c1c",
+  "executor_source_commit": "da4cf845dbea2add6ec8f2b0b2c13441468bb665",
+  "runtime_source_commit": "7bdc3d406209208e81604e303f6e6e39e8d459b3",
+  "runtime_git_tree": "5af2b9ff5a6d0ea5094e679c3b5f8263f24879d6",
+  "hub_source_commit": "1b50667940f75f10887b08fa2336bbb17eb438e3",
   "validation": "Detached Hub checkout plus exact git-archived executor-owned files; no Hub-owned files overwritten or main merge",
   "full_linux_suite": {
-    "passed": 669,
-    "seconds": 73.27,
+    "passed": 683,
+    "seconds": 81.49,
     "exit_code": 0,
     "warnings": [
       "Existing Starlette/httpx TestClient deprecation",
       "ResourceWarning: unclosed event loop, emitted during test_presence; allocation/root cause remains under investigation"
     ]
+  },
+  "focused_executor_suite": {"passed": 44, "seconds": 13.86},
+  "real_sigkill_recovery": {
+    "passed": 2,
+    "seconds": 0.42,
+    "boundaries": ["before real effect", "after actual atomic/fsynced effect before result commit"],
+    "ledger": "Independently running both before SIGKILL and after death/before fresh owner startup; held/outcome_unresolved on normal CLI reopen",
+    "stable_identity": "Three replay POSTs plus GETs preserve absent state before-effect or exact state bytes/effect_count1 after-effect",
+    "reconcile": "Bodyless explicit POST inspects only; absent evidence stays held, signed already-written effect becomes succeeded without filesystem replay",
+    "negative_mutation": "Disabling only startup recovery in a disposable copy makes the regression fail: fresh-owner lookup running != held"
+  },
+  "warning_diagnostic": {
+    "source": "10c8b3772ae9ccbd840da2bc170e8e61ef926c1c",
+    "lightweight_allocation_run": "627 passed, two warnings; captured pytest_asyncio/plugin.py:984 _provide_clean_event_loop allocation",
+    "global_tracemalloc_probe": "624 passed, three failed: since-now wait, global peak memory assertion, bounded spawned-writer join; not acceptance",
+    "caveat": "Upload test calls tracemalloc.stop, preventing later global allocation tracing; timing root causes remain unproved",
+    "shared_evidence": "agent-bus/engineering-hub/event-loop-allocation-evidence-2026-10-17.md version1",
+    "fixed": false
   },
   "earlier_failed_attempt": {
     "exit_code": 4,
@@ -30,7 +50,7 @@
     "fixture_credentials": "Ephemeral only; no live credentials or Docker socket",
     "cleanup": "No labeled fixture containers remained after acceptance"
   },
-  "independent_review": "Initial source findings fixed with regression tests; final Codex review requested for exact executor source and remains a separate integration gate",
+  "independent_review": "Codex accepted scoped functional runtime source7bdc3d4 for private local Linux without mixed writers/lock-file replacement; da4cf84 changes tests only. Final crash/container/pilot integration acceptance remains separate",
   "scope": {
     "fixture_only": true,
     "live_staging_activation": false,

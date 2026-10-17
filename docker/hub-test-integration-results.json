@@ -1,5 +1,5 @@
 {
-  "hub_commit": "10c8b3772ae9ccbd840da2bc170e8e61ef926c1c",
+  "hub_commit": "1b50667940f75f10887b08fa2336bbb17eb438e3",
   "transport": "actual container HTTP; explicit fixture fault injection",
   "results": [
     {
