@@ -84,6 +84,11 @@ before copying the database. Copying only the main database while WAL is active
 is not a backup. Protect the DB and backup: they contain session verifiers and
 private task/decision records. Retain NAS dataset backups independently.
 
+`python -m engineering_hub.backup SOURCE DESTINATION` creates a new coherent
+backup, verifies SQLite integrity and prints its SHA-256 and size, not its
+contents. It refuses to overwrite existing files. Choose a restricted destination
+directory: POSIX files are owner-only; Windows files inherit directory ACLs.
+
 After restore, leave dispatch disabled until executor command state, target
 identity, current immutable artifact and fence generation are reconciled. Do not
 replay unknown commands blindly. A container restart test is not proof of TrueNAS
