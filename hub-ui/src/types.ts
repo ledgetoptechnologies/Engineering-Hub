@@ -90,6 +90,7 @@ export interface Capabilities {
   github_merge: boolean;
   processing: boolean;
   fixture_dispatch: boolean;
+  container_pilot_dispatch: boolean;
   merge_gate_strength: string;
 }
 export interface Overview {

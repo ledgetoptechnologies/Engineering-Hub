@@ -95,6 +95,7 @@ export function createDemoOverview(now = new Date()): Overview {
       github_merge: false,
       processing: false,
       fixture_dispatch: false,
+      container_pilot_dispatch: false,
       merge_gate_strength: "not_enforced",
     },
   };

@@ -1,0 +1,230 @@
+"""Explicit container-pilot controller; never a Docker client or default worker.
+
+The operator supplies a binding to a complete host-owned canonical manifest.
+The manifest digest is not an agent approval or proof of image provenance. Host
+acceptance must independently validate that manifest and actual Docker effects.
+Fixture actions, manifests and ledgers are deliberately not reused here.
+"""
+from dataclasses import asdict, dataclass
+import json
+import re
+import uuid
+
+from .container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
+from .repository import HubError
+
+
+@dataclass(frozen=True)
+class ContainerPilotTarget:
+    """Immutable controller view of an operator-selected complete host manifest.
+
+    Image IDs are Docker config IDs, not registry manifest digests. This object
+    does not construct the full host manifest or authorize an arbitrary daemon.
+    """
+    artifact_digest: str
+    candidate_commit: str
+    manifest_digest: str
+    rollback_image_config_id: str
+    rollback_commit: str
+    target_id: str = 'engineering-hub:staging'
+    policy_revision: int = 1
+    driver: str = 'container_pilot_v1'
+
+    def __post_init__(self):
+        if self.driver != 'container_pilot_v1' or self.policy_revision != 1:
+            raise ValueError('container_pilot_binding_required')
+        if type(self.policy_revision) is not int:
+            raise ValueError('container_pilot_binding_required')
+        for digest in (self.artifact_digest, self.manifest_digest, self.rollback_image_config_id):
+            if not isinstance(digest, str) or re.fullmatch(r'sha256:[0-9a-f]{64}', digest) is None:
+                raise ValueError('invalid_pilot_digest')
+        if self.artifact_digest == self.rollback_image_config_id:
+            raise ValueError('distinct_pilot_images_required')
+        for commit in (self.candidate_commit, self.rollback_commit):
+            if not isinstance(commit, str) or re.fullmatch(r'[0-9a-f]{40}', commit) is None:
+                raise ValueError('invalid_pilot_commit')
+        ContainerPilotRequest(schema_version='container_pilot_v1', command_id=str(uuid.uuid4()),
+                              run_id=str(uuid.uuid4()), target_id=self.target_id,
+                              action='deploy_container', manifest_digest=self.manifest_digest,
+                              candidate_commit=self.candidate_commit, policy_revision=1,
+                              fencing_generation=1)
+
+
+class ContainerPilotWorkflow:
+    @staticmethod
+    def _manifest_digest(target):
+        # Recovery fingerprints the original request using the full operator
+        # manifest digest, not a hash of this narrower controller view.
+        return target.manifest_digest
+
+    def __init__(self, repo, client, targets):
+        if repo.execution_principal is None:
+            raise ValueError('execution_identity_required')
+        if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
+            raise ValueError('invalid_pilot_targets')
+        self.repo, self.client = repo, client
+        self.targets = {target.target_id: target for target in targets}
+        if len(self.targets) != len(targets) or any(not isinstance(t, ContainerPilotTarget) for t in targets):
+            raise ValueError('invalid_pilot_targets')
+        with repo._connection() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS hub_container_pilot_commands (
+                    run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,
+                    state TEXT NOT NULL, response_json TEXT, PRIMARY KEY(run_id,action));
+                CREATE TABLE IF NOT EXISTS hub_container_pilot_bindings (
+                    run_id TEXT PRIMARY KEY, binding TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_container_pilot_advances (
+                    run_id TEXT PRIMARY KEY, owner TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_container_pilot_manifest_views (
+                    manifest_digest TEXT PRIMARY KEY, binding TEXT NOT NULL);
+            ''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(hub_container_pilot_commands)')}
+            if 'response_json' not in columns:
+                # Preserve legacy unknown/held reservations; never reconstruct
+                # missing evidence or resend because this column was absent.
+                db.execute('ALTER TABLE hub_container_pilot_commands ADD COLUMN response_json TEXT')
+        # Pin the operator's manifest interpretation before run creation, not
+        # only before the first effect. A restart must not reinterpret the same
+        # manifest digest as a different rollback image or source provenance.
+        with repo._transaction() as db:
+            for target in targets:
+                binding = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+                db.execute('INSERT OR IGNORE INTO hub_container_pilot_manifest_views VALUES(?,?)', (target.manifest_digest, binding))
+                prior = db.execute('SELECT binding FROM hub_container_pilot_manifest_views WHERE manifest_digest=?', (target.manifest_digest,)).fetchone()[0]
+                if prior != binding:
+                    raise HubError('container_pilot_manifest_changed', 409)
+
+    def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id, *, client_request_id=None):
+        task = self.repo.get_task(task_id)
+        target = self.targets.get(target_id)
+        if (target is None or task['project'] != 'engineering-hub'
+                or artifact_digest != target.artifact_digest
+                or task['candidate_commit'] != target.candidate_commit):
+            raise HubError('container_pilot_manifest_mismatch', 403)
+        return self.repo.create_run(actor, task_id, expected_revision, artifact_digest, target_id,
+                                    execution_manifest_digest=target.manifest_digest,
+                                    client_request_id=client_request_id)
+
+    def _target(self, run):
+        target = self.targets.get(run['target'])
+        if (target is None or run['artifact_digest'] != target.artifact_digest
+                or run['commit'] != target.candidate_commit
+                or run['policy_revision'] != target.policy_revision
+                or run['execution_actor'] != self.repo.execution_principal
+                or run.get('execution_manifest_digest') != target.manifest_digest):
+            raise HubError('container_pilot_manifest_mismatch', 403)
+        canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+        with self.repo._transaction() as db:
+            db.execute('INSERT OR IGNORE INTO hub_container_pilot_bindings VALUES(?,?)', (run['id'], canonical))
+            prior = db.execute('SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?', (run['id'],)).fetchone()[0]
+            if prior != canonical:
+                raise HubError('container_pilot_manifest_changed', 409)
+        return target
+
+    def _event(self, run, event):
+        return self.repo.append_run_event(self.repo.execution_principal, run['id'], event,
+                                         run['id'], run['fencing_generation'], run['revision'])
+
+    def _hold(self, run):
+        return self._event(run, 'held') if run['status'] in {'pending', 'running'} else run
+
+    @staticmethod
+    def _verified_state(response, command, target):
+        # Typed client verifies echo; retain that boundary even for an injected
+        # adapter and do not equate a transport success with actual app health.
+        if type(response) is not ContainerPilotResponse or any(
+                getattr(response, key, None) != value for key, value in command.model_dump().items()):
+            return 'held'
+        state = response.state
+        if state not in {'succeeded', 'failed'}:
+            return 'held'
+        if state == 'failed':
+            return 'failed'
+        evidence = response.evidence
+        rollback = command.action in {'rollback_container', 'smoke_container_rollback'}
+        expected = target.rollback_image_config_id if rollback else target.artifact_digest
+        if (not evidence.evidence_verified or evidence.image_config_id != expected
+                or not evidence.container_id):
+            return 'held'
+        if command.action in {'smoke_container', 'smoke_container_rollback'} and evidence.health != 'healthy':
+            return 'held'
+        return 'succeeded'
+
+    async def _command(self, run, target, action):
+        command = ContainerPilotRequest(
+            schema_version='container_pilot_v1', command_id=str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:' + action)),
+            run_id=run['id'], target_id=run['target'], action=action,
+            manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
+            policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
+        canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        with self.repo._transaction() as db:
+            row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
+            if row:
+                if row['payload'] != canonical:
+                    raise HubError('container_pilot_manifest_changed', 409)
+                return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+            db.execute('INSERT INTO hub_container_pilot_commands(run_id,action,payload,state) VALUES(?,?,?,?)',
+                       (run['id'], action, canonical, 'unknown'))
+        response_json = None
+        try:
+            response = await self.client.submit_command(command)
+            state = self._verified_state(response, command, target)
+            if type(response) is ContainerPilotResponse:
+                # Typed, bounded adapter assertion, not independent Docker proof.
+                # Retain exact evidence for audit even when it causes a hold.
+                response_json = response.model_dump_json()
+        except Exception:
+            state = 'held'  # No endpoint, credential or exception output retained.
+        with self.repo._transaction() as db:
+            db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
+                       (state, response_json, run['id'], action))
+        return state
+
+    async def advance(self, run_id):
+        owner = str(uuid.uuid4())
+        with self.repo._transaction() as db:
+            if db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone():
+                raise HubError('advance_requires_reconciliation', 409)
+            db.execute('INSERT INTO hub_container_pilot_advances VALUES(?,?)', (run_id, owner))
+        try:
+            run = self.repo.get_run(run_id)
+            target = self._target(run)
+            if run['status'] in {'succeeded', 'rolled_back', 'held'}:
+                return run
+            if self.repo.get_paused():
+                raise HubError('paused', 423)
+            if run['status'] == 'pending':
+                run = self._event(run, 'running')
+            if run['status'] == 'running':
+                for action in ('deploy_container', 'smoke_container'):
+                    if self.repo.get_paused():
+                        return self._hold(run)
+                    state = await self._command(run, target, action)
+                    if state == 'held':
+                        return self._hold(run)
+                    if state == 'failed':
+                        run = self._event(run, 'failed')
+                        break
+                else:
+                    return self._event(run, 'succeeded')
+            if run['status'] == 'failed':
+                for action in ('rollback_container', 'smoke_container_rollback'):
+                    if self.repo.get_paused():
+                        return run
+                    if await self._command(run, target, action) != 'succeeded':
+                        return run  # Retain reservation; never claim healthy rollback.
+                return self._event(run, 'rolled_back')
+            return run
+        finally:
+            with self.repo._transaction() as db:
+                db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?', (run_id, owner))
+
+    async def inspect(self, run_id, action):
+        run = self.repo.get_run(run_id)
+        self._target(run)
+        with self.repo._connection() as db:
+            row = db.execute('SELECT payload FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run_id, action)).fetchone()
+        if row is None:
+            raise HubError('command_not_found', 404)
+        # No automatic reconcile, effect replay, release or takeover.
+        return await self.client.get_command(ContainerPilotRequest(**json.loads(row['payload'])))

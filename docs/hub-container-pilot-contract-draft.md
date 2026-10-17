@@ -95,3 +95,39 @@ None of this substitutes for dedicated OAuth setup, canonical topic attachment,
 TrueNAS storage/backup checks, staging-host writer exclusion or actual host reboot
 acceptance. The default Hub startup remains non-dispatching until explicitly
 configured with a reviewed workflow and operator manifest.
+
+## Controller source slice (not actual app acceptance)
+
+`container_pilot_client.py` and `container_pilot.py` implement the separate typed
+client/controller. Explicit constructor injection enables only the new
+`/api/hub/v1/container-pilot/runs` and run dispatch namespace. Existing fixture
+routes remain disabled when only the pilot workflow is injected. Both workflows
+cannot be configured together in this first slice. No environment setting, agent
+request or default entrypoint constructs a pilot workflow or selects a daemon.
+The overview reports `container_pilot_dispatch` independently of fixture support.
+
+The controller binds the complete operator manifest digest in each reviewed run
+and durably pins its narrower immutable view before creating runs. That view
+includes candidate/rollback image config IDs and source commits; it does not
+invent or validate the still-to-be-agreed full host manifest. The host adapter
+must independently enforce that full manifest before any actual deployment.
+
+Wire responses echo every request field and add `state`, nullable fixed `reason`,
+`evidence` and `replayed`. Evidence fields are exactly `container_id` (64 lowercase
+hex or null), `image_config_id` (SHA-256 or null), `health`
+(`unknown|healthy|unhealthy`) and strict boolean `evidence_verified`. These remain
+adapter assertions, not independent Docker verification. Both health phases
+require a matching image/container plus healthy evidence; start/create success
+alone cannot complete the run or rollback. Unknown outcomes preserve stable IDs,
+hold reservations and never trigger automatic repost or takeover.
+The private command ledger retains the exact bounded typed adapter response,
+including mismatched evidence that caused a hold. Unknown outcomes retain null
+evidence rather than an invented success. Older unknown reservations gain only
+the nullable evidence column on upgrade; absence never permits resubmission.
+
+The draft reason vocabulary is `inspect_required`, `paused`, `target_busy`,
+`stale_fence`, `identity_conflict`, `manifest_mismatch`, `policy_mismatch`,
+`image_unavailable`, `daemon_unavailable`, `container_conflict`, `evidence_mismatch`,
+`health_failed`, `effect_failed` and `recovery_required`. Adapter agreement and
+actual image/state/health/restart acceptance remain outstanding. MockTransport
+and typed-fake controller tests are not an application pilot.

@@ -57,7 +57,8 @@ class StagingDispatcher:
                     and review and review.get('actor') in AGENTS
                     and review['actor'] != task['owner'] and review.get('verdict') == 'approve'
                     and review.get('commit') == task['candidate_commit'] == target.candidate_commit
-                    and target.policy_revision == 1 and target.driver == 'fixture')
+                    and target.policy_revision == 1
+                    and target.driver in {'fixture', 'container_pilot_v1'})
 
     def _reserve_next(self):
         """Select/validate/reserve and advance one durable event atomically."""

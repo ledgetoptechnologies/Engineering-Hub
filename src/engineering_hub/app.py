@@ -24,6 +24,7 @@ from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
 from .events import NativeHubEventFeed
 from .autonomy import StagingRuntime
+from .container_pilot import ContainerPilotWorkflow
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO,
@@ -120,15 +121,22 @@ class TopicPreflight(Input):
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
-               staging_dispatcher=None):
+               staging_dispatcher=None, container_pilot_workflow=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
     if fixture_workflow is not None and fixture_workflow.repo is not repo:
         raise ValueError("fixture_repository_mismatch")
+    if container_pilot_workflow is not None and (
+            type(container_pilot_workflow) is not ContainerPilotWorkflow
+            or container_pilot_workflow.repo is not repo):
+        raise ValueError('container_pilot_repository_mismatch')
+    if fixture_workflow is not None and container_pilot_workflow is not None:
+        raise ValueError('one_staging_workflow_required')
+    configured_workflow = container_pilot_workflow or fixture_workflow
     sessions = SessionStore(settings.database)
     feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
-            staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not fixture_workflow):
+            staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):
         raise ValueError('dispatcher_workflow_mismatch')
     runtime = StagingRuntime(staging_dispatcher, feed) if staging_dispatcher is not None else None
 
@@ -298,6 +306,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
                                  "fixture_dispatch": fixture_workflow is not None,
+                                 "container_pilot_dispatch": container_pilot_workflow is not None,
                                  "merge_gate_strength": "not_enforced"}}
 
     @app.get("/api/hub/v1/projects", response_model=ProjectListDTO)
@@ -380,6 +389,23 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if repo.get_run(run_id)['created_by'] != identity:
             raise HTTPException(403, detail={"code": "forbidden"})
         return await fixture_workflow.advance(run_id)
+
+    @app.post("/api/hub/v1/container-pilot/runs", status_code=201, response_model=RunDTO)
+    def create_container_pilot_run(payload: NewRun, request: Request):
+        identity = agent(request)
+        if container_pilot_workflow is None:
+            raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
+        return container_pilot_workflow.create_run(identity, payload.task_id, payload.expected_revision,
+                                                   payload.artifact_digest, payload.target)
+
+    @app.post("/api/hub/v1/container-pilot/runs/{run_id}/dispatch", response_model=RunDTO)
+    async def dispatch_container_pilot(run_id: str, request: Request):
+        identity = agent(request)
+        if container_pilot_workflow is None:
+            raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
+        if repo.get_run(run_id)['created_by'] != identity:
+            raise HTTPException(403, detail={'code': 'forbidden'})
+        return await container_pilot_workflow.advance(run_id)
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")

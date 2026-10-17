@@ -772,6 +772,83 @@
           }
         }
       }
+    },
+    "/api/hub/v1/container-pilot/runs": {
+      "post": {
+        "summary": "Create Container Pilot Run",
+        "operationId": "create_container_pilot_run_api_hub_v1_container_pilot_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/container-pilot/runs/{run_id}/dispatch": {
+      "post": {
+        "summary": "Dispatch Container Pilot",
+        "operationId": "dispatch_container_pilot_api_hub_v1_container_pilot_runs__run_id__dispatch_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -942,6 +1019,10 @@
             "type": "boolean",
             "title": "Fixture Dispatch"
           },
+          "container_pilot_dispatch": {
+            "type": "boolean",
+            "title": "Container Pilot Dispatch"
+          },
           "merge_gate_strength": {
             "type": "string",
             "const": "not_enforced",
@@ -956,6 +1037,7 @@
           "github_merge",
           "processing",
           "fixture_dispatch",
+          "container_pilot_dispatch",
           "merge_gate_strength"
         ],
         "title": "CapabilitiesDTO"

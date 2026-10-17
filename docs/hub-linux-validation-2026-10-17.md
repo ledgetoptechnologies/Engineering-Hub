@@ -109,3 +109,35 @@ This integrated suite includes real loopback HTTP and actual SIGKILL recovery,
 but does not start nested Docker or establish an actual application rollout.
 The separate four-scenario Docker acceptance was peer-run on Hub `1b50667` plus
 executor `da4cf84`; revalidation on the integrated revision remains distinct.
+
+## Pilot controller source validation
+
+After the separate pilot client/workflow/API slice and functional-review fixes,
+the normal isolated Linux suite passed **858 tests in 56.87 seconds**, with only
+the existing Starlette deprecation. Image ID:
+`sha256:d692f0304cbfa318a86f16925b00ab87b2b92ab8b3c19b77edbe1fcd69f831d6`.
+This frozen overlay is based on `aed6cb8`, with the new pilot controller/client,
+142 added tests, separate API routes/capability, dispatcher support and regenerated
+OpenAPI. It is not labelled an earlier exact Git commit. Isolation and private
+tmpfs bounds match the integrated executor run above; no Docker socket is mounted.
+The test container was removed after exit. Browser validation also passed eight
+unit tests, TypeScript/Vite build and all 20 real Edge tests. Current TypeScript
+fixtures and the published OpenAPI match the server response models.
+
+Independent functional review found a dispatcher restart-path incompatibility:
+the pilot workflow needed the original manifest-digest recovery method. It was
+fixed and tested across local receipt/completion-record crash gaps, with exact
+run/fence preservation, explicit quiescence and no repeated command submissions.
+Typed adapter responses are retained durably as assertions; unknown outcomes
+remain null. Migration preserves legacy unknown reservations without replay.
+These new pilot tests use typed fakes/MockTransport, not actual application Docker
+effects. The host adapter/full manifest/real app campaign remain incomplete.
+
+Hermes separately ran the existing four real Docker FILE-fixture scenarios once
+against exact `aed6cb8ea3eec2bce16be6d63136d3da63ef2ff8`: success two POSTs,
+corruption/rollback three, lost post-commit response one and persistent pause one.
+Every scenario restarted its actual container with no repeated POST. Root
+retrieved the canonical report from shared knowledge at
+`agent-bus/engineering-hub/acceptance/aed6cb8-fixture-container.md`, version 1,
+SHA-256 `0e4b86bee2395a3f8ddaf0f21e6cedd001367a0cd8edac4b5929f62fef14f9fc`.
+This is peer-run exact-source container evidence, not a root-run application pilot.

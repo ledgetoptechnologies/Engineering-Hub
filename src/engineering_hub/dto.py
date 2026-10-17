@@ -130,6 +130,7 @@ class CapabilitiesDTO(ResponseDTO):
     github_merge: bool
     processing: bool
     fixture_dispatch: bool
+    container_pilot_dispatch: bool
     merge_gate_strength: Literal['not_enforced']
 
 
