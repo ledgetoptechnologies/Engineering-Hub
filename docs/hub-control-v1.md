@@ -109,6 +109,41 @@ must be labelled as fixtures, not represented as usable production login.
 
 ## Storage and recovery
 
+### Dashboard source and isolated image checks
+
+`hub-ui/` contains the React dashboard. From that directory, use `npm ci`,
+`npm test`, `npm run build`, and `npm run test:e2e` (Playwright needs an installed
+browser; Windows tests use Edge). `npm run dev` binds only to loopback and proxies
+the Hub API to loopback port 8770. The dev server is not a production deployment.
+The explicit `?demo=1` workspace uses synthetic, browser-memory fixtures and makes
+no API calls. The normal URL always uses the real cookie-authenticated API.
+
+The independent `docker/Dockerfile.hub-control` builds and bundles the dashboard;
+the live message-bus image and its port remain unchanged. It serves the UI and API
+from one origin. The image runs as UID/GID 10001 with `HUB_DB` defaulting to
+`/var/lib/hub/hub.sqlite3`. A real deployment must explicitly provide protected,
+durable local storage there; the image filesystem itself is not a backup.
+
+After building a local image, run
+`python scripts/hub_dashboard_container_smoke.py --image <local-image>`.
+This creates and removes only its uniquely named disposable container: no network,
+host ports, host mounts, production tokens or OAuth credentials. It verifies static
+assets, security headers, auth-disabled startup and denial of private API reads.
+Its disposable tmpfs deliberately does **not** establish storage/reboot acceptance.
+
+Browser connection indicators expire locally without HTTP status polling. Native
+SSE invalidations are coalesced; disconnects invalidate readiness and block writes
+until reconciled. Topic readiness remains advisory, separate from durable mail,
+claiming work, executing work and completing it.
+
+Local verification on 2026-10-17: production Vite/TypeScript build, eight API-client
+unit tests, twelve real-Edge Playwright tests, and the network-disabled container
+smoke passed. The Hub Python suite passed 366 tests with two Windows-specific
+skips. Browser tests mock private API data and exercise real native browser fetch,
+Origin/cookies/CSRF, stale-response handling, distinct peer expiry deadlines,
+topic switching, invalidation coalescing, conflict recovery and session expiry.
+They do not establish a real GitHub OAuth callback or live registry attachment.
+
 Keep the control DB on local storage on its host, not an SMB SQLite WAL path.
 Use SQLite's backup API for a coherent backup while running, or stop all writers
 before copying the database. Copying only the main database while WAL is active

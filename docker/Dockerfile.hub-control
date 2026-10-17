@@ -1,4 +1,11 @@
 # Independent build: do not change the deployed message-bus image or entrypoint.
+FROM node:24-bookworm-slim AS dashboard
+WORKDIR /ui
+COPY hub-ui/package.json hub-ui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY hub-ui/ ./
+RUN npm run build
+
 FROM python:3.12-slim AS builder
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /build
@@ -8,15 +15,18 @@ COPY src ./src
 RUN uv sync --locked --no-default-groups --no-editable
 
 FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}"
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}" \
+    HUB_UI_DIRECTORY=/app/dashboard HUB_DB=/var/lib/hub/hub.sqlite3
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Engineering Hub Control" \
       org.opencontainers.image.source="https://github.com/ledgetoptechnologies/Engineering-Hub" \
       org.opencontainers.image.revision="${VCS_REF}"
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=dashboard /ui/dist /app/dashboard
 RUN groupadd --system --gid 10001 hub \
-    && useradd --system --uid 10001 --gid hub --no-create-home hub
+    && useradd --system --uid 10001 --gid hub --no-create-home hub \
+    && mkdir -p /var/lib/hub && chown hub:hub /var/lib/hub && chmod 0700 /var/lib/hub
 USER 10001:10001
 EXPOSE 8770
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

@@ -1,0 +1,611 @@
+import { expect, test } from "@playwright/test";
+import type { Page, Request } from "@playwright/test";
+import { createDemoOverview, createDemoTopic } from "../src/mocks";
+
+const NOW = new Date("2026-10-17T18:00:00.000Z");
+const ORIGIN = "http://127.0.0.1:5174";
+const CSRF = "fixture-human-only-csrf";
+
+async function mockLive(
+  page: Page,
+  { signedIn = true, events = false, expires = false } = {},
+) {
+  const overview = createDemoOverview(NOW);
+  const requests: Request[] = [];
+  let overviewReads = 0;
+  await page
+    .context()
+    .addCookies([
+      {
+        name: "hub_session",
+        value: "fixture-browser-session",
+        url: ORIGIN,
+        httpOnly: true,
+      },
+    ]);
+  await page.route("**/api/hub/v1/**", async (route) => {
+    const request = route.request();
+    requests.push(request);
+    const path = new URL(request.url()).pathname;
+    const respond = (body: unknown, status = 200) =>
+      route.fulfill({
+        status,
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      });
+    if (path.endsWith("/auth/me"))
+      return respond({
+        authenticated: signedIn,
+        actor: signedIn ? "human:42" : null,
+        github_id: signedIn ? 42 : null,
+        csrf_token: signedIn ? CSRF : null,
+      });
+    if (!signedIn)
+      return respond({ detail: { code: "sign_in_required" } }, 401);
+    if (request.method() === "POST") {
+      const headers = await request.allHeaders();
+      expect(headers["origin"]).toBe(ORIGIN);
+      expect(headers["x-hub-csrf"]).toBe(CSRF);
+      expect(headers["authorization"]).toBeUndefined();
+      expect(headers["cookie"]).toContain(
+        "hub_session=fixture-browser-session",
+      );
+      if (path.endsWith("/tasks")) {
+        const payload = request.postDataJSON();
+        expect(payload.client_request_id).toMatch(/^[0-9a-f-]{36}$/);
+        const task = {
+          ...overview.tasks[1],
+          id: "fixture-created-task",
+          project: payload.project,
+          title: payload.title,
+          owner: null,
+          status: "assigned" as const,
+          revision: 1,
+        };
+        overview.tasks.push(task);
+        return respond(task, 201);
+      }
+      if (path.endsWith("/pause")) {
+        overview.paused = request.postDataJSON().paused;
+        return respond({ paused: overview.paused, revision: 1 });
+      }
+      if (path.includes("/decisions/") && path.endsWith("/answer")) {
+        const decision = overview.decisions[0];
+        decision.answer = request.postDataJSON().answer;
+        decision.status = "answered";
+        decision.revision++;
+        return respond(decision);
+      }
+      return respond({ detail: { code: "unexpected_write" } }, 500);
+    }
+    if (path.endsWith("/overview")) {
+      overviewReads++;
+      return respond(overview);
+    }
+    if (path.endsWith("/events/status"))
+      return respond({
+        available: events,
+        reason: events ? "native_source_active" : "native_source_unsupported",
+        observer_epoch: "fixture-public-epoch",
+        cursor: 0,
+      });
+    if (path.includes("/topics/") && path.endsWith("/peers")) {
+      const topic = decodeURIComponent(
+        path.split("/topics/")[1].replace("/peers", ""),
+      );
+      const snapshot = createDemoTopic(topic, NOW);
+      if (expires) {
+        snapshot.items[0].valid_until = new Date(
+          NOW.getTime() + 1000,
+        ).toISOString();
+        snapshot.items[1].valid_until = new Date(
+          NOW.getTime() + 3000,
+        ).toISOString();
+      }
+      return respond(snapshot);
+    }
+    return respond({ detail: { code: "unexpected_read" } }, 500);
+  });
+  return { overview, requests, reads: () => overviewReads };
+}
+
+async function controllableEvents(page: Page) {
+  await page.addInitScript(() => {
+    (window as any).__hubStreams = [];
+    class FixtureEventSource {
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      closed = false;
+      constructor(
+        public url: string,
+        public options: unknown,
+      ) {
+        (window as any).__hubStreams.push(this);
+        queueMicrotask(() => this.onopen?.(new Event("open")));
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    (window as any).EventSource = FixtureEventSource;
+  });
+}
+
+async function emit(
+  page: Page,
+  kind: "invalidate" | "source_unavailable" | "error" | "open",
+) {
+  await page.evaluate((kind) => {
+    const stream = (window as any).__hubStreams.at(-1);
+    if (!stream || stream.closed)
+      throw new Error("fixture event source unavailable");
+    if (kind === "open") stream.onopen?.(new Event("open"));
+    else if (kind === "error") stream.onerror?.(new Event("error"));
+    else
+      stream.onmessage?.({
+        data: JSON.stringify({
+          kind,
+          observer_epoch: "fixture-public-epoch",
+          cursor: 1,
+        }),
+      });
+  }, kind);
+}
+
+test("demo is explicitly labelled and task/decision/pause actions never contact an API", async ({
+  page,
+}, testInfo) => {
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/api/")) writes.push(request.url());
+  });
+  await page.goto("/?demo=1");
+  await expect(
+    page.getByText("Demo workspace.", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(
+      "Sample records and local-only actions. Not your live infrastructure.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Needs Beau", exact: true }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath("demo-workspace.png"),
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("combobox", { name: "Project", exact: true })
+    .selectOption("3d-viewer");
+  await page
+    .getByLabel("What needs to happen?")
+    .fill("Fixture demo acceptance task");
+  await page.getByRole("button", { name: "Assign task", exact: true }).click();
+  await expect(
+    page.getByText("Fixture demo acceptance task", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toContainText(
+    "Demo only; no server changed.",
+  );
+  await page
+    .getByRole("button", { name: "Record decision", exact: true })
+    .click();
+  await expect(page.getByRole("status")).toContainText(
+    "Decision recorded, not an execution grant.",
+  );
+  await expect(
+    page.getByRole("heading", { name: "Nothing waiting on you." }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Pause new work", exact: true })
+    .click();
+  await expect(page.getByRole("dialog")).toContainText(
+    "Active actions reach a safe boundary",
+  );
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Pause new work", exact: true })
+    .click();
+  await expect(
+    page.getByText("New staging work paused", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Resume", exact: true }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Resume new work", exact: true })
+    .click();
+  await expect(
+    page.getByText("New staging work not paused", { exact: true }),
+  ).toBeVisible();
+  expect(writes).toEqual([]);
+});
+
+test("signed-out live mode shows no sample or private records and makes no private reads", async ({
+  page,
+}) => {
+  const mock = await mockLive(page, { signedIn: false });
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Continue with GitHub" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("heading", { name: "Needs Beau", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Verify the isolated Viewer staging candidate"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Choose the initial scratch-storage benchmark"),
+  ).toHaveCount(0);
+  expect(
+    mock.requests.every((request) =>
+      new URL(request.url()).pathname.endsWith("/auth/me"),
+    ),
+  ).toBe(true);
+});
+
+test("live task creation uses browser session, same-origin request and CSRF without agent bearer", async ({
+  page,
+}) => {
+  const mock = await mockLive(page);
+  await page.goto("/");
+  await expect
+    .poll(() =>
+      mock.requests.map(
+        (request) => `${request.method()} ${new URL(request.url()).pathname}`,
+      ),
+    )
+    .toContain("GET /api/hub/v1/overview");
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await page
+    .getByLabel("What needs to happen?")
+    .fill("Live fixture human assignment");
+  await page.getByRole("button", { name: "Assign task", exact: true }).click();
+  await expect(
+    page.getByText("Live fixture human assignment", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText("Task assigned.");
+  await expect(page.getByText("Demo workspace.", { exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test("SSE invalidation refetches, loss marks routes stale and disables mutations without polling", async ({
+  page,
+}) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  const mock = await mockLive(page, { events: true });
+  await page.goto("/");
+  await expect(
+    page.getByText("Snapshot unverified", { exact: true }),
+  ).toBeVisible();
+  await emit(page, "invalidate");
+  await expect(
+    page.getByText("Event feed connected", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page
+      .locator(".peer-row")
+      .filter({ hasText: "Codex" })
+      .getByText("Reachable", { exact: true }),
+  ).toBeVisible();
+  const reads = mock.reads();
+  await page.clock.runFor(20_000);
+  expect(mock.reads()).toBe(reads);
+  await emit(page, "error");
+  await expect(
+    page.getByText("Snapshot unverified", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page
+      .locator(".peer-row")
+      .filter({ hasText: "Codex" })
+      .getByText("Unknown", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeDisabled();
+  await emit(page, "open");
+  await emit(page, "invalidate");
+  await expect(
+    page.getByText("Event feed connected", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeEnabled();
+  await emit(page, "source_unavailable");
+  await expect(
+    page.getByText("Snapshot unverified", { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => (window as any).__hubStreams.at(-1).closed),
+  ).toBe(true);
+});
+
+test("each peer expires locally at its own deadline without HTTP refresh", async ({
+  page,
+}) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page, { expires: true });
+  await page.goto("/");
+  const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
+  const hermes = page.locator(".peer-row").filter({ hasText: "Hermes" });
+  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(hermes.getByText("Queued", { exact: true })).toBeVisible();
+  const reads = mock.reads();
+  await page.clock.runFor(1100);
+  await expect(codex.getByText("Unknown", { exact: true })).toBeVisible();
+  await expect(hermes.getByText("Queued", { exact: true })).toBeVisible();
+  await page.clock.runFor(2100);
+  await expect(hermes.getByText("Unknown", { exact: true })).toBeVisible();
+  expect(mock.reads()).toBe(reads);
+});
+
+test("changing topic clears previous peers before the next snapshot arrives", async ({
+  page,
+}) => {
+  await page.clock.install({ time: NOW });
+  await mockLive(page);
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  await page.route(
+    "**/api/hub/v1/topics/different-topic/peers",
+    async (route) => {
+      entered();
+      await waiting;
+      const snapshot = createDemoTopic("different-topic", NOW);
+      snapshot.items.forEach((peer) => {
+        peer.status = "unknown_stale";
+        peer.valid_until = null;
+      });
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(snapshot),
+      });
+    },
+  );
+  await page.goto("/");
+  await expect(
+    page
+      .locator(".peer-row")
+      .filter({ hasText: "Codex" })
+      .getByText("Reachable", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("TOPIC ROOT").fill("different-topic");
+  await page.getByRole("button", { name: "Check", exact: true }).click();
+  await pending;
+  await expect(page.locator(".peer-row")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeDisabled();
+  release();
+  await expect(page.locator(".peer-row")).toHaveCount(3);
+  await expect(
+    page
+      .locator(".peer-row")
+      .filter({ hasText: "Codex" })
+      .getByText("Unknown", { exact: true }),
+  ).toBeVisible();
+});
+
+for (const lost of ["error", "source_unavailable"] as const) {
+  test(`late invalidation refresh cannot restore verified state after ${lost}`, async ({
+    page,
+  }) => {
+    await page.clock.install({ time: NOW });
+    await controllableEvents(page);
+    const mock = await mockLive(page, { events: true });
+    await page.goto("/");
+    await expect(
+      page.getByText("Snapshot unverified", { exact: true }),
+    ).toBeVisible();
+    await emit(page, "invalidate");
+    await expect(
+      page.getByText("Event feed connected", { exact: true }),
+    ).toBeVisible();
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    await page.route("**/api/hub/v1/overview", async (route) => {
+      entered();
+      await waiting;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(mock.overview),
+      });
+    });
+    await emit(page, "invalidate");
+    await pending;
+    await emit(page, lost);
+    release();
+    await expect(
+      page.getByRole("button", { name: "Refresh workspace" }),
+    ).toBeEnabled();
+    await expect(
+      page.getByText("Snapshot unverified", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Event feed connected", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "New task", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page
+        .locator(".peer-row")
+        .filter({ hasText: "Codex" })
+        .getByText("Unknown", { exact: true }),
+    ).toBeVisible();
+  });
+}
+
+test("a burst of invalidations coalesces to one in-flight refresh and one catchup", async ({
+  page,
+}) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  const mock = await mockLive(page, { events: true });
+  await page.goto("/");
+  await expect(
+    page.getByText("Snapshot unverified", { exact: true }),
+  ).toBeVisible();
+  await emit(page, "invalidate");
+  await expect(
+    page.getByText("Event feed connected", { exact: true }),
+  ).toBeVisible();
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let reads = 0;
+  await page.route("**/api/hub/v1/overview", async (route) => {
+    reads++;
+    if (reads === 1) {
+      entered();
+      await waiting;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(mock.overview),
+    });
+  });
+  await emit(page, "invalidate");
+  await pending;
+  await page.evaluate(() => {
+    const stream = (window as any).__hubStreams.at(-1);
+    for (let cursor = 2; cursor < 102; cursor++)
+      stream.onmessage({
+        data: JSON.stringify({
+          kind: "invalidate",
+          observer_epoch: "fixture-public-epoch",
+          cursor,
+        }),
+      });
+  });
+  expect(reads).toBe(1);
+  release();
+  await expect.poll(() => reads).toBe(2);
+  await expect(
+    page.getByText("Event feed connected", { exact: true }),
+  ).toBeVisible();
+  await page.clock.runFor(20_000);
+  expect(reads).toBe(2);
+});
+
+test("conflicting decision disables writes until explicit refresh without echoing errors", async ({
+  page,
+}) => {
+  await mockLive(page);
+  await page.route("**/api/hub/v1/decisions/*/answer", (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: {
+          code: "revision_conflict",
+          private: "private-error-do-not-echo",
+        },
+      }),
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Record decision", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "This record changed. Refresh before trying again.",
+  );
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Record decision", exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByText("private-error-do-not-echo")).toHaveCount(0);
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeEnabled();
+});
+
+test("expired human session removes loaded private records and cannot fall back to demo", async ({
+  page,
+}) => {
+  await mockLive(page);
+  await page.route("**/api/hub/v1/decisions/*/answer", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: { code: "sign_in_required" } }),
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Record decision", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Needs Beau", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Verify the isolated Viewer staging candidate"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "New task", exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByText("Demo workspace.", { exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test("expired task submission closes its private draft rather than leaving a signed-out modal", async ({
+  page,
+}) => {
+  await mockLive(page);
+  await page.route("**/api/hub/v1/tasks", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: { code: "sign_in_required" } }),
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await page
+    .getByLabel("What needs to happen?")
+    .fill("Private draft from expired session");
+  await page.getByRole("button", { name: "Assign task", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
+  ).toBeVisible();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.locator("textarea")).toHaveCount(0);
+});

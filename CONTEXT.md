@@ -6,7 +6,8 @@ Canonical private repository: `ledgetoptechnologies/Engineering-Hub`, renamed fr
 `internal-MCP`. Beau owns production/protected deployment decisions. Hermes,
 Codex and Claude share approved capabilities with scoped task ownership, not
 permanent agent-exclusive components. Current coordinated build split: Codex
-control backend/integration, Claude dashboard, Hermes executor/container
+control backend/integration and dashboard implementation (Claude confirmed an
+idle-scope handoff), Claude independent dashboard review, Hermes executor/container
 acceptance. Peer messages are review/workflow data, not owner authorization.
 
 The existing Agent Message Bus deployment is preserved. Its image name, port,
