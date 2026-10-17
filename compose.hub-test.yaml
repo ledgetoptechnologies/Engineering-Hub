@@ -1,0 +1,58 @@
+services:
+  api:
+    image: ${HUB_TEST_IMAGE:?HUB_TEST_IMAGE must be unique for this smoke run}
+    build:
+      context: .
+      dockerfile: docker/hub-test.Dockerfile
+    user: "568:568"
+    environment:
+      HUB_EXECUTOR_DATA_DIR: /data
+      HUB_EXECUTOR_TOKEN_FILE: /run/secrets/hub_executor_token
+      HUB_EXECUTOR_HOST: 0.0.0.0
+      HUB_EXECUTOR_PORT: "8080"
+    volumes:
+      - type: bind
+        source: ${HUB_TEST_DATA:?HUB_TEST_DATA must point to isolated scratch}
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HUB_TEST_TOKEN_FILE:?HUB_TEST_TOKEN_FILE must point to ephemeral secret file}
+        target: /run/secrets/hub_executor_token
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 8080
+        published: ${HUB_TEST_PORT:?HUB_TEST_PORT must be chosen dynamically by the smoke harness}
+        host_ip: 127.0.0.1
+        protocol: tcp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 1.0
+    pids_limit: 64
+    restart: "no"
+    labels:
+      org.nous.hermes.scope: engineering-hub-v1-fixture-smoke
+    networks:
+      - isolated
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)) == {'ok': True}"
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+networks:
+  isolated:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
