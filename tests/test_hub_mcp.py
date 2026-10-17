@@ -54,7 +54,8 @@ def test_real_initialize_discovery_and_auth_on_every_request(hub):
     tools = rpc(client, "tools/list").json()["result"]["tools"]
     assert {tool["name"] for tool in tools} == {
         "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate",
-        "hub_task_review", "hub_decision_request", "hub_run_list"}
+        "hub_task_review", "hub_decision_request", "hub_run_list",
+        "hub_topic_peers", "hub_topic_preflight"}
     for tool in tools:
         assert not {"actor", "reviewer", "identity", "github_id"} & set(tool["inputSchema"].get("properties", {}))
 

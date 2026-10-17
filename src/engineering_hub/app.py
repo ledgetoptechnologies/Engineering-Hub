@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.transport_security import TransportSecuritySettings
@@ -18,6 +21,8 @@ from agent_message_bus.auth import AuthSettings
 from .auth import AuthConfig, SessionStore, build_auth_router, require_human
 from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
+from .reachability import PublicReachability, project_topic_snapshot
+from .events import NativeHubEventFeed
 
 PROJECTS = (
     ("engineering-hub", "Engineering Hub"), ("3d-viewer", "3D Viewer"),
@@ -91,14 +96,59 @@ class NewRun(Revision):
     target: str = Field(min_length=1, max_length=128)
 
 
+class TopicSnapshot(Input):
+    topic: str
+    items: list[PublicReachability]
+    advisory: Literal[True]
+    delivery_guaranteed: Literal[False]
+    snapshot_revision: str | None
+
+
+class TopicPreflight(Input):
+    topic: str
+    recipient: Literal['codex', 'hermes', 'claude']
+    peer: PublicReachability
+    advisory: Literal[True]
+    delivery_guaranteed: Literal[False]
+
+
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
-               fixture_workflow=None):
+               fixture_workflow=None, reachability_provider=None, event_feed=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
     if fixture_workflow is not None and fixture_workflow.repo is not repo:
         raise ValueError("fixture_repository_mismatch")
     sessions = SessionStore(settings.database)
-    hub_mcp = build_hub_mcp(repo, settings.agent_auth)
+    feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
+
+    def peers_for(topic):
+        if not isinstance(topic, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic):
+            raise HubError('invalid_topic', 422)
+        if reachability_provider is not None:
+            try:
+                # An internal authenticated registry adapter supplies evidence,
+                # never public ready flags or a second writable binding store.
+                evidence = reachability_provider(topic)
+                evidence = dict(evidence)
+                observer = evidence.get('observer')
+                if observer is not None:
+                    evidence['observer'] = observer.model_copy(
+                        update={'now': datetime.now(timezone.utc)})
+                return project_topic_snapshot(topic, **evidence)
+            except Exception:
+                pass  # Unavailable/malformed source is unknown, not unlinked.
+        return project_topic_snapshot(topic)
+
+    def preflight_for(topic, recipient):
+        if recipient not in {'codex', 'hermes', 'claude'}:
+            raise HubError('invalid_recipient', 422)
+        snapshot = peers_for(topic)
+        peer = next(item for item in snapshot['items'] if item['agent'] == recipient)
+        return {'topic': topic, 'recipient': recipient, 'peer': peer,
+                'advisory': True, 'delivery_guaranteed': False}
+
+    hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
+                          topic_preflight=preflight_for)
     origin = urlsplit(settings.auth_config.origin)
     hub_mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -108,12 +158,17 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @asynccontextmanager
     async def lifespan(app):
-        async with hub_mcp.session_manager.run():
-            yield
+        await feed.start()
+        try:
+            async with hub_mcp.session_manager.run():
+                yield
+        finally:
+            await feed.stop()
 
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
+    app.state.event_feed = feed
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
 
@@ -151,6 +206,44 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     def agent(request: Request):
         return settings.agent_auth.agent(request)
+
+    @app.get('/api/hub/v1/topics/{topic}/peers', response_model=TopicSnapshot)
+    def topic_peers(topic: str, request: Request):
+        actor(request)
+        return TopicSnapshot.model_validate_json(json.dumps(peers_for(topic)))
+
+    @app.get('/api/hub/v1/topics/{topic}/preflight', response_model=TopicPreflight)
+    def topic_preflight(topic: str, request: Request,
+                        recipient: Literal['codex', 'hermes', 'claude']):
+        actor(request)
+        return TopicPreflight.model_validate_json(json.dumps(preflight_for(topic, recipient)))
+
+    @app.get('/api/hub/v1/events/status')
+    def event_status(request: Request):
+        actor(request)
+        return feed.status
+
+    @app.get('/api/hub/v1/events', response_class=StreamingResponse,
+             responses={200: {'content': {'text/event-stream': {'schema': {'type': 'string'}}}}})
+    async def events(request: Request):
+        actor(request)
+        if not feed.available:
+            raise HTTPException(503, detail={'code': 'native_events_unavailable'})
+
+        async def stream():
+            source = feed.broker.events()
+            try:
+                async for pointer in source:
+                    try:
+                        actor(request)  # Recheck revocation/expiry on each event.
+                    except HTTPException:
+                        return
+                    yield 'data: ' + json.dumps(pointer, separators=(',', ':')) + '\n\n'
+            finally:
+                await source.aclose()
+
+        return StreamingResponse(stream(), media_type='text/event-stream',
+                                 headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
 
     def projects():
         return [{"id": key, "name": name, "environment": "staging",

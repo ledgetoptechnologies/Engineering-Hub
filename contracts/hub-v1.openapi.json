@@ -81,6 +81,132 @@
         }
       }
     },
+    "/api/hub/v1/topics/{topic}/peers": {
+      "get": {
+        "summary": "Topic Peers",
+        "operationId": "topic_peers_api_hub_v1_topics__topic__peers_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicSnapshot"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/topics/{topic}/preflight": {
+      "get": {
+        "summary": "Topic Preflight",
+        "operationId": "topic_preflight_api_hub_v1_topics__topic__preflight_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          },
+          {
+            "name": "recipient",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "enum": [
+                "codex",
+                "hermes",
+                "claude"
+              ],
+              "type": "string",
+              "title": "Recipient"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicPreflight"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/events/status": {
+      "get": {
+        "summary": "Event Status",
+        "operationId": "event_status_api_hub_v1_events_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/events": {
+      "get": {
+        "summary": "Events",
+        "operationId": "events_api_hub_v1_events_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health",
@@ -769,6 +895,200 @@
         ],
         "title": "Pause"
       },
+      "PublicReachability": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "agent": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "hermes",
+              "claude"
+            ],
+            "title": "Agent"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "unlinked",
+              "linked_unverified",
+              "reachable",
+              "busy_queued",
+              "offline",
+              "unknown_stale"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "no_exact_binding",
+              "no_observer_evidence",
+              "observer_unavailable",
+              "observer_restarted",
+              "binding_generation_mismatch",
+              "evidence_expired",
+              "evidence_in_future",
+              "conflicting_evidence",
+              "stream_only",
+              "session_ready",
+              "session_busy_queue_verified",
+              "session_disconnected",
+              "session_offline",
+              "runtime_readiness_unverified"
+            ],
+            "title": "Reason"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "state_since": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Since"
+          },
+          "last_evidence_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Evidence At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "advisory_only": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory Only",
+            "default": true
+          },
+          "link_state": {
+            "type": "string",
+            "enum": [
+              "linked",
+              "unlinked",
+              "unknown"
+            ],
+            "title": "Link State",
+            "default": "unknown"
+          },
+          "transport_state": {
+            "type": "string",
+            "enum": [
+              "attached",
+              "disconnected",
+              "unverified",
+              "unknown"
+            ],
+            "title": "Transport State",
+            "default": "unknown"
+          },
+          "availability_state": {
+            "type": "string",
+            "enum": [
+              "available",
+              "busy",
+              "offline",
+              "unverified",
+              "unknown"
+            ],
+            "title": "Availability State",
+            "default": "unknown"
+          },
+          "evidence_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "connector_observer",
+                  "runtime_control",
+                  "bus_stream"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Source"
+          },
+          "evidence_level": {
+            "type": "string",
+            "enum": [
+              "runtime_verified",
+              "observed",
+              "unverified"
+            ],
+            "title": "Evidence Level",
+            "default": "unverified"
+          },
+          "snapshot_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Revision"
+          },
+          "binding_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Binding Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "agent",
+          "status",
+          "reason"
+        ],
+        "title": "PublicReachability",
+        "description": "Only this safe projection is intended for authenticated REST/MCP/UI reads."
+      },
       "Review": {
         "properties": {
           "expected_revision": {
@@ -813,6 +1133,92 @@
           "expected_revision"
         ],
         "title": "Revision"
+      },
+      "TopicPreflight": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "recipient": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "hermes",
+              "claude"
+            ],
+            "title": "Recipient"
+          },
+          "peer": {
+            "$ref": "#/components/schemas/PublicReachability"
+          },
+          "advisory": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory"
+          },
+          "delivery_guaranteed": {
+            "type": "boolean",
+            "const": false,
+            "title": "Delivery Guaranteed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "recipient",
+          "peer",
+          "advisory",
+          "delivery_guaranteed"
+        ],
+        "title": "TopicPreflight"
+      },
+      "TopicSnapshot": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PublicReachability"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "advisory": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory"
+          },
+          "delivery_guaranteed": {
+            "type": "boolean",
+            "const": false,
+            "title": "Delivery Guaranteed"
+          },
+          "snapshot_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "items",
+          "advisory",
+          "delivery_guaranteed",
+          "snapshot_revision"
+        ],
+        "title": "TopicSnapshot"
       },
       "ValidationError": {
         "properties": {

@@ -23,7 +23,7 @@ GitHub merging and real host dispatch are not enabled by this scaffold.
 
 The separate control service MCP endpoint is `/mcp/`. It reuses the existing
 Hermes/Codex/Claude bearer identities and authenticates discovery and every call.
-Its seven `hub_*` tools expose task/review/decision-request/read operations, not
+Its nine `hub_*` tools expose task/review/decision-request/read operations, not
 human assignment, decision answers, pause changes or deployment. This is not a
 change to the existing production bus's MCP tool list.
 
@@ -131,6 +131,37 @@ Acceptance must cover a peer online on a different topic, missing bindings,
 disconnects, stale generations after restart, busy sessions with queued work,
 offline durable delivery after reconnection, and a disconnect between preflight
 and send. Test reachability independently from message receipt and task completion.
+
+The read-only Hub projection is implemented at
+`GET /api/hub/v1/topics/{topic}/peers` and
+`GET /api/hub/v1/topics/{topic}/preflight?recipient=hermes` (or codex/claude), with
+matching `hub_topic_peers` and `hub_topic_preflight` MCP tools. Topic roots are
+bounded stable identifiers, not display names or slash-separated subthreads.
+Responses carry `advisory=true` and `delivery_guaranteed=false`; public peer
+records separate link, transport, availability and evidence levels. Verified
+ready/queued records have `valid_until`, so a client can locally expire cached
+readiness without polling. Reads use the control server's current clock, not a
+cached observer clock. Missing authoritative registry integration returns
+`unknown_stale`, never fabricated online status or asserted absence.
+
+No writable readiness or competing binding registry exists in the Hub. Hermes
+owns the canonical bus-side binding/evidence registry slice; its owner-selection
+and trusted bridge mechanisms are not yet integrated or live. Ordinary agent
+tokens do not mint human selection or trusted runtime attestations. Actual
+Codex/Claude/Hermes conversation and reconnect acceptance remains required.
+
+`GET /api/hub/v1/events` is an authenticated SSE invalidation feed for **Hub
+outbox changes**. It subscribes before the first snapshot, uses native Linux
+SQLite commit notifications, bounds slow-subscriber queues, and emits only
+`observer_epoch`, `cursor` and `kind`. Clients re-read current data on an
+invalidation or reconnect; this is not a historical replay stream. Epoch changes
+invalidate caches, and source loss or overflow closes the stream with an explicit
+unavailable pointer. Human session expiry/revocation is checked before every
+event. `/api/hub/v1/events/status` reports source availability. Unsupported native
+platforms return 503 for streaming, without silently enabling status polling.
+The canonical topic-registry invalidation bridge is still pending: the Hub
+outbox cursor is not a bus registry cursor, and this local stream alone does not
+prove topic presence updates are wired end to end.
 
 ## Acceptance gates still required
 

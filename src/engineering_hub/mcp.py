@@ -28,7 +28,7 @@ class HubMCPAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def build_hub_mcp(repo, auth) -> FastMCP:
+def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
 
@@ -88,5 +88,21 @@ def build_hub_mcp(repo, auth) -> FastMCP:
         """Read execution records without dispatching work."""
         identity(ctx)
         return {"items": invoke(repo.list_runs)}
+
+    @mcp.tool()
+    def hub_topic_peers(topic: str, ctx: Context) -> dict:
+        """Read exact-topic peer evidence; this is not a delivery guarantee."""
+        identity(ctx)
+        if topic_peers is None:
+            raise ToolError('reachability_source_unavailable')
+        return invoke(topic_peers, topic)
+
+    @mcp.tool()
+    def hub_topic_preflight(topic: str, recipient: str, ctx: Context) -> dict:
+        """Read advisory reachability before sending; never discards offline mail."""
+        identity(ctx)
+        if topic_preflight is None:
+            raise ToolError('reachability_source_unavailable')
+        return invoke(topic_preflight, topic, recipient)
 
     return mcp
