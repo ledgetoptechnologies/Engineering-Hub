@@ -4,6 +4,7 @@ The injected client owns authentication. This module never handles agent tokens,
 starts a watcher, or treats delivery as execution/approval acknowledgement.
 """
 from contextlib import contextmanager
+import asyncio
 import hashlib
 import json
 import re
@@ -19,6 +20,13 @@ def _valid_route(topic, correlation):
 
 
 class HubOutboxPublisher:
+    """One fixed authenticated bus principal per Hub database.
+
+    The operator-injected client must keep its authenticated session immutable
+    for the entire batch (including bus_info and send_message). The publisher
+    derives identity from the authenticated server, never caller-declared actor
+    fields. Tokens may rotate, but the server-proven principal must stay fixed.
+    """
     def __init__(self, repo, bus_client, *, recipients=("hermes", "claude"),
                  topic="auto-wake-v1-test", correlation_id=None):
         self.path = repo.path
@@ -40,6 +48,8 @@ class HubOutboxPublisher:
             db.execute("""CREATE TABLE IF NOT EXISTS hub_delivery_receipts (
                 sequence INTEGER NOT NULL, recipient TEXT NOT NULL, request_json TEXT NOT NULL,
                 message_id TEXT, PRIMARY KEY(sequence, recipient))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS hub_delivery_sender (
+                id INTEGER PRIMARY KEY CHECK(id=1), principal TEXT NOT NULL)""")
 
     @contextmanager
     def _db(self):
@@ -93,6 +103,32 @@ class HubOutboxPublisher:
                 ON d.sequence=o.sequence AND d.recipient=? WHERE d.message_id IS NULL""", (recipient,)).fetchone()[0]
                        for recipient in self.recipients)
 
+    async def _verify_sender(self):
+        """One bounded identity check and atomic pin per explicitly run batch."""
+        try:
+            info = await asyncio.wait_for(self.client.bus_info(topic='overview'), timeout=5)
+            native = info.get('native_push') if isinstance(info, dict) else None
+            inbox = native.get('inbox_uri') if isinstance(native, dict) else None
+            allowed = {'agentbus://inbox/' + name: name for name in ('codex', 'hermes', 'claude')}
+            if not isinstance(inbox, str) or inbox not in allowed:
+                return 'sender_identity_unverified'
+            principal = allowed[inbox]
+        except Exception:
+            # Network errors/response representations may include credentials.
+            return 'sender_identity_unverified'
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            pin = db.execute('SELECT principal FROM hub_delivery_sender WHERE id=1').fetchone()
+            if pin:
+                return None if pin['principal'] == principal else 'sender_identity_conflict'
+            if db.execute('SELECT 1 FROM hub_delivery_receipts LIMIT 1').fetchone():
+                # Existing prepared or accepted envelopes have unknown sender
+                # provenance. Adopting today's token could duplicate an earlier
+                # uncertain sender-scoped bus acceptance.
+                return 'legacy_sender_unverified'
+            db.execute('INSERT INTO hub_delivery_sender VALUES(1,?)', (principal,))
+        return None
+
     async def drain_batch(self, limit=50):
         """Send at most limit pointers. Replays use the exact persisted request.
 
@@ -102,6 +138,9 @@ class HubOutboxPublisher:
         """
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("Batch size must be between 1 and 500")
+        held_reason = await self._verify_sender()
+        if held_reason is not None:
+            return {'accepted': 0, 'failed': 1, 'pending': self._pending(), 'held_reason': held_reason}
         accepted, failed, held_reason = 0, 0, None
         for delivery in self._prepare(limit):
             try:

@@ -77,3 +77,25 @@ runner without NAS dependency; unique Compose naming alone is not writer exclusi
 
 Root's typed client now bounds fences to SQLite's positive signed-64-bit range.
 No live executor, deployment, credentials or existing watcher was changed.
+
+Hermes added `tests/test_executor_crash_recovery.py` in `da4cf845dbea2add6ec8f2b0b2c13441468bb665`.
+Root fetched it and verified that its runtime `hub_executor` Git tree is exactly
+the reviewed `7bdc3d4` tree, `5af2b9ff5a6d0ea5094e679c3b5f8263f24879d6`.
+The test blocks before and after the real atomic filesystem effect, verifies a
+durable running row, SIGKILLs the process without exception cleanup, then checks
+fresh-owner held recovery and repeated stable-ID operations without a new effect.
+Source inspection supports the intended stronger crash test; the final frozen
+control/executor combined and container jobs are still awaiting Hermes's results.
+Peer-reported 44 focused tests and the mutation check are not being substituted
+for that final combined acceptance.
+
+Final handoff `53f9bb188cf92de227d730e0aad129dadf19064e` subsequently published
+evidence JSON only. Root fetched and inspected both reports. Hermes reports 683
+Linux passes on the exact frozen Hub `1b50667` plus executor `da4cf84`, including
+44 focused executor tests and both SIGKILL boundaries. Four actual container HTTP
+fixture scenarios cover success, rollback, uncertain outcome and persistent pause;
+each restarts without repeated command POSTs. This peer-run evidence does not cover
+later root changes, real OAuth, a full REST task-assignment flow, an actual app
+deployment or TrueNAS/host boot acceptance. Root integration remains a separate gate.
+The older snapshot's loop warning is addressed by the separately verified test-only
+ownership fixes documented in `hub-linux-validation-2026-10-17.md`.

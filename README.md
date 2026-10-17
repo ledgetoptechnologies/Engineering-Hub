@@ -12,6 +12,11 @@ is 8770 on loopback. Live OAuth and real host dispatch remain disabled until
 their separate setup and acceptance gates pass; fixture tests are not production
 deployment or TrueNAS reboot proof.
 
+The standalone, opt-in [`compose.hub-control.yaml`](compose.hub-control.yaml) and
+[private deployment guide](docs/hub-control-deployment.md) describe its separate
+local state, loopback-only port and activation gates. They do not start a service
+or change the existing bus deployment.
+
 ## Existing Agent Message Bus
 
 A self-hosted, authenticated MCP Streamable HTTP service for Hermes, Codex, and Claude Code. It provides durable agent messaging, shared-file storage, audit records, and (when included in a release) shared-knowledge tools. SQLite and artifacts live in the service's persistent data directory.

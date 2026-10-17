@@ -1,0 +1,25 @@
+# Isolated test image only; never used by the production message-bus service.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/validation-venv \
+    PATH="/opt/validation-venv/bin:${PATH}"
+
+WORKDIR /validation
+RUN python -m pip install --no-cache-dir uv==0.11.17
+COPY pyproject.toml uv.lock README.md .env.example ./
+COPY src ./src
+RUN uv sync --locked --group test --no-editable
+COPY tests ./tests
+COPY scripts ./scripts
+COPY contracts ./contracts
+COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml ./
+COPY docker ./docker
+COPY docs ./docs
+
+USER 10001:10001
+# Keep global tracemalloc OFF: the streaming-memory test manages its own trace
+# window. For focused ownership diagnostics, see tests/_hub_loop_diagnostics.py.
+CMD ["python", "-m", "pytest", "-W", "default", "--basetemp", "/tmp/hub-validation", "-o", "cache_dir=/tmp/pytest-cache"]

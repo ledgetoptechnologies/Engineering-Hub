@@ -55,6 +55,13 @@ The correlation root must agree with the approved topic. Conflicting persisted
 legacy envelopes remain intact and held with `routing_conflict`, never silently
 rewritten under a possibly accepted idempotency key. Unconfirmed sends report
 `bus_acceptance_unconfirmed` and preserve the original key/payload for reconciliation.
+Each explicit batch makes one bounded authenticated `bus_info` identity check,
+then atomically pins that server-proven principal to this Hub database before
+preparing or sending pointers. The injected client's authenticated session must
+stay immutable throughout the batch. Changing principals is held with
+`sender_identity_conflict`; missing identity or legacy prepared receipts without
+sender provenance are held, never adopted under today's token. Same-principal
+token rotation retains the original sender-scoped idempotency protection.
 Its current linked-discussion routing is for the
 isolated build test; no publishing worker is activated by importing it.
 
@@ -149,7 +156,7 @@ claiming work, executing work and completing it.
 
 Local verification on 2026-10-17: production Vite/TypeScript build, eight API-client
 unit tests, twenty real-Edge Playwright tests, and the network-disabled container
-smoke passed. The Hub Python suite passed 390 tests with two Windows-specific
+smoke passed. The Hub Python suite passed 410 tests with two Windows-specific
 skips. Browser tests mock private API data and exercise real native browser fetch,
 Origin/cookies/CSRF, stale-response handling, distinct peer expiry deadlines,
 topic switching, invalidation coalescing, conflict recovery and session expiry.
@@ -159,8 +166,10 @@ Public REST responses now use strict DTOs in the published OpenAPI contract.
 topic fixtures against the Python response models without a server or credentials.
 The standalone deployment profile also passed five structural tests and actual
 Docker Compose configuration validation with fixture-only variable values. No
-service was created or started by that configuration check. Full Linux warning
-analysis and final executor/container integration remain separate evidence gates.
+service was created or started by that configuration check. The isolated Linux
+suite passed 672 tests without resource warnings; see the qualified snapshot and
+test-only loop ownership fixes in `hub-linux-validation-2026-10-17.md`. Final
+executor/container integration remains a separate gate.
 
 Keep the control DB on local storage on its host, not an SMB SQLite WAL path.
 Use SQLite's backup API for a coherent backup while running, or stop all writers

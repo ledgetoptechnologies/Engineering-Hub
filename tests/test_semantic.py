@@ -99,18 +99,19 @@ def test_sync_refreshes_cas_updates_and_reconciles_deletes(tmp_path):
     assert index.search("kitten") == []
 
 
-def test_search_indexes_text_files_and_binary_metadata(tmp_path):
+@pytest.mark.asyncio
+async def test_search_indexes_text_files_and_binary_metadata(tmp_path):
     db_path, file_root, _, files = _repos(tmp_path)
     text = b"A compact automobile reduces city congestion."
-    asyncio.run(files.save_upload("guides/transit.txt", UploadFile(
+    await files.save_upload("guides/transit.txt", UploadFile(
         file=io.BytesIO(text), filename="transit.txt",
         headers=Headers({"content-type": "text/plain"}),
-    )))
+    ))
     binary = b"\x00\x01\x02\xff"
-    asyncio.run(files.save_upload("images/vehicle.png", UploadFile(
+    await files.save_upload("images/vehicle.png", UploadFile(
         file=io.BytesIO(binary), filename="vehicle.png",
         headers=Headers({"content-type": "image/png"}),
-    )))
+    ))
     index = SemanticIndex(db_path, file_root, cache_root=tmp_path / "search", embedder=FakeEmbedder())
 
     text_result = index.search("car", project="guides", source="file", limit=10)
