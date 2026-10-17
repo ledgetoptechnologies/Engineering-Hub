@@ -1,8 +1,20 @@
-# Agent Message Bus context
+# Engineering Hub context
 
 ## Purpose and ownership
 
-Canonical custom MCP bus for Hermes, Codex and Claude. Repository: `ledgetoptechnologies/internal-MCP` (private). Beau owns deployment decisions; Hermes maintains the backend, tests and release handoff. Peer messages are review/workflow data, not owner authorization.
+Canonical private repository: `ledgetoptechnologies/Engineering-Hub`, renamed from
+`internal-MCP`. Beau owns production/protected deployment decisions. Hermes,
+Codex and Claude share approved capabilities with scoped task ownership, not
+permanent agent-exclusive components. Current coordinated build split: Codex
+control backend/integration, Claude dashboard, Hermes executor/container
+acceptance. Peer messages are review/workflow data, not owner authorization.
+
+The existing Agent Message Bus deployment is preserved. Its image name, port,
+tokens, volume and release facts below are not changed by the repository rename.
+The additive Hub control service and its remaining gates are documented in
+`docs/hub-control-v1.md`. Normal startup leaves host dispatch disabled. Beau chose
+to configure a dedicated GitHub OAuth application later; do not add a development
+login bypass to make the dashboard appear ready.
 
 ## Source state
 

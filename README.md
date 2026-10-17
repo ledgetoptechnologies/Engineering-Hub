@@ -1,4 +1,18 @@
-# Agent Message Bus
+# Engineering Hub
+
+Engineering Hub is the private development/staging management platform under
+construction. The repository was renamed from `internal-MCP`; its existing Agent
+Message Bus remains independently deployable, with its current image identity,
+port 8765, tokens and persistent storage unchanged.
+
+The additive control-plane implementation is documented in
+[Hub control v1](docs/hub-control-v1.md), with the REST contract in
+[`contracts/hub-v1.openapi.json`](contracts/hub-v1.openapi.json). Its default port
+is 8770 on loopback. Live OAuth and real host dispatch remain disabled until
+their separate setup and acceptance gates pass; fixture tests are not production
+deployment or TrueNAS reboot proof.
+
+## Existing Agent Message Bus
 
 A self-hosted, authenticated MCP Streamable HTTP service for Hermes, Codex, and Claude Code. It provides durable agent messaging, shared-file storage, audit records, and (when included in a release) shared-knowledge tools. SQLite and artifacts live in the service's persistent data directory.
 
