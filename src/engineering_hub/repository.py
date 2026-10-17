@@ -53,6 +53,8 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_events (
                     run_id TEXT NOT NULL, command_id TEXT NOT NULL, event TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, PRIMARY KEY(run_id,command_id,event));
+                CREATE TABLE IF NOT EXISTS hub_target_fences (
+                    target TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0));
             ''')
 
     @contextmanager
@@ -165,7 +167,7 @@ class HubRepository:
     def _no_active_run(db, task_id, target=None):
         for row in db.execute("SELECT data FROM hub_entities WHERE kind='run'"):
             run = json.loads(row['data'])
-            if (run['task_id'] == task_id or (target and run['target'] == target)) and run['status'] in {'pending', 'running', 'held'}:
+            if (run['task_id'] == task_id or (target and run['target'] == target)) and run['status'] in {'pending', 'running', 'held', 'failed'}:
                 raise HubError('active_run', 409)
 
     def set_candidate(self, actor, identity, expected_revision, commit):
@@ -241,9 +243,19 @@ class HubRepository:
             if task['repair_count'] >= 3:
                 raise HubError('repair_limit', 409)
             self._no_active_run(db, task_id, target)
+            fence = db.execute('SELECT generation FROM hub_target_fences WHERE target=?', (target,)).fetchone()
+            # Include older run snapshots when upgrading a pre-fence Hub database.
+            previous_generations = [fence['generation'] if fence else 0]
+            for row in db.execute("SELECT data FROM hub_entities WHERE kind='run'"):
+                previous_run = json.loads(row['data'])
+                if previous_run['target'] == target:
+                    previous_generations.append(previous_run['fencing_generation'])
+            generation = max(previous_generations) + 1
+            db.execute('INSERT INTO hub_target_fences(target,generation) VALUES(?,?) '
+                       'ON CONFLICT(target) DO UPDATE SET generation=excluded.generation', (target, generation))
             run = self._save(db, actor, 'run.created', 'run', dict(id=str(uuid.uuid4()), task_id=task_id,
                 project=task['project'], target=target, commit=task['candidate_commit'], artifact_digest=artifact_digest,
-                policy_revision=1, review=task['review'], status='pending', command_id=None, fencing_generation=1,
+                policy_revision=1, review=task['review'], status='pending', command_id=None, fencing_generation=generation,
                 created_by=actor, execution_actor=self.execution_principal, events=[]), new=True)
             self._save(db, actor, 'task.run_created', 'task', task)
             return run

@@ -27,6 +27,30 @@ Its seven `hub_*` tools expose task/review/decision-request/read operations, not
 human assignment, decision answers, pause changes or deployment. This is not a
 change to the existing production bus's MCP tool list.
 
+## Fixture integration modules
+
+`FixtureWorkflow` is an explicitly invoked fixture-only coordinator, not an
+enabled API endpoint or unattended worker. Operator-supplied manifests pin both
+candidate and rollback digest/provenance before any effect. It deploys, smokes,
+then records success, or records failure and attempts the configured rollback.
+Failed targets remain reserved until confirmed rollback; each new run receives
+a durable increasing per-target fence. No shell, Docker socket, download URL or
+live application driver is accepted.
+
+The executor client sends one typed command and verifies every echoed field.
+Timeouts, malformed responses and uncertain outcomes do not retry. A durable
+advance lock prevents competing controllers. A hard crash can leave that lock
+reserved; there is deliberately no automatic expiry or takeover. Inspect the
+original command read-only and reconcile with actual effect evidence before
+operator recovery. These restrictions are safer than silently replaying a
+possibly completed deployment, but need a recovery UI before live activation.
+
+`HubOutboxPublisher.drain_batch` is bounded and explicitly invoked. It sends only
+event pointers, persists prepared payloads and stable bus idempotency keys before
+I/O, and records delivery only after a valid message ID. It does not equate bus
+delivery with task completion. Its current linked-discussion routing is for the
+isolated build test; no publishing worker is activated by importing it.
+
 ## Private configuration
 
 Use the existing approved secret/environment mechanism, not command arguments,

@@ -183,7 +183,13 @@ def test_pause_and_three_repairs(repo):
     for index in range(3):
         item = repo.get_task(item['id'])
         job = repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
-        repo.append_run_event(EXECUTOR, job['id'], 'failed', str(index), 1, 1)
+        assert job['fencing_generation'] == index + 1
+        job = repo.append_run_event(EXECUTOR, job['id'], 'failed', str(index), job['fencing_generation'], 1)
+        current = repo.get_task(item['id'])
+        if index < 2:
+            with pytest.raises(HubError, match='active_run'):
+                repo.create_run('codex', current['id'], current['revision'], DIGEST, 'engineering-hub:staging')
+        repo.append_run_event(EXECUTOR, job['id'], 'rolled_back', str(index), job['fencing_generation'], job['revision'])
     item = repo.get_task(item['id'])
     assert item['repair_count'] == 3
     item = repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
@@ -191,6 +197,35 @@ def test_pause_and_three_repairs(repo):
     item = repo.review_task('hermes', item['id'], item['revision'], 'c' * 40, 'approve')
     with pytest.raises(HubError, match='repair_limit'):
         repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
+
+
+def test_target_generation_survives_restart_and_rejects_old_fence(repo):
+    first = run(repo)
+    first = repo.append_run_event(EXECUTOR, first['id'], 'running', 'first', first['fencing_generation'], 1)
+    first = repo.append_run_event(EXECUTOR, first['id'], 'succeeded', 'first', first['fencing_generation'], first['revision'])
+    reopened = HubRepository(repo.path, execution_principal=EXECUTOR)
+    item = reopened.get_task(first['task_id'])
+    second = reopened.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
+    assert second['fencing_generation'] > first['fencing_generation']
+    with pytest.raises(HubError, match='stale_fence'):
+        reopened.append_run_event(EXECUTOR, second['id'], 'running', 'second', first['fencing_generation'], 1)
+    second = reopened.append_run_event(EXECUTOR, second['id'], 'running', 'second', second['fencing_generation'], 1)
+    assert second['status'] == 'running'
+
+
+def test_failed_run_creation_rolls_back_fence_allocation(repo, monkeypatch):
+    item = verified(repo)
+    before = len(repo.list_audit())
+    def fail(*args):
+        raise sqlite3.OperationalError('simulated outbox failure')
+    with monkeypatch.context() as context:
+        context.setattr(repo, '_emit', fail)
+        with pytest.raises(sqlite3.OperationalError):
+            repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
+    assert repo.list_runs() == []
+    assert len(repo.list_audit()) == len(repo.list_outbox()) == before
+    job = repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
+    assert job['fencing_generation'] == 1
 
 
 @pytest.mark.parametrize('title,options', [('', ['a', 'b']), ('x'*201, ['a', 'b']), ('ok', ['a']), ('ok', ['a', 'a'])])

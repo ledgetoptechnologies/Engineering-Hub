@@ -1,0 +1,24 @@
+# Independent build: do not change the deployed message-bus image or entrypoint.
+FROM python:3.12-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /build
+RUN python -m pip install --no-cache-dir uv==0.11.17
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN uv sync --locked --no-default-groups --no-editable
+
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}"
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="Engineering Hub Control" \
+      org.opencontainers.image.source="https://github.com/ledgetoptechnologies/Engineering-Hub" \
+      org.opencontainers.image.revision="${VCS_REF}"
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+RUN groupadd --system --gid 10001 hub \
+    && useradd --system --uid 10001 --gid hub --no-create-home hub
+USER 10001:10001
+EXPOSE 8770
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["python", "-c", "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"]
+ENTRYPOINT ["python", "-m", "engineering_hub", "--host", "0.0.0.0", "--port", "8770"]
