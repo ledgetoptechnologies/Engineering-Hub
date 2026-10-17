@@ -1,0 +1,4 @@
+name: agent-bus-wake
+version: "0.1.0"
+description: "Explicitly opt-in native MCP inbox resource subscriptions for routing bus messages into exact, linked Hermes Desktop conversations."
+author: "Ledge Top Technologies"
