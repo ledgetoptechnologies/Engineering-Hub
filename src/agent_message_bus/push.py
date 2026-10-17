@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import uuid
@@ -34,6 +35,18 @@ def _utc_text(value: datetime | None) -> str | None:
     return value.isoformat().replace("+00:00", "Z") if value is not None else None
 
 
+def presence_session_fingerprint(session_id: str) -> str:
+    """Return a domain-separated, non-reversible DB reference for an MCP session ID."""
+    return hashlib.sha256(b"agent-message-bus/topic-presence-session/v1\0" + session_id.encode("utf-8")).hexdigest()
+
+
+def presence_stream_fingerprint(stream_generation: str) -> str:
+    """Return a private, domain-separated reference to one observed SSE registration."""
+    return hashlib.sha256(
+        b"agent-message-bus/topic-presence-stream/v1" + bytes([0]) + stream_generation.encode("utf-8")
+    ).hexdigest()
+
+
 class PushPublisher:
     """Bounded, in-process fanout of recipient-only MCP resource invalidations.
 
@@ -57,6 +70,7 @@ class PushPublisher:
         self._subscribers: dict[tuple[str, str], ServerSession] = {}
         self._subscription_since: dict[tuple[str, str], datetime] = {}
         self._subscription_generations: dict[tuple[str, str], object] = {}
+        self._subscription_binding_ids: dict[tuple[str, str], str] = {}
         self._presence_streams: dict[str, dict[str, Any]] = {}
         # A bool per in-flight subscription is a bounded dirty bit: multiple
         # commits collapse to one follow-up invalidation, never a dropped edge.
@@ -119,6 +133,7 @@ class PushPublisher:
             self._subscribers.clear()
             self._subscription_since.clear()
             self._subscription_generations.clear()
+            self._subscription_binding_ids.clear()
             self._pending.clear()
         async def notify(key, session):
             try:
@@ -159,6 +174,7 @@ class PushPublisher:
             # Every successful registration fences earlier in-flight sends, even
             # when the SDK reuses the same ServerSession object.
             self._subscription_generations[key] = object()
+            self._subscription_binding_ids[key] = uuid.uuid4().hex
             self._pending.pop(key, None)
 
     async def unsubscribe(self, session_id: str, recipient: str) -> None:
@@ -168,6 +184,7 @@ class PushPublisher:
             self._subscribers.pop(key, None)
             self._subscription_since.pop(key, None)
             self._subscription_generations.pop(key, None)
+            self._subscription_binding_ids.pop(key, None)
             self._pending.pop(key, None)
 
     async def drop_session(self, session_id: str | None) -> None:
@@ -179,7 +196,48 @@ class PushPublisher:
                     self._subscribers.pop(key, None)
                     self._subscription_since.pop(key, None)
                     self._subscription_generations.pop(key, None)
+                    self._subscription_binding_ids.pop(key, None)
                     self._pending.pop(key, None)
+
+    async def topic_subscription_binding(self, session_id: str, agent: str) -> tuple[str, str] | None:
+        """Return the subscription and exact SSE generations, only for one unambiguous attachment."""
+        self._validate_presence_agent(agent)
+        if not isinstance(session_id, str) or not session_id or not self.enabled:
+            return None
+        key = (session_id, BASE_RESOURCE_URI.format(agent))
+        async with self._lock:
+            if not self.enabled or key not in self._subscribers:
+                return None
+            streams = [stream for stream in self._presence_streams.values()
+                       if stream["session_id"] == session_id and stream["agent"] == agent]
+            if len(streams) != 1:
+                return None
+            binding_id = self._subscription_binding_ids.get(key)
+            if binding_id is None:
+                return None
+            return binding_id, presence_stream_fingerprint(streams[0]["generation"])
+
+    async def live_topic_bindings(self) -> set[tuple[str, str, str, str]]:
+        """Snapshot exact session, inbox-subscription and observed SSE registrations."""
+        async with self._lock:
+            if not self.enabled:
+                return set()
+            active_streams = {
+                (stream["session_id"], stream["agent"],
+                 presence_stream_fingerprint(stream["generation"]))
+                for stream in self._presence_streams.values()
+            }
+            result: set[tuple[str, str, str, str]] = set()
+            for (session_id, uri), _session in self._subscribers.items():
+                agent = uri.removeprefix("agentbus://inbox/")
+                binding_id = self._subscription_binding_ids.get((session_id, uri))
+                if binding_id is None:
+                    continue
+                for stream_session, stream_agent, stream_generation in active_streams:
+                    if stream_session == session_id and stream_agent == agent:
+                        result.add((presence_session_fingerprint(session_id), agent,
+                                    binding_id, stream_generation))
+            return result
 
     async def open_presence_stream(self, session_id: str, agent: str) -> str:
         """Record an authorized persistent MCP GET stream observed at the ASGI boundary."""
@@ -187,10 +245,12 @@ class PushPublisher:
             raise ValueError("MCP session id required")
         self._validate_presence_agent(agent)
         token = uuid.uuid4().hex
+        stream_generation = uuid.uuid4().hex
         async with self._lock:
             self._presence_streams[token] = {
                 "session_id": session_id,
                 "agent": agent,
+                "generation": stream_generation,
                 "connected_since": _utc_now(),
                 "last_stream_write_at": None,
             }
@@ -296,6 +356,7 @@ class PushPublisher:
                             self._subscribers.pop(key, None)
                             self._subscription_since.pop(key, None)
                             self._subscription_generations.pop(key, None)
+                            self._subscription_binding_ids.pop(key, None)
                         pending = self._pending.get(key)
                         if pending is not None and pending[0] is generation:
                             self._pending.pop(key, None)

@@ -253,7 +253,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
                 push_health["state"] = "failed"
         return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] != "failed",
                                       "database": db_status,
-                                      "schema_version": 4,
+                                      "schema_version": 5,
                                       "version": version("agent-message-bus"),
                                       "audit": "error" if audit.last_error else ("ok" if audit.verify() else "invalid"),
                                       "semantic": {"state": "enabled" if semantic.enabled else "disabled"},

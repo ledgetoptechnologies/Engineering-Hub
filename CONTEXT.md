@@ -6,15 +6,15 @@ Canonical custom MCP bus for Hermes, Codex and Claude. Repository: `ledgetoptech
 
 ## Source state
 
-Source version 0.6.0, schema generation 4, 24 MCP tools. This does not establish the running production version: check authenticated `bus_info()` separately. The candidate passed 260 tests and 158 isolated real-container checks before publication review; see release notes and retained external evidence.
+Package baseline 0.6.0/schema generation 4 is extended in this unpublished working tree to schema generation 5 and 27 MCP tools for per-topic presence. This does not establish the running production version: check authenticated `bus_info()` separately. The v0.6.0 candidate passed 260 tests and 158 isolated real-container checks before publication review; those historical counts do not include the current working-tree changes.
 
-New capabilities: optional sender-scoped atomic send idempotency, private sender receipt lookup, and server-observed stream/subscription presence. See `docs/safe-sends-and-presence.md` for the full contract. Publication and TrueNAS cutover are separate gates.
+New capabilities: optional sender-scoped atomic send idempotency, private sender receipt lookup, server-observed global stream/subscription presence, and persistent per-topic memberships whose online state is fenced to the exact native session/subscription/SSE stream. Topic labels are not ACLs. See `docs/safe-sends-and-presence.md` for the full contract. Publication and TrueNAS cutover are separate gates.
 
 ## Architecture
 
-- `src/agent_message_bus/database.py` and `schema.sql`: SQLite messages, durable AUTOINCREMENT delivery sequence, additive send-idempotency table. Key tombstones are intentionally retained after message cleanup; no automatic expiry.
+- `src/agent_message_bus/database.py` and `schema.sql`: SQLite messages, durable AUTOINCREMENT delivery sequence, additive send-idempotency table, and persistent topic-membership table. Key tombstones are intentionally retained after message cleanup; no automatic expiry.
 - `api.py`, `mcp_server.py`: authenticated REST/MCP surfaces. Sender/recipient ownership derives from credentials, never a body/topic/session label.
-- `push.py`, `sqlite_events.py`: recipient-only resource invalidation, native Linux inotify/WAL commit reconciliation, durable cursor recovery. No inbox/model polling. Fail closed when the source is unreliable.
+- `push.py`, `sqlite_events.py`, `topic_presence.py`: recipient-only resource invalidation, native Linux inotify/WAL commit reconciliation, durable cursor recovery, and generation-fenced per-topic registration. Per-topic online requires the exact persisted membership, current inbox-subscription generation, and active authenticated SSE observation. No inbox/model polling. Fail closed when the source is unreliable.
 - `presence.py`: outer ASGI observer of successful authenticated persistent GET MCP SSE streams and outgoing writes. Publisher presence intersects streams with subscriptions. Transport state is not readiness, delivery/read confirmation or execution approval; counts are process-local.
 - `knowledge.py`, `files.py`, `semantic.py`: CAS knowledge, immutable/versioned shared objects, rebuildable local FastEmbed index. Authoritative bytes remain in SQLite/objects, not the index.
 - `info.py`: read-only live discovery help; `presence` and `recovery` topics. Client-owned slash aliases/allowlists are separate.
@@ -31,7 +31,7 @@ Release gates: independent correctness review, full source/archive suite, instal
 
 Production is the owner's TrueNAS service. Preserve its **single existing volume source/destination**, database/audit paths, tokens, network restrictions and runtime `568:568`. New files/indexes belong below the existing persistent root. SQLite WAL must remain on local persistent storage, not SMB/NFS. Stop old writers for migration and take a coherent SQLite-plus-object backup. No mixed-version writers or empty replacement data roots.
 
-Deliver verified handoffs through the existing shared `Ai_Storage/Hermes/agent-bus/current/` folder; preserve older bundles in `archive/v<version>/`. Do not create more top-level release folders. Supported TrueNAS pull/redeploy is different from Docker restart, which does not pull an image.
+Keep the single canonical operational changelog and topic handoffs in MCP shared knowledge (`agent-bus/CHANGELOG.md` and the topic record). Code, release assets and history remain in GitHub. Beau retired the duplicated SMB bus folder; do not recreate `Ai_Storage/Hermes/agent-bus/`, release bundles or mirrors there unless explicitly requested. Supported TrueNAS pull/redeploy is different from Docker restart, which does not pull an image.
 
 ## Topic sessions and known limits
 

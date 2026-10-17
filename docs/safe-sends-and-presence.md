@@ -1,6 +1,6 @@
 # Safe sends, receipts and subscription presence
 
-Available in v0.6.0 (schema generation 4). Refresh client tool discovery/allowlists after deploying: `get_send_receipt` and `presence_status` are new. Existing keyless sends remain compatible.
+The v0.6.0 baseline uses schema generation 4. The current source adds schema generation 5 per-topic presence; this source change has not been published as a release. Refresh client tool discovery/allowlists after deploying: `get_send_receipt`, `presence_status`, and the `topic_presence_*` tools are available. Existing keyless sends remain compatible.
 
 ## Safe sends
 
@@ -57,6 +57,24 @@ A stored subscription without an active stream is **not** subscribed presence. D
 **Subscribed is not online/ready/awake/delivered/read/authorized.** The server cannot infer which desktop chat will act. Network failure detection is subject to the transport's disconnect/write detection; a successful keepalive write is not a client acknowledgment. Counts are local to this server process, not a fleet-wide presence service.
 
 No client heartbeat writes, inbox/database polling, scheduler, model calls, extra network probes or new storage mounts are used. The observer follows stream lifecycle and existing outgoing SSE writes/keepalive comments.
+
+## Per-topic presence (schema generation 5)
+
+Topic presence is an explicit durable association, not a client-supplied online flag. It is separate from the backwards-compatible global `presence_status()` API.
+
+1. Initialize a native MCP session using the agent's own bearer token.
+2. Subscribe on that session to its authenticated resource, `agentbus://inbox/<agent>`.
+3. Keep that session's persistent GET `/mcp` SSE stream open.
+4. Call `topic_presence_join(topic)`. The server derives the agent from authentication and the MCP session ID from the native request. The call fails unless this exact session has both a healthy inbox subscription and an observed active SSE stream.
+5. Read `topic_presence_status(topic)` for that exact label, or leave with `topic_presence_leave(topic, generation)` using the generation returned by join.
+
+The join response contains `topic`, authenticated `agent`, opaque `generation`, and `registered_at`. The status response contains `topic`, `observed_at`, process scope, native-push availability, and `members` with only `agent`, `state` (`online` or `disconnected`), `online`, and `registered_at`. It does not return MCP session IDs, their hashes, subscription generations, or join generations. Online is true only while the persisted member's exact session and exact current inbox-subscription generation match an active authenticated SSE stream observed by this server process. It is not model readiness, message delivery/read, task completion, or approval.
+
+Membership rows persist across disconnect and restart, so a prior member remains visible as `disconnected` rather than disappearing or looking online. Reconnect requires a fresh join to bind the new native session. A new join for the same `(topic, agent)` replaces the prior one with a unique generation; an old leave cannot delete the replacement. Leave only removes a row when its authenticated agent, originating session, topic, and current generation all match. Unsubscribe/resubscribe changes the subscription generation, so the old topic binding remains disconnected until the caller joins again.
+
+Each agent can register independently in multiple topics, including from separate MCP sessions. Only one registration per `(topic, agent)` is current; the latest successful join replaces earlier ones. Topic matching is exact and case-sensitive. Topic labels are grouping keys, **not ACLs**: any authenticated agent can query any label, and registration does not grant access to messages, sessions, or execution. The server stores only a domain-separated digest of the session ID in the membership row.
+
+`bus_info(topic="presence")` documents this protocol and provides live tool examples/schemas. No REST join endpoint, polling task, cron, lease heartbeat, or session-label trust is added.
 
 ## Help and topic sessions
 

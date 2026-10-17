@@ -116,7 +116,16 @@ class MessageRepository:
         with self.connect() as conn:
             self._migrate_messages(conn)
             conn.executescript(Path(__file__).with_name("schema.sql").read_text())
+            self._migrate_topic_presence(conn)
             self._migrate_delivery_sequence(conn)
+
+    @staticmethod
+    def _migrate_topic_presence(conn: sqlite3.Connection) -> None:
+        """Fence legacy memberships by a missing stream as disconnected until rejoin."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(topic_memberships)")}
+        if "stream_generation" not in columns:
+            conn.execute("""ALTER TABLE topic_memberships
+                ADD COLUMN stream_generation TEXT NOT NULL DEFAULT ''""")
 
     @staticmethod
     def _migrate_delivery_sequence(conn: sqlite3.Connection) -> None:

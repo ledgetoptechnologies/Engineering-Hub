@@ -222,6 +222,26 @@ async def test_source_failure_disables_subscription_presence_without_erasing_tra
 
 
 @pytest.mark.asyncio
+async def test_topic_join_fails_closed_when_session_has_multiple_sse_attachments():
+    publisher = PushPublisher(enabled=True)
+
+    class Session:
+        async def send_resource_updated(self, _uri):
+            pass
+
+    await publisher.subscribe("same-session", "codex", Session())
+    first = await publisher.open_presence_stream("same-session", "codex")
+    second = await publisher.open_presence_stream("same-session", "codex")
+    try:
+        assert await publisher.topic_subscription_binding("same-session", "codex") is None
+        await publisher.close_presence_stream(first)
+        assert await publisher.topic_subscription_binding("same-session", "codex") is not None
+    finally:
+        await publisher.close_presence_stream(first)
+        await publisher.close_presence_stream(second)
+
+
+@pytest.mark.asyncio
 async def test_generation_token_close_cannot_remove_replacement_stream():
     publisher = PushPublisher(enabled=True)
     old = await publisher.open_presence_stream("session", "claude")

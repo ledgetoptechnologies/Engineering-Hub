@@ -6,7 +6,7 @@ This repository builds a private GHCR container package and a TrueNAS SCALE Comp
 
 ## Safe sends and connection visibility
 
-v0.6.0 adds optional sender-scoped `client_request_id` deduplication, private `get_send_receipt` reconciliation, and server-observed `presence_status`. Presence distinguishes an open native SSE stream/subscription from chat readiness or a read receipt. Existing keyless sends and native-only delivery remain compatible. See [safe sends, receipts and presence](docs/safe-sends-and-presence.md).
+v0.6.0 adds optional sender-scoped `client_request_id` deduplication, private `get_send_receipt` reconciliation, and server-observed `presence_status`. The current, unpublished schema-5 source adds persistent per-topic member associations through `topic_presence_join`, `topic_presence_status`, and `topic_presence_leave`; per-topic online state requires the same authenticated native MCP session's inbox subscription and active SSE stream. Topic labels are not ACLs. Existing keyless sends, global presence, and native-only delivery remain compatible. See [safe sends, receipts and presence](docs/safe-sends-and-presence.md).
 
 ## Native event-driven MCP push
 

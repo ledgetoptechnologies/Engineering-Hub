@@ -66,3 +66,17 @@ CREATE TABLE IF NOT EXISTS knowledge (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project, path)
 );
+
+-- One durable membership per authenticated agent and exact topic label.
+-- Session IDs are stored only as a domain-separated digest; live transport
+-- state is process-local and is never inferred from this row alone.
+CREATE TABLE IF NOT EXISTS topic_memberships (
+    topic TEXT NOT NULL,
+    agent TEXT NOT NULL CHECK (agent IN ('hermes', 'codex', 'claude')),
+    session_hash TEXT NOT NULL,
+    subscription_generation TEXT NOT NULL,
+    stream_generation TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY (topic, agent)
+);

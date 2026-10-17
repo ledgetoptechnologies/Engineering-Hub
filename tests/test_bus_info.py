@@ -17,7 +17,8 @@ async def test_bus_info_live_catalog_help_and_authentication(tmp_path):
     info=tools['bus_info'].fn
     overview=await info(ctx=context('codex'))
     assert overview['version']=='0.6.0'
-    assert overview['tool_count']==len(tools)==24
+    assert overview['tool_count']==len(tools)==27
+    assert overview['schema_version']==5
     assert set(overview['tools'])==set(tools)
     assert overview['native_push']['subscriptions_enabled'] is False
     assert overview['native_push']['inbox_uri']=='agentbus://inbox/codex'
@@ -45,6 +46,14 @@ async def test_bus_info_presence_recovery_and_selected_conversation_help(tmp_pat
     assert presence['presence']['scope']=='this_server_process'
     assert all(not row['subscribed'] for row in presence['presence']['agents'])
     assert presence['examples'][0]['tool']=='presence_status'
+    assert {item['tool'] for item in presence['examples'] if 'tool' in item} == {
+        'presence_status', 'topic_presence_join', 'topic_presence_status', 'topic_presence_leave'
+    }
+    assert presence['features']['per_topic_presence'] is True
+    assert all(name in presence['help'] for name in (
+        'topic_presence_join', 'topic_presence_status', 'topic_presence_leave',
+    ))
+    assert 'not ACLs' in presence['help']
     recovery=await info(topic='recovery',ctx=context('codex'))
     assert recovery['examples'][0]['tool']=='get_send_receipt'
     assert 'same key' in recovery['help']

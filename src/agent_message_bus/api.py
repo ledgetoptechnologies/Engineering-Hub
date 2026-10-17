@@ -17,6 +17,7 @@ from .database import InvalidTransition, MessageError, MessageRepository, NotFou
 from .files import FileConflict, FileError, FileIntegrityError, FileTooLarge, FileNotFound, FilePathError, FileRepository, file_dict
 from .feedback import FeedbackError, FeedbackRepository, feedback_dict, feedback_page_dict, feedback_revision_dict
 from .retention import RetentionPolicy, cleanup
+from .topic_presence import TopicPresenceRepository
 
 
 class MessageCreate(BaseModel):
@@ -53,9 +54,11 @@ class FeedbackUpdate(BaseModel):
 
 class Service:
     def __init__(self, repository: MessageRepository, audit: AuditLog, auth: AuthSettings,
-                 policy: RetentionPolicy, files: FileRepository | None = None, semantic: Any = None):
+                 policy: RetentionPolicy, files: FileRepository | None = None, semantic: Any = None,
+                 topic_presence: TopicPresenceRepository | None = None):
         self.repository, self.audit, self.auth, self.policy, self.files = repository, audit, auth, policy, files
         self.semantic = semantic
+        self.topic_presence = topic_presence or TopicPresenceRepository(repository.path)
         self.feedback = FeedbackRepository(repository.path)
 
     def audit_feedback(self, operation: str, agent: str, request: Request | None = None) -> None:

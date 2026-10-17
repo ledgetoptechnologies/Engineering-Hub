@@ -4,7 +4,8 @@ import asyncio
 import base64
 import binascii
 import json
-from typing import Any
+from datetime import datetime, timezone
+from typing import Annotated, Any
 from urllib.parse import parse_qsl
 
 from mcp import types
@@ -12,7 +13,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.lowlevel import Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import AnyUrl
+from pydantic import AnyUrl, Field
 
 from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, SendConflict, SendReplayUnavailable, message_dict
@@ -26,6 +27,9 @@ _INBOX_TEMPLATE = "agentbus://inbox/{recipient}?after={cursor}"
 _MAX_CURSOR = (1 << 63) - 1
 _MAX_PAGE_SIZE = 100
 _DEFAULT_PAGE_SIZE = 50
+_TOPIC_LABEL = Annotated[str, Field(min_length=1, max_length=128,
+                                    pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")]
+_REGISTRATION_GENERATION = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 
 
 def _install_inbox_resources(mcp: FastMCP, service: Service, publisher: PushPublisher) -> None:
@@ -161,6 +165,7 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
     import os
 
     push_publisher = push_publisher or getattr(service, "push_publisher", None) or PushPublisher()
+    assert isinstance(push_publisher, PushPublisher)
     service.push_publisher = push_publisher
 
     allowed_hosts = [
@@ -234,6 +239,73 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         if ctx is None: raise ValueError("request context required")
         authenticated(ctx)
         return await push_publisher.presence_status()
+
+    @mcp.tool()
+    async def topic_presence_join(topic: _TOPIC_LABEL, ctx: Context | None = None) -> dict[str, Any]:
+        """Register your authenticated agent for a topic on this live subscribed MCP session.
+
+        Requires one unambiguous observed SSE stream and a healthy inbox subscription. Rejoining
+        replaces this agent's prior topic registration with a new generation. Topic names are
+        grouping labels, not access-control boundaries.
+        """
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        request = ctx.request_context.request
+        session_id = request.headers.get("mcp-session-id")
+        if not session_id:
+            raise ValueError("MCP session id required")
+        binding = await push_publisher.topic_subscription_binding(session_id, identity)
+        if binding is None:
+            raise ValueError("topic registration requires this session's healthy inbox subscription and exactly one active SSE stream")
+        subscription_generation, stream_generation = binding
+        return service.topic_presence.register(
+            agent=identity, topic=topic, session_id=session_id,
+            subscription_generation=subscription_generation,
+            stream_generation=stream_generation,
+        )
+
+    @mcp.tool()
+    def topic_presence_leave(topic: _TOPIC_LABEL, generation: _REGISTRATION_GENERATION,
+                             ctx: Context | None = None) -> dict[str, Any]:
+        """Leave only your matching registration from this MCP session; stale generations are harmless."""
+        if ctx is None: raise ValueError("request context required")
+        identity = authenticated(ctx)
+        request = ctx.request_context.request
+        session_id = request.headers.get("mcp-session-id")
+        if not session_id:
+            raise ValueError("MCP session id required")
+        removed = service.topic_presence.leave(
+            agent=identity, topic=topic, session_id=session_id, generation=generation,
+        )
+        return {"topic": topic, "removed": removed}
+
+    @mcp.tool()
+    async def topic_presence_status(topic: _TOPIC_LABEL, ctx: Context | None = None) -> dict[str, Any]:
+        """Read persisted members for one exact topic and their current transport-only online state."""
+        if ctx is None: raise ValueError("request context required")
+        authenticated(ctx)
+        members = service.topic_presence.members(topic)
+        live = await push_publisher.live_topic_bindings()
+        result = []
+        for member in members:
+            online = (
+                member["session_hash"], member["agent"], member["subscription_generation"],
+                member["stream_generation"],
+            ) in live
+            result.append({
+                "agent": member["agent"],
+                "state": "online" if online else "disconnected",
+                "online": online,
+                "registered_at": member["registered_at"],
+            })
+        return {
+            "topic": topic,
+            "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scope": "this_server_process",
+            "native_push_available": push_publisher.enabled,
+            "semantics": "Online means this registration's authenticated MCP session currently has an observed SSE stream and inbox subscription; it does not indicate model readiness or message receipt.",
+            "members": result,
+        }
 
     @mcp.tool()
     def receive_messages(limit: int = 50, ctx: Context | None = None) -> dict[str, Any]:
