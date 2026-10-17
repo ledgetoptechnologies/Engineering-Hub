@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import closing
 import threading
 import time
 
@@ -31,7 +32,7 @@ def test_coherent_wal_backup_and_restored_repository_auth(tmp_path):
     assert report["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
     assert "PRIVATE" not in json.dumps(report)
     assert session["cookie_token"] not in json.dumps(report)
-    with sqlite3.connect(target) as restored:
+    with closing(sqlite3.connect(target)) as restored, restored:
         assert restored.execute("SELECT value FROM concurrent_committed").fetchone() == (42,)
     assert HubRepository(target).get_task(task["id"])["title"] == "PRIVATE fixture title"
     assert SessionStore(target).session_for(session["cookie_token"])["github_id"] == 123
@@ -107,7 +108,7 @@ def test_cli_reports_only_digest_integrity_metadata(tmp_path, capsys):
 def test_backup_is_transactionally_coherent_while_wal_writer_runs(tmp_path):
     source, target = tmp_path / "hub.db", tmp_path / "snapshot.db"
     HubRepository(source)
-    with sqlite3.connect(source) as db:
+    with closing(sqlite3.connect(source)) as db, db:
         db.execute("CREATE TABLE snapshot_pair (id INTEGER PRIMARY KEY, version INTEGER)")
         db.executemany("INSERT INTO snapshot_pair VALUES (?,0)", [(1,), (2,)])
     stop, ready = threading.Event(), threading.Event()
@@ -115,7 +116,7 @@ def test_backup_is_transactionally_coherent_while_wal_writer_runs(tmp_path):
 
     def write_transactions():
         try:
-            with sqlite3.connect(source, timeout=5) as db:
+            with closing(sqlite3.connect(source, timeout=5)) as db, db:
                 while not stop.is_set():
                     db.execute("BEGIN IMMEDIATE")
                     db.execute("UPDATE snapshot_pair SET version=version+1")
@@ -134,6 +135,6 @@ def test_backup_is_transactionally_coherent_while_wal_writer_runs(tmp_path):
         stop.set()
         thread.join(5)
     assert not thread.is_alive() and not errors
-    with sqlite3.connect(target) as restored:
+    with closing(sqlite3.connect(target)) as restored, restored:
         values = [row[0] for row in restored.execute("SELECT version FROM snapshot_pair ORDER BY id")]
     assert values[0] >= 1 and values[0] == values[1]

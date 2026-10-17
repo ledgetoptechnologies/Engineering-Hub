@@ -23,6 +23,7 @@ from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
 from .events import NativeHubEventFeed
+from .autonomy import StagingRuntime
 
 PROJECTS = (
     ("engineering-hub", "Engineering Hub"), ("3d-viewer", "3D Viewer"),
@@ -113,13 +114,25 @@ class TopicPreflight(Input):
 
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
-               fixture_workflow=None, reachability_provider=None, event_feed=None):
+               fixture_workflow=None, reachability_provider=None, event_feed=None,
+               staging_dispatcher=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
     if fixture_workflow is not None and fixture_workflow.repo is not repo:
         raise ValueError("fixture_repository_mismatch")
     sessions = SessionStore(settings.database)
     feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
+    if staging_dispatcher is not None and (
+            staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not fixture_workflow):
+        raise ValueError('dispatcher_workflow_mismatch')
+    runtime = StagingRuntime(staging_dispatcher, feed) if staging_dispatcher is not None else None
+
+    def autonomy_for():
+        if runtime is None:
+            return {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
+        receipts = [{key: value for key, value in item.items() if key != 'owner'}
+                    for item in staging_dispatcher.receipts()]
+        return {**runtime.status, 'receipts': receipts}
 
     def peers_for(topic):
         if not isinstance(topic, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic):
@@ -148,7 +161,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 'advisory': True, 'delivery_guaranteed': False}
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
-                          topic_preflight=preflight_for)
+                          topic_preflight=preflight_for, autonomy_status=autonomy_for)
     origin = urlsplit(settings.auth_config.origin)
     hub_mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -161,14 +174,19 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         await feed.start()
         try:
             async with hub_mcp.session_manager.run():
+                if runtime is not None:
+                    await runtime.start()
                 yield
         finally:
+            if runtime is not None:
+                await runtime.stop()
             await feed.stop()
 
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.event_feed = feed
+    app.state.staging_runtime = runtime
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
 
@@ -206,6 +224,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     def agent(request: Request):
         return settings.agent_auth.agent(request)
+
+    @app.get('/api/hub/v1/autonomy')
+    def autonomy_status(request: Request):
+        actor(request)
+        return autonomy_for()
 
     @app.get('/api/hub/v1/topics/{topic}/peers', response_model=TopicSnapshot)
     def topic_peers(topic: str, request: Request):
@@ -266,7 +289,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_tasks(), "decisions": repo.list_decisions(),
-                "runs": repo.list_runs(), "agents": agents(),
+                "runs": repo.list_runs(), "agents": agents(), "autonomy": autonomy_for(),
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
                                  "fixture_dispatch": fixture_workflow is not None,

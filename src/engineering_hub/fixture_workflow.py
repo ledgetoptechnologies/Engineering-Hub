@@ -68,7 +68,8 @@ class FixtureWorkflow:
         canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
         return 'sha256:' + hashlib.sha256(canonical.encode()).hexdigest()
 
-    def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id):
+    def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id, *,
+                   client_request_id=None):
         task = self.repo.get_task(task_id)
         target = self.targets.get(target_id)
         if (target is None or target_id != task['project'] + ':staging'
@@ -77,7 +78,8 @@ class FixtureWorkflow:
                 or target.policy_revision != 1):
             raise HubError('fixture_manifest_mismatch', 403)
         return self.repo.create_run(actor, task_id, expected_revision, artifact_digest, target_id,
-                                    execution_manifest_digest=self._manifest_digest(target))
+                                    execution_manifest_digest=self._manifest_digest(target),
+                                    client_request_id=client_request_id)
 
     def _event(self, run, event):
         # Run execution evidence uses one stable run identity. The individual

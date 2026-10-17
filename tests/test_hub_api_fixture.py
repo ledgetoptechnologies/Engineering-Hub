@@ -73,8 +73,12 @@ def fixture_hub(tmp_path):
         session = app.state.sessions.create_session(42)  # Internal fixture; never an HTTP mint route.
         client.cookies.set(settings.auth_config.cookie_name, session["cookie_token"])
         human = {"Origin": settings.auth_config.origin, "X-Hub-CSRF": session["csrf_token"]}
-        yield Harness(client, app, settings, repo, workflow, target, commands, outcomes, human)
-    asyncio.run(executor.aclose())
+        try:
+            yield Harness(client, app, settings, repo, workflow, target, commands, outcomes, human)
+        finally:
+            # Close on the app's existing loop. asyncio.run() would replace the
+            # clean policy loop installed by pytest-asyncio and orphan it.
+            client.portal.call(executor.aclose)
 
 
 def verified_task(hub, *, commit=COMMIT):
@@ -258,3 +262,14 @@ def test_reject_workflow_repository_mismatch(fixture_hub, tmp_path):
     different = HubRepository(tmp_path / "different.sqlite3", execution_principal="executor:fixture")
     with pytest.raises(ValueError, match="fixture_repository_mismatch"):
         create_app(hub.settings, repository=different, fixture_workflow=hub.workflow)
+
+
+async def test_fixture_cleanup_preserves_pytest_owned_running_loop(tmp_path):
+    # Teardown must also be safe when another test harness owns the caller loop;
+    # creating/replacing a loop with asyncio.run is not valid resource ownership.
+    caller_loop = asyncio.get_running_loop()
+    lifecycle = fixture_hub.__wrapped__(tmp_path)
+    next(lifecycle)
+    lifecycle.close()
+    assert asyncio.get_running_loop() is caller_loop
+    assert not caller_loop.is_closed()

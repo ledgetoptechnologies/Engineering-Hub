@@ -1,0 +1,240 @@
+"""Explicit, bounded durable-outbox catchup for operator-configured fixtures.
+
+No timer, observer, reassignment, model invocation or real-host driver lives here.
+Call ``drain_batch`` on startup/invalidation. A reservation without a completed
+receipt is *not* retried: a process may have died across the run-creation gap.
+Such entries remain visible as requiring reconciliation, never guessed from
+another run's target or task. The repository still enforces CAS, pause, fences
+and the task's lifetime repair budget.
+"""
+from dataclasses import asdict
+import json
+import uuid
+
+from .repository import AGENTS, HubError
+
+
+class StagingDispatcher:
+    def __init__(self, repo, workflow):
+        if workflow.repo is not repo or repo.execution_principal is None:
+            raise ValueError('dispatcher_repository_identity_required')
+        self.repo, self.workflow = repo, workflow
+        with repo._connection() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS hub_dispatch_cursor (
+                    id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL);
+                INSERT OR IGNORE INTO hub_dispatch_cursor VALUES(1,0);
+                CREATE TABLE IF NOT EXISTS hub_dispatch_receipts (
+                    sequence INTEGER PRIMARY KEY, entity_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, owner TEXT NOT NULL,
+                    state TEXT NOT NULL, run_id TEXT, reason TEXT,
+                    request TEXT NOT NULL, attempt_head INTEGER NOT NULL DEFAULT 0);
+            ''')
+
+    @property
+    def cursor(self):
+        with self.repo._connection() as db:
+            return db.execute('SELECT sequence FROM hub_dispatch_cursor WHERE id=1').fetchone()[0]
+
+    def receipts(self, limit=50):
+        self._limit(limit)
+        with self.repo._connection() as db:
+            rows = db.execute('SELECT * FROM hub_dispatch_receipts ORDER BY sequence DESC LIMIT ?', (limit,))
+            return [{**{key: row[key] for key in row.keys() if key != 'request'},
+                     'needs_reconciliation': row['state'] in {'reserved', 'running', 'needs_reconciliation'}}
+                    for row in rows]
+
+    @staticmethod
+    def _limit(limit):
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise HubError('invalid_limit')
+
+    @staticmethod
+    def _eligible(task, target, revision):
+        review = task.get('review') if task else None
+        return bool(task and target and task['revision'] == revision
+                    and task['status'] == 'verified' and task['owner'] in AGENTS
+                    and review and review.get('actor') in AGENTS
+                    and review['actor'] != task['owner'] and review.get('verdict') == 'approve'
+                    and review.get('commit') == task['candidate_commit'] == target.candidate_commit
+                    and target.policy_revision == 1 and target.driver == 'fixture')
+
+    def _reserve_next(self):
+        """Select/validate/reserve and advance one durable event atomically."""
+        with self.repo._transaction() as db:
+            cursor = db.execute('SELECT sequence FROM hub_dispatch_cursor WHERE id=1').fetchone()[0]
+            row = db.execute('SELECT * FROM hub_outbox WHERE sequence>? ORDER BY sequence LIMIT 1', (cursor,)).fetchone()
+            if row is None:
+                return None
+            task, target = None, None
+            if row['action'] == 'task.reviewed':
+                found = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (row['entity_id'],)).fetchone()
+                task = json.loads(found[0]) if found else None
+                if task:
+                    target = self.workflow.targets.get(task['project'] + ':staging')
+            eligible = self._eligible(task, target, row['revision'])
+            if eligible and self.repo._paused(db):
+                return {'paused': True}
+            # Advancing past unrelated/stale events is safe; it never records a
+            # deployment receipt for them. Coalesced invalidations lose no rows.
+            db.execute('UPDATE hub_dispatch_cursor SET sequence=? WHERE id=1', (row['sequence'],))
+            if not eligible:
+                return {'skipped': row['sequence']}
+            owner = str(uuid.uuid4())
+            request = dict(actor=task['owner'], task_id=task['id'], expected_revision=task['revision'],
+                           artifact_digest=target.artifact_digest, target_id=target.target_id,
+                           client_request_id='hub-dispatch:' + str(row['sequence']), manifest=asdict(target))
+            head = db.execute('SELECT COALESCE(MAX(sequence),0) FROM hub_outbox').fetchone()[0]
+            db.execute('INSERT INTO hub_dispatch_receipts VALUES(?,?,?,?,?,?,?,?,?)',
+                       (row['sequence'], task['id'], task['revision'], owner, 'reserved', None, None,
+                        json.dumps(request, sort_keys=True), head))
+            return dict(sequence=row['sequence'], task=task, target=target, owner=owner)
+
+    def _reserve_deferred(self, sequence):
+        """Reclaim only proven local nonacceptance, never uncertain effects."""
+        with self.repo._transaction() as db:
+            row = db.execute("SELECT * FROM hub_dispatch_receipts WHERE sequence=? AND state='deferred'",
+                             (sequence,)).fetchone()
+            if row is None:
+                return None
+            head = db.execute('SELECT COALESCE(MAX(sequence),0) FROM hub_outbox').fetchone()[0]
+            if row['attempt_head'] >= head:
+                return None
+            request = json.loads(row['request'])
+            target = self.workflow.targets.get(request['target_id'])
+            if target is None or asdict(target) != request['manifest']:
+                db.execute("UPDATE hub_dispatch_receipts SET state='needs_reconciliation',reason='fixture_manifest_changed' WHERE sequence=?",
+                           (sequence,))
+                return None
+            found = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (request['task_id'],)).fetchone()
+            task = json.loads(found[0]) if found else None
+            if not self._eligible(task, target, request['expected_revision']):
+                db.execute("UPDATE hub_dispatch_receipts SET state='skipped',reason='stale_review' WHERE sequence=?", (sequence,))
+                return None
+            if self.repo._paused(db):
+                return None
+            owner = str(uuid.uuid4())
+            changed = db.execute("UPDATE hub_dispatch_receipts SET owner=?,state='reserved',reason=NULL,attempt_head=? WHERE sequence=? AND state='deferred'",
+                                 (owner, head, sequence)).rowcount
+            return dict(sequence=sequence, owner=owner) if changed == 1 else None
+
+    def _record(self, reservation, state, *, run_id=None, reason=None):
+        with self.repo._transaction() as db:
+            db.execute('UPDATE hub_dispatch_receipts SET state=?,run_id=COALESCE(?,run_id),reason=? '
+                       'WHERE sequence=? AND owner=?',
+                       (state, run_id, reason, reservation['sequence'], reservation['owner']))
+
+    async def drain_batch(self, limit=50):
+        """Inspect at most limit historical rows, with at most one workflow per row.
+
+        This is not a durable replay subscription. Call again when ``more`` is
+        true; the caller decides scheduling. Exceptions are sanitized in receipts.
+        BaseException/cancellation deliberately leaves an uncertain reservation.
+        """
+        self._limit(limit)
+        examined = dispatched = 0
+        paused = False
+        # Snapshot the bounded retry set once. A still-busy target cannot spin
+        # within one invocation or consume a new run identity on each retry.
+        with self.repo._connection() as db:
+            head = db.execute('SELECT COALESCE(MAX(sequence),0) FROM hub_outbox').fetchone()[0]
+            deferred = [row[0] for row in db.execute("SELECT sequence FROM hub_dispatch_receipts WHERE state='deferred' AND attempt_head<? ORDER BY sequence LIMIT ?", (head, limit))]
+        for sequence in deferred:
+            examined += 1
+            reservation = self._reserve_deferred(sequence)
+            if reservation is not None:
+                dispatched += await self._execute(reservation)
+        for _ in range(limit - examined):
+            reservation = self._reserve_next()
+            if reservation is None:
+                break
+            if reservation.get('paused'):
+                paused = True
+                break
+            examined += 1
+            if 'skipped' in reservation:
+                continue
+            dispatched += await self._execute(reservation)
+        with self.repo._connection() as db:
+            more = db.execute('SELECT 1 FROM hub_outbox WHERE sequence>? LIMIT 1', (self.cursor,)).fetchone() is not None
+        return dict(examined=examined, dispatched=dispatched, cursor=self.cursor, paused=paused, more=more)
+
+    async def _execute(self, reservation):
+        with self.repo._connection() as db:
+            row = db.execute('SELECT request FROM hub_dispatch_receipts WHERE sequence=? AND owner=?',
+                             (reservation['sequence'], reservation['owner'])).fetchone()
+        if row is None:
+            raise HubError('dispatch_reservation_conflict', 409)
+        request = json.loads(row[0])
+        try:
+            target = self.workflow.targets.get(request['target_id'])
+            if target is None or asdict(target) != request['manifest']:
+                raise HubError('fixture_manifest_changed', 409)
+            # Receipt lookup is exact, sender-scoped and transactional with run
+            # creation. Never search by target/task/latest run to infer identity.
+            prior = self.repo.get_run_request(request['actor'], request['client_request_id'])
+            arguments = {key: value for key, value in request.items() if key != 'manifest'}
+            # Re-submit the same *local transactional request*, not an executor
+            # command: this also validates the saved request fingerprint. A
+            # colliding key must not bind an unrelated run, even with similar
+            # task/target fields. No external I/O happens in create_run.
+            if prior is None:
+                run = self.workflow.create_run(**arguments)
+            else:
+                # Exact receipt validation must not depend on today's task
+                # candidate: the completed task may already have a new one.
+                run = self.repo.create_run(request['actor'], request['task_id'], request['expected_revision'],
+                                           request['artifact_digest'], request['target_id'],
+                                           execution_manifest_digest=self.workflow._manifest_digest(target),
+                                           client_request_id=request['client_request_id'])
+            if prior is not None and prior['id'] != run['id']:
+                raise HubError('dispatch_receipt_conflict', 409)
+            self._record(reservation, 'running', run_id=run['id'])
+            result = await self.workflow.advance(run['id'])
+            state = result['status']
+            self._record(reservation, state if state in {'succeeded', 'rolled_back'} else 'needs_reconciliation',
+                         run_id=run['id'], reason=None if state in {'succeeded', 'rolled_back'} else state)
+            return 1
+        except HubError as exc:
+            if exc.code in {'active_run', 'paused'}:
+                try:
+                    unaccepted = self.repo.get_run_request(request['actor'], request['client_request_id']) is None
+                except Exception:
+                    unaccepted = False
+                if unaccepted:
+                    # Repository rejects these before allocating run/fence or
+                    # effects. Only exact absence of the atomic receipt permits
+                    # ordinary event-triggered retry, with current review CAS.
+                    self._record(reservation, 'deferred', reason=exc.code)
+                    return 0
+            self._record(reservation, 'needs_reconciliation', reason=exc.code)
+        except Exception:
+            self._record(reservation, 'needs_reconciliation', reason='dispatch_uncertain')
+        return 0
+
+    async def reconcile(self, sequence, *, expected_owner, confirmed_quiescent=False):
+        """Explicit recovery after the prior dispatcher is proven quiescent.
+
+        Not an expiry-based lock takeover. Exact durable run receipts recover
+        local crashes, but unknown executor effects remain held by the workflow.
+        A caller must establish quiescence outside this module before invoking.
+        """
+        if type(sequence) is not int or sequence < 1 or confirmed_quiescent is not True:
+            raise HubError('dispatch_quiescence_required', 409)
+        owner = str(uuid.uuid4())
+        with self.repo._transaction() as db:
+            row = db.execute('SELECT * FROM hub_dispatch_receipts WHERE sequence=?', (sequence,)).fetchone()
+            if row is None:
+                raise HubError('not_found', 404)
+            if row['state'] in {'succeeded', 'rolled_back'}:
+                return {key: row[key] for key in row.keys() if key != 'request'}
+            if row['owner'] != expected_owner:
+                raise HubError('dispatch_reservation_conflict', 409)
+            if self.repo._paused(db):
+                raise HubError('paused', 423)
+            db.execute("UPDATE hub_dispatch_receipts SET owner=?,state='reserved' WHERE sequence=? AND owner=?",
+                       (owner, sequence, expected_owner))
+        await self._execute(dict(sequence=sequence, owner=owner))
+        with self.repo._connection() as db:
+            row = db.execute('SELECT * FROM hub_dispatch_receipts WHERE sequence=?', (sequence,)).fetchone()
+            return {key: row[key] for key in row.keys() if key != 'request'}

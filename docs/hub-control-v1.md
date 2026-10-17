@@ -51,6 +51,33 @@ I/O, and records delivery only after a valid message ID. It does not equate bus
 delivery with task completion. Its current linked-discussion routing is for the
 isolated build test; no publishing worker is activated by importing it.
 
+## Opt-in autonomous staging
+
+`StagingDispatcher` selects durable `task.reviewed` events only when the task's
+current revision, independent review, exact candidate and operator-owned fixture
+manifest agree. Each event has a durable reservation and stable run request key;
+run creation, its acceptance receipt, target fence and audit/outbox writes commit
+together. Exact retries return the same run rather than allocating another one.
+Unknown effects stay held. Known target-busy or pause rejection may be deferred
+and retried on a later durable event, without inventing another run identity.
+Changed candidates/manifests cannot reuse an old review. Three failed attempts
+remain the task's lifetime limit.
+
+An explicitly supplied `staging_dispatcher` dependency enables `StagingRuntime`
+inside the control process. It consumes the **existing** native Hub feed, catches
+up bounded outbox history, and otherwise waits without DB/model/status polling.
+No second native watcher is created. It checks observer health at each safe
+boundary and waits for an active bounded workflow on orderly shutdown, instead
+of cancelling a deployment mid-effect. Actual process crashes still require
+inspection before taking over uncertain work; a timeout is not quiescence proof.
+
+Normal environment startup has no dispatcher or host manifests and remains
+disabled. Agents cannot enable it through a tool or API. Authenticated
+`GET /api/hub/v1/autonomy` exposes the actual runtime state and redacted durable
+receipts. The current configured driver is fixture-only; no source test or
+MockTransport result establishes a real application rollout or staging target
+activation. Host inventory and real HTTP/container acceptance remain gates.
+
 ## Private configuration
 
 Use the existing approved secret/environment mechanism, not command arguments,

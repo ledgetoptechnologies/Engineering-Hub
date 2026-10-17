@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 import json
 import sqlite3
 import threading
@@ -15,7 +16,7 @@ def test_cursor_reader_only_reads_head_and_accepts_retention_gaps(tmp_path):
     repo = HubRepository(path)
     task = repo.create_task("human:42", "engineering-hub", "private title", "one")
     reader = HubOutboxCursorReader()
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         statements = []
         db.set_trace_callback(statements.append)
         assert reader(db, None) == ((), 1)
@@ -194,14 +195,14 @@ async def test_linux_native_external_commit_restart_and_idle_no_reads(tmp_path):
         await asyncio.sleep(0.05)
         assert source.stats["snapshot_reads"] == before
         # Independent connection/process-style writer, not broker.publish().
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute("INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES ('private','private',1,'now')")
         pointer = await asyncio.wait_for(anext(stream), timeout=5)
         assert pointer["cursor"] == 1
         assert set(pointer) == {"observer_epoch", "cursor", "kind"}
         # WAL writes alone are not commits: native arbitration must wait until
         # the external writer commits, then emit the durable head exactly once.
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES ('private','private',1,'now')")
             pending = asyncio.create_task(anext(stream))

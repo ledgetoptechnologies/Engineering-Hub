@@ -28,7 +28,7 @@ class HubMCPAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None) -> FastMCP:
+def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
 
@@ -54,8 +54,11 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None) -> Fast
     def hub_overview(ctx: Context) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state."""
         identity(ctx)
-        return {"tasks": invoke(repo.list_tasks), "decisions": invoke(repo.list_decisions),
-                "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
+        result = {"tasks": invoke(repo.list_tasks), "decisions": invoke(repo.list_decisions),
+                  "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
+        if autonomy_status is not None:
+            result['autonomy'] = invoke(autonomy_status)
+        return result
 
     @mcp.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:

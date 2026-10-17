@@ -81,6 +81,22 @@
         }
       }
     },
+    "/api/hub/v1/autonomy": {
+      "get": {
+        "summary": "Autonomy Status",
+        "operationId": "autonomy_status_api_hub_v1_autonomy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/topics/{topic}/peers": {
       "get": {
         "summary": "Topic Peers",

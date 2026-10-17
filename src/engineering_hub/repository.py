@@ -55,6 +55,9 @@ class HubRepository:
                     fingerprint TEXT NOT NULL, PRIMARY KEY(run_id,command_id,event));
                 CREATE TABLE IF NOT EXISTS hub_target_fences (
                     target TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0));
+                CREATE TABLE IF NOT EXISTS hub_run_requests (
+                    actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
             ''')
 
     @contextmanager
@@ -225,7 +228,7 @@ class HubRepository:
             item.update(answer=answer, answered_by=actor, status='answered')
             return self._save(db, actor, 'decision.answered', 'decision', item)
 
-    def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None):
+    def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None, client_request_id=None):
         self._actor(actor, agent=True)
         if not isinstance(artifact_digest, str) or not re.fullmatch('sha256:[0-9a-f]{64}', artifact_digest):
             raise HubError('invalid_digest')
@@ -234,7 +237,15 @@ class HubRepository:
             or re.fullmatch('sha256:[0-9a-f]{64}', execution_manifest_digest) is None
         ):
             raise HubError('invalid_manifest_digest')
+        key = self._text(client_request_id, 128) if client_request_id is not None else None
+        fingerprint = hashlib.sha256(_json([task_id, expected_revision, artifact_digest, target, execution_manifest_digest]).encode()).hexdigest()
         with self._transaction() as db:
+            if key is not None:
+                prior = db.execute('SELECT fingerprint,run_id FROM hub_run_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+                if prior:
+                    if prior['fingerprint'] != fingerprint:
+                        raise HubError('idempotency_conflict', 409)
+                    return self._get(db, prior['run_id'], 'run')
             task = self._get(db, task_id, 'task')
             self._cas(task, expected_revision)
             if self._paused(db):
@@ -264,7 +275,21 @@ class HubRepository:
                 created_by=actor, execution_actor=self.execution_principal,
                 execution_manifest_digest=execution_manifest_digest, events=[]), new=True)
             self._save(db, actor, 'task.run_created', 'task', task)
+            if key is not None:
+                self._record_run_request(db, actor, key, fingerprint, run['id'])
             return run
+
+    @staticmethod
+    def _record_run_request(db, actor, key, fingerprint, run_id):
+        db.execute('INSERT INTO hub_run_requests(actor,key,fingerprint,run_id) VALUES(?,?,?,?)',
+                   (actor, key, fingerprint, run_id))
+
+    def get_run_request(self, actor, key):
+        self._actor(actor, agent=True)
+        key = self._text(key, 128)
+        with self._connection() as db:
+            receipt = db.execute('SELECT run_id FROM hub_run_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            return self._get(db, receipt['run_id'], 'run') if receipt else None
 
     def get_run(self, identity):
         return self._read(identity, 'run')

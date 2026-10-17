@@ -249,6 +249,76 @@ def test_execution_manifest_atomically_snapshotted_and_preserved_by_event(repo):
     assert job['execution_manifest_digest'] == manifest
 
 
+def test_run_acceptance_receipt_survives_pause_state_change_and_restart(repo):
+    item = verified(repo)
+    manifest = 'sha256:' + 'e' * 64
+    args = ('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
+    first = repo.create_run(*args, execution_manifest_digest=manifest, client_request_id='request-one')
+    first = repo.append_run_event(EXECUTOR, first['id'], 'running', 'one', first['fencing_generation'], first['revision'])
+    repo.set_pause('human:1234', True)
+    before = len(repo.list_audit())
+    reopened = HubRepository(repo.path, execution_principal=EXECUTOR)
+    assert reopened.create_run(*args, execution_manifest_digest=manifest, client_request_id='request-one') == first
+    assert reopened.get_run_request('codex', 'request-one') == first
+    assert reopened.get_run_request('hermes', 'request-one') is None
+    assert len(reopened.list_audit()) == len(reopened.list_outbox()) == before
+    assert len(reopened.list_runs()) == 1
+    with repo._connection() as db:
+        assert db.execute('SELECT generation FROM hub_target_fences').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('change', ['revision', 'digest', 'manifest', 'target', 'task'])
+def test_run_receipt_conflict(repo, change):
+    item = verified(repo)
+    kwargs = dict(actor='codex', task_id=item['id'], expected_revision=item['revision'], artifact_digest=DIGEST,
+                  target='engineering-hub:staging', execution_manifest_digest='sha256:' + 'e' * 64,
+                  client_request_id='request-one')
+    repo.create_run(**kwargs)
+    if change == 'revision':
+        kwargs['expected_revision'] += 1
+    elif change == 'digest':
+        kwargs['artifact_digest'] = 'sha256:' + 'f' * 64
+    elif change == 'manifest':
+        kwargs['execution_manifest_digest'] = 'sha256:' + 'f' * 64
+    elif change == 'target':
+        kwargs['target'] = 'treedar:staging'
+    else:
+        kwargs['task_id'] = 'another-task'
+    with pytest.raises(HubError, match='idempotency_conflict'):
+        repo.create_run(**kwargs)
+    assert len(repo.list_runs()) == 1
+
+
+@pytest.mark.parametrize('failure', ['receipt', 'audit'])
+def test_run_receipt_and_run_creation_rollback_atomically(repo, monkeypatch, failure):
+    item = verified(repo)
+    before = len(repo.list_audit())
+    def fail(*args, **kwargs):
+        raise sqlite3.OperationalError('simulated failure')
+    with monkeypatch.context() as context:
+        if failure == 'receipt':
+            context.setattr(repo, '_record_run_request', fail)
+        else:
+            with repo._connection() as db:
+                db.execute("CREATE TRIGGER reject_run_audit BEFORE INSERT ON hub_audit WHEN NEW.action = 'run.created' BEGIN SELECT RAISE(ABORT, 'simulated audit failure'); END")
+        with pytest.raises(sqlite3.DatabaseError):
+            repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging', client_request_id='receipt')
+    assert repo.get_run_request('codex', 'receipt') is None
+    assert repo.list_runs() == []
+    assert len(repo.list_audit()) == len(repo.list_outbox()) == before
+    assert repo.get_task(item['id'])['revision'] == item['revision']
+    with repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_target_fences').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('key', ['', ' ', 'x' * 129, 123])
+def test_invalid_run_request_key(repo, key):
+    item = verified(repo)
+    with pytest.raises(HubError, match='invalid_input'):
+        repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging', client_request_id=key)
+    assert repo.list_runs() == []
+
+
 @pytest.mark.parametrize('title,options', [('', ['a', 'b']), ('x'*201, ['a', 'b']), ('ok', ['a']), ('ok', ['a', 'a'])])
 def test_decision_validation(repo, title, options):
     with pytest.raises(HubError):

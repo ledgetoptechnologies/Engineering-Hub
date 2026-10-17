@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 import uuid
 
 import pytest
@@ -88,7 +89,7 @@ async def test_invalid_receipt_never_marks_delivered_and_pause_allows_notificati
     bus.bad_receipt = True
     publisher = HubOutboxPublisher(repo, bus, recipients=("hermes",))
     assert await publisher.drain_batch() == {"delivered": 0, "failed": 1, "pending": 2}
-    with sqlite3.connect(repo.path) as db:
+    with closing(sqlite3.connect(repo.path)) as db, db:
         assert db.execute("SELECT COUNT(*) FROM hub_delivery_receipts WHERE message_id IS NOT NULL").fetchone()[0] == 0
     bus.bad_receipt = False
     assert await publisher.drain_batch() == {"delivered": 2, "failed": 0, "pending": 0}

@@ -30,6 +30,7 @@ agent_message_bus = ["schema.sql", "feedback_schema.sql"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.uv]
 default-groups = ["test"]
