@@ -9,6 +9,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from .ownership import OwnerBusy, exclusive_owner, guard_initialization
 
 
 COMMAND_FIELDS = {
@@ -31,6 +32,7 @@ class ExecutorError(Exception):
 
 
 class HubExecutor:
+    @guard_initialization
     def __init__(
         self,
         database_path,
@@ -145,6 +147,29 @@ class HubExecutor:
                 raise ExecutorError("invalid_payload", 400)
 
     def execute_command(self, command):
+        try:
+            lock = self.database_path.with_name(self.database_path.name + '.execution.lock')
+            with exclusive_owner(lock):
+                return self._execute_owned(command)
+        except OwnerBusy:
+            # Read-only idempotency lookup is safe while another owner acts.
+            # Never adopt its operation or replay a side effect.
+            self._validate_shape(command)
+            payload = json.dumps(command, sort_keys=True, separators=(",", ":"))
+            with self._db() as connection:
+                row = connection.execute(
+                    "SELECT payload,result FROM commands WHERE command_id=?",
+                    (command['command_id'],),
+                ).fetchone()
+            if row is not None:
+                if row['payload'] != payload:
+                    raise ExecutorError('command_conflict', 409) from None
+                result = json.loads(row['result'])
+                result['replayed'] = True
+                return result
+            raise ExecutorError('target_busy', 409) from None
+
+    def _execute_owned(self, command):
         self._validate_shape(command)
         payload = json.dumps(command, sort_keys=True, separators=(",", ":"))
         result = {

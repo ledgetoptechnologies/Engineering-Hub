@@ -86,3 +86,40 @@ def test_docker_harness_supports_real_backend_scenario_callback():
     repository = Path(__file__).resolve().parents[1]
     smoke = runpy.run_path(str(repository / 'docker/hub-test-smoke.py'))
     assert 'scenario' in inspect.signature(smoke['run_smoke']).parameters
+
+
+def test_second_service_process_refuses_a_live_owner(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    token = tmp_path / 'private-token'
+    token.write_text('fixture-only-owner-lock-test')
+    token.chmod(0o600)
+    port = _free_port()
+    env = os.environ.copy()
+    env.update(HUB_EXECUTOR_DATA_DIR=str(tmp_path / 'data'), HUB_EXECUTOR_TOKEN_FILE=str(token),
+               HUB_EXECUTOR_HOST='127.0.0.1', HUB_EXECUTOR_PORT=str(port), PYTHONPATH=str(repository))
+    first = subprocess.Popen([sys.executable, '-m', 'hub_executor'], cwd=repository, env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    second = None
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=0.2):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.03)
+        other = env | {'HUB_EXECUTOR_PORT': str(_free_port())}
+        second = subprocess.Popen([sys.executable, '-m', 'hub_executor'], cwd=repository, env=other,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            second.wait(timeout=0.7)
+        except subprocess.TimeoutExpired:
+            raise AssertionError('second fixture service adopted state while first owner was live')
+        assert second.returncode != 0
+        assert first.poll() is None
+    finally:
+        for process in (second, first):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)

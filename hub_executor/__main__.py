@@ -1,7 +1,9 @@
 import os
+from pathlib import Path
 
 from .fixtures import make_fixture_executor
 from .http import make_server
+from .ownership import exclusive_owner
 
 
 def main():
@@ -9,7 +11,7 @@ def main():
     token_env = os.environ.get("HUB_EXECUTOR_TOKEN")
     if token_file and token_env:
         raise RuntimeError("configure the executor token by file or environment, not both")
-    token = open(token_file, encoding="utf-8").read().strip() if token_file else token_env
+    token = Path(token_file).read_text(encoding="utf-8").strip() if token_file else token_env
     if not token:
         raise RuntimeError("fixture executor token is required")
 
@@ -24,13 +26,14 @@ def main():
         raise RuntimeError("fixture executor port is invalid")
 
     root = os.environ.get("HUB_EXECUTOR_DATA_DIR", "/data")
-    executor = make_fixture_executor(root)
-    server = make_server(executor, token, host=host, port=port)
-    server.daemon_threads = True
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
+    with exclusive_owner(Path(root) / '.service.lock'):
+        executor = make_fixture_executor(root)
+        server = make_server(executor, token, host=host, port=port)
+        server.daemon_threads = False
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
 
 
 if __name__ == "__main__":

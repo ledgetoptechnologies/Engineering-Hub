@@ -379,3 +379,56 @@ def test_reconcile_does_not_trust_forged_target_marker(tmp_path, monkeypatch):
     result = executor.reconcile_command(payload['command_id'])
     assert result['state'] == 'held'
     assert result['observed'] == {}
+
+
+def test_second_instance_cannot_adopt_a_genuinely_active_command(tmp_path, monkeypatch):
+    executor = executor_for(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    from contextlib import contextmanager
+    original_db = executor._db
+    armed = True
+    @contextmanager
+    def executing():
+        nonlocal armed
+        with original_db() as connection:
+            yield connection
+            accepted = armed and connection.execute("SELECT 1 FROM commands WHERE status='running'").fetchone() is not None
+        if accepted:
+            armed = False
+            entered.set()
+            assert release.wait(timeout=3)
+    monkeypatch.setattr(executor, '_db', executing)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(executor.execute_command, command())
+        assert entered.wait(timeout=2)
+        try:
+            with pytest.raises(RuntimeError, match='owner'):
+                executor_for(tmp_path)
+            assert executor.get_command(command()['command_id'])['state'] == 'running'
+        finally:
+            release.set()
+        assert future.result(timeout=5)['state'] == 'succeeded'
+
+
+def test_inflight_identical_command_replays_without_adopting_owner(tmp_path, monkeypatch):
+    executor = executor_for(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = executor._apply_fixture
+    def active(payload):
+        entered.set()
+        assert release.wait(timeout=3)
+        return original(payload)
+    monkeypatch.setattr(executor, '_apply_fixture', active)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(executor.execute_command, command())
+        assert entered.wait(timeout=2)
+        try:
+            replay = executor.execute_command(command())
+            assert replay['replayed'] is True and replay['state'] == 'running'
+            with pytest.raises(ExecutorError) as error:
+                executor.execute_command(command(action='smoke_fixture'))
+            assert error.value.code == 'command_conflict'
+        finally:
+            release.set()
+        assert future.result(timeout=5)['state'] == 'succeeded'
+    assert executor._read_observed(TARGET)['effect_count'] == 1
