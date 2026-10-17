@@ -11,9 +11,16 @@ import sqlite3
 import uuid
 
 
+def _valid_route(topic, correlation):
+    return (isinstance(correlation, str)
+            and re.fullmatch(r"[a-zA-Z0-9_./:-]{1,128}", correlation) is not None
+            and correlation.split('/', 1)[0] == topic
+            and all(correlation.split('/')))
+
+
 class HubOutboxPublisher:
     def __init__(self, repo, bus_client, *, recipients=("hermes", "claude"),
-                 topic="auto-wake-v1-test", correlation_id="engineering-hub-events"):
+                 topic="auto-wake-v1-test", correlation_id=None):
         self.path = repo.path
         self.client = bus_client
         self.recipients = tuple(dict.fromkeys(recipients))
@@ -21,8 +28,10 @@ class HubOutboxPublisher:
             raise ValueError("Recipients must be configured agent identities")
         if topic != "auto-wake-v1-test":
             raise ValueError("Publisher topic must use the approved linked discussion")
-        if not isinstance(correlation_id, str) or not re.fullmatch(r"[a-zA-Z0-9_./:-]{1,128}", correlation_id):
-            raise ValueError("Invalid correlation identifier")
+        if correlation_id is None:
+            correlation_id = topic + "/engineering-hub-events"
+        if not _valid_route(topic, correlation_id):
+            raise ValueError("Correlation root must match the approved topic")
         self.topic, self.correlation_id = topic, correlation_id
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS hub_delivery_namespace (id INTEGER PRIMARY KEY CHECK(id=1), namespace TEXT NOT NULL)")
@@ -73,7 +82,7 @@ class HubOutboxPublisher:
                     result.append(dict(row))
             return result
 
-    def _mark_delivered(self, sequence, recipient, message_id):
+    def _mark_accepted(self, sequence, recipient, message_id):
         with self._db() as db:
             db.execute("UPDATE hub_delivery_receipts SET message_id=? WHERE sequence=? AND recipient=? AND message_id IS NULL",
                        (message_id, sequence, recipient))
@@ -87,22 +96,35 @@ class HubOutboxPublisher:
     async def drain_batch(self, limit=50):
         """Send at most limit pointers. Replays use the exact persisted request.
 
-        Delivery is at-least-once; bus client_request_id deduplication is required.
+        Sends are at-least-once; bus client_request_id deduplication is required.
+        Accepted means durable bus acceptance, NOT selected-session delivery.
         The first uncertain/failing result stops the batch for safe explicit retry.
         """
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("Batch size must be between 1 and 500")
-        delivered, failed = 0, 0
+        accepted, failed, held_reason = 0, 0, None
         for delivery in self._prepare(limit):
             try:
-                result = await self.client.send_message(**json.loads(delivery["request_json"]))
+                request = json.loads(delivery["request_json"])
+                # A persisted pre-upgrade envelope may have a conflicting root.
+                # Never rewrite a possibly accepted idempotent payload or send it
+                # to a different topic. Leave it intact for explicit reconciliation.
+                correlation = request.get('correlation_id')
+                body = request.get('body')
+                if (not isinstance(body, dict) or body.get('topic') != self.topic
+                        or not _valid_route(self.topic, correlation)):
+                    failed, held_reason = failed + 1, 'routing_conflict'
+                    break
+                result = await self.client.send_message(**request)
                 message_id = result.get("id") if isinstance(result, dict) else None
                 if not isinstance(message_id, str) or str(uuid.UUID(message_id)) != message_id:
                     raise ValueError("Invalid delivery receipt")
-                self._mark_delivered(delivery["sequence"], delivery["recipient"], message_id)
-                delivered += 1
+                self._mark_accepted(delivery["sequence"], delivery["recipient"], message_id)
+                accepted += 1
             except Exception:
                 # Deliberately omit exception text: clients may include secrets.
                 failed += 1
+                held_reason = 'bus_acceptance_unconfirmed'
                 break
-        return {"delivered": delivered, "failed": failed, "pending": self._pending()}
+        return {"accepted": accepted, "failed": failed, "pending": self._pending(),
+                "held_reason": held_reason}

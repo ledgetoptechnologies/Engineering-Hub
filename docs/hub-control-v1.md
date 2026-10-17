@@ -49,8 +49,13 @@ possibly completed deployment, but need a recovery UI before live activation.
 
 `HubOutboxPublisher.drain_batch` is bounded and explicitly invoked. It sends only
 event pointers, persists prepared payloads and stable bus idempotency keys before
-I/O, and records delivery only after a valid message ID. It does not equate bus
-delivery with task completion. Its current linked-discussion routing is for the
+I/O, and records **bus acceptance** only after a valid message ID. Its result uses
+`accepted`, not `delivered`: this proves neither chat delivery nor task completion.
+The correlation root must agree with the approved topic. Conflicting persisted
+legacy envelopes remain intact and held with `routing_conflict`, never silently
+rewritten under a possibly accepted idempotency key. Unconfirmed sends report
+`bus_acceptance_unconfirmed` and preserve the original key/payload for reconciliation.
+Its current linked-discussion routing is for the
 isolated build test; no publishing worker is activated by importing it.
 
 ## Opt-in autonomous staging
@@ -81,6 +86,10 @@ MockTransport result establishes a real application rollout or staging target
 activation. Host inventory and real HTTP/container acceptance remain gates.
 
 ## Private configuration
+
+The opt-in, standalone `compose.hub-control.yaml` profile and
+[`hub-control-deployment.md`](hub-control-deployment.md) provide the private
+operator deployment path. They have not been activated and do not modify the bus.
 
 Use the existing approved secret/environment mechanism, not command arguments,
 repository files, chat, or browser storage. Required variables:
@@ -140,7 +149,7 @@ claiming work, executing work and completing it.
 
 Local verification on 2026-10-17: production Vite/TypeScript build, eight API-client
 unit tests, twenty real-Edge Playwright tests, and the network-disabled container
-smoke passed. The Hub Python suite passed 377 tests with two Windows-specific
+smoke passed. The Hub Python suite passed 390 tests with two Windows-specific
 skips. Browser tests mock private API data and exercise real native browser fetch,
 Origin/cookies/CSRF, stale-response handling, distinct peer expiry deadlines,
 topic switching, invalidation coalescing, conflict recovery and session expiry.
@@ -148,6 +157,10 @@ They do not establish a real GitHub OAuth callback or live registry attachment.
 Public REST responses now use strict DTOs in the published OpenAPI contract.
 `python scripts/check_hub_ui_contract.py` validates actual TypeScript overview and
 topic fixtures against the Python response models without a server or credentials.
+The standalone deployment profile also passed five structural tests and actual
+Docker Compose configuration validation with fixture-only variable values. No
+service was created or started by that configuration check. Full Linux warning
+analysis and final executor/container integration remain separate evidence gates.
 
 Keep the control DB on local storage on its host, not an SMB SQLite WAL path.
 Use SQLite's backup API for a coherent backup while running, or stop all writers

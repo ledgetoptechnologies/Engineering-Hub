@@ -16,8 +16,10 @@ Claude reply: `b3b39d37-ec24-4e91-bc50-b9fd78fc7f6d`, 2026-10-17.
 F1–F3 were implemented and reviewed locally, with twenty real-Edge regressions
 passing. This includes a hanging topic request not blocking fresh overview actions,
 late topic authentication failure removing a private draft, exact protected-choice
-confirmation and cancellation, and actual operator identity. Claude's re-review of
-the correction commit is still pending; no pilot authorization is implied.
+confirmation and cancellation, and actual operator identity. Claude independently
+re-reviewed `1b50667940f75f10887b08fa2336bbb17eb438e3` and confirmed F1–F3 resolved
+in message `98f712a0-2a6d-4c4a-83b0-b2e137c3979e`. Claude reran install/unit/build/
+TypeScript checks, not browser or Python checks. No pilot authorization is implied.
 
 ## Remaining contract and integration work
 
@@ -44,17 +46,34 @@ OAuth setup is deferred by Beau; no dev login is a substitute for its acceptance
 
 ## Executor integration review
 
-Hermes corrected source: `3d040542e231ff8daa7036c724a865c4c3f3806f` on
+Hermes corrected source: `7bdc3d406209208e81604e303f6e6e39e8d459b3` on
 `work/hub-executor-v1`. It has not been integrated into the root control branch.
-Peer-reported 39 tests and prior Docker success are not final exact-source
+Peer-reported 42 focused tests and prior Docker success are not final exact-source
 container acceptance. New final acceptance is still being performed by Hermes.
 
-Independent functional review found the constructor still updates every running
+Independent functional review of prior `3d04054` found the constructor updated every running
 command to held without proving its previous owner stopped. The pre-effect path
 then does not revalidate current command ownership/state. A second instance can
 mislabel active work while its original executor proceeds. Integration requires
 single-owner/fenced ownership with genuine restart/quiescence handling and a
 concurrent-instance regression, not merely another restart-after-completion test.
+
+Independent read-only review of `7bdc3d4` found that defect corrected: initialization
+and execution share a nonblocking kernel lock; the CLI also holds service lifetime
+ownership until shutdown completes. This is scoped source acceptance for trusted,
+private local Linux storage, with no mixed old/new writers or lock-file replacement.
+Actual process death while a command is running, fresh-owner held recovery and
+proof of no repeated effect still require a dedicated regression and final exact-
+source/container acceptance. Exception handlers which already mark held before
+reopening do not establish this crash case.
+
+Canonical staging inventory v2 was actually retrieved from shared knowledge:
+`agent-bus/engineering-hub/staging-inventory-2026-10-17.md`, SHA-256
+`88d429d8052374e31db70f24539b6b96b2e2fe02ed5ddcf64502077779bb0a5a`.
+It verifies distinct `//192.168.50.80/Staging` at `/mnt/Staging`, not server-side
+ZFS/ACL/backup/reboot behavior. Global staging cleanup and external deployment
+writers remain unreconciled. The first Hub fixture pilot stays on a local/CI
+runner without NAS dependency; unique Compose naming alone is not writer exclusion.
 
 Root's typed client now bounds fences to SQLite's positive signed-64-bit range.
 No live executor, deployment, credentials or existing watcher was changed.

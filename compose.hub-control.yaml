@@ -1,0 +1,52 @@
+# Standalone, opt-in Hub control deployment. Never merge with bus Compose files.
+# Compose requires an image string; the operator must separately validate @sha256.
+name: engineering-hub-control
+services:
+  hub-control:
+    profiles: [hub-control]
+    image: "${HUB_CONTROL_IMAGE:?Set the reviewed immutable Hub control image digest}"
+    pull_policy: missing
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    ports:
+      - "127.0.0.1:8770:8770"
+    environment:
+      HUB_DB: /var/lib/hub/hub.sqlite3
+      HUB_UI_DIRECTORY: /app/dashboard
+      HUB_BASE_URL: "${HUB_BASE_URL:?Set the exact private HTTPS Hub origin}"
+      HERMES_TOKEN: "${HERMES_TOKEN:?Existing Hermes bearer required}"
+      CODEX_TOKEN: "${CODEX_TOKEN:?Existing Codex bearer required}"
+      CLAUDE_TOKEN: "${CLAUDE_TOKEN:?Existing Claude bearer required}"
+      # Optional, Hub-specific source allowlist; do not assume bus proxy/IP parity.
+      AGENT_BUS_ALLOWED_IPS: "${HUB_ALLOWED_IPS:-}"
+      # Unconfigured human login remains denied; no temporary bypass exists.
+      HUB_GITHUB_CLIENT_ID: "${HUB_GITHUB_CLIENT_ID:-}"
+      HUB_GITHUB_CLIENT_SECRET: "${HUB_GITHUB_CLIENT_SECRET:-}"
+      HUB_BEAU_GITHUB_ID: "${HUB_BEAU_GITHUB_ID:-}"
+    volumes:
+      - type: bind
+        source: "${HUB_STATE_DIRECTORY:?Set a dedicated protected local ZFS state directory}"
+        target: /var/lib/hub
+        read_only: false
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
