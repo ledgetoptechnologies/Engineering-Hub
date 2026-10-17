@@ -1,0 +1,43 @@
+{
+  "executor_source_commit": "7bdc3d406209208e81604e303f6e6e39e8d459b3",
+  "hub_source_commit": "10c8b3772ae9ccbd840da2bc170e8e61ef926c1c",
+  "validation": "Detached Hub checkout plus exact git-archived executor-owned files; no Hub-owned files overwritten or main merge",
+  "full_linux_suite": {
+    "passed": 669,
+    "seconds": 73.27,
+    "exit_code": 0,
+    "warnings": [
+      "Existing Starlette/httpx TestClient deprecation",
+      "ResourceWarning: unclosed event loop, emitted during test_presence; allocation/root cause remains under investigation"
+    ]
+  },
+  "earlier_failed_attempt": {
+    "exit_code": 4,
+    "reason": "Collecting both checkout tests packages caused tests.conftest ImportPathMismatchError",
+    "resolution": "Replaced with one frozen validation overlay; full 669-test run then passed",
+    "classification": "Test-layout failure, not suppressed or counted as product acceptance"
+  },
+  "container_http": {
+    "transport": "Actual container HTTP through real ExecutorClient/FixtureWorkflow; Hub REST dispatch via ASGI",
+    "results": [
+      {"scenario": "success", "run_status": "succeeded", "command_posts": 2, "real_container_restart": true, "no_restart_replay": true},
+      {"scenario": "rollback", "run_status": "rolled_back", "command_posts": 3, "real_container_restart": true, "no_restart_replay": true},
+      {"scenario": "unknown", "run_status": "held", "command_posts": 1, "real_container_restart": true, "no_restart_replay": true},
+      {"scenario": "pause", "run_status": "held", "command_posts": 1, "real_container_restart": true, "no_restart_replay": true}
+    ],
+    "fault_injection": "Rollback deliberately corrupts isolated fixture state before real smoke; unknown case discards an actual response after executor commit. No executor response is fabricated.",
+    "network_profile": "Dedicated bridge with masquerading disabled and random loopback-published port; not an egress firewall or approved untrusted-build sandbox",
+    "fixture_credentials": "Ephemeral only; no live credentials or Docker socket",
+    "cleanup": "No labeled fixture containers remained after acceptance"
+  },
+  "independent_review": "Initial source findings fixed with regression tests; final Codex review requested for exact executor source and remains a separate integration gate",
+  "scope": {
+    "fixture_only": true,
+    "live_staging_activation": false,
+    "production_change": false,
+    "real_oauth_acceptance": false,
+    "truenas_zfs_boot_acceptance": false,
+    "windows_executor_support": false,
+    "main_unchanged_at": "2001ee7cf0b24cce12b7340904476d06c36593dc"
+  }
+}

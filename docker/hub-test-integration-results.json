@@ -1,0 +1,36 @@
+{
+  "hub_commit": "10c8b3772ae9ccbd840da2bc170e8e61ef926c1c",
+  "transport": "actual container HTTP; explicit fixture fault injection",
+  "results": [
+    {
+      "scenario": "success",
+      "run_status": "succeeded",
+      "command_posts": 2,
+      "real_container_restart": true,
+      "no_restart_replay": true
+    },
+    {
+      "scenario": "rollback",
+      "run_status": "rolled_back",
+      "command_posts": 3,
+      "real_container_restart": true,
+      "no_restart_replay": true
+    },
+    {
+      "scenario": "unknown",
+      "run_status": "held",
+      "command_posts": 1,
+      "real_container_restart": true,
+      "no_restart_replay": true
+    },
+    {
+      "scenario": "pause",
+      "run_status": "held",
+      "command_posts": 1,
+      "real_container_restart": true,
+      "no_restart_replay": true
+    }
+  ],
+  "staging_activation": false,
+  "truenas_zfs_boot_acceptance": false
+}
