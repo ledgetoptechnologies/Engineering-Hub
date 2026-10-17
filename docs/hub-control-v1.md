@@ -101,6 +101,37 @@ identity, current immutable artifact and fence generation are reconciled. Do not
 replay unknown commands blindly. A container restart test is not proof of TrueNAS
 reboot, ZFS restore, credentials, network partitions or desktop-session recovery.
 
+## Active goal addendum: topic-level peer reachability
+
+Beau explicitly added this requirement to the build goal: agents must be able to
+tell whether another agent is connected to the **same session topic**, so a send
+does not silently disappear into a topic without a reachable recipient. This is
+required scope, not a claim that the feature is already implemented.
+
+Expose the same authenticated per-topic reachability evidence to the dashboard
+and agent API/MCP. Distinguish unlinked, linked but listener unverified,
+reachable, busy/queued, offline and unknown/stale. A generic authenticated MCP
+connection, stream/subscription count or healthy service is not proof that the
+intended chat can accept a message. Bind readiness to the exact topic and current
+session/connector generation, and invalidate stale evidence on disconnect or
+restart. Keep private session identifiers and transport credentials out of peer
+status responses.
+
+Before a topic-directed request, show the sender the recipient's route/readiness
+status. Report durable acceptance, awaiting connection, delivery to the selected
+session, processing and completion separately. Presence can change after any
+check: preflight status is advisory, never a delivery guarantee. Preserve offline
+messages; do not discard them, silently reroute to an unrelated default chat,
+launch replacement agents or retry with fresh message IDs. Unroutable or stale
+bindings must yield visible, recoverable status. Notify interested participants
+of meaningful reachability changes through the existing event-driven mechanism,
+without polling/model checks or acknowledgement-only message loops.
+
+Acceptance must cover a peer online on a different topic, missing bindings,
+disconnects, stale generations after restart, busy sessions with queued work,
+offline durable delivery after reconnection, and a disconnect between preflight
+and send. Test reachability independently from message receipt and task completion.
+
 ## Acceptance gates still required
 
 1. Isolated fixture executor: typed allowlisted targets/actions/artifacts, durable
@@ -112,6 +143,8 @@ reboot, ZFS restore, credentials, network partitions or desktop-session recovery
 5. Explicit production/action-bound approvals and GitHub automation gates before
    enabling those capabilities. Existing shared write credentials mean Hub-only
    review gates are not bypass-proof repository protections.
+6. Topic-level peer reachability and visible queued/unroutable delivery status as
+   specified in the active goal addendum above.
 
 The staging PC runs software tests and tiny fixtures, never full LiDAR, OpenSplat
 or photogrammetry workloads. Processing reservations/adapters remain later work.
