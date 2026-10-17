@@ -76,6 +76,10 @@ checks the numeric allowlist, one-use browser-bound state, PKCE, HttpOnly sessio
 cookie, exact Origin and session CSRF token for human mutations. The human OAuth
 identity is separate from a future GitHub automation credential.
 
+Beau chose to create a dedicated OAuth application later. Until it is securely
+configured, live human sign-in stays disabled; mock UI and internal test sessions
+must be labelled as fixtures, not represented as usable production login.
+
 ## Storage and recovery
 
 Keep the control DB on local storage on its host, not an SMB SQLite WAL path.
@@ -88,6 +92,9 @@ private task/decision records. Retain NAS dataset backups independently.
 backup, verifies SQLite integrity and prints its SHA-256 and size, not its
 contents. It refuses to overwrite existing files. Choose a restricted destination
 directory: POSIX files are owner-only; Windows files inherit directory ACLs.
+The destination parent must be private and trusted: SQLite reopens the exclusive
+new file by name, so this utility does not defend against a hostile process that
+can replace files or directories there while the backup is running.
 
 After restore, leave dispatch disabled until executor command state, target
 identity, current immutable artifact and fence generation are reconciled. Do not

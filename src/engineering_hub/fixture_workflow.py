@@ -5,6 +5,7 @@ agent input. Every command is durably reserved before I/O. Unknown delivery is
 held, including after a crash; inspect-only recovery never repeats an effect.
 """
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import uuid
 
@@ -57,7 +58,26 @@ class FixtureWorkflow:
                 or target.policy_revision != run['policy_revision']
                 or run['execution_actor'] != self.repo.execution_principal):
             raise HubError("fixture_manifest_mismatch", 403)
+        bound = run.get('execution_manifest_digest')
+        if bound is not None and bound != self._manifest_digest(target):
+            raise HubError('fixture_manifest_changed', 409)
         return target
+
+    @staticmethod
+    def _manifest_digest(target):
+        canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+        return 'sha256:' + hashlib.sha256(canonical.encode()).hexdigest()
+
+    def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id):
+        task = self.repo.get_task(task_id)
+        target = self.targets.get(target_id)
+        if (target is None or target_id != task['project'] + ':staging'
+                or artifact_digest != target.artifact_digest
+                or task['candidate_commit'] != target.candidate_commit
+                or target.policy_revision != 1):
+            raise HubError('fixture_manifest_mismatch', 403)
+        return self.repo.create_run(actor, task_id, expected_revision, artifact_digest, target_id,
+                                    execution_manifest_digest=self._manifest_digest(target))
 
     def _event(self, run, event):
         # Run execution evidence uses one stable run identity. The individual

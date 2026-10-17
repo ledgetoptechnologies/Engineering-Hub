@@ -4,6 +4,8 @@ Backups contain sensitive Hub state, including session data. POSIX output is
 created owner-only (0600). Windows inherits the destination directory's ACL;
 the operator must choose an appropriately restricted directory. No environment
 files or separate credentials are collected. This module starts no services.
+The destination parent must be trusted and private: SQLite reopens the exclusively
+created file by name, so this utility is not safe in an attacker-writable directory.
 """
 import argparse
 import hashlib
@@ -17,17 +19,20 @@ import time
 def backup_hub(source, destination, *, timeout_seconds=30):
     """Create a new, verified backup; never overwrite an existing destination."""
     source = Path(source).resolve(strict=True)
-    destination = Path(destination).resolve(strict=False)
+    requested_destination = Path(destination)
+    # Resolve the parent, not the leaf. Resolving a dangling leaf symlink would
+    # redirect exclusive creation to its target and violate no-overwrite policy.
+    destination = requested_destination.parent.resolve(strict=True) / requested_destination.name
     if not source.is_file():
         raise ValueError("Source must be an existing database file")
     if source == destination:
         raise ValueError("Source and destination must differ")
     if not destination.parent.is_dir():
         raise ValueError("Destination directory must already exist")
-    if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 300:
+    if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 300:
         raise ValueError("Backup deadline must be positive and at most 300 seconds")
     # Exclusive creation rejects existing files, symlinks and concurrent creators.
-    descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
     created_identity = os.fstat(descriptor)
     os.close(descriptor)
     started = time.monotonic()

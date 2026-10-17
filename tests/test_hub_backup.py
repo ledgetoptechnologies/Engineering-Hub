@@ -54,6 +54,32 @@ def test_no_overwrite_same_path_and_missing_source(tmp_path):
     assert not (tmp_path / "unused.db").exists()
 
 
+def test_dangling_destination_symlink_never_creates_target(tmp_path):
+    source, link = tmp_path / "hub.db", tmp_path / "backup-link.db"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    absent_target = outside / "must-not-exist.db"
+    HubRepository(source)
+    try:
+        link.symlink_to(absent_target)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation is unavailable for this Windows identity")
+    with pytest.raises(FileExistsError):
+        backup_hub(source, link)
+    assert link.is_symlink()
+    assert link.readlink() == absent_target
+    assert not absent_target.exists()
+
+
+@pytest.mark.parametrize("deadline", [True, False, 0, 301, float("nan"), float("inf")])
+def test_invalid_deadline_rejected_without_destination(tmp_path, deadline):
+    source, target = tmp_path / "hub.db", tmp_path / "unused.db"
+    HubRepository(source)
+    with pytest.raises(ValueError):
+        backup_hub(source, target, timeout_seconds=deadline)
+    assert not target.exists()
+
+
 def test_bad_database_removes_only_new_partial(tmp_path):
     source, target = tmp_path / "bad.db", tmp_path / "partial.db"
     source.write_bytes(b"not-a-database-private-content")

@@ -91,9 +91,12 @@ class NewRun(Revision):
     target: str = Field(min_length=1, max_length=128)
 
 
-def create_app(settings: Settings | None = None, *, repository=None, github_client=None):
+def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
+               fixture_workflow=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
+    if fixture_workflow is not None and fixture_workflow.repo is not repo:
+        raise ValueError("fixture_repository_mismatch")
     sessions = SessionStore(settings.database)
     hub_mcp = build_hub_mcp(repo, settings.agent_auth)
     origin = urlsplit(settings.auth_config.origin)
@@ -173,6 +176,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 "runs": repo.list_runs(), "agents": agents(),
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
+                                 "fixture_dispatch": fixture_workflow is not None,
                                  "merge_gate_strength": "not_enforced"}}
 
     @app.get("/api/hub/v1/projects")
@@ -239,15 +243,22 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.post("/api/hub/v1/runs", status_code=201)
     def create_run(payload: NewRun, request: Request):
-        agent(request)
+        identity = agent(request)
         # Remains fail-closed until operator-owned manifests and an actual
         # executor integration pass acceptance. Not a pretend deploy button.
-        raise HTTPException(423, detail={"code": "executor_not_enabled"})
+        if fixture_workflow is None:
+            raise HTTPException(423, detail={"code": "executor_not_enabled"})
+        return fixture_workflow.create_run(identity, payload.task_id, payload.expected_revision,
+                                           payload.artifact_digest, payload.target)
 
     @app.post("/api/hub/v1/runs/{run_id}/dispatch")
-    def dispatch(run_id: str, request: Request):
-        agent(request)
-        raise HTTPException(423, detail={"code": "executor_not_enabled"})
+    async def dispatch(run_id: str, request: Request):
+        identity = agent(request)
+        if fixture_workflow is None:
+            raise HTTPException(423, detail={"code": "executor_not_enabled"})
+        if repo.get_run(run_id)['created_by'] != identity:
+            raise HTTPException(403, detail={"code": "forbidden"})
+        return await fixture_workflow.advance(run_id)
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")

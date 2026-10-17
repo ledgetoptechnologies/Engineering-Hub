@@ -269,6 +269,23 @@ def test_run_requires_independent_review(repo):
         repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging')
 
 
+@pytest.mark.asyncio
+async def test_workflow_creation_binds_manifest_before_first_advance(repo, target):
+    item = repo.create_task('human:1234', 'engineering-hub', 'Fixture', 'atomic-manifest')
+    item = repo.claim_task('codex', item['id'], item['revision'])
+    item = repo.set_candidate('codex', item['id'], item['revision'], COMMIT)
+    item = repo.review_task('claude', item['id'], item['revision'], COMMIT, 'approve')
+    client = FakeClient()
+    workflow = FixtureWorkflow(repo, client, [target])
+    run = workflow.create_run('codex', item['id'], item['revision'], DIGEST, target.target_id)
+    assert run['execution_manifest_digest'].startswith('sha256:')
+    changed = replace(target, rollback_digest='sha256:' + 'e' * 64)
+    with pytest.raises(HubError, match='fixture_manifest_changed'):
+        await FixtureWorkflow(repo, client, [changed]).advance(run['id'])
+    assert repo.get_run(run['id'])['status'] == 'pending'
+    assert client.submissions == []
+
+
 def test_viewer_target_is_valid():
     configured = FixtureTarget('3d-viewer:staging', DIGEST, COMMIT, ROLLBACK_DIGEST, ROLLBACK_COMMIT)
     assert configured.target_id == '3d-viewer:staging'

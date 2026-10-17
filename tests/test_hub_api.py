@@ -64,7 +64,7 @@ def test_overview_requires_identity_and_has_explicit_unknown_readiness(hub):
     overview = response.json()
     assert overview["capabilities"] == {
         "production": False, "host_dispatch": False, "github_merge": False,
-        "processing": False, "merge_gate_strength": "not_enforced",
+        "processing": False, "fixture_dispatch": False, "merge_gate_strength": "not_enforced",
     }
     assert all(not project["executor_enabled"] and project["health"] == "unknown"
                for project in overview["projects"])

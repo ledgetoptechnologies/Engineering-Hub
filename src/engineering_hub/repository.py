@@ -225,10 +225,15 @@ class HubRepository:
             item.update(answer=answer, answered_by=actor, status='answered')
             return self._save(db, actor, 'decision.answered', 'decision', item)
 
-    def create_run(self, actor, task_id, expected_revision, artifact_digest, target):
+    def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None):
         self._actor(actor, agent=True)
         if not isinstance(artifact_digest, str) or not re.fullmatch('sha256:[0-9a-f]{64}', artifact_digest):
             raise HubError('invalid_digest')
+        if execution_manifest_digest is not None and (
+            not isinstance(execution_manifest_digest, str)
+            or re.fullmatch('sha256:[0-9a-f]{64}', execution_manifest_digest) is None
+        ):
+            raise HubError('invalid_manifest_digest')
         with self._transaction() as db:
             task = self._get(db, task_id, 'task')
             self._cas(task, expected_revision)
@@ -256,7 +261,8 @@ class HubRepository:
             run = self._save(db, actor, 'run.created', 'run', dict(id=str(uuid.uuid4()), task_id=task_id,
                 project=task['project'], target=target, commit=task['candidate_commit'], artifact_digest=artifact_digest,
                 policy_revision=1, review=task['review'], status='pending', command_id=None, fencing_generation=generation,
-                created_by=actor, execution_actor=self.execution_principal, events=[]), new=True)
+                created_by=actor, execution_actor=self.execution_principal,
+                execution_manifest_digest=execution_manifest_digest, events=[]), new=True)
             self._save(db, actor, 'task.run_created', 'task', task)
             return run
 

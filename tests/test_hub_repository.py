@@ -228,6 +228,27 @@ def test_failed_run_creation_rolls_back_fence_allocation(repo, monkeypatch):
     assert job['fencing_generation'] == 1
 
 
+@pytest.mark.parametrize('manifest', ['latest', 'sha256:' + 'G' * 64, 'sha256:' + 'a' * 63, 123, True])
+def test_invalid_execution_manifest_does_not_allocate_run_or_fence(repo, manifest):
+    item = verified(repo)
+    before = len(repo.list_audit())
+    with pytest.raises(HubError, match='invalid_manifest_digest'):
+        repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging', execution_manifest_digest=manifest)
+    assert repo.list_runs() == []
+    assert len(repo.list_audit()) == len(repo.list_outbox()) == before
+    with repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_target_fences').fetchone()[0] == 0
+
+
+def test_execution_manifest_atomically_snapshotted_and_preserved_by_event(repo):
+    item = verified(repo)
+    manifest = 'sha256:' + 'e' * 64
+    job = repo.create_run('codex', item['id'], item['revision'], DIGEST, 'engineering-hub:staging', execution_manifest_digest=manifest)
+    assert repo.get_run(job['id'])['execution_manifest_digest'] == manifest
+    job = repo.append_run_event(EXECUTOR, job['id'], 'running', 'one', job['fencing_generation'], job['revision'])
+    assert job['execution_manifest_digest'] == manifest
+
+
 @pytest.mark.parametrize('title,options', [('', ['a', 'b']), ('x'*201, ['a', 'b']), ('ok', ['a']), ('ok', ['a', 'a'])])
 def test_decision_validation(repo, title, options):
     with pytest.raises(HubError):
