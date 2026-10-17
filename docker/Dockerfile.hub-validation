@@ -13,9 +13,10 @@ COPY pyproject.toml uv.lock README.md .env.example ./
 COPY src ./src
 RUN uv sync --locked --group test --no-editable
 COPY tests ./tests
+COPY hub_executor ./hub_executor
 COPY scripts ./scripts
 COPY contracts ./contracts
-COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml ./
+COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml compose.hub-test.yaml ./
 COPY docker ./docker
 COPY docs ./docs
 

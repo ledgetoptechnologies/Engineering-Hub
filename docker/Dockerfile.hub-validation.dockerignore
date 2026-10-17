@@ -2,6 +2,7 @@
 **/.git
 **/__pycache__
 **/.pytest_cache
+**/.test-data
 .env
 **/.env
 **/.env.*

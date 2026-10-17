@@ -67,3 +67,45 @@ instrumentation distorts both memory peaks and short multiprocess deadlines.
 Earlier instrumented runs with fixture omissions, timing failures or distorted
 memory peaks were diagnostic failures, not acceptance results or demonstrated
 production regressions. They were not counted as green gates.
+
+For the integrated executor validation, also supply private writable tmpfs at
+`/validation/tests/.test-data` (UID/GID 10001, mode 0700). The legacy conftest
+sets its import-time bus database there. Generated `.test-data` directories are
+excluded from new validation images. Without this tmpfs, a read-only image can
+fail collection before any test runs; that is not a passing validation result.
+The test-only `/tmp` mount must permit execution: two existing tests deliberately
+launch tiny generated fake CLIs there. A first integrated run with `noexec` passed
+714 tests and failed those two CLI cases; no assertion was relaxed. Permit `exec`
+only for this bounded, network-disabled trusted-test scratch. Application and
+deployment profiles are unchanged and keep their own restrictions.
+
+## Current integrated executor result
+
+The corrected bounded test invocation passed **716 tests in 55.72 seconds**,
+with one existing Starlette deprecation and no ResourceWarning or skips. The
+frozen image ID was
+`sha256:08abdb2f5d0700c15a6ebc6073efce5304b284e4405a468350ca4bfbd9016861`.
+It contains root `ce50f67` plus the selectively imported executor slice from
+`53f9bb188cf92de227d730e0aad129dadf19064e`, test platform gates and packaging
+changes. It is a frozen working-tree overlay, not an exact pre-existing commit.
+Root independently verified all six executor Python runtime Git blobs match
+that upstream commit exactly. Only its contract wording and Compose health
+check were clarified; no Docker capability was added to fixture actions.
+
+The run used no network, host mounts, ports or real credentials; read-only root,
+dropped capabilities, no-new-privileges, 2 GiB memory, two CPUs and 256 PIDs.
+Private tmpfs held `/tmp` (exec, 256 MiB), `/validation/data` and
+`/validation/tests/.test-data` (both noexec, UID/GID10001, mode0700, 64 MiB).
+The uniquely named test container was automatically removed after completion.
+
+Windows Hub plus executor collection passed 410 tests, with eight explicit
+platform skips: six Linux executor modules plus existing native/symlink skips.
+The Linux run, not the Windows skips, establishes executor test coverage.
+`uv build --quiet` also succeeded; the source archive includes the separate
+executor source, contract and Docker harness. Its historical evidence JSON
+remains labelled against the older exact peer-selected snapshots.
+
+This integrated suite includes real loopback HTTP and actual SIGKILL recovery,
+but does not start nested Docker or establish an actual application rollout.
+The separate four-scenario Docker acceptance was peer-run on Hub `1b50667` plus
+executor `da4cf84`; revalidation on the integrated revision remains distinct.

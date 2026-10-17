@@ -88,6 +88,12 @@ Use [`compose.truenas.yaml`](compose.truenas.yaml) as a prebuilt-image compose f
 
 ## Three-agent integration
 
+The separate Linux-only [fixture executor](hub_executor/CONTRACT.md) and
+`compose.hub-test.yaml` are isolated acceptance tools, not application deployment
+adapters. They do not enable dispatch in the default Hub or modify the existing
+message-bus service. See the [qualified integrated test evidence](docs/hub-linux-validation-2026-10-17.md)
+and the separate [application-pilot contract draft](docs/hub-container-pilot-contract-draft.md).
+
 See [`docs/three-agent-integration.md`](docs/three-agent-integration.md) for the Windows PowerShell Codex and Claude Code setup, the Hermes client snippet, separate-token handling, and the limits around agent wake-ups and shared knowledge. It documents intended setup only; it does not assert that any client is configured.
 
 Other operational references: [`docs/current-integration-inventory.md`](docs/current-integration-inventory.md), [`docs/cutover-checklist.md`](docs/cutover-checklist.md), [`docs/wake-daemon.md`](docs/wake-daemon.md), [`docs/file-management.md`](docs/file-management.md), and the retained [`docs/vaultbridge-audit.md`](docs/vaultbridge-audit.md).
