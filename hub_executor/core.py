@@ -1,7 +1,9 @@
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import uuid
@@ -80,6 +82,13 @@ class HubExecutor:
                 "CREATE TABLE IF NOT EXISTS control ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            connection.execute(
+                "INSERT OR IGNORE INTO control(key,value) VALUES ('effect_receipt_key',?)",
+                (secrets.token_hex(32),),
+            )
+            self._evidence_key = bytes.fromhex(connection.execute(
+                "SELECT value FROM control WHERE key='effect_receipt_key'"
+            ).fetchone()[0])
             rows = connection.execute(
                 "SELECT command_id, result FROM commands WHERE status = 'running'"
             ).fetchall()
@@ -131,7 +140,8 @@ class HubExecutor:
             raise ExecutorError("invalid_payload", 400)
         for field in ("policy_revision", "fencing_generation"):
             value = command[field]
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            if (isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    or (field == 'fencing_generation' and value > 2**63 - 1)):
                 raise ExecutorError("invalid_payload", 400)
 
     def execute_command(self, command):
@@ -177,8 +187,23 @@ class HubExecutor:
                 "SELECT fencing_generation FROM targets WHERE target_id = ?",
                 (command["target_id"],),
             ).fetchone()
-            if current and command["fencing_generation"] <= current["fencing_generation"]:
+            if current and command["fencing_generation"] < current["fencing_generation"]:
                 raise ExecutorError("stale_fence", 409)
+            busy = connection.execute(
+                "SELECT 1 FROM commands WHERE status IN ('running', 'held') "
+                "AND json_extract(payload, '$.target_id') = ?",
+                (command["target_id"],),
+            ).fetchone()
+            if busy:
+                raise ExecutorError("target_busy", 409)
+            prior_action = connection.execute(
+                "SELECT 1 FROM commands WHERE json_extract(payload, '$.target_id') = ? "
+                "AND json_extract(payload, '$.fencing_generation') = ? "
+                "AND json_extract(payload, '$.action') = ?",
+                (command["target_id"], command["fencing_generation"], command["action"]),
+            ).fetchone()
+            if prior_action:
+                raise ExecutorError("command_conflict", 409)
             connection.execute(
                 "INSERT INTO targets(target_id, fencing_generation) VALUES (?, ?) "
                 "ON CONFLICT(target_id) DO UPDATE SET fencing_generation = excluded.fencing_generation",
@@ -204,9 +229,16 @@ class HubExecutor:
                         (json.dumps(result), command["command_id"]),
                     )
                     stale_before_effect = True
+                elif self._paused_in(connection):
+                    result.update(state="held", reason="paused_before_effect")
+                    connection.execute(
+                        "UPDATE commands SET status = 'held', result = ? WHERE command_id = ?",
+                        (json.dumps(result), command["command_id"]),
+                    )
                 elif command["action"] == "smoke_fixture":
                     observed = self._read_observed(command["target_id"])
-                    if observed.get("active_artifact_digest") != command["artifact_digest"]:
+                    if (not observed.get("evidence_valid")
+                            or observed.get("active_artifact_digest") != command["artifact_digest"]):
                         result.update(
                             state="failed",
                             reason="fixture_state_mismatch",
@@ -261,11 +293,19 @@ class HubExecutor:
 
     def _apply_fixture(self, command):
         target = self.target_roots[command["target_id"]]
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.mkdir(exist_ok=True)
-        os.chmod(target.parent, 0o777)
-        os.chmod(target, 0o777)
+        for directory in (target.parent, target):
+            try:
+                directory.mkdir(mode=0o770)
+            except FileExistsError:
+                if not directory.is_dir() or directory.is_symlink():
+                    raise ValueError("fixture directory must be a trusted real directory")
+            else:
+                # Set only directories just created by this effect. Preserve
+                # inherited setgid for the isolated harness group, never widen
+                # permissions of an existing operator-owned directory.
+                directory.chmod(0o770 | (directory.stat().st_mode & 0o2000))
         state_path = target / "state.json"
+        state: dict
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8"))
         else:
@@ -283,10 +323,12 @@ class HubExecutor:
                 },
             }
         )
+        state.pop('receipt', None)
+        state['receipt'] = self._state_receipt(command['target_id'], state)
         descriptor, temporary_name = tempfile.mkstemp(prefix=".state-", dir=target)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                os.fchmod(stream.fileno(), 0o644)
+                os.fchmod(stream.fileno(), 0o640)
                 json.dump(state, stream, sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -299,11 +341,10 @@ class HubExecutor:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
-        return {
-            "active_artifact_digest": state["active_artifact_digest"],
-            "effect_count": state["effect_count"],
-            "marker": state["marker"],
-        }
+        observed = self._read_observed(command['target_id'])
+        if not observed.get('evidence_valid'):
+            raise RuntimeError('fixture effect receipt could not be verified')
+        return observed
 
     def set_paused(self, paused):
         if not isinstance(paused, bool):
@@ -317,12 +358,14 @@ class HubExecutor:
             )
         return {"paused": paused}
 
+    @staticmethod
+    def _paused_in(connection):
+        row = connection.execute("SELECT value FROM control WHERE key = 'paused'").fetchone()
+        return bool(row and row["value"] == "true")
+
     def is_paused(self):
         with self._db() as connection:
-            row = connection.execute(
-                "SELECT value FROM control WHERE key = 'paused'"
-            ).fetchone()
-        return bool(row and row["value"] == "true")
+            return self._paused_in(connection)
 
     def get_command(self, command_id):
         try:
@@ -363,7 +406,8 @@ class HubExecutor:
                 "fencing_generation": command["fencing_generation"],
             }
             if (
-                marker == expected_marker
+                observed.get('evidence_valid') is True
+                and marker == expected_marker
                 and observed.get("active_artifact_digest") == command["artifact_digest"]
             ):
                 result.update(state="succeeded", reason=None, observed=observed)
@@ -377,14 +421,36 @@ class HubExecutor:
             )
             return result
 
+    def _state_receipt(self, target_id, state):
+        payload = json.dumps({'target_id': target_id, 'state': state},
+                             sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+        return hmac.new(self._evidence_key, payload, hashlib.sha256).hexdigest()
+
     def _read_observed(self, target_id):
         state_path = self.target_roots[target_id] / "state.json"
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+            with state_path.open('rb') as source:
+                raw = source.read(32769)
+            if len(raw) > 32768:
+                return {}
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                return {}
+            receipt = state.pop('receipt', None)
+            actual_bytes = state.get('artifact_bytes')
+            if not isinstance(actual_bytes, str):
+                return {}
+            actual_digest = 'sha256:' + hashlib.sha256(actual_bytes.encode('ascii')).hexdigest()
+            valid = (isinstance(receipt, str)
+                     and hmac.compare_digest(receipt, self._state_receipt(target_id, state))
+                     and actual_digest == state.get('active_artifact_digest'))
+        except (OSError, ValueError, TypeError, UnicodeError):
+            return {}
+        if not valid:
             return {}
         return {
             "active_artifact_digest": state.get("active_artifact_digest"),
             "effect_count": state.get("effect_count"),
             "marker": state.get("marker"),
+            "evidence_valid": valid,
         }

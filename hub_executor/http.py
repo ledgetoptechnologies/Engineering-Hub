@@ -1,6 +1,7 @@
 import hmac
 import json
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .core import COMMAND_FIELDS, ExecutorError, HubExecutor
@@ -162,7 +163,47 @@ class _ExecutorHandler(BaseHTTPRequestHandler):
         self._unsupported_method()
 
 
-def make_server(executor, token, *, host="127.0.0.1", port=0):
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    def __init__(self, address, handler, *, max_workers, request_timeout):
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._counts_lock = threading.Lock()
+        self._active_connections = 0
+        self.peak_connections = 0
+        self.request_timeout = request_timeout
+        super().__init__(address, handler)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout)
+        return request, address
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._counts_lock:
+            self._active_connections += 1
+            self.peak_connections = max(self.peak_connections, self._active_connections)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release_slot()
+            raise
+
+    def _release_slot(self):
+        with self._counts_lock:
+            self._active_connections -= 1
+        self._slots.release()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_slot()
+
+
+def make_server(executor, token, *, host="127.0.0.1", port=0,
+                max_workers=16, request_timeout=1.0):
     if not isinstance(token, str) or not token:
         raise ValueError("configured bearer token is required")
     handler = type(
@@ -170,4 +211,9 @@ def make_server(executor, token, *, host="127.0.0.1", port=0):
         (_ExecutorHandler,),
         {"executor": executor, "expected_authorization": f"Bearer {token}"},
     )
-    return ThreadingHTTPServer((host, port), handler)
+    if type(max_workers) is not int or not 1 <= max_workers <= 32:
+        raise ValueError("invalid fixture connection limit")
+    if type(request_timeout) not in (float, int) or not 0 < request_timeout <= 5:
+        raise ValueError("invalid fixture request timeout")
+    return _BoundedHTTPServer((host, port), handler, max_workers=max_workers,
+                              request_timeout=request_timeout)

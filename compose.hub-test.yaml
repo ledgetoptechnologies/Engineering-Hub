@@ -5,6 +5,8 @@ services:
       context: .
       dockerfile: docker/hub-test.Dockerfile
     user: "568:568"
+    group_add:
+      - "${HUB_TEST_GID:?HUB_TEST_GID must be the isolated fixture owner's group}"
     environment:
       HUB_EXECUTOR_DATA_DIR: /data
       HUB_EXECUTOR_TOKEN_FILE: /run/secrets/hub_executor_token

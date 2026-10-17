@@ -110,6 +110,7 @@ def _inspect_isolation(env, project, data_root, token_path):
     inspected = json.loads(_run(["docker", "inspect", container_id], env=env).stdout)[0]
     host = inspected["HostConfig"]
     assert inspected["Config"]["User"] == "568:568"
+    assert env["HUB_TEST_GID"] in host["GroupAdd"]
     assert host["ReadonlyRootfs"] is True
     assert "ALL" in host["CapDrop"]
     assert any("no-new-privileges" in value for value in host["SecurityOpt"])
@@ -137,17 +138,22 @@ def _inspect_isolation(env, project, data_root, token_path):
     return ports[0]["HostPort"]
 
 
-def run_smoke():
+def _prepare_fixture_files(scratch_root, token):
+    scratch_root.chmod(0o700)
+    data_root = scratch_root / "data"
+    data_root.mkdir(mode=0o2770)
+    data_root.chmod(0o2770)
+    token_path = scratch_root / "executor-token"
+    token_path.write_text(token, encoding="utf-8")
+    token_path.chmod(0o440)
+    return data_root, token_path
+
+
+def run_smoke(*, scenario=None):
     SCRATCH.mkdir(parents=True, exist_ok=True)
     scratch_root = Path(tempfile.mkdtemp(prefix="hub-executor-v1-", dir=SCRATCH))
-    scratch_root.chmod(0o755)
-    data_root = scratch_root / "data"
-    data_root.mkdir(mode=0o777)
-    data_root.chmod(0o777)
-    token_path = scratch_root / "executor-token"
     token = secrets.token_urlsafe(32)
-    token_path.write_text(token, encoding="utf-8")
-    token_path.chmod(0o444)
+    data_root, token_path = _prepare_fixture_files(scratch_root, token)
     suffix = secrets.token_hex(5)
     project = f"hub-executor-v1-{suffix}"
     image = f"hub-executor-v1-smoke:{suffix}"
@@ -167,6 +173,7 @@ def run_smoke():
             "HUB_TEST_TOKEN_FILE": str(token_path),
             "HUB_TEST_IMAGE": image,
             "HUB_TEST_PORT": str(host_port),
+            "HUB_TEST_GID": str(os.getgid()),
         }
     )
     compose = ["docker", "compose", "-f", "compose.hub-test.yaml", "-p", project]
@@ -183,7 +190,14 @@ def run_smoke():
         assert health_status == 200 and health == {"ok": True}
         checks.append("isolated container policy and loopback-only port")
 
-        candidate = _payload("deploy_fixture", CANDIDATE_DIGEST, CANDIDATE_COMMIT, 1, "candidate")
+        if scenario is not None:
+            def restart_fixture():
+                _run(compose + ["restart", "api"], env=env, timeout=30)
+                _wait_health(base_url)
+            checks.extend(scenario(base_url, token, data_root, restart_fixture))
+            return checks
+
+        candidate = _payload("deploy_fixture", CANDIDATE_DIGEST, CANDIDATE_COMMIT, 2, "candidate")
         unauth_status, unauth = _request(
             base_url, "/v1/commands", method="POST", body=candidate
         )
@@ -246,7 +260,7 @@ def run_smoke():
         assert resume_status == 200 and resumed == {"paused": False}
         checks.append("pause admission persists across restart")
 
-        rollback = _payload("rollback_fixture", ROLLBACK_DIGEST, ROLLBACK_COMMIT, 3, "rollback")
+        rollback = _payload("rollback_fixture", ROLLBACK_DIGEST, ROLLBACK_COMMIT, 2, "rollback")
         rollback_status, rolled_back = _request(
             base_url, "/v1/commands", token=token, method="POST", body=rollback
         )
@@ -256,7 +270,7 @@ def run_smoke():
         assert final_state["active_artifact_digest"] == ROLLBACK_DIGEST
         assert final_state["artifact_bytes"] == "engineering hub fixture v1\n"
         assert final_state["effect_count"] == 3
-        stale = _payload("rollback_fixture", ROLLBACK_DIGEST, ROLLBACK_COMMIT, 2, "stale")
+        stale = _payload("rollback_fixture", ROLLBACK_DIGEST, ROLLBACK_COMMIT, 1, "stale")
         stale_status, stale_error = _request(
             base_url, "/v1/commands", token=token, method="POST", body=stale
         )

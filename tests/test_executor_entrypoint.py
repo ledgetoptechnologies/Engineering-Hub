@@ -65,3 +65,24 @@ def test_module_entrypoint_serves_health_from_private_token_file(tmp_path):
     assert status == 200
     assert health == {"ok": True}
     assert (data_root / "ledger.sqlite3").is_file()
+
+
+def test_container_fixture_paths_exclude_other_users(tmp_path):
+    import runpy
+    import stat
+    repository = Path(__file__).resolve().parents[1]
+    smoke = runpy.run_path(str(repository / 'docker/hub-test-smoke.py'))
+    assert '_prepare_fixture_files' in smoke
+    data, secret = smoke['_prepare_fixture_files'](tmp_path, 'fixture-only-secret')
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(data.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o440
+    assert secret.read_text() == 'fixture-only-secret'
+
+
+def test_docker_harness_supports_real_backend_scenario_callback():
+    import inspect
+    import runpy
+    repository = Path(__file__).resolve().parents[1]
+    smoke = runpy.run_path(str(repository / 'docker/hub-test-smoke.py'))
+    assert 'scenario' in inspect.signature(smoke['run_smoke']).parameters

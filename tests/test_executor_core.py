@@ -214,6 +214,13 @@ def test_concurrent_target_takeover_leaves_highest_fence_active(tmp_path):
         low_result = low_future.result(timeout=5)
         high_result = high_future.result(timeout=5)
 
+    if high_result.get('reason') == 'target_busy':
+        # A newer fence cannot take over a running/unknown operation. Only
+        # retry the definitively unaccepted original command after inspection.
+        assert low_result['state'] == 'succeeded'
+        assert executor.get_command(high['command_id']) is None
+        assert executor.reconcile_command(low['command_id'])['state'] == 'succeeded'
+        high_result = executor.execute_command(high)
     state = json.loads(
         (tmp_path / "targets/3d-viewer-staging/state.json").read_text(encoding="utf-8")
     )
@@ -260,34 +267,115 @@ def test_production_entry_fixture_manifest_binds_candidate_and_rollback(tmp_path
     assert state["active_artifact_digest"] == FIXTURE_ROLLBACK_DIGEST
 
 
-def test_smoke_failure_retains_fence_until_higher_generation_rollback(tmp_path):
+def test_smoke_failure_allows_same_run_generation_rollback(tmp_path):
     executor = executor_for(tmp_path)
     executor.execute_command(command())
     failed_smoke = command(
         command_id="550e8400-e29b-41d4-a716-446655440050",
-        action="smoke_fixture",
-        artifact_digest=DIGEST_V1,
-        candidate_commit=ROLLBACK_COMMIT,
-        fencing_generation=2,
+        action="smoke_fixture", artifact_digest=DIGEST_V1,
+        candidate_commit=ROLLBACK_COMMIT, fencing_generation=1,
     )
-
     failed = executor.execute_command(failed_smoke)
-    state_path = tmp_path / "targets/3d-viewer-staging/state.json"
-    state_after_smoke = json.loads(state_path.read_text(encoding="utf-8"))
-    stale_rollback = command(
+    assert failed['state'] == 'failed'
+    assert failed['reason'] == 'fixture_state_mismatch'
+    assert executor._read_observed(TARGET)['effect_count'] == 1
+    rollback = executor.execute_command(command(
         command_id="550e8400-e29b-41d4-a716-446655440051",
-        action="rollback_fixture",
-        artifact_digest=DIGEST_V1,
-        candidate_commit=ROLLBACK_COMMIT,
-        fencing_generation=2,
-    )
-    with pytest.raises(ExecutorError) as error:
-        executor.execute_command(stale_rollback)
-    rollback = executor.execute_command({**stale_rollback, "fencing_generation": 3})
+        action="rollback_fixture", artifact_digest=DIGEST_V1,
+        candidate_commit=ROLLBACK_COMMIT, fencing_generation=1,
+    ))
+    assert rollback['state'] == 'succeeded'
+    assert executor._read_observed(TARGET)['active_artifact_digest'] == DIGEST_V1
 
-    assert failed["state"] == "failed"
-    assert failed["reason"] == "fixture_state_mismatch"
-    assert state_after_smoke["effect_count"] == 1
-    assert error.value.code == "stale_fence"
-    assert rollback["state"] == "succeeded"
-    assert json.loads(state_path.read_text(encoding="utf-8"))["active_artifact_digest"] == DIGEST_V1
+
+def test_new_id_cannot_repeat_an_action_within_same_run_generation(tmp_path):
+    executor = executor_for(tmp_path)
+    executor.execute_command(command())
+    with pytest.raises(ExecutorError) as error:
+        executor.execute_command(command(command_id="550e8400-e29b-41d4-a716-446655440099"))
+    assert error.value.code == "command_conflict"
+    assert executor._read_observed(TARGET)["effect_count"] == 1
+
+
+def test_pause_after_admission_stops_before_atomic_effect(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    executor = executor_for(tmp_path)
+    original_db = executor._db
+    armed = True
+
+    @contextmanager
+    def pause_at_boundary():
+        nonlocal armed
+        with original_db() as connection:
+            yield connection
+            accepted = armed and connection.execute(
+                "SELECT 1 FROM commands WHERE status='running'"
+            ).fetchone() is not None
+        if accepted:
+            armed = False
+            executor.set_paused(True)
+
+    monkeypatch.setattr(executor, '_db', pause_at_boundary)
+    result = executor.execute_command(command())
+    assert result['state'] == 'held'
+    assert result['reason'] == 'paused_before_effect'
+    assert not (tmp_path / 'targets/3d-viewer-staging/state.json').exists()
+
+
+def test_unresolved_target_blocks_a_new_generation_until_reconciled(tmp_path, monkeypatch):
+    executor = executor_for(tmp_path)
+    original_apply = executor._apply_fixture
+
+    def lose_outcome(payload):
+        original_apply(payload)
+        raise RuntimeError('fixture lost outcome')
+
+    monkeypatch.setattr(executor, '_apply_fixture', lose_outcome)
+    with pytest.raises(RuntimeError):
+        executor.execute_command(command())
+    monkeypatch.setattr(executor, '_apply_fixture', original_apply)
+    later = command(command_id='550e8400-e29b-41d4-a716-446655440098', fencing_generation=2)
+    with pytest.raises(ExecutorError) as error:
+        executor.execute_command(later)
+    assert error.value.code == 'target_busy'
+    assert executor._read_observed(TARGET)['effect_count'] == 1
+    assert executor.reconcile_command(command()['command_id'])['state'] == 'succeeded'
+    assert executor.execute_command(later)['state'] == 'succeeded'
+
+
+def test_fixture_effect_does_not_widen_parent_or_world_permissions(tmp_path):
+    import stat
+    parent = tmp_path / 'targets'
+    parent.mkdir(mode=0o750)
+    before = stat.S_IMODE(parent.stat().st_mode)
+    executor = executor_for(tmp_path)
+    import os
+    previous_umask = os.umask(0o022)  # Match the isolated container's default.
+    try:
+        executor.execute_command(command())
+    finally:
+        os.umask(previous_umask)
+    target = parent / '3d-viewer-staging'
+    assert stat.S_IMODE(parent.stat().st_mode) == before
+    assert stat.S_IMODE(target.stat().st_mode) & 0o007 == 0
+    assert stat.S_IMODE(target.stat().st_mode) & 0o070 == 0o070
+    assert stat.S_IMODE((target / 'state.json').stat().st_mode) & 0o007 == 0
+
+
+def test_reconcile_does_not_trust_forged_target_marker(tmp_path, monkeypatch):
+    executor = executor_for(tmp_path)
+    def no_effect(_payload):
+        raise RuntimeError('fixture interruption before effect')
+    monkeypatch.setattr(executor, '_apply_fixture', no_effect)
+    payload = command()
+    with pytest.raises(RuntimeError):
+        executor.execute_command(payload)
+    target = executor.target_roots[TARGET]
+    target.mkdir(parents=True)
+    forged = {'active_artifact_digest': DIGEST_V2,
+              'artifact_bytes': 'engineering hub fixture v2\n', 'effect_count': 1,
+              'marker': {key: payload[key] for key in ('command_id', 'action', 'artifact_digest', 'fencing_generation')}}
+    (target / 'state.json').write_text(json.dumps(forged))
+    result = executor.reconcile_command(payload['command_id'])
+    assert result['state'] == 'held'
+    assert result['observed'] == {}

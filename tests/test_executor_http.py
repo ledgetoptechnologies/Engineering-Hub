@@ -302,7 +302,7 @@ def test_fixture_manifest_and_fence_errors_match_wire_contract(tmp_path):
         "artifact_digest": FIXTURE_CANDIDATE_DIGEST,
         "candidate_commit": FIXTURE_CANDIDATE_COMMIT,
         "policy_revision": 1,
-        "fencing_generation": 1,
+        "fencing_generation": 2,
     }
     try:
         created_status, _ = request(
@@ -325,7 +325,7 @@ def test_fixture_manifest_and_fence_errors_match_wire_contract(tmp_path):
             "/v1/commands",
             token=TOKEN,
             method="POST",
-            body={**base, "command_id": "550e8400-e29b-41d4-a716-446655440030"},
+            body={**base, "command_id": "550e8400-e29b-41d4-a716-446655440030", "fencing_generation": 1},
         )
         target_status, target_error = request(
             server,
