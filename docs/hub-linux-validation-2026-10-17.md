@@ -567,3 +567,33 @@ adapter behavior, negotiated API admission, trusted provenance/state providers,
 owner-enrolled restore, OAuth, TrueNAS or a host reboot. No fresh full Linux suite
 is claimed for this five-case harness extension; the preceding 1,830-test frozen
 run remains the full controller/manifest source evidence.
+
+## Independent host/controller source overlay
+
+The published host `70df47c` owned-file commits were replayed onto controller
+`1e9768b` in the separate detached review checkout
+`../engineering-hub-host-overlay-70df-ca5`, resulting in `bed88c7`. The only
+uncommitted review wiring adds `COPY hub_container_executor` to that checkout's
+test Dockerfile. The primary controller branch was not merged or activated.
+
+Frozen combined validation image
+`sha256:cba0ebcaf4f7377ad1fdf6b1063a5be4128dcdf60ed751ee97cadc7486db1f12`
+passed **1,919 Linux tests in 74.41 seconds**, exit 0. Same UID10001,
+network-none/read-only/private-tmpfs harness, no host mounts, sockets, ports or
+real credentials. This reruns the actual combined source instead of promoting
+Hermes's branch-only report to controller integration evidence.
+
+Two warnings were observed: existing Starlette/httpx deprecation and an
+unclosed-event-loop ResourceWarning emitted during
+`test_hub_dispatcher_continuation.py::test_matching_malformed_owner_fields_are_not_quiescence_proof`.
+The allocation owner is not established; the warning was not suppressed, fixed
+or attributed merely to the test where collection reported it.
+
+A separate effect-free probe on that image confirms required shared cgroup mode
+is **not** projected into the old host EffectiveProfile, and its binding accepts
+API `1.40`. These known source-contract gaps remain despite green existing tests.
+No daemon socket was opened and no new API support was inferred. Matching
+cgroup field/create/readback and numerical API-floor rejection are required
+before accepting the host against `ca5d0a0`. Concrete providers, generation
+exclusion and actual autonomous app/rollback/SIGKILL acceptance are still gates.
+The review checkout remains isolated for follow-up; it is not a deployed service.
