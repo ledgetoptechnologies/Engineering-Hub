@@ -50,3 +50,35 @@ acceptance remain operator-dependent gates. The full goal is not complete.
 
 Any later local-provider changes require a new frozen image and their own test
 evidence; the image above does not contain those subsequent additions.
+
+## Read-only local providers
+
+The next snapshot adds `PrivateContentStore` and
+`ImmutableTestSecretResolver`, with explicit private filesystem provisioning,
+digest verification, strict bounded reads, immutable version bindings and no
+ambient credentials or provenance approval. Independent read-only review found
+no blocker. Build verification still refuses a missing trusted verifier.
+
+Snapshot including the actual fork test:
+`sha256:5c1fe9d16fb87abfccce3abeeb0b26f9183037fa6fb9a6d4394fdceea6f25d5f`.
+Full Linux suite in this snapshot: **2384 passed, 3 skipped, 90.40 seconds**,
+exit 0. The warnings are the same Starlette and event-loop warnings noted
+above, plus the deliberate multithreaded fork deprecation described below.
+All three skipped ownership checks then passed in a separate invocation of
+this exact snapshot (**3 passed, 0.33 seconds**) with the isolated `CHOWN`
+profile described below. No case was skipped across the combined runs.
+Focused provider/import tests: **48 passed, 2 skipped, 1.05 seconds**, exit 0,
+with resource warnings treated as errors. The deliberate multithreaded fork
+produces Python's fork deprecation warning; the test confirms child read denial
+and child cleanup while the inherited mutex is locked, then parent usability.
+
+The two skipped provider owner-change checks passed separately (**2 passed,
+0.29 seconds**) in snapshot
+`sha256:bbd882d20168a0e5afc1d6ebe96a212f2ca6db1f0a30eb50065e2b96a7023b35`,
+before the fork-test-only addition. The original journal owner check also passed
+separately (**1 passed, 0.30 seconds**) in the original integration snapshot.
+These three cases used container UID 0 with only `CHOWN` added to otherwise
+dropped capabilities, no host mounts/socket/network and disposable tmpfs.
+The first journal owner-check invocation omitted the test fixture tmpfs and
+failed during conftest setup; the corrected invocation supplied it and passed.
+These isolated tests do not grant the executor a runtime chown capability.

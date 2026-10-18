@@ -88,8 +88,15 @@ Still required before any real acceptance:
 6. Review and execute the acceptance harness only after the above gates. No
    Docker/harness execution is part of this unit-source phase.
 
-Run the scoped source tests from the repository root with the locked environment:
+Read-only local implementations of content-addressed record/blob storage and
+version-pinned synthetic test secrets are available in `local_providers.py`.
+They require explicitly provisioned private Linux directories and do not supply
+trusted build approval, executable identity, baseline or state enrollment.
+Neither is wired into a running executor by importing it.
+
+Run the scoped source tests on Linux from the repository root with the locked
+environment (or use the isolated validation image):
 
 ```sh
-PYTHONPATH=.:src /home/bkoltz/.hermes/cache/scratch/internal-MCP-messaging/.venv/bin/python -W default -m pytest -q tests/test_hub_container_executor*.py
+uv run --locked python -W default -m pytest -q tests/test_hub_container_executor*.py
 ```
