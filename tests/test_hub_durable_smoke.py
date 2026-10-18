@@ -78,7 +78,7 @@ class Docker:
 
 
 def profile(mounts):
-    return {'user': '10001:10001', 'network': 'none', 'readonly': True, 'privileged': False,
+    return {'user': '10001:10001', 'network': 'none', 'cgroupns': 'private', 'readonly': True, 'privileged': False,
             'cap_drop': ['ALL'], 'cap_add': None, 'ports': {}, 'binds': None, 'devices': [],
             'tmpfs': {'/tmp': 'rw,noexec,nosuid,size=32m'}, 'security': ['no-new-privileges'],
             'memory': 512 * 1024 ** 2, 'nano_cpus': 1_000_000_000, 'pids_limit': 64,
@@ -99,6 +99,7 @@ def test_isolated_restart_backup_restore_and_exact_cleanup(monkeypatch):
     assert len(creates) == 3
     for args in creates:
         assert args[args.index('--network') + 1] == 'none'
+        assert args[args.index('--cgroupns') + 1] == 'private'
         assert args[args.index('--user') + 1] == '10001:10001'
         assert args[args.index('--pull') + 1] == 'never'
         assert '--read-only' in args and '--cap-drop' in args
@@ -169,6 +170,7 @@ def test_embedded_probe_scripts_compile():
 
 @pytest.mark.parametrize('change', [
     {'network': 'bridge'}, {'user': '0:0'}, {'privileged': True}, {'readonly': False},
+    {'cgroupns': 'host'}, {'cgroupns': None}, {'cgroupns': ''}, {'cgroupns': True}, {'cgroupns': 'PRIVATE'},
     {'cap_add': ['SYS_ADMIN']}, {'ports': {'8770/tcp': [{'HostPort': '8770'}]}},
     {'binds': ['/var/run/docker.sock:/var/run/docker.sock']}, {'tmpfs': {}},
     {'security': []}, {'mounts': [{'Type': 'bind', 'Destination': '/var/lib/hub'}]},

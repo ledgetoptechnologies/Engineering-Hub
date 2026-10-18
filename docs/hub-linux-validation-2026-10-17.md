@@ -543,3 +543,27 @@ Host EffectiveProfile, API admission and effective create/inspect checks still
 need the matching adapter implementation and real daemon acceptance. This run
 does not prove those host properties, nor update the actual app-image smoke's
 previously recorded source identity. Production bus baseline remains unchanged.
+
+## Local real-container private-cgroup profile check
+
+The durability harness now passes `--cgroupns private` explicitly and verifies
+the actual filtered `HostConfig.CgroupnsMode` is exactly `private` before starting
+each original/helper/restored container. Host/empty/null/Boolean/uppercase values
+are rejected by profile regressions. The final focused harness/Compose/dashboard
+set passed **89 Windows tests**, with the existing Starlette warning only.
+
+The actual local Docker run against the previously recorded immutable app index
+`e2dd35f2c151261eeb1668f5826b1c6fdc6ec413c14cea95d9cd8e272ad91567`
+and baked app commit `80583b2219ce0f886af0aa882c87b26b4c46eb5a` passed again:
+explicit effective private cgroup configuration, same-container restart, online
+backup, isolated byte-identical/integrity-checked restore, matching claimed task
+state and anonymous/invalid-token denials. All three unique test containers and
+both test volumes were removed; no user data was removed.
+
+This changes only the reusable harness and tests, not the packaged app's source
+identity or a deployed profile. It proves local Docker CLI-created effective
+configuration, not a direct kernel namespace inspection, remote host/Engine HTTP
+adapter behavior, negotiated API admission, trusted provenance/state providers,
+owner-enrolled restore, OAuth, TrueNAS or a host reboot. No fresh full Linux suite
+is claimed for this five-case harness extension; the preceding 1,830-test frozen
+run remains the full controller/manifest source evidence.

@@ -141,7 +141,7 @@ def _container(name, owner, *, missing_ok=False):
 
 def _options(name, owner, volume):
     return ['create', '--pull', 'never', '--name', name, '--label', LABEL + '=' + owner,
-        '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
+        '--network', 'none', '--cgroupns', 'private', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
         '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
         '--mount', 'type=volume,source=' + volume + ',target=/var/lib/hub',
@@ -154,6 +154,7 @@ def _options(name, owner, volume):
 def _profile(identity, expected_volumes):
     # Inspect only public isolation fields, never Config.Env or full metadata.
     template = ('{"user":{{json .Config.User}},"network":{{json .HostConfig.NetworkMode}},'
+        '"cgroupns":{{json .HostConfig.CgroupnsMode}},'
         '"readonly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},'
         '"cap_drop":{{json .HostConfig.CapDrop}},"cap_add":{{json .HostConfig.CapAdd}},'
         '"ports":{{json .HostConfig.PortBindings}},"binds":{{json .HostConfig.Binds}},'
@@ -163,6 +164,7 @@ def _profile(identity, expected_volumes):
         '"security":{{json .HostConfig.SecurityOpt}},"mounts":{{json .Mounts}}}')
     value = json.loads(_docker(['container', 'inspect', '--format', template, identity], timeout=15).stdout)
     if (value.get('user') != '10001:10001' or value.get('network') != 'none'
+            or value.get('cgroupns') != 'private'
             or value.get('readonly') is not True or value.get('privileged') is not False
             or value.get('cap_drop') != ['ALL'] or value.get('cap_add') not in (None, [])
             or value.get('ports') not in (None, {}) or value.get('binds') not in (None, [])
@@ -258,6 +260,7 @@ def run_smoke(image, expected_commit):
         _docker(['start', restored_app])
         _probe(restored_app, 'verify', expected_commit, task)
         report = {'durability_smoke': 'passed', 'build_commit': expected_commit,
+                  'private_cgroup_namespace': 'effective_configuration_verified',
                   'same_container_restart': 'passed', 'backup_quick_check': 'ok',
                   'restored_integrity_check': 'ok', 'restored_app_state': 'matched',
                   'task_revision': task['revision'], 'auth_denials': 'passed',
