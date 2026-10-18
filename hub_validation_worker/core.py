@@ -125,7 +125,7 @@ class ValidationJob:
     @classmethod
     def from_claim(cls, row):
         try:
-            agent, instance = row['worker'].split(':', 1)
+            agent, instance = row['worker'].rsplit(':', 1)
             if row['requires_execution_proof'] is not True:
                 raise ValueError()
             return cls(row['id'], row['action_key'], row['project'], row['machine_id'],

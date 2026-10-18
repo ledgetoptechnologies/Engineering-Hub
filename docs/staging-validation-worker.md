@@ -129,6 +129,31 @@ process has stopped. Lease expiration alone does not release a machine.
 
 ## Remote staging is not implemented by this local core
 
+### Candidate private service composition
+
+`OwnedValidationService` now composes the existing local queue, private receipt
+ledger, native event feed and bounded worker. This is an explicit Python API,
+not an installed service, public enrollment endpoint or production entrypoint.
+Its fixed `executor:software-validation` identity is not an agent identity and
+cannot be selected through the authenticated agent API. Public packaged queue
+admission remains closed; only trusted local composition binds an exact reviewed
+task, source commit, artifact and machine to the executor.
+
+The Linux owner holds a separate private local lock across its lifetime. Native
+invalidation subscribes before the initial durable queue drain. There is no
+timer-based inbox scan. Source failure closes admission; shutdown waits for
+accepted backend work before releasing ownership. Each new owner has a fresh
+instance ID. Old uncertain claims remain held instead of being automatically
+adopted or replayed. The composition rejects container-pilot and legacy-dispatch
+ledgers so it cannot silently become a competing controller.
+
+The Hub database must remain local and unchanged in identity while the service
+runs. The receipt ledger lives in the owner's separate private state directory.
+The configured supervisor stop grace must exceed the longest enrolled validation
+timeout by at least 30 seconds. That value is an operator assertion, not proof
+that an installed supervisor honors it; actual installation/reboot acceptance
+and authoritative reconciliation of held work remain separate requirements.
+
 `ValidationWorker` takes the actual local `WorkQueue` object. It is **not** a
 client for the Hub HTTP endpoints. The authenticated work-queue endpoints provide
 coordination and leases, but do not turn an arbitrary remote agent into this
@@ -142,6 +167,29 @@ and a correctly integrated machine-reservation boundary. That remote adapter and
 its deployment/credential setup are not implemented by this local worker core.
 Legacy dispatch cannot run concurrently with the queue until both participate
 in the same reservation authority.
+
+### Shared-host activation gate
+
+Claude's linked review `b5e541c9-69f4-47ae-87e0-06c1a50c001b` identifies a
+separate boundary: the existing staging daemon also hosts Viewer and PA. A
+cooperative sidecar lock and container-label allowlist do not exclude another
+deployer or restrict what a privileged Docker connection could change.
+Do not activate this executor against that shared daemon on the strength of
+the source tests or the earlier read-only SSH inspection.
+
+Before host provisioning, inventory existing CI/manual deploy writers and agree
+their exclusion boundary. Prefer a dedicated validation daemon, rootless context
+or VM with no access to the existing applications' daemon, mounts or credentials.
+That boundary also needs host-level resource admission: a separate daemon alone
+does not reserve the physical machine's CPU, memory or storage. Do not treat a
+forced Docker command or a label-only proxy as proven resource authorization.
+
+Any approved remote credential must be dedicated, separately revocable and
+stored only in the private executor, with pinned host identity, constrained
+source/commands where supported, and documented rotation and recovery. The
+public Hub must not receive it. Actual effective transport permissions and
+writer exclusion need verification before a real staging pilot. No provisioning
+or credential approval is implied by this design checkpoint.
 
 ## What the verification establishes
 

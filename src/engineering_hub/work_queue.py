@@ -16,6 +16,11 @@ import uuid
 from .repository import AGENTS, PROJECTS, HubError
 
 
+# A fixed private control-plane worker role, never an agent bearer identity.
+# Public REST/MCP derive their worker from authenticated AGENTS and cannot select it.
+SOFTWARE_VALIDATION_EXECUTOR = 'executor:software-validation'
+
+
 def _key(value):
     if type(value) is not str or re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}', value) is None:
         raise HubError('invalid_work_key')
@@ -64,7 +69,8 @@ class WorkWorker:
             valid = type(self.instance_id) is str and str(uuid.UUID(self.instance_id)) == self.instance_id
         except ValueError:
             valid = False
-        if type(self.agent) is not str or self.agent not in AGENTS or not valid:
+        if (type(self.agent) is not str
+                or self.agent not in {*AGENTS, SOFTWARE_VALIDATION_EXECUTOR} or not valid):
             raise HubError('invalid_work_worker')
 
     def encoded(self):
