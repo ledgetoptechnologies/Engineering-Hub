@@ -222,12 +222,10 @@ concurrent generation renames/tree changes through validation and daemon bind
 establishment. No lease or race-free provider is supplied here; that remains an
 activation gate, especially when an outside same-UID writer could mutate paths.
 
-The shared manifest and `EffectiveProfile` currently model private PID/IPC
-namespaces, **not cgroup namespace mode**. This backend neither pins nor verifies
-`CgroupnsMode`; it must not be described as guaranteeing a private cgroup
-namespace. A host-default cgroup namespace can currently pass that unmodeled
-property. Shared-model ownership remains with Codex: an explicit profile decision,
-compatible API minimum, source implementation and inspect tests are required
-before claiming private cgroup isolation or approving an operator enrollment
-that requires it. This conditional review finding is not silently treated as
-fixed or as permission to activate.
+The earlier unmodeled cgroup-namespace finding is now corrected in source:
+the shared manifest requires `cgroupns_mode="private"`, `EffectiveProfile`
+carries it, create sets `HostConfig.CgroupnsMode`, and inspect rejects missing
+or non-private readback. API versions below 1.41 are denied before I/O. Tests
+cover explicit creation, invalid planned modes and missing/non-private observed
+modes. These are source and simulated-response checks, not actual-daemon
+isolation acceptance or permission to activate an executor.

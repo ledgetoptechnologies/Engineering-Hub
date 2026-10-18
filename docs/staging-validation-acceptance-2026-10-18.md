@@ -2,6 +2,29 @@
 
 ## Latest verified source
 
+Baseline observer checkpoint:
+`5fa2e8494ad6f4c7fc9bb40319105d8650013892`, development branch only.
+A clean Git archive produced image index
+`sha256:259c0153e8d5074b1253185e1dd8efa84267ffde781725cea39b664fd5de7fec`,
+manifest `sha256:1c441cfbfa0dcce7d7a863bbc6311697a270214410a3b5c4514d83555a425104`,
+config `sha256:f925239eb1737188c2e3d42cb0ddd43399665e112679b1befb386faefb4ab81b`.
+Full exact-image Linux suite: **2961 passed, 3 skipped, 4 known warnings**,
+138.33s. The three owner-change checks separately passed **3/3**, 0.28s,
+on the same image. Focused observer/snapshot/receipt/profile tests passed
+**100/100**, 47.65s, with ResourceWarning errors enabled in the working image.
+
+Independent source review accepted the one-attempt observer after mock-transport
+and frozen-inode descriptor safeguards were added. Observation checks runner,
+image, profile, unchanged original inventory, frozen SQLite integrity and exact
+terminal private probe receipts before returning draft bytes. Tests use actual
+private SQLite journals and separate Linux processes with a quiet WAL writer,
+but **simulate Engine methods**. They do not establish real daemon/container
+health. Receipt publication, independent operator pinning, trusted driver-runtime
+identity and actual deployment/rollback/reboot acceptance remain incomplete.
+No live host, NAS, endpoint, credential or installed worker changed.
+
+## Earlier baseline preparation checkpoint
+
 Baseline preparation checkpoint:
 `372f38b96a81970188c770869afb02aa2a18ff38`, pushed to the development branch,
 not main or an installed image. Clean Git archive image index
