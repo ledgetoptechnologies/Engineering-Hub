@@ -11,7 +11,7 @@ def main():
     args = parser.parse_args()
     # OAuth callback URLs contain short-lived codes. Never log query strings.
     uvicorn.run("engineering_hub.app:create_app", factory=True, host=args.host,
-                port=args.port, access_log=False)
+                port=args.port, access_log=False, proxy_headers=False)
 
 
 if __name__ == "__main__":

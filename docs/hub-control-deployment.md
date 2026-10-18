@@ -9,6 +9,52 @@ its compiled dashboard plus the independent Hub API/MCP on container port 8770.
 
 ## Preconditions and private storage
 
+### Tunnel-only browser ingress: source capability and acceptance gate
+
+The initial host-network Compose serves one combined listener. A Cloudflare
+Access application at the public hostname does **not** hide that listener's
+dashboard from the LAN. Do not call the deployment tunnel-only until direct LAN
+requests to the dashboard, assets and human-auth routes are denied, including
+requests with the public Host header and forged forwarded/identity headers.
+
+The source supports explicit `HUB_INGRESS_MODE` values:
+
+- `combined` is the compatibility default; it does not provide ingress isolation.
+- `agents` admits only health and existing bearer-authenticated Hub API/MCP
+  routes, never the dashboard, assets or human-auth routes. Existing source-IP
+  restrictions and human-only action restrictions still apply.
+- `browser` requires complete Cloudflare Access configuration at startup and a
+  valid Hub-specific assertion on every non-health browser request, including
+  assets and sign-in. Agent Authorization headers and MCP are denied. Existing
+  local sessions, identity pins, Origin and CSRF checks remain required.
+
+`HUB_AGENT_ALLOWED_HOSTS` is an optional comma-separated list of exact MCP
+`host[:port]` values, including bracketed IPv6 where needed. It does not disable
+DNS-rebinding protection or make a Host header evidence of tunnel transit.
+The entry point disables Uvicorn forwarded-header trust; agent source-IP checks
+use the actual connected peer rather than user-supplied proxy claims.
+
+Network isolation remains an independent deployment requirement: the full
+browser origin must be reachable only by the verified tunnel connector/private
+network, while only the agent front door is available on the approved LAN.
+Do not publish the browser listener on all interfaces or assume that a remote
+or bridge-networked connector can reach the NAS host's loopback address.
+
+Two independent app instances sharing local ZFS SQLite can be evaluated for the
+current unowned release, but are **not** the permanent autonomous-pilot design:
+an owner-enrolled ledger intentionally refuses an unrelated second process.
+Browser mode rejects supplied execution components. Never weaken PilotOwner
+guards to accommodate a second frontend. An owned pilot needs a single-owner
+core with authenticated frontends or an explicitly tested single-owner,
+multi-listener lifecycle before activation.
+
+Acceptance must cover private browser reachability, agent token/IP access, all
+three identities, cross-frontend task/session/native-event consistency, proper
+disconnect cleanup, and unchanged legacy MCP on 8765. Source tests are not
+TrueNAS, tunnel, signed-in-browser, restart or reboot acceptance. Until the
+topology is verified, retain the existing live configuration and report the
+remaining LAN exposure explicitly.
+
 - Create `/mnt/Plugins/App_Data/Agent_MCP/engineering-hub` on the NAS's local
   ZFS storage, under the established MCP parent but never sharing its database.
   This follows the owner-supplied `Current-MCP.yaml` mount hierarchy. Do not use

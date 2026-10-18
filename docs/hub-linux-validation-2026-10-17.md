@@ -725,3 +725,55 @@ Coordination INFO `3b3a0568-2b3a-4ba3-845d-0d3857c66110` told Hermes the patch w
 confined to this review checkout; no replacement daemon worker or activation was
 requested. Live bus/ports/data, Ops, DNS, Access policies and credentials remain
 unchanged. Overall release is still incomplete.
+
+## October 18: browser/agent ingress boundary candidate
+
+Starting from main `112a60e629a0555b2a9de2f2812f5c8eeda1e0d1`, the source adds
+opt-in `combined` (unchanged default), `agents`, and `browser` ingress roles.
+The pure-ASGI boundary executes before redirects, static serving and human auth.
+Agent mode retains existing bearer/source-IP authorization but refuses UI and
+human-auth paths; browser mode requires configured Access assertions even for
+index/assets/sign-in, rejects bearer/MCP, and retains local session/CSRF checks.
+Explicit exact agent MCP hosts preserve DNS-rebinding checks. The entry point
+now disables implicit forwarded-header trust. Browser execution injection fails
+closed; no PilotOwner rule is relaxed for a second frontend.
+
+Independent read-only review accepted this bounded source slice and independently
+ran the new ingress plus entrypoint tests: **91 passed**. Implementation-focused
+API/auth/MCP coverage: **218 passed**, one existing Starlette warning. Tests use
+local RSA signatures and mocked JWKS (not live Cloudflare credentials), including
+wrong audience/key/algorithm rejection, all three agents, source-IP/header/path
+spoofing, session/CSRF, multi-body streaming and cancellation propagation.
+
+Frozen working-tree validation image index
+`sha256:3154c9d370cd31d99696b078c8f77ecbf7deb93349cb018628f3670e34ae4eda`
+passed the full Linux suite: **2,083 passed**, **76.08 seconds**, exit 0, one
+existing Starlette/httpx deprecation warning. It contains the candidate runtime
+and tests; this evidence/deployment-document update followed the image build.
+The run used network none, read-only root, UID10001, private cgroup namespace,
+cap-drop ALL, no-new-privileges, two CPUs, 2GiB RAM, 256 PIDs, no host mounts,
+ports, Docker socket or real credentials. Only disposable private tmpfs was
+writable: executable test scratch `/tmp`, and noexec `/validation/data` plus
+`/validation/tests/.test-data`. The named container removed itself after exit.
+
+The first Windows full-suite attempt failed collection because existing bus file
+code imports Linux `fcntl`; it was not counted as acceptance. Two initial Linux
+harness attempts omitted required fixture tmpfs and likewise failed collection.
+The final invocation supplied the already-documented isolated mounts; no test
+assertions or application behavior were weakened to obtain the passing result.
+
+Separately authorized Cloudflare work created a Hub-only Access application and
+exact-two-email Allow policy, without modifying Ops. An unauthenticated public
+request changed from HTML200 to Access-login302. Direct NAS8770 still returned
+HTML200. Origin-side Access configuration, physical browser/agent separation,
+signed-in browser acceptance, cross-frontend shared-state/events, actual TrueNAS
+rollout/reboot, trusted host providers and an owned autonomous pilot remain
+unproven. Two app processes on an unenrolled SQLite database are not a substitute
+for deliberate single-owner integration once the pilot ledger is enrolled.
+
+A post-app-restart native listener recovery attempt also exposed a separate live
+bus fault: version0.6.0 health reports native push `failed`, `OperationalError`,
+subscriptions disabled; independent initialize advertises `resources.subscribe`
+false while ordinary authenticated receive works. No polling fallback, bus
+restart or server configuration change was made. A linked read-only diagnostic
+request and evidence were sent to Hermes; acceptance is pending, not assumed.
