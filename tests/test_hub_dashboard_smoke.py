@@ -21,6 +21,29 @@ CONTAINER = "c" * 64
 REPORT = {"image_smoke": "passed", "assets": 2, "durability": "not_tested"}
 
 
+@pytest.mark.parametrize('commit', ['unknown', 'a' * 39, 'A' * 40, 'a' * 40 + '\n', 1])
+def test_invalid_expected_commit_never_calls_docker(fake_docker, commit):
+    calls, _ = fake_docker
+    with pytest.raises(ValueError, match='Expected commit'):
+        smoke.run_smoke(IMAGE, commit)
+    assert calls == []
+
+
+def test_expected_identity_is_passed_to_probe_and_verified(fake_docker):
+    calls, controls = fake_docker
+    commit = 'd' * 40
+    controls['exec'] = subprocess.CompletedProcess([], 0, stdout=json.dumps(REPORT | {'build_commit': commit}), stderr='')
+    assert smoke.run_smoke(IMAGE, commit)['build_commit'] == commit
+    assert calls[1][0][-1] == commit
+
+
+def test_mismatched_build_report_fails_and_cleans_up(fake_docker):
+    calls, _ = fake_docker
+    with pytest.raises(ValueError, match='build identity'):
+        smoke.run_smoke(IMAGE, 'd' * 40)
+    assert calls[-1][0] == ['docker', 'rm', '--force', CONTAINER]
+
+
 @pytest.fixture
 def fake_docker(monkeypatch):
     calls = []

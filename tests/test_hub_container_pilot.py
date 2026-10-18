@@ -138,15 +138,81 @@ async def test_smoke_failure_requires_four_distinct_commands_and_rollback_health
 async def test_rollback_smoke_failure_or_unknown_retains_target_and_no_repost(repo, target, outcome):
     client = FakeClient({'smoke_container': 'failed', 'smoke_container_rollback': outcome})
     workflow, run = ready_run(repo, target, client)
-    assert (await workflow.advance(run['id']))['status'] == 'failed'
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == (
+        'rollback_smoke_failed' if outcome == 'failed' else 'rollback_smoke_outcome_uncertain')
     assert [c.action for c in client.submissions] == ACTIONS
     reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
     next_client = FakeClient()
-    assert (await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id']))['status'] == 'failed'
+    assert await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id']) == result
     assert next_client.submissions == []
     task = reviewed_task(repo, 'other-pilot')
     with pytest.raises(HubError, match='active_run'):
         workflow.create_run('codex', task['id'], task['revision'], IMAGE, target.target_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['failed', 'held', 'running', 'pending', TimeoutError()])
+async def test_rollback_failure_or_unknown_holds_before_smoke_without_retry(repo, target, outcome):
+    client = FakeClient({'smoke_container': 'failed', 'rollback_container': outcome})
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == (
+        'rollback_failed' if outcome == 'failed' else 'rollback_outcome_uncertain')
+    assert [command.action for command in client.submissions] == ACTIONS[:3]
+    assert len({command.command_id for command in client.submissions}) == 3
+    assert result['fencing_generation'] == run['fencing_generation']
+    assert repo.get_task(run['task_id'])['repair_count'] == 1
+    reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
+    next_client = FakeClient()
+    recovered = ContainerPilotWorkflow(reopened, next_client, [target])
+    assert await recovered.advance(run['id']) == result
+    assert next_client.submissions == []
+    # Inspect the original stable command, not a replacement or replay.
+    await recovered.inspect(run['id'], 'rollback_container')
+    assert next_client.inspections == client.submissions[-1:]
+    assert repo.get_run(run['id']) == result
+    other = reviewed_task(repo, 'after-held-rollback')
+    with pytest.raises(HubError, match='active_run'):
+        workflow.create_run('codex', other['id'], other['revision'], IMAGE, target.target_id)
+
+
+@pytest.mark.asyncio
+async def test_pause_between_rollback_effect_and_smoke_is_held_and_not_resumed(repo, target):
+    class PausingRollbackClient(FakeClient):
+        async def submit_command(self, command):
+            response = await super().submit_command(command)
+            if command.action == 'rollback_container':
+                repo.set_pause('human:1234', True)
+            return response
+
+    client = PausingRollbackClient({'smoke_container': 'failed'})
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == 'staging_paused'
+    assert [command.action for command in client.submissions] == ACTIONS[:3]
+    assert repo.get_task(run['task_id'])['repair_count'] == 1
+    repo.set_pause('human:1234', False)
+    reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
+    next_client = FakeClient()
+    assert await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id']) == result
+    assert next_client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_paused_preexisting_failed_run_surfaces_hold_without_effect(repo, target):
+    workflow, run = ready_run(repo, target)
+    run = workflow._event(run, 'running')
+    run = workflow._event(run, 'failed')
+    repo.set_pause('human:1234', True)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == 'staging_paused'
+    assert workflow.client.submissions == []
+    assert repo.get_task(run['task_id'])['repair_count'] == 1
 
 
 @pytest.mark.asyncio
@@ -170,7 +236,9 @@ async def test_rollback_success_requires_exact_rollback_image_and_healthy_smoke(
         assert result['status'] == 'rolled_back'
         assert client.submissions[-1].action == 'smoke_container_rollback'
     else:
-        assert result['status'] == 'failed'
+        assert result['status'] == 'held'
+        assert result['events'][-1]['reason'] == (
+            'rollback_outcome_uncertain' if action == 'rollback_container' else 'rollback_smoke_outcome_uncertain')
         assert client.submissions[-1].action == action
 
 
@@ -184,7 +252,9 @@ async def test_pause_after_failure_prevents_rollback_effect(repo, target):
             return response
     client = PausingFailureClient({'smoke_container': 'failed'})
     workflow, run = ready_run(repo, target, client)
-    assert (await workflow.advance(run['id']))['status'] == 'failed'
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == 'staging_paused'
     assert [c.action for c in client.submissions] == ACTIONS[:2]
 
 
@@ -208,7 +278,9 @@ async def test_three_failed_candidates_exhaust_repair_budget(repo, target):
 async def test_unknown_candidate_is_held_no_rollback_or_repost_inspect_only(repo, target, outcome):
     client = FakeClient({'deploy_container': outcome})
     workflow, run = ready_run(repo, target, client)
-    assert (await workflow.advance(run['id']))['status'] == 'held'
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == 'candidate_outcome_uncertain'
     assert [c.action for c in client.submissions] == ACTIONS[:1]
     reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
     next_client = FakeClient()

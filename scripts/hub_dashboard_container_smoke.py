@@ -12,11 +12,12 @@ import uuid
 
 
 PROBE = r'''
-import json, os, re, time, urllib.request, urllib.error
+import json, os, re, sys, time, urllib.request, urllib.error
 base = 'http://127.0.0.1:8770'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 deadline = time.monotonic() + 20
 assert os.getuid() == 10001 and os.getgid() == 10001
+expected_commit = sys.argv[1] if len(sys.argv) == 2 else None
 
 def read(response):
     body = response.read(1024 * 1024 + 1)
@@ -37,7 +38,12 @@ ready_by = time.monotonic() + 10
 while time.monotonic() < ready_by:
     try:
         status, _, body = get('/health')
-        assert status == 200 and json.loads(body).get('ok') is True
+        health = json.loads(body)
+        assert status == 200 and health.get('ok') is True
+        actual_commit = health.get('build_commit')
+        assert actual_commit is None or isinstance(actual_commit, str) and re.fullmatch('[0-9a-f]{40}', actual_commit)
+        if expected_commit is not None:
+            assert actual_commit == expected_commit
         break
     except (OSError, AssertionError):
         time.sleep(.2)
@@ -95,13 +101,16 @@ for agent in ('HERMES', 'CODEX', 'CLAUDE'):
 print(json.dumps({'image_smoke': 'passed', 'assets': len(assets),
                   'human_sign_in': 'disabled_as_requested', 'private_api': 'denied',
                   'network': 'none', 'durability': 'not_tested',
+                  'build_commit': actual_commit,
                   'authenticated_agents': 3, 'mcp_tools': len(expected_tools)}))
 '''
 
 
-def run_smoke(image):
+def run_smoke(image, expected_commit=None):
     if not isinstance(image, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', image):
         raise ValueError('An immutable local image ID is required')
+    if expected_commit is not None and (not isinstance(expected_commit, str) or not re.fullmatch('[0-9a-f]{40}', expected_commit)):
+        raise ValueError('Expected commit must be lowercase 40-character SHA')
     owner = uuid.uuid4().hex
     name = 'hub-dashboard-smoke-' + owner
     run = [
@@ -119,11 +128,16 @@ def run_smoke(image):
     # No shell, token retrieval, user configuration, or shared Docker resources.
     try:
         subprocess.run(run, check=True, capture_output=True, text=True, timeout=60)
-        result = subprocess.run(['docker', 'exec', name, 'python', '-c', PROBE],
+        probe = ['docker', 'exec', name, 'python', '-c', PROBE]
+        if expected_commit is not None:
+            probe.append(expected_commit)
+        result = subprocess.run(probe,
                                 check=True, capture_output=True, text=True, timeout=30)
         report = json.loads(result.stdout)
         if not isinstance(report, dict) or report.get('image_smoke') != 'passed':
             raise ValueError('Smoke probe did not report success')
+        if expected_commit is not None and report.get('build_commit') != expected_commit:
+            raise ValueError('Smoke build identity did not match')
         return report
     finally:
         # docker run may have created the container even if its response was
@@ -145,10 +159,11 @@ def run_smoke(image):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True, help='Already-built immutable local sha256 image ID')
+    parser.add_argument('--expected-commit', help='Require the app health response to identify this exact source commit')
     args = parser.parse_args()
     if not re.fullmatch(r'sha256:[a-f0-9]{64}', args.image):
         parser.error('An immutable local sha256 image ID is required')
-    print(json.dumps(run_smoke(args.image)))
+    print(json.dumps(run_smoke(args.image, args.expected_commit)))
 
 
 if __name__ == '__main__':

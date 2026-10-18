@@ -174,12 +174,15 @@ class ContainerPilotWorkflow:
                 raise HubError('container_pilot_manifest_changed', 409)
         return target
 
-    def _event(self, run, event):
+    def _event(self, run, event, *, reason=None):
         return self.repo.append_run_event(self.repo.execution_principal, run['id'], event,
-                                         run['id'], run['fencing_generation'], run['revision'])
+                                         run['id'], run['fencing_generation'], run['revision'], reason=reason)
 
-    def _hold(self, run):
-        return self._event(run, 'held') if run['status'] in {'pending', 'running'} else run
+    def _hold(self, run, reason):
+        # A failed candidate is not a terminal recovery result. Failed or
+        # uncertain rollback must visibly hold the same target reservation,
+        # rather than leaving an ordinary candidate-failure label behind.
+        return self._event(run, 'held', reason=reason) if run['status'] in {'pending', 'running', 'failed'} else run
 
     @staticmethod
     def _verified_state(response, command, target):
@@ -245,16 +248,18 @@ class ContainerPilotWorkflow:
             if run['status'] in {'succeeded', 'rolled_back', 'held'}:
                 return run
             if self.repo.get_paused():
+                if run['status'] == 'failed':
+                    return self._hold(run, 'staging_paused')
                 raise HubError('paused', 423)
             if run['status'] == 'pending':
                 run = self._event(run, 'running')
             if run['status'] == 'running':
                 for action in ('deploy_container', 'smoke_container'):
                     if self.repo.get_paused():
-                        return self._hold(run)
+                        return self._hold(run, 'staging_paused')
                     state = await self._command(run, target, action)
                     if state == 'held':
-                        return self._hold(run)
+                        return self._hold(run, 'candidate_outcome_uncertain')
                     if state == 'failed':
                         run = self._event(run, 'failed')
                         break
@@ -263,9 +268,12 @@ class ContainerPilotWorkflow:
             if run['status'] == 'failed':
                 for action in ('rollback_container', 'smoke_container_rollback'):
                     if self.repo.get_paused():
-                        return run
-                    if await self._command(run, target, action) != 'succeeded':
-                        return run  # Retain reservation; never claim healthy rollback.
+                        return self._hold(run, 'staging_paused')
+                    state = await self._command(run, target, action)
+                    if state != 'succeeded':
+                        phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
+                        reason = phase + ('_failed' if state == 'failed' else '_outcome_uncertain')
+                        return self._hold(run, reason)
                 return self._event(run, 'rolled_back')
             return run
         finally:

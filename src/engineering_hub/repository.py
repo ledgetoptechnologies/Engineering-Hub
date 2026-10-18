@@ -11,6 +11,8 @@ import uuid
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
+HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
+                         'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
 
 
 class HubError(Exception):
@@ -254,7 +256,15 @@ class HubRepository:
                 raise HubError('forbidden', 403)
             if target != task['project'] + ':staging':
                 raise HubError('invalid_target', 403)
-            if task['status'] != 'verified' or not task['review'] or task['review']['commit'] != task['candidate_commit']:
+            # Recheck the evidence at consumption, not merely the stored status:
+            # legacy/corrupted rows must never allocate execution authority.
+            review, candidate = task.get('review'), task.get('candidate_commit')
+            if (task['status'] != 'verified' or not isinstance(review, dict)
+                or review.get('verdict') != 'approve'
+                or not isinstance(review.get('actor'), str) or review['actor'] not in AGENTS
+                or review['actor'] == task['owner']
+                or not isinstance(candidate, str) or re.fullmatch('[0-9a-f]{40}', candidate) is None
+                or review.get('commit') != candidate):
                 raise HubError('review_required', 409)
             if task['repair_count'] >= 3:
                 raise HubError('repair_limit', 409)
@@ -297,13 +307,16 @@ class HubRepository:
     def list_runs(self):
         return self._list('run')
 
-    def append_run_event(self, actor, runid, event, command_id, fencing_generation, expected_revision):
+    def append_run_event(self, actor, runid, event, command_id, fencing_generation, expected_revision, *, reason=None):
         if self.execution_principal is None or actor != self.execution_principal:
             raise HubError('forbidden', 403)
         command_id = self._text(command_id)
         if event not in {'running', 'succeeded', 'failed', 'rolled_back', 'held'} or type(fencing_generation) is not int or fencing_generation < 1:
             raise HubError('invalid_event')
-        fingerprint = _json([actor, fencing_generation])
+        if reason is not None and (event != 'held' or not isinstance(reason, str) or reason not in HELD_REASONS):
+            raise HubError('invalid_event')
+        # Preserve the exact legacy fingerprint for omitted reasons.
+        fingerprint = _json([actor, fencing_generation] if reason is None else [actor, fencing_generation, reason])
         with self._transaction() as db:
             run = self._get(db, runid, 'run')
             if run['execution_actor'] != actor:
@@ -319,13 +332,16 @@ class HubRepository:
                 return run
             self._cas(run, expected_revision)
             transitions = {'pending': {'running', 'held', 'failed'}, 'running': {'succeeded', 'failed', 'held'},
-                           'held': {'failed'}, 'failed': {'rolled_back'}}
+                           'held': {'failed'}, 'failed': {'rolled_back', 'held'}}
             if event not in transitions.get(run['status'], set()):
                 raise HubError('invalid_transition', 409)
             if self._paused(db) and event == 'running':
                 raise HubError('paused', 409)
             run.update(status=event, command_id=command_id, fencing_generation=fencing_generation, execution_actor=actor)
-            run['events'].append(dict(event=event, actor=actor, command_id=command_id, fencing_generation=fencing_generation))
+            entry = dict(event=event, actor=actor, command_id=command_id, fencing_generation=fencing_generation)
+            if reason is not None:
+                entry['reason'] = reason
+            run['events'].append(entry)
             db.execute('INSERT INTO hub_events VALUES(?,?,?,?)', (runid, command_id, event, fingerprint))
             if event == 'failed':
                 task = self._get(db, run['task_id'], 'task')

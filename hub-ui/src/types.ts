@@ -61,6 +61,8 @@ export interface Run extends Versioned {
     actor: string;
     command_id: string;
     fencing_generation: number;
+    reason?: "candidate_outcome_uncertain" | "staging_paused" | "rollback_failed" |
+      "rollback_outcome_uncertain" | "rollback_smoke_failed" | "rollback_smoke_outcome_uncertain" | null;
   }>;
 }
 export interface Project {

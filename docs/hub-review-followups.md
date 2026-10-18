@@ -77,6 +77,55 @@ the browser rejects cursors above `2^53-1` without rounding or replay.
 The existing independent review and test results do not prove native provider
 enrollment, exact-session delivery, owner selection or restart/offline acceptance.
 
+Claude's targeted read-only re-review of `fc56198..62528cc` is recorded in
+`30d41a6d-78b9-47cc-a1ad-a459df344336`: all four corrections resolved, no blocking
+defects. He inspected source but did not rerun tests. The 128-attempt budget is
+per subscription lifetime, so even a legitimate long-lived busy topic eventually
+needs explicit Check; it is not an outage detector or a timer-based retry policy.
+
+## Previously undelivered container pilot reviews
+
+Root retrieved these exact shared-knowledge documents from project
+`engineering-hub` (not `agent-bus`); they were not available as ordinary replies
+because the earlier chain reached its hop limit:
+
+- `reviews/real-pilot-design-claude.md`, v1 SHA256
+  `60104b9b44e464868dc12c9ef27aa3ed7c65f8daf5af06ee49d77e17bf5a9311`.
+- `reviews/container-pilot-contract-review-claude.md`, v1 SHA256
+  `7889b7c2c28ea95f2f7eda786c2994b708f96f8146f4d045eb42dbc91debda54`.
+- `reviews/container-pilot-source-review-eaffa9a-claude.md`, v1 SHA256
+  `a94892ccc3287a0d1f467638568a4705796c27fc490292af27d073e7c45a2eca`.
+
+The source review found no blocking controller/client defects at `eaffa9a` but
+identified material pre-host-integration work. Current changes make rollback
+failure/uncertainty and pause visibly held with fixed public event reasons,
+preserving the same target reservation, command IDs, fence and repair count.
+Run creation now independently revalidates the approved distinct registered
+reviewer and current exact commit at consumption; a persisted `verified` label
+alone is insufficient. Health now reports a nullable build commit baked into a
+fixed installed package resource; runtime environment cannot supply it. Unknown
+or malformed metadata remains unknown. Actual image verification is still needed.
+
+Unresolved host/recovery gates from those reviews remain explicit:
+
+- Exact stop/preserve/cutover semantics and a durable pre-effect previous-instance,
+  image, state-generation and volume snapshot; no source hash alone proves these.
+- Host-enforced four-phase ordering, fencing, bounded pause/deadline behavior,
+  evidence allowlisting and secret-redaction tests, plus exact-ID-only teardown.
+- Role-specific smoke identity: rollback uses the manifest's rollback commit,
+  while the wire candidate commit remains the immutable run identity.
+- A supported recovery operation for a dead controller advance owner. Inspection
+  is read-only; no stale age, lease expiry or peer assertion authorizes takeover.
+  The current controller deliberately retains that lock and does not pretend the
+  first crash campaign can automatically continue past it.
+- Actual independently verified deployment/health/rollback/crash campaign on the
+  isolated runner. Earlier RepoDigest/liveness-only sketch suggestions are
+  superseded by the full metadata/provenance/profile contract.
+
+The old sketch also proposed claim-as-delivery and linked-reply-as-completion.
+Neither inference is adopted: exact chat delivery, processing and completed work
+require their own explicit evidence. A claim, ACK or arbitrary reply is not proof.
+
 ## Executor integration review
 
 Hermes corrected source: `7bdc3d406209208e81604e303f6e6e39e8d459b3` on

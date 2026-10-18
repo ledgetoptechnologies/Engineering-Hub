@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from agent_message_bus.auth import AuthSettings
 from .auth import AuthConfig, SessionStore, build_auth_router, require_human
+from .build_info import read_build_commit
 from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
@@ -373,7 +374,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def health():
         # Control service liveness is not host, agent or deployment readiness.
         repo.get_paused()
-        return {"ok": True, "service": "engineering-hub-control"}
+        return {"ok": True, "service": "engineering-hub-control",
+                "build_commit": read_build_commit()}
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     def overview(request: Request):

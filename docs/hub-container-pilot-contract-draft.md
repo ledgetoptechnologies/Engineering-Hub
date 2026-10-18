@@ -5,6 +5,22 @@ This is separate from the file-fixture executor. Existing `*_fixture` actions
 retain their original meanings. The first application target is a separate Hub
 instance, not the controller orchestrating its own replacement.
 
+The application `/health` now includes `build_commit`, baked from validated
+`VCS_REF` into a fixed installed-package resource during the control-image build.
+It is never taken from runtime environment, an agent request or OCI labels.
+Missing or malformed metadata yields null. Host smoke must require this claim to
+match the role's manifest source commit, in addition to independently verified
+image/config/container identity; a matching public claim is not build provenance.
+Rollback smoke checks `rollback.source_commit`, not the candidate commit carried
+on every wire command as immutable run identity.
+
+Failed or uncertain rollback/rollback smoke and pause during recovery now leave
+the run `held`, not ordinary `failed`, with an allowlisted event reason visible
+in the dashboard. The target/task reservation and original command IDs remain.
+No automatic retry, lock expiry or takeover is added. A dead controller advance
+owner still requires a separately reviewed recovery/quiescence protocol; GET
+inspection alone does not release it or authorize another effect.
+
 The synchronous pilot client has a bounded 125-second whole-operation deadline
 by default (and maximum). A configured deadline must cover the manifest's
 `total_command_ms` plus five seconds for transport. Workflow construction, run

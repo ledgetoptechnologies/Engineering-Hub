@@ -6,6 +6,27 @@ const NOW = new Date("2026-10-17T18:00:00.000Z");
 const ORIGIN = "http://127.0.0.1:5174";
 const CSRF = "fixture-human-only-csrf";
 
+test("held rollback reports why it needs attention without claiming rollback success", async ({ page }) => {
+  const mock = await mockLive(page);
+  mock.overview.runs.push({
+    id: "fixture-held-pilot", revision: 4, updated_at: NOW.toISOString(),
+    task_id: "fixture-task", project: "engineering-hub", target: "engineering-hub:staging",
+    commit: "a".repeat(40), artifact_digest: "sha256:" + "b".repeat(64), policy_revision: 1,
+    review: { actor: "claude", commit: "a".repeat(40), verdict: "approve" },
+    status: "held", command_id: "fixture-phase", fencing_generation: 1,
+    created_by: "codex", execution_actor: "executor:hub-pilot-v1", execution_manifest_digest: null,
+    events: [{ event: "held", actor: "executor:hub-pilot-v1", command_id: "fixture-phase",
+      fencing_generation: 1, reason: "rollback_outcome_uncertain" }],
+  });
+  await page.goto("/");
+  const held = page.locator("details").filter({ hasText: "Needs attention: Rollback outcome uncertain" });
+  await expect(held).toHaveCount(1);
+  await held.locator("summary").click();
+  await expect(held.getByText("Needs attention: Rollback outcome uncertain", { exact: true })).toBeVisible();
+  await expect(held.getByText("Held", { exact: true })).toBeVisible();
+  await expect(held.getByText("Rolled back", { exact: true })).toHaveCount(0);
+});
+
 async function mockLive(
   page: Page,
   { signedIn = true, events = false, expires = false, canonical = false } = {},

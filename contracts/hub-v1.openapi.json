@@ -1390,13 +1390,26 @@
             "type": "string",
             "const": "engineering-hub-control",
             "title": "Service"
+          },
+          "build_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Commit"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
           "ok",
-          "service"
+          "service",
+          "build_commit"
         ],
         "title": "HealthDTO"
       },
@@ -2127,6 +2140,25 @@
             "type": "integer",
             "minimum": 1.0,
             "title": "Fencing Generation"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "candidate_outcome_uncertain",
+                  "staging_paused",
+                  "rollback_failed",
+                  "rollback_outcome_uncertain",
+                  "rollback_smoke_failed",
+                  "rollback_smoke_outcome_uncertain"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
           }
         },
         "additionalProperties": false,

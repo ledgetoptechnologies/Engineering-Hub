@@ -986,6 +986,9 @@ export function HubApp() {
                           </Badge>
                         </summary>
                         <p className="small-text">Target: {run.target}</p>
+                        {run.status === "held" && run.events.at(-1)?.reason && (
+                          <p className="small-text">Needs attention: {pretty(run.events.at(-1)!.reason!)}</p>
+                        )}
                         <code>{run.artifact_digest}</code>
                         <p className="small-text">
                           Fence {run.fencing_generation} · {run.events.length}{" "}
