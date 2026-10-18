@@ -45,6 +45,7 @@ from .build_record import (
     verify_image_record,
 )
 from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger
+from .runtime_profile import derive_runtime_profile, probe_set_digest
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -351,39 +352,7 @@ class HostAdapter:
 
     def _profile(self, image: VerifiedImage, defaults: ImageDefaults, generation_id: str,
                  secrets: dict[str, str]) -> EffectiveProfile:
-        runtime = self.manifest.runtime
-        environment = {}
-        for item in defaults.environment:
-            name, value = item.split("=", 1)
-            environment[name] = value
-        environment.update({"HUB_BASE_URL": runtime.environment.base_url,
-                            "HUB_DB": runtime.environment.database})
-        environment.update(secrets)
-        tmp = runtime.tmpfs.tmp
-        # Wire digits 1777 are octal permission bits, not decimal chmod input.
-        tmp_mode = int(str(tmp.mode), 8)
-        return EffectiveProfile(
-            uid=runtime.user.uid, gid=runtime.user.gid,
-            supplementary_groups=tuple(runtime.user.supplementary_groups),
-            read_only_root=runtime.read_only_root, cap_drop=tuple(runtime.cap_drop),
-            no_new_privileges=runtime.no_new_privileges, privileged=runtime.privileged,
-            pid_mode=runtime.pid_mode, ipc_mode=runtime.ipc_mode,
-            cgroupns_mode=runtime.cgroupns_mode,
-            network_mode=runtime.network.mode, published_ports=(),
-            memory_bytes=runtime.resources.memory_bytes,
-            cpu_millicores=runtime.resources.cpu_millicores,
-            pids_limit=runtime.resources.pids_limit,
-            tmpfs=(("/tmp", tmp.size_bytes, tmp_mode, tmp.noexec, tmp.nosuid),),
-            mounts=(("state_generation", runtime.state_mount.container_destination,
-                     runtime.state_mount.mode, generation_id),
-                    ("tmpfs", "/tmp", "rw", f"size={tmp.size_bytes}",
-                     f"mode={tmp_mode:o}", "noexec", "nosuid")),
-            state_destination=runtime.state_mount.container_destination,
-            state_mode=runtime.state_mount.mode, state_generation_id=generation_id,
-            environment=tuple(sorted(environment.items())),
-            entrypoint=defaults.entrypoint, command=defaults.command,
-            restart_policy=runtime.restart_policy,
-        )
+        return derive_runtime_profile(self.manifest, defaults, generation_id, secrets)
 
     def _get_baseline(self) -> BaselineIdentity:
         try:
@@ -533,9 +502,7 @@ class HostAdapter:
 
     @staticmethod
     def _probe_digest(probes: tuple[Probe, ...]) -> str:
-        raw = json.dumps([probe.model_dump(mode="json") for probe in probes],
-                         sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        return "sha256:" + hashlib.sha256(raw).hexdigest()
+        return probe_set_digest(probes)
 
     @staticmethod
     def _evidence(container_id, image_config_id, health, verified):

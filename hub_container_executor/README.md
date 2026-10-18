@@ -39,6 +39,23 @@ not enable itself from import, environment, Hub startup, or a listener.
   hashing and surrounding I/O, plus a non-destructive retention planner. Error
   cleanup removes only the newly created matching inode; blocking OS I/O cannot
   be forcibly cancelled by this in-process primitive.
+- `baseline_snapshot.py`: explicit first-baseline snapshot preparation in a
+  dedicated Linux operator process, not the Hub service. It preserves the
+  original database/WAL/SHM inventory, normalizes only its own temporary backup,
+  and publishes a frozen artifact without replacing an existing leaf. Process,
+  private-storage and source-inventory checks fail closed. This prepares bytes;
+  it does not prove baseline health or authorize a rollout.
+- `baseline_receipt.py`: read-only `BaselineProvider` implementation over an
+  independently pinned private receipt, campaign, verified rollback image and
+  private runtime-profile digest. It revalidates the original protected bytes
+  and full manifest bindings on every call, exports the bound immutable file
+  inventory and rejects future-dated observations. The receipt describes
+  historical enrollment, never current health. The actual observed enroller
+  and independent operator pinning workflow are still required; a caller-authored
+  healthy flag plus its hash is not adequate authority.
+- `runtime_profile.py`: pure shared profile/probe derivation used by the adapter
+  and future enroller. Runtime-profile and probe-set digests remain distinct.
+  Profile inputs contain synthetic test secrets; never serialize or log them.
 - `state_provider.py`: explicit private, independently enrolled frozen-baseline
   generation provider for one bounded pilot. Candidate admission reserves count
   and byte headroom for the same run's rollback before writing intent. Durable
@@ -89,6 +106,8 @@ Still required before any real acceptance:
    identity (not a backend echo or label). The interface is source-only and no
    concrete driver-identity provider is supplied; without one, effects hold.
    Missing dependencies fail closed.
+   The protected baseline receipt reader and snapshot helper do not supply the
+   missing actual health observer/enroller or authenticate an invented receipt.
 3. A private generation provider that uses the tested SQLite copy primitive,
    enforces no migrations/external writes, validates baseline immutability,
    preprovisions uid/gid 10001 access without privileged helper/chown, and applies
