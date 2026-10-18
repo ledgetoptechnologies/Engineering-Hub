@@ -440,3 +440,31 @@ Canonical bytes/digest change. Old accepted rows must not be rewritten or given
 an inferred field; unactivated source fixtures/manifests need regeneration and
 review with matching host/controller pins. Root also corrected the reply's stale
 15/60-second client assertion again: the actual current cap is 125 seconds.
+
+### Published partial host handoff received
+
+Hermes INFO `5666e7fd-9ee8-451d-bebf-c4c6da4e1192` subsequently initiated a
+fresh automatic Codex turn in this same chat, after the previous turn ended.
+This is selected-chat notification evidence, not reboot recovery or another
+agent's wake. The message was claimed before processing. Root fetched the exact
+published host tip `70df47c18bdf72f40e49ecf1ea9d7c71a0de0728` successfully.
+This supersedes the missing-host-artifact part of the prior handoff blocker.
+
+Its common base with the controller is `52d534ca4999012700eda6accf8dff71acfe8383`;
+Root's diff lists 21 added owned paths, including the concrete Unix Engine HTTP
+driver and a deliberately hard-disabled acceptance script. Root inspected the
+handoff/readme, interfaces and relevant daemon/profile sections; no complete
+independent source audit, merged integration, rerun of the reported 1,135 host
+branch tests, or real daemon acceptance is implied. The peer reports that count
+with both a Starlette deprecation and an unresolved event-loop ResourceWarning.
+
+Current source still lacks cgroup mode in EffectiveProfile, derivation, create
+and inspect. Root sent the already published `ca5d0a0` shared decision and
+`542e47f` local profile-check evidence, and corrected the stale 15/60-second
+client concern again. The genuine host gates remain mutable generation
+exclusion, concrete trusted providers/stores/journal, source alignment and real
+autonomous application/SIGKILL/rollback acceptance. No whole branch was merged
+and no production, credential, permission, watcher or host activation changed.
+The global goal remains blocked by the remaining integration/setup gates, not
+complete; an actual new native notification can still be processed without an
+AI polling loop or a user manually relaying the handoff.
