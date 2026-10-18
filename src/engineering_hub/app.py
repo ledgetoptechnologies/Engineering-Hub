@@ -23,6 +23,7 @@ from .build_info import read_build_commit
 from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
+from .delivery_guidance import DeliveryGuidance, topic_delivery_guidance
 from .events import NativeHubEventFeed
 from .sse_keepalive import with_keepalive
 from .autonomy import StagingRuntime
@@ -162,6 +163,7 @@ class TopicPreflight(Input):
     peer: PublicReachability
     advisory: Literal[True]
     delivery_guaranteed: Literal[False]
+    guidance: DeliveryGuidance
 
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
@@ -258,7 +260,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         snapshot = await peers_for(topic, principal=principal, bearer=bearer)
         peer = next(item for item in snapshot['items'] if item['agent'] == recipient)
         return {'topic': topic, 'recipient': recipient, 'peer': peer,
-                'advisory': True, 'delivery_guaranteed': False}
+                'advisory': True, 'delivery_guaranteed': False,
+                'guidance': topic_delivery_guidance(
+                    PublicReachability.model_validate_json(json.dumps(peer))).model_dump()}
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,

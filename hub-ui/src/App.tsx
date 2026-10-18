@@ -1147,8 +1147,10 @@ export function HubApp() {
                             : state === "linked_unverified"
                               ? "Unverified"
                               : state === "busy_queued"
-                                ? "Queued"
-                                : pretty(state)}
+                                ? "Busy"
+                                : state === "reachable"
+                                  ? "Online · verified"
+                                  : pretty(state)}
                         </Badge>
                       </div>
                     );

@@ -1599,6 +1599,59 @@
         ],
         "title": "DecisionListDTO"
       },
+      "DeliveryGuidance": {
+        "properties": {
+          "recipient_state": {
+            "type": "string",
+            "enum": [
+              "online",
+              "busy",
+              "offline",
+              "unknown",
+              "unlinked"
+            ],
+            "title": "Recipient State"
+          },
+          "send_mode": {
+            "type": "string",
+            "enum": [
+              "notify_if_still_reachable",
+              "queue_only",
+              "link_first"
+            ],
+            "title": "Send Mode"
+          },
+          "response_expectation": {
+            "type": "string",
+            "enum": [
+              "may_respond",
+              "may_be_delayed",
+              "not_verified"
+            ],
+            "title": "Response Expectation"
+          },
+          "durable_delivery_required": {
+            "type": "boolean",
+            "const": true,
+            "title": "Durable Delivery Required",
+            "default": true
+          },
+          "receipt_required": {
+            "type": "boolean",
+            "const": true,
+            "title": "Receipt Required",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "recipient_state",
+          "send_mode",
+          "response_expectation"
+        ],
+        "title": "DeliveryGuidance"
+      },
       "DispatchReceiptDTO": {
         "properties": {
           "sequence": {
@@ -2829,6 +2882,9 @@
             "type": "boolean",
             "const": false,
             "title": "Delivery Guaranteed"
+          },
+          "guidance": {
+            "$ref": "#/components/schemas/DeliveryGuidance"
           }
         },
         "additionalProperties": false,
@@ -2838,7 +2894,8 @@
           "recipient",
           "peer",
           "advisory",
-          "delivery_guaranteed"
+          "delivery_guaranteed",
+          "guidance"
         ],
         "title": "TopicPreflight"
       },

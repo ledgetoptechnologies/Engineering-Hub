@@ -123,7 +123,11 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
     @mcp.tool()
     async def hub_topic_preflight(topic: str, recipient: str, ctx: Context) -> dict:
-        """Read advisory reachability before sending; never discards offline mail."""
+        """Check exact-topic presence/send guidance; queue offline mail durably.
+
+        Online is advisory, not receipt or completion. Busy may delay replies;
+        unknown/offline must not imply an immediate response or trigger retries.
+        """
         identity(ctx)
         if topic_preflight is None:
             raise ToolError('reachability_source_unavailable')

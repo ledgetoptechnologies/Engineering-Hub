@@ -63,3 +63,51 @@ No client heartbeat writes, inbox/database polling, scheduler, model calls, extr
 Use `bus_info(topic="presence")` for a live snapshot, `bus_info(topic="recovery")` for retry rules, and `bus_info(topic="commands")` for live schemas. `/info` aliases remain client-owned.
 
 An explicitly owner-selected conversation remains the topic owner. Presence does not authenticate client-supplied session labels or reassign sessions. The deleted `mcp-worker` profile is not required and must not be recreated as a fallback. No scheduled inbox/model polling is enabled.
+
+## Engineering Hub exact-topic preflight (candidate source)
+
+The Hub interface is separate from the old message-bus interface above. Use
+Hub's authenticated `hub_topic_peers(topic)` and
+`hub_topic_preflight(topic, recipient)` MCP tools, or
+`GET /api/hub/v1/topics/{topic}/preflight?recipient=hermes`. Keep the exact
+discussion topic and the current authenticated agent identity. Do not infer
+readiness from a reply in another topic or a global transport connection.
+
+Preflight now includes `guidance`:
+
+| Recipient state | Send mode | Response expectation |
+| --- | --- | --- |
+| Online, fresh owning-runtime evidence | `notify_if_still_reachable` | `may_respond` |
+| Busy, verified input queue | `notify_if_still_reachable` | `may_be_delayed` |
+| Explicitly disconnected/offline | `queue_only` | `not_verified` |
+| Unknown, expired, stream-only or unverified | `queue_only` | `not_verified` |
+| Authoritatively no exact-topic binding | `link_first` | `not_verified` |
+
+`durable_delivery_required` and `receipt_required` are always true;
+`delivery_guaranteed` remains false. A recipient can disconnect just after
+preflight. Send meaningful requests through durable addressed storage, retain
+their send key, and report accepted/pending rather than delivered. Do not send
+empty wake messages, repeatedly resend the same request, or start a model or
+replacement listener just because another agent is unavailable. Presence is
+not task ownership or permission to take over an uncertain external operation.
+
+The dashboard calls the verified idle route **Online · verified** and the
+verified queue-capable route **Busy**, not **Queued**. The latter must not imply
+that any particular message has been accepted. Readiness expires locally at its
+deadline; new authoritative evidence is required to turn it green again.
+
+### Current operational gap
+
+The default packaged startup still does **not** inject the canonical registry
+bridge. The bus's `presence_status` reports transport connections only, not
+same-topic selected-runtime readiness. Therefore an unconfigured or unavailable
+source returns **Unknown** and queue-only guidance, never fabricated online
+status. Wiring the owner's published canonical registry, authenticated topic
+membership and selected-session observer is still required for actual live
+presence. No registry, heartbeat writer, scheduled polling, connector or service
+is activated by these source changes.
+
+Verification: 327 independently run backend presence/registry tests passed;
+19 UI unit tests and the build passed. Two focused real-browser tests against
+mock API fixtures passed for evidence expiry and topic switching. These are not
+production registry, native agent wake, or live dashboard acceptance results.

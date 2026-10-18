@@ -89,6 +89,10 @@ def test_unconfigured_topic_is_unknown_not_authoritatively_unlinked(settings):
             assert preflight["peer"]["agent"] == recipient
             assert preflight["peer"]["status"] == "unknown_stale"
             assert preflight["advisory"] is True and preflight["delivery_guaranteed"] is False
+            assert preflight['guidance'] == {
+                'recipient_state': 'unknown', 'send_mode': 'queue_only',
+                'response_expectation': 'not_verified',
+                'durable_delivery_required': True, 'receipt_required': True}
 
 
 @pytest.mark.parametrize("topic", ["bad topic", "$private-invalid", "x" * 129, ".invalid", "bad%value"])
@@ -129,11 +133,15 @@ def test_trusted_provider_ready_disconnect_and_exact_topic_projection(settings):
         assert first.json()["peer"]["evidence_level"] == "runtime_verified"
         assert first.json()["peer"]["valid_until"] is not None
         assert first.json()["delivery_guaranteed"] is False
+        assert first.json()['guidance']['recipient_state'] == 'online'
+        assert first.json()['guidance']['send_mode'] == 'notify_if_still_reachable'
         assert PRIVATE not in first.text and "session_id" not in first.text
         state["event"] = "disconnected"
         second = client.get(path, headers=AUTH, params={"recipient": "hermes"})
         assert second.json()["peer"]["status"] == "offline"
         assert second.json()["peer"]["reason"] == "session_disconnected"
+        assert second.json()['guidance']['recipient_state'] == 'offline'
+        assert second.json()['guidance']['send_mode'] == 'queue_only'
         other = client.get(f"{BASE}/topics/different-topic/peers", headers=AUTH).json()
         assert all(peer["status"] == "unlinked" for peer in other["items"])
         assert calls == [TOPIC, TOPIC, "different-topic"]
@@ -179,6 +187,10 @@ def test_mcp_topic_tools_match_rest_and_use_existing_bearer_auth(settings):
         assert structured(rpc(client, "hub_topic_peers", {"topic": TOPIC})) == rest
         preflight = structured(rpc(client, "hub_topic_preflight", {"topic": TOPIC, "recipient": "hermes"}))
         assert preflight["peer"]["status"] == "reachable" and preflight["delivery_guaranteed"] is False
+        rest_preflight = client.get(f'{BASE}/topics/{TOPIC}/preflight', headers=AUTH,
+                                    params={'recipient': 'hermes'}).json()
+        assert preflight['guidance'] == rest_preflight['guidance']
+        assert preflight['guidance']['recipient_state'] == 'online'
         for headers in ({}, {"Authorization": "Bearer invalid"}):
             assert rpc(client, "hub_topic_peers", {"topic": TOPIC}, authorization=headers).status_code == 401
 
