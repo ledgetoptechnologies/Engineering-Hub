@@ -53,6 +53,20 @@ descriptors without unlocking the parent's open file description. SIGSTOP does
 not release ownership. Garbage collection and failed construction close only
 owned descriptors; the lock file itself is never unlinked.
 
+The database inode is checked with no-follow stat through the private directory,
+not a lifetime raw database FD. Closing unmanaged database FDs can release
+SQLite's process-wide POSIX locks; only SQLite manages existing database opens.
+Acquire ownership before constructing database writers. Fresh creation closes
+its temporary FD before any SQLite connection starts.
+
+The current filesystem allowlist also admits tmpfs/overlay for isolated tests;
+this is not production storage acceptance. Before activation, ephemeral storage
+must be explicitly test-only and the ledger must have verified durable local
+storage across restart and container recreation. Copying/restoring a database
+changes its pinned identity and intentionally refuses startup. Restores require
+a separately reviewed re-enrollment procedure; deleting the lock or editing the
+enrollment row is not an automatic recovery mechanism.
+
 This local-kernel primitive does not prove remote commands have stopped, exclude
 legacy writers ignoring it, or support a volume shared between hosts. An eventual
 single-process deployment must hold it for all mutation tasks and their shutdown,

@@ -219,3 +219,31 @@ later root changes, real OAuth, a full REST task-assignment flow, an actual app
 deployment or TrueNAS/host boot acceptance. Root integration remains a separate gate.
 The older snapshot's loop warning is addressed by the separately verified test-only
 ownership fixes documented in `hub-linux-validation-2026-10-17.md`.
+
+### Pending ownership integration review: Claude, d4aba6f
+
+Message `328fbfe5-faef-4629-907d-864810f8df57` arrived automatically in this
+existing chat and was claimed and evaluated. This was source-only peer review,
+not an independent test run. Before wiring PilotOwner into workflow mutations:
+
+- Remove the lifetime raw SQLite database file descriptor, or enforce safe
+  connection shutdown ordering. Closing an unmanaged descriptor can release
+  process-wide POSIX SQLite locks. Add a separate-process write-lock regression
+  test; existing green ownership tests do not cover this hazard.
+- Separate ephemeral tmpfs/overlay validation from durable production storage
+  acceptance. Neither ephemeral storage nor a container-layer inode establishes
+  reboot/recreation durability.
+- Document that restored/copied database identities deliberately refuse startup
+  and require a separately reviewed re-enrollment procedure, not automatic repair.
+
+The raw-descriptor finding is now fixed in source: existing database validation
+uses no-follow, parent-dirfd-relative stat rather than raw open/close. The fresh
+creation FD closes before SQLite starts. All 36 focused Linux ownership tests
+pass, including an independent-process SQLITE_BUSY probe with an active sibling
+transaction while the owner closes. A mutation restoring unmanaged raw FD close
+fails that exact regression with `SQLite transaction lock was lost`, establishing
+that the test detects the reviewed defect. This does not establish workflow
+integration or production durability. The storage and restore items remain open
+integration gates. Repeated same-phase recovery events also
+still require occurrence identities. No production activation is authorized by
+this review or by acknowledging its message.

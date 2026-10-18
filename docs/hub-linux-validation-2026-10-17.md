@@ -309,3 +309,20 @@ continuation, stale-owner adoption, automatic accepted-pause recovery, default
 worker, credential or permissions change. Remote effects remain the separate
 host adapter's responsibility. No actual controller-driven deployment/rollback,
 private OAuth, native enrollment, TrueNAS migration or PC reboot is proved here.
+# SQLite ownership descriptor correction
+
+Frozen validation image
+`sha256:3b924dc8204af59a99423ac1cf1d5837bcfefd1b394ad0f44d374068968a15c6`
+contains the no-raw-existing-database-FD correction and cross-process lock test.
+Focused actual Linux ownership tests: **36 passed**. Full suite: **1,529 passed
+in 61.48 seconds**, with the existing Starlette deprecation warning only.
+Tests ran as UID 10001, network disabled, read-only root, no host mounts, ports,
+Docker socket or credentials, and private temporary test directories.
+
+A separate disposable container monkeypatched close to raw-open/close the DB
+before normal owner cleanup. The exact new regression failed as expected with
+`SQLite transaction lock was lost`; the unmodified image passes. This confirms
+the test detects the reviewed POSIX-lock hazard rather than merely exercising
+the success path. Validation does not prove controller ownership integration,
+durable production storage, real application deployment or reboot recovery.
+Documentation-only updates following the image build are not part of its layers.

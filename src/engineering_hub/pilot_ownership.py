@@ -69,7 +69,7 @@ class PilotOwner:
     """
 
     def __init__(self, database_path):
-        self._parent_fd = self._lock_fd = self._database_fd = None
+        self._parent_fd = self._lock_fd = None
         self._closed = True
         self._pid = os.getpid()
         _OWNERS.add(self)
@@ -96,14 +96,20 @@ class PilotOwner:
             self._check_file(self._lock_fd, self._lock_name, self._lock_identity)
             fresh = False
             try:
-                self._database_fd = os.open(path.name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                            0o600, dir_fd=self._parent_fd)
+                created_fd = os.open(path.name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     0o600, dir_fd=self._parent_fd)
+                try:
+                    self._database_identity = self._check_file(created_fd, path.name)
+                    _local_filesystem(created_fd)
+                finally:
+                    # Close a newly created file before SQLite can acquire any
+                    # locks. Never raw-open an existing database: closing even
+                    # an unrelated FD releases this process's POSIX inode locks.
+                    os.close(created_fd)
                 fresh = True
             except FileExistsError:
-                self._database_fd = os.open(path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                            dir_fd=self._parent_fd)
-            self._database_identity = self._check_file(self._database_fd, path.name)
-            _local_filesystem(self._database_fd)
+                self._database_identity = self._check_database()
+            self._check_database(self._database_identity)
             with self._connect() as db:
                 db.execute('BEGIN IMMEDIATE')
                 if fresh:
@@ -148,7 +154,19 @@ class PilotOwner:
                 or self._path.parent.resolve() != self._path.parent):
             raise PilotOwnershipError()
         self._check_file(self._lock_fd, self._lock_name, self._lock_identity)
-        self._check_file(self._database_fd, self._path.name, self._database_identity)
+        self._check_database(self._database_identity)
+
+    def _check_database(self, expected=None):
+        # The private parent FD anchors identity checks without a raw database
+        # FD whose close could invalidate SQLite's process-wide POSIX locks.
+        named = os.stat(self._path.name, dir_fd=self._parent_fd, follow_symlinks=False)
+        identity = (named.st_dev, named.st_ino)
+        if (not stat.S_ISREG(named.st_mode) or named.st_uid != os.getuid()
+                or named.st_dev != self._parent_identity[0]
+                or stat.S_IMODE(named.st_mode) != 0o600 or named.st_nlink != 1
+                or (expected is not None and identity != expected)):
+            raise PilotOwnershipError()
+        return identity
 
     @contextmanager
     def _connect(self):
@@ -192,7 +210,7 @@ class PilotOwner:
         # Never LOCK_UN: an inherited child must not unlock its parent's shared
         # open file description. Closing only these FDs preserves that boundary.
         failed = False
-        for name in ('_database_fd', '_lock_fd', '_parent_fd'):
+        for name in ('_lock_fd', '_parent_fd'):
             fd = getattr(self, name, None)
             if fd is not None:
                 setattr(self, name, None)

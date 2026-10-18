@@ -228,7 +228,7 @@ def test_foreign_owner_and_no_permission_repair(database, monkeypatch):
 def test_cloexec_and_explicit_child_close_fds(database):
     import fcntl
     with PilotOwner(database) as owner:
-        for fd in (owner._parent_fd, owner._lock_fd, owner._database_fd):
+        for fd in (owner._parent_fd, owner._lock_fd):
             assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
         child = subprocess.run([sys.executable, '-c', 'print("child-ok")'], close_fds=True,
                                capture_output=True, text=True, timeout=10)
@@ -287,7 +287,7 @@ def test_garbage_collection_closes_orphaned_capability(database):
 def test_close_attempts_all_descriptors_when_one_close_fails(database, monkeypatch):
     import engineering_hub.pilot_ownership as module
     owner = PilotOwner(database)
-    descriptors = [owner._database_fd, owner._lock_fd, owner._parent_fd]
+    descriptors = [owner._lock_fd, owner._parent_fd]
     real_close = os.close
     attempted = []
     def close(fd):
@@ -303,3 +303,37 @@ def test_close_attempts_all_descriptors_when_one_close_fails(database, monkeypat
     owner.close()
     with PilotOwner(database) as successor:
         assert successor.previous_epoch == owner.epoch
+
+
+def test_closing_owner_preserves_other_sqlite_connection_write_lock(database):
+    owner = PilotOwner(database)
+    db = sqlite3.connect(database, timeout=0)
+    try:
+        db.execute('CREATE TABLE lock_probe(value INTEGER)')
+        db.commit()
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('INSERT INTO lock_probe VALUES(1)')
+        owner.assert_active(database)
+        owner.close()
+        # A different process must still be excluded by SQLite, even though
+        # the ownership flock is now released. A raw DB fd close breaks this.
+        result = subprocess.run([sys.executable, '-c', '''
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1], timeout=0)
+try:
+    db.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as error:
+    assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    print('still-locked')
+else:
+    raise SystemExit('SQLite transaction lock was lost')
+finally:
+    db.close()
+''', str(database)], capture_output=True, text=True, timeout=10, close_fds=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == 'still-locked'
+        db.commit()
+        assert db.execute('SELECT value FROM lock_probe').fetchall() == [(1,)]
+    finally:
+        db.close()
+        owner.close()
