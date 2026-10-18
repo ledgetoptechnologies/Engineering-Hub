@@ -285,10 +285,33 @@ and typed-fake controller tests are not an application pilot.
 
 ## Shared manifest source profile
 
+### Explicit private cgroup namespace decision
+
+The closed draft manifest now requires `runtime.cgroupns_mode: "private"`, with
+no default. Host `EffectiveProfile` must include the same required literal and
+the concrete adapter must request `HostConfig.CgroupnsMode="private"` and verify
+the resulting effective configuration. Missing/host/unsupported mode must not be
+treated as private or accepted as verified isolation. No daemon-default fallback
+is allowed. This remains one part of the fixed profile, not a general sandbox
+guarantee or proof that CPU/memory quotas are enforced.
+
+`MIN_CGROUPNS_ENGINE_API=(1, 41)` records this feature's minimum. Docker's official
+[Engine API history](https://docs.docker.com/reference/api/engine/version-history/)
+documents Linux create support in API 1.41. A backend may impose a newer API
+minimum. It must compare negotiated versions numerically, retain the supported
+version pin, and reject unsupported daemon/kernel capability before accepting
+an effect. A successful schema parse is not proof of API/kernel support.
+
+This is a pre-activation draft tightening, not an automatic migration of saved
+manifests. The required field changes canonical bytes and the digest; unactivated
+fixtures/manifests must be explicitly regenerated and reviewed. Never inject a
+default into a previously accepted persisted run or rewrite its original command
+identity. Previous profiles do not acquire a private-cgroup guarantee retroactively.
+
 The shared `container_pilot_manifest.py` schema validates every nominated section,
 rejects unknown/duplicate JSON keys, floats/non-finite numbers and numeric values
 masquerading as security booleans. The fixed profile is a first Hub campaign,
-not a generic container service: Linux amd64/arm64, UID/GID10001, private PID/IPC,
+not a generic container service: Linux amd64/arm64, UID/GID10001, private PID/IPC/cgroup namespaces,
 read-only root, all capabilities dropped, no-new-privileges, no privileged mode,
 no network or published ports, and a private state generation at `/var/lib/hub`.
 Health is checked inside the exact selected container, never at an agent URL.

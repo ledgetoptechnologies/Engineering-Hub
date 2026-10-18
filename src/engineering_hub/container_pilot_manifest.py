@@ -21,6 +21,9 @@ Opaque = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-
 Milliseconds = Annotated[int, Field(ge=100, le=120_000)]
 MAX_BYTES = 64 * 1024
 SOURCE_REPOSITORY = "https://github.com/ledgetoptechnologies/Engineering-Hub"
+# Feature minimum only; a concrete backend may require a newer Engine API.
+# Compare negotiated versions numerically, never lexicographically or by default.
+MIN_CGROUPNS_ENGINE_API = (1, 41)
 
 
 class _Closed(BaseModel):
@@ -153,6 +156,7 @@ class Runtime(_Closed):
     privileged: Literal[False]
     pid_mode: Literal["private"]
     ipc_mode: Literal["private"]
+    cgroupns_mode: Literal["private"]
     network: Network
     resources: Resources
     tmpfs: Tmpfs

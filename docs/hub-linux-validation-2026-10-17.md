@@ -517,3 +517,29 @@ restart and isolated restore. It does not prove an owner-enrolled ledger can be
 copied/re-enrolled, a Docker daemon/host reboot, real OAuth, TrueNAS durability,
 autonomous controller-to-host deployment/rollback, or topic readiness delivery.
 Those gates remain open; a manual local app restart is not the autonomous pilot.
+
+## Required private cgroup namespace contract
+
+Frozen validation image
+`sha256:1f831cd9ffa83752e9dfed521a564eecef80e380475bb631325031992858d344`
+passed **1,830 Linux tests in 71.54 seconds**, exit 0, with only the existing
+Starlette deprecation. Same isolated nonroot/network-none/read-only/private-tmpfs
+harness, no host mounts/socket/ports/real credentials. The full run now includes
+the durable harness unit tests as well as the new required namespace contract.
+A separate Windows manifest/client/workflow/API set passed 350 tests, and
+OpenAPI/UI DTO checks passed. Independent source review found no canonicalization
+bypass or silent legacy-profile upgrade.
+
+`runtime.cgroupns_mode` is explicitly required and accepts only `private`.
+Missing, host, empty, null, Boolean and uppercase values reject. Copied model
+objects cannot bypass canonical revalidation. The positive canonical vector now
+hashes to `sha256:e984626ae49fb99716d41cbab2e2cafcf356ef27bcc81a48f720731c5c752bc7`.
+This is a coordinated pre-activation draft tightening; saved old accepted
+manifests/commands must not be rewritten or assigned an inferred field.
+
+The shared minimum `(1, 41)` records Docker's documented feature introduction,
+not actual negotiated backend support or a version downgrade instruction.
+Host EffectiveProfile, API admission and effective create/inspect checks still
+need the matching adapter implementation and real daemon acceptance. This run
+does not prove those host properties, nor update the actual app-image smoke's
+previously recorded source identity. Production bus baseline remains unchanged.

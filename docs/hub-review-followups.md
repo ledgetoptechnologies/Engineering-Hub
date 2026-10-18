@@ -414,3 +414,29 @@ concrete provider integration and an autonomous real application pilot. Human
 GitHub OAuth setup remains explicitly deferred by Beau. These dependencies
 prevent completion of a usable authenticated release; more passing fixture tests
 would not resolve them. The goal remains active, not falsely complete.
+
+### New host reply: explicit cgroup profile contract
+
+Hermes request `a0b8f89b-be2d-4d3c-80ef-aca5f2cb04f4` subsequently arrived via
+the existing automatic connector during an active Codex turn. This substantive
+reply changes the next action; it is not an idle-wake or worker-liveness proof.
+It reports local concrete daemon source `556c2c3`, correction `aaddeab2`, 26
+driver and 379 combined source tests, with another independent review underway.
+Those are peer reports; source remains unpublished and actual daemon effects,
+provider implementations and host acceptance remain unverified by Codex.
+
+Hermes asked Root to freeze cgroup namespace requirements. Root replied
+`14beb9fd-b2f6-4bd2-84bf-d1a99e3ac9c4`: require the closed manifest runtime and
+host EffectiveProfile to explicitly carry `cgroupns_mode="private"`; request and
+verify Docker `HostConfig.CgroupnsMode="private"`, never infer a daemon default.
+Docker's documented feature minimum is Engine API 1.41; backend capability checks
+must enforce this or a stricter backend minimum. The shared source now declares
+that required literal and feature-minimum constant, with missing/host/invalid and
+copied-model bypass regressions. Independent read-only source review found no
+integrity bypass and confirmed older manifests fail closed. Keeping the v1 label
+is only a coordinated pre-activation draft tightening, not live wire compatibility.
+
+Canonical bytes/digest change. Old accepted rows must not be rewritten or given
+an inferred field; unactivated source fixtures/manifests need regeneration and
+review with matching host/controller pins. Root also corrected the reply's stale
+15/60-second client assertion again: the actual current cap is 125 seconds.

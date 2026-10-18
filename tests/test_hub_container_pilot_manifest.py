@@ -6,7 +6,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from engineering_hub.container_pilot_manifest import MAX_BYTES, PilotManifest, PROBE_PROFILE
+from engineering_hub.container_pilot_manifest import MAX_BYTES, MIN_CGROUPNS_ENGINE_API, PilotManifest, PROBE_PROFILE
 
 
 def make_manifest_data():
@@ -36,7 +36,7 @@ def make_manifest_data():
         "runtime": {
             "resource_name_prefix": "hub-pilot-fixture", "user": {"uid": 10001, "gid": 10001, "supplementary_groups": []},
             "read_only_root": True, "cap_drop": ["ALL"], "no_new_privileges": True, "privileged": False,
-            "pid_mode": "private", "ipc_mode": "private",
+            "pid_mode": "private", "ipc_mode": "private", "cgroupns_mode": "private",
             "network": {"mode": "none", "policy_digest": digest("d"), "loopback_address": None,
                         "host_port": None, "container_port": 8770},
             "resources": {"memory_bytes": 512 * 1024**2, "cpu_millicores": 1000,
@@ -78,7 +78,7 @@ def test_positive_canonical_vector():
     expected = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
     assert manifest.canonical_bytes() == expected
     assert manifest.digest() == "sha256:" + hashlib.sha256(expected).hexdigest()
-    assert manifest.digest() == "sha256:dc7103842f716bb6bbd603c123f7c41ef85f27a3864a4738670c1e42417b8389"
+    assert manifest.digest() == "sha256:e984626ae49fb99716d41cbab2e2cafcf356ef27bcc81a48f720731c5c752bc7"
     assert PilotManifest.from_bytes(expected).canonical_bytes() == expected
     assert parse(dict(reversed(list(data.items())))).digest() == manifest.digest()
 
@@ -92,6 +92,8 @@ def test_positive_canonical_vector():
     ("runner_binding.platform.os", "windows"), ("runner_binding.platform.variant", "v8"),
     ("runtime.user.uid", True), ("runtime.user.uid", 0), ("runtime.user.supplementary_groups", [0]),
     ("runtime.cap_drop", []), ("runtime.cap_drop", ["ALL", "ALL"]), ("runtime.cap_drop", ["SYS_ADMIN"]),
+    ("runtime.cgroupns_mode", "host"), ("runtime.cgroupns_mode", ""), ("runtime.cgroupns_mode", None),
+    ("runtime.cgroupns_mode", True), ("runtime.cgroupns_mode", "PRIVATE"),
     ("runtime.network.mode", "bridge"), ("runtime.network.host_port", 8770),
     ("runtime.network.container_port", True), ("runtime.network.loopback_address", "127.0.0.1"),
     ("runtime.resources.memory_bytes", 128 * 1024**2 - 1), ("runtime.resources.memory_bytes", 2 * 1024**3 + 1),
@@ -117,6 +119,20 @@ def test_rejects_unsupported_profile(path, value):
     set_path(data, path, value)
     with pytest.raises(ValueError):
         parse(data)
+
+
+def test_private_cgroup_namespace_is_required_not_a_daemon_default():
+    data = make_manifest_data()
+    assert MIN_CGROUPNS_ENGINE_API == (1, 41)
+    manifest = parse(data)
+    assert manifest.runtime.cgroupns_mode == 'private'
+    del data['runtime']['cgroupns_mode']
+    with pytest.raises(ValueError):
+        parse(data)
+    bypass = manifest.model_copy(update={
+        'runtime': manifest.runtime.model_copy(update={'cgroupns_mode': 'host'})})
+    with pytest.raises(ValueError):
+        bypass.canonical_bytes()
 
 
 BOOLEAN_PATHS = [
