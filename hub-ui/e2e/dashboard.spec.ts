@@ -172,6 +172,52 @@ async function emitRegistry(page: Page, kind: string, overrides: Record<string, 
   }, { kind, overrides });
 }
 
+for (const typed of [false, true]) {
+  test(`topic ACL denial stays panel-local for ${typed ? "typed" : "default"} topic`, async ({ page }) => {
+    await page.clock.install({ time: NOW });
+    await mockLive(page);
+    const deniedTopic = typed ? "restricted-topic" : "auto-wake-v1-test";
+    await page.route(`**/api/hub/v1/topics/${deniedTopic}/peers`, (route) => route.fulfill({
+      status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "topic_read_forbidden" } }),
+    }));
+    await page.goto("/");
+    if (typed) {
+      await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+      await page.getByLabel("TOPIC ROOT").fill(deniedTopic);
+      await page.getByRole("button", { name: "Check", exact: true }).click();
+    }
+    await expect(page.getByText("This session cannot read the selected topic.", { exact: false })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+    await expect(page.locator(".peer-row")).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Sign in with GitHub" })).toHaveCount(0);
+  });
+}
+
+for (const eventSource of ["hub_only", "none"] as const) {
+test(`canonical topic ACL denial stays local and same-topic ${eventSource} recovery clears stale state`, async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  await mockLive(page, { canonical: true });
+  await page.goto("/");
+  const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
+  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({
+    status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "topic_read_forbidden" } }),
+  }));
+  await emitRegistry(page, "registry.invalidated");
+  await expect(page.getByText("This session cannot read the selected topic.", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  await expect(page.locator(".peer-row")).toHaveCount(0);
+  await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({
+    contentType: "application/json", body: JSON.stringify({ ...createDemoTopic("auto-wake-v1-test", NOW), event_source: eventSource, registry_epoch: null }),
+  }));
+  await page.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(page.getByText("This session cannot read the selected topic.", { exact: false })).toHaveCount(0);
+});
+}
+
 test("canonical topic invalidation refreshes only topic and source loss leaves workspace writable", async ({ page }) => {
   await page.clock.install({ time: NOW });
   await controllableEvents(page);

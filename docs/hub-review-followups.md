@@ -44,6 +44,39 @@ TypeScript checks, not browser or Python checks. No pilot authorization is impli
 These items remain subject to the full active goal and topic reachability addendum.
 OAuth setup is deferred by Beau; no dev login is a substitute for its acceptance.
 
+## Canonical registry bridge independent review
+
+Claude reviewed `52d534c..65d7d0d` in bus reply
+`2fb6d664-ee41-4362-b5f6-3fd75de5dced`. He independently ran232 backend registry
+tests and7 topic-event unit tests; he did not run Playwright or live acceptance.
+The review confirms original-agent identity preservation, scoped human readers,
+closed/bounded payloads, independent cursors and fail-closed freshness behavior.
+
+The following corrections are implemented and locally verified, awaiting Claude's
+targeted independent re-review of the published patch:
+
+- Distinguish panel-local `topic_read_forbidden` from real human-session loss.
+  A restricted default/topic selection must not wipe healthy workspace records.
+- Recheck local session access on upstream keepalive chunks, not just data
+  pointers, and prove the upstream stream closes when that session is revoked.
+- Bound event-driven refresh counts and report a recoverable manual-check state
+  rather than allow an upstream event burst to drive unlimited snapshot reads.
+- Clear stale topic markers when leaving a session or successfully reading a
+  noncanonical source; document the browser's safe-integer cursor limit.
+
+An invalidation pointer's revision is not required to equal a later fresh
+snapshot's revision: a coalesced fetch can legitimately observe newer state, and
+UUID revisions have no ordering. Topic and registry epoch must still agree.
+Claude explicitly agreed in reply `10aeeeb1-c00c-4a9b-8ca8-c885e2109071` and
+withdrew exact revision equality as a gap. The patch passes369 focused backend
+integration tests,18 UI unit tests, TypeScript/Vite build and28 Edge E2E tests.
+The stream test revokes a real synthetic SessionStore session between comment
+chunks and proves upstream closure before reading the next chunk. The UI's
+128-snapshot per-subscription budget closes to an explicit manual-Check state;
+the browser rejects cursors above `2^53-1` without rounding or replay.
+The existing independent review and test results do not prove native provider
+enrollment, exact-session delivery, owner selection or restart/offline acceptance.
+
 ## Executor integration review
 
 Hermes corrected source: `7bdc3d406209208e81604e303f6e6e39e8d459b3` on

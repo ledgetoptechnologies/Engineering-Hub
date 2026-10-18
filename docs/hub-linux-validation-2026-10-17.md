@@ -239,3 +239,11 @@ This is an actual application **packaging/startup smoke**, not the required
 controller-driven deployment/health/rollback pilot. Private state was disposable
 tmpfs; no state durability, host reboot, OAuth, trusted registry/provider, actual
 host adapter, immutable build approval or TrueNAS acceptance is established.
+
+Full isolated Linux validation of frozen source `fc56198` (including the deadline
+compatibility correction and smoke-harness tests) subsequently passed **1,323
+tests in 59.13 seconds**, with only the existing Starlette deprecation. The
+validation image was OCI index
+`sha256:43bb59ad6c636350a917a0157062966463f784ae0a3ada4eb3c0e9a05ffb7309`.
+It used the same network-none/no-host-mount/private-tmpfs validation profile and
+auto-removed after exit. This does not cover later peer-review corrections.

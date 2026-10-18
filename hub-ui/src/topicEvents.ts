@@ -1,7 +1,11 @@
 import type { TopicSnapshot } from "./types";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// The server's signed-64 cursors may exceed JS precision. Fail closed above
+// 2^53-1 rather than rounding and resuming from a different event position.
 const cursor = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+export const TOPIC_SNAPSHOT_BUDGET = 128;
+export class TopicRefreshBudgetExhausted extends Error {}
 const reasons = new Set(["initial_snapshot", "epoch_changed", "retention_gap", "catchup_limit", "subscriber_overflow"]);
 export function registryNotice(kind: string, data: string, topic: string, id = "") {
   const value = JSON.parse(data);
@@ -44,6 +48,7 @@ export function watchTopicRegistry(options: {
   let epoch = options.epoch;
   let lastCursor = -1;
   let consecutiveRecoveries = 0;
+  let snapshotReads = 0;
   let recovery: { epoch: string; head: number } | null = null;
   const close = () => { generation++; stream?.close(); stream = null; };
   const fail = (error?: unknown) => {
@@ -60,6 +65,9 @@ export function watchTopicRegistry(options: {
       do {
         dirty = false;
         const expected = generation;
+        // Event-driven admission bound, not a timer/rate polling loop. Once
+        // exhausted the user must explicitly Check to start a new subscription.
+        if (++snapshotReads > TOPIC_SNAPSHOT_BUDGET) { fail(new TopicRefreshBudgetExhausted()); break; }
         const snapshot = await options.fetchSnapshot();
         if (!alive || expected !== generation) continue;
         if (snapshot.topic !== options.topic || snapshot.event_source !== "canonical_registry" ||

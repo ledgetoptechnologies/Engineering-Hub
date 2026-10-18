@@ -304,9 +304,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         # upstream subscribe still registers before its own catch-up/head.
         await peers_for(topic, principal=principal, bearer=original_bearer(request))
 
+        def check_access():
+            if actor(request) != principal:
+                raise HTTPException(401)
+
         async def stream():
             source = registry_bridge.events(principal, topic, agent_bearer=original_bearer(request),
-                                            after=after, epoch=epoch)
+                                            after=after, epoch=epoch, check_access=check_access)
             try:
                 async for event in source:
                     try:

@@ -8,7 +8,7 @@ requests and unavailable notices remain explicit events for the caller.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
@@ -50,14 +50,14 @@ def _cursor(value: Any) -> int:
     return value
 
 
-async def _frames(response: httpx.Response) -> AsyncIterator[tuple[str, str | None, str]]:
+async def _frames(response: httpx.Response, check_access: Callable[[], None] | None = None) -> AsyncIterator[tuple[str, str | None, str]]:
     """Strict bounded SSE subset. Unknown fields and incomplete frames fail shut."""
     pending = bytearray()
     fields: dict[str, str] = {}
     data: list[str] = []
     frame_bytes = 0
 
-    async for chunk in _chunks(response):
+    async for chunk in _chunks(response, check_access):
         # Retain at most one bounded partial line, regardless of remote chunking.
         for octet in chunk:
             if octet != 10:
@@ -109,7 +109,7 @@ async def _frames(response: httpx.Response) -> AsyncIterator[tuple[str, str | No
         raise RegistryStreamProtocolError()
 
 
-async def _chunks(response: httpx.Response) -> AsyncIterator[bytes]:
+async def _chunks(response: httpx.Response, check_access: Callable[[], None] | None = None) -> AsyncIterator[bytes]:
     iterator = response.aiter_bytes().__aiter__()
     while True:
         try:
@@ -117,6 +117,11 @@ async def _chunks(response: httpx.Response) -> AsyncIterator[bytes]:
                 chunk = await anext(iterator)
         except StopAsyncIteration:
             return
+        # Transport activity must not keep a locally revoked session's upstream
+        # credential alive. Comments are swallowed by framing, so check here,
+        # before parsing any bytes, rather than only on yielded public events.
+        if check_access is not None:
+            check_access()
         yield chunk
 
 
@@ -151,7 +156,7 @@ class RegistryStream:
 
     async def events(
         self, topic: str, bearer: str, *, after: int | None = None,
-        epoch: str | None = None,
+        epoch: str | None = None, check_access: Callable[[], None] | None = None,
     ) -> AsyncIterator[RegistryEvent]:
         topic = validate_topic(topic)
         if not isinstance(bearer, str) or not bearer or len(bearer) > 8192 or any(
@@ -191,7 +196,7 @@ class RegistryStream:
                         raise RegistryStreamProtocolError()
                     if response.headers.get("content-encoding", "identity").lower() != "identity":
                         raise RegistryStreamProtocolError()
-                    async for event_type, event_id, data in _frames(response):
+                    async for event_type, event_id, data in _frames(response, check_access):
                         try:
                             event = parse_event(event_type, data)
                         except RegistryStreamProtocolError:

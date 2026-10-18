@@ -8,6 +8,10 @@ const response = (body: unknown, status = 200) =>
   });
 
 describe("live human API boundary", () => {
+  it("preserves the exact topic ACL denial code without downgrading other forbidden failures", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code: "topic_read_forbidden" } }, 403));
+    await expect(new HubClient({ mode: "live", fetchImpl }).getTopic("topic")).rejects.toMatchObject({ status: 403, code: "topic_read_forbidden" });
+  });
   it("calls browser fetch with the global receiver, not the HubClient", async () => {
     let receiver: unknown;
     const fetchImpl = function (this: unknown) {

@@ -8,7 +8,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { HubApiError, HubClient } from "./api";
-import { watchTopicRegistry } from "./topicEvents";
+import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import type {
   Decision,
   EventsStatus,
@@ -26,6 +26,8 @@ const names: Record<string, string> = {
 };
 const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
+const topicDenied = (error: unknown) =>
+  error instanceof HubApiError && error.status === 403 && error.code === "topic_read_forbidden";
 const errorText = (error: unknown) =>
   error instanceof HubApiError
     ? error.status === 401
@@ -191,6 +193,7 @@ export function HubApp() {
     setRegistryEpoch(null);
     setEvents(null);
     setTopicError("");
+    setTopicStale(false);
     setLoading(false);
     setStale(true);
     setNewTask(false);
@@ -230,12 +233,19 @@ export function HubApp() {
             if (!canVerify()) return; // A disconnected SSE generation cannot revive readiness.
             setPeers(snapshot);
             setRegistryEpoch(snapshot.event_source === "canonical_registry" ? snapshot.registry_epoch ?? null : null);
+            if (snapshot.event_source !== "canonical_registry") setTopicStale(false);
             setTopicError("");
           },
           (error) => {
             if (request !== requests.current) return;
             if (topicRead !== topicReads.current) return;
             setPeers(null);
+            if (topicDenied(error)) {
+              setRegistryEpoch(null);
+              setTopicStale(true);
+              setTopicError("This session cannot read the selected topic. Choose an authorized topic; workspace records remain available.");
+              return;
+            }
             if (
               error instanceof HubApiError &&
               [401, 403].includes(error.status)
@@ -379,11 +389,17 @@ export function HubApp() {
         setTopicStale(true);
       },
       failed: (error) => {
-        if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+        if (topicDenied(error)) {
+          setPeers(null);
+          setRegistryEpoch(null);
+          setTopicError("This session cannot read the selected topic. Choose an authorized topic; workspace records remain available.");
+        } else if (error instanceof HubApiError && [401, 403].includes(error.status)) {
           setNotice(errorText(error));
           setNoticeError(true);
           clearPrivateWorkspace();
-        } else setTopicError("Topic event source unavailable. Readiness is unverified; use Check to reconnect. Workspace records remain available.");
+        } else setTopicError(error instanceof TopicRefreshBudgetExhausted
+          ? "Topic snapshot budget reached. Readiness is unverified; use Check to reconnect. Workspace records remain available."
+          : "Topic event source unavailable. Readiness is unverified; use Check to reconnect. Workspace records remain available.");
       },
     });
   }, [client, demo, session?.authenticated, topic, registryEpoch, registryRetry, clearPrivateWorkspace]);

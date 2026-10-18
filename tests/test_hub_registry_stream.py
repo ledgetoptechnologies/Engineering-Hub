@@ -87,6 +87,23 @@ async def test_scoped_request_and_explicit_early_close():
     assert "private-test-token" not in repr(stream)
 
 
+async def test_access_guard_checks_comment_chunks_and_closes_without_public_event():
+    stream, wire, requests = subscription([b": keepalive\n\n", b": keepalive again\n\n"], block=True)
+    checks = []
+
+    def check_access():
+        checks.append(True)
+        if len(checks) == 2:
+            raise RegistryAccessDenied(403)
+
+    with pytest.raises(RegistryAccessDenied):
+        await asyncio.wait_for(collect(stream, check_access=check_access), 1)
+    assert len(checks) == 2
+    assert len(requests) == 1
+    assert wire.closed
+    assert not wire.waiting.is_set()
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 async def test_fragmented_frames_comments_and_exact_duplicate(newline):
     unavailable = dict(topic=TOPIC, registry_epoch=EPOCH, reason="observer_unavailable")

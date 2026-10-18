@@ -95,11 +95,14 @@ class CanonicalRegistryBridge:
         snapshot = await self.client.fetch_snapshot(topic, bearer)
         return project_registry_snapshot(snapshot, topic=topic, stream_configured=self.stream is not None)
 
-    async def events(self, principal, topic, *, agent_bearer=None, after=None, epoch=None):
+    async def events(self, principal, topic, *, agent_bearer=None, after=None, epoch=None, check_access=None):
         bearer = self.access(principal, topic, agent_bearer)
         if self.stream is None:
             raise RegistrySourceUnavailable()
-        events = self.stream.events(topic, bearer, after=after, epoch=epoch)
+        options = dict(after=after, epoch=epoch)
+        if check_access is not None:
+            options['check_access'] = check_access
+        events = self.stream.events(topic, bearer, **options)
         try:
             async for event in events:
                 yield event

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { registryNotice, watchTopicRegistry } from "./topicEvents";
+import { registryNotice, TOPIC_SNAPSHOT_BUDGET, TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import type { TopicSnapshot } from "./types";
 
 const epoch = "12345678-1234-1234-1234-123456789abc";
@@ -104,5 +104,22 @@ describe("canonical topic event channel", () => {
     old.pointer(500); old.onerror?.();
     expect(state.failed).not.toHaveBeenCalled();
     expect(state.fetchSnapshot).toHaveBeenCalledOnce();
+  });
+  it("accepts a newer same-epoch snapshot revision than the invalidation pointer", async () => {
+    const newer = { ...snapshot, snapshot_revision: "87654321-1234-1234-1234-123456789abc" };
+    const state = setup(vi.fn(async () => newer));
+    state.sources[0].pointer(1); await flush();
+    expect(state.accept).toHaveBeenCalledWith(newer);
+    expect(state.failed).not.toHaveBeenCalled();
+  });
+  it("bounds event-driven snapshot attempts with explicit manual recovery, not timers", async () => {
+    const state = setup();
+    for (let cursor = 1; cursor <= TOPIC_SNAPSHOT_BUDGET + 1; cursor++) {
+      state.sources[0].pointer(cursor); await flush();
+    }
+    expect(state.fetchSnapshot).toHaveBeenCalledTimes(TOPIC_SNAPSHOT_BUDGET);
+    expect(state.failed).toHaveBeenCalledExactlyOnceWith(expect.any(TopicRefreshBudgetExhausted));
+    expect(state.sources[0].closed).toBe(true);
+    expect(state.sources).toHaveLength(1);
   });
 });

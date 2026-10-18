@@ -301,6 +301,39 @@ def test_stream_rechecks_human_session_before_emitting_pointer(make_hub):
     assert closed == [True]
 
 
+def test_comment_only_stream_closes_on_local_human_session_revocation(make_hub):
+    shared, closed, consumed_after_revocation = {}, [], []
+
+    class RevokingComments(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            # No public registry event follows revocation: the chunk-level guard
+            # must close before requesting another chunk or retaining the reader.
+            yield b": still connected\n\n"
+            shared["app"].state.sessions.delete_session(shared["token"])
+            yield b": PRIVATE_KEEPALIVE\n\n"
+            consumed_after_revocation.append(True)
+            raise AssertionError("PRIVATE_UPSTREAM_DETAILS")
+
+        async def aclose(self):
+            closed.append(True)
+
+    client, app, settings = make_hub(
+        human_reader=lambda principal, topic: HumanRegistryAccess("fixture-service", frozenset({"engineering-hub"})),
+        stream_handler=lambda _: httpx.Response(200, stream=RevokingComments(),
+                                                headers={"content-type": "text/event-stream"}),
+    )
+    session = app.state.sessions.create_session(42)
+    client.cookies.set(settings.auth_config.cookie_name, session["cookie_token"])
+    shared.update(app=app, token=session["cookie_token"])
+    response = client.get(BASE + "/events")
+    assert response.status_code == 200
+    assert response.text.count("event: registry.unavailable") == 1
+    assert "registry.invalidated" not in response.text
+    assert "PRIVATE" not in response.text and "fixture-service" not in response.text
+    assert not consumed_after_revocation
+    assert closed == [True]
+
+
 def test_mcp_acl_denial_does_not_fallback_or_reflect_remote_data(make_hub):
     client, _, _ = make_hub(lambda _: httpx.Response(403, text="PRIVATE_OTHER_TOPIC"))
     response = client.post("/mcp/", headers=headers() | {

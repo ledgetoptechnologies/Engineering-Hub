@@ -36,6 +36,7 @@ const knownCodes = new Set([
   "already_claimed",
   "invalid_topic",
   "invalid_recipient",
+  "topic_read_forbidden",
 ]);
 const fallbackCode = (status: number) =>
   status === 401
