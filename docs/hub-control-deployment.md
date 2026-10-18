@@ -109,6 +109,29 @@ Verify all of the following on the isolated pilot before declaring acceptance:
 6. Topic readiness remains unknown without authoritative owning-session evidence.
    No host deployment, production change or real processing job is dispatched.
 
+## Shutdown grace for an owned pilot
+
+The standalone profile declares `stop_grace_period: 1200s` and the matching
+`HUB_SUPERVISOR_STOP_GRACE_SECONDS=1200` operator assertion. This environment
+value does not activate the pilot or select manifests. A future approved
+bootstrap must explicitly pass the installed supervisor's configured grace as
+`supervisor_stop_grace_seconds` to `create_owned_pilot_app`.
+
+The owned factory rejects missing, noninteger or undersized grace before taking
+ownership. The required budget is 1120 seconds: up to four original-command
+inspections plus four phase submissions at the actual 125-second transport cap,
+plus 120 seconds for cleanup. This is a conservative configuration contract,
+not proof every dependency obeys its deadline or the supervisor installed it.
+Autonomy status exposes required/configured grace and explicitly reports
+`supervisor_configuration_verified=false` with `configuration_source` equal to
+`operator_assertion`. Verify the deployed Docker/systemd/container-manager kill
+deadline independently, including outer service wrappers. Never shorten it by
+force-cancelling an accepted command and releasing its ownership lock early.
+
+The control profile is source configuration only; it has not been applied to
+TrueNAS. Actual installed grace, restart under load and real executor recovery
+remain acceptance checks, not claims supported by a fixture's clean shutdown.
+
 ## Backup, isolated restore and rollback
 
 Use the SQLite backup utility, not a raw copy of a busy database file: committed

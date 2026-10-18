@@ -8,6 +8,7 @@ import threading
 import weakref
 
 from .container_pilot import ContainerPilotWorkflow
+from .container_pilot_client import ContainerPilotClient
 from .dispatcher import StagingDispatcher
 from .owned_tasks import OwnedPilotTasks, finish_owned
 from .pilot_ownership import PilotOwner
@@ -17,10 +18,18 @@ from .repository import HubError, HubRepository
 
 _TRANSFERRED_OWNERS = weakref.WeakSet()
 _TRANSFER_LOCK = threading.Lock()
+# A recovered run may inspect all four original phases and then execute all
+# four bounded phases. Cleanup has its own conservative operator budget. This
+# is a deployment precondition, not an internal deadline that kills work.
+REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS = int(8 * ContainerPilotClient.MAX_TIMEOUT_SECONDS + 120)
 
 
 class OwnedPilotService:
-    def __init__(self, settings, client, targets, *, owner=None):
+    def __init__(self, settings, client, targets, *, owner=None, supervisor_stop_grace_seconds=None):
+        if (type(supervisor_stop_grace_seconds) is not int
+                or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
+            raise ValueError('owned_pilot_supervisor_stop_grace_required')
+        self.supervisor_stop_grace_seconds = supervisor_stop_grace_seconds
         if not callable(getattr(client, 'aclose', None)):
             raise ValueError('owned_pilot_client_close_required')
         # A provided capability transfers ownership only after exact validation.
@@ -51,6 +60,20 @@ class OwnedPilotService:
             # Client ownership transfers only on successful construction.
             raise
         self.client = client
+
+    @property
+    def status(self):
+        # Supplied configuration is not evidence about a running Docker/ASGI
+        # supervisor; actual installed stop-grace acceptance remains separate.
+        return {
+            'state': ('stopped' if self._closed else 'stopping' if self._closing
+                      else 'active' if self._started else 'not_started'),
+            'required_supervisor_stop_grace_seconds': REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS,
+            'configured_supervisor_stop_grace_seconds': self.supervisor_stop_grace_seconds,
+            'supervisor_configuration_verified': False,
+            'configuration_source': 'operator_assertion',
+            'tasks': self.tasks.status,
+        }
 
     def assert_active(self):
         try:
@@ -111,15 +134,18 @@ class OwnedPilotService:
 
 
 def create_owned_pilot_app(settings, client, targets, *, owner=None, event_feed=None,
-                           github_client=None, registry_bridge=None):
+                           github_client=None, registry_bridge=None, supervisor_stop_grace_seconds=None):
     """Transfer the selected client/capability to one explicit ASGI lifecycle.
 
     A constructor failure leaves an unaccepted client with the caller. An app
     construction failure closes the owner; the caller still must close its
     supplied asynchronous client. No environment/CLI activation is added.
+    The operator must explicitly assert a sufficient supervisor stop grace;
+    this value neither configures nor verifies an installed supervisor.
     """
     from .app import create_app
-    service = OwnedPilotService(settings, client, targets, owner=owner)
+    service = OwnedPilotService(settings, client, targets, owner=owner,
+                                supervisor_stop_grace_seconds=supervisor_stop_grace_seconds)
     try:
         return create_app(settings, repository=service.repo, github_client=github_client,
                           event_feed=event_feed, staging_dispatcher=service.dispatcher,

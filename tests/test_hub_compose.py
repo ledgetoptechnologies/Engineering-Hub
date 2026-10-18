@@ -38,6 +38,15 @@ def test_nonroot_readonly_bounded_runtime_without_host_privileges():
     assert not {'privileged', 'devices', 'cap_add', 'pid', 'ipc'} & hub.keys()
 
 
+def test_declared_stop_grace_covers_owned_pilot_contract_without_activation():
+    from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+    hub = service()
+    declared = int(hub['environment']['HUB_SUPERVISOR_STOP_GRACE_SECONDS'])
+    assert hub['stop_grace_period'] == f'{declared}s'
+    assert declared >= REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+    assert 'command' not in hub and 'entrypoint' not in hub
+
+
 def test_only_dedicated_operator_state_bind_no_credential_files_or_source():
     hub = service()
     assert len(hub['volumes']) == 1

@@ -164,7 +164,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             return {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
         receipts = [{key: value for key, value in item.items() if key != 'owner'}
                     for item in staging_dispatcher.receipts()]
-        return {**runtime.status, 'receipts': receipts}
+        result = {**runtime.status, 'receipts': receipts}
+        if owned_pilot_service is not None:
+            result['pilot_lifecycle'] = owned_pilot_service.status
+        return result
 
     async def peers_for(topic, *, principal=None, bearer=None):
         if not isinstance(topic, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic):

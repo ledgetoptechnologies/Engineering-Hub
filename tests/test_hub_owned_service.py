@@ -11,7 +11,9 @@ from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.events import EventBroker
 from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError
-from engineering_hub.pilot_service import create_owned_pilot_app
+from engineering_hub.pilot_service import (
+    REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, OwnedPilotService, create_owned_pilot_app,
+)
 from engineering_hub.container_pilot import ContainerPilotTarget
 from engineering_hub.repository import HubError
 from tests.test_hub_container_pilot import FakeClient, IMAGE, pilot_manifest, reviewed_task
@@ -98,7 +100,8 @@ def rig(tmp_path):
     target = ContainerPilotTarget.from_manifest(pilot_manifest())
     def build(*, blocked=False, fail_close=False, fail_start=False):
         client, feed = Client(blocked=blocked, fail_close=fail_close), Feed(fail_start=fail_start)
-        app = create_owned_pilot_app(settings, client, [target], owner=owner, event_feed=feed)
+        app = create_owned_pilot_app(settings, client, [target], owner=owner, event_feed=feed,
+                                     supervisor_stop_grace_seconds=1200)
         return SimpleNamespace(app=app, client=client, feed=feed, owner=owner,
                                settings=settings, target=target, service=app.state.owned_pilot_service)
     yield build
@@ -124,6 +127,15 @@ def run_for(state):
 async def test_constructor_holds_owner_and_lifespan_starts_actual_runtime(rig):
     state = rig()
     assert_exclusive(state)
+    assert REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS == 1120
+    assert state.service.status == {
+        'state': 'not_started',
+        'required_supervisor_stop_grace_seconds': 1120,
+        'configured_supervisor_stop_grace_seconds': 1200,
+        'supervisor_configuration_verified': False,
+        'configuration_source': 'operator_assertion',
+        'tasks': state.service.tasks.status,
+    }
     assert state.service.tasks.status['state'] == 'not_started'
     async with state.app.router.lifespan_context(state.app):
         await settle(lambda: state.app.state.staging_runtime.last_result is not None)
@@ -131,8 +143,70 @@ async def test_constructor_holds_owner_and_lifespan_starts_actual_runtime(rig):
         assert state.feed.broker.subscriber_count == 1
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=state.app), base_url='https://hub.test') as http:
             assert (await http.get('/health')).status_code == 200
+            response = await http.get('/api/hub/v1/autonomy', headers=CODEX)
+            assert response.status_code == 200
+            lifecycle = response.json()['pilot_lifecycle']
+            assert lifecycle['state'] == 'active'
+            assert lifecycle['required_supervisor_stop_grace_seconds'] == 1120
+            assert lifecycle['configured_supervisor_stop_grace_seconds'] == 1200
+            assert lifecycle['supervisor_configuration_verified'] is False
+            assert lifecycle['configuration_source'] == 'operator_assertion'
+            assert lifecycle['tasks']['state'] == 'active'
     assert state.client.closed and state.feed.stopped
+    assert state.service.status['state'] == 'stopped'
     assert not state.app.state.staging_runtime.status['running']
+    assert_released(state)
+
+
+@pytest.mark.parametrize('factory', [OwnedPilotService, create_owned_pilot_app])
+@pytest.mark.parametrize('grace', ['omitted', None, True, False, 0, -1, 60, 1119, 1120.0, '1200', float('nan')])
+async def test_invalid_stop_grace_rejected_before_owner_transfer(rig, monkeypatch, factory, grace):
+    state = rig()
+    rejected_client = Client()
+    kwargs = {} if grace == 'omitted' else {'supervisor_stop_grace_seconds': grace}
+    def unexpected_close():
+        pytest.fail('Rejected grace closed the existing service owner')
+    with monkeypatch.context() as patch:
+        patch.setattr(state.owner, 'close', unexpected_close)
+        with pytest.raises(ValueError, match='^owned_pilot_supervisor_stop_grace_required$'):
+            factory(state.settings, rejected_client, [None], owner=state.owner, **kwargs)
+    assert_exclusive(state)
+    assert not rejected_client.closed and not state.client.closed
+    # The accepted first service still has an ordinary, usable lifespan.
+    async with state.app.router.lifespan_context(state.app):
+        assert state.service.status['state'] == 'active'
+    await rejected_client.aclose()
+    assert_released(state)
+
+
+async def test_short_observer_deadline_does_not_release_running_attempt(rig):
+    state = rig(blocked=True)
+    await state.feed.start()
+    await state.service.start(state.feed)
+    run = run_for(state)
+    accepted = asyncio.create_task(state.service.advance(run['id']))
+    await state.client.entered.wait()
+    shutdown = asyncio.create_task(state.service.stop(None, state.feed))
+    try:
+        await settle(lambda: state.service.tasks.status['state'] == 'stopping')
+        # Model an external observer's too-short deadline, not real elapsed
+        # command time and not an actual supervisor SIGKILL/reboot proof.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(shutdown), timeout=0)
+        assert not shutdown.done() and not accepted.done()
+        assert_exclusive(state)
+        assert state.service.status['state'] == 'stopping'
+        assert state.service.status['supervisor_configuration_verified'] is False
+        with state.service.repo._connection() as db:
+            assert db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?',
+                              (run['id'],)).fetchone() is not None
+        assert not state.client.closed and not state.client.cancelled
+    finally:
+        state.client.release.set()
+        result = await accepted
+        await shutdown
+    assert result['status'] == 'succeeded'
+    assert state.service.status['state'] == 'stopped'
     assert_released(state)
 
 
@@ -156,7 +230,8 @@ async def test_duplicate_capability_transfer_never_closes_accepted_service(rig, 
                 with pytest.raises(ValueError, match='^owned_pilot_capability_already_transferred$'):
                     create_owned_pilot_app(state.settings, second_client,
                                            [None] if invalid_targets else [state.target],
-                                           owner=state.owner, event_feed=Feed())
+                                           owner=state.owner, event_feed=Feed(),
+                                           supervisor_stop_grace_seconds=REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS)
             assert_exclusive(state)
             state.service.assert_active()
             assert state.service.tasks.status['inflight'] == 1

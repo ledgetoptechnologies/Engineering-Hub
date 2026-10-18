@@ -7,6 +7,9 @@ services:
     image: "${HUB_CONTROL_IMAGE:?Set the reviewed immutable Hub control image digest}"
     pull_policy: missing
     restart: unless-stopped
+    # Allows bounded pilot inspection/phase completion and cleanup before kill.
+    # Does not activate the owned pilot factory; runtime wiring remains explicit.
+    stop_grace_period: 1200s
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
@@ -21,6 +24,7 @@ services:
       - "127.0.0.1:8770:8770"
     environment:
       HUB_DB: /var/lib/hub/hub.sqlite3
+      HUB_SUPERVISOR_STOP_GRACE_SECONDS: "1200"
       HUB_UI_DIRECTORY: /app/dashboard
       HUB_BASE_URL: "${HUB_BASE_URL:?Set the exact private HTTPS Hub origin}"
       HERMES_TOKEN: "${HERMES_TOKEN:?Existing Hermes bearer required}"

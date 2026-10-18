@@ -147,12 +147,28 @@ class DispatchReceiptDTO(ResponseDTO):
     needs_reconciliation: bool
 
 
+class PilotTasksDTO(ResponseDTO):
+    state: Literal['not_started', 'active', 'stopping', 'stopped']
+    inflight: int = Field(ge=0, le=64)
+    max_inflight: int = Field(ge=1, le=64)
+
+
+class PilotLifecycleDTO(ResponseDTO):
+    state: Literal['not_started', 'active', 'stopping', 'stopped']
+    required_supervisor_stop_grace_seconds: int = Field(ge=1)
+    configured_supervisor_stop_grace_seconds: int = Field(ge=1)
+    supervisor_configuration_verified: Literal[False]
+    configuration_source: Literal['operator_assertion']
+    tasks: PilotTasksDTO
+
+
 class AutonomyDTO(ResponseDTO):
     configured: bool
     state: Literal['disabled', 'not_started', 'native_source_unavailable', 'active', 'stopped', 'failed']
     running: bool
     receipts: list[DispatchReceiptDTO]
     last_result: DispatchResultDTO | None = None
+    pilot_lifecycle: PilotLifecycleDTO | None = None
 
 
 class CapabilitiesDTO(ResponseDTO):

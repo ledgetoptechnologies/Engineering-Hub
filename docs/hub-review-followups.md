@@ -340,3 +340,42 @@ the intended lifecycle. Hermes was sent INFO
 `c61243f3-7b8e-4688-b7d6-7d9e97f6d76e` with the new peer-readiness requirement,
 existing worker ownership and unchanged production boundary. Bus acceptance of
 that INFO is not proof it reached an active Hermes session.
+
+### Owned lifecycle independent review and live readiness discovery
+
+Claude reply `24cf69c5-2f95-44a2-8606-2462cea65c7a` reviewed
+`bf5445a..51341a0` source without running tests. It confirmed cancellation,
+single-transfer, ownership drain and held-retry corrections. Its automatic
+notification arrived during an active Codex turn, not an idle-wake test.
+It identified supervisor grace as a remaining deployment hazard. Source now
+requires explicit sufficient configured grace before capability transfer,
+publishes asserted/not-verified lifecycle status, and the standalone profile
+declares 1200 seconds. Validation evidence follows separately. The review's
+60-second client assumption is stale: the actual maximum transport cap is 125
+seconds. The conservative required budget is 1120 seconds, including inspection,
+phase execution and cleanup allowance; it is not a verified installed kill timer.
+
+Fresh one-shot authenticated discovery at `2026-10-18T01:36Z` found the live bus
+advertises v0.6.0/schema 4, 24 tools, native inbox subscriptions and process-scoped
+transport presence. It does not advertise canonical topic-registry tools. All
+three identities had subscribed transport observations; these do not prove any
+specific topic/session is linked or reachable. No credentials or live config were
+changed by discovery.
+
+Read-only source assessment confirms Hub snapshot/preflight and canonical SSE
+projection exist, while the installed Codex connector handles inbox resources
+only. Thus automatic same-topic readiness notices are **not implemented** by
+those read paths. The next integration must extend the existing selected-session
+connector with canonical topic invalidations and semantic-change coalescing, not
+send readiness as inbox messages or create another daemon/presence database.
+Expiry cannot be extended by hysteresis; a correlated REPLY alone is not explicit
+completion evidence. Missing canonical provider/enrollment and session-bound
+runtime evidence remain concrete prerequisites. Hermes request
+`318a11f4-5948-4908-8110-160a35bed352` asks its existing lane for that published
+contract; no replacement worker or production activation was requested. Claude
+follow-up `eab66fc9-64cc-4868-84ce-5d14ef8860fe` records these distinctions.
+
+The grace follow-up passed the frozen 1,778-test Linux suite, and independent
+subagent source review found no concrete defect in the validation ordering,
+status semantics or Compose consistency. No installed supervisor verification
+or readiness-notification activation is inferred from those results.

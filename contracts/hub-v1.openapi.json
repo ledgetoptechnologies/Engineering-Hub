@@ -1074,6 +1074,16 @@
                 "type": "null"
               }
             ]
+          },
+          "pilot_lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotLifecycleDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -1661,6 +1671,88 @@
           "paused"
         ],
         "title": "PauseDTO"
+      },
+      "PilotLifecycleDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "active",
+              "stopping",
+              "stopped"
+            ],
+            "title": "State"
+          },
+          "required_supervisor_stop_grace_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Required Supervisor Stop Grace Seconds"
+          },
+          "configured_supervisor_stop_grace_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Configured Supervisor Stop Grace Seconds"
+          },
+          "supervisor_configuration_verified": {
+            "type": "boolean",
+            "const": false,
+            "title": "Supervisor Configuration Verified"
+          },
+          "configuration_source": {
+            "type": "string",
+            "const": "operator_assertion",
+            "title": "Configuration Source"
+          },
+          "tasks": {
+            "$ref": "#/components/schemas/PilotTasksDTO"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "required_supervisor_stop_grace_seconds",
+          "configured_supervisor_stop_grace_seconds",
+          "supervisor_configuration_verified",
+          "configuration_source",
+          "tasks"
+        ],
+        "title": "PilotLifecycleDTO"
+      },
+      "PilotTasksDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "active",
+              "stopping",
+              "stopped"
+            ],
+            "title": "State"
+          },
+          "inflight": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 0.0,
+            "title": "Inflight"
+          },
+          "max_inflight": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Inflight"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "inflight",
+          "max_inflight"
+        ],
+        "title": "PilotTasksDTO"
       },
       "ProjectDTO": {
         "properties": {

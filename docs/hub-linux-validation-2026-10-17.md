@@ -442,3 +442,28 @@ This factory is explicit source wiring, not deployed startup configuration.
 Actual host adapter/provenance/secret-provider acceptance, authenticated host
 completion events, OAuth setup, real application success/rollback, TrueNAS
 durable volume and reboot/installed connector acceptance remain separate gates.
+
+## Supervisor grace and asserted lifecycle status
+
+Frozen image
+`sha256:0ee8ddb85088224e8dca7e205feae9efbb49b08baacf194d1c724917fe9151eb`
+passed **1,778 Linux tests in 72.79 seconds**, with the existing Starlette
+deprecation only. The isolated UID10001/network-none/read-only/private-tmpfs
+harness still has no host mounts, socket, ports or real credentials. Portable
+Compose/task/DTO tests separately passed 37 tests on Windows. OpenAPI and actual
+TypeScript DTO fixture checks pass.
+
+The owned factory now rejects missing/invalid/undersized supervisor grace before
+ownership transfer. The 1120-second minimum derives from eight possible bounded
+125-second inspection/submission operations plus a 120-second cleanup allowance.
+The standalone profile declares 1200 seconds without activating pilot wiring.
+Autonomy exposes configured/required values explicitly as an operator assertion,
+not verified supervisor evidence. A simulated too-short observer deadline proves
+the existing attempt/owner remain active until the blocked accepted work ends;
+it is not a real Docker kill-timer or reboot test.
+
+Independent subagent source review found no concrete defect in this grace patch;
+it did not rerun tests. Production bus source/config/ports remain unchanged from
+the preserved baseline. Subsequent documentation updates do not alter the frozen
+runtime/test sources. Actual installed supervisor and workload restart acceptance
+remain outstanding.
