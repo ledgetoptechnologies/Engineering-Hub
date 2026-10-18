@@ -1,4 +1,4 @@
-# Container-pilot host adapter source (pending independent review)
+# Container-pilot host adapter source (live acceptance pending)
 
 This is a separately scoped source candidate. It consumes the shared
 `engineering_hub.container_pilot_manifest.PilotManifest` and typed request,
@@ -36,13 +36,18 @@ not enable itself from import, environment, Hub startup, or a listener.
   importing it does not construct an app or bind a socket. GET, reconcile and
   submit body reads share a configurable bounded request-body deadline, separate
   from the manifest's command budget, and bodyless routes consume and reject bytes.
+- `daemon_backend.py`: concrete operator-pinned Unix Engine HTTP driver, verified
+  only with fake transports and synthetic OCI archives. Its tmpfs/hard-link
+  corrections passed independent source review; see `DAEMON_SOURCE.md` for
+  unsupported identity paths, mutable-generation and cgroup profile gates.
 - `docker/hub-container-pilot-acceptance.py`: import-safe, hard-disabled gate;
-  it intentionally cannot run a Docker acceptance until source review and a
-  separately authorized backend implementation.
+  a concrete acceptance harness and separate live-execution approval are still
+  required. This script is not an implemented acceptance runner.
 
 ## Explicit limits / pending gates
 
-There is **no concrete Docker/daemon driver** in this source. No Docker command,
+The concrete daemon driver is present, but **no real daemon was exercised**.
+No Docker command,
 API call, listener, container, model CLI, network call, live state or credential
 was used. Unit-test fake engines, fake builders, fake state provisioners and fake
 secret resolvers demonstrate protocol and local ledger behavior only. They are
@@ -50,9 +55,12 @@ not daemon, provenance issuer, image-layer, health, rollback or application proo
 
 Still required before any real acceptance:
 
-1. Independent source review and a separately reviewed implementation bound to
-   the operator-owned/pinned daemon endpoint; actual effective profile and image
-   selection evidence must be correlated to original immutable metadata.
+1. Source corrections were independently reviewed; that does not establish live
+   daemon compatibility. Actual effective profile and image selection must be
+   correlated to original immutable metadata on the operator-pinned daemon.
+   Shared cgroup namespace policy is unresolved; private cgroup isolation is not
+   modeled or guaranteed. Mutable-generation exclusion through bind establishment
+   remains an operator/provider gate, not a guarantee from a path walk.
 2. Enrolled provenance verifier and protected content-addressed record/blob
    stores; operator-enrolled healthy baseline; versioned test-only secret
    resolver; isolated-runner state provisioner; and an independently trusted
