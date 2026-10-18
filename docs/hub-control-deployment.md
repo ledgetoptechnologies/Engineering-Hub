@@ -151,6 +151,20 @@ that exact main commit, checks private authenticated registry read and isolated
 startup, then promotes the tested digest to `latest` and reads it back. PRs
 validate only and cannot publish. A plain restart does not pull an updated image.
 
+For a deliberate installation or rollback, the operator may replace only the
+image reference in their private copy with the verified immutable release:
+
+```yaml
+image: ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:fdfa41b8c0a511c50eeb80a9a1e4c780b4d9b30a82b2cc0a54e57c10824f1bab
+```
+
+This digest was published from main commit
+`c720f7a82c70230e267a369077211749c30e9360`, workflow run `39167860307`.
+Keep the previous digest and a compatible state backup before updating. With a
+digest reference, `pull_policy: always` cannot silently select a later build.
+Registry verification is not proof of installation, NAS connectivity, human
+sign-in, reboot recovery or completion of the autonomous staging pilot.
+
 The package stays private. Configure authenticated GHCR pulls in TrueNAS using
 an authorized GitHub account and a PAT (classic) with `read:packages`, including
 any required organization SSO authorization. Existing registry credentials may
@@ -159,9 +173,14 @@ chat or Compose. CI's ephemeral GitHub token is not an installation credential.
 Authenticated CI access does not prove the NAS's own credentials are enrolled.
 
 Only replace the three existing agent-token placeholders locally in the private
-TrueNAS application configuration. Leave the human-auth fields empty until the
-separate authentication setup is approved and verified. No hidden env file or
-source build on TrueNAS is required.
+TrueNAS application configuration. Keep the filled-in configuration private;
+never share or screenshot it. A separately provisioned private `env_file` can
+avoid embedding agent tokens in YAML, but remains readable by authorized host
+and Docker administrators. It is not a new authorization boundary. No hidden
+env file or source build on TrueNAS is required. The selected human provider is
+Cloudflare Access with the separately approved Hub application; GitHub OAuth
+fields stay empty. Verify the Access application and fresh sign-in independently
+before treating human access as accepted.
 
 The profile limits the service to a read-only non-root filesystem, one CPU,
 512 MiB memory without extra swap, 128 processes, and a 64 MiB restricted tmpfs.
