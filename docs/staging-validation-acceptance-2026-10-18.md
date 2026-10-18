@@ -2,6 +2,33 @@
 
 ## Latest verified source
 
+Baseline preparation checkpoint:
+`372f38b96a81970188c770869afb02aa2a18ff38`, pushed to the development branch,
+not main or an installed image. Clean Git archive image index
+`sha256:84de0f6abaa98e85859af7485fc4e624eadc8c3c6152062e50ac6d1b483eb02a`,
+manifest `sha256:5d35c83aafa0a16631760bd98081cfd8c66f357278028ab2783fffd4486a328f`,
+config `sha256:2a98b268773e477d3e21f8e6200eb210fb19edbaf84bfde940e272b3af2306b2`.
+Full exact-image Linux verification: **2936 passed, 3 skipped, 4 known warnings**,
+102.63s. The three owner-change checks passed separately **3/3**, 0.29s.
+
+This adds a protected historical baseline receipt reader, bound file inventory,
+shared pure runtime-profile derivation and an explicit first-baseline snapshot
+helper. Actual Linux SQLite/WAL snapshot tests use a separate operator process
+while the fixture writer remains running; database/WAL/SHM bytes and identity
+remain unchanged. The helper rejects an already-open source descriptor or a
+multithreaded operator and never normalizes the live source. An initial test
+measurement itself released the writer's POSIX locks; moving that measurement
+into another process fixed the test without relaxing production guards.
+
+Receipt-reader integration exercises real private storage and candidate/rollback
+state copies with **synthetic health authority**. It is not actual application
+health, observed baseline enrollment, driver-runtime identity, real container
+deployment/rollback or reboot acceptance. The actual health enroller and
+independent pinning workflow are still missing; the acceptance gate stays
+disabled. No live host, NAS, MCP endpoint, token or production state changed.
+
+## Earlier private executor lifecycle checkpoint
+
 Private lifecycle implementation checkpoint:
 `dc9d1dffd71a4cc658aa56d242613aaa44fe500b`, pushed to
 `work/hub-pilot-integration-codex`, not main or an installed image.
