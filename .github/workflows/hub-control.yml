@@ -62,6 +62,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify existing private package before any image upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          req = urllib.request.Request('https://api.github.com/orgs/ledgetoptechnologies/packages/container/engineering-hub-control', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(req, timeout=20) as response:
+              package = json.load(response)
+          if package.get('visibility') != 'private' or package.get('name') != 'engineering-hub-control':
+              raise SystemExit('Existing private Hub package required; refusing upload')
+          print('Existing private Hub package verified before upload')
+          PY
       - uses: docker/build-push-action@v6
         with:
           context: .

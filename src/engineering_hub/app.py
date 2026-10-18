@@ -52,6 +52,13 @@ class Settings:
     auth_config: AuthConfig
     ui_directory: Path | None = None
 
+    def __post_init__(self):
+        # Operator templates must never become usable public bearer credentials.
+        for value in (self.agent_auth.hermes_token, self.agent_auth.codex_token,
+                      self.agent_auth.claude_token, self.agent_auth.admin_token):
+            if value and value.startswith("REPLACE_WITH_"):
+                raise ValueError("Replace agent-token placeholders before starting Hub")
+
     @classmethod
     def from_env(cls):
         path = Path(os.environ.get("HUB_DB", "data/hub.sqlite3"))

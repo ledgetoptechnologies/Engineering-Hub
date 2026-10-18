@@ -11,6 +11,28 @@ def run(*args, timeout=60):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
 
 
+def owned_exists(kind, name, owner):
+    label = '.Config.Labels' if kind == 'container' else '.Labels'
+    result = subprocess.run(['docker', kind, 'inspect', '--format',
+                             '{{index ' + label + ' "hub.release-owner"}}', name],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode == 0:
+        if result.stdout.strip() != owner:
+            raise RuntimeError('Release fixture ownership mismatch; not removed')
+        return True
+    if ('no such ' + kind) in result.stderr.lower():
+        return False
+    raise RuntimeError('Cannot verify release fixture cleanup: Docker inspect failed')
+
+
+def remove_owned(kind, name, owner):
+    if owned_exists(kind, name, owner):
+        args = ['docker', kind, 'rm'] + (['-f'] if kind == 'container' else []) + [name]
+        run(*args)
+        if owned_exists(kind, name, owner):
+            raise RuntimeError('Release fixture still exists after removal')
+
+
 def smoke(image, commit):
     if not re.fullmatch(r"ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|ghcr\.io/ledgetoptechnologies/engineering-hub-control@sha256:[a-f0-9]{64}", image):
         raise ValueError("Expected the explicit Hub release artifact")
@@ -43,21 +65,15 @@ def smoke(image, commit):
             marker = "from pathlib import Path; p=Path('/var/lib/hub/.release-smoke'); "
             marker += "p.write_text('isolated-release-fixture')" if iteration == 0 else "assert p.read_text() == 'isolated-release-fixture'"
             run("docker", "exec", name, "python", "-c", marker)
-            identity = run("docker", "inspect", "--format", '{{index .Config.Labels "hub.release-owner"}}', name)
-            assert identity == owner
-            run("docker", "rm", "-f", name)
+            remove_owned('container', name, owner)
             names.remove(name)
         return {"source_commit": commit, "image_smoke": "passed", "canonical_host": "hub.ledgetoptechnologies.com",
                 "authenticated_agents": 3, "mcp_tools": 9, "human_sign_in": "disabled",
                 "named_volume_recreation": "passed", "network": "none", "truenas": "not_deployed"}
     finally:
         for name in names:
-            result = subprocess.run(["docker", "inspect", "--format", '{{index .Config.Labels "hub.release-owner"}}', name], capture_output=True, text=True, timeout=15)
-            if result.returncode == 0 and result.stdout.strip() == owner:
-                run("docker", "rm", "-f", name)
-        result = subprocess.run(["docker", "volume", "inspect", "--format", '{{index .Labels "hub.release-owner"}}', volume], capture_output=True, text=True, timeout=15)
-        if result.returncode == 0 and result.stdout.strip() == owner:
-            run("docker", "volume", "rm", volume)
+            remove_owned('container', name, owner)
+        remove_owned('volume', volume, owner)
 
 
 if __name__ == "__main__":

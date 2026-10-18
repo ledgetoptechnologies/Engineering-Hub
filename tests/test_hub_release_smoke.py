@@ -35,11 +35,24 @@ def test_isolated_568_profile_and_owned_recreation_plan(monkeypatch):
     owner = 'b' * 32
     commit = 'a' * 40
     monkeypatch.setattr(module.uuid, 'uuid4', lambda: SimpleNamespace(hex=owner))
+    containers, volumes = set(), set()
     def fake(args, **kwargs):
-        calls.append(list(args))
+        args = list(args)
+        calls.append(args)
         stdout = ''
-        if args[1] == 'inspect' or args[1:3] == ['volume', 'inspect']:
+        if args[1] == 'run':
+            containers.add(args[args.index('--name') + 1])
+        if args[1:3] == ['volume', 'create']:
+            volumes.add(args[-1])
+        if args[1:3] in (['container', 'inspect'], ['volume', 'inspect']):
+            objects = containers if args[1] == 'container' else volumes
+            if args[-1] not in objects:
+                return SimpleNamespace(returncode=1, stdout='', stderr='No such ' + args[1] + ': ' + args[-1])
             stdout = owner
+        if args[1:3] == ['container', 'rm']:
+            containers.discard(args[-1])
+        if args[1:3] == ['volume', 'rm']:
+            volumes.discard(args[-1])
         if args[1] == 'exec' and 'image_smoke' in args[-2]:
             stdout = json.dumps({'image_smoke': 'passed', 'build_commit': commit})
         return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
@@ -57,4 +70,28 @@ def test_isolated_568_profile_and_owned_recreation_plan(monkeypatch):
     assert len(probes) == 2 and all("('Host', 'hub.ledgetoptechnologies.com')" in c[-2] for c in probes)
     assert result['named_volume_recreation'] == 'passed'
     assert result['truenas'] == 'not_deployed'
-    assert calls[-1][1:3] == ['volume', 'rm']
+    assert not containers and not volumes
+    assert calls[-1][1:3] == ['volume', 'inspect']
+
+
+@pytest.mark.parametrize('kind', ['container', 'volume'])
+@pytest.mark.parametrize('code,stdout,stderr', [
+    (1, '', 'Docker daemon unavailable'),
+    (0, 'another-owner', ''),
+])
+def test_cleanup_inspection_errors_and_owner_mismatch_fail_closed(monkeypatch, kind, code, stdout, stderr):
+    module = load(monkeypatch)
+    def fake(args, **kwargs):
+        assert args[2] == 'inspect', 'Unverified object must never be removed'
+        return SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(module.subprocess, 'run', fake)
+    with pytest.raises(RuntimeError):
+        module.remove_owned(kind, 'test-owned-fixture', 'expected-owner')
+
+
+@pytest.mark.parametrize('kind', ['container', 'volume'])
+def test_only_explicit_missing_object_is_benign(monkeypatch, kind):
+    module = load(monkeypatch)
+    monkeypatch.setattr(module.subprocess, 'run', lambda *a, **kw: SimpleNamespace(
+        returncode=1, stdout='', stderr='Error: No such ' + kind + ': test-owned-fixture'))
+    assert module.owned_exists(kind, 'test-owned-fixture', 'expected-owner') is False
