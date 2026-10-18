@@ -5,6 +5,17 @@ This is separate from the file-fixture executor. Existing `*_fixture` actions
 retain their original meanings. The first application target is a separate Hub
 instance, not the controller orchestrating its own replacement.
 
+The synchronous pilot client has a bounded 125-second whole-operation deadline
+by default (and maximum). A configured deadline must cover the manifest's
+`total_command_ms` plus five seconds for transport. Workflow construction, run
+creation and phase dispatch reject incompatible client/manifest pairs before
+reservation or effects. Missing capability is not inferred optimistically from
+an injected adapter. Unknown outcomes still remain held under the original
+command identity; no timeout permits blind retry or asynchronous takeover.
+Focused controller/client/API regressions pass (168 tests), including the maximum
+120-second admitted host budget and rejection without creating runs/effects.
+These tests use synthetic transport, not actual host execution.
+
 ## Ownership and boundaries
 
 Codex owns the typed controller client, workflow, dispatcher integration and Hub

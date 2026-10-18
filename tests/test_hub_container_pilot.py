@@ -5,12 +5,13 @@ import hashlib
 import json
 import uuid
 
+import httpx
 import pytest
 
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
 from engineering_hub.container_pilot_manifest import PilotManifest
 from engineering_hub.container_pilot_client import (
-    ContainerPilotEvidence, ContainerPilotRequest, ContainerPilotResponse,
+    ContainerPilotClient, ContainerPilotEvidence, ContainerPilotRequest, ContainerPilotResponse,
 )
 from engineering_hub.repository import HubError, HubRepository
 from tests.test_hub_container_pilot_manifest import make_manifest_data
@@ -46,6 +47,8 @@ MANIFEST = pilot_manifest().digest()
 
 
 class FakeClient:
+    timeout_seconds = 125.0
+
     def __init__(self, outcomes=None):
         self.outcomes = outcomes or {}
         self.submissions = []
@@ -508,6 +511,78 @@ def test_constructor_pins_complete_canonical_manifest_before_any_run(repo, targe
     assert PilotManifest.from_bytes(pinned['canonical_manifest'].encode()).digest() == MANIFEST
     assert json.loads(pinned['canonical_manifest']) == json.loads(pilot_manifest().canonical_bytes())
     assert repo.list_runs() == [] and client.submissions == []
+
+
+def maximum_budget_target(target):
+    data = json.loads(target.canonical_manifest)
+    data['timeouts']['total_command_ms'] = 120000
+    return ContainerPilotTarget.from_manifest(PilotManifest.from_bytes(json.dumps(data).encode()))
+
+
+@pytest.mark.asyncio
+async def test_maximum_host_budget_supported_with_bounded_transport_margin(repo, target):
+    target = maximum_budget_target(target)
+    client = FakeClient()
+    workflow, run = ready_run(repo, target, client)
+    assert (await workflow.advance(run['id']))['status'] == 'succeeded'
+    assert len(client.submissions) == 2
+    assert all(command.manifest_digest == target.manifest_digest for command in client.submissions)
+
+
+@pytest.mark.asyncio
+async def test_real_wire_client_admits_maximum_budget_with_125_second_deadline(repo, target):
+    target = maximum_budget_target(target)
+    commands = []
+    simulated = FakeClient()
+
+    def handler(request):
+        assert request.extensions['timeout'] == {'connect': 5.0, 'read': 125.0, 'write': 125.0, 'pool': 125.0}
+        command = ContainerPilotRequest.model_validate(json.loads(request.content))
+        commands.append(command)
+        return httpx.Response(200, json=simulated.response(command).model_dump())
+
+    async with ContainerPilotClient('https://adapter.test', 'synthetic-deadline-secret',
+                                   timeout_seconds=125, transport=httpx.MockTransport(handler)) as client:
+        workflow, run = ready_run(repo, target, client)
+        assert (await workflow.advance(run['id']))['status'] == 'succeeded'
+    assert [command.action for command in commands] == ACTIONS[:2]
+
+
+@pytest.mark.parametrize('deadline', [None, True, 15, 60, 120, 124.999, 126, float('nan')])
+def test_incompatible_deadline_rejected_before_tables_runs_or_effects(repo, target, deadline):
+    client = FakeClient()
+    client.timeout_seconds = deadline
+    with pytest.raises(HubError, match='container_pilot_client_deadline_incompatible'):
+        ContainerPilotWorkflow(repo, client, [maximum_budget_target(target)])
+    with repo._connection() as db:
+        assert db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'hub_container_pilot_%'").fetchall() == []
+    assert repo.list_runs() == []
+    assert client.submissions == [] and client.inspections == []
+
+
+def test_shortened_client_deadline_rejected_at_create_before_run(repo, target):
+    client = FakeClient()
+    workflow = ContainerPilotWorkflow(repo, client, [target])
+    task = reviewed_task(repo)
+    client.timeout_seconds = 15
+    with pytest.raises(HubError, match='container_pilot_client_deadline_incompatible'):
+        workflow.create_run('codex', task['id'], task['revision'], IMAGE, target.target_id)
+    assert repo.list_runs() == []
+    assert client.submissions == [] and client.inspections == []
+
+
+@pytest.mark.asyncio
+async def test_shortened_client_deadline_rejected_at_dispatch_without_effects(repo, target):
+    client = FakeClient()
+    workflow, run = ready_run(repo, target, client)
+    client.timeout_seconds = 15
+    with pytest.raises(HubError, match='container_pilot_client_deadline_incompatible'):
+        await workflow.advance(run['id'])
+    assert repo.get_run(run['id'])['status'] == 'pending'
+    assert client.submissions == [] and client.inspections == []
+    with repo._connection() as db:
+        assert db.execute('SELECT * FROM hub_container_pilot_commands').fetchall() == []
+        assert db.execute('SELECT * FROM hub_container_pilot_advances').fetchall() == []
 
 
 @pytest.mark.asyncio

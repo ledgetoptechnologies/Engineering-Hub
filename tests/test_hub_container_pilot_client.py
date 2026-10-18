@@ -88,10 +88,19 @@ def test_origin_policy_and_safe_errors(origin):
         assert origin not in str(error.value)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True, 61, "15", float("inf"), float("nan")])
+@pytest.mark.parametrize("timeout", [0, -1, True, 126, "15", float("inf"), float("nan")])
 def test_bounded_timeout(timeout):
     with pytest.raises(ValueError):
         ContainerPilotClient("https://executor.test", SECRET, timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize('timeout', [None, 125, 120.001, 61])
+async def test_manifest_maximum_transport_deadline_is_bounded_and_explicit(timeout):
+    kwargs = {} if timeout is None else {'timeout_seconds': timeout}
+    async with ContainerPilotClient('https://executor.test', SECRET, **kwargs) as client:
+        assert client.timeout_seconds == (125.0 if timeout is None else timeout)
+        with pytest.raises(AttributeError):
+            client.timeout_seconds = 1
 
 
 @pytest.mark.parametrize("secret", ["", "has space", "line\nbreak", "\x7f", None])

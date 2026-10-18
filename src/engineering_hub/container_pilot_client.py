@@ -97,8 +97,12 @@ class ContainerPilotClient:
     """Explicit bounded operations, separate from the existing fixture executor."""
 
     RESPONSE_BYTE_LIMIT = 16 * 1024
+    # The host may use the manifest's complete 120-second command budget.
+    # Transport setup and the bounded response need their own finite margin.
+    TRANSPORT_MARGIN_SECONDS = 5.0
+    MAX_TIMEOUT_SECONDS = 125.0
 
-    def __init__(self, base_url: str, service_token: str, *, timeout_seconds: float = 15.0,
+    def __init__(self, base_url: str, service_token: str, *, timeout_seconds: float = 125.0,
                  transport: httpx.AsyncBaseTransport | None = None):
         if (not isinstance(base_url, str) or "\\" in base_url
                 or any(ord(character) <= 32 or ord(character) == 127 for character in base_url)):
@@ -117,7 +121,7 @@ class ContainerPilotClient:
         if (not isinstance(service_token, str) or not service_token
                 or any(not 33 <= ord(character) <= 126 for character in service_token)):
             raise ValueError("invalid container pilot credential")
-        if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= 60:
+        if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= self.MAX_TIMEOUT_SECONDS:
             raise ValueError("container pilot timeout must be positive and bounded")
         self.__token = service_token
         self.__timeout_seconds = timeout_seconds
@@ -130,6 +134,11 @@ class ContainerPilotClient:
 
     def __repr__(self):
         return "ContainerPilotClient(credential=<redacted>)"
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Whole-operation deadline, including connection and response transport."""
+        return self.__timeout_seconds
 
     async def __aenter__(self):
         await self.__client.__aenter__()

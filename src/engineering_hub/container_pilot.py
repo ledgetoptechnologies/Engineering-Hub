@@ -10,7 +10,7 @@ import json
 import re
 import uuid
 
-from .container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
+from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse
 from .container_pilot_manifest import PilotManifest
 from .repository import HubError
 
@@ -87,6 +87,18 @@ class ContainerPilotTarget:
 
 class ContainerPilotWorkflow:
     @staticmethod
+    def _validate_client_deadline(client, manifest):
+        # A synchronous host response must fit within the client's complete
+        # deadline. Reject before reserving a run, rather than predictably
+        # timing out after a possible effect. Injected adapters must declare
+        # this capability too; no optimistic default is inferred.
+        deadline = getattr(client, 'timeout_seconds', None)
+        required = manifest.timeouts.total_command_ms / 1000 + ContainerPilotClient.TRANSPORT_MARGIN_SECONDS
+        if (type(deadline) not in {int, float}
+                or not required <= deadline <= ContainerPilotClient.MAX_TIMEOUT_SECONDS):
+            raise HubError('container_pilot_client_deadline_incompatible', 403)
+
+    @staticmethod
     def _manifest_digest(target):
         # Recovery fingerprints the original request using the full operator
         # manifest digest, not a hash of this narrower controller view.
@@ -98,7 +110,7 @@ class ContainerPilotWorkflow:
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
             raise ValueError('invalid_pilot_targets')
         for target in targets:
-            target.validated_manifest()
+            self._validate_client_deadline(client, target.validated_manifest())
         self.repo, self.client = repo, client
         self.targets = {target.target_id: target for target in targets}
         if len(self.targets) != len(targets) or any(not isinstance(t, ContainerPilotTarget) for t in targets):
@@ -135,7 +147,7 @@ class ContainerPilotWorkflow:
         task = self.repo.get_task(task_id)
         target = self.targets.get(target_id)
         if target is not None:
-            target.validated_manifest()
+            self._validate_client_deadline(self.client, target.validated_manifest())
         if (target is None or task['project'] != 'engineering-hub'
                 or artifact_digest != target.artifact_digest
                 or task['candidate_commit'] != target.candidate_commit):
@@ -147,7 +159,7 @@ class ContainerPilotWorkflow:
     def _target(self, run):
         target = self.targets.get(run['target'])
         if target is not None:
-            target.validated_manifest()
+            self._validate_client_deadline(self.client, target.validated_manifest())
         if (target is None or run['artifact_digest'] != target.artifact_digest
                 or run['commit'] != target.candidate_commit
                 or run['policy_revision'] != target.policy_revision
