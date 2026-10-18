@@ -336,6 +336,18 @@ class WorkQueue:
                 db.execute('UPDATE hub_work_policy SET paused=?,revision=revision+1 WHERE id=1', (int(paused),))
                 self._emit(db, 'work.paused', 'work-queue-policy', current['revision'] + 1, 'system:work-queue')
 
+    def get_job(self, job_id):
+        """Fetch one durable job without claiming it or replaying an effect."""
+        _key(job_id)
+        with self.repo._connection() as db:
+            row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise HubError('work_job_not_found', 404)
+            result = self._public(row)
+        result['requires_reconciliation'] = (row['state'] == 'held'
+            or row['state'] == 'claimed' and row['lease_until'] <= self._now())
+        return result
+
     def status(self, *, limit=50):
         self._limit(limit)
         # A status read never mutates expired jobs; expose ambiguity explicitly.

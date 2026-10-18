@@ -85,6 +85,7 @@ human session, allowed Origin and valid `X-Hub-CSRF`.
 | --- | --- |
 | `GET /status?limit=50` | Registry, pause state, counts, jobs and blocked reasons |
 | `GET /jobs?limit=50` | Bounded recent job list (`items`) |
+| `GET /jobs/{id}` | Fetch one exact durable job without claiming or renewing it |
 | `POST /jobs` | Idempotent admission, keyed by authenticated agent + `request_id` |
 | `POST /claim` | Claim one eligible job (`job: null` means no admission) |
 | `POST /jobs/{id}/renew` | Renew matching live instance + fence; maximum lease 600 seconds |
@@ -96,6 +97,25 @@ worker name, shell command, host path, credential, or execution-provider URL.
 Queue status/history is shared across agents; use task/job identifiers rather
 than private local notes for handoffs. No automatic replay, scheduler loop, or
 processing worker starts merely by calling these routes.
+
+### Agent MCP interface
+
+The candidate Hub MCP URL is `http://192.168.50.80:8770/mcp/`, not the old bus
+port 8765. Existing agent bearer identities are reused. When the queue is
+explicitly configured, it additionally advertises `hub_work_status`,
+`hub_work_jobs`, `hub_work_get`, `hub_work_submit`, `hub_work_claim`,
+`hub_work_renew` and `hub_work_complete`. Each takes a closed `payload` object
+using the equivalent HTTP fields; get/renew/complete additionally carry `job_id`.
+Status/list take `{"limit": 50}` or `{}`. Unknown fields and caller-provided
+identity are rejected. There is no agent MCP pause, reconciliation, approval or
+receipt-enrollment tool. Queue-disabled deployments retain the original nine
+Hub tools, without advertising an unconfigured queue.
+
+The Hub's authenticated `/api/hub/v1/events` SSE feed receives transactional
+queue invalidations. An invalidation is not a job claim, execution permission,
+or automatic agent wake; fetch the referenced job and inspect durable state.
+No polling or replacement listener is activated by this source. The old bus's
+push availability is independent of this Hub-native feed.
 
 ## Minimal Python connection, admission, claim and renewal
 

@@ -35,6 +35,22 @@ def finish(queue, claimed, outcome='succeeded'):
     return queue.complete(job_id=claimed['id'], worker=WorkWorker(*claimed['worker'].split(':', 1)), fence=claimed['fence'], outcome=outcome)
 
 
+def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):
+    q, clock, repo, _ = setup_queue
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    with repo._connection() as db:
+        before = db.execute('SELECT MAX(sequence) FROM hub_outbox').fetchone()[0]
+    assert q.get_job(job['id'])['requires_reconciliation'] is False
+    clock[0] += 10
+    assert q.get_job(job['id'])['requires_reconciliation'] is True
+    assert q.get_job(job['id'])['state'] == 'claimed'
+    with repo._connection() as db:
+        assert db.execute('SELECT MAX(sequence) FROM hub_outbox').fetchone()[0] == before
+    with pytest.raises(HubError, match='work_job_not_found'):
+        q.get_job(str(uuid.uuid4()))
+
+
 def test_live_admission_rechecks_policy_target_registry_and_ownership(setup_queue):
     q, clock, _, _ = setup_queue
     submit(q)

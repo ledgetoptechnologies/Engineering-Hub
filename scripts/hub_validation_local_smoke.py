@@ -112,10 +112,16 @@ def main():
         results = []
         production = queue.submit(actor='codex', request_id='unapproved-production',
                                   action_key='engineering-hub.validate', environment='production', target=target)
+        # The suite's conftest creates its own data directory next to the tests.
+        # Copy only the fixed test tree into disposable tmpfs, not a host mount.
+        fixed_tests = ("import shutil,subprocess,sys;"
+            "shutil.copytree('/validation/tests','/tmp/tests');"
+            "raise SystemExit(subprocess.call([sys.executable,'-m','pytest','-q',"
+            "'-c','/validation/pyproject.toml','/tmp/tests/test_hub_work_queue.py',"
+            "'/tmp/tests/test_hub_work_queue_api.py','/tmp/tests/test_hub_work_queue_bootstrap.py',"
+            "'--basetemp','/tmp/validation-case','-o','cache_dir=/tmp/validation-cache']))")
         commands = (
-            ('python', '-m', 'pytest', '-q', 'tests/test_hub_work_queue.py',
-             'tests/test_hub_work_queue_api.py', 'tests/test_hub_work_queue_bootstrap.py',
-             '--basetemp', '/tmp/validation-case', '-o', 'cache_dir=/tmp/validation-cache'),
+            ('python', '-c', fixed_tests),
             ('python', '-c', 'raise SystemExit(7)'),
         )
         for position, command in enumerate(commands):
@@ -129,8 +135,10 @@ def main():
             result = ValidationWorker(queue, ledger, backend, (enrollment,)).run_once(
                 job_id=claim['id'], worker=worker, fence=claim['fence'])
             expected = 'succeeded' if position == 0 else 'failed'
-            if result['state'] != expected:
+            if result['state'] == 'held':
                 raise RuntimeError('Actual validation held; inspect original deterministic container before retry')
+            if result['state'] != expected:
+                raise RuntimeError('Verified terminal validation did not match the fixed acceptance expectation')
             assert ledger.verify_completion(claim, result['evidence_id'], expected)
             assert not ledger.verify_completion(claim, str(uuid4()), expected)
             reopened = ValidationLedger(ledger.path, create=False,

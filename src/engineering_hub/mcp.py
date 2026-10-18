@@ -4,8 +4,12 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from pydantic import ValidationError
 
 from .repository import HubError
+from .work_queue import WorkWorker
+from .work_queue_api import (WorkList, WorkGet, WorkSubmission, WorkClaim,
+                             WorkJobRenew, WorkJobComplete, submit_reviewed_work)
 import inspect
 
 
@@ -29,7 +33,8 @@ class HubMCPAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None) -> FastMCP:
+def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
+                  work_queue=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
 
@@ -48,6 +53,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         except HubError as error:
             # Repository codes are fixed internal identifiers, never peer titles.
             raise ToolError(error.code) from None
+        except ToolError:
+            raise
         except Exception:
             raise ToolError("internal_error") from None
 
@@ -121,5 +128,70 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         if topic_preflight is None:
             raise ToolError('reachability_source_unavailable')
         return await invoke_topic(topic_preflight, ctx, topic, recipient)
+
+    def work_input(model, payload):
+        try:
+            return model.model_validate(payload)
+        except ValidationError:
+            raise ToolError('invalid_input') from None
+
+    def configured_work():
+        if work_queue is None:
+            raise ToolError('work_queue_not_configured')
+        return work_queue
+
+    def hub_work_status(payload: dict, ctx: Context) -> dict:
+        """Read queue policy/registry/jobs; no worker or execution is started."""
+        identity(ctx)
+        query = work_input(WorkList, payload)
+        return invoke(lambda: configured_work().status(limit=query.limit))
+
+    def hub_work_jobs(payload: dict, ctx: Context) -> dict:
+        """Read a bounded shared job list, including reasons work is blocked."""
+        identity(ctx)
+        query = work_input(WorkList, payload)
+        return {'items': invoke(lambda: configured_work().status(limit=query.limit))['jobs']}
+
+    def hub_work_get(payload: dict, ctx: Context) -> dict:
+        """Read one durable job without renewing, dispatching or reconciling it."""
+        identity(ctx)
+        query = work_input(WorkGet, payload)
+        return invoke(lambda: configured_work().get_job(query.job_id))
+
+    def hub_work_submit(payload: dict, ctx: Context) -> dict:
+        """Admit registered work for an owned, independently reviewed exact task."""
+        principal = identity(ctx)
+        data = work_input(WorkSubmission, payload)
+        return invoke(lambda: submit_reviewed_work(repo, configured_work(), principal, data))
+
+    def hub_work_claim(payload: dict, ctx: Context) -> dict:
+        """Reserve one eligible job for this agent and process-instance UUID."""
+        principal = identity(ctx)
+        data = work_input(WorkClaim, payload)
+        return {'job': invoke(lambda: configured_work().claim(
+            worker=WorkWorker(principal, data.instance_id), lease_seconds=data.lease_seconds))}
+
+    def hub_work_renew(payload: dict, ctx: Context) -> dict:
+        """Renew only this authenticated agent's matching live instance/fence."""
+        principal = identity(ctx)
+        data = work_input(WorkJobRenew, payload)
+        return invoke(lambda: configured_work().renew(
+            job_id=data.job_id, worker=WorkWorker(principal, data.instance_id),
+            fence=data.fence, lease_seconds=data.lease_seconds))
+
+    def hub_work_complete(payload: dict, ctx: Context) -> dict:
+        """Record a bound outcome; execution proof is required, not fabricated here."""
+        principal = identity(ctx)
+        data = work_input(WorkJobComplete, payload)
+        return invoke(lambda: configured_work().complete(
+            job_id=data.job_id, worker=WorkWorker(principal, data.instance_id),
+            fence=data.fence, outcome=data.outcome, evidence_id=data.evidence_id))
+
+    # Default/off deployments preserve the established nine-tool contract and
+    # must not advertise an unconfigured worker/admission capability.
+    if work_queue is not None:
+        for operation in (hub_work_status, hub_work_jobs, hub_work_get, hub_work_submit,
+                          hub_work_claim, hub_work_renew, hub_work_complete):
+            mcp.add_tool(operation)
 
     return mcp

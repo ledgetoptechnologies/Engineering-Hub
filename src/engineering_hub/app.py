@@ -261,7 +261,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 'advisory': True, 'delivery_guaranteed': False}
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
-                          topic_preflight=preflight_for, autonomy_status=autonomy_for)
+                          topic_preflight=preflight_for, autonomy_status=autonomy_for,
+                          work_queue=work_queue)
     origin = urlsplit(settings.auth_config.origin)
     hub_mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,

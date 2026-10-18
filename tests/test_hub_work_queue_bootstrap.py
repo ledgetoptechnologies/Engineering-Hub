@@ -1,6 +1,7 @@
 """First-version app wiring, not proof of a deployed runner."""
 from types import SimpleNamespace
 from uuid import uuid4
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,6 +64,26 @@ def test_opt_in_first_version_connects_and_claims_only_verified_staging_work(tmp
 def test_new_queue_cannot_bypass_legacy_dispatch_machine_exclusion(tmp_path):
     with pytest.raises(ValueError, match='shared reservation bridge'):
         create_app(settings(tmp_path, work_queue_enabled=True), staging_dispatcher=SimpleNamespace())
+
+
+def test_real_app_passes_configured_queue_to_authenticated_mcp(tmp_path):
+    app = create_app(settings(tmp_path, work_queue_enabled=True))
+    headers = {'Authorization': 'Bearer test-codex',
+               'Accept': 'application/json, text/event-stream',
+               'MCP-Protocol-Version': '2025-06-18'}
+    with TestClient(app, base_url='http://hub.invalid') as client:
+        response = client.post('/mcp/', headers=headers, json={
+            'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
+        assert response.status_code == 200
+        tools = {tool['name'] for tool in response.json()['result']['tools']}
+        assert len(tools) == 16 and 'hub_work_status' in tools
+        response = client.post('/mcp/', headers=headers, json={
+            'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+            'params': {'name': 'hub_work_status', 'arguments': {'payload': {}}}})
+        result = response.json()['result']
+        assert not result.get('isError')
+        data = result.get('structuredContent') or json.loads(result['content'][0]['text'])
+        assert 'engineering-hub.validate' in data['actions']
 
 
 def test_queue_enable_flag_requires_explicit_boolean_or_environment_value(tmp_path, monkeypatch):

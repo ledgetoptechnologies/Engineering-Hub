@@ -74,6 +74,42 @@ class WorkPause(WorkInput):
     paused: bool
 
 
+class WorkList(WorkInput):
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+class WorkGet(WorkInput):
+    job_id: str = Field(min_length=36, max_length=36, pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+
+
+class WorkJobRenew(WorkRenew, WorkGet):
+    pass
+
+
+class WorkJobComplete(WorkComplete, WorkGet):
+    pass
+
+
+def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
+    """Shared REST/MCP submission guard; identity is authenticated, never input."""
+    if queue is None:
+        raise HubError('work_queue_not_configured', 423)
+    task = repo.get_task(payload.target.task_id)
+    review = task.get('review')
+    if task.get('owner') != principal:
+        raise HubError('forbidden', 403)
+    if queue.action_project(payload.action_key) != task.get('project'):
+        raise HubError('work_project_mismatch', 403)
+    if (task.get('status') != 'verified' or task.get('candidate_commit') != payload.target.source_commit
+            or type(review) is not dict or review.get('verdict') != 'approve'
+            or review.get('actor') not in AGENTS or review.get('actor') == principal
+            or review.get('commit') != payload.target.source_commit):
+        raise HubError('review_required', 409)
+    return queue.submit(actor=principal, request_id=payload.request_id,
+                        action_key=payload.action_key, environment=payload.environment,
+                        target=WorkTarget(**payload.target.model_dump()), approval_id=payload.approval_id)
+
+
 def _authorization(request):
     # Never let duplicate/malformed bearer input silently select a cookie or a
     # different identity. The configured authentication callable still checks
@@ -108,24 +144,15 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
         identity(request, actor)
         return {'items': configured().status(limit=limit)['jobs']}
 
+    @app.get('/api/hub/v1/work/jobs/{job_id}')
+    def get_job(job_id: JobID, request: Request):
+        identity(request, actor)
+        return configured().get_job(job_id)
+
     @app.post('/api/hub/v1/work/jobs', status_code=201)
     def submit(payload: WorkSubmission, request: Request):
         principal = identity(request, agent)
-        work = configured()
-        task = repo.get_task(payload.target.task_id)
-        review = task.get('review')
-        if task.get('owner') != principal:
-            raise HubError('forbidden', 403)
-        if work.action_project(payload.action_key) != task.get('project'):
-            raise HubError('work_project_mismatch', 403)
-        if (task.get('status') != 'verified' or task.get('candidate_commit') != payload.target.source_commit
-                or type(review) is not dict or review.get('verdict') != 'approve'
-                or review.get('actor') not in AGENTS or review.get('actor') == principal
-                or review.get('commit') != payload.target.source_commit):
-            raise HubError('review_required', 409)
-        return work.submit(actor=principal, request_id=payload.request_id,
-                           action_key=payload.action_key, environment=payload.environment,
-                           target=WorkTarget(**payload.target.model_dump()), approval_id=payload.approval_id)
+        return submit_reviewed_work(repo, configured(), principal, payload)
 
     @app.post('/api/hub/v1/work/claim')
     def claim(payload: WorkClaim, request: Request):
