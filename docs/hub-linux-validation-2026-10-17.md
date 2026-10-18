@@ -168,3 +168,29 @@ pilot evidence. The full manifest schema similarly proves policy syntax and
 digest binding—not backup consistency, secret resolution or host enforcement.
 Actual application rollout/rollback, OAuth and live topic integration remain
 unfulfilled acceptance gates.
+
+## Canonical registry request/stream bridge
+
+The frozen registry-bridge source overlay based on `52d534c` passed **1,283
+Linux tests in 58.76 seconds**, with only the existing Starlette deprecation.
+The validation image was OCI index
+`sha256:e17d728357f9629721caf1be184dfad1b7dc842c35f1906a0505df77c62227cc`.
+It ran with no network, host mounts, exposed ports, credentials or Docker socket;
+read-only root, dropped capabilities, resource bounds and private temporary
+filesystems match the preceding campaign. The container auto-removed on exit.
+
+The first full run found a real REST/MCP metadata mismatch in the legacy topic
+projection (1 failure, 1,282 passing); the shared projection now supplies the same
+registry epoch/event-source defaults, and the full rerun above passed. Focused
+review separately found malformed event cursors triggered an upstream snapshot
+before local validation. That ordering is fixed, with regression assertions that
+neither snapshot nor subscription can run for malformed cursor/header requests.
+
+Request-scoped synthetic transports cover original-agent bearer preservation,
+fixed-topic human reader isolation, denial/default-unconfigured behavior, expired
+and future evidence, independent registry cursors, bounded stream parsing and
+stream cleanup/session revocation. OpenAPI matches source, actual TypeScript
+fixtures match public DTOs, and wheel/source builds pass. This proves neither
+live registry availability nor trusted provider enrollment, actual same-chat
+readiness, offline delivery or reboot recovery. No live bus or connector changes
+were made in this validation campaign.

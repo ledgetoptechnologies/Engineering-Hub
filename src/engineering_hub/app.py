@@ -25,6 +25,11 @@ from .reachability import PublicReachability, project_topic_snapshot
 from .events import NativeHubEventFeed
 from .autonomy import StagingRuntime
 from .container_pilot import ContainerPilotWorkflow
+from .registry_bridge import CanonicalRegistryBridge
+from .registry_client import (
+    RegistryAccessDenied, RegistrySourceUnavailable, RegistryPointer,
+    RegistrySnapshotRequired, validate_topic as validate_registry_topic,
+)
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO,
@@ -109,6 +114,8 @@ class TopicSnapshot(Input):
     advisory: Literal[True]
     delivery_guaranteed: Literal[False]
     snapshot_revision: str | None
+    registry_epoch: str | None = None
+    event_source: Literal['hub_only', 'canonical_registry', 'none'] = 'hub_only'
 
 
 class TopicPreflight(Input):
@@ -121,9 +128,12 @@ class TopicPreflight(Input):
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
-               staging_dispatcher=None, container_pilot_workflow=None):
+               staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
+    if registry_bridge is not None and (type(registry_bridge) is not CanonicalRegistryBridge
+                                        or reachability_provider is not None):
+        raise ValueError('one_reachability_source_required')
     if fixture_workflow is not None and fixture_workflow.repo is not repo:
         raise ValueError("fixture_repository_mismatch")
     if container_pilot_workflow is not None and (
@@ -147,9 +157,20 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     for item in staging_dispatcher.receipts()]
         return {**runtime.status, 'receipts': receipts}
 
-    def peers_for(topic):
+    async def peers_for(topic, *, principal=None, bearer=None):
         if not isinstance(topic, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic):
             raise HubError('invalid_topic', 422)
+        if registry_bridge is not None:
+            try:
+                validate_registry_topic(topic)
+            except ValueError:
+                raise HubError('invalid_topic', 422) from None
+            try:
+                return await registry_bridge.snapshot(principal, topic, agent_bearer=bearer)
+            except RegistryAccessDenied:
+                raise HubError('topic_read_forbidden', 403) from None
+            except Exception:
+                raise HubError('reachability_source_unavailable', 503) from None
         if reachability_provider is not None:
             try:
                 # An internal authenticated registry adapter supplies evidence,
@@ -165,10 +186,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 pass  # Unavailable/malformed source is unknown, not unlinked.
         return project_topic_snapshot(topic)
 
-    def preflight_for(topic, recipient):
+    async def preflight_for(topic, recipient, *, principal=None, bearer=None):
         if recipient not in {'codex', 'hermes', 'claude'}:
             raise HubError('invalid_recipient', 422)
-        snapshot = peers_for(topic)
+        snapshot = await peers_for(topic, principal=principal, bearer=bearer)
         peer = next(item for item in snapshot['items'] if item['agent'] == recipient)
         return {'topic': topic, 'recipient': recipient, 'peer': peer,
                 'advisory': True, 'delivery_guaranteed': False}
@@ -238,21 +259,74 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def agent(request: Request):
         return settings.agent_auth.agent(request)
 
+    def original_bearer(request):
+        scheme, _, bearer = request.headers.get('authorization', '').partition(' ')
+        return bearer if scheme.lower() == 'bearer' else None
+
     @app.get('/api/hub/v1/autonomy', response_model=AutonomyDTO, response_model_exclude_unset=True)
     def autonomy_status(request: Request):
         actor(request)
         return autonomy_for()
 
     @app.get('/api/hub/v1/topics/{topic}/peers', response_model=TopicSnapshot)
-    def topic_peers(topic: str, request: Request):
-        actor(request)
-        return TopicSnapshot.model_validate_json(json.dumps(peers_for(topic)))
+    async def topic_peers(topic: str, request: Request):
+        principal = actor(request)
+        snapshot = await peers_for(topic, principal=principal, bearer=original_bearer(request))
+        return TopicSnapshot.model_validate_json(json.dumps(snapshot))
 
     @app.get('/api/hub/v1/topics/{topic}/preflight', response_model=TopicPreflight)
-    def topic_preflight(topic: str, request: Request,
+    async def topic_preflight(topic: str, request: Request,
                         recipient: Literal['codex', 'hermes', 'claude']):
-        actor(request)
-        return TopicPreflight.model_validate_json(json.dumps(preflight_for(topic, recipient)))
+        principal = actor(request)
+        result = await preflight_for(topic, recipient, principal=principal, bearer=original_bearer(request))
+        return TopicPreflight.model_validate_json(json.dumps(result))
+
+    @app.get('/api/hub/v1/topics/{topic}/events', response_class=StreamingResponse,
+             responses={200: {'content': {'text/event-stream': {'schema': {'type': 'string'}}}}})
+    async def topic_events(topic: str, request: Request, after: int | None = None, epoch: str | None = None):
+        principal = actor(request)
+        if registry_bridge is None or registry_bridge.stream is None:
+            raise HubError('reachability_source_unavailable', 503)
+        if request.headers.get('last-event-id'):
+            raise HubError('registry_cursor_query_required', 422)
+        if (after is None) != (epoch is None) or type(after) not in {int, type(None)} or (after is not None and not 0 <= after <= 2**63 - 1):
+            raise HubError('invalid_registry_cursor', 422)
+        if epoch is not None:
+            from uuid import UUID
+            try:
+                if str(UUID(epoch)) != epoch:
+                    raise ValueError
+            except ValueError:
+                raise HubError('invalid_registry_cursor', 422) from None
+
+        # Reject malformed local cursors before any upstream I/O. This explicit
+        # connection-time ACL read is not a watcher or freshness cache; the
+        # upstream subscribe still registers before its own catch-up/head.
+        await peers_for(topic, principal=principal, bearer=original_bearer(request))
+
+        async def stream():
+            source = registry_bridge.events(principal, topic, agent_bearer=original_bearer(request),
+                                            after=after, epoch=epoch)
+            try:
+                async for event in source:
+                    try:
+                        if actor(request) != principal:
+                            return
+                    except HTTPException:
+                        return
+                    name = ('registry.invalidated' if isinstance(event, RegistryPointer) else
+                            'registry.snapshot_required' if isinstance(event, RegistrySnapshotRequired) else
+                            'registry.unavailable')
+                    identity = f'id: {event.registry_epoch}:{topic}:{event.cursor}\n' if isinstance(event, RegistryPointer) else ''
+                    yield identity + 'event: ' + name + '\ndata: ' + event.model_dump_json() + '\n\n'
+            except Exception:
+                yield 'event: registry.unavailable\ndata: ' + json.dumps(
+                    {'topic': topic, 'registry_epoch': None, 'reason': 'observer_unavailable'}) + '\n\n'
+            finally:
+                await source.aclose()
+
+        return StreamingResponse(stream(), media_type='text/event-stream',
+                                 headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
 
     @app.get('/api/hub/v1/events/status', response_model=EventStatusDTO)
     def event_status(request: Request):

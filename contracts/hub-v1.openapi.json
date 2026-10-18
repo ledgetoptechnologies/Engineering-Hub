@@ -191,6 +191,77 @@
         }
       }
     },
+    "/api/hub/v1/topics/{topic}/events": {
+      "get": {
+        "summary": "Topic Events",
+        "operationId": "topic_events_api_hub_v1_topics__topic__events_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "name": "epoch",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Epoch"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/events/status": {
       "get": {
         "summary": "Event Status",
@@ -1646,7 +1717,9 @@
               "session_busy_queue_verified",
               "session_disconnected",
               "session_offline",
-              "runtime_readiness_unverified"
+              "runtime_readiness_unverified",
+              "inventory_incomplete",
+              "owner_selection_unverified"
             ],
             "title": "Reason"
           },
@@ -1784,6 +1857,17 @@
               }
             ],
             "title": "Binding Revision"
+          },
+          "attachment_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attachment Revision"
           }
         },
         "additionalProperties": false,
@@ -2263,6 +2347,27 @@
               }
             ],
             "title": "Snapshot Revision"
+          },
+          "registry_epoch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registry Epoch"
+          },
+          "event_source": {
+            "type": "string",
+            "enum": [
+              "hub_only",
+              "canonical_registry",
+              "none"
+            ],
+            "title": "Event Source",
+            "default": "hub_only"
           }
         },
         "additionalProperties": false,

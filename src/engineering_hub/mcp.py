@@ -6,6 +6,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .repository import HubError
+import inspect
 
 
 class HubMCPAuthMiddleware:
@@ -50,6 +51,19 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         except Exception:
             raise ToolError("internal_error") from None
 
+    async def invoke_topic(operation, ctx, *args):
+        principal = identity(ctx)
+        request = ctx.request_context.request
+        scheme, _, bearer = request.headers.get('authorization', '').partition(' ')
+        try:
+            result = operation(*args, principal=principal,
+                               bearer=bearer if scheme.lower() == 'bearer' else None)
+            return await result if inspect.isawaitable(result) else result
+        except HubError as error:
+            raise ToolError(error.code) from None
+        except Exception:
+            raise ToolError('reachability_source_unavailable') from None
+
     @mcp.tool()
     def hub_overview(ctx: Context) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state."""
@@ -93,19 +107,19 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return {"items": invoke(repo.list_runs)}
 
     @mcp.tool()
-    def hub_topic_peers(topic: str, ctx: Context) -> dict:
+    async def hub_topic_peers(topic: str, ctx: Context) -> dict:
         """Read exact-topic peer evidence; this is not a delivery guarantee."""
         identity(ctx)
         if topic_peers is None:
             raise ToolError('reachability_source_unavailable')
-        return invoke(topic_peers, topic)
+        return await invoke_topic(topic_peers, ctx, topic)
 
     @mcp.tool()
-    def hub_topic_preflight(topic: str, recipient: str, ctx: Context) -> dict:
+    async def hub_topic_preflight(topic: str, recipient: str, ctx: Context) -> dict:
         """Read advisory reachability before sending; never discards offline mail."""
         identity(ctx)
         if topic_preflight is None:
             raise ToolError('reachability_source_unavailable')
-        return invoke(topic_preflight, topic, recipient)
+        return await invoke_topic(topic_preflight, ctx, topic, recipient)
 
     return mcp

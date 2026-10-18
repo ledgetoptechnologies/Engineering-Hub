@@ -248,9 +248,27 @@ invalidate caches, and source loss or overflow closes the stream with an explici
 unavailable pointer. Human session expiry/revocation is checked before every
 event. `/api/hub/v1/events/status` reports source availability. Unsupported native
 platforms return 503 for streaming, without silently enabling status polling.
-The canonical topic-registry invalidation bridge is still pending: the Hub
-outbox cursor is not a bus registry cursor, and this local stream alone does not
-prove topic presence updates are wired end to end.
+An opt-in, request-scoped canonical registry bridge is implemented in source.
+It forwards each authenticated agent's original bearer, never an impersonation
+header or shared service credential. Human access requires a separately supplied
+fixed-topic read-only resolver and remains unavailable by default. No credentials,
+owner selections or trusted runtime attestations are provisioned by this bridge.
+
+`GET /api/hub/v1/topics/{topic}/events` is a separate authenticated SSE channel
+for canonical registry invalidations. Its epoch and cursor never share the Hub
+outbox namespace. It accepts paired `after`/`epoch` query parameters, rejects
+malformed local cursors before upstream I/O, and performs an upstream ACL check
+before streaming. The upstream transport is bounded and closes on malformed
+frames, source loss or required snapshot recovery; it does not reconnect, poll
+or renew evidence on keepalive comments. Reads downgrade expired/future evidence
+and never infer absent membership from an incomplete inventory.
+
+This bridge is constructor-injected only: the default server does not activate
+it from environment variables. Synthetic HTTP/MCP/stream tests establish its
+request-scoping and failure contracts, not live registry/provider integration.
+Actual source deployment, scoped reader enrollment, exact-session attestations
+and three-agent reconnect acceptance remain required before claiming end-to-end
+topic readiness. The Hub outbox stream alone cannot prove topic presence.
 
 ## Acceptance gates still required
 

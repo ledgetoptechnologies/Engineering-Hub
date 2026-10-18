@@ -37,7 +37,7 @@ class _EvidenceModel(BaseModel):
             raise ValueError("evidence time must be timezone-aware")
         return value
 
-    @field_validator("binding_revision", "snapshot_revision", check_fields=False)
+    @field_validator("binding_revision", "snapshot_revision", "attachment_revision", check_fields=False)
     @classmethod
     def public_revision_is_opaque(cls, value):
         if value is not None:
@@ -117,6 +117,7 @@ class PublicReachability(_EvidenceModel):
         "session_ready", "session_busy_queue_verified", "session_disconnected",
         "session_offline",
         "runtime_readiness_unverified",
+        "inventory_incomplete", "owner_selection_unverified",
     ]
     observed_at: datetime | None = None
     # Transition time is unknown without a complete transition log. Never turn
@@ -135,6 +136,7 @@ class PublicReachability(_EvidenceModel):
     evidence_level: Literal["runtime_verified", "observed", "unverified"] = "unverified"
     snapshot_revision: str | None = None
     binding_revision: str | None = None
+    attachment_revision: str | None = None
 
 
 def project_reachability(
@@ -253,4 +255,5 @@ def project_topic_snapshot(
         items.append(item.model_dump(mode="json"))
     return {"topic": topic, "items": items, "advisory": True,
             "delivery_guaranteed": False,
-            "snapshot_revision": observer.snapshot_revision if observer else None}
+            "snapshot_revision": observer.snapshot_revision if observer else None,
+            "registry_epoch": None, "event_source": "hub_only"}
