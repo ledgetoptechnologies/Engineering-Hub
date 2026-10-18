@@ -900,3 +900,59 @@ Starlette warning. Tests use actualRSA/mockedJWKS and a controlled session clock
 for day29/day30, earlier JWT expiry, non-renewal, missing/forged assertions, CSRF
 and logout replay. These prove source behavior, not thirty elapsed real days or
 installation of this updated release. A fresh sign-in after deployment is needed.
+
+## October 18: split-ingress release published from main
+
+PR2 merged as `c720f7a82c70230e267a369077211749c30e9360`. Main Hub workflow
+`39167860307` completed successfully, including verify and publish. Verification:
+**2,137 Python tests**, two warnings, **102.27seconds**; **19 UI unit tests**,
+**32 Playwright tests**, production UI build, actual combined and split image
+smokes. Legacy workflow `39167860273` also passed; old-bus publication skipped.
+
+Published private package:
+`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`
+is recorded and read back by CI as
+`sha256:fdfa41b8c0a511c50eeb80a9a1e4c780b4d9b30a82b2cc0a54e57c10824f1bab`.
+The pipeline verified package privacy before upload, tested the exact build,
+authenticated registry pull and same-artifact startup, denied anonymous pull,
+checked current main, promoted the tested digest, compared manifests and tested
+startup again. Registry split smoke reports baked source `c720f7a...`, three
+authenticated identities/nine tools, actual agent/browser binds, successful
+task/decision recreation and no real human sign-in or TrueNAS deployment claim.
+
+Root downloaded `hub-control-main-publication-evidence`, independently compared
+registry/latest manifest bytes and computed their SHA256: it exactly equals the
+release digest above. The workflow artifact does not include the intermediate
+descriptor JSON; an initial local check for that missing file was a harness
+mistake, not a failed publication. Local Docker registry inspection returned403
+under this PC's existing Docker credential context. CI authenticated pull success
+is not proof that this PC or NAS has equivalent credentials. Keep the package
+private and use the operator's already approved registry configuration.
+
+The operator-ready source Compose is at main `c720f7a...`; all real tokens and
+dedicated state remain private and must be preserved. Only after installing this
+image should the operator point the Hub tunnel route to `http://127.0.0.1:8771`
+on the confirmed same-NAS host-network connector. No agent changed NAS, tunnel,
+Ops, old8765 endpoints, clients or stored data. Actual LAN isolation, fresh
+Access/Hub sign-in, container/app/reboot acceptance and owned autonomous pilot
+remain outstanding. This is publication acceptance, not overall goal completion.
+
+### Isolated host-provider journal source
+
+Separate host-overlay commit `12abc7c2c8d9e22d9dac3c9ce5cc8b6930b34625` adds an
+explicit private SQLite operation journal, not runtime wiring. Every existing
+operation ID denies a second `begin`; exact completed receipt recording alone is
+idempotent. Pending uncertainty survives process exit; no health/retry/terminal
+failure is inferred. Dedicated schema, Linux owner/private-path and inode guards
+prevent ordinary unrelated-database adoption. Malicious same-UID administrative
+replacement races remain outside this private-directory trust boundary.
+
+Independent review found and verified correction of inherited child descriptor
+cleanup; the regression holds a forked child alive while proving parent authority
+and later reopen. Root's fixed isolated Linux image index
+`sha256:f601fee8a3961c8cb3910ec1088074028a13c00b534c7072dbef50b6bddcb14c`
+passed journal plus existing daemon/hardening tests: **96passed,1skipped,1.77s**.
+No network, host mounts/ports/socket, credentials or Docker effects were exposed.
+Tests cover committed intents/receipts across real process exit; hot rollback
+journal recovery during a transaction remains unproven/fail-closed. The journal
+is not integrated or enabled, and does not complete the actual application pilot.
