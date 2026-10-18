@@ -808,8 +808,9 @@ class DockerEngineBackend:
                     if seen > 200_000:
                         raise ValueError
                     info = os.lstat(Path(base) / name)
-                    if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode)
-                                                          or stat.S_ISREG(info.st_mode)):
+                    if (stat.S_ISLNK(info.st_mode)
+                            or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
                         raise ValueError
             return source
         except DaemonBackendError:
@@ -1138,14 +1139,18 @@ class DockerEngineBackend:
         mount_mode = tmp_mount.get("Mode")
         if type(mount_mode) is not str:
             raise DaemonBackendError("container scratch mount mode is unavailable")
-        mount_mode_tokens = mount_mode.split(",")
-        mount_mode_set = set(mount_mode_tokens)
-        required_mount_mode = {"rw", "noexec", "nosuid", size_token}
-        if (len(mount_mode_set) != len(mount_mode_tokens)
-                or not required_mount_mode.issubset(mount_mode_set)
-                or mount_mode_set - required_mount_mode - {"nodev", "mode=1777"}
-                or not 1024**2 <= tmp_size <= _FIXED_TMPFS_SIZE_MAX):
+        if not 1024**2 <= tmp_size <= _FIXED_TMPFS_SIZE_MAX:
             raise DaemonBackendError("container scratch mount differs from policy")
+        # Engine reports an empty top-level Mode for tmpfs. The security
+        # options are authoritative in HostConfig.Tmpfs, checked above.
+        if mount_mode:
+            mount_mode_tokens = mount_mode.split(",")
+            mount_mode_set = set(mount_mode_tokens)
+            required_mount_mode = {"rw", "noexec", "nosuid", size_token}
+            if (len(mount_mode_set) != len(mount_mode_tokens)
+                    or not required_mount_mode.issubset(mount_mode_set)
+                    or mount_mode_set - required_mount_mode - {"nodev", "mode=1777"}):
+                raise DaemonBackendError("container scratch mount differs from policy")
         tmp_profile = (("/tmp", tmp_size, 0o1777, True, True),)
         expected_env_names = {item.split("=", 1)[0] for item in defaults_result.environment}
         expected_env_names.update({"HUB_BASE_URL", "HUB_DB", "CODEX_TOKEN", "HERMES_TOKEN", "CLAUDE_TOKEN"})

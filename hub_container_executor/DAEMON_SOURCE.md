@@ -148,3 +148,28 @@ independent driver implementation issuer, and a durable trusted private operatio
 journal. No test here establishes actual daemon identity, effective isolation,
 UID/GID state access, health, rollback, layers, provenance, or host-project
 acceptance. The acceptance harness remains outside this task and was not run.
+
+## Review corrections and unresolved profile gates
+
+The tmpfs `Mounts[].Mode` may be the documented empty string; security options
+remain mandatory in `HostConfig.Tmpfs`. Nonempty mount modes are additionally
+validated, and a missing `noexec` or `nosuid` is still rejected. Fake create and
+readback fixtures now use the documented empty mode, not an invented repetition
+of options. This is not an actual-daemon compatibility result.
+
+Generation regular files must have exactly one hard link. A hard link to an
+outside inode is rejected before any create POST. This walk is not an atomic
+filesystem confinement mechanism: the enrolled state provider must exclude
+concurrent generation renames/tree changes through validation and daemon bind
+establishment. No lease or race-free provider is supplied here; that remains an
+activation gate, especially when an outside same-UID writer could mutate paths.
+
+The shared manifest and `EffectiveProfile` currently model private PID/IPC
+namespaces, **not cgroup namespace mode**. This backend neither pins nor verifies
+`CgroupnsMode`; it must not be described as guaranteeing a private cgroup
+namespace. A host-default cgroup namespace can currently pass that unmodeled
+property. Shared-model ownership remains with Codex: an explicit profile decision,
+compatible API minimum, source implementation and inspect tests are required
+before claiming private cgroup isolation or approving an operator enrollment
+that requires it. This conditional review finding is not silently treated as
+fixed or as permission to activate.
