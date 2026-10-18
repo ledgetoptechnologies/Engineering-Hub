@@ -1,9 +1,14 @@
 """Explicit fake boundaries exercise adapter state; these are not Docker evidence."""
 import hashlib
 import json
+import threading
+import time
 import uuid
 from dataclasses import replace
 
+import pytest
+
+import hub_container_executor.adapter as adapter_module
 from engineering_hub.container_pilot_client import ContainerPilotRequest
 from engineering_hub.container_pilot_manifest import PilotManifest
 from hub_container_executor.adapter import HostAdapter, KnownTerminalFailure
@@ -18,6 +23,7 @@ from hub_container_executor.backend import (
     StateGeneration,
 )
 from hub_container_executor.build_record import verify_image_record
+from hub_container_executor.ledger import LedgerClosed, OwnerBusy
 from tests.test_hub_container_executor_build_record import FakeStore, FakeTrust, make_record
 from tests.test_hub_container_pilot_manifest import make_manifest_data
 
@@ -41,6 +47,16 @@ class FakeSecrets:
         return self.values[prefix + "_TOKEN"]
 
 
+class FakeDriverIdentityVerifier:
+    def __init__(self, implementation_commit):
+        self.commit = implementation_commit
+
+    def implementation_commit(self):
+        if isinstance(self.commit, BaseException):
+            raise self.commit
+        return self.commit
+
+
 class FakeBaselineProvider:
     def __init__(self, baseline):
         self.baseline = baseline
@@ -56,20 +72,25 @@ class FakeStateProvisioner:
     def __init__(self, baseline):
         self.baseline = baseline
         self.calls = []
+        self.deadlines = []
+        self.delay_seconds = 0
 
-    def _new(self, operation_id, generation_id):
+    def _new(self, operation_id, generation_id, deadline_monotonic):
         self.calls.append(operation_id)
+        self.deadlines.append((deadline_monotonic, time.monotonic()))
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
         return StateGeneration(generation_id=generation_id,
                                previous_generation_id=self.baseline.state_generation_id,
                                source_backup_digest=self.baseline.backup_digest,
                                generation_digest="sha256:" + "f" * 64,
                                size_bytes=4096, baseline_unchanged=True)
 
-    def prepare_candidate(self, manifest, run_id, baseline, operation_id):
-        return self._new(operation_id, "candidate-g1")
+    def prepare_candidate(self, manifest, run_id, baseline, operation_id, *, deadline_monotonic=None):
+        return self._new(operation_id, "candidate-g1", deadline_monotonic)
 
-    def prepare_rollback(self, manifest, run_id, baseline, operation_id):
-        return self._new(operation_id, "rollback-g1")
+    def prepare_rollback(self, manifest, run_id, baseline, operation_id, *, deadline_monotonic=None):
+        return self._new(operation_id, "rollback-g1", deadline_monotonic)
 
 
 class FakeBackend:
@@ -154,7 +175,8 @@ class FakeBackend:
 
 
 def make_fixture(tmp_path, *, include_verifier=True, late_create=False, bad_runner=False,
-                 alter_profile=False, terminal_start=False):
+                 alter_profile=False, terminal_start=False, driver_identity_commit="manifest",
+                 include_driver_identity=True, command_budget_ms=None, state_delay_seconds=0):
     candidate_manifest, candidate_raw, candidate_blobs = make_record("candidate")
     rollback_manifest, rollback_raw, rollback_blobs = make_record("rollback")
     manifest_data = make_manifest_data()
@@ -164,6 +186,14 @@ def make_fixture(tmp_path, *, include_verifier=True, late_create=False, bad_runn
     manifest_data["candidate"]["provenance"]["attestation_digest"] = digest(candidate_raw)
     manifest_data["rollback"]["image_config_id"] = rollback_record["selection"]["image_config_id"]
     manifest_data["rollback"]["provenance"]["attestation_digest"] = digest(rollback_raw)
+    if command_budget_ms is not None:
+        for phase in ("create_ms", "start_ms", "stop_ms", "inspect_ms"):
+            manifest_data["timeouts"][phase] = min(100, command_budget_ms)
+        manifest_data["timeouts"]["total_command_ms"] = command_budget_ms
+        probe_budget = max(100, command_budget_ms // 3)
+        for role_probes in manifest_data["probes"].values():
+            for probe in role_probes:
+                probe["timeout_ms"] = probe_budget
     manifest = PilotManifest.from_bytes(canonical(manifest_data))
 
     records = {digest(candidate_raw): candidate_raw, digest(rollback_raw): rollback_raw}
@@ -182,16 +212,25 @@ def make_fixture(tmp_path, *, include_verifier=True, late_create=False, bad_runn
     )
     secrets = FakeSecrets()
     state = FakeStateProvisioner(baseline)
+    state.delay_seconds = state_delay_seconds
     backend = FakeBackend(manifest, secrets, late_create, bad_runner=bad_runner,
                           alter_profile=alter_profile, terminal_start=terminal_start)
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
+    identity_commit = (manifest.driver.implementation_commit if driver_identity_commit == "manifest"
+                       else driver_identity_commit)
+    driver_identity_verifier = (
+        FakeDriverIdentityVerifier(identity_commit) if identity_commit is not None else None
+    )
+    identity_kwargs = ({"driver_identity_verifier": driver_identity_verifier}
+                       if include_driver_identity else {})
     adapter = HostAdapter(
         root / "ledger.sqlite3", manifest,
         record_store=record_store, metadata_store=metadata_store,
         provenance_verifier=FakeTrust() if include_verifier else None,
         backend=backend, baseline_provider=FakeBaselineProvider(baseline),
         state_provisioner=state, secret_resolver=secrets,
+        **identity_kwargs,
     )
     # Baseline image/profile is constructed from the authenticated rollback record.
     rollback_image = verify_image_record(manifest, "rollback", record_store, metadata_store, FakeTrust())
@@ -304,6 +343,38 @@ def test_pause_stops_at_state_effect_boundary_and_profile_mismatch_never_starts(
     adapter.close()
 
 
+def test_probe_budgets_share_remaining_command_deadline(tmp_path, monkeypatch):
+    adapter, _backend, _state, manifest = make_fixture(tmp_path)
+    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: 100.0)
+    timeouts = adapter._probe_timeouts(manifest.probes.candidate, deadline=102.5)
+    assert timeouts == (1000, 1000, 500)
+    assert sum(timeouts) <= 2500
+    adapter.close()
+
+
+def test_state_copy_receives_shared_monotonic_command_deadline(tmp_path):
+    adapter, _backend, state, manifest = make_fixture(tmp_path, state_delay_seconds=0.02)
+    response = adapter.submit(command(manifest, "deploy_container"))
+    assert response.state == "succeeded"
+    deadline, entered_at = state.deadlines[0]
+    assert isinstance(deadline, float)
+    assert 0 < deadline - entered_at < manifest.timeouts.total_command_ms / 1000
+    adapter.close()
+
+
+def test_state_copy_overrun_stays_held_and_does_not_start_next_effect(tmp_path):
+    adapter, backend, state, manifest = make_fixture(
+        tmp_path, command_budget_ms=300, state_delay_seconds=0.4
+    )
+    response = adapter.submit(command(manifest, "deploy_container"))
+    assert response.state == "held" and response.reason == "inspect_required"
+    assert len(state.calls) == 1
+    assert backend.events.count("create") == 0
+    operation = adapter.ledger.operation_rows(response.command_id)
+    assert operation[0]["kind"] == "state_copy" and operation[0]["status"] == "intent"
+    adapter.close()
+
+
 def test_foreign_runner_is_denied_before_state_provisioning_or_daemon_effect(tmp_path):
     adapter, backend, state, manifest = make_fixture(tmp_path, bad_runner=True)
     response = adapter.submit(command(manifest, "deploy_container"))
@@ -313,7 +384,38 @@ def test_foreign_runner_is_denied_before_state_provisioning_or_daemon_effect(tmp
     adapter.close()
 
 
-def test_only_typed_terminal_effect_failure_is_failed_and_rollback_can_follow(tmp_path):
+@pytest.mark.parametrize("identity_commit", [None, "d" * 40, RuntimeError("unavailable")],
+                         ids=["missing", "wrong", "unavailable"])
+def test_unverified_runtime_driver_identity_holds_before_any_effect(tmp_path, identity_commit):
+    adapter, backend, state, manifest = make_fixture(
+        tmp_path, driver_identity_commit=identity_commit
+    )
+    response = adapter.submit(command(manifest, "deploy_container"))
+    assert response.state == "held" and response.reason == "daemon_unavailable"
+    assert state.calls == []
+    assert "inspect_runner" not in backend.events
+    assert backend.events.count("create") == 0
+    adapter.close()
+
+
+def test_trusted_runtime_driver_identity_matching_manifest_allows_verified_flow(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    response = adapter.submit(command(manifest, "deploy_container"))
+    assert response.state == "succeeded"
+    assert backend.events.count("create") == 1
+    adapter.close()
+
+
+def test_runtime_driver_identity_provider_is_unavailable_by_default(tmp_path):
+    adapter, backend, state, manifest = make_fixture(tmp_path, include_driver_identity=False)
+    response = adapter.submit(command(manifest, "deploy_container"))
+    assert response.state == "held" and response.reason == "daemon_unavailable"
+    assert state.calls == []
+    assert "inspect_runner" not in backend.events
+    adapter.close()
+
+
+def test_only_typed_terminal_effect_failure_can_be_failed_and_rollback_can_follow(tmp_path):
     adapter, backend, _state, manifest = make_fixture(tmp_path, terminal_start=True)
     run_id = str(uuid.uuid4())
     failed = adapter.submit(command(manifest, "deploy_container", run_id=run_id))
@@ -324,3 +426,90 @@ def test_only_typed_terminal_effect_failure_is_failed_and_rollback_can_follow(tm
     rolled_back = adapter.submit(command(manifest, "rollback_container", run_id=run_id))
     assert rolled_back.state == "succeeded"
     adapter.close()
+
+
+def test_close_waits_for_inflight_effect_and_keeps_owner_exclusive(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    request = command(manifest, "deploy_container")
+    entered = threading.Event()
+    release = threading.Event()
+    original_create = backend.create_container
+
+    def blocked_create(plan, operation_id, timeout_ms):
+        result = original_create(plan, operation_id, timeout_ms)
+        entered.set()
+        assert release.wait(5)
+        return result
+
+    backend.create_container = blocked_create
+    submit_result = []
+    submit_errors = []
+
+    def submit():
+        try:
+            submit_result.append(adapter.submit(request))
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    worker = threading.Thread(target=submit)
+    worker.start()
+    assert entered.wait(5)
+    close_done = threading.Event()
+    closer = threading.Thread(target=lambda: (adapter.close(), close_done.set()))
+    closer.start()
+    writer_done = threading.Event()
+    writer_errors = []
+
+    def waiting_writer():
+        try:
+            adapter.set_paused(True)
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    try:
+        assert not close_done.wait(0.05), "close released ownership during the callback"
+        close_deadline = time.monotonic() + 2
+        while not adapter._closing and time.monotonic() < close_deadline:
+            time.sleep(0.001)
+        assert adapter._closing
+        writer = threading.Thread(target=waiting_writer)
+        writer.start()
+        assert writer_done.wait(2), "writer waited behind shutdown instead of being rejected"
+        writer.join(2)
+        assert len(writer_errors) == 1 and isinstance(writer_errors[0], LedgerClosed)
+        assert adapter.ledger.is_paused() is False
+        try:
+            replacement = HostAdapter(adapter.ledger.path, manifest)
+        except OwnerBusy:
+            pass
+        else:
+            replacement.close()
+            raise AssertionError("replacement owner opened during an in-flight effect")
+    finally:
+        release.set()
+        worker.join(10)
+        closer.join(10)
+    assert not worker.is_alive() and not closer.is_alive()
+    assert not submit_errors
+    assert submit_result[0].state == "succeeded"
+    assert close_done.is_set()
+
+
+def test_reentrant_close_from_effect_callback_is_deferred_until_result_commit(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    request = command(manifest, "deploy_container")
+    original_create = backend.create_container
+
+    def close_inside_callback(plan, operation_id, timeout_ms):
+        result = original_create(plan, operation_id, timeout_ms)
+        adapter.close()
+        return result
+
+    backend.create_container = close_inside_callback
+    response = adapter.submit(request)
+    assert response.state == "succeeded"
+    replacement = HostAdapter(adapter.ledger.path, manifest)
+    assert replacement.get(request.command_id).state == "succeeded"
+    replacement.close()

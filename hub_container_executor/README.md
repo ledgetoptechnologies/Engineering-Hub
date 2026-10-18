@@ -10,9 +10,12 @@ not enable itself from import, environment, Hub startup, or a listener.
 - `ledger.py`: private local SQLite admission/run/target/phase/operation records,
   stable payload replay, target/fence reservation, exact phase ordering, pause
   checks before each effect intent, a separate private HMAC key for operation
-  receipts (outside app mounts), lifetime `flock` ownership before orphan
-  recovery, and held recovery after an unclean shutdown. Lock/database/key inodes
-  are not replaced or unlinked; Linux mountinfo excludes network filesystems.
+  receipts (outside app mounts), creator-PID binding, connection/close
+  serialization, lifetime `flock` ownership before orphan recovery, and held
+  recovery after an unclean shutdown. Inherited child use is rejected before
+  touching SQLite or a possibly inherited mutex; child close only drops its FD
+  copy. Lock/database/key inodes are not replaced or unlinked; Linux mountinfo
+  excludes network filesystems.
 - `build_record.py`: closed bounded record parsing using the frozen source
   contract, original metadata bytes and index→platform-manifest→config digest
   chain validation, shared `Platform`, and mandatory explicit enrolled-builder
@@ -20,12 +23,19 @@ not enable itself from import, environment, Hub startup, or a listener.
 - `adapter.py`: fixed profile derivation and typed no-pull/no-caller-options
   backend boundary; exact image defaults, runtime profile, actual selected image,
   baseline, state-generation and probe identity checks. It persists intents before
-  calls and holds uncertain outcomes. Reconcile only asks the backend to inspect
-  original operation/container IDs; it never retries, starts or re-probes.
+  calls and holds uncertain outcomes. An independent trusted runtime-identity
+  verifier must match the manifest's driver commit before runner inspection or any
+  effect; missing providers hold unavailable. The adapter serializes close against
+  submit/reconcile and rejects new work after shutdown begins. Reconcile only asks
+  the backend to inspect original operation/container IDs; it never retries,
+  starts or re-probes. State providers receive one cooperative monotonic command
+  deadline; a returned overrun remains held with its intent incomplete.
 - `state.py`: online SQLite backup into a private exclusive destination with
   integrity/size checks, plus a non-destructive explicit retention planner.
 - `asgi.py`: optional bearer-authenticated ASGI factory for the frozen namespace;
-  importing it does not construct an app or bind a socket.
+  importing it does not construct an app or bind a socket. GET, reconcile and
+  submit body reads share a configurable bounded request-body deadline, separate
+  from the manifest's command budget, and bodyless routes consume and reject bytes.
 - `docker/hub-container-pilot-acceptance.py`: import-safe, hard-disabled gate;
   it intentionally cannot run a Docker acceptance until source review and a
   separately authorized backend implementation.
@@ -45,11 +55,17 @@ Still required before any real acceptance:
    selection evidence must be correlated to original immutable metadata.
 2. Enrolled provenance verifier and protected content-addressed record/blob
    stores; operator-enrolled healthy baseline; versioned test-only secret
-   resolver; isolated-runner state provisioner. Missing dependencies fail closed.
+   resolver; isolated-runner state provisioner; and an independently trusted
+   `TrustedDriverIdentityVerifier` backed by immutable executable/provenance
+   identity (not a backend echo or label). The interface is source-only and no
+   concrete driver-identity provider is supplied; without one, effects hold.
+   Missing dependencies fail closed.
 3. A private generation provider that uses the tested SQLite copy primitive,
    enforces no migrations/external writes, validates baseline immutability,
    preprovisions uid/gid 10001 access without privileged helper/chown, and applies
-   reviewed retention/cleanup limits.
+   reviewed retention/cleanup limits. It must cooperatively honor the absolute
+   monotonic command deadline; an in-process blocking Python call cannot be
+   safely killed, so a deadline overrun remains held and owner-locked until return.
 4. Real daemon-specific identity/profile inspection, bounded operations, fixed
    compiled in-container probes and authentic private probe evidence. No fake
    backend may be reported as acceptance.

@@ -37,6 +37,60 @@ async def request(app, method, path, **kwargs):
         return await client.request(method, path, headers={"Authorization": "Bearer test-token-only"}, **kwargs)
 
 
+def test_get_consumes_and_rejects_headerless_nonempty_body(tmp_path):
+    adapter, app = setup_app(tmp_path)
+    messages = []
+    receive_count = 0
+
+    async def receive():
+        nonlocal receive_count
+        receive_count += 1
+        return {"type": "http.request", "body": b"unexpected", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http", "method": "GET",
+        "path": "/v1/container-pilot/commands/" + str(uuid4()),
+        "query_string": b"", "headers": [(b"authorization", b"Bearer test-token-only")],
+    }
+    asyncio.run(app(scope, receive, send))
+    assert messages[0]["status"] == 400
+    assert receive_count == 1
+    adapter.close()
+
+
+@pytest.mark.parametrize("path,headers", [
+    ("/v1/container-pilot/commands", [
+        (b"authorization", b"Bearer test-token-only"),
+        (b"content-type", b"application/json"),
+        (b"content-length", b"10"),
+    ]),
+    ("/v1/container-pilot/commands/00000000-0000-4000-8000-000000000000/reconcile", [
+        (b"authorization", b"Bearer test-token-only"),
+    ]),
+], ids=["submit", "reconcile"])
+def test_stalled_post_body_is_bounded_by_independent_request_deadline(tmp_path, path, headers):
+    adapter, _unused_app = setup_app(tmp_path)
+    app = create_app(adapter, bearer_token="test-token-only", request_body_timeout_seconds=0.02)
+    scope = {
+        "type": "http", "method": "POST", "path": path,
+        "query_string": b"", "headers": headers,
+    }
+    messages = []
+
+    async def receive():
+        await asyncio.Future()
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(asyncio.wait_for(app(scope, receive, send), timeout=0.5))
+    assert messages[0]["status"] == 408
+    adapter.close()
+
+
 def test_optional_asgi_exact_echo_get_and_bodyless_reconcile(tmp_path):
     adapter, app = setup_app(tmp_path)
     body = command(adapter.manifest).model_dump(mode="json")
