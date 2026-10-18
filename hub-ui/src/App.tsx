@@ -8,6 +8,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { HubApiError, HubClient } from "./api";
+import { watchTopicRegistry } from "./topicEvents";
 import type {
   Decision,
   EventsStatus,
@@ -149,6 +150,9 @@ export function HubApp() {
   const [data, setData] = useState<Overview | null>(null);
   const [peers, setPeers] = useState<TopicSnapshot | null>(null);
   const [topicError, setTopicError] = useState("");
+  const [topicStale, setTopicStale] = useState(false);
+  const [registryEpoch, setRegistryEpoch] = useState<string | null>(null);
+  const [registryRetry, setRegistryRetry] = useState(0);
   const [events, setEvents] = useState<EventsStatus | null>(null);
   const [topic, setTopic] = useState("auto-wake-v1-test");
   const [topicDraft, setTopicDraft] = useState(topic);
@@ -174,14 +178,17 @@ export function HubApp() {
     answer: string;
   } | null>(null);
   const requests = useRef(0);
+  const topicReads = useRef(0);
   const taskRequest = useRef<{ payload: string; key: string } | null>(null);
 
   const clearPrivateWorkspace = useCallback(() => {
     // Also fence late reads from a request whose identity is no longer valid.
     requests.current++;
+    topicReads.current++;
     setSession(null);
     setData(null);
     setPeers(null);
+    setRegistryEpoch(null);
     setEvents(null);
     setTopicError("");
     setLoading(false);
@@ -213,17 +220,21 @@ export function HubApp() {
         }
         setPeers(null);
         setTopicError("");
+        const topicRead = ++topicReads.current;
         // Topic evidence is independent of workspace records. A slow or hung
         // observer must not hold overview loading or the human task controls.
         void client.getTopic(topic).then(
           (snapshot) => {
             if (request !== requests.current) return;
+            if (topicRead !== topicReads.current) return;
             if (!canVerify()) return; // A disconnected SSE generation cannot revive readiness.
             setPeers(snapshot);
+            setRegistryEpoch(snapshot.event_source === "canonical_registry" ? snapshot.registry_epoch ?? null : null);
             setTopicError("");
           },
           (error) => {
             if (request !== requests.current) return;
+            if (topicRead !== topicReads.current) return;
             setPeers(null);
             if (
               error instanceof HubApiError &&
@@ -352,6 +363,32 @@ export function HubApp() {
   }, [demo, session?.authenticated, events?.available, refresh]);
 
   useEffect(() => {
+    if (demo || !session?.authenticated || !registryEpoch) return;
+    return watchTopicRegistry({
+      topic,
+      epoch: registryEpoch,
+      fetchSnapshot: () => client.getTopic(topic),
+      accept: (snapshot) => {
+        topicReads.current++;
+        setPeers(snapshot);
+        setTopicStale(false);
+        setTopicError("");
+      },
+      invalidate: () => {
+        topicReads.current++;
+        setTopicStale(true);
+      },
+      failed: (error) => {
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+          setNotice(errorText(error));
+          setNoticeError(true);
+          clearPrivateWorkspace();
+        } else setTopicError("Topic event source unavailable. Readiness is unverified; use Check to reconnect. Workspace records remain available.");
+      },
+    });
+  }, [client, demo, session?.authenticated, topic, registryEpoch, registryRetry, clearPrivateWorkspace]);
+
+  useEffect(() => {
     const deadlines = (peers?.items ?? [])
       .filter(
         (peer) =>
@@ -449,7 +486,7 @@ export function HubApp() {
   const projectName = (id: string) =>
     data?.projects.find((item) => item.id === id)?.name ?? pretty(id);
   const peerState = (peer: PublicReachability) =>
-    (!demo && stale) ||
+    (!demo && (stale || topicStale)) ||
     (["reachable", "busy_queued"].includes(peer.status) &&
       (!peer.valid_until || Date.parse(peer.valid_until) <= Date.now()))
       ? "unknown_stale"
@@ -458,10 +495,16 @@ export function HubApp() {
   function checkTopic(event: React.FormEvent) {
     event.preventDefault();
     if (topicDraft !== topic) {
+      topicReads.current++;
       setPeers(null);
+      setRegistryEpoch(null);
+      setTopicStale(false);
       setTopicError("");
       setTopic(topicDraft);
-    } else void refresh();
+    } else {
+      setRegistryRetry((value) => value + 1);
+      void refresh();
+    }
   }
 
   async function saveTask(event: React.FormEvent) {
@@ -1060,7 +1103,7 @@ export function HubApp() {
                           <small>
                             {pretty(peer.reason)}
                             {state !== peer.status
-                              ? !demo && stale
+                              ? !demo && (stale || topicStale)
                                 ? " · Snapshot unverified"
                                 : " · Evidence expired"
                               : ""}

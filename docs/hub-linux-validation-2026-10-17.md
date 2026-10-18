@@ -194,3 +194,14 @@ fixtures match public DTOs, and wheel/source builds pass. This proves neither
 live registry availability nor trusted provider enrollment, actual same-chat
 readiness, offline delivery or reboot recovery. No live bus or connector changes
 were made in this validation campaign.
+
+The dashboard counterpart passed **15 unit tests, TypeScript/Vite build and 24
+Edge browser tests**. It opens a separate canonical topic event stream only when
+the snapshot advertises it, uses explicit epoch/head snapshot recovery, closes
+on source errors instead of automatic retry, and invalidates readiness without
+disabling healthy workspace actions. Review found a stale rejected topic fetch
+could erase a newer accepted snapshot (or clear workspace state on a late 403).
+Both read-generation guards and deterministic 503/403 browser regressions now
+cover that race. Unit cases also cover successful epoch changes and callbacks
+from closed streams. Browser tests use synthetic routes/events: they do not
+establish deployed registry, trusted-session, private OAuth or reboot acceptance.

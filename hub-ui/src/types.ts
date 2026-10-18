@@ -124,7 +124,9 @@ export type ReachabilityReason =
   | "session_busy_queue_verified"
   | "session_disconnected"
   | "session_offline"
-  | "runtime_readiness_unverified";
+  | "runtime_readiness_unverified"
+  | "inventory_incomplete"
+  | "owner_selection_unverified";
 export interface PublicReachability {
   topic: string;
   agent: Agent;
@@ -144,9 +146,12 @@ export interface PublicReachability {
   evidence_level: "runtime_verified" | "observed" | "unverified";
   snapshot_revision: string | null;
   binding_revision: string | null;
+  attachment_revision?: string | null;
 }
 export type TopicPeer = PublicReachability;
 export interface TopicSnapshot {
+  registry_epoch?: string | null;
+  event_source?: "hub_only" | "canonical_registry" | "none";
   topic: string;
   items: PublicReachability[];
   advisory: true;

@@ -8,7 +8,7 @@ const CSRF = "fixture-human-only-csrf";
 
 async function mockLive(
   page: Page,
-  { signedIn = true, events = false, expires = false } = {},
+  { signedIn = true, events = false, expires = false, canonical = false } = {},
 ) {
   const overview = createDemoOverview(NOW);
   const requests: Request[] = [];
@@ -92,6 +92,10 @@ async function mockLive(
         path.split("/topics/")[1].replace("/peers", ""),
       );
       const snapshot = createDemoTopic(topic, NOW);
+      if (canonical) {
+        snapshot.event_source = "canonical_registry";
+        snapshot.registry_epoch = "12345678-1234-1234-1234-123456789abc";
+      }
       if (expires) {
         snapshot.items[0].valid_until = new Date(
           NOW.getTime() + 1000,
@@ -115,6 +119,10 @@ async function controllableEvents(page: Page) {
       onmessage: ((event: { data: string }) => void) | null = null;
       onerror: ((event: Event) => void) | null = null;
       closed = false;
+      handlers: Record<string, (event: unknown) => void> = {};
+      addEventListener(kind: string, callback: (event: unknown) => void) {
+        this.handlers[kind] = callback;
+      }
       constructor(
         public url: string,
         public options: unknown,
@@ -149,6 +157,97 @@ async function emit(
         }),
       });
   }, kind);
+}
+
+async function emitRegistry(page: Page, kind: string, overrides: Record<string, unknown> = {}) {
+  await page.evaluate(({ kind, overrides }) => {
+    const stream = (window as any).__hubStreams.filter((entry: any) => entry.url.includes("/topics/")).at(-1);
+    if (!stream || stream.closed) throw new Error("Topic source unavailable");
+    const epoch = "12345678-1234-1234-1234-123456789abc";
+    const body = kind === "registry.invalidated"
+      ? { topic: "auto-wake-v1-test", registry_epoch: epoch, snapshot_revision: epoch, cursor: 1 }
+      : { topic: "auto-wake-v1-test", registry_epoch: epoch, head: 1, reason: "initial_snapshot" };
+    if (kind === "error") stream.onerror?.(new Event("error"));
+    else stream.handlers[kind]?.({ data: JSON.stringify({ ...body, ...overrides }), lastEventId: `${epoch}:auto-wake-v1-test:1` });
+  }, { kind, overrides });
+}
+
+test("canonical topic invalidation refreshes only topic and source loss leaves workspace writable", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  const mock = await mockLive(page, { canonical: true });
+  await page.goto("/");
+  const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
+  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  const overviewReads = mock.reads();
+  const topicReads = () => mock.requests.filter((request) => new URL(request.url()).pathname.endsWith("/peers")).length;
+  const before = topicReads();
+  await emitRegistry(page, "registry.invalidated");
+  await expect.poll(topicReads).toBe(before + 1);
+  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  expect(mock.reads()).toBe(overviewReads);
+  await emitRegistry(page, "error");
+  await expect(codex.getByText("Unknown", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  const streamCount = await page.evaluate(() => (window as any).__hubStreams.length);
+  await page.clock.runFor(20_000);
+  expect(await page.evaluate(() => (window as any).__hubStreams.length)).toBe(streamCount);
+  expect(mock.reads()).toBe(overviewReads);
+  expect(topicReads()).toBe(before + 1);
+});
+
+test("canonical terminal recovery takes fresh snapshot and resumes with explicit scoped cursor", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  await mockLive(page, { canonical: true });
+  await page.goto("/");
+  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+  await emitRegistry(page, "registry.snapshot_required");
+  await expect.poll(() => page.evaluate(() => (window as any).__hubStreams.filter((entry: any) => entry.url.includes("/topics/")).length)).toBe(2);
+  const sources = await page.evaluate(() => (window as any).__hubStreams.map((entry: any) => ({ url: entry.url, closed: entry.closed })));
+  expect(sources[0].closed).toBe(true);
+  expect(sources[1].url).toBe("/api/hub/v1/topics/auto-wake-v1-test/events?after=1&epoch=12345678-1234-1234-1234-123456789abc");
+  await emitRegistry(page, "registry.snapshot_required");
+  await expect(page.getByText("Topic event source unavailable.", { exact: false })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__hubStreams.length)).toBe(2);
+});
+
+for (const status of [503, 403]) {
+  test(`obsolete topic ${status} cannot erase a newer canonical snapshot or workspace`, async ({ page }) => {
+    await page.clock.install({ time: NOW });
+    await controllableEvents(page);
+    await mockLive(page, { canonical: true });
+    await page.goto("/");
+    const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
+    await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const pending = new Promise<void>((resolve) => { entered = resolve; });
+    let first = true;
+    await page.route("**/api/hub/v1/topics/*/peers", async (route) => {
+      if (!first) return route.fallback();
+      first = false;
+      entered();
+      await held;
+      await route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ detail: { code: "obsolete_failure" } }) });
+    });
+    try {
+      await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
+      await pending;
+      await emitRegistry(page, "registry.invalidated");
+      await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+      const response = page.waitForResponse((response) => response.status() === status && response.url().endsWith("/peers"));
+      release();
+      await response;
+      // Flush promise/render work through a browser task boundary, not time polling.
+      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+      await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+      await expect(page.getByText("Topic status unavailable.", { exact: false })).toHaveCount(0);
+    } finally { release(); }
+  });
 }
 
 test("demo is explicitly labelled and task/decision/pause actions never contact an API", async ({
