@@ -247,3 +247,33 @@ validation image was OCI index
 `sha256:43bb59ad6c636350a917a0157062966463f784ae0a3ada4eb3c0e9a05ffb7309`.
 It used the same network-none/no-host-mount/private-tmpfs validation profile and
 auto-removed after exit. This does not cover later peer-review corrections.
+
+## Rollback holds and baked health identity
+
+Source `1b9e5dd71ccb8a3e115904a1b7fd87b4f564a022` adds visible held rollback
+outcomes, transactionally revalidated independent reviews, and a fixed package
+resource for the build commit. Root ran400 affected controller/client/API/repo/
+dispatcher/public-contract tests; all passed. Build-identity and hardened smoke
+tests separately passed63 cases (overlapping, not additional to that count).
+UI unit18/build and all29 Edge E2E tests passed, including the held reason display.
+
+Root built the exact clean committed source with `VCS_REF` equal to that commit.
+The actual local image's original-byte metadata chain was independently verified:
+
+- OCI index `sha256:76b8b4e4d2f28d9bfe4761dad0cc504dff2f086a5fab0d6e6936bcdd488ae4fe`.
+- amd64 manifest `sha256:e32299ecbbbdb90231d52a2f35b6964de0f7719e120b933c37630e3b899f53cc`.
+- image config `sha256:121f1bcc631c20cb29c40923a8f405e462c4e03ad5fa7fc1a253cf67328daed9`.
+
+The offline image smoke passed with `--expected-commit` equal to the exact source.
+The actual `/health` response reported that baked commit; packaged assets, private
+API rejection and three synthetic MCP identities/exact nine tools also passed.
+A second actual invocation with a deliberately wrong expected commit was rejected.
+Both owned disposable containers were removed, and the label-filtered daemon read
+confirmed none remain. No runtime environment or label supplied the health value.
+
+This proves the build recipe and probe discriminate an actual build identity,
+not that the identity claim authenticates a builder, layers or source provenance.
+It remains application packaging smoke, not controller-driven rollout/rollback,
+coherent durable state, dead-owner recovery, OAuth, TrueNAS or reboot acceptance.
+Claude's independent source review was requested as727d5228-a4d8-495c-928c-513a5443b6a6;
+no review result is inferred from these local passes.
