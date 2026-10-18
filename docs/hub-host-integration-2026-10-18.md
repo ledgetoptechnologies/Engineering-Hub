@@ -82,3 +82,36 @@ dropped capabilities, no host mounts/socket/network and disposable tmpfs.
 The first journal owner-check invocation omitted the test fixture tmpfs and
 failed during conftest setup; the corrected invocation supplied it and passed.
 These isolated tests do not grant the executor a runtime chown capability.
+
+## Explicit build enrollment and bounded SQLite copying
+
+`OperatorEnrolledBuildVerifier` now provides an exact immutable allowlist from
+trusted local composition, bound to manifest digest, role, exact record digest,
+builder and invocation. It never derives approval from content-store discovery,
+record self-claims or agent input. This is an operator trust anchor, not a CI
+signature verifier; no real build was enrolled by these synthetic tests.
+
+State copying now accepts an optional absolute cooperative monotonic deadline.
+Checks surround I/O, SQLite queries/VM progress, backup-page callbacks, bounded
+hashing and durability operations. A concrete SQLite-error cleanup bug was fixed:
+previously a sibling exception handler translated the error without removing
+the newly created partial destination. Cleanup now covers SQL errors and does
+not unlink an unrelated replacement inode. Connection closure also covers a
+destination-open failure. None of this forcibly cancels a blocked disk call.
+
+Independent source reviews accepted both changes. Frozen Linux snapshot
+`sha256:a1951bf7c95bb50eed4a7c2ecd013113d083f44e1e103b54f9dfb92bdaf39b1a`:
+**2425 passed, 3 skipped, 86.46 seconds**, exit 0; same three warning classes as
+the prior full run. Focused enrollment/copy/import tests with resource warnings
+as errors: **45 passed, 1.00 seconds**. The three skipped ownership cases are
+unchanged from the separately verified owner-guard tests described above.
+
+One subsequent test-only addition exercises a real long-running recursive
+SQLite query: the installed VM progress callback interrupts it at its deadline,
+without mocking the clock, connection or query. Snapshot
+`sha256:bbdbb8c7e73a2899c85740d5aa64564ab95d1c782891e12bd704c8d0f20d1dd0`
+passed all **46 focused tests in 1.15 seconds**, with resource warnings as errors.
+The full-suite count above predates this one extra test.
+
+The baseline/state-generation provider and real daemon pilot remain incomplete.
+No host socket, NAS, production state, agent credential or runtime was changed.

@@ -20,6 +20,10 @@ not enable itself from import, environment, Hub startup, or a listener.
   contract, original metadata bytes and index→platform-manifest→config digest
   chain validation, shared `Platform`, and mandatory explicit enrolled-builder
   verifier injection. The shipped fake verifier exists only in unit tests.
+- `build_enrollment.py`: an immutable exact manifest/role/record/builder/invocation
+  allowlist supplied by trusted local composition. Construction is privileged
+  operator enrollment, never an API operation. It is not signature verification
+  and does not independently establish that any real build has been approved.
 - `adapter.py`: fixed profile derivation and typed no-pull/no-caller-options
   backend boundary; exact image defaults, runtime profile, actual selected image,
   baseline, state-generation and probe identity checks. It persists intents before
@@ -31,7 +35,10 @@ not enable itself from import, environment, Hub startup, or a listener.
   starts or re-probes. State providers receive one cooperative monotonic command
   deadline; a returned overrun remains held with its intent incomplete.
 - `state.py`: online SQLite backup into a private exclusive destination with
-  integrity/size checks, plus a non-destructive explicit retention planner.
+  integrity/size checks, cooperative deadline checks through VM/backup progress,
+  hashing and surrounding I/O, plus a non-destructive retention planner. Error
+  cleanup removes only the newly created matching inode; blocking OS I/O cannot
+  be forcibly cancelled by this in-process primitive.
 - `asgi.py`: optional bearer-authenticated ASGI factory for the frozen namespace;
   importing it does not construct an app or bind a socket. GET, reconcile and
   submit body reads share a configurable bounded request-body deadline, separate

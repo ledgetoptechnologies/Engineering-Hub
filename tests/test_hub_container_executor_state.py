@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import stat
+import time
 
 import pytest
 
@@ -11,6 +12,7 @@ from hub_container_executor.state import (
     copy_sqlite_generation,
     retention_plan,
 )
+from hub_container_executor import state as state_module
 
 
 def private_dir(path):
@@ -93,3 +95,189 @@ def test_retention_plan_preserves_current_and_unverified_previous_generation():
     assert plan.keep_ids == ("g2", "g3")
     with pytest.raises(StateCopyError, match="protected generations exceed"):
         retention_plan(generations, max_generations=1, max_storage_bytes=5)
+
+
+@pytest.fixture
+def copy_paths(tmp_path):
+    root = private_dir(tmp_path / "state")
+    source = root / "source.sqlite3"
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE fixture(v TEXT)")
+        db.execute("INSERT INTO fixture VALUES ('unchanged source')")
+    source.chmod(0o600)
+    return source, root / "copy.sqlite3"
+
+
+@pytest.mark.parametrize("deadline", [True, float("nan"), float("inf"), -float("inf"), "tomorrow", 10**1000])
+def test_invalid_copy_deadline_denied_without_destination(copy_paths, deadline):
+    source, destination = copy_paths
+    with pytest.raises(StateCopyError, match="invalid state-copy deadline"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024,
+                               deadline_monotonic=deadline)
+    assert not destination.exists()
+
+
+def test_already_expired_deadline_does_not_open_or_create_destination(copy_paths, monkeypatch):
+    source, destination = copy_paths
+    monkeypatch.setattr(state_module, "_private_dir", lambda *a: pytest.fail("Expired copy must not inspect paths"))
+    with pytest.raises(StateCopyError, match="cooperative deadline"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024,
+                               deadline_monotonic=time.monotonic() - 1)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("where", ["backup", "destination_connect", "destination_integrity"])
+def test_sqlite_errors_remove_only_new_partial_destination_and_close_connections(copy_paths, monkeypatch, where):
+    source, destination = copy_paths
+    original = sqlite3.connect
+    before = source.read_bytes()
+    opened, closed = [], []
+
+    class Connection(sqlite3.Connection):
+        def backup(self, target, **kwargs):
+            if where == "backup":
+                raise sqlite3.OperationalError("private SQL diagnostic")
+            return super().backup(target, **kwargs)
+
+        def execute(self, query, *args, **kwargs):
+            if where == "destination_integrity" and self is opened[-1] and len(opened) == 3 and query == "PRAGMA integrity_check":
+                raise sqlite3.OperationalError("private SQL diagnostic")
+            return super().execute(query, *args, **kwargs)
+
+        def close(self):
+            closed.append(self)
+            return super().close()
+
+    def connect(database, **kwargs):
+        if where == "destination_connect" and str(destination) in str(database):
+            raise sqlite3.OperationalError("private connection diagnostic")
+        connection = original(database, factory=Connection, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(state_module.sqlite3, "connect", connect)
+    with pytest.raises(StateCopyError, match="SQLite backup failed") as error:
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024)
+    assert not destination.exists() and source.read_bytes() == before
+    assert set(opened) == set(closed)
+    assert "private SQL" not in str(error.value) and str(source) not in str(error.value)
+
+
+def test_backup_page_callback_honors_deadline_and_cleans_partial_copy(copy_paths, monkeypatch):
+    source, destination = copy_paths
+    original = sqlite3.connect
+    now = [100.0]
+    callbacks = []
+    before = source.read_bytes()
+    monkeypatch.setattr(state_module.time, "monotonic", lambda: now[0])
+
+    class Connection(sqlite3.Connection):
+        def backup(self, target, *, pages, progress, sleep):
+            assert pages == 64 and sleep == .01
+
+            def tick(status, remaining, total):
+                callbacks.append((status, remaining, total))
+                now[0] = 101.0
+                return progress(status, remaining, total)
+
+            return super().backup(target, pages=pages, progress=tick, sleep=sleep)
+
+    monkeypatch.setattr(state_module.sqlite3, "connect", lambda database, **kw: original(database, factory=Connection, **kw))
+    with pytest.raises(StateCopyError, match="cooperative deadline"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024, deadline_monotonic=101.0)
+    assert callbacks and not destination.exists() and source.read_bytes() == before
+
+
+def test_integrity_check_uses_vm_progress_handler_and_deadline(copy_paths, monkeypatch):
+    source, destination = copy_paths
+    original = sqlite3.connect
+    now = [100.0]
+    handlers = []
+    monkeypatch.setattr(state_module.time, "monotonic", lambda: now[0])
+
+    class Connection(sqlite3.Connection):
+        def set_progress_handler(self, callback, steps):
+            assert steps == 1000
+            handlers.append(callback)
+            return super().set_progress_handler(callback, steps)
+
+        def execute(self, query, *args, **kwargs):
+            if query == "PRAGMA integrity_check":
+                now[0] = 101.0
+                assert handlers[-1]() == 1
+                raise sqlite3.OperationalError("interrupted")
+            return super().execute(query, *args, **kwargs)
+
+    monkeypatch.setattr(state_module.sqlite3, "connect", lambda database, **kw: original(database, factory=Connection, **kw))
+    with pytest.raises(StateCopyError, match="cooperative deadline"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024, deadline_monotonic=101.0)
+    assert handlers and not destination.exists()
+
+
+def test_hashing_checks_deadline_during_actual_chunks_and_copy_cleanup(copy_paths, monkeypatch):
+    source, destination = copy_paths
+    now = [100.0]
+    original_hash = state_module.hashlib.sha256
+    before = source.read_bytes()
+    monkeypatch.setattr(state_module.time, "monotonic", lambda: now[0])
+    updates = []
+
+    class Digest:
+        def __init__(self):
+            self.inner = original_hash()
+
+        def update(self, chunk):
+            self.inner.update(chunk)
+            updates.append(len(chunk))
+            now[0] = 101.0
+
+        def hexdigest(self):
+            return self.inner.hexdigest()
+
+    monkeypatch.setattr(state_module.hashlib, "sha256", Digest)
+    with pytest.raises(StateCopyError, match="cooperative deadline"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024, deadline_monotonic=101.0)
+    assert updates and not destination.exists() and source.read_bytes() == before
+
+
+def test_success_with_future_deadline_preserves_source_and_expected_digest(copy_paths):
+    import hashlib
+    source, destination = copy_paths
+    before = source.read_bytes()
+    report = copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024,
+                                    deadline_monotonic=time.monotonic() + 5)
+    assert source.read_bytes() == before
+    assert report.sha256 == "sha256:" + hashlib.sha256(destination.read_bytes()).hexdigest()
+
+
+def test_failure_cleanup_never_unlinks_a_replaced_destination(copy_paths, monkeypatch):
+    source, destination = copy_paths
+    def replace_then_fail(path, **kwargs):
+        replacement = destination.with_name("replacement.sqlite3")
+        replacement.write_bytes(b"operator replacement")
+        replacement.chmod(0o600)
+        replacement.replace(destination)
+        raise sqlite3.OperationalError("injected SQL error after replacement")
+
+    monkeypatch.setattr(state_module, "_hash_file", replace_then_fail)
+    with pytest.raises(StateCopyError, match="SQLite backup failed"):
+        copy_sqlite_generation(source, destination, maximum_bytes=1024 * 1024)
+    assert destination.read_bytes() == b"operator replacement"
+
+
+def test_actual_sqlite_vm_progress_interrupts_long_query_at_deadline(copy_paths):
+    source, _ = copy_paths
+    deadline = time.monotonic() + 0.15
+    connection = state_module._copy_connection(source, readonly=True, deadline=deadline)
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            # No injected clock/query/connection: the real SQLite VM calls the
+            # installed progress handler while executing this bounded counter.
+            connection.execute("""WITH RECURSIVE n(x) AS (
+                VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000
+            ) SELECT sum(x) FROM n""").fetchone()
+        assert time.monotonic() >= deadline
+        assert time.monotonic() - started < 3
+    finally:
+        connection.close()
