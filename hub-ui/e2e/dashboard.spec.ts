@@ -194,6 +194,46 @@ async function emitRegistry(page: Page, kind: string, overrides: Record<string, 
   }, { kind, overrides });
 }
 
+test("colon topic passes strict ingress without discarding task or decision records", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  await page.route("**/api/hub/v1/topics/**", async (route) => {
+    if (new URL(route.request().url()).pathname.includes("%"))
+      return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) });
+    return route.fallback();
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await page.getByLabel("TOPIC ROOT").fill("ops:alerts");
+  const peers = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/topics/ops:alerts/peers");
+  await page.getByRole("button", { name: "Check", exact: true }).click();
+  expect((await peers).status()).toBe(200);
+  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await expect(page.getByText(mock.overview.decisions[0].title, { exact: true })).toBeVisible();
+  await expect(page.getByText(mock.overview.tasks[0].title, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  await expect(page.locator("#agents").getByRole("alert")).toHaveCount(0);
+});
+
+test("topic ingress rejection remains panel-local but overview ingress rejection clears private records", async ({ page }) => {
+  await mockLive(page);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
+  await page.getByLabel("TOPIC ROOT").fill("ops:alerts");
+  await page.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(page.locator("#agents").getByRole("alert")).toContainText("rejected by ingress");
+  await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  await expect(page.locator(".peer-row")).toHaveCount(0);
+  await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
+  await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Sign in to Engineering Hub." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toHaveCount(0);
+  await expect(page.getByText("Verify the isolated Viewer staging candidate")).toHaveCount(0);
+});
+
 for (const typed of [false, true]) {
   test(`topic ACL denial stays panel-local for ${typed ? "typed" : "default"} topic`, async ({ page }) => {
     await page.clock.install({ time: NOW });

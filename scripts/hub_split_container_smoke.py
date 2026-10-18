@@ -115,6 +115,87 @@ print(json.dumps({'split_image_smoke': 'passed', 'build_commit': expected_commit
 '''
 
 
+SEED_RECORDS = r'''
+import json, os
+from pathlib import Path
+from engineering_hub.repository import HubRepository
+# Isolated test-data setup only: never manufactures a browser cookie, changes
+# an auth guard, enrolls a pilot owner, or writes to an operator database.
+database = Path(os.environ['HUB_DB'])
+fixture = database.parent / '.split-records.json'
+fd = os.open(fixture, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, 'w') as stream:
+    repo = HubRepository(database)
+    task = repo.create_task('human:123', 'treedar', 'Isolated durable split task', 'split-durable-fixture')
+    json.dump({'schema': 1, 'task': task, 'decision': None}, stream, separators=(',', ':'))
+    stream.flush()
+    os.fsync(stream.fileno())
+'''
+
+
+DURABILITY_PROBE = r'''
+import json, os, sys, time, urllib.error, urllib.request
+from pathlib import Path
+from uuid import UUID
+phase = int(sys.argv[1])
+assert phase in (0, 1)
+fixture = Path(os.environ['HUB_DB']).parent / '.split-records.json'
+assert fixture.stat().st_mode & 0o777 == 0o600, 'Fixture record permissions mismatch'
+state = json.loads(fixture.read_text())
+assert state['schema'] == 1
+assert str(UUID(state['task']['id'])) == state['task']['id']
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+deadline = time.monotonic() + 30
+
+def api(agent, path, payload=None):
+    remaining = deadline - time.monotonic()
+    assert remaining > 0, 'Durability request deadline expired'
+    headers = {'Host': 'hub.ledgetoptechnologies.com', 'Content-Type': 'application/json',
+               'Authorization': 'Bearer ' + os.environ[agent.upper() + '_TOKEN']}
+    body = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request('http://127.0.0.1:8770/api/hub/v1' + path,
+                                     headers=headers, data=body)
+    with opener.open(request, timeout=min(2, remaining)) as response:
+        assert response.status == (201 if path == '/decisions' and body is not None else 200)
+        data = response.read(1024 * 1024 + 1)
+        assert len(data) <= 1024 * 1024, 'Oversized durability response'
+        return json.loads(data)
+
+if phase == 0:
+    assert state['task']['revision'] == 1 and state['task']['status'] == 'assigned'
+    assert state['decision'] is None, 'Durability setup must not replay existing work'
+    claimed = api('codex', '/tasks/' + state['task']['id'] + '/claim', {'expected_revision': 1})
+    assert claimed['id'] == state['task']['id'] and claimed['revision'] == 2
+    assert claimed['owner'] == 'codex' and claimed['status'] == 'claimed'
+    decision = api('hermes', '/decisions', {'project': 'treedar', 'title': 'Isolated durable split decision',
+                                          'options': ['hold', 'review'], 'protected': False})
+    assert str(UUID(decision['id'])) == decision['id']
+    assert decision['revision'] == 1 and decision['status'] == 'open'
+    assert decision['execution_authorization'] is False
+    state.update(task=claimed, decision=decision)
+    with fixture.open('w') as stream:
+        json.dump(state, stream, separators=(',', ':'))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+assert state['task']['title'] == 'Isolated durable split task'
+assert state['task']['project'] == 'treedar' and state['task']['revision'] == 2
+assert state['task']['owner'] == 'codex' and state['task']['status'] == 'claimed'
+assert state['decision']['title'] == 'Isolated durable split decision'
+assert state['decision']['project'] == 'treedar' and state['decision']['revision'] == 1
+assert state['decision']['status'] == 'open' and state['decision']['answer'] is None
+assert state['decision']['options'] == ['hold', 'review'] and state['decision']['protected'] is False
+assert state['decision']['execution_authorization'] is False
+for agent in ('hermes', 'codex', 'claude'):
+    assert api(agent, '/tasks/' + state['task']['id']) == state['task'], 'Durable task mismatch'
+    decisions = api(agent, '/decisions')['items']
+    matches = [item for item in decisions if item['id'] == state['decision']['id']]
+    assert matches == [state['decision']], 'Durable decision mismatch'
+print(json.dumps({'durable_records_verified': True, 'authenticated_readers': 3,
+                  'durable_task_decision_recreation': phase == 1}))
+'''
+
+
 def _validate(image, commit):
     if (not isinstance(image, str) or not re.fullmatch(
             r"ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|"
@@ -177,13 +258,20 @@ def smoke(image, commit):
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
             assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 9
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
+            if iteration == 0:
+                run("docker", "exec", name, "python", "-c", SEED_RECORDS)
+            durable = json.loads(run("docker", "exec", name, "python", "-c", DURABILITY_PROBE,
+                                     str(iteration), timeout=45))
+            assert durable["durable_records_verified"] is True and durable["authenticated_readers"] == 3
+            assert durable["durable_task_decision_recreation"] is (iteration == 1)
             marker = "from pathlib import Path; p=Path('/var/lib/hub/.split-smoke'); "
             marker += ("p.write_text('isolated-split-fixture')" if iteration == 0 else
                        "assert p.read_text() == 'isolated-split-fixture'")
             run("docker", "exec", name, "python", "-c", marker)
             remove_owned("container", name, owner)
             names.remove(name)
-        return {**report, "named_volume_recreation": "passed", "truenas": "not_deployed",
+        return {**report, "named_volume_recreation": "passed", "durable_task_decision_recreation": True,
+                "truenas": "not_deployed",
                 "registry_publication": "not_tested", "autonomous_pilot": "not_tested"}
     finally:
         # Reuse existing ownership-verifying reconciliation. If container state

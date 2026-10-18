@@ -42,6 +42,10 @@ async def test_real_sockets_share_one_core_and_enforce_roles(config):
             # Secure cookie to public HTTPS, not directly to the test HTTP hop.
             cookie = client.cookies.get(config.auth_config.cookie_name)
             browser_headers = {**SIGNED, "Cookie": config.auth_config.cookie_name + "=" + cookie}
+            topic = await client.get(browser_url + BASE + "/topics/ops:alerts/peers", headers=browser_headers)
+            assert topic.status_code == 200 and topic.json()["topic"] == "ops:alerts"
+            encoded = await client.get(browser_url + BASE + "/topics/ops%3Aalerts/peers", headers=browser_headers)
+            assert encoded.status_code == 403  # Keep the raw-path boundary strict.
             me = (await client.get(browser_url + BASE + "/auth/me", headers=browser_headers)).json()
             csrf = {**browser_headers, "Origin": ORIGIN, "X-Hub-CSRF": me["csrf_token"]}
             created = await client.post(browser_url + BASE + "/tasks", headers=csrf, json={

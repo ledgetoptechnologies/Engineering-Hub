@@ -74,6 +74,10 @@ def simulation(monkeypatch, module, *, fail=None):
             stdout = json.dumps({"split_image_smoke": "passed", "build_commit": "b" * 40 if fail == "probe" else commit,
                                  "authenticated_agents": 3, "mcp_tools": 9, "agent_bind": "0.0.0.0:8770",
                                  "browser_bind": "127.0.0.1:8771", "human_sign_in": "not_tested", "network": "none"})
+        elif args[1] == "exec" and args[-2] == module.DURABILITY_PROBE:
+            stdout = json.dumps({"durable_records_verified": fail != "durable",
+                                 "authenticated_readers": 3,
+                                 "durable_task_decision_recreation": args[-1] == "1"})
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake)
@@ -103,15 +107,21 @@ def test_plan_hardening_split_entrypoint_recreation_and_owned_cleanup(monkeypatc
         assert all("synthetic-split-" in value for value in env if "_TOKEN=" in value)
     probes = [call for call in calls if call[1] == "exec" and call[-2] == module.PROBE]
     assert len(probes) == 2 and all(call[-1] == commit for call in probes)
-    markers = [call[-1] for call in calls if call[1] == "exec" and call[-2] == "-c"]
+    seeds = [call for call in calls if call[1] == "exec" and call[-1] == module.SEED_RECORDS]
+    assert len(seeds) == 1
+    durability = [call for call in calls if call[1] == "exec" and call[-2] == module.DURABILITY_PROBE]
+    assert len(durability) == 2 and [call[-1] for call in durability] == ["0", "1"]
+    markers = [call[-1] for call in calls if call[1] == "exec" and call[-2] == "-c"
+               and ".split-smoke" in call[-1]]
     assert "write_text" in markers[0] and "read_text" in markers[1]
     assert report["named_volume_recreation"] == "passed" and report["registry_publication"] == "not_tested"
     assert report["truenas"] == "not_deployed" and report["autonomous_pilot"] == "not_tested"
+    assert report["durable_task_decision_recreation"] is True
     assert not containers and not volumes
     assert calls[-1][1:3] == ["volume", "inspect"]
 
 
-@pytest.mark.parametrize("fail", ["partial_run", "profile", "probe"])
+@pytest.mark.parametrize("fail", ["partial_run", "profile", "probe", "durable"])
 def test_failed_run_profile_or_probe_reconciles_owned_objects(monkeypatch, fail):
     module = load(monkeypatch)
     calls, containers, volumes, commit = simulation(monkeypatch, module, fail=fail)
@@ -187,3 +197,84 @@ def test_probe_request_transport_sets_host_and_bounds_body_and_timeout(monkeypat
     with pytest.raises(TimeoutError):
         namespace["request"](port, "/api/hub/v1/overview")
     assert len(requests) == 1
+
+
+def test_durable_fixture_probes_actual_api_records_and_rejects_mismatch(monkeypatch, tmp_path, capsys):
+    import sys
+    import urllib.request
+    from fastapi.testclient import TestClient
+    from agent_message_bus.auth import AuthSettings
+    from engineering_hub.app import Settings, create_app
+    from engineering_hub.auth import AuthConfig
+
+    module = load(monkeypatch)
+    database = tmp_path / "hub.db"
+    monkeypatch.setenv("HUB_DB", str(database))
+    for name in ("hermes", "codex", "claude"):
+        monkeypatch.setenv(name.upper() + "_TOKEN", "synthetic-" + name)
+    exec(compile(module.SEED_RECORDS, "<seed-unit>", "exec"), {})
+    metadata = tmp_path / ".split-records.json"
+    saved = json.loads(metadata.read_text())
+    assert saved["task"]["revision"] == 1 and saved["decision"] is None
+    # The packaged test runs on Linux. Windows cannot report Unix permission
+    # bits, so this transport unit supplies the Linux metadata for this one file.
+    original_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == metadata:
+            return SimpleNamespace(st_mode=0o100600)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    active_http = [None]
+    requests = []
+
+    class Response:
+        def __init__(self, response):
+            self.response, self.status = response, response.status_code
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, limit):
+            return self.response.content[:limit]
+
+    class Opener:
+        def open(self, request, timeout):
+            assert request.full_url.startswith("http://127.0.0.1:8770/api/hub/v1/")
+            assert request.get_header("Host") == "hub.ledgetoptechnologies.com"
+            assert request.get_header("Authorization") in {"Bearer synthetic-" + name for name in ("hermes", "codex", "claude")}
+            requests.append(request.get_method())
+            response = active_http[0].request(request.get_method(), request.full_url,
+                                             headers=dict(request.headers), content=request.data)
+            return Response(response)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Opener())
+    settings = Settings(database, AuthSettings("synthetic-hermes", "synthetic-codex",
+                        claude_token="synthetic-claude"), AuthConfig("https://hub.ledgetoptechnologies.com"),
+                        ingress_mode="agents")
+    for phase in (0, 1):
+        # A fresh app simulates process recreation for probe unit coverage;
+        # only the separate actual Docker run proves packaged recreation.
+        with TestClient(create_app(settings)) as http:
+            active_http[0] = http
+            before = len(requests)
+            monkeypatch.setattr(sys, "argv", ["probe", str(phase)])
+            exec(compile(module.DURABILITY_PROBE, "<durable-unit>", "exec"), {})
+            report = json.loads(capsys.readouterr().out)
+            assert report["durable_records_verified"] is True
+            assert report["durable_task_decision_recreation"] is (phase == 1)
+            if phase == 1:
+                assert set(requests[before:]) == {"GET"}  # No replay during verification.
+    assert requests.count("POST") == 2  # One claim and one agent decision, only in phase zero.
+    state = json.loads(metadata.read_text())
+    from engineering_hub.repository import HubRepository
+    HubRepository(database).set_candidate("codex", state["task"]["id"], 2, "a" * 40)
+    with TestClient(create_app(settings)) as http:
+        active_http[0] = http
+        monkeypatch.setattr(sys, "argv", ["probe", "1"])
+        with pytest.raises(AssertionError, match="Durable task mismatch"):
+            exec(compile(module.DURABILITY_PROBE, "<durable-unit>", "exec"), {})

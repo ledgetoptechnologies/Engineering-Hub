@@ -828,3 +828,57 @@ all NAS administration for himself; no agent NAS inspection/change is allowed
 under the current scope. Operator instructions remain gated on a published image.
 Actual Cloudflare login, NAS/LAN isolation, app/reboot acceptance, trusted host
 providers and an owned autonomous pilot remain required. Overall goal incomplete.
+
+### Stronger shared-record recreation probe
+
+The subsequent smoke-helper enhancement was run against that same packaged
+`6531c742...` image and passed. It seeds one synthetic human-owned fixture task
+through the repository (not a fabricated browser session), claims it through the
+Codex bearer API and creates an open non-authorizing decision through Hermes's
+bearer API. All three agent identities read exact resulting records. After
+container replacement, only GETs verify the original task/decision IDs, full
+fields, status, owner and revisions against private saved expectations. Report:
+`durable_task_decision_recreation: true`. No task/decision is recreated or replayed
+in the replacement. Unit evidence: **31 passed**, one existing warning; includes
+fresh-app transport and deliberately mutated-record failure. This strengthens
+record persistence evidence, not browser authentication or autonomous execution.
+
+The enhanced helper/tests full Linux snapshot index
+`sha256:da8928790b1fd5252341a6e7aa3b99bb5757e28b99876cc88e4fb940c286e347`
+passed **2,133 tests in 80.98 seconds**, exit0, with the same Starlette and
+unclosed-event-loop warning classes. Independent helper review ran its scoped
+18 tests and accepted exact-record and negative mutation coverage.
+
+Claude's review identified a valid legacy topic containing a colon being encoded
+as `%3A`, rejected by strict ingress and treated by UI as global session loss.
+The UI now validates the exact legacy alphabet before HTTP and preserves literal
+colons; topic-specific ingress denial stays local while real auth/global ingress
+denials still clear private state. Canonical registry streaming retains its
+separate narrower alphabet, not a new colon-support claim. UI unit19, full
+Playwright32 and production build passed; independent API review10 passed.
+A real two-socket regression also proved literal-colon peers200 while encoded
+colon remains403 (10 server tests passed). That server-test assertion and the UI
+changes followed the Linux snapshot above; do not imply it included them.
+Both GitHub workflows for prior head7935ef4 succeeded (39166678653/39166678655),
+including actual packaged split smoke; updated source still needs fresh CI.
+
+### Actual application pilot: concrete remaining host composition
+
+Read-only comparison with host overlay `e5ed4d3` confirms the concrete Engine
+backend exists but is not integrated into the control checkout. Actual acceptance
+still needs protected content-addressed/build enrollment, installed-driver
+measurement, immutable private test-secret versions, healthy baseline enrollment,
+exclusive bounded candidate/rollback state generations, and a durable private
+operation journal. Existing mocks do not supply those trusted implementations.
+The explicit application-pilot acceptance entrypoint is still disabled.
+
+Two specific compatibility gates were identified: the host profile rejects the
+control image's fixed `HUB_DB` default, and the pilot requires UID/GID10001 rather
+than the control deployment's568. Resolve these with exact profile/default and
+private-state permission evidence; do not broadly waive environment checks or
+change the working control image just to pass. The isolated pilot expects the
+combined internal8770 target, not the production split-listener layout. Mid-effect
+unknown successes deliberately remain held; durable completed-command recovery
+must not be reported as arbitrary successful crash continuation. Hermes request
+`861ce3b6-44ab-4ad9-a4a2-7774e1be9c73` asks for the bounded source/provider
+composition and isolated evidence only, with all NAS administration excluded.

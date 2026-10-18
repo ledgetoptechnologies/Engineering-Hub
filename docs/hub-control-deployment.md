@@ -13,6 +13,9 @@ Beau owns all TrueNAS administration. Agents prepare/review source, images and
 instructions; they must not inspect or change NAS management, containers, ACLs,
 mounts or services on his behalf without new explicit authorization. Beau
 confirmed the existing cloudflared connector runs on this NAS with host networking.
+The NAS clock must be synchronized: Access assertions use strict issued-at,
+not-before and expiry checks. A clock error can deny sign-in; verify time sync
+rather than bypassing JWT validation or extending accepted token lifetimes.
 
 The candidate `--split-ingress` entry point binds the agent front door on the
 existing Hub port8770 and the browser front door **only** on `127.0.0.1:8771`.
