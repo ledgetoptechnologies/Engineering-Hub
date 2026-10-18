@@ -597,3 +597,56 @@ cgroup field/create/readback and numerical API-floor rejection are required
 before accepting the host against `ca5d0a0`. Concrete providers, generation
 exclusion and actual autonomous app/rollback/SIGKILL acceptance are still gates.
 The review checkout remains isolated for follow-up; it is not a deployed service.
+
+## Cloudflare human authentication and canonical alias
+
+Beau selected Cloudflare Access human authentication as an alternative to the
+previous GitHub-only dashboard setup. Source commit
+`68adb7333a5819c98a109832f5fb2646951e8b78` adds explicit provider configuration,
+RS256/team issuer/EH-specific audience/expiry/exact-email validation, bounded
+on-demand JWKS handling, a hashed local session bound to the verified identity,
+and the existing exact-Origin/CSRF human-write protection. No fallback to GitHub
+or agent bearers exists in Cloudflare mode. New human actors propagate through
+repository authorization, decision DTOs and explicitly scoped registry readers.
+
+Canonical browser origin is `https://eh.ledgetopdroneservices.com`; configured
+navigation alias `https://eh.ledgetoptechnologies.com` redirects to the fixed
+canonical root without query strings. Alternate-host API/MCP and non-GET/HEAD
+requests fail 421 before authentication/route effects. These addresses and the
+two user-approved exact emails are documented deployment inputs, not activated
+DNS, TLS, Access application or policy evidence.
+
+Frozen isolated validation index:
+`sha256:a5a4cca1ead2b7caa1d83ca147c50fe2a045d13181a508d63bf6317244e0088c`.
+The full Linux suite completed **1,942 passed**, one existing Starlette/httpx
+deprecation warning, **72.48 seconds**, exit 0, in the network-none/read-only,
+non-root, cap-drop/private-tmpfs harness with no host socket/mount/port or live
+credential. This includes real RSA signature verification against synthetic
+JWKS transport, real ASGI human/agent API integration, and Linux ownership-loss
+and additive-session-schema rollback cases. An earlier frozen run was 1,941
+passed/one failed because the checked-in OpenAPI human-actor regex was stale;
+the existing exporter produced exactly that one-line schema update, and the
+entire suite was rebuilt and rerun successfully rather than ignoring the check.
+
+Additional evidence: **250 passed/four expected Linux-only skips** in the focused
+Windows auth/API/repository/DTO/registry/Compose suite before the generated-schema
+refresh; generated-contract check separately passed. Dashboard Vitest **18
+passed**, TypeScript/Vite production build passed, and Playwright/Edge **30
+passed**, including the new verified-email/Cloudflare profile view. Independent
+review found no remaining auth/alias issue in the reviewed delta. Documentation
+and reviewed source are not a live security-policy acceptance result.
+
+Read-only public HTTPS observation of Ops returned 302 to
+`ledgetoptechnologies.cloudflareaccess.com`; no cookies or query values were
+recorded. Verify the real Zero Trust account, separate EH application audience,
+allowed/denied identities, origin topology, both hostname certificates, and SSO
+behavior before enabling. Existing Ops policy and agent bus remain unchanged;
+baseline `2001ee7` has no diff in bus source/root Dockerfile/root bus Compose or
+GitHub workflows. No TrueNAS activation, actual Access login, autonomous host
+pilot, host reboot, or missing trusted host/registry provider acceptance is
+claimed. Overall release remains incomplete.
+
+Coordination INFOs were accepted by the bus as
+Hermes `a0641515-7c52-44ed-9942-a371358097c6` and
+Claude `b985188d-f31d-4f9b-8fd3-01e8c9b492d1`, on the existing build correlation.
+Acceptance is not evidence of peer wake, processing or deployment permission.
