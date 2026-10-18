@@ -8,7 +8,11 @@ from hub_dashboard_container_smoke import PROBE
 
 
 def run(*args, timeout=60):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        # This helper accepts only fixed synthetic fixtures, never live tokens.
+        raise RuntimeError('Release fixture command failed: ' + (error.stderr or '')[:4096]) from None
 
 
 def owned_exists(kind, name, owner):
@@ -41,9 +45,7 @@ def smoke(image, commit):
     owner = uuid.uuid4().hex
     volume = "hub-release-state-" + owner
     names = []
-    anchor = "opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))"
-    assert PROBE.count(anchor) == 1
-    probe = PROBE.replace(anchor, anchor + "\nopener.addheaders = [('Host', 'hub.ledgetoptechnologies.com')]")
+    probe = PROBE
     try:
         run("docker", "volume", "create", "--label", "hub.release-owner=" + owner, volume)
         for iteration in range(2):

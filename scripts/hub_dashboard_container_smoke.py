@@ -13,7 +13,9 @@ import uuid
 
 PROBE = r'''
 import json, os, re, sys, time, urllib.request, urllib.error
+from urllib.parse import urlsplit
 base = 'http://127.0.0.1:8770'
+expected_host = urlsplit(os.environ['HUB_BASE_URL']).netloc
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 deadline = time.monotonic() + 20
 assert os.getuid() == 568 and os.getgid() == 568
@@ -29,7 +31,8 @@ def get(path):
     if remaining <= 0:
         raise TimeoutError('Smoke deadline expired')
     try:
-        with opener.open(base + path, timeout=min(1, remaining)) as r:
+        request = urllib.request.Request(base + path, headers={'Host': expected_host})
+        with opener.open(request, timeout=min(1, remaining)) as r:
             return read(r)
     except urllib.error.HTTPError as r:
         with r:
@@ -72,7 +75,7 @@ expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_ca
                   'hub_task_review', 'hub_decision_request', 'hub_run_list',
                   'hub_topic_peers', 'hub_topic_preflight'}
 def rpc(method, params, token):
-    headers = {'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
+    headers = {'Host': expected_host, 'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
                'MCP-Protocol-Version': '2025-06-18'}
     if token is not None:
         headers['Authorization'] = 'Bearer ' + token
