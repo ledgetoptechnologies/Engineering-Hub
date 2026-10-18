@@ -10,6 +10,7 @@
 **/test-results
 **/playwright-report
 .test-tmp*
+**/.test-data
 data
 *.sqlite3
 *.jsonl

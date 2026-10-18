@@ -15,6 +15,7 @@ RUN uv sync --locked --group test --no-editable
 COPY tests ./tests
 COPY hub_executor ./hub_executor
 COPY hub_container_executor ./hub_container_executor
+COPY hub_validation_worker ./hub_validation_worker
 COPY scripts ./scripts
 COPY contracts ./contracts
 COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml compose.hub-test.yaml ./
