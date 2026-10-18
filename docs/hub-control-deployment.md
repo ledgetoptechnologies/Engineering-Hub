@@ -9,14 +9,13 @@ its compiled dashboard plus the independent Hub API/MCP on container port 8770.
 
 ## Preconditions and private storage
 
-- Choose a dedicated, protected **local ZFS** dataset directory for Hub state.
-  Set `HUB_STATE_DIRECTORY` to its absolute host path. Verify the actual mount
-  backing it: it must not be SMB, NFS, the bus state directory, a checkout, or a
-  processing data share. Production and staging must use different directories.
-- Create the directory outside Compose with ownership UID/GID `10001:10001` and
-  owner-only directory permissions, or equivalently restrictive TrueNAS ACLs.
-  Preserve required administrator recovery access. Verify inherited ACLs; do not
-  recursively change ownership of a pool, existing share, or unrelated data.
+- Create `/mnt/Plugins/App_Data/Agent_MCP/engineering-hub` on the NAS's local
+  ZFS storage, under the established MCP parent but never sharing its database.
+  This follows the owner-supplied `Current-MCP.yaml` mount hierarchy. Do not use
+  an SMB/NFS client mount or mount the whole parent into Hub.
+- Only this new child directory needs UID/GID `568:568` and owner rwx access
+  (or restrictive equivalent TrueNAS ACLs with administrator recovery access).
+  Verify inherited ACLs. Never recursively chown the parent, pool, or bus data.
   `create_host_path: false` intentionally rejects a missing directory.
 - Hub stores its SQLite database, WAL and session tables in `/var/lib/hub`.
   No Docker socket, host source tree, SMB mount or bus database is exposed.
@@ -29,17 +28,27 @@ its compiled dashboard plus the independent Hub API/MCP on container port 8770.
 
 ## Image and configuration gate
 
-Set `HUB_CONTROL_IMAGE` to an independently reviewed, tested control-image
-reference ending in `@sha256:` plus exactly 64 lowercase hexadecimal characters.
-Record that digest and source revision in release evidence. **Compose's required
-string interpolation does not enforce immutable image syntax.** Before pulling
-or starting, reject tag-only references and validate the image against the
-reviewed build/provenance record. This validation example prints no environment
-values and performs no deployment:
+The operator Compose uses
+`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest` with
+`pull_policy: always`, per Beau's main-built moving-image requirement. A moving
+reference does not enforce immutable image syntax; exact registry digests and
+source revisions belong in release/rollback evidence, not this default Compose.
+The separate `.github/workflows/hub-control.yml` verifies the source, builds from
+that exact main commit, checks private authenticated registry read and isolated
+startup, then promotes the tested digest to `latest` and reads it back. PRs
+validate only and cannot publish. A plain restart does not pull an updated image.
 
-```sh
-python -c "import os,re; assert re.fullmatch(r'[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}', os.environ.get('HUB_CONTROL_IMAGE','')), 'An immutable reviewed image digest is required'"
-```
+The package stays private. Configure authenticated GHCR pulls in TrueNAS using
+an authorized GitHub account and a PAT (classic) with `read:packages`, including
+any required organization SSO authorization. Existing registry credentials may
+work if they can read this separate package. Never put the registry PAT in Git,
+chat or Compose. CI's ephemeral GitHub token is not an installation credential.
+Authenticated CI access does not prove the NAS's own credentials are enrolled.
+
+Only replace the three existing agent-token placeholders locally in the private
+TrueNAS application configuration. Leave the human-auth fields empty until the
+separate authentication setup is approved and verified. No hidden env file or
+source build on TrueNAS is required.
 
 The profile limits the service to a read-only non-root filesystem, one CPU,
 512 MiB memory without extra swap, 128 processes, and a 64 MiB restricted tmpfs.
@@ -49,18 +58,24 @@ No runtime Docker administration or untrusted build execution belongs here.
 
 ## Private ingress and authentication
 
-The only host publication is `127.0.0.1:8770`. There is no direct LAN or public
-listener. Use an independently reviewed private HTTPS reverse proxy on the same
-host, with LAN/VPN access restrictions. A containerized proxy cannot reach host
-loopback using its own loopback: review a host-reachable arrangement before
-changing networking. Do not casually publish Hub on all interfaces.
+Networking intentionally matches the owner's current MCP: `network_mode: host`.
+Hub listens on NAS port 8770; the existing MCP remains on 8765. Ensure 8770 is
+free before installation. There are no Docker port mappings or Hub bridge
+network to join. This is a LAN-reachable listener, not loopback-only isolation.
+Existing firewall/Access policy is unchanged, and application auth still applies.
+
+For a future operator-configured tunnel, a connector able to reach the NAS can
+use `http://192.168.50.80:8770`. Only a connector using host networking on this
+same NAS can use `http://127.0.0.1:8770`; a bridge/remote connector's own localhost
+is wrong. Do not change any existing route as part of publication. Browser origin
+is exactly `https://hub.ledgetoptechnologies.com`, without aliases.
 
 Set `HUB_BASE_URL` to the exact HTTPS origin used by browsers and agents, without
 a path or wildcard. The proxy must preserve the configured Host, forward SSE
 without buffering, and maintain authenticated transport for `/mcp/` and the API.
 The application uses that origin for OAuth redirects, cookie security, CSRF and
 MCP DNS-rebinding checks. Do not disable those checks to repair a proxy mismatch.
-If using `HUB_ALLOWED_IPS`, verify the actual authenticated proxy/client address
+If using `AGENT_BUS_ALLOWED_IPS`, verify the actual authenticated proxy/client address
 seen by the application; do not assume it matches the bus's allowlist. Do not
 trust arbitrary forwarded-IP headers or enable wildcard CORS.
 
@@ -85,14 +100,14 @@ This is source/configuration support, **not a created Access application, DNS
 record, tunnel route, changed Ops policy, or live authentication acceptance**.
 
 Beau's latest choice is a single browser origin:
-`https://eh.ledgetoptechnologies.com`. This supersedes the earlier two-hostname
+`https://hub.ledgetoptechnologies.com`. This supersedes the earlier two-hostname
 plan. Do not configure the drone-services EH hostname or an alias redirect.
 
 Supply the following through the protected Hub deployment environment:
 
 ```dotenv
 HUB_HUMAN_AUTH_MODE=cloudflare_access
-HUB_BASE_URL=https://eh.ledgetoptechnologies.com
+HUB_BASE_URL=https://hub.ledgetoptechnologies.com
 HUB_ALTERNATE_ORIGINS=
 HUB_CF_ACCESS_ISSUER=https://ledgetoptechnologies.cloudflareaccess.com
 HUB_CF_ACCESS_AUDIENCE=<exact-EH-application-AUD-not-Ops-AUD>
@@ -115,10 +130,9 @@ redirect is required for this deployment. The generic code's optional alias
 support does not activate an alias by itself. Configure machine access separately
 from the human-only browser Access policy.
 
-The loopback port binding remains unchanged. A `cloudflared` container cannot
-reach `127.0.0.1:8770` in the host namespace through its own loopback. Review the
-actual existing connector/proxy topology before selecting its private origin;
-do not expose 8770 to the whole LAN or mount a Docker socket as a shortcut.
+The host-networking/tunnel instructions above apply. No tunnel, DNS record or
+Access application was created or modified by image publication. Real ingress
+and authentication remain separate owner-run setup and acceptance steps.
 
 EH validates `Cf-Access-Jwt-Assertion` cryptographically with RS256, the exact team
 issuer and EH audience, mandatory expiry/issued-at/subject/email/app-type claims,
@@ -181,13 +195,10 @@ bridge, real host executor or Viewer pilot is activated by this deployment.
 
 ## Explicit activation and restart acceptance
 
-Only after the preconditions and reviewed release gates pass should the operator
-explicitly select this standalone file and `hub-control` profile. An example
-activation command is shown for the operator; it has not been run:
-
-```sh
-docker compose -f compose.hub-control.yaml --profile hub-control up -d
-```
+Only after preconditions and release checks pass should the operator install
+this standalone Compose using TrueNAS Custom Apps. Publication does not install
+it. Use TrueNAS's supported update/redeploy path with image pulling enabled for
+future versions; do not independently manage middleware-generated containers.
 
 `restart: unless-stopped` applies only after the operator creates/starts this
 service. It does not auto-create it, test boot readiness, or enable an executor.

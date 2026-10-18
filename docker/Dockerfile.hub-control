@@ -28,10 +28,10 @@ COPY --from=dashboard /ui/dist /app/dashboard
 # Bake identity into the installed package; runtime VCS_REF cannot override it.
 # An unlabelled developer build stays unknown; malformed claimed IDs fail build.
 RUN python -c "import importlib.resources as r,json,os,re,sys; ref=os.environ['VCS_REF']; ref == 'unknown' or re.fullmatch('[0-9a-f]{40}',ref) or sys.exit('VCS_REF must be unknown or lowercase 40-character SHA'); r.files('engineering_hub').joinpath('_build_identity.json').write_text(json.dumps({'schema_version':1,'build_commit':None if ref == 'unknown' else ref},separators=(',',':')),encoding='utf-8')"
-RUN groupadd --system --gid 10001 hub \
-    && useradd --system --uid 10001 --gid hub --no-create-home hub \
+RUN groupadd --system --gid 568 hub \
+    && useradd --system --uid 568 --gid hub --no-create-home hub \
     && mkdir -p /var/lib/hub && chown hub:hub /var/lib/hub && chmod 0700 /var/lib/hub
-USER 10001:10001
+USER 568:568
 EXPOSE 8770
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["python", "-c", "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"]

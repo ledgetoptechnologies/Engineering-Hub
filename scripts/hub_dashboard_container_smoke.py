@@ -16,7 +16,7 @@ import json, os, re, sys, time, urllib.request, urllib.error
 base = 'http://127.0.0.1:8770'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 deadline = time.monotonic() + 20
-assert os.getuid() == 10001 and os.getgid() == 10001
+assert os.getuid() == 568 and os.getgid() == 568
 expected_commit = sys.argv[1] if len(sys.argv) == 2 else None
 
 def read(response):
@@ -116,9 +116,9 @@ def run_smoke(image, expected_commit=None):
     run = [
         'docker', 'run', '--detach', '--pull', 'never', '--name', name,
         '--label', 'engineering-hub.smoke-owner=' + owner, '--network', 'none',
-        '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--user', '568:568', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
         '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
-        '--tmpfs', '/var/lib/hub:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700',
+        '--tmpfs', '/var/lib/hub:rw,noexec,nosuid,size=64m,uid=568,gid=568,mode=0700',
         '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
         '--env', 'HERMES_TOKEN=fixture-only-hermes-not-a-service-token',
         '--env', 'CODEX_TOKEN=fixture-only-codex-not-a-service-token',

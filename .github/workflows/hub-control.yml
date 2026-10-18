@@ -1,0 +1,121 @@
+name: Engineering Hub control image
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hub-control-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.17'
+          python-version: '3.12'
+      - run: uv sync --locked
+      - run: uv run --locked python -W default -m pytest -q
+      - run: npm ci --ignore-scripts && npm test && npm run build && npx playwright install --with-deps chromium && npm run test:e2e
+        working-directory: hub-ui
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: docker/Dockerfile.hub-control
+          load: true
+          push: false
+          build-args: VCS_REF=${{ github.sha }}
+          tags: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Isolated UID 568 startup and named-volume recreation
+        run: python scripts/hub_release_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PACKAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control
+      BUILD_IMAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.hub-control
+          load: true
+          push: false
+          build-args: VCS_REF=${{ github.sha }}
+          tags: ${{ env.BUILD_IMAGE }}
+      - name: Test the exact publication candidate before upload
+        run: python scripts/hub_release_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-startup.json
+      - name: Publish unique build tag and verify authenticated registry read
+        run: |
+          set -eu
+          docker push "$BUILD_IMAGE"
+          docker buildx imagetools inspect "$BUILD_IMAGE" --raw > hub-registry-manifest.json
+          docker buildx imagetools inspect "$BUILD_IMAGE" --format '{{json .Manifest}}' > hub-registry-descriptor.json
+          DIGEST="$(python -c 'import json,re; d=json.load(open("hub-registry-descriptor.json"))["digest"]; assert re.fullmatch("sha256:[a-f0-9]{64}",d); print(d)')"
+          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          docker pull "$PACKAGE@$DIGEST"
+          python scripts/hub_release_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-startup.json
+      - name: Require private package and current main before latest promotion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, urllib.error
+          url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:ledgetoptechnologies/engineering-hub-control:pull'
+          try:
+              with urllib.request.urlopen(url, timeout=20):
+                  raise SystemExit('Anonymous pull token unexpectedly available; refusing promotion')
+          except urllib.error.HTTPError as e:
+              if e.code not in (401, 403):
+                  raise
+          req = urllib.request.Request('https://api.github.com/repos/ledgetoptechnologies/Engineering-Hub/branches/main', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(req, timeout=20) as r:
+              head = json.load(r)['commit']['sha']
+          if head != os.environ['GITHUB_SHA']:
+              raise SystemExit('Main advanced; refusing stale latest promotion')
+          print('Private registry and current-main gates passed')
+          PY
+      - name: Promote only the tested registry digest and read latest back
+        run: |
+          set -eu
+          docker buildx imagetools create --prefer-index=false --tag "$PACKAGE:latest" "$PACKAGE@$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$PACKAGE:latest" --raw > hub-latest-manifest.json
+          cmp hub-registry-manifest.json hub-latest-manifest.json
+          docker pull "$PACKAGE:latest"
+          python scripts/hub_release_smoke.py --image "$PACKAGE@$IMAGE_DIGEST" --commit "$GITHUB_SHA" > hub-latest-startup.json
+          printf 'source=%s\nimage=%s:latest\ndigest=%s\n' "$GITHUB_SHA" "$PACKAGE" "$IMAGE_DIGEST" > hub-release.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hub-control-main-publication-evidence
+          path: |
+            hub-*-startup.json
+            hub-*-manifest.json
+            hub-release.txt
