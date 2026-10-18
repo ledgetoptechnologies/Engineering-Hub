@@ -312,3 +312,31 @@ behavior are covered. The real in-process runtime is exercised with an injected
 event feed; no installed watcher or production service is activated. A remote
 receipt changing by itself still needs supported host-to-Hub invalidation, and
 owned lifecycle/cancellation handling remains a deployment gate.
+
+Claude reply `3d9daaf9-08d1-4275-8255-4c56a878d7ab` reviewed the published
+`bf5445a` source without running tests. Its held-receipt amplification finding is
+addressed by narrowing same-epoch retry triggers to exact-run receipt/terminal
+invalidation, unpause, or explicit recovery; unrelated task/decision activity is
+not receipt evidence. Initial Linux validation caught a test using an agent to
+perform a human-only task creation; the fixture identity was corrected without
+relaxing authorization. Hot-WAL SIGKILL reads before successor epoch writes and
+the owned service lifecycle passed their initial Linux tests. Final combined
+validation subsequently passed 1,754 tests on frozen image
+`2eaa8357b1ac79d9fc4f159fa5a86f783444917f0bee9014ead9a47f55e2b001`.
+
+The suggestion to require a new user approval for all forward continuation is
+not adopted as a new source restriction: Beau already authorized bounded
+autonomous staging, including safe restart recovery. Execution still requires
+the explicit opt-in dispatcher, exact reviewed manifest and original-command
+evidence; uncertain effects remain held. No deployment or production activation
+is authorized by an agent review. A distinct lifecycle review follows this
+exhausted five-hop review chain rather than extending it.
+
+Independent lifecycle review found a duplicate capability-transfer edge: a
+second service construction could close the first service's owner on failure.
+Single-use process-local transfer rejection and two Linux regression cases now
+protect that path. Source review otherwise found no premature owner release on
+the intended lifecycle. Hermes was sent INFO
+`c61243f3-7b8e-4688-b7d6-7d9e97f6d76e` with the new peer-readiness requirement,
+existing worker ownership and unchanged production boundary. Bus acceptance of
+that INFO is not proof it reached an active Hermes session.

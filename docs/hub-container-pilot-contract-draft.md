@@ -333,6 +333,38 @@ adapter. Use no platform rewrite when exporting an index: on this Docker version
 that rewrite removed the original index from the archive, preventing proof of
 the requested index's relationship to the platform config.
 
+## Explicit owned ASGI lifecycle
+
+`create_owned_pilot_app` is an operator-injected application factory, not a new
+environment switch, CLI entrypoint or deployed service. It takes an approved
+client and manifest set, acquires or accepts one exact Linux `PilotOwner`, and
+binds the repository, authentication store, workflow, recovery and dispatcher to
+that capability. The same capability object cannot transfer to another service.
+Failed duplicate construction cannot close the first service's live owner.
+
+Accepted dispatch and recovery calls run in bounded service-owned tasks. Request
+cancellation detaches the caller without cancelling accepted work. Concurrent
+identical operations share the in-flight task, not a permanent result cache.
+Shutdown stops admission, waits for accepted API work and the native runtime,
+then stops the feed, closes the client and finally releases ownership. Repeated
+lifespan cancellation cannot release ownership early. A forced process death
+still requires the durable original-command recovery rules; this is not a claim
+that an HTTP timeout proves an executor stopped.
+
+The opt-in recovery route is
+`POST /api/hub/v1/container-pilot/runs/{run_id}/recover`; it requires the original
+run creator's agent identity and an owned service. The unchanged default app
+rejects it as disabled. Health fails closed if configured ownership is lost.
+Authentication schema, OAuth-state consumption and session mutations share the
+repository's ownership-guarded transaction boundary; session reads are read-only.
+
+Held same-epoch dispatcher receipts are not retried on unrelated task/decision
+activity. Supported triggers are an exact-run internal `pilot.receipt_changed`
+invalidation, same-run terminal event, unpause, or explicit recovery. The internal
+event contract does not create or authenticate a host-to-Hub push provider.
+Actual adapter completion signaling, durable host provenance/secrets and a real
+application pilot remain required before this factory can be activated.
+
 Root independently exercised this helper against an existing synthetic image:
 index `d692f0304cbfa318a86f16925b00ab87b2b92ab8b3c19b77edbe1fcd69f831d6`
 selected platform manifest `5e4fc6400b4d21cc28dff2459c01906fcb886ce3b1e00dbe17bb5c1bb8aa6eb7`

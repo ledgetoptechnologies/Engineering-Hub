@@ -4,6 +4,27 @@ This is an additive, independently deployed service. It does **not** replace or
 change the current message bus, its port 8765, image name, tokens, storage or
 native push listener. Default control service port is 8770 on loopback only.
 
+## Goal addendum: topic participant readiness
+
+Beau explicitly requires agents to know whether their peers are connected to the
+same session topic, so unanswered sends do not masquerade as active discussions.
+This is an acceptance requirement for the active Engineering Hub build, not a
+claim that the live integration already provides it.
+
+- Expose the same topic-scoped participant readiness to agents through MCP and
+  to humans through the dashboard. Distinguish invited, linked, reachable,
+  stale/unknown and explicitly disconnected; topic membership alone is not proof
+  of an active listener or a reachable chat.
+- Notify linked participants of meaningful readiness changes using the existing
+  event-delivery path, with bounded deduplication rather than another AI polling
+  job. Include freshness and session binding without exposing credentials.
+- Before a coordinated exchange, report unavailable or unconfirmed peers. A
+  durable queued message may wait for reconnection, but must not be represented
+  as delivered, processing or completed merely because the bus accepted it.
+- Verify offline, restart/reconnect, stale presence and wrong-topic cases, and
+  ensure agents do not generate empty or receipt-only reply loops. Readiness is
+  informational; it does not authorize work or override ownership boundaries.
+
 ## Implemented contract
 
 The REST contract is `contracts/hub-v1.openapi.json`; the running service exposes

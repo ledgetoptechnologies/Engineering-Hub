@@ -15,6 +15,8 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from .repository import HubError, HubRepository
+
 
 @dataclass(frozen=True)
 class AuthConfig:
@@ -50,22 +52,62 @@ def _hash(value: str) -> str:
 class SessionStore:
     """Persist only hashed bearer session IDs; OAuth state is one-use and short-lived."""
 
-    def __init__(self, path: str | Path, *, session_ttl=28800, state_ttl=600, clock=time.time):
+    def __init__(self, path: str | Path, *, session_ttl=28800, state_ttl=600, clock=time.time, repository=None):
         self.path = str(path)
+        if repository is not None and (
+            type(repository) is not HubRepository
+            or Path(repository.path).absolute() != Path(self.path).absolute()
+        ):
+            raise HubError('pilot_ownership_required', 409)
+        self.repository = repository
         self.session_ttl = session_ttl
         self.state_ttl = state_ttl
         self.clock = clock
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        if self.repository is None:
+            self._assert_unenrolled()
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, github_id INTEGER NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS auth_states (state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, expires REAL NOT NULL)")
 
     @contextmanager
     def _db(self):
+        if self.repository is not None:
+            with self.repository._transaction() as db:
+                yield db
+            return
+        # Probe before opening writable: even SQLite journal recovery would be
+        # an unauthorized write to an owner-enrolled ledger.
+        self._assert_unenrolled()
         connection = sqlite3.connect(self.path, timeout=10)
         try:
             with connection:
+                connection.execute('BEGIN IMMEDIATE')
+                self._assert_unenrolled(connection)
                 yield connection
+                self._assert_unenrolled(connection)
+        finally:
+            connection.close()
+
+    def _assert_unenrolled(self, connection=None):
+        if connection is None:
+            if not Path(self.path).exists():
+                return
+            with self._read_db() as db:
+                self._assert_unenrolled(db)
+        elif connection.execute("SELECT 1 FROM sqlite_master WHERE name='hub_pilot_owner' COLLATE NOCASE").fetchone():
+            # Any marker, including malformed tables/views, is a deny signal.
+            raise HubError('pilot_ownership_required', 409)
+
+    @contextmanager
+    def _read_db(self):
+        if self.repository is not None:
+            with self.repository._connection() as db:
+                yield db
+            return
+        connection = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=ro', uri=True, timeout=10)
+        try:
+            yield connection
         finally:
             connection.close()
 
@@ -79,7 +121,6 @@ class SessionStore:
 
     def consume_state(self, state):
         with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT verifier, expires FROM auth_states WHERE state_hash = ?", (_hash(state),)).fetchone()
             db.execute("DELETE FROM auth_states WHERE state_hash = ?", (_hash(state),))
         return row[0] if row and row[1] > self.clock() else None
@@ -94,7 +135,7 @@ class SessionStore:
     def session_for(self, token):
         if not token:
             return None
-        with self._db() as db:
+        with self._read_db() as db:
             row = db.execute("SELECT github_id, csrf_token, expires FROM auth_sessions WHERE token_hash = ?", (_hash(token),)).fetchone()
         if not row or row[2] <= self.clock():
             return None

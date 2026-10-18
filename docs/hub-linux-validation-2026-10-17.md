@@ -403,3 +403,42 @@ An earlier frozen image `sha256:0957a278ef9e4222eea152a13d1619c1d950b4bc221fcc77
 passed 1,697 tests before the runtime integration cases and same-run terminal
 event handling were added; final combined evidence supersedes it. All subsequent
 changes in this slice are documentation only, not frozen runtime/test changes.
+
+## Owned service lifecycle, auth barrier and scoped retry
+
+Final frozen image
+`sha256:2eaa8357b1ac79d9fc4f159fa5a86f783444917f0bee9014ead9a47f55e2b001`
+passed **1,754 Linux tests in 70.28 seconds**, with only the existing Starlette
+deprecation. Same UID 10001, network-none/read-only harness, bounded private
+tmpfs, no host mounts, Docker socket, exposed ports or real credentials.
+OpenAPI source/snapshot and actual TypeScript DTO fixture checks also passed.
+Production bus source, root image/Compose and workflows have no diff from the
+preserved `2001ee7cf0b24cce12b7340904476d06c36593dc` baseline.
+
+Eleven Linux owned-service tests exercise actual local ownership with an
+injected event feed and simulated executor: detached dispatch/recovery, repeated
+shutdown cancellation, admission stop, runtime/API drain, feed/client failure
+cleanup, original-creator recovery access, failed health on owner loss, duplicate
+capability transfer rejection and unchanged default activation. The owner stays
+held until accepted work is terminal. Twenty-two portable owned-task tests cover
+bounded concurrency, concurrent deduplication and cancellation behavior.
+
+A real child process commits a task, spills a different uncommitted transaction
+into WAL, then is SIGKILLed. The first repository read before successor ownership
+writes sees only committed state and rejects mutation. This covers existing
+writable SHM; absent/unwritable SHM permission variants are not asserted.
+Authentication mutation paths now share the repository transaction barrier.
+Held-receipt tests prove unrelated task/decision and wrong-run events cause no
+executor inspection; exact-run invalidation, unpause and explicit recovery can
+inspect the original command and continue only never-reserved phases.
+
+The initial image's focused run passed 65 tests and failed three new fixture
+cases that incorrectly created a human-only task as Hermes. The fixture actor
+was corrected; authorization was not relaxed. Duplicate-transfer regression
+cases were then added before the final image/full run. Subsequent documentation
+updates postdate the freeze but do not alter runtime or tests.
+
+This factory is explicit source wiring, not deployed startup configuration.
+Actual host adapter/provenance/secret-provider acceptance, authenticated host
+completion events, OAuth setup, real application success/rollback, TrueNAS
+durable volume and reboot/installed connector acceptance remain separate gates.

@@ -56,6 +56,13 @@ def owner_record(repo, sequence):
         return tuple(row) if row else None
 
 
+def receipt_changed(repo, run, *, entity_id=None, action='pilot.receipt_changed'):
+    # Internal, owner-guarded native invalidation only: no new public endpoint
+    # or provider authentication is implied by this test helper.
+    with repo._transaction() as db:
+        repo._emit(db, action, {**run, 'id': entity_id or run['id']})
+
+
 def assert_original_identity(current, before, original_request):
     after = current.repo.get_run(before['id'])
     for field in ('id', 'task_id', 'fencing_generation', 'execution_manifest_digest', 'artifact_digest'):
@@ -116,7 +123,8 @@ async def test_unpause_drain_continues_accepted_original_run(rig, boundary):
 
 
 @pytest.mark.asyncio
-async def test_held_quiescent_attempt_gets_terminal_proof_before_next_phase(rig):
+@pytest.mark.parametrize('trigger', ['receipt', 'unpause', 'explicit'])
+async def test_held_quiescent_attempt_gets_terminal_proof_before_next_phase(rig, trigger):
     current = rig.restart(RecoveryClient({'deploy_container': 'running'}))
     current.dispatcher = StagingDispatcher(current.repo, current.workflow)
     reviewed_task(current.repo)
@@ -128,8 +136,24 @@ async def test_held_quiescent_attempt_gets_terminal_proof_before_next_phase(rig)
     assert run['status'] == 'held'
     assert owner_record(current.repo, row['sequence'])[2] == 'quiescent'
     current.client = current.workflow.client = RecoveryClient()
-    current.repo.create_decision('hermes', 'engineering-hub', 'Receipt is available', ['inspect', 'wait'])
-    await current.dispatcher.drain_batch()
+    current.repo.create_decision('hermes', 'engineering-hub', 'Unrelated question', ['inspect', 'wait'])
+    current.repo.create_task('human:1234', 'engineering-hub', 'Unrelated task', 'unrelated-task')
+    receipt_changed(current.repo, run, entity_id=str(uuid.uuid4()))
+    receipt_changed(current.repo, run, action='run.held')
+    for _ in range(5):
+        await current.dispatcher.drain_batch()
+    assert current.client.inspections == current.client.submissions == []
+    if trigger == 'receipt':
+        receipt_changed(current.repo, run)
+        await current.dispatcher.drain_batch()
+    elif trigger == 'unpause':
+        current.repo.set_pause('human:1234', True)
+        await current.dispatcher.drain_batch()
+        assert current.client.inspections == current.client.submissions == []
+        current.repo.set_pause('human:1234', False)
+        await current.dispatcher.drain_batch()
+    else:
+        await current.dispatcher.resume_accepted(row['sequence'], expected_owner=row['owner'])
     assert current.client.inspections == original
     assert [item.action for item in current.client.submissions] == ['smoke_container']
     assert receipt(current.dispatcher)['state'] == 'succeeded'
@@ -228,7 +252,7 @@ async def test_unknown_receipt_one_attempt_per_new_head_no_hot_loop(rig):
     row = receipt(current.dispatcher)
     run = current.repo.get_run(row['run_id'])
     request = saved_request(current.repo, row['sequence'])
-    current.repo.create_decision('hermes', 'engineering-hub', 'Inspect uncertain receipt', ['inspect', 'wait'])
+    receipt_changed(current.repo, run)
     for _ in range(8):
         result = await current.dispatcher.drain_batch(limit=1)
         assert result['examined'] <= 1

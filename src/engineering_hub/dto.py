@@ -98,6 +98,19 @@ class RunDTO(EntityDTO):
     events: list[RunEventDTO]
 
 
+class RecoveryDTO(ResponseDTO):
+    run: RunDTO
+    recovery: Literal['recovered', 'held', 'paused']
+    occurrence: str
+
+    @field_validator('occurrence')
+    @classmethod
+    def canonical_occurrence(cls, value):
+        if str(UUID(value)) != value:
+            raise ValueError('canonical recovery occurrence required')
+        return value
+
+
 class ProjectDTO(ResponseDTO):
     id: ProjectId
     name: str

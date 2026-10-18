@@ -920,6 +920,45 @@
           }
         }
       }
+    },
+    "/api/hub/v1/container-pilot/runs/{run_id}/recover": {
+      "post": {
+        "summary": "Recover Container Pilot",
+        "operationId": "recover_container_pilot_api_hub_v1_container_pilot_runs__run_id__recover_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1893,6 +1932,34 @@
         ],
         "title": "PublicReachability",
         "description": "Only this safe projection is intended for authenticated REST/MCP/UI reads."
+      },
+      "RecoveryDTO": {
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/RunDTO"
+          },
+          "recovery": {
+            "type": "string",
+            "enum": [
+              "recovered",
+              "held",
+              "paused"
+            ],
+            "title": "Recovery"
+          },
+          "occurrence": {
+            "type": "string",
+            "title": "Occurrence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run",
+          "recovery",
+          "occurrence"
+        ],
+        "title": "RecoveryDTO"
       },
       "Review": {
         "properties": {

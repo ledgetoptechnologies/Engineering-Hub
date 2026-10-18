@@ -84,6 +84,12 @@ class StagingDispatcher:
                 raise HubError('dispatch_owner_unverified', 409)
 
     def _recovery_candidates(self, limit):
+        # ``pilot.receipt_changed`` is a native authenticated Hub invalidation:
+        # entity_id is the exact original run ID, not a task, topic or mailbox
+        # pointer. No endpoint/provider is exposed here. A same-epoch held
+        # receipt must not cause remote GET merely because unrelated work made
+        # the outbox head advance. Policy events are eligible only while the
+        # current pause policy is false (checked again before recovery I/O).
         if self._owner() is None or limit == 0:
             return [], 0
         with self.repo._connection() as db:
@@ -95,8 +101,11 @@ class StagingDispatcher:
                 AND (s.sequence IS NULL OR s.epoch<>? OR s.head<?)
                 AND (o.epoch<>? OR (o.state='quiescent' AND r.attempt_head<?
                     AND EXISTS (SELECT 1 FROM hub_outbox b WHERE b.sequence>r.attempt_head
-                        AND (b.entity_id<>COALESCE(r.run_id,'')
-                             OR b.action IN ('run.succeeded','run.rolled_back'))
+                        AND ((b.entity_id=r.run_id AND b.action IN
+                                ('pilot.receipt_changed','run.succeeded','run.rolled_back'))
+                             OR (b.action='policy.paused' AND b.entity_id='pause')
+                             OR (COALESCE(r.reason,'') NOT IN ('held','paused')
+                                 AND b.entity_id<>COALESCE(r.run_id,'')))
                         AND b.action NOT IN ('task.run_created','task.run_failed'))))
                 ORDER BY r.sequence LIMIT ?''', (self._owner().epoch, head, self._owner().epoch, head, limit))]
         return rows, head

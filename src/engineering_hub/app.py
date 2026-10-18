@@ -33,7 +33,7 @@ from .registry_client import (
 )
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
-    HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO,
+    HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
     TaskDTO, TaskListDTO,
 )
 
@@ -129,7 +129,8 @@ class TopicPreflight(Input):
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
-               staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None):
+               staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
+               owned_pilot_service=None):
     settings = settings or Settings.from_env()
     repo = repository or HubRepository(settings.database)
     if registry_bridge is not None and (type(registry_bridge) is not CanonicalRegistryBridge
@@ -144,7 +145,14 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     if fixture_workflow is not None and container_pilot_workflow is not None:
         raise ValueError('one_staging_workflow_required')
     configured_workflow = container_pilot_workflow or fixture_workflow
-    sessions = SessionStore(settings.database)
+    if owned_pilot_service is not None:
+        from .pilot_service import OwnedPilotService
+        if (type(owned_pilot_service) is not OwnedPilotService
+                or owned_pilot_service.repo is not repo
+                or owned_pilot_service.workflow is not container_pilot_workflow
+                or owned_pilot_service.dispatcher is not staging_dispatcher):
+            raise ValueError('owned_pilot_service_mismatch')
+    sessions = SessionStore(settings.database, repository=repo)
     feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
             staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):
@@ -206,22 +214,30 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @asynccontextmanager
     async def lifespan(app):
-        await feed.start()
         try:
+            await feed.start()
+            if owned_pilot_service is not None:
+                await owned_pilot_service.start(feed)
             async with hub_mcp.session_manager.run():
                 if runtime is not None:
                     await runtime.start()
                 yield
         finally:
-            if runtime is not None:
-                await runtime.stop()
-            await feed.stop()
+            if owned_pilot_service is not None:
+                await owned_pilot_service.stop(runtime, feed)
+            else:
+                try:
+                    if runtime is not None:
+                        await runtime.stop()
+                finally:
+                    await feed.stop()
 
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
+    app.state.owned_pilot_service = owned_pilot_service
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
 
@@ -373,6 +389,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.get("/health", response_model=HealthDTO)
     def health():
         # Control service liveness is not host, agent or deployment readiness.
+        if owned_pilot_service is not None:
+            owned_pilot_service.assert_active()
         repo.get_paused()
         return {"ok": True, "service": "engineering-hub-control",
                 "build_commit": read_build_commit()}
@@ -485,7 +503,18 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
         if repo.get_run(run_id)['created_by'] != identity:
             raise HTTPException(403, detail={'code': 'forbidden'})
+        if owned_pilot_service is not None:
+            return await owned_pilot_service.advance(run_id)
         return await container_pilot_workflow.advance(run_id)
+
+    @app.post('/api/hub/v1/container-pilot/runs/{run_id}/recover', response_model=RecoveryDTO)
+    async def recover_container_pilot(run_id: str, request: Request):
+        identity = agent(request)
+        if owned_pilot_service is None:
+            raise HTTPException(423, detail={'code': 'owned_pilot_not_enabled'})
+        if repo.get_run(run_id)['created_by'] != identity:
+            raise HTTPException(403, detail={'code': 'forbidden'})
+        return await owned_pilot_service.recover(run_id)
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
