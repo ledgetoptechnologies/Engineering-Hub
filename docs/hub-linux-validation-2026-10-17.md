@@ -650,3 +650,78 @@ Coordination INFOs were accepted by the bus as
 Hermes `a0641515-7c52-44ed-9942-a371358097c6` and
 Claude `b985188d-f31d-4f9b-8fd3-01e8c9b492d1`, on the existing build correlation.
 Acceptance is not evidence of peer wake, processing or deployment permission.
+
+## Access peer follow-ups and matching host cgroup source
+
+Claude review `77691ea9-edb0-488e-af61-d13c576bd4cc` was claimed, evaluated,
+answered with linked reply `4628142e-9041-4907-8789-73a5d0a00fa2`, and acknowledged.
+Most points matched the already implemented boundaries. Two concrete source
+follow-ups are in `4f3e15d6cbd2aa64d6d907d72ec2fcdf1645779d`:
+
+- Durable first-verified Access subject pins per issuer/application/email,
+  committed atomically with session creation. Pins survive logout, expiry and
+  reopening; conflicting subjects cannot repin or delete a prior valid session.
+  Concurrent enrollment and owner-loss schema rollback are tested. Account
+  reprovisioning requires explicit operator review, not an automatic reset.
+- Fifteen-second transport-only SSE comments on both Hub and topic routes,
+  retaining one pending source read and the original subscription. No task,
+  message or readiness polling/model wake occurs. Authentication is rechecked
+  on idle sends; expiry/revocation closes the stream and pending readers are
+  cancelled, awaited and closed. Comments do not extend evidence freshness.
+
+Frozen source validation index
+`sha256:0a44f19b9d029a84c4bac15d2ff0eb6b9be27ab816a4b3a6bba69f417f9d5ecb`
+completed **1,974 passed**, one existing Starlette/httpx warning, **72.60 seconds**,
+exit 0, with the same isolated Linux constraints. Focused Windows run was
+220 passed/five platform skips; the separate actual-endpoint iterator/helper
+suite was 25 passed. Endpoint tests seed synthetic verified identities and
+typed registry fixtures; they do not claim real Cloudflare or registry acceptance.
+Independent source review and seven concurrent/persistent-pin regressions
+supplement the cryptographic verification cases from the prior section.
+
+A newly built real packaged Hub image identifies source `4f3e15d`:
+
+- OCI index: `sha256:c90bf9c574d338baa1f034b691274203cef6fb49c4eb02ab2079b2e034425654`
+- Platform manifest: `sha256:0026cc65862bed049a29e7280d3883d51044582f8ce6ad358f37230b00b97a4c`
+- Config: `sha256:80f127a3100af33f3e055932ddf13a9c261af18651e5f60d6144bc870191aedf`
+
+The existing offline dashboard smoke passed against that exact index and source:
+two compiled assets served, human sign-in disabled, anonymous private requests
+denied, three synthetic authenticated agents, and nine Hub MCP tools. It used
+no network, host mounts, published ports or live credentials, and cleaned up its
+owned disposable container. This is packaging/auth-disabled startup evidence,
+not identity-provider, durable-state, trusted provenance enrollment, or deployment
+acceptance. The image is local; no registry push or activation is implied.
+
+### Host shared-contract alignment artifact
+
+The independent combined host review checkout is now published as
+`work/hub-host-cgroup-alignment-codex`, commit
+`e5ed4d32dc467a3cb628d38e992b10acab3dbb63`. Its eight-path source patch adds the
+required EffectiveProfile field, manifest derivation, explicit create field,
+strict effective readback, canonical numeric API floor, regression coverage and
+corrected source-limit documentation. The previously local validation Dockerfile
+COPY is included so the host tests are reproducible. Hermes's existing branch
+and primary control branch are not changed by publishing this separate artifact.
+
+Frozen combined validation index
+`sha256:24fb01467f0381f9e4314ae139a4cf4ccec5bad01d919e4720b9f682aa4639b0`
+completed **1,944 passed**, **73.47 seconds**, exit 0. Warnings were the existing
+Starlette deprecation and an unclosed-event-loop ResourceWarning, this time
+emitted during `test_hub_owned_service.py::test_invalid_stop_grace_rejected_before_owner_transfer`.
+The allocation owner remains unestablished; neither the warning nor its cause
+was suppressed, fixed or assigned to that test merely from its emission site.
+
+New fake-transport regressions reject API 1.40 and noncanonical versions before
+I/O, preserve higher pins including 1.56/1.100, require explicit private mode
+with no default, check private create body, reject missing/host/empty/null
+readback, and deny unsafe plans before daemon requests. Expected-denial test
+paths close their synthetic HTTP clients. The source-contract gap is addressed
+in this artifact; **real daemon execution is still unproven**. Concrete trusted
+providers, generation exclusion, registry implementation, coherent enrollment,
+real autonomous app/rollback/SIGKILL and TrueNAS/reboot acceptance remain required.
+
+Coordination INFO `3b3a0568-2b3a-4ba3-845d-0d3857c66110` told Hermes the patch was
+confined to this review checkout; no replacement daemon worker or activation was
+requested. Live bus/ports/data, Ops, DNS, Access policies and credentials remain
+unchanged. Overall release is still incomplete.
