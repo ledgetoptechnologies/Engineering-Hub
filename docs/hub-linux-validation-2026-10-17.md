@@ -205,3 +205,37 @@ Both read-generation guards and deterministic 503/403 browser regressions now
 cover that race. Unit cases also cover successful epoch changes and callbacks
 from closed streams. Browser tests use synthetic routes/events: they do not
 establish deployed registry, trusted-session, private OAuth or reboot acceptance.
+
+## Actual bundled control-image packaging smoke
+
+Root built the independent control Dockerfile from clean source
+`292a648464471b65013637bfba13ea70b6a9dba1` with that exact revision label.
+Immutable local OCI index:
+`sha256:74a7c1b0cb66ff7839e91756adf3d6bc058cce6917bcf4ca3e63a87b689505a9`.
+The read-only metadata helper independently verified its original-byte chain to
+amd64 platform manifest
+`sha256:a9f6a4c992c02665879c9f4b6c534fe8cee2f43c595304c122cb4e742e4fe59a`
+and config
+`sha256:bf729811d05fca793d4f57160f655ed711698ae9b06aaed1c2442c4c7d3abc14`.
+This is metadata identity, not authenticated source/build provenance or layer proof.
+
+The hardened host-side smoke harness ran that immutable local image with pull
+disabled, network none, no ports or host mounts, explicit UID/GID10001, read-only
+root, dropped capabilities, no-new-privileges and bounded resources. Its in-container
+probe confirmed actual app health, both compiled JS/CSS assets and content types,
+security headers, anonymous private-API rejection and human login disabled. Each
+of three synthetic agent identities initialized MCP and listed exactly the nine
+Hub tools; unauthenticated and invalid-token discovery returned401. No real token
+or OAuth credential was retrieved. The uniquely owned container was removed, and
+a label-filtered container read confirmed no remaining smoke containers.
+
+Independent review hardened missing-image/no-pull behavior and cleanup when a
+startup response is interrupted. Twenty-four fake-subprocess tests cover owned-ID
+cleanup, foreign identity refusal, absence and ambiguous daemon failures. Probe
+readiness/whole-operation time and response sizes are bounded. The harness is
+outside the tested image and does not change its packaged source revision.
+
+This is an actual application **packaging/startup smoke**, not the required
+controller-driven deployment/health/rollback pilot. Private state was disposable
+tmpfs; no state durability, host reboot, OAuth, trusted registry/provider, actual
+host adapter, immutable build approval or TrueNAS acceptance is established.

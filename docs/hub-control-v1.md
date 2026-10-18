@@ -143,10 +143,14 @@ from one origin. The image runs as UID/GID 10001 with `HUB_DB` defaulting to
 durable local storage there; the image filesystem itself is not a backup.
 
 After building a local image, run
-`python scripts/hub_dashboard_container_smoke.py --image <local-image>`.
+`python scripts/hub_dashboard_container_smoke.py --image sha256:<immutable-local-image-id>`.
 This creates and removes only its uniquely named disposable container: no network,
 host ports, host mounts, production tokens or OAuth credentials. It verifies static
-assets, security headers, auth-disabled startup and denial of private API reads.
+assets and their content types, security headers, UID/GID, auth-disabled startup,
+denial of private API reads, and actual MCP initialization/discovery for three
+synthetic identities. Pulling is disabled. Cleanup reconciles the uniquely labeled
+container even if the startup response was interrupted; it removes only the
+verified owned container ID and reports ambiguous cleanup instead of guessing.
 Its disposable tmpfs deliberately does **not** establish storage/reboot acceptance.
 
 Browser connection indicators expire locally without HTTP status polling. Native
