@@ -278,6 +278,7 @@ def test_fake_engine_candidate_failure_requires_separate_rollback_smoke(tmp_path
     assert profile.uid == 10001 and profile.gid == 10001
     assert profile.supplementary_groups == ()
     assert profile.cap_drop == ("ALL",) and profile.read_only_root and profile.no_new_privileges
+    assert profile.cgroupns_mode == manifest.runtime.cgroupns_mode == "private"
     assert profile.network_mode == "none" and profile.published_ports == ()
     assert profile.tmpfs == (("/tmp", 64 * 1024**2, 0o1777, True, True),)
     assert profile.mounts == (("state_generation", "/var/lib/hub", "rw", "candidate-g1"),

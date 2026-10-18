@@ -368,6 +368,7 @@ class HostAdapter:
             read_only_root=runtime.read_only_root, cap_drop=tuple(runtime.cap_drop),
             no_new_privileges=runtime.no_new_privileges, privileged=runtime.privileged,
             pid_mode=runtime.pid_mode, ipc_mode=runtime.ipc_mode,
+            cgroupns_mode=runtime.cgroupns_mode,
             network_mode=runtime.network.mode, published_ports=(),
             memory_bytes=runtime.resources.memory_bytes,
             cpu_millicores=runtime.resources.cpu_millicores,

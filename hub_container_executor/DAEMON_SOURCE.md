@@ -17,6 +17,15 @@ not inspect environment variables, discover a socket/context, call `/version`,
 negotiate an API version, accept a remote URL, or fall back to another socket.
 Only explicit `httpx.MockTransport` injection is accepted as a test transport.
 
+The pinned API version must use canonical numeric `1.<minor>` spelling and be
+at least the shared private-cgroup feature floor, API 1.41. Unsupported versions
+are rejected while validating the binding, before transport construction or I/O.
+Higher operator-pinned versions remain unchanged; there is no negotiation or
+downgrade. The closed profile requires explicit `cgroupns_mode="private"`, sends
+`HostConfig.CgroupnsMode="private"`, and accepts effective readback only when
+that exact field is present and private. Missing, default/empty or host mode is
+not treated as evidence of namespace isolation.
+
 The runner check reads `/info`, compares daemon `ID`, OS and architecture, and
 returns the operator-enrolled runner ID and platform. Docker's architecture
 aliases are accepted only for `amd64`/`x86_64` and `arm64`/`aarch64`. The Engine

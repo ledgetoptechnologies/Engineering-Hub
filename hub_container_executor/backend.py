@@ -1,7 +1,7 @@
-"""Narrow typed interfaces for a future operator-pinned daemon implementation.
+"""Narrow typed interfaces for an operator-pinned daemon implementation.
 
-No concrete Docker client is shipped here. Unit tests inject explicitly named
-fakes; production effects require independent implementation/review/acceptance.
+The separate concrete backend remains source-only until independent review,
+trusted provider enrollment and real host acceptance are complete.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ class EffectiveProfile:
     privileged: bool
     pid_mode: str
     ipc_mode: str
+    cgroupns_mode: str
     network_mode: str
     published_ports: tuple[()]
     memory_bytes: int

@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import tarfile
+from contextlib import closing
 
 import httpx
 import pytest
@@ -102,7 +103,8 @@ def safe_generation(tmp_path, generation_id="fixture-g1"):
     return source
 
 
-def test_constructor_is_inert_and_runner_inspection_uses_only_explicit_api_binding(tmp_path):
+@pytest.mark.parametrize("api_version", ["1.41", "1.56", "1.100"])
+def test_constructor_is_inert_and_runner_inspection_uses_only_explicit_api_binding(tmp_path, api_version):
     manifest, _image, _blobs = verified_image()
     requests = []
 
@@ -110,7 +112,7 @@ def test_constructor_is_inert_and_runner_inspection_uses_only_explicit_api_bindi
         requests.append(request)
         assert request.method == "GET"
         assert request.url.host == "docker"
-        assert request.url.path == "/v1.56/info"
+        assert request.url.path == f"/v{api_version}/info"
         return httpx.Response(200, json={
             "ID": manifest.runner_binding.daemon_identity,
             "OSType": "linux",
@@ -118,7 +120,7 @@ def test_constructor_is_inert_and_runner_inspection_uses_only_explicit_api_bindi
         })
 
     transport = httpx.MockTransport(handler)
-    backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=transport)
+    backend = DockerEngineBackend(binding(manifest, tmp_path, api_version=api_version), test_transport=transport)
     assert requests == []
     observed = backend.inspect_runner(1000)
     assert observed == RunnerObservation(
@@ -126,8 +128,30 @@ def test_constructor_is_inert_and_runner_inspection_uses_only_explicit_api_bindi
         manifest.runner_binding.daemon_identity,
         manifest.runner_binding.platform,
     )
-    assert [(req.method, req.url.path) for req in requests] == [("GET", "/v1.56/info")]
+    assert backend.binding.api_version == api_version
+    assert [(req.method, req.url.path) for req in requests] == [("GET", f"/v{api_version}/info")]
     backend.close()
+
+
+@pytest.mark.parametrize("api_version", [
+    "1.0", "1.9", "1.40", "1.041", "1.056", "01.56", "1.56.0", "v1.56",
+    "1.56\n", "1.56 ", "1.-1", "2.56", "", None, 1.56,
+])
+def test_unsupported_or_noncanonical_api_binding_rejects_before_transport(tmp_path, api_version):
+    manifest, _image, _blobs = verified_image()
+    calls = []
+    transport = httpx.MockTransport(lambda request: calls.append(request))
+    with pytest.raises(ValueError):
+        DockerEngineBackend(binding(manifest, tmp_path, api_version=api_version), test_transport=transport)
+    assert calls == []
+
+
+def test_effective_profile_requires_explicit_cgroup_namespace_field():
+    from dataclasses import MISSING, fields
+    from hub_container_executor.backend import EffectiveProfile
+
+    field = next(field for field in fields(EffectiveProfile) if field.name == "cgroupns_mode")
+    assert field.default is MISSING and field.default_factory is MISSING
 
 
 def test_runner_wrong_daemon_or_architecture_fails_closed(tmp_path):
@@ -291,6 +315,7 @@ def make_profile(image, generation_id="fixture-g1", secrets=None):
         uid=10001, gid=10001, supplementary_groups=(), read_only_root=True,
         cap_drop=("ALL",), no_new_privileges=True, privileged=False,
         pid_mode="private", ipc_mode="private", network_mode="none",
+        cgroupns_mode="private",
         published_ports=(), memory_bytes=512 * 1024**2,
         cpu_millicores=1000, pids_limit=128,
         tmpfs=(("/tmp", size, 0o1777, True, True),),
@@ -322,6 +347,7 @@ def container_inspect(image, profile, source, container_id="c" * 64, status="cre
             "ReadonlyRootfs": True, "CapDrop": ["ALL"], "CapAdd": [],
             "SecurityOpt": ["no-new-privileges:true"], "Privileged": False,
             "PidMode": "", "IpcMode": "", "NetworkMode": "none",
+            "CgroupnsMode": profile.cgroupns_mode,
             "PortBindings": {}, "Memory": profile.memory_bytes,
             "MemorySwap": profile.memory_bytes,
             "NanoCpus": profile.cpu_millicores * 1_000_000,
@@ -346,7 +372,7 @@ def container_inspect(image, profile, source, container_id="c" * 64, status="cre
     }
 
 
-def test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path):
+def _exercise_create_closed_profile(tmp_path):
     from hub_container_executor.backend import ContainerPlan
 
     manifest, image, blobs = verified_image()
@@ -376,32 +402,74 @@ def test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path):
             return httpx.Response(200, json=observed)
         raise AssertionError(f"unexpected fake route: {request.method} {path}")
 
-    backend = DockerEngineBackend(
+    with closing(DockerEngineBackend(
         binding(manifest, tmp_path), test_transport=httpx.MockTransport(handler)
-    )
-    result = backend.create_container(plan, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
-    assert result == "c" * 64
-    create = next(row for row in requests if row[0] == "POST" and row[1].endswith("/containers/create"))
-    body = json.loads(create[2])
-    assert body["Image"] == image.runnable_reference and body["Image"] != image.image_config_id
-    assert "Entrypoint" not in body and "Cmd" not in body
-    assert body["User"] == "10001:10001"
-    assert body["Env"] == [f"{key}={value}" for key, value in profile.environment]
-    host = body["HostConfig"]
-    assert host["ReadonlyRootfs"] is True and host["CapDrop"] == ["ALL"]
-    assert host["SecurityOpt"] == ["no-new-privileges:true"]
-    assert host["NetworkMode"] == "none" and host["PortBindings"] == {}
-    assert host["RestartPolicy"] == {"Name": "no"}
-    assert host["Memory"] == profile.memory_bytes
-    assert host["NanoCpus"] == profile.cpu_millicores * 1_000_000
-    assert host["PidsLimit"] == profile.pids_limit
-    assert host["Mounts"] == [{"Type": "bind", "Source": str(generation),
-                               "Target": "/var/lib/hub", "ReadOnly": False}]
-    assert host["Tmpfs"] == {"/tmp": "rw,noexec,nosuid,size=67108864,mode=1777"}
-    assert not any("/pull" in path or "/build" in path or "/exec" in path
-                   for _, path, _ in requests)
-    assert not any(method == "POST" and "/images/" in path for method, path, _ in requests)
-    backend.close()
+    )) as backend:
+        result = backend.create_container(plan, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+        assert result == "c" * 64
+        create = next(row for row in requests if row[0] == "POST" and row[1].endswith("/containers/create"))
+        body = json.loads(create[2])
+        assert body["Image"] == image.runnable_reference and body["Image"] != image.image_config_id
+        assert "Entrypoint" not in body and "Cmd" not in body
+        assert body["User"] == "10001:10001"
+        assert body["Env"] == [f"{key}={value}" for key, value in profile.environment]
+        host = body["HostConfig"]
+        assert host["ReadonlyRootfs"] is True and host["CapDrop"] == ["ALL"]
+        assert host["SecurityOpt"] == ["no-new-privileges:true"]
+        assert host["CgroupnsMode"] == "private"
+        assert host["NetworkMode"] == "none" and host["PortBindings"] == {}
+        assert host["RestartPolicy"] == {"Name": "no"}
+        assert host["Memory"] == profile.memory_bytes
+        assert host["NanoCpus"] == profile.cpu_millicores * 1_000_000
+        assert host["PidsLimit"] == profile.pids_limit
+        assert host["Mounts"] == [{"Type": "bind", "Source": str(generation),
+                                   "Target": "/var/lib/hub", "ReadOnly": False}]
+        assert host["Tmpfs"] == {"/tmp": "rw,noexec,nosuid,size=67108864,mode=1777"}
+        assert not any("/pull" in path or "/build" in path or "/exec" in path
+                       for _, path, _ in requests)
+        assert not any(method == "POST" and "/images/" in path for method, path, _ in requests)
+
+
+def test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path):
+    _exercise_create_closed_profile(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["host", "", None, "missing"])
+def test_effective_cgroup_namespace_readback_must_be_explicit_private(tmp_path, monkeypatch, mode):
+    original = container_inspect
+
+    def changed_inspection(*args, **kwargs):
+        observed = original(*args, **kwargs)
+        if mode == "missing":
+            observed["HostConfig"].pop("CgroupnsMode")
+        else:
+            observed["HostConfig"]["CgroupnsMode"] = mode
+        return observed
+
+    monkeypatch.setattr(__import__(__name__, fromlist=["container_inspect"]),
+                        "container_inspect", changed_inspection)
+    with pytest.raises(DaemonBackendError, match="host security profile differs"):
+        _exercise_create_closed_profile(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["host", "", None])
+def test_unsafe_planned_cgroup_namespace_rejected_before_any_daemon_call(tmp_path, mode):
+    from dataclasses import replace
+    from hub_container_executor.backend import ContainerPlan
+
+    manifest, image, _blobs = verified_image()
+    profile = replace(make_profile(image), cgroupns_mode=mode)
+    plan = ContainerPlan("hub-pilot-fixture-01234567-89a-candidate", image,
+                         image.runnable_reference, False, profile)
+    calls = []
+    backend = DockerEngineBackend(binding(manifest, tmp_path),
+                                  test_transport=httpx.MockTransport(lambda request: calls.append(request)))
+    try:
+        with pytest.raises(DaemonBackendError, match="closed pilot policy"):
+            backend.create_container(plan, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+        assert calls == []
+    finally:
+        backend.close()
 
 
 def test_create_rejects_profile_mismatch_and_symlink_generation_before_post(tmp_path):

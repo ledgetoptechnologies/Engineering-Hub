@@ -20,7 +20,9 @@ from uuid import UUID
 
 import httpx
 
-from engineering_hub.container_pilot_manifest import PROBE_PROFILE, Platform, Probe
+from engineering_hub.container_pilot_manifest import (
+    MIN_CGROUPNS_ENGINE_API, PROBE_PROFILE, Platform, Probe,
+)
 
 from .backend import (
     ActualImageSelection,
@@ -34,7 +36,7 @@ from .backend import (
 )
 from .build_record import VerifiedImage
 
-API_RE = re.compile(r"^1\.[0-9]{1,3}$")
+API_RE = re.compile(r"1\.(?:0|[1-9][0-9]{0,2})\Z")
 OPAQUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -196,6 +198,8 @@ class DockerEngineBinding:
             raise TypeError("explicit shared Platform binding required")
         if type(self.api_version) is not str or not API_RE.fullmatch(self.api_version):
             raise ValueError("explicit Docker API version required")
+        if tuple(int(part) for part in self.api_version.split(".")) < MIN_CGROUPNS_ENGINE_API:
+            raise ValueError("Docker API version does not support private cgroup namespaces")
         for value in (self.unix_socket_path, self.generation_root):
             if (type(value) is not str or not os.path.isabs(value)
                     or ".." in Path(value).parts or "\x00" in value):
@@ -867,6 +871,7 @@ class DockerEngineBackend:
                 or profile.no_new_privileges is not True
                 or profile.privileged is not False
                 or profile.pid_mode != "private" or profile.ipc_mode != "private"
+                or profile.cgroupns_mode != "private"
                 or profile.network_mode != "none" or profile.published_ports != ()
                 or profile.restart_policy != "no"
                 or profile.state_destination != "/var/lib/hub"
@@ -927,6 +932,7 @@ class DockerEngineBackend:
                 or profile.cap_drop != ("ALL",) or profile.no_new_privileges is not True
                 or profile.privileged is not False or profile.pid_mode != "private"
                 or profile.ipc_mode != "private" or profile.network_mode != "none"
+                or profile.cgroupns_mode != "private"
                 or profile.published_ports != () or profile.restart_policy != "no"):
             raise DaemonBackendError("runtime profile is outside the closed pilot policy")
 
@@ -942,6 +948,7 @@ class DockerEngineBackend:
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges:true"],
                 "Privileged": False,
+                "CgroupnsMode": profile.cgroupns_mode,
                 # Private PID and IPC are Docker's defaults: omit host/container modes.
                 "NetworkMode": "none",
                 "PortBindings": {},
@@ -1177,6 +1184,7 @@ class DockerEngineBackend:
                 or type(host.get("Privileged")) is not bool or host.get("Privileged") is not False
                 or host.get("PidMode") not in ("", "private")
                 or host.get("IpcMode") not in ("", "private")
+                or host.get("CgroupnsMode") != "private"
                 or host.get("NetworkMode") != "none"
                 or not self._safe_port_bindings(host.get("PortBindings"))
                 or host.get("PublishAllPorts") is True
@@ -1207,6 +1215,7 @@ class DockerEngineBackend:
             uid=10001, gid=10001, supplementary_groups=(), read_only_root=True,
             cap_drop=("ALL",), no_new_privileges=True, privileged=False,
             pid_mode="private", ipc_mode="private", network_mode="none",
+            cgroupns_mode=host["CgroupnsMode"],
             published_ports=(), memory_bytes=host["Memory"],
             cpu_millicores=host["NanoCpus"] // 1_000_000,
             pids_limit=host["PidsLimit"], tmpfs=tmp_profile,

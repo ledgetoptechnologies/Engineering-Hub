@@ -39,27 +39,31 @@ not enable itself from import, environment, Hub startup, or a listener.
 - `daemon_backend.py`: concrete operator-pinned Unix Engine HTTP driver, verified
   only with fake transports and synthetic OCI archives. Its tmpfs/hard-link
   corrections passed independent source review; see `DAEMON_SOURCE.md` for
-  unsupported identity paths, mutable-generation and cgroup profile gates.
+  unsupported identity paths, explicit private-cgroup profile and remaining
+  mutable-generation/live acceptance gates.
 - `docker/hub-container-pilot-acceptance.py`: import-safe, hard-disabled gate;
   a concrete acceptance harness and separate live-execution approval are still
   required. This script is not an implemented acceptance runner.
 
 ## Explicit limits / pending gates
 
-The concrete daemon driver is present, but **no real daemon was exercised**.
-No Docker command,
-API call, listener, container, model CLI, network call, live state or credential
-was used. Unit-test fake engines, fake builders, fake state provisioners and fake
-secret resolvers demonstrate protocol and local ledger behavior only. They are
-not daemon, provenance issuer, image-layer, health, rollback or application proof.
+The concrete daemon driver is present, but **no real daemon was exercised through
+this driver**. Isolated Docker validation containers execute the unit suite; that
+does not exercise the driver's Engine API, open a daemon socket from the test,
+or start an executor service. Unit-test fake engines, fake builders, fake state
+provisioners and fake secret resolvers demonstrate protocol and local ledger
+behavior only. They are not daemon, provenance issuer, image-layer, health,
+rollback or application proof, and use no live credentials or application state.
 
 Still required before any real acceptance:
 
 1. Source corrections were independently reviewed; that does not establish live
    daemon compatibility. Actual effective profile and image selection must be
    correlated to original immutable metadata on the operator-pinned daemon.
-   Shared cgroup namespace policy is unresolved; private cgroup isolation is not
-   modeled or guaranteed. Mutable-generation exclusion through bind establishment
+   Shared private cgroup namespace policy is required in profile derivation,
+   explicit create configuration and effective inspect; API versions below 1.41
+   are denied before I/O. These source checks are not live isolation proof.
+   Mutable-generation exclusion through bind establishment
    remains an operator/provider gate, not a guarantee from a path walk.
 2. Enrolled provenance verifier and protected content-addressed record/blob
    stores; operator-enrolled healthy baseline; versioned test-only secret
@@ -77,9 +81,10 @@ Still required before any real acceptance:
 4. Real daemon-specific identity/profile inspection, bounded operations, fixed
    compiled in-container probes and authentic private probe evidence. No fake
    backend may be reported as acceptance.
-5. Align the Root-owned client deadline (15s default / 60s ceiling) with the
-   manifest's 120s maximum plus bounded transport margin. This branch does not
-   edit the client or change shared models.
+5. Preserve the Root-owned client's aligned 125s default/ceiling, covering the
+   manifest's 120s maximum plus a 5s transport margin. Real host deadline and
+   shutdown behavior still require acceptance. This patch does not edit the
+   client or change shared models.
 6. Review and execute the acceptance harness only after the above gates. No
    Docker/harness execution is part of this unit-source phase.
 
