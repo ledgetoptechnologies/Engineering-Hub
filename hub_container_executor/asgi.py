@@ -1,8 +1,10 @@
 """Authenticated optional ASGI factory; no module-level app or listener."""
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
+import math
 import re
 from uuid import UUID
 
@@ -16,12 +18,18 @@ _COMMAND_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 
 class PilotASGI:
-    def __init__(self, adapter, bearer_token: str):
+    def __init__(self, adapter, bearer_token: str, *, request_body_timeout_seconds: float = 2.0):
         if (not isinstance(bearer_token, str) or not bearer_token
                 or any(not 33 <= ord(char) <= 126 for char in bearer_token)):
             raise ValueError("configured container-pilot bearer credential is required")
+        if (isinstance(request_body_timeout_seconds, bool)
+                or not isinstance(request_body_timeout_seconds, (int, float))
+                or not 0 < request_body_timeout_seconds <= 60
+                or not math.isfinite(request_body_timeout_seconds)):
+            raise ValueError("request body deadline must be finite and in (0, 60] seconds")
         self._adapter = adapter
         self._authorization = ("Bearer " + bearer_token).encode("ascii")
+        self._request_body_timeout_seconds = float(request_body_timeout_seconds)
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -42,7 +50,21 @@ class PilotASGI:
             return
         if method == "GET" and path.startswith(COMMANDS + "/"):
             command_id = path[len(COMMANDS) + 1:]
-            if not self._valid_id(command_id) or not self._bodyless(headers):
+            if not self._valid_id(command_id):
+                await self._error(send, 400, "invalid_payload")
+                return
+            try:
+                body = await self._read_body(receive, headers, allow_missing_length=True)
+            except TimeoutError:
+                await self._error(send, 408, "request_timeout")
+                return
+            except OverflowError:
+                await self._error(send, 413, "invalid_payload")
+                return
+            except ValueError:
+                await self._error(send, 400, "invalid_payload")
+                return
+            if body:
                 await self._error(send, 400, "invalid_payload")
                 return
             response = self._adapter.get(command_id)
@@ -59,6 +81,9 @@ class PilotASGI:
                 return
             try:
                 body = await self._read_body(receive, headers, allow_missing_length=True)
+            except TimeoutError:
+                await self._error(send, 408, "request_timeout")
+                return
             except OverflowError:
                 await self._error(send, 413, "invalid_payload")
                 return
@@ -88,6 +113,9 @@ class PilotASGI:
             if not isinstance(value, dict) or set(value) != set(ContainerPilotRequest.model_fields):
                 raise ValueError
             request = ContainerPilotRequest.model_validate(value)
+        except TimeoutError:
+            await self._error(send, 408, "request_timeout")
+            return
         except OverflowError:
             await self._error(send, 413, "invalid_payload")
             return
@@ -97,8 +125,8 @@ class PilotASGI:
         response = self._adapter.submit(request)
         await self._response(send, 200, response)
 
-    @staticmethod
-    async def _read_body(receive, headers, *, allow_missing_length: bool):
+    async def _read_body(self, receive, headers, *, allow_missing_length: bool):
+        deadline = asyncio.get_running_loop().time() + self._request_body_timeout_seconds
         lengths = [value for key, value in headers if key.lower() == b"content-length"]
         transfers = [value for key, value in headers if key.lower() == b"transfer-encoding"]
         if transfers or len(lengths) > 1 or (not lengths and not allow_missing_length):
@@ -116,7 +144,13 @@ class PilotASGI:
                 raise OverflowError
         body = bytearray()
         while True:
-            message = await receive()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("request body deadline expired")
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError:
+                raise TimeoutError("request body deadline expired") from None
             if message.get("type") == "http.disconnect":
                 raise ValueError("request disconnected")
             if message.get("type") != "http.request":
@@ -132,19 +166,6 @@ class PilotASGI:
         if expected is not None and len(body) != expected:
             raise ValueError("content length mismatch")
         return bytes(body)
-
-    @staticmethod
-    def _bodyless(headers):
-        lengths = [value for key, value in headers if key.lower() == b"content-length"]
-        transfers = [value for key, value in headers if key.lower() == b"transfer-encoding"]
-        if transfers or len(lengths) > 1:
-            return False
-        if not lengths:
-            return True
-        try:
-            return lengths[0].decode("ascii") == "0"
-        except UnicodeError:
-            return False
 
     @staticmethod
     def _valid_id(value: str) -> bool:
@@ -180,6 +201,8 @@ class PilotASGI:
         await send({"type": "http.response.body", "body": raw})
 
 
-def create_app(adapter, *, bearer_token: str) -> PilotASGI:
+def create_app(adapter, *, bearer_token: str, request_body_timeout_seconds: float = 2.0) -> PilotASGI:
     """Return an ASGI callable without binding a socket or starting a task."""
-    return PilotASGI(adapter, bearer_token)
+    return PilotASGI(
+        adapter, bearer_token, request_body_timeout_seconds=request_body_timeout_seconds
+    )

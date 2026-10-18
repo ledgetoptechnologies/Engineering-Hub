@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,10 @@ class OwnerBusy(RuntimeError):
 
 class LedgerClosed(RuntimeError):
     pass
+
+
+class InheritedLedgerUse(RuntimeError):
+    """An inherited child-process descriptor is not an authorized ledger owner."""
 
 
 class Admission:
@@ -105,6 +110,10 @@ class SQLiteLedger:
     def __init__(self, database_path, *, manifest_digest: str,
                  candidate_commit: str, policy_revision: int):
         self.path = Path(database_path)
+        self._owner_pid = os.getpid()
+        self._lifecycle = threading.Condition()
+        self._active_connections = 0
+        self._closing = False
         if not self.path.is_absolute():
             raise ValueError("ledger path must be absolute")
         self.lock_path = self.path.with_name(self.path.name + ".owner.lock")
@@ -122,6 +131,10 @@ class SQLiteLedger:
             raise
 
     def _check_open(self):
+        # Check the PID before touching a lock inherited from a possibly
+        # multithreaded parent; the child must never wait on that mutex.
+        if os.getpid() != self._owner_pid:
+            raise InheritedLedgerUse("ledger authority is bound to its creating process")
         if self._closed or self._lock_fd is None:
             raise LedgerClosed("ledger is closed")
 
@@ -221,15 +234,26 @@ class SQLiteLedger:
     @contextmanager
     def _connection(self):
         self._check_open()
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        connection.row_factory = sqlite3.Row
+        with self._lifecycle:
+            if self._closing or self._closed:
+                raise LedgerClosed("ledger is closing or closed")
+            self._active_connections += 1
+        connection = None
         try:
+            connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA busy_timeout=5000")
             yield connection
         finally:
-            connection.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                with self._lifecycle:
+                    self._active_connections -= 1
+                    self._lifecycle.notify_all()
 
     @contextmanager
     def _transaction(self):
@@ -487,12 +511,21 @@ class SQLiteLedger:
             row = db.execute("SELECT * FROM commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None or row["state"] != "held":
                 raise RuntimeError("command is not held")
-            failure = db.execute(
-                "SELECT 1 FROM operations WHERE command_id=? AND status='terminal_failed'",
+            failures = db.execute(
+                "SELECT operation_id,command_id,kind,status,intent,receipt,receipt_mac "
+                "FROM operations WHERE command_id=? AND status='terminal_failed' ORDER BY operation_id",
                 (command_id,),
-            ).fetchone()
-            if failure is None:
-                raise PermissionError("terminal failure evidence is required")
+            ).fetchall()
+            authenticated_failure = False
+            for failure in failures:
+                operation = self._format_operation(failure)
+                if (operation["status"] == "terminal_failed"
+                        and operation["receipt_authentic"] is True
+                        and operation["receipt"] == {"terminal": True}):
+                    authenticated_failure = True
+                    break
+            if not authenticated_failure:
+                raise PermissionError("authenticated terminal failure evidence is required")
             old = ContainerPilotResponse.model_validate_json(row["response"])
             result = old.model_copy(update={"state": "failed", "reason": "effect_failed",
                                             "replayed": False})
@@ -627,10 +660,23 @@ class SQLiteLedger:
         return dict(row) if row else None
 
     def close(self):
-        if self._closed:
+        # flock is associated with the shared open-file description. A forked
+        # child closes only its descriptor copy; LOCK_UN would release the
+        # parent's still-active owner lock.
+        if os.getpid() != self._owner_pid:
+            fd, self._lock_fd = self._lock_fd, None
+            self._closed = True
+            if fd is not None:
+                os.close(fd)
             return
-        self._closed = True
-        fd, self._lock_fd = self._lock_fd, None
+        with self._lifecycle:
+            if self._closed:
+                return
+            self._closing = True
+            while self._active_connections:
+                self._lifecycle.wait()
+            self._closed = True
+            fd, self._lock_fd = self._lock_fd, None
         if fd is not None:
             os.close(fd)
 

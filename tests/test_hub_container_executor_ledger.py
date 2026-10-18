@@ -1,8 +1,11 @@
 """Real private SQLite and kernel-owner tests; no Docker or listener."""
 import multiprocessing
+import os
 import sqlite3
 import stat
+import threading
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
@@ -305,3 +308,136 @@ def test_missing_evidence_key_never_replaces_key_for_existing_ledger(tmp_path):
     with pytest.raises(ValueError, match="key is missing"):
         open_ledger(tmp_path)
     assert database_path.exists() and not key_path.exists()
+
+
+def test_close_waits_for_sqlite_writer_already_waiting_on_transaction_lock(tmp_path):
+    ledger = open_ledger(tmp_path)
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    holder_errors = []
+
+    def hold_write_lock():
+        try:
+            with ledger._transaction():
+                holder_entered.set()
+                assert release_holder.wait(5)
+        except BaseException as exc:
+            holder_errors.append(exc)
+
+    holder = threading.Thread(target=hold_write_lock)
+    holder.start()
+    assert holder_entered.wait(5)
+
+    writer_id = None
+    writer_lease_entered = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    original_connection = ledger._connection
+
+    @contextmanager
+    def tracked_connection():
+        with original_connection() as connection:
+            if threading.get_ident() == writer_id:
+                writer_lease_entered.set()
+            yield connection
+
+    ledger._connection = tracked_connection
+
+    def write_pause():
+        nonlocal writer_id
+        writer_id = threading.get_ident()
+        try:
+            ledger.set_paused(True)
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=write_pause)
+    writer.start()
+    assert writer_lease_entered.wait(5)
+    close_done = threading.Event()
+    closer = threading.Thread(target=lambda: (ledger.close(), close_done.set()))
+    closer.start()
+    try:
+        assert not close_done.wait(0.05), "close released the owner while a writer held a connection"
+        with pytest.raises(OwnerBusy):
+            open_ledger(tmp_path)
+    finally:
+        release_holder.set()
+        holder.join(10)
+        writer.join(10)
+        closer.join(10)
+    assert not holder.is_alive() and not writer.is_alive() and not closer.is_alive()
+    assert not holder_errors and not writer_errors
+    assert writer_done.is_set() and close_done.is_set()
+
+    recovered = open_ledger(tmp_path)
+    assert recovered.is_paused() is True
+    recovered.close()
+
+
+def test_forked_ledger_use_is_rejected_and_child_close_preserves_parent_owner(tmp_path):
+    ledger = open_ledger(tmp_path)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            try:
+                ledger.set_paused(True)
+            except Exception as exc:
+                result = "rejected:" + type(exc).__name__
+            else:
+                result = "mutated"
+            ledger.close()
+            os.write(write_fd, result.encode("ascii"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 256).decode("ascii")
+    finally:
+        os.close(read_fd)
+        _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert result.startswith("rejected:"), result
+    assert ledger.is_paused() is False
+    with pytest.raises(OwnerBusy):
+        open_ledger(tmp_path)
+    ledger.close()
+
+
+def test_terminal_failure_resolution_rejects_forged_private_receipt_atomically(tmp_path):
+    ledger = open_ledger(tmp_path)
+    command = request()
+    ledger.admit(command)
+    operation_id = ledger.begin_operation(command.command_id, "create")
+    ledger.close()
+
+    recovered = open_ledger(tmp_path)
+    connection = sqlite3.connect(recovered.path)
+    connection.execute(
+        "UPDATE operations SET status='terminal_failed',receipt='{}',receipt_mac='00' "
+        "WHERE operation_id=?", (operation_id,)
+    )
+    connection.commit()
+    connection.close()
+
+    try:
+        recovered.resolve_terminal_failure(command.command_id)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("forged terminal-failure receipt released the reservation")
+    assert recovered.get(command.command_id).state == "held"
+    with sqlite3.connect(recovered.path) as check:
+        phase, run, target = check.execute(
+            "SELECT p.state,r.state,t.state FROM phases p "
+            "JOIN runs r ON r.run_id=p.run_id JOIN targets t ON t.current_run_id=r.run_id "
+            "WHERE p.command_id=?", (command.command_id,)
+        ).fetchone()
+    assert (phase, run, target) == ("held", "held", "held")
+    recovered.close()

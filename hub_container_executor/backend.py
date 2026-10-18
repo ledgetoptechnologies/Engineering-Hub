@@ -129,6 +129,17 @@ class ContainerPlanInput:
     profile: EffectiveProfile
 
 
+class TrustedDriverIdentityVerifier(Protocol):
+    """Operator-enrolled source of immutable runtime implementation identity.
+
+    Implementations must derive this from a trusted executable/provenance
+    boundary independent of the daemon backend; a backend echo, image label, or
+    caller-supplied expected value is not an acceptable verifier.
+    """
+
+    def implementation_commit(self) -> str: ...
+
+
 class PilotBackend(Protocol):
     """An implementation must use an operator-pinned local daemon binding only."""
 
@@ -150,10 +161,12 @@ class BaselineProvider(Protocol):
 
 
 class StateProvisioner(Protocol):
+    """Cooperative private-state provider; implementations must observe the shared deadline."""
+
     def prepare_candidate(self, manifest: PilotManifest, run_id: str, baseline: BaselineIdentity,
-                          operation_id: str) -> StateGeneration: ...
+                          operation_id: str, *, deadline_monotonic: float) -> StateGeneration: ...
     def prepare_rollback(self, manifest: PilotManifest, run_id: str, baseline: BaselineIdentity,
-                         operation_id: str) -> StateGeneration: ...
+                         operation_id: str, *, deadline_monotonic: float) -> StateGeneration: ...
 
 
 class TestSecretResolver(Protocol):

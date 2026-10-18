@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 
 from engineering_hub.container_pilot_client import (
@@ -31,6 +34,7 @@ from .backend import (
     ProbeObservation,
     RunnerObservation,
     StateGeneration,
+    TrustedDriverIdentityVerifier,
 )
 from .build_record import (
     BuildRecordError,
@@ -39,7 +43,7 @@ from .build_record import (
     VerifiedImage,
     verify_image_record,
 )
-from .ledger import Admission, SQLiteLedger
+from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -68,7 +72,8 @@ class HostAdapter:
                  metadata_store: ContentStore | None = None,
                  provenance_verifier: TrustedBuildVerifier | None = None,
                  backend: PilotBackend | None = None,
-                 baseline_provider=None, state_provisioner=None, secret_resolver=None):
+                 baseline_provider=None, state_provisioner=None, secret_resolver=None,
+                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
@@ -81,6 +86,14 @@ class HostAdapter:
         self.baseline_provider = baseline_provider
         self.state_provisioner = state_provisioner
         self.secret_resolver = secret_resolver
+        self.driver_identity_verifier = driver_identity_verifier
+        self._owner_pid = os.getpid()
+        self._lifecycle = threading.Condition()
+        self._active_operations = 0
+        self._active_threads = {}
+        self._closing = False
+        self._finalizing_close = False
+        self._closed = False
         self.ledger = SQLiteLedger(
             database_path,
             manifest_digest=self.manifest_digest,
@@ -88,17 +101,79 @@ class HostAdapter:
             policy_revision=self.manifest.policy_revision,
         )
 
+    @contextmanager
+    def _active_operation(self):
+        if os.getpid() != self._owner_pid:
+            raise InheritedLedgerUse("adapter authority is bound to its creating process")
+        thread_id = threading.get_ident()
+        with self._lifecycle:
+            if self._closing or self._closed:
+                raise LedgerClosed("adapter is closing or closed")
+            self._active_operations += 1
+            self._active_threads[thread_id] = self._active_threads.get(thread_id, 0) + 1
+        try:
+            yield
+        finally:
+            finalize = False
+            with self._lifecycle:
+                self._active_operations -= 1
+                remaining = self._active_threads[thread_id] - 1
+                if remaining:
+                    self._active_threads[thread_id] = remaining
+                else:
+                    del self._active_threads[thread_id]
+                if (self._closing and self._active_operations == 0
+                        and not self._finalizing_close):
+                    self._finalizing_close = True
+                    finalize = True
+                self._lifecycle.notify_all()
+            if finalize:
+                self._finish_close()
+
+    def _finish_close(self):
+        try:
+            self.ledger.close()
+        finally:
+            with self._lifecycle:
+                self._closed = True
+                self._finalizing_close = False
+                self._lifecycle.notify_all()
+
     def close(self):
-        self.ledger.close()
+        if os.getpid() != self._owner_pid:
+            self._closed = True
+            self.ledger.close()
+            return
+        thread_id = threading.get_ident()
+        with self._lifecycle:
+            if self._closed:
+                return
+            self._closing = True
+            # A callback may request shutdown reentrantly. Defer descriptor close
+            # until its outer submit/reconcile lease has finished all ledger writes.
+            if self._active_threads.get(thread_id, 0):
+                return
+            while self._active_operations or self._finalizing_close:
+                self._lifecycle.wait()
+                if self._closed:
+                    return
+            self._finalizing_close = True
+        self._finish_close()
 
     def set_paused(self, paused: bool):
         """Local operator control; deliberately absent from the wire namespace."""
-        self.ledger.set_paused(paused)
+        with self._active_operation():
+            self.ledger.set_paused(paused)
 
     def get(self, command_id: str) -> ContainerPilotResponse | None:
-        return self.ledger.get(command_id)
+        with self._active_operation():
+            return self.ledger.get(command_id)
 
     def submit(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
+        with self._active_operation():
+            return self._submit_active(request)
+
+    def _submit_active(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         admission = self.ledger.admit(request)
         if admission.replayed or not admission.accepted:
             return admission.response
@@ -141,7 +216,10 @@ class HostAdapter:
                       else self.state_provisioner.prepare_rollback)
             state = self._effect(
                 request, "state_copy" if role == "candidate" else "rollback_state",
-                lambda operation_id, timeout: method(self.manifest, request.run_id, baseline, operation_id),
+                lambda operation_id, timeout: method(
+                    self.manifest, request.run_id, baseline, operation_id,
+                    deadline_monotonic=deadline,
+                ),
                 self.manifest.timeouts.total_command_ms, deadline,
                 self._state_receipt,
             )
@@ -166,7 +244,7 @@ class HostAdapter:
         outcome = self._effect(
             request, "probe",
             lambda operation_id, timeout: self.backend.run_compiled_probes(
-                container_id, probes, operation_id, tuple(min(p.timeout_ms, timeout) for p in probes)
+                container_id, probes, operation_id, self._probe_timeouts(probes, deadline)
             ),
             self.manifest.timeouts.total_command_ms, deadline,
             self._probe_receipt,
@@ -194,7 +272,33 @@ class HostAdapter:
             raise _Held("inspect_required")
         return max(1, min(phase_limit, remaining))
 
+    def _probe_timeouts(self, probes: tuple[Probe, ...], deadline: float) -> tuple[int, ...]:
+        remaining = self._timeout(deadline, self.manifest.timeouts.total_command_ms)
+        budgets = []
+        for index, probe in enumerate(probes):
+            reserve_for_later = len(probes) - index - 1
+            allocation = min(probe.timeout_ms, remaining - reserve_for_later)
+            if allocation <= 0:
+                raise _Held("inspect_required")
+            budgets.append(allocation)
+            remaining -= allocation
+        return tuple(budgets)
+
+    def _check_driver_identity(self):
+        verifier = self.driver_identity_verifier
+        if verifier is None:
+            raise _Held("daemon_unavailable")
+        try:
+            observed_commit = verifier.implementation_commit()
+        except Exception:
+            raise _Held("daemon_unavailable") from None
+        if (type(observed_commit) is not str
+                or not re.fullmatch(r"[0-9a-f]{40}", observed_commit)
+                or observed_commit != self.manifest.driver.implementation_commit):
+            raise _Held("daemon_unavailable")
+
     def _check_runner(self, deadline):
+        self._check_driver_identity()
         observed = self.backend.inspect_runner(self._timeout(deadline, self.manifest.timeouts.inspect_ms))
         expected = self.manifest.runner_binding
         if (type(observed) is not RunnerObservation or observed.runner_id != expected.runner_id
@@ -323,6 +427,9 @@ class HostAdapter:
             raise _Held("stale_fence") from None
         try:
             result = callback(operation_id, timeout)
+            # A deadline detects an overrun; it is not cancellation. Keep the
+            # intent held so no later effect can run after an untrusted worker returns.
+            self._timeout(deadline, phase_limit)
         except KnownTerminalFailure:
             try:
                 self.ledger.record_terminal_failure(operation_id)
@@ -429,6 +536,10 @@ class HostAdapter:
 
     def reconcile(self, command_id: str) -> ContainerPilotResponse | None:
         """Inspect exact durable operation IDs only; never re-effect or re-probe."""
+        with self._active_operation():
+            return self._reconcile_active(command_id)
+
+    def _reconcile_active(self, command_id: str) -> ContainerPilotResponse | None:
         response = self.ledger.get(command_id)
         if response is None or response.state != "held":
             return response
