@@ -2,6 +2,33 @@
 
 ## Latest verified source
 
+Private lifecycle implementation checkpoint:
+`dc9d1dffd71a4cc658aa56d242613aaa44fe500b`, pushed to
+`work/hub-pilot-integration-codex`, not main or an installed image.
+A clean Git archive produced image index
+`sha256:28ce50baeb55f71be8b594cd2b7e1c19cb799f0bdcab7508de48b121852146bb`,
+manifest `sha256:e7690bdeba9715375de84c46f134d0e8e7faf90260e2372becd1bba56ea5d265`,
+config `sha256:5d0c4ac47f5b0c85739ea538cd22ef2a0ed8b5cd39017b76e272528e01db5cfa`.
+The exact image passed **2821 tests, 3 skipped, 4 known warnings**, 90.31s.
+The three owner-change checks passed separately **3/3**, 0.29s, with only CHOWN.
+The final focused identity, authentication, ownership, runtime and composition
+set passed **92/92**, 2.06s, with ResourceWarning errors enabled. Independent
+source review found no blocker.
+
+This adds actual Linux lock/native-feed lifecycle verification with a **mocked
+execution backend**, not an installed remote executor or a new real Docker pilot.
+It proves startup draining, event-driven invalidation, accepted-work shutdown,
+fresh restart identity, exact private admission and agent-token impersonation
+denial. No entrypoint, credential or worker service was activated. Existing
+shared staging Viewer/PA resources remain outside the allowed pilot boundary;
+see the shared-host activation gate in `staging-validation-worker.md`.
+
+An earlier working-tree image passed 2860 tests; that count includes unrelated
+untracked tests and is not the clean-commit release evidence above. The exact
+clean commit is the authoritative checkpoint.
+
+## Earlier queue and actual local Engine checkpoint
+
 Final implementation checkpoint:
 `2132e8727e9eeb3688a59075ddd3eb11f20ea282` on the same development branch.
 A fresh clean Git archive was built as image index
