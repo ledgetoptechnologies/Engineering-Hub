@@ -53,8 +53,12 @@ class Settings:
     ui_directory: Path | None = None
     ingress_mode: str = "combined"
     agent_allowed_hosts: tuple[str, ...] = ()
+    work_queue_enabled: bool = False
+    staging_machine_id: str = "staging-pc"
 
     def __post_init__(self):
+        if type(self.work_queue_enabled) is not bool:
+            raise ValueError("Explicit work queue enable flag required")
         from .ingress import validate_agent_hosts
         validate_agent_hosts(self.agent_allowed_hosts)
         if self.ingress_mode not in {"combined", "agents", "browser"}:
@@ -71,6 +75,9 @@ class Settings:
 
     @classmethod
     def from_env(cls):
+        work_queue_flag = os.environ.get("HUB_WORK_QUEUE_ENABLED", "0")
+        if work_queue_flag not in {"0", "1"}:
+            raise ValueError("HUB_WORK_QUEUE_ENABLED must be 0 or 1")
         path = Path(os.environ.get("HUB_DB", "data/hub.sqlite3"))
         bus_path = os.environ.get("AGENT_BUS_DB")
         if bus_path and path.resolve() == Path(bus_path).resolve():
@@ -91,7 +98,9 @@ class Settings:
         ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
                    ingress_mode=os.environ.get("HUB_INGRESS_MODE", "combined"),
                    agent_allowed_hosts=tuple(value.strip() for value in
-                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()))
+                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()),
+                   work_queue_enabled=work_queue_flag == "1",
+                   staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"))
 
 
 class Input(BaseModel):
@@ -158,12 +167,25 @@ class TopicPreflight(Input):
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
-               owned_pilot_service=None):
+               owned_pilot_service=None, work_queue=None):
     settings = settings or Settings.from_env()
     if settings.ingress_mode == "browser" and any(component is not None for component in (
-            fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service)):
+            fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service, work_queue)):
         raise ValueError("Browser ingress must not own staging execution")
     repo = repository or HubRepository(settings.database)
+    if (work_queue is not None or settings.work_queue_enabled) and any(
+            component is not None for component in (fixture_workflow, staging_dispatcher,
+                                                   container_pilot_workflow, owned_pilot_service)):
+        raise ValueError("Work queue and legacy dispatch require a shared reservation bridge")
+    if work_queue is not None:
+        from .work_queue import WorkQueue
+        if type(work_queue) is not WorkQueue or work_queue.repo is not repo:
+            raise ValueError("Work queue repository identity required")
+    elif settings.work_queue_enabled:
+        if settings.ingress_mode == "browser":
+            raise ValueError("Browser ingress cannot own work scheduling")
+        from .work_queue_config import configured_work_queue
+        work_queue = configured_work_queue(repo, machine_id=settings.staging_machine_id)
     if registry_bridge is not None and (type(registry_bridge) is not CanonicalRegistryBridge
                                         or reachability_provider is not None):
         raise ValueError('one_reachability_source_required')
@@ -574,6 +596,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if repo.get_run(run_id)['created_by'] != identity:
             raise HTTPException(403, detail={'code': 'forbidden'})
         return await owned_pilot_service.recover(run_id)
+
+    from .work_queue_api import attach_work_queue_routes
+    attach_work_queue_routes(app, repo=repo, queue=work_queue,
+                             actor=actor, agent=agent, human=human)
+    app.state.work_queue = work_queue
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
