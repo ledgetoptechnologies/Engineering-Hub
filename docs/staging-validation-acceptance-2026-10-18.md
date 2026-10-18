@@ -1,5 +1,32 @@
 # Software staging checkpoint — 2026-10-18
 
+## Latest verified source
+
+Final implementation checkpoint:
+`2132e8727e9eeb3688a59075ddd3eb11f20ea282` on the same development branch.
+A fresh clean Git archive was built as image index
+`sha256:a4bfe1acfcc881ffe45be3357a73f3c18fc1e122a7eda3f86a2295e18bc1d6aa`,
+selected manifest
+`sha256:73c6ff2e63858f887af18fea834f2560dbb2bf87a549aa0fb7122ba312543c8c`,
+config `sha256:79bd865ef8e3da2eb248a5b4990d03354ff4b6e5c9efa7f80e60b4244253bf16`.
+
+The exact final image passed **2701 Linux tests**, with 3 owner-change skips
+separately verified **3/3** (0.31s), and 3 known warnings, in 93.12s. The full
+suite includes opt-in MCP transport, closed bootstrap admission, exact worker/
+target authorization and action-filter tests. The actual-HTTP/native-SSE smoke
+also passed against this image. The actual local Engine acceptance was repeated
+successfully against this exact image with explicit test-only worker admission:
+fixed tests succeeded, the separate exit-7 command failed correctly, forged
+evidence was denied, receipts reopened, reservations released, and only the two
+receipt-bound stopped containers were removed. Production remained blocked.
+
+The older a377 checkpoint below preserves the initial acceptance/fix history;
+it is not the final source. All remote, deployment, credential and reboot gaps
+below remain. Existing approved SSH access to staging `192.168.50.90` was
+verified read-only, including Docker availability; no host configuration or
+service was changed. Staging root reported 19 GiB free of 98 GiB, so image/scratch
+retention must be bounded before any installed worker is activated.
+
 Beau selected software workflows first. Bulk ODM/OpenSplat/TreeDAR processing
 workers remain separate future work. This is **not** a report that the remote
 staging installation is ready.
