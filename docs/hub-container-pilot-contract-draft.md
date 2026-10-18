@@ -14,12 +14,20 @@ image/config/container identity; a matching public claim is not build provenance
 Rollback smoke checks `rollback.source_commit`, not the candidate commit carried
 on every wire command as immutable run identity.
 
-Failed or uncertain rollback/rollback smoke and pause during recovery now leave
+Failed or uncertain rollback/rollback smoke now leave
 the run `held`, not ordinary `failed`, with an allowlisted event reason visible
 in the dashboard. The target/task reservation and original command IDs remain.
 No automatic retry, lock expiry or takeover is added. A dead controller advance
 owner still requires a separately reviewed recovery/quiescence protocol; GET
 inspection alone does not release it or authorize another effect.
+Pause before the next unsubmitted phase instead returns `paused` (423) without
+turning a known pending/running/failed run into a terminal hold. Unpausing and
+advancing the same run consumes its existing phase ledger and submits only the
+next unreserved phase. Actual unknown or failed recovery stays held regardless
+of pause. The dispatcher still classifies an already-accepted paused run as
+`needs_reconciliation`; automatic accepted-run pause/restart recovery is not yet
+implemented or claimed. Both candidate and rollback images must bake their real
+source commit; null/missing build identity cannot pass the corresponding smoke.
 
 The synchronous pilot client has a bounded 125-second whole-operation deadline
 by default (and maximum). A configured deadline must cover the manifest's

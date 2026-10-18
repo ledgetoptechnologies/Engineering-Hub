@@ -180,7 +180,7 @@ async def test_rollback_failure_or_unknown_holds_before_smoke_without_retry(repo
 
 
 @pytest.mark.asyncio
-async def test_pause_between_rollback_effect_and_smoke_is_held_and_not_resumed(repo, target):
+async def test_pause_between_rollback_effect_and_smoke_resumes_without_repost(repo, target):
     class PausingRollbackClient(FakeClient):
         async def submit_command(self, command):
             response = await super().submit_command(command)
@@ -190,29 +190,42 @@ async def test_pause_between_rollback_effect_and_smoke_is_held_and_not_resumed(r
 
     client = PausingRollbackClient({'smoke_container': 'failed'})
     workflow, run = ready_run(repo, target, client)
-    result = await workflow.advance(run['id'])
-    assert result['status'] == 'held'
-    assert result['events'][-1]['reason'] == 'staging_paused'
+    with pytest.raises(HubError, match='paused') as paused:
+        await workflow.advance(run['id'])
+    assert paused.value.status == 423
+    result = repo.get_run(run['id'])
+    assert result['status'] == 'failed'
     assert [command.action for command in client.submissions] == ACTIONS[:3]
     assert repo.get_task(run['task_id'])['repair_count'] == 1
+    with repo._connection() as db:
+        assert db.execute('SELECT action FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                          (run['id'], 'smoke_container_rollback')).fetchone() is None
     repo.set_pause('human:1234', False)
     reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
     next_client = FakeClient()
-    assert await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id']) == result
-    assert next_client.submissions == []
+    resumed = await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id'])
+    assert resumed['status'] == 'rolled_back'
+    assert resumed['fencing_generation'] == result['fencing_generation']
+    assert [command.action for command in next_client.submissions] == ACTIONS[3:]
+    assert next_client.submissions[0].command_id == str(uuid.uuid5(
+        uuid.UUID(run['id']), 'container_pilot_v1:smoke_container_rollback'))
 
 
 @pytest.mark.asyncio
-async def test_paused_preexisting_failed_run_surfaces_hold_without_effect(repo, target):
+async def test_paused_preexisting_failed_run_is_resumable_without_effect(repo, target):
     workflow, run = ready_run(repo, target)
     run = workflow._event(run, 'running')
     run = workflow._event(run, 'failed')
     repo.set_pause('human:1234', True)
-    result = await workflow.advance(run['id'])
-    assert result['status'] == 'held'
-    assert result['events'][-1]['reason'] == 'staging_paused'
+    with pytest.raises(HubError, match='paused') as paused:
+        await workflow.advance(run['id'])
+    assert paused.value.status == 423
+    assert repo.get_run(run['id']) == run
     assert workflow.client.submissions == []
     assert repo.get_task(run['task_id'])['repair_count'] == 1
+    repo.set_pause('human:1234', False)
+    assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
+    assert [command.action for command in workflow.client.submissions] == ACTIONS[2:]
 
 
 @pytest.mark.asyncio
@@ -252,10 +265,51 @@ async def test_pause_after_failure_prevents_rollback_effect(repo, target):
             return response
     client = PausingFailureClient({'smoke_container': 'failed'})
     workflow, run = ready_run(repo, target, client)
+    with pytest.raises(HubError, match='paused') as paused:
+        await workflow.advance(run['id'])
+    assert paused.value.status == 423
+    result = repo.get_run(run['id'])
+    assert result['status'] == 'failed'
+    assert [c.action for c in client.submissions] == ACTIONS[:2]
+    with repo._connection() as db:
+        assert db.execute('SELECT action FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                          (run['id'], 'rollback_container')).fetchone() is None
+    repo.set_pause('human:1234', False)
+    reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
+    next_client = FakeClient()
+    resumed = await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id'])
+    assert resumed['status'] == 'rolled_back'
+    assert resumed['fencing_generation'] == result['fencing_generation']
+    assert [c.action for c in next_client.submissions] == ACTIONS[2:]
+    assert repo.get_task(run['task_id'])['repair_count'] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action,outcome,reason', [
+    ('deploy_container', 'held', 'candidate_outcome_uncertain'),
+    ('rollback_container', 'held', 'rollback_outcome_uncertain'),
+    ('rollback_container', 'failed', 'rollback_failed'),
+    ('smoke_container_rollback', 'held', 'rollback_smoke_outcome_uncertain'),
+    ('smoke_container_rollback', 'failed', 'rollback_smoke_failed'),
+])
+async def test_pause_never_converts_uncertain_or_failed_recovery_into_retryable_pause(
+        repo, target, action, outcome, reason):
+    class PausingOutcomeClient(FakeClient):
+        async def submit_command(self, command):
+            response = await super().submit_command(command)
+            if command.action == action:
+                repo.set_pause('human:1234', True)
+            return response
+
+    client = PausingOutcomeClient({'smoke_container': 'failed', action: outcome})
+    workflow, run = ready_run(repo, target, client)
     result = await workflow.advance(run['id'])
     assert result['status'] == 'held'
-    assert result['events'][-1]['reason'] == 'staging_paused'
-    assert [c.action for c in client.submissions] == ACTIONS[:2]
+    assert result['events'][-1]['reason'] == reason
+    submitted = list(client.submissions)
+    repo.set_pause('human:1234', False)
+    assert await workflow.advance(run['id']) == result
+    assert client.submissions == submitted
 
 
 @pytest.mark.asyncio
@@ -385,8 +439,22 @@ async def test_pause_before_effect_and_between_candidate_phases(repo, target):
     assert client.submissions == []
     assert repo.get_run(run['id'])['status'] == 'pending'
     repo.set_pause('human:1234', False)
-    assert (await workflow.advance(run['id']))['status'] == 'held'
+    with pytest.raises(HubError, match='paused') as paused:
+        await workflow.advance(run['id'])
+    assert paused.value.status == 423
     assert [c.action for c in client.submissions] == ACTIONS[:1]
+    result = repo.get_run(run['id'])
+    assert result['status'] == 'running'
+    with repo._connection() as db:
+        assert db.execute('SELECT action FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                          (run['id'], 'smoke_container')).fetchone() is None
+    repo.set_pause('human:1234', False)
+    reopened = HubRepository(repo.path, execution_principal=PRINCIPAL)
+    next_client = FakeClient()
+    resumed = await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id'])
+    assert resumed['status'] == 'succeeded'
+    assert resumed['fencing_generation'] == result['fencing_generation']
+    assert [c.action for c in next_client.submissions] == ACTIONS[1:2]
 
 
 @pytest.mark.asyncio

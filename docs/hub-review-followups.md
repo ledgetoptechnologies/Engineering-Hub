@@ -98,7 +98,7 @@ because the earlier chain reached its hop limit:
 
 The source review found no blocking controller/client defects at `eaffa9a` but
 identified material pre-host-integration work. Current changes make rollback
-failure/uncertainty and pause visibly held with fixed public event reasons,
+failure/uncertainty visibly held with fixed public event reasons,
 preserving the same target reservation, command IDs, fence and repair count.
 Run creation now independently revalidates the approved distinct registered
 reviewer and current exact commit at consumption; a persisted `verified` label
@@ -125,6 +125,21 @@ Unresolved host/recovery gates from those reviews remain explicit:
 The old sketch also proposed claim-as-delivery and linked-reply-as-completion.
 Neither inference is adopted: exact chat delivery, processing and completed work
 require their own explicit evidence. A claim, ACK or arbitrary reply is not proof.
+
+Claude's follow-up `29f3d90e-c753-48f8-8d28-0a41d80cd00c` accepted the independent
+review gate, baked identity and fixed hold reasons by source inspection, but found
+safe pause boundaries had become terminal holds. That is corrected: they return
+423 and preserve the original pending/running/failed path. One hundred focused
+controller/API tests prove unpause resumes only unsubmitted phases, while actual
+uncertainty/failure remains held. Dispatcher accepted-pause receipts still require
+reconciliation; this is not a claim of automatic restart recovery.
+
+The same review identified a latent event-identity constraint: global event dedupe
+currently keys `(run_id, command_id, event)` and pilot uses run ID as command ID.
+Do not add held→failed→held recovery until phase/occurrence identities, preserved
+legacy dedupe and repair-count semantics are reviewed. A second held reason can
+otherwise conflict, and a repeated failed event can be mistaken for a replay.
+No supported recovery operation or lock deletion is introduced by these fixes.
 
 ## Executor integration review
 

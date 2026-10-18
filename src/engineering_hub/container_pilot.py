@@ -248,15 +248,15 @@ class ContainerPilotWorkflow:
             if run['status'] in {'succeeded', 'rolled_back', 'held'}:
                 return run
             if self.repo.get_paused():
-                if run['status'] == 'failed':
-                    return self._hold(run, 'staging_paused')
                 raise HubError('paused', 423)
             if run['status'] == 'pending':
                 run = self._event(run, 'running')
             if run['status'] == 'running':
                 for action in ('deploy_container', 'smoke_container'):
                     if self.repo.get_paused():
-                        return self._hold(run, 'staging_paused')
+                        # Pause before the next effect is resumable. It is not
+                        # evidence of an unknown effect requiring a hold.
+                        raise HubError('paused', 423)
                     state = await self._command(run, target, action)
                     if state == 'held':
                         return self._hold(run, 'candidate_outcome_uncertain')
@@ -268,7 +268,7 @@ class ContainerPilotWorkflow:
             if run['status'] == 'failed':
                 for action in ('rollback_container', 'smoke_container_rollback'):
                     if self.repo.get_paused():
-                        return self._hold(run, 'staging_paused')
+                        raise HubError('paused', 423)
                     state = await self._command(run, target, action)
                     if state != 'succeeded':
                         phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
