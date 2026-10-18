@@ -143,21 +143,27 @@ class ContainerPilotWorkflow:
         self.targets = {target.target_id: target for target in targets}
         if len(self.targets) != len(targets) or any(not isinstance(t, ContainerPilotTarget) for t in targets):
             raise ValueError('invalid_pilot_targets')
-        with repo._connection() as db:
+        with repo._transaction() as db:
             self._assert_pilot_owner()
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS hub_container_pilot_commands (
+            statements = (
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_commands (
                     run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,
-                    state TEXT NOT NULL, response_json TEXT, PRIMARY KEY(run_id,action));
-                CREATE TABLE IF NOT EXISTS hub_container_pilot_bindings (
-                    run_id TEXT PRIMARY KEY, binding TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS hub_container_pilot_advances (
-                    run_id TEXT PRIMARY KEY, owner TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS hub_container_pilot_advance_epochs (
-                    run_id TEXT PRIMARY KEY, advance_owner TEXT NOT NULL, epoch TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS hub_container_pilot_manifest_views (
-                    manifest_digest TEXT PRIMARY KEY, binding TEXT NOT NULL);
-            ''')
+                    state TEXT NOT NULL, response_json TEXT, PRIMARY KEY(run_id,action))''',
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_bindings (
+                    run_id TEXT PRIMARY KEY, binding TEXT NOT NULL)''',
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_advances (
+                    run_id TEXT PRIMARY KEY, owner TEXT NOT NULL)''',
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_advance_epochs (
+                    run_id TEXT PRIMARY KEY, advance_owner TEXT NOT NULL, epoch TEXT NOT NULL)''',
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_attempts (
+                    run_id TEXT PRIMARY KEY, advance_owner TEXT NOT NULL,
+                    epoch TEXT NOT NULL, state TEXT NOT NULL)''',
+                '''CREATE TABLE IF NOT EXISTS hub_container_pilot_manifest_views (
+                    manifest_digest TEXT PRIMARY KEY, binding TEXT NOT NULL)''',
+            )
+            for statement in statements:
+                self._assert_pilot_owner()
+                db.execute(statement)
             columns = {row[1] for row in db.execute('PRAGMA table_info(hub_container_pilot_commands)')}
             if 'response_json' not in columns:
                 # Preserve legacy unknown/held reservations; never reconstruct
@@ -314,13 +320,28 @@ class ContainerPilotWorkflow:
         owner = str(uuid.uuid4())
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
+            recovery_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                        "AND name='hub_container_pilot_recovery_claims'").fetchone()
+            if recovery_table and db.execute(
+                    "SELECT 1 FROM hub_container_pilot_recovery_claims WHERE run_id=? AND state='inspecting'",
+                    (run_id,)).fetchone():
+                raise HubError('advance_requires_reconciliation', 409)
             if (db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone()
                     or db.execute('SELECT 1 FROM hub_container_pilot_advance_epochs WHERE run_id=?', (run_id,)).fetchone()):
+                raise HubError('advance_requires_reconciliation', 409)
+            attempt = db.execute('SELECT state FROM hub_container_pilot_attempts WHERE run_id=?', (run_id,)).fetchone()
+            # Missing advance rows do not prove that a prior active attempt
+            # finished. Only our exact, guarded finally transaction does so.
+            if attempt and (self.pilot_owner is None or attempt['state'] != 'quiescent'):
                 raise HubError('advance_requires_reconciliation', 409)
             db.execute('INSERT INTO hub_container_pilot_advances VALUES(?,?)', (run_id, owner))
             if self.pilot_owner is not None:
                 db.execute('INSERT INTO hub_container_pilot_advance_epochs VALUES(?,?,?)',
                            (run_id, owner, self.pilot_owner.epoch))
+                db.execute('INSERT INTO hub_container_pilot_attempts VALUES(?,?,?,?) '
+                           'ON CONFLICT(run_id) DO UPDATE SET advance_owner=excluded.advance_owner, '
+                           'epoch=excluded.epoch,state=excluded.state',
+                           (run_id, owner, self.pilot_owner.epoch, 'active'))
         try:
             run = self.repo.get_run(run_id)
             target = self._target(run)
@@ -372,9 +393,15 @@ class ContainerPilotWorkflow:
                     # Mismatched metadata remains evidence, never adoption.
                     paired = db.execute('SELECT 1 FROM hub_container_pilot_advances a '
                                         'JOIN hub_container_pilot_advance_epochs e ON e.run_id=a.run_id '
-                                        'WHERE a.run_id=? AND a.owner=? AND e.advance_owner=? AND e.epoch=?',
-                                        (run_id, owner, owner, self.pilot_owner.epoch)).fetchone()
+                                        'JOIN hub_container_pilot_attempts t ON t.run_id=a.run_id '
+                                        'WHERE a.run_id=? AND a.owner=? AND e.advance_owner=? AND e.epoch=? '
+                                        "AND t.advance_owner=? AND t.epoch=? AND t.state='active'",
+                                        (run_id, owner, owner, self.pilot_owner.epoch,
+                                         owner, self.pilot_owner.epoch)).fetchone()
                     if paired:
+                        db.execute("UPDATE hub_container_pilot_attempts SET state='quiescent' "
+                                   "WHERE run_id=? AND advance_owner=? AND epoch=? AND state='active'",
+                                   (run_id, owner, self.pilot_owner.epoch))
                         db.execute('DELETE FROM hub_container_pilot_advance_epochs '
                                    'WHERE run_id=? AND advance_owner=? AND epoch=?',
                                    (run_id, owner, self.pilot_owner.epoch))

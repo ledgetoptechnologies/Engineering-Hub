@@ -288,3 +288,27 @@ ancestry across idle restarts, exact reservation CAS and one-time repair countin
 An actual Linux SIGKILL test covers controller lock release and durable receipts,
 with simulated host evidence only. Peer review of the published combined slice
 and actual host acceptance remain separate gates.
+
+Claude follow-up `bb2bab14-79c8-4246-b38f-c027b533cccd` (source review only)
+confirmed the repository barrier and recovery invariants, then identified the
+remaining writable read-context/schema path. Read contexts now reopen enrolled
+ledgers with SQLite mode=ro; schema initialization uses guarded transactions and
+individual DDL statements. Cancellation of an inspection still conservatively
+requires a verified successor epoch. No recovery HTTP/MCP endpoint may inherit
+request cancellation directly: endpoint integration must use a supervisor-owned
+task/result occurrence or prove unwind before same-epoch retry. That integration
+is not claimed here. Repeated inspection history growth and a formal transition
+matrix were review follow-ups, not silent production acceptance. The next slice
+now declares and enforces an explicit recovery transition matrix, including an
+integration regression against running-to-rolled_back rewind.
+
+Quiescent attempt and dispatcher continuation source is now verified in the
+1,700-test frozen Linux run. Read-only contexts, guarded schema transactions and
+outbox publisher ownership cover the identified internal writer paths. Independent
+subagent review identified malformed paired-owner UUID and recovery-prefix
+starvation: canonical UUID checks, per-head seen records and fair limit=1 lanes
+were added and tested. Original request/run binding, pause races and no-self-wake
+behavior are covered. The real in-process runtime is exercised with an injected
+event feed; no installed watcher or production service is activated. A remote
+receipt changing by itself still needs supported host-to-Hub invalidation, and
+owned lifecycle/cancellation handling remains a deployment gate.

@@ -62,7 +62,7 @@ class FixtureWorkflow:
         self.targets = {target.target_id: target for target in targets}
         if len(self.targets) != len(targets):
             raise ValueError("duplicate_target")
-        with repo._connection() as db:
+        with repo._transaction() as db:
             self._assert_pilot_owner()
             db.execute('''CREATE TABLE IF NOT EXISTS hub_fixture_commands (
                 run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,

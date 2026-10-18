@@ -53,6 +53,12 @@ exact live capability after BEGIN IMMEDIATE and before commit, including generic
 task/decision/run writes. This is source integration, not an activated service or
 proof that older external writers respect the lock. It accepts a new database in an
 existing private local directory, or the exact enrolled database/lock inodes.
+
+Read contexts for enrolled ledgers use SQLite mode=ro, even for a live owner.
+Schema and outbox publisher writes use the guarded transaction context, not a
+raw writer or implicitly committing executescript. Outbox delivery rechecks
+ownership before and after bus I/O; an accepted-but-unrecorded bus receipt keeps
+its original sender-scoped idempotency request for later reconciliation.
 Un-enrolled existing state is refused; no permission changes, legacy adoption,
 watcher or daemon activation occur. It holds a nonblocking Linux `flock`, binds
 its live capability to the process/FD/path/durable epoch, and rejects replaced
@@ -105,15 +111,46 @@ Pause allows inspection evidence but no reactivation/release. Repeated explicit
 inspections get distinct occurrences. Ordinary local validation/CAS errors mark
 only their own inspection claim held, allowing a corrected retry; cancellation
 or owner loss conservatively leaves in-flight claims for a later verified owner.
-Dispatcher accepted-pause continuation, normally cleaned-up held runs without an
-advance reservation, supervised startup/shutdown and actual app/reboot acceptance
-still require integration. No automatic production recovery is claimed.
+Normally cleaned-up attempts retain an exact UUID/epoch `quiescent` record.
+That record permits same-epoch or proven-prior-epoch inspection only when no
+active/orphan advance pair exists. It does not mean a remote job has stopped.
+Active recovery claims block new advances; inconsistent attempt metadata holds.
+
+The dedicated recovery transition matrix is deliberately separate from generic
+run-event transitions. A disallowed derivation holds; terminal runs never downgrade.
+
+| Current state | Allowed derived state |
+| --- | --- |
+| pending | running, held |
+| running | running, succeeded, failed, held |
+| failed | failed, rolled_back, held |
+| held | running, succeeded, failed, rolled_back, held |
+| succeeded | succeeded |
+| rolled_back | rolled_back |
+
+Dispatcher receipts now carry an exact UUID/epoch active/quiescent pairing.
+`resume_accepted` validates this proof, the original sender-scoped run request and
+the complete manifest before continuation. It uses GET recovery for existing
+attempts; a pending accepted run with no attempt/command/orphan may start its
+first phase only after current review/fence checks. New outbox invalidations or
+a proven prior epoch trigger bounded catchup, including unpause. Per-head seen
+records and fair recovery/outbox lanes prevent malformed prefix starvation and
+self-generated recovery events from causing repeat GET loops. Canonical terminal
+events from another executor can finalize the original dispatcher receipt.
+
+The existing in-process runtime exercises this path on startup snapshots and
+invalidation, with no new timer, watcher or model checks. A remote receipt becoming
+terminal alone still needs a supported external Hub invalidation; this slice adds
+no host-completion push subscription. Supervised startup/shutdown, request-safe
+owned recovery tasks and actual app/reboot acceptance remain required. No
+automatic production recovery is claimed.
 
 Pilot run events now carry optional deterministic `event_id` UUIDs scoped to
 run, phase and event kind. They are not effect command IDs: the original command
 binding and fence stay unchanged. Separate receipt dedupe preserves legacy event
 fingerprints and permits candidate and rollback holds to coexist. This does not
-yet define repeated inspection occurrences or a held-run continuation operation.
+grant generic held-run continuation; dedicated inspected recovery defines that
+operation separately, with distinct inspection occurrences.
 `staging_paused` is retained solely for legacy event records; new safe pause
 boundaries emit no held event. Injected typed responses are strictly revalidated
 in Python-value form and bounded JSON form before verification or retention.

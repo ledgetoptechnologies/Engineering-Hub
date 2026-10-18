@@ -41,7 +41,7 @@ class HubRepository:
             raise HubError('durable_path_required')
         self._assert_pilot_owner(None)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connection() as db:
+        with self._write_connection() as db:
             # Even WAL configuration is a mutation. A legacy constructor must
             # not change an enrolled ledger before checking its live owner.
             self._assert_pilot_owner(db)
@@ -92,10 +92,24 @@ class HubRepository:
 
     @contextmanager
     def _connection(self):
+        """Read contexts cannot mutate an enrolled ledger, even for its owner."""
         if self.pilot_owner is not None:
-            # Owner enrollment created the database already. Reads or failed
-            # writes must not silently recreate a deleted/replaced ledger.
-            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=rw', uri=True, timeout=10)
+            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=ro', uri=True, timeout=10)
+        elif Path(self.path).exists():
+            # Probe existing ledgers read-only as well: an initial RW open or
+            # schema read must not recover a journal on an enrolled database.
+            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=ro', uri=True, timeout=10)
+            # Preserve historical un-enrolled fixture behavior only. Do not
+            # hand out a writable handle after discovering enrollment, even
+            # when this repository was constructed before that marker existed.
+            try:
+                enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE name='hub_pilot_owner'").fetchone()
+            except BaseException:
+                db.close()
+                raise
+            if not enrolled:
+                db.close()
+                db = sqlite3.connect(self.path, timeout=10)
         else:
             db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
@@ -105,9 +119,26 @@ class HubRepository:
             db.close()
 
     @contextmanager
+    def _write_connection(self):
+        """Private writer boundary; only initialization and transactions use it."""
+        self._assert_pilot_owner(None)
+        if self.pilot_owner is not None:
+            # Enrollment already created this file. Never recreate it on loss.
+            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=rw', uri=True, timeout=10)
+        else:
+            db = sqlite3.connect(self.path, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            self._assert_pilot_owner(db)
+            yield db
+            self._assert_pilot_owner(db)
+        finally:
+            db.close()
+
+    @contextmanager
     def _transaction(self):
         self._assert_pilot_owner(None)
-        with self._connection() as db:
+        with self._write_connection() as db:
             db.execute('BEGIN IMMEDIATE')
             try:
                 self._assert_pilot_owner(db)

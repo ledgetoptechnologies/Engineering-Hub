@@ -3,12 +3,10 @@
 The injected client owns authentication. This module never handles agent tokens,
 starts a watcher, or treats delivery as execution/approval acknowledgement.
 """
-from contextlib import contextmanager
 import asyncio
 import hashlib
 import json
 import re
-import sqlite3
 import uuid
 
 
@@ -29,7 +27,7 @@ class HubOutboxPublisher:
     """
     def __init__(self, repo, bus_client, *, recipients=("hermes", "claude"),
                  topic="auto-wake-v1-test", correlation_id=None):
-        self.path = repo.path
+        self.repo, self.path = repo, repo.path
         self.client = bus_client
         self.recipients = tuple(dict.fromkeys(recipients))
         if not self.recipients or not all(x in {"hermes", "claude", "codex"} for x in self.recipients):
@@ -51,19 +49,17 @@ class HubOutboxPublisher:
             db.execute("""CREATE TABLE IF NOT EXISTS hub_delivery_sender (
                 id INTEGER PRIMARY KEY CHECK(id=1), principal TEXT NOT NULL)""")
 
-    @contextmanager
     def _db(self):
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        # The same ledger and capability boundary as every other Hub writer.
+        return self.repo._transaction()
+
+    def _guard(self):
+        self.repo._assert_pilot_owner(None)
+        with self.repo._connection() as db:
+            self.repo._assert_pilot_owner(db)
 
     def _prepare(self, limit):
         with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
             candidates = []
             for recipient in self.recipients:
                 rows = db.execute("""SELECT o.* FROM hub_outbox o LEFT JOIN hub_delivery_receipts d
@@ -98,15 +94,22 @@ class HubOutboxPublisher:
                        (message_id, sequence, recipient))
 
     def _pending(self):
-        with self._db() as db:
+        with self.repo._connection() as db:
             return sum(db.execute("""SELECT COUNT(*) FROM hub_outbox o LEFT JOIN hub_delivery_receipts d
                 ON d.sequence=o.sequence AND d.recipient=? WHERE d.message_id IS NULL""", (recipient,)).fetchone()[0]
                        for recipient in self.recipients)
 
     async def _verify_sender(self):
         """One bounded identity check and atomic pin per explicitly run batch."""
+        self._guard()
         try:
             info = await asyncio.wait_for(self.client.bus_info(topic='overview'), timeout=5)
+        except Exception:
+            self._guard()
+            # Network errors/response representations may include credentials.
+            return 'sender_identity_unverified'
+        self._guard()
+        try:
             native = info.get('native_push') if isinstance(info, dict) else None
             inbox = native.get('inbox_uri') if isinstance(native, dict) else None
             allowed = {'agentbus://inbox/' + name: name for name in ('codex', 'hermes', 'claude')}
@@ -117,7 +120,6 @@ class HubOutboxPublisher:
             # Network errors/response representations may include credentials.
             return 'sender_identity_unverified'
         with self._db() as db:
-            db.execute('BEGIN IMMEDIATE')
             pin = db.execute('SELECT principal FROM hub_delivery_sender WHERE id=1').fetchone()
             if pin:
                 return None if pin['principal'] == principal else 'sender_identity_conflict'
@@ -154,13 +156,18 @@ class HubOutboxPublisher:
                         or not _valid_route(self.topic, correlation)):
                     failed, held_reason = failed + 1, 'routing_conflict'
                     break
+                self._guard()
                 result = await self.client.send_message(**request)
+                self._guard()
                 message_id = result.get("id") if isinstance(result, dict) else None
                 if not isinstance(message_id, str) or str(uuid.UUID(message_id)) != message_id:
                     raise ValueError("Invalid delivery receipt")
                 self._mark_accepted(delivery["sequence"], delivery["recipient"], message_id)
                 accepted += 1
             except Exception:
+                # Owner loss is not a bus/network failure. In particular, do
+                # not commit a receipt or continue the batch after an await.
+                self._guard()
                 # Deliberately omit exception text: clients may include secrets.
                 failed += 1
                 held_reason = 'bus_acceptance_unconfirmed'

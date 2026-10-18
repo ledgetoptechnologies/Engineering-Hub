@@ -5,12 +5,27 @@ host liveness, source provenance, current application health or user approval.
 """
 import json
 import uuid
+from dataclasses import dataclass
 
 from .container_pilot import ContainerPilotWorkflow
 from .repository import AGENTS, HubError
 
 
 ACTIONS = ('deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback')
+RECOVERY_TRANSITIONS = {
+    'pending': frozenset({'running', 'held'}),
+    'running': frozenset({'running', 'succeeded', 'failed', 'held'}),
+    'failed': frozenset({'failed', 'rolled_back', 'held'}),
+    'held': frozenset({'running', 'succeeded', 'failed', 'rolled_back', 'held'}),
+    'succeeded': frozenset({'succeeded'}),
+    'rolled_back': frozenset({'rolled_back'}),
+}
+
+
+@dataclass(frozen=True)
+class _Reservation:
+    active: tuple | None
+    attempt: tuple | None
 
 
 class PilotRecovery:
@@ -38,19 +53,37 @@ class PilotRecovery:
             'SELECT action,payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? ORDER BY action', (run_id,))]
 
     def _reservation(self, db, run_id):
-        row = db.execute('''SELECT a.owner,e.advance_owner,e.epoch
-            FROM hub_container_pilot_advances a
-            LEFT JOIN hub_container_pilot_advance_epochs e ON e.run_id=a.run_id
-            WHERE a.run_id=?''', (run_id,)).fetchone()
-        if row is None or row['owner'] != row['advance_owner'] or row['epoch'] is None:
-            raise HubError('pilot_recovery_reservation_unverified', 409)
+        advance = db.execute('SELECT owner FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone()
+        epoch = db.execute('SELECT advance_owner,epoch FROM hub_container_pilot_advance_epochs WHERE run_id=?', (run_id,)).fetchone()
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_container_pilot_attempts'").fetchone()
+        attempt = (db.execute('SELECT advance_owner,epoch,state FROM hub_container_pilot_attempts WHERE run_id=?',
+                              (run_id,)).fetchone() if table else None)
         try:
-            self.owner.assert_prior_epoch(row['epoch'])
+            if advance is not None or epoch is not None:
+                if advance is None or epoch is None or advance['owner'] != epoch['advance_owner']:
+                    raise ValueError
+                if str(uuid.UUID(advance['owner'])) != advance['owner']:
+                    raise ValueError
+                # Only the kernel-excluded predecessor can leave an active
+                # reservation. A current-epoch coroutine may still be running.
+                self.owner.assert_prior_epoch(epoch['epoch'])
+                active = (advance['owner'], epoch['advance_owner'], epoch['epoch'])
+                if attempt is not None and tuple(attempt) != (advance['owner'], epoch['epoch'], 'active'):
+                    raise ValueError
+                return _Reservation(active, tuple(attempt) if attempt is not None else None)
+            if attempt is None or attempt['state'] != 'quiescent':
+                raise ValueError
+            if str(uuid.UUID(attempt['advance_owner'])) != attempt['advance_owner']:
+                raise ValueError
+            if attempt['epoch'] != self.owner.epoch:
+                self.owner.assert_prior_epoch(attempt['epoch'])
+            return _Reservation(None, tuple(attempt))
         except Exception:
             raise HubError('pilot_recovery_reservation_unverified', 409) from None
-        return tuple(row)
 
     def _authorized(self, db, run):
+        if run['status'] not in RECOVERY_TRANSITIONS:
+            raise HubError('pilot_recovery_state_unverified', 409)
         if run['command_id'] not in {None, run['id']}:
             raise HubError('command_conflict', 409)
         task = self.repo._get(db, run['task_id'], 'task')
@@ -185,6 +218,8 @@ class PilotRecovery:
                         'rollback_smoke_failed': ACTIONS[3], 'rollback_smoke_outcome_uncertain': ACTIONS[3]}.get(event.get('reason'))
             if required is not None and required not in by_action:
                 derived = 'held'
+        if derived not in RECOVERY_TRANSITIONS[run['status']]:
+            derived = 'held'
         self._guard()
         with self.repo._transaction() as db:
             if self._reservation(db, run_id) != reservation or self._rows(db, run_id) != original_rows:
@@ -216,9 +251,20 @@ class PilotRecovery:
                 for item in evidence:
                     db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                                (item['state'], item['response'], run_id, item['action']))
-                db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?', (run_id, reservation[0]))
-                db.execute('DELETE FROM hub_container_pilot_advance_epochs WHERE run_id=? AND advance_owner=? AND epoch=?',
-                           (run_id, reservation[1], reservation[2]))
+                if reservation.active is not None:
+                    advance_owner, epoch_owner, prior_epoch = reservation.active
+                    if (db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?',
+                                   (run_id, advance_owner)).rowcount != 1
+                            or db.execute('DELETE FROM hub_container_pilot_advance_epochs WHERE run_id=? AND advance_owner=? AND epoch=?',
+                                          (run_id, epoch_owner, prior_epoch)).rowcount != 1):
+                        raise HubError('pilot_recovery_conflict', 409)
+                if reservation.attempt is not None:
+                    advance_owner, prior_epoch, prior_state = reservation.attempt
+                    changed = db.execute("UPDATE hub_container_pilot_attempts SET state='quiescent' "
+                        'WHERE run_id=? AND advance_owner=? AND epoch=? AND state=?',
+                        (run_id, advance_owner, prior_epoch, prior_state)).rowcount
+                    if changed != 1:
+                        raise HubError('pilot_recovery_conflict', 409)
                 candidate_failed = any(item['action'] in ACTIONS[:2] and item['state'] == 'failed' for item in evidence)
                 if candidate_failed and not any(event['event'] == 'failed' for event in current['events']):
                     task = self.repo._get(db, current['task_id'], 'task')

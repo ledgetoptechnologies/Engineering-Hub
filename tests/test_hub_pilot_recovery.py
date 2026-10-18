@@ -22,6 +22,22 @@ pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Actual Linux ow
 
 
 @pytest.mark.asyncio
+async def test_recovery_transition_matrix_refuses_running_to_rolled_back_rewind(rig):
+    _, run, outcomes = await rig.crash(ACTIONS[3])
+    current = rig.restart(RecoveryClient(outcomes))
+    with current.repo._transaction() as db:
+        altered = current.repo._get(db, run['id'], 'run')
+        altered['status'] = 'running'
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(altered), run['id']))
+    result = await current.recovery.recover(run['id'])
+    assert result['recovery'] == 'held'
+    assert result['run']['status'] == 'held'
+    assert len(reservations(current.repo, run['id'])[0]) == 1
+    assert current.client.submissions == []
+    assert current.repo.get_task(run['task_id'])['repair_count'] == 1
+
+
+@pytest.mark.asyncio
 async def test_correctable_local_validation_error_does_not_strand_current_claim(rig):
     _, run, _ = await rig.crash()
     current = rig.restart()
@@ -280,6 +296,8 @@ async def test_terminal_run_leftover_reservation_is_cleaned_without_posts(rig):
     with first.repo._transaction() as db:
         db.execute('INSERT INTO hub_container_pilot_advances VALUES(?,?)', (run['id'], reservation))
         db.execute('INSERT INTO hub_container_pilot_advance_epochs VALUES(?,?,?)', (run['id'], reservation, first.owner.epoch))
+        db.execute("UPDATE hub_container_pilot_attempts SET advance_owner=?,epoch=?,state='active' WHERE run_id=?",
+                   (reservation, first.owner.epoch, run['id']))
     first.owner.close()
     current = rig.restart()
     result = await current.recovery.recover(run['id'])

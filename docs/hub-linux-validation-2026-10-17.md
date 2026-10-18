@@ -374,3 +374,32 @@ Default service startup is not activated. Accepted-pause dispatcher continuation
 cleaned-up held runs lacking a stale advance, actual host adapter acceptance,
 real OAuth and reboot/durable-volume acceptance are still required. Documentation
 updates following the final frozen build do not change runtime/test sources.
+
+## Quiescent continuation and event-driven runtime integration
+
+Final frozen image
+`sha256:6e94213059c082068628d825edaf5de1075bf77974e1e37efcdbd30ea177689b`
+passed **1,700 Linux tests in 71.36 seconds**, with only the existing Starlette
+deprecation. The same image passed **18 focused runtime/dispatcher tests in
+2.20 seconds**. Isolation remains UID 10001, network none, read-only root,
+private disposable tmpfs, no host mounts, ports, Docker socket or credentials.
+
+Durable quiescent attempts permit normally cleaned-up held/paused runs to be
+inspected safely. Dispatcher UUID/epoch proof and original accepted request
+binding preserve run/fence/manifest identities. Tests include concurrent unpause
+before receipt persistence, original-command GET only, no unchanged-head retry
+loop, active-epoch exclusion, malformed-prefix fairness with limit=1, and receipt
+completion from another executor's terminal run event. Enrolled read contexts
+reject writes; schema and outbox writes use guarded transactions, with pre/post
+bus-I/O owner checks.
+
+Two tests run the real StagingRuntime and dispatcher rather than manual drains:
+an injected EventBroker invalidation continues a paused run, and a new runtime's
+startup snapshot recovers after simulated owner loss. Receipts remain simulated.
+These tests do not establish installed native-watcher, supervisor, host completion
+push, real app, TrueNAS volume or reboot acceptance.
+
+An earlier frozen image `sha256:0957a278ef9e4222eea152a13d1619c1d950b4bc221fcc779764f7186051af92`
+passed 1,697 tests before the runtime integration cases and same-run terminal
+event handling were added; final combined evidence supersedes it. All subsequent
+changes in this slice are documentation only, not frozen runtime/test changes.
