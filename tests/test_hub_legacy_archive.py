@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import io
 import json
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 
@@ -17,6 +15,127 @@ import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "hub_legacy_archive.py"
 REVISION = "a" * 40
+
+
+
+
+def _load_validator_for_review():
+    spec = importlib.util.spec_from_file_location('archive_review_target', SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_logical_rows_are_streamed_without_batch_materialization():
+    module = _load_validator_for_review()
+    class Cursor:
+        def fetchmany(self, *args):
+            pytest.fail('batch materialization forbidden')
+        def __iter__(self):
+            return iter([(1, 'synthetic-value')])
+    class Connection:
+        def execute(self, *args):
+            return Cursor()
+    assert len(module._logical_digest(Connection(), 'messages', 1, time.monotonic() + 10)) == 64
+
+
+@pytest.mark.parametrize('mutation', ['missing_mapping', 'stale_highwater'])
+def test_delivery_sequence_inconsistency_rejected(tmp_path, mutation):
+    bundle = tmp_path / 'bundle'
+    _build_bundle(bundle)
+    with sqlite3.connect(bundle / 'data/messages.sqlite3') as conn:
+        if mutation == 'missing_mapping':
+            conn.execute('DELETE FROM message_delivery_sequence')
+        else:
+            conn.execute("UPDATE sqlite_sequence SET seq=0 WHERE name='message_delivery_sequence'")
+    conn.close()
+    _refresh_inventory(bundle)
+    report = tmp_path / 'report.json'
+    result = subprocess.run([sys.executable, str(SCRIPT), 'validate', '--bundle', str(bundle), '--report', str(report)],
+                            env=_readonly_subprocess_env(tmp_path, bundle), capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'delivery_sequence_invalid' in result.stderr
+    assert not report.exists()
+
+
+def test_report_replacement_is_detected_without_deleting_replacement(tmp_path, monkeypatch):
+    module = _load_validator_for_review()
+    bundle = tmp_path / 'bundle'
+    bundle.mkdir()
+    target = tmp_path / 'report.json'
+    original = module.os.write
+    replaced = False
+    def replace_on_write(fd, data):
+        nonlocal replaced
+        result = original(fd, data)
+        if not replaced:
+            replaced = True
+            target.unlink()
+            target.write_text('replacement-not-owned')
+        return result
+    monkeypatch.setattr(module.os, 'write', replace_on_write)
+    with pytest.raises(module.ArchiveValidationError, match='report_path_changed'):
+        module._write_report_exclusive(target, {}, str(bundle))
+    assert target.read_text() == 'replacement-not-owned'
+
+
+def test_writable_report_alias_into_source_directory_rejected(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = _load_validator_for_review()
+    bundle = tmp_path / 'bundle'
+    child = bundle / 'data'
+    child.mkdir(parents=True)
+    alias = tmp_path / 'writable-alias'
+    alias.mkdir()
+    source_identity = child.stat()
+    alias_identity = alias.stat()
+    original = module.os.fstat
+    def simulated_alias(fd):
+        value = original(fd)
+        if (value.st_dev, value.st_ino) == (alias_identity.st_dev, alias_identity.st_ino):
+            fields = {n:getattr(value,n) for n in dir(value) if n.startswith('st_')}
+            fields['st_dev'], fields['st_ino'] = source_identity.st_dev, source_identity.st_ino
+            return SimpleNamespace(**fields)
+        return value
+    monkeypatch.setattr(module.os, 'fstat', simulated_alias)
+    target = alias / 'report.json'
+    monkeypatch.setattr(module, '_open_report_parent', lambda path: (
+        os.open(alias, os.O_RDONLY | os.O_DIRECTORY), target.name, str(target)))
+    with pytest.raises(module.ArchiveValidationError, match='report_must_be_outside_bundle'):
+        module._write_report_exclusive(target, {}, str(bundle))
+    assert not target.exists()
+
+
+def test_fixture_has_no_sibling_checkout_or_git_tag_dependency(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('Fixture must be self-contained'))
+    _build_bundle(tmp_path / 'bundle')
+
+
+def test_all_archive_payload_cursors_stream_rows(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = _load_validator_for_review()
+    bundle = tmp_path / 'bundle'
+    _build_bundle(bundle)
+    original = module._connect_immutable
+    class Cursor:
+        def __init__(self, cursor): self.cursor = cursor
+        def __iter__(self): return iter(self.cursor)
+        def fetchmany(self, *args): pytest.fail('payload batch materialization forbidden')
+        def __getattr__(self, key): return getattr(self.cursor, key)
+    class Connection:
+        def __init__(self, connection): self.connection = connection
+        def execute(self, *args): return Cursor(self.connection.execute(*args))
+        def __getattr__(self, key): return getattr(self.connection, key)
+    monkeypatch.setattr(module, '_connect_immutable', lambda *a: Connection(original(*a)))
+    monkeypatch.setattr(module.os, 'fstatvfs', lambda fd: SimpleNamespace(f_flag=os.ST_RDONLY))
+    db = str(bundle / 'data/messages.sqlite3')
+    fd = os.open(bundle, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert module._validate_files(db, fd, 'files', time.monotonic() + 10)['current_rows_verified'] == 2
+        assert module._validate_knowledge(db, time.monotonic() + 10)['source_notes_verified'] == 65
+    finally:
+        os.close(fd)
 
 
 def _sha256(data: bytes) -> str:
@@ -42,15 +161,12 @@ def _audit_record(previous: str, marker: str) -> dict[str, object]:
 
 def _initialize_v060_stores(db_path: Path, files_root: Path, extraction_root: Path) -> None:
     """Initialize a synthetic DB through the actual v0.6.0 store code/resources."""
-    source_repo = Path(__file__).resolve().parents[2] / "internal-MCP-messaging"
-    archived = subprocess.run(
-        ["git", "archive", "--format=tar", "v0.6.0", "src/agent_message_bus"],
-        cwd=source_repo, capture_output=True, check=True, timeout=30,
-    )
-    extraction_root.mkdir()
-    with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as source_archive:
-        source_archive.extractall(extraction_root, filter="data")
-    package_root = extraction_root / "src" / "agent_message_bus"
+    # These repository resources match the reviewed v0.6.0 bytes. No sibling
+    # checkout or Git history is required by the test/sdist/CI fixture.
+    package_root = Path(__file__).resolve().parents[1] / "src" / "agent_message_bus"
+    expected = {'schema.sql': 'b5e68483cc7eb96d40dfc8cbff5dbf3fc53769d458db3323a864477a391088bb', 'feedback_schema.sql': '7db3369c28076f9ed82e43b586f85825f59bd14a0895da7380daab781b515570', 'database.py': '54d6b7ec8741aebc5e9b31bd88cab5b67f0d0276eddaef65ef2f95002c4203e1', 'files.py': '0028e6b1593de44e5ae4c5926c2069b7c5321325513a050f1202b4e14583df81', 'feedback.py': '8c448d0fef027ec4b3b0f4175309c81562fedabf6ba2c3b96f793be7cd4a95ad', '__init__.py': 'c00f6cdcd5966fc1ba0d1e216e25fb74ed0324f0aec3377663fdeb671d4fc4df'}
+    for name, digest in expected.items():
+        assert _sha256((package_root / name).read_bytes()) == digest
     package_name = "legacy_bus_v060_" + hashlib.sha256(str(extraction_root).encode()).hexdigest()[:12]
     package_spec = importlib.util.spec_from_file_location(
         package_name, package_root / "__init__.py", submodule_search_locations=[str(package_root)],

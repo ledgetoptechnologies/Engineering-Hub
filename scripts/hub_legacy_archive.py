@@ -475,15 +475,11 @@ def _connect_immutable(database_path: str, deadline: float) -> sqlite3.Connectio
 def _logical_digest(connection: sqlite3.Connection, table: str, count: int, deadline: float) -> str:
     cursor = connection.execute(f"SELECT * FROM {_quoted_identifier(table)}")
     row_hashes: list[bytes] = []
-    while True:
+    for row in cursor:
         _check_deadline(deadline)
-        rows = cursor.fetchmany(256)
-        if not rows:
-            break
-        for row in rows:
-            row_hashes.append(_row_digest(tuple(row)))
-            if len(row_hashes) > MAX_SQL_ROWS:
-                _fail("sql_row_limit")
+        row_hashes.append(_row_digest(tuple(row)))
+        if len(row_hashes) > MAX_SQL_ROWS:
+            _fail("sql_row_limit")
     if len(row_hashes) != count:
         _fail("database_changed")
     row_hashes.sort()
@@ -529,6 +525,15 @@ def _validate_database(bundle_path: str, root_fd: int, relative_db: str, deadlin
             if primary_key != _TABLE_PRIMARY_KEYS[table]:
                 _fail("database_schema_invalid")
             schema_pk[table] = list(primary_key)
+
+        missing = connection.execute("SELECT 1 FROM messages m LEFT JOIN message_delivery_sequence d ON d.message_id=m.id WHERE d.message_id IS NULL LIMIT 1").fetchone()
+        orphan = connection.execute("SELECT 1 FROM message_delivery_sequence d LEFT JOIN messages m ON m.id=d.message_id WHERE m.id IS NULL OR d.seq<=0 LIMIT 1").fetchone()
+        maximum = max(connection.execute("SELECT COALESCE(MAX(seq),0) FROM message_delivery_sequence").fetchone()[0],
+                      connection.execute("SELECT COALESCE(MAX(seq),0) FROM send_idempotency").fetchone()[0])
+        head_row = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='message_delivery_sequence'").fetchone()
+        if (missing or orphan or (maximum > 0 and head_row is None)
+                or (head_row is not None and (type(head_row[0]) is not int or head_row[0] < maximum))):
+            _fail("delivery_sequence_invalid")
 
         counts: dict[str, int] = {}
         logical_digests: dict[str, str] = {}
@@ -604,22 +609,20 @@ def _validate_files(connection_path: str, bundle_fd: int, files_root: str, deadl
 
         current_count = 0
         current_cursor = connection.execute("SELECT path,size,sha256,storage_key FROM files")
-        while batch := current_cursor.fetchmany(128):
-            for row in batch:
-                verify(*row)
-                current_count += 1
-                if current_count > MAX_SQL_ROWS:
-                    _fail("sql_row_limit")
+        for row in current_cursor:
+            verify(*row)
+            current_count += 1
+            if current_count > MAX_SQL_ROWS:
+                _fail("sql_row_limit")
         revision_count = 0
         revision_cursor = connection.execute(
             "SELECT path,size,sha256,storage_key FROM file_revisions"
         )
-        while batch := revision_cursor.fetchmany(128):
-            for row in batch:
-                verify(*row)
-                revision_count += 1
-                if current_count + revision_count > MAX_SQL_ROWS:
-                    _fail("sql_row_limit")
+        for row in revision_cursor:
+            verify(*row)
+            revision_count += 1
+            if current_count + revision_count > MAX_SQL_ROWS:
+                _fail("sql_row_limit")
         return {
             "current_rows_verified": current_count,
             "revision_rows_verified": revision_count,
@@ -687,26 +690,25 @@ def _validate_knowledge(connection_path: str, deadline: float) -> dict[str, Any]
         vaultbridge: dict[str, str] = {}
         manifest_contents: str | None = None
         total_rows = 0
-        while batch := cursor.fetchmany(128):
-            for project, path, content, expected in batch:
-                _check_deadline(deadline)
-                total_rows += 1
-                if total_rows > MAX_SQL_ROWS:
-                    _fail("sql_row_limit")
-                if type(project) is not str or type(path) is not str or type(content) is not str or not _is_sha256(expected):
-                    _fail("knowledge_row_invalid")
-                encoded = content.encode("utf-8", errors="strict")
-                if len(encoded) > MAX_KNOWLEDGE_CONTENT_BYTES:
-                    _fail("knowledge_content_limit")
-                if not hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), expected):
-                    _fail("knowledge_content_mismatch")
-                if project == "vaultbridge":
-                    _safe_relative(path)
-                    if path in vaultbridge:
-                        _fail("vaultbridge_archive_invalid")
-                    vaultbridge[path] = expected
-                    if path == _VAULTBRIDGE_MANIFEST:
-                        manifest_contents = content
+        for project, path, content, expected in cursor:
+            _check_deadline(deadline)
+            total_rows += 1
+            if total_rows > MAX_SQL_ROWS:
+                _fail("sql_row_limit")
+            if type(project) is not str or type(path) is not str or type(content) is not str or not _is_sha256(expected):
+                _fail("knowledge_row_invalid")
+            encoded = content.encode("utf-8", errors="strict")
+            if len(encoded) > MAX_KNOWLEDGE_CONTENT_BYTES:
+                _fail("knowledge_content_limit")
+            if not hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), expected):
+                _fail("knowledge_content_mismatch")
+            if project == "vaultbridge":
+                _safe_relative(path)
+                if path in vaultbridge:
+                    _fail("vaultbridge_archive_invalid")
+                vaultbridge[path] = expected
+                if path == _VAULTBRIDGE_MANIFEST:
+                    manifest_contents = content
         if manifest_contents is None:
             _fail("vaultbridge_manifest_missing")
 
@@ -855,6 +857,30 @@ def _write_report_exclusive(path: str | os.PathLike[str], report: dict[str, Any]
                 _fail("report_must_be_outside_bundle")
         except ValueError:
             pass
+        # Compare physical directories, not just lexical paths: a writable bind
+        # alias into the read-only archive must not become a report destination.
+        ancestors = set()
+        walk_fd = os.dup(parent_fd)
+        try:
+            while True:
+                st = os.fstat(walk_fd)
+                identity = (st.st_dev, st.st_ino)
+                if identity in ancestors:
+                    break
+                ancestors.add(identity)
+                next_fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=walk_fd)
+                os.close(walk_fd)
+                walk_fd = next_fd
+        finally:
+            os.close(walk_fd)
+        checked = 0
+        for _directory, _dirs, _files, source_fd in os.fwalk(bundle, follow_symlinks=False):
+            checked += 1
+            if checked > MAX_INVENTORY_ENTRIES:
+                _fail("inventory_entry_limit")
+            st = os.fstat(source_fd)
+            if (st.st_dev, st.st_ino) in ancestors:
+                _fail("report_must_be_outside_bundle")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(leaf, flags, 0o600, dir_fd=parent_fd)
         created = os.fstat(fd)
@@ -869,6 +895,9 @@ def _write_report_exclusive(path: str | os.PathLike[str], report: dict[str, Any]
                     _fail("report_creation_failed")
                 view = view[written:]
             os.fsync(fd)
+            current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino) or os.fstat(fd).st_nlink != 1:
+                _fail("report_path_changed")
         except BaseException:
             try:
                 current = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
