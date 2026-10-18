@@ -19,6 +19,10 @@ from .repository import HubError, HubRepository
 from .cloudflare_access import CloudflareAccessConfig, CloudflareIdentity
 
 
+DEFAULT_LOCAL_SESSION_TTL_SECONDS = 8 * 60 * 60
+CLOUDFLARE_LOCAL_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+
+
 @dataclass(frozen=True)
 class AuthConfig:
     base_url: str
@@ -72,6 +76,14 @@ class AuthConfig:
     def secure(self):
         return urlsplit(self.base_url).scheme == "https"
 
+    @property
+    def local_session_ttl_seconds(self):
+        # Access still supplies and verifies an assertion on every request.
+        # This is a fixed local-cookie ceiling, never a JWT expiry extension,
+        # automatic renewal, or a change to the GitHub session default.
+        return (CLOUDFLARE_LOCAL_SESSION_TTL_SECONDS if self.human_auth_mode == "cloudflare_access"
+                else DEFAULT_LOCAL_SESSION_TTL_SECONDS)
+
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
@@ -80,7 +92,8 @@ def _hash(value: str) -> str:
 class SessionStore:
     """Persist only hashed bearer session IDs; OAuth state is one-use and short-lived."""
 
-    def __init__(self, path: str | Path, *, session_ttl=28800, state_ttl=600, clock=time.time, repository=None):
+    def __init__(self, path: str | Path, *, session_ttl=DEFAULT_LOCAL_SESSION_TTL_SECONDS,
+                 state_ttl=600, clock=time.time, repository=None):
         self.path = str(path)
         if repository is not None and (
             type(repository) is not HubRepository

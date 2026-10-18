@@ -17,6 +17,16 @@ The NAS clock must be synchronized: Access assertions use strict issued-at,
 not-before and expiry checks. A clock error can deny sign-in; verify time sync
 rather than bypassing JWT validation or extending accepted token lifetimes.
 
+Beau approved a 30-day human sign-in duration. The Hub-only Cloudflare Access
+application was saved and read back as **1 month**; its exact-email policy inherits
+the application duration. Global settings, Ops and agent tokens were not changed.
+The matching candidate source sets the local Access-session ceiling to 30 days,
+still capped by the verified assertion's expiry. GitHub sessions remain eight
+hours. Existing cookies/rows are not extended: after installing that release,
+perform one fresh Hub/Access sign-in to obtain the longer session. Clearing
+cookies, explicit logout, revocation, identity changes or earlier assertion expiry
+can still require sign-in sooner. No automatic/sliding renewal is introduced.
+
 The candidate `--split-ingress` entry point binds the agent front door on the
 existing Hub port8770 and the browser front door **only** on `127.0.0.1:8771`.
 It binds both sockets before constructing the core, creates one repository,

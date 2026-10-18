@@ -183,7 +183,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 or owned_pilot_service.workflow is not container_pilot_workflow
                 or owned_pilot_service.dispatcher is not staging_dispatcher):
             raise ValueError('owned_pilot_service_mismatch')
-    sessions = SessionStore(settings.database, repository=repo)
+    sessions = SessionStore(settings.database, repository=repo,
+                            session_ttl=settings.auth_config.local_session_ttl_seconds)
     feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
             staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):

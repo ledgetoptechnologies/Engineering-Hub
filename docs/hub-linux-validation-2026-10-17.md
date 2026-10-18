@@ -882,3 +882,21 @@ unknown successes deliberately remain held; durable completed-command recovery
 must not be reported as arbitrary successful crash continuation. Hermes request
 `861ce3b6-44ab-4ad9-a4a2-7774e1be9c73` asks for the bounded source/provider
 composition and isolated evidence only, with all NAS administration excluded.
+
+### Approved 30-day sign-in preference
+
+Following Beau's direct request and action-time confirmation, only the Hub Access
+application duration was saved from24hours to1month and independently read back
+in the browser. Existing Hub policy inherits application duration; Ops/global
+settings, email selectors, agent tokens and TrueNAS were unchanged. The local
+Access-session ceiling now becomes2,592,000seconds, while GitHub and standalone
+SessionStore defaults remain28,800seconds. Verified JWT expiry still caps the
+local session and every browser request still requires a signed assertion.
+No leeway, sliding renewal, identity repinning or retroactive cookie extension.
+
+Implementation auth/ingress/proof tests142passed; independent auth review45passed;
+root reran the broader set including real sockettests: **152passed**, existing
+Starlette warning. Tests use actualRSA/mockedJWKS and a controlled session clock
+for day29/day30, earlier JWT expiry, non-renewal, missing/forged assertions, CSRF
+and logout replay. These prove source behavior, not thirty elapsed real days or
+installation of this updated release. A fresh sign-in after deployment is needed.
