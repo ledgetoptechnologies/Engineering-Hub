@@ -306,6 +306,42 @@ configured adapters. This container is **not egress-isolated**, an untrusted-cod
 runner, or a security sandbox for arbitrary jobs. No canonical bus topic-registry
 bridge, real host executor or Viewer pilot is activated by this deployment.
 
+## Legacy bus archive handoff (design only, not an installed import)
+
+Hermes reported a separate owner request to copy the complete old bus into Hub.
+PR2 does not implement that copy or compose the legacy MCP into the Hub process.
+The existing port8765 service remains the sole active bus; Hub's control SQLite
+must never be replaced by the legacy database. A proposed copy is an immutable
+private archive, not a second active bus or an inbox-delivery source.
+
+The operator must supply a coherent frozen snapshot of the legacy SQLite state,
+immutable file objects, all revisions, compatibility files and audit history.
+Copying a live database file without its consistent WAL state is not sufficient;
+SQLite backup alone does not establish atomic consistency with external objects.
+The source snapshot must cover those stores together, or establish and verify an
+equivalent explicit quiescence protocol. Agents do not inspect or administer NAS
+storage on Beau's behalf. Credentials remain separately configured by the
+operator; never put them in an archive manifest, dashboard, chat or Git.
+
+Before installation, a bounded offline validator must check schema/version,
+integrity, every table's row counts and stable logical digests, original IDs and
+revisions, every referenced object version's byte count/SHA256, and the audit
+chain. Unknown/missing schemas or objects fail closed; there is no automatic
+schema migration, retention cleanup, embedding download or startup mutation.
+Historical pending/claimed messages remain historical rows: no replay, claim,
+acknowledgment or restart delivery. Historical session bindings/presence cannot
+be interpreted as current connected peers. Semantic indexes may be rebuilt only
+from preserved originals under a separately scoped operation.
+
+A future read surface must retain sender/recipient visibility boundaries for
+agents and require the approved human session for owner-wide administration.
+Possessing an agent token cannot grant access to other agents' private history or
+configuration. No archive content/API is currently enabled. Hermes owns only the
+proposed disjoint offline validation helper; Codex owns eventual Hub composition.
+Reply `2c423071-903a-473d-a56c-59a4262b1399` records this source-only contract.
+No actual export/import, client cutover, deletion, old-bus stop or replacement
+credential authority follows from that discussion.
+
 ## Explicit activation and restart acceptance
 
 Only after preconditions and release checks pass should the operator install
@@ -320,7 +356,8 @@ Verify all of the following on the isolated pilot before declaring acceptance:
 1. Control health succeeds on port 8770, while the existing bus on 8765 remains
    healthy and its client/lifecycle tests still pass.
 2. Anonymous API/MCP requests and invalid agent tokens are denied. Human writes
-   remain disabled without the dedicated OAuth configuration. Credentials never
+   require the selected configured identity provider (Hub Access in this rollout),
+   an authenticated local session and mutation protections. Credentials never
    appear in logs or dashboard storage.
 3. Native event support reports its actual state. Unsupported sources remain
    visibly unavailable; no polling or fake readiness is substituted.
