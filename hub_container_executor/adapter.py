@@ -7,6 +7,7 @@ versioned test-secret resolver remain explicit operator-owned dependencies.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -228,6 +229,7 @@ class HostAdapter:
             container_id = self._start_new_container(request, role, image, profile, state,
                                                      deadline)
             evidence = self._evidence(container_id, image.image_config_id, "unknown", True)
+            self._timeout(deadline, self.manifest.timeouts.total_command_ms)
             return self.ledger.finish(request.command_id, state="succeeded", reason=None,
                                       evidence=evidence, generation_id=state.generation_id)
 
@@ -260,6 +262,7 @@ class HostAdapter:
         if outcome.health != "healthy" or type(outcome.evidence_verified) is not bool or not outcome.evidence_verified:
             raise _Held("inspect_required")
         evidence = self._evidence(container_id, image.image_config_id, "healthy", True)
+        self._timeout(deadline, self.manifest.timeouts.total_command_ms)
         return self.ledger.finish(request.command_id, state="succeeded", reason=None, evidence=evidence)
 
     def _verified_image(self, role: str) -> VerifiedImage:
@@ -290,6 +293,8 @@ class HostAdapter:
             raise _Held("daemon_unavailable")
         try:
             observed_commit = verifier.implementation_commit()
+            if inspect.iscoroutine(observed_commit):
+                observed_commit.close()
         except Exception:
             raise _Held("daemon_unavailable") from None
         if (type(observed_commit) is not str
@@ -382,7 +387,12 @@ class HostAdapter:
     def _get_baseline(self) -> BaselineIdentity:
         try:
             baseline = self.baseline_provider.enrolled_baseline(self.manifest)
+            if inspect.iscoroutine(baseline):
+                baseline.close()
+                raise _Held("recovery_required")
             approved = baseline is not None and self.baseline_provider.verify_baseline(baseline, self.manifest)
+            if inspect.iscoroutine(approved):
+                approved.close()
         except Exception:
             raise _Held("recovery_required") from None
         state = self.manifest.state_policy
@@ -426,6 +436,9 @@ class HostAdapter:
         except RuntimeError:
             raise _Held("stale_fence") from None
         try:
+            # Durable admission can wait on SQLite; recompute the budget only
+            # after admission and never start an effect with an expired intent.
+            timeout = self._timeout(deadline, phase_limit)
             result = callback(operation_id, timeout)
             # A deadline detects an overrun; it is not cancellation. Keep the
             # intent held so no later effect can run after an untrusted worker returns.
@@ -504,6 +517,7 @@ class HostAdapter:
             )
         except Exception:
             raise _Held("daemon_unavailable") from None
+        self._timeout(deadline, self.manifest.timeouts.inspect_ms)
         expected_image = ActualImageSelection(
             image.runnable_reference, image.platform_manifest_digest,
             image.image_config_id, image.platform,
