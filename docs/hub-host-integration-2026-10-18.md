@@ -115,3 +115,46 @@ The full-suite count above predates this one extra test.
 
 The baseline/state-generation provider and real daemon pilot remain incomplete.
 No host socket, NAS, production state, agent credential or runtime was changed.
+
+## Private state provider and crash recovery
+
+`FrozenSQLiteStateProvisioner` now supplies real Linux filesystem/SQLite copies
+under an explicitly provisioned UID/GID10001. Its trusted manifest and external
+baseline provider remain mandatory; it does not invent healthy-baseline proof.
+It pins separate private generation/reservation roots, baseline inventory and
+backup identities, uses durable exclusive intents/completions and checks quotas
+and deadlines. Frozen backups require a quiescent rollback-format SQLite file,
+without WAL/SHM/journal companions. Baseline auxiliary files may be empty.
+
+Independent review found and resolved an actual workflow defect: admitting a
+candidate could consume the last slot or bytes needed for mandatory rollback.
+Candidate admission now checks two new generation slots and two backup-sized
+allowances before intent. An outstanding same-run rollback reservation survives
+reopening and cannot be consumed by another candidate or unrelated rollback.
+The first Linux run also exposed 35 fixture errors (a model was treated as a
+dictionary); these were repaired rather than reported as passing coverage.
+
+Corrected provider snapshot
+`sha256:c3ff1385c423213342d043a7704c237eb6859d2cf8bf8fa00c01104f3d944878`:
+**37 passed, 0.76 seconds**, exit 0. Independent review accepted the quota fix.
+
+Final snapshot including an actual crash test and import boundary:
+`sha256:7c31d8204f60e3cecbb9d159df412ceac1bda5512462d3acfd9e0013f75274d4`.
+Focused tests: **39 passed, 1.49 seconds**, exit 0, with resource warnings treated
+as errors. A freshly constructed child exits with `os._exit(23)` after durable
+intent; the parent reopens and proves original/new operations hold without copy,
+artifact deletion or changed baseline bytes. This is real process/file recovery,
+not machine reboot, actual Docker effects or success promotion after ambiguity.
+
+Full suite in this same final snapshot: **2464 passed, 3 skipped, 91.91 seconds**,
+exit 0, with the previously documented Starlette, event-loop and deliberate-fork
+warning classes. The three skipped owner-change checks passed separately in the
+same snapshot (**3 passed, 0.31 seconds**) using the disposable UID0/CHOWN-only
+profile; the state-provider tests themselves ran as real UID/GID10001.
+
+Limits remain deliberate: admission accounting is not a physical OS disk quota;
+runtime application growth can consume disk space. A successful candidate keeps
+its rollback reservation, so continuous staging campaigns need a separately
+reviewed success-release/retention lifecycle. OwnedPilotService's inode-bound
+state is not a supported target clone. The actual runtime identity/launcher,
+baseline enrollment and real daemon success/rollback pilot remain unproven.

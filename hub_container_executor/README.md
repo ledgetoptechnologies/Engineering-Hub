@@ -39,6 +39,16 @@ not enable itself from import, environment, Hub startup, or a listener.
   hashing and surrounding I/O, plus a non-destructive retention planner. Error
   cleanup removes only the newly created matching inode; blocking OS I/O cannot
   be forcibly cancelled by this in-process primitive.
+- `state_provider.py`: explicit private, independently enrolled frozen-baseline
+  generation provider for one bounded pilot. Candidate admission reserves count
+  and byte headroom for the same run's rollback before writing intent. Durable
+  reservations survive reopening; interrupted/foreign state holds without
+  replay, automatic adoption or deletion. Existing baseline bytes are checked,
+  and real UID/GID10001 must already own the private storage. Admission accounting
+  is not an OS disk quota: runtime application growth can consume space. A
+  successful candidate retains its rollback reservation; continuous campaigns
+  need a separately reviewed release/retention lifecycle. Plain Hub target state
+  is supported, not an enabled OwnedPilotService's inode-bound ownership data.
 - `asgi.py`: optional bearer-authenticated ASGI factory for the frozen namespace;
   importing it does not construct an app or bind a socket. GET, reconcile and
   submit body reads share a configurable bounded request-body deadline, separate

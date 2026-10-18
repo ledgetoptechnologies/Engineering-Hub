@@ -32,6 +32,7 @@ import hub_container_executor.daemon_backend
 import hub_container_executor.operation_journal
 import hub_container_executor.local_providers
 import hub_container_executor.build_enrollment
+import hub_container_executor.state_provider
 assert not list(pathlib.Path.cwd().iterdir())
 print('optional-host-imports-inert')
 '''

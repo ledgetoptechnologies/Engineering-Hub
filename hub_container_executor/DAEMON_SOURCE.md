@@ -69,6 +69,32 @@ backend does not authenticate layers or claim provenance. The adapter still
 requires its separate `TrustedDriverIdentityVerifier` backed by a trusted issuer.
 The backend cannot satisfy that verifier by echoing an ID or label.
 
+### Concrete runtime enrollment still required
+
+Do not fill the missing runtime verifier with a constant copied from the pilot
+manifest or package metadata. The preferred acceptance boundary is a separately
+built, non-editable executor artifact and an independently trusted launcher that
+checks the actual launched image/config/platform, command, read-only filesystem,
+mounts and process instance. Mutable checkout hashing is development evidence,
+not proof of an immutable installed runtime.
+
+A private signed launch-receipt design was independently reviewed as viable,
+but is not implemented or accepted here. Its launcher must authenticate the
+requesting process (for example, kernel Unix peer credentials), map that live
+process to the real container and bind a fresh provider-generated nonce to its
+container/process-start/boot identity. Inspecting a caller-supplied victim PID
+or container is not sufficient. A provider would require a separately pinned
+verification key and artifact enrollment, strict bounded canonical fields,
+dedicated protocol/audience, one-shot receipt acceptance, fork denial and bounded
+issuance/expiry converted to a fixed monotonic lifetime. No request-selected key,
+algorithm, expected identity or refresh may become authority.
+
+Such evidence establishes launch conditions for a bounded interval, not memory
+attestation or cancellation of effects already admitted. The actual authenticated
+launcher and process/container correlation must be exercised with the Engine API
+before claiming the real pilot passed. This note does not activate a launcher,
+expose a socket, generate production credentials or authorize host changes.
+
 ## Closed create profile
 
 Before the create POST, the backend rechecks runner and image metadata, validates
