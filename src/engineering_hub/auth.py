@@ -181,7 +181,11 @@ class SessionStore:
         return _hash("\n".join((config.cloudflare_issuer, config.cloudflare_audience,
                                 identity.subject, identity.email)))
 
-    def create_cloudflare_session(self, config, identity):
+    @staticmethod
+    def _cloudflare_identity_key(config, identity):
+        return _hash("\n".join((config.cloudflare_issuer, config.cloudflare_audience, identity.email)))
+
+    def create_cloudflare_session(self, config, identity, *, previous_token=None):
         if type(identity) is not CloudflareIdentity or identity.expires_at <= self.clock():
             raise HTTPException(401, "Human sign-in required")
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
@@ -189,20 +193,37 @@ class SessionStore:
         with self._db() as db:
             # Lazy, additive schema: default GitHub installs are unchanged.
             db.execute("CREATE TABLE IF NOT EXISTS auth_access_sessions (token_hash TEXT PRIMARY KEY, binding TEXT NOT NULL, actor TEXT NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS auth_access_identities (identity_key TEXT PRIMARY KEY, binding TEXT NOT NULL, actor TEXT NOT NULL)")
+            key = self._cloudflare_identity_key(config, identity)
+            binding = self._cloudflare_binding(config, identity)
+            enrolled = db.execute("SELECT binding, actor FROM auth_access_identities WHERE identity_key = ?", (key,)).fetchone()
+            if enrolled is not None and (not secrets.compare_digest(enrolled[0], binding) or enrolled[1] != identity.actor):
+                raise HTTPException(403, "Human identity requires operator review")
+            if enrolled is None:
+                # Only a cryptographically verified, explicitly allowlisted
+                # identity can reach this transaction. Never repin on logout,
+                # expiry or a later matching-email/different-subject assertion.
+                db.execute("INSERT INTO auth_access_identities VALUES (?, ?, ?)", (key, binding, identity.actor))
             db.execute("DELETE FROM auth_access_sessions WHERE expires <= ?", (self.clock(),))
+            if previous_token:
+                db.execute("DELETE FROM auth_access_sessions WHERE token_hash = ?", (_hash(previous_token),))
             db.execute("INSERT INTO auth_access_sessions VALUES (?, ?, ?, ?, ?)",
-                       (_hash(token), self._cloudflare_binding(config, identity), identity.actor, csrf, expires))
+                       (_hash(token), binding, identity.actor, csrf, expires))
         return {"cookie_token": token, "csrf_token": csrf, "expires": expires}
 
     def cloudflare_session_for(self, token, config, identity):
         if not token or type(identity) is not CloudflareIdentity or identity.expires_at <= self.clock():
             return None
         with self._read_db() as db:
-            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_access_sessions'").fetchone():
+            if db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('auth_access_sessions', 'auth_access_identities')").fetchone()[0] != 2:
                 return None
+            enrolled = db.execute("SELECT binding, actor FROM auth_access_identities WHERE identity_key = ?",
+                                  (self._cloudflare_identity_key(config, identity),)).fetchone()
             row = db.execute("SELECT binding, actor, csrf_token, expires FROM auth_access_sessions WHERE token_hash = ?",
                              (_hash(token),)).fetchone()
-        if (not row or row[3] <= self.clock() or row[1] != identity.actor
+        if (not enrolled or enrolled[1] != identity.actor
+                or not secrets.compare_digest(enrolled[0], self._cloudflare_binding(config, identity))
+                or not row or row[3] <= self.clock() or row[1] != identity.actor
                 or not secrets.compare_digest(row[0], self._cloudflare_binding(config, identity))):
             return None
         return {"actor": row[1], "csrf_token": row[2], "github_id": None,
@@ -283,8 +304,8 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
             identity = getattr(request.state, "cloudflare_identity", None)
             if request.headers.get("authorization") or type(identity) is not CloudflareIdentity:
                 raise HTTPException(getattr(request.state, "cloudflare_auth_error", 401), "Human sign-in required")
-            auth_store.delete_cloudflare_session(request.cookies.get(config.cookie_name))
-            session = auth_store.create_cloudflare_session(config, identity)
+            session = auth_store.create_cloudflare_session(config, identity,
+                previous_token=request.cookies.get(config.cookie_name))
             response = RedirectResponse("/", status_code=303)
             response.set_cookie(config.cookie_name, session["cookie_token"],
                                 max_age=max(0, int(session["expires"] - auth_store.clock())), **cookie_options)

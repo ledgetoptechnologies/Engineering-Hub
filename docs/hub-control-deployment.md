@@ -140,6 +140,25 @@ in Access mode; changing providers requires sign-in again. Local logout deletes
 the EH session only, **not the upstream Cloudflare Access session**. A later
 explicit sign-in may therefore succeed without another identity-provider prompt.
 
+The first **verified and explicitly allowlisted** sign-in pins that email's
+Cloudflare subject for this issuer and EH audience in the same guarded local
+transaction as session creation. This is not anonymous first-user enrollment.
+The pin survives logout, session expiry, restart, and backup/restore. A later
+matching-email/different-subject sign-in returns 403 rather than repinning; it
+also preserves any existing valid local session. Legitimate identity-provider
+account reprovisioning therefore needs an operator-reviewed re-enrollment plan.
+There is no automatic email-account takeover, self-service pin reset, or reset
+endpoint in this release. Include the identity table in coherent SQLite backups.
+
+Both Hub and canonical-registry SSE routes emit an idle transport comment every
+15 seconds, with authentication rechecked before each comment/event. Comments
+retain the same pending source read/subscription, do not manufacture cursors or
+readiness evidence, and do not poll task/message/readiness records or trigger
+agent/model wakes or work items. Local authentication is rechecked on each send.
+Revoked/expired streams terminate and pending reads are cancelled/awaited on
+closure. Proxy buffering must remain off; real Cloudflare transport acceptance
+is still required rather than inferred from synthetic ASGI tests.
+
 Agent bearer authentication and the existing bus port 8765 remain independent.
 Do not put a human-only browser challenge in front of the agents' established
 route. Any separate tunneled machine route needs its own approved machine policy

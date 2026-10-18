@@ -24,6 +24,7 @@ from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
 from .events import NativeHubEventFeed
+from .sse_keepalive import with_keepalive
 from .autonomy import StagingRuntime
 from .container_pilot import ContainerPilotWorkflow
 from .registry_bridge import CanonicalRegistryBridge
@@ -350,13 +351,17 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         async def stream():
             source = registry_bridge.events(principal, topic, agent_bearer=original_bearer(request),
                                             after=after, epoch=epoch, check_access=check_access)
+            pulses = with_keepalive(source)
             try:
-                async for event in source:
+                async for event in pulses:
                     try:
                         if actor(request) != principal:
                             return
                     except HTTPException:
                         return
+                    if event is None:
+                        yield ': keepalive\n\n'
+                        continue
                     name = ('registry.invalidated' if isinstance(event, RegistryPointer) else
                             'registry.snapshot_required' if isinstance(event, RegistrySnapshotRequired) else
                             'registry.unavailable')
@@ -366,7 +371,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 yield 'event: registry.unavailable\ndata: ' + json.dumps(
                     {'topic': topic, 'registry_epoch': None, 'reason': 'observer_unavailable'}) + '\n\n'
             finally:
-                await source.aclose()
+                await pulses.aclose()
 
         return StreamingResponse(stream(), media_type='text/event-stream',
                                  headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
@@ -385,15 +390,19 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
         async def stream():
             source = feed.broker.events()
+            pulses = with_keepalive(source)
             try:
-                async for pointer in source:
+                async for pointer in pulses:
                     try:
                         actor(request)  # Recheck revocation/expiry on each event.
                     except HTTPException:
                         return
+                    if pointer is None:
+                        yield ': keepalive\n\n'
+                        continue
                     yield 'data: ' + json.dumps(pointer, separators=(',', ':')) + '\n\n'
             finally:
-                await source.aclose()
+                await pulses.aclose()
 
         return StreamingResponse(stream(), media_type='text/event-stream',
                                  headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})

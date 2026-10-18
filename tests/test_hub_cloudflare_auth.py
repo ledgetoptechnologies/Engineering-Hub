@@ -112,12 +112,18 @@ def test_binding_logout_csrf_and_github_fallback_are_closed(hub):
     headers, _ = sign_in(client, assertion())
     other = {"Cf-Access-Jwt-Assertion": assertion(sub="other-operator")}
     assert client.get(BASE + "/overview", headers=other).status_code == 401
+    prior_cookie = client.cookies.get(config.cookie_name)
+    assert client.get(BASE + "/auth/login", headers=other).status_code == 403
+    assert client.cookies.get(config.cookie_name) == prior_cookie
+    assert client.get(BASE + "/overview", headers=headers).status_code == 200
     changed_email = {"Cf-Access-Jwt-Assertion": assertion(email=EMAILS[1])}
     assert client.get(BASE + "/overview", headers=changed_email).status_code == 401
     assert client.post(BASE + "/pause", headers={**headers, "Origin": "https://evil.example"}, json={"paused": True}).status_code == 403
     assert client.post(BASE + "/pause", headers={**headers, "X-Hub-CSRF": "wrong"}, json={"paused": True}).status_code == 403
     assert client.post(BASE + "/auth/logout", headers=headers).status_code == 200
     assert client.get(BASE + "/auth/me", headers=headers).json()["authenticated"] is False
+    assert client.get(BASE + "/auth/login", headers=other).status_code == 403
+    sign_in(client, assertion())  # Original identity can explicitly sign in again.
     session = app.state.sessions.create_session(42)
     client.cookies.set(config.cookie_name, session["cookie_token"])
     assert client.get(BASE + "/overview", headers=headers).status_code == 401
