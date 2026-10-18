@@ -8,15 +8,17 @@
 # access. Do not recursively chown the parent or touch current MCP data/ACLs.
 # Hub uses its own child directory/database; no existing MCP state is replaced.
 #
-# Networking matches Current-MCP.yaml: host mode, Hub listens on port 8770.
+# Networking: one backend, host-network LAN agent port8770 and loopback browser8771.
 # Existing MCP remains on 8765 with its image/tokens/clients/mount untouched.
-# Port 8770 must be free before you install. No tunnel changes were made.
-# Future tunnel origin: http://192.168.50.80:8770 for a connector that can reach
-# the NAS LAN address. A connector using host networking ON THIS NAS may instead
-# use http://127.0.0.1:8770. A bridge/remote connector must NOT use its localhost.
-# There is no Hub bridge network to join. Configure ingress separately yourself.
+# Both ports must be free before installation. No tunnel changes were made.
+# Beau confirmed cloudflared uses host networking ON THIS NAS. After the matching
+# split-ingress image is published and installed, set ONLY the Hub tunnel route
+# to http://127.0.0.1:8771. Never route browser traffic to LAN agent port8770.
+# A remote/bridge connector cannot use its own localhost for this arrangement.
 # Browser origin: https://hub.ledgetoptechnologies.com (no aliases).
-# Human sign-in stays unavailable until its separate auth setup is completed.
+# Separate Hub-only Cloudflare Access policy is required; Ops is not modified.
+# The AUD below is public application identity, not an agent or service token.
+# Do not install this candidate until its split-ingress image is published.
 #
 # Updates: pull_policy always checks :latest when Compose creates/updates the app.
 # A plain container restart does NOT pull a new image. Use TrueNAS Update/Redeploy
@@ -30,6 +32,7 @@ services:
   engineering-hub-control:
     image: ghcr.io/ledgetoptechnologies/engineering-hub-control:latest
     pull_policy: always
+    command: [--split-ingress, --browser-port, "8771"]
     restart: unless-stopped
     stop_grace_period: 1200s
     user: "568:568"
@@ -51,17 +54,19 @@ services:
       HUB_SUPERVISOR_STOP_GRACE_SECONDS: "1200"
       HUB_BASE_URL: https://hub.ledgetoptechnologies.com
       HUB_ALTERNATE_ORIGINS: ""
+      HUB_INGRESS_MODE: combined
+      HUB_AGENT_ALLOWED_HOSTS: "192.168.50.80:8770,127.0.0.1:8770"
       HERMES_TOKEN: REPLACE_WITH_EXISTING_HERMES_TOKEN
       CODEX_TOKEN: REPLACE_WITH_EXISTING_CODEX_TOKEN
       CLAUDE_TOKEN: REPLACE_WITH_EXISTING_CLAUDE_TOKEN
       AGENT_BUS_ALLOWED_IPS: "192.168.60.92,192.168.20.151"
-      HUB_HUMAN_AUTH_MODE: github
+      HUB_HUMAN_AUTH_MODE: cloudflare_access
       HUB_GITHUB_CLIENT_ID: ""
       HUB_GITHUB_CLIENT_SECRET: ""
       HUB_BEAU_GITHUB_ID: ""
-      HUB_CF_ACCESS_ISSUER: ""
-      HUB_CF_ACCESS_AUDIENCE: ""
-      HUB_CF_ACCESS_ALLOWED_EMAILS: ""
+      HUB_CF_ACCESS_ISSUER: https://ledgetoptechnologies.cloudflareaccess.com
+      HUB_CF_ACCESS_AUDIENCE: fdd1c44b308a90db171fb2d801f8d91149259878438ccddc389eb3a534b8ee35
+      HUB_CF_ACCESS_ALLOWED_EMAILS: "bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com"
     volumes:
       - type: bind
         source: /mnt/Plugins/App_Data/Agent_MCP/engineering-hub
@@ -73,7 +78,7 @@ services:
         - CMD
         - python
         - -c
-        - "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"
+        - "import json,urllib.request; p=urllib.request.build_opener(urllib.request.ProxyHandler({})); results=[json.load(p.open('http://127.0.0.1:'+str(port)+'/health',timeout=3)) for port in (8770,8771)]; raise SystemExit(0 if all(r.get('ok') is True for r in results) and results[0].get('build_commit') == results[1].get('build_commit') else 1)"
       interval: 30s
       timeout: 5s
       retries: 3

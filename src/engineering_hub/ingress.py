@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request
 from starlette.responses import JSONResponse
 
-from .cloudflare_access import AccessDenied, CloudflareAccessVerifier
+from .cloudflare_access import AccessDenied, CloudflareAccessVerifier, _record_verified_access
 
 
 def _within(path, prefix):
@@ -53,6 +53,7 @@ class HubIngressMiddleware:
         if mode not in {"agents", "browser"}:
             raise ValueError("Separated Hub ingress mode required")
         self.checker = CloudflareAccessVerifier(cloudflare_config) if mode == "browser" else None
+        self.cloudflare_config = cloudflare_config
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "websocket":
@@ -119,4 +120,5 @@ class HubIngressMiddleware:
                 await deny("access_unavailable", 503)
                 return
             scope.setdefault("state", {})["cloudflare_identity"] = identity
+            _record_verified_access(scope, self.cloudflare_config, identity)
         await self.app(scope, receive, send)
