@@ -154,7 +154,7 @@ class HubRepository:
 
     @staticmethod
     def _actor(actor, human=False, agent=False):
-        valid_human = isinstance(actor, str) and re.fullmatch(r'human:[1-9][0-9]{0,19}', actor) is not None
+        valid_human = isinstance(actor, str) and re.fullmatch(r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', actor) is not None
         if not (actor in AGENTS or valid_human) or (human and not valid_human) or (agent and actor not in AGENTS):
             raise HubError('forbidden', 403)
 

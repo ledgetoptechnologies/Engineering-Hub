@@ -11,6 +11,8 @@ export interface Session {
   actor: string | null;
   csrf_token: string | null;
   github_id: number | null;
+  auth_provider?: "cloudflare_access";
+  email?: string | null;
 }
 export interface Versioned {
   id: string;

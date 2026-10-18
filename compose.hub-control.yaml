@@ -27,6 +27,7 @@ services:
       HUB_SUPERVISOR_STOP_GRACE_SECONDS: "1200"
       HUB_UI_DIRECTORY: /app/dashboard
       HUB_BASE_URL: "${HUB_BASE_URL:?Set the exact private HTTPS Hub origin}"
+      HUB_ALTERNATE_ORIGINS: "${HUB_ALTERNATE_ORIGINS:-}"
       HERMES_TOKEN: "${HERMES_TOKEN:?Existing Hermes bearer required}"
       CODEX_TOKEN: "${CODEX_TOKEN:?Existing Codex bearer required}"
       CLAUDE_TOKEN: "${CLAUDE_TOKEN:?Existing Claude bearer required}"
@@ -36,6 +37,11 @@ services:
       HUB_GITHUB_CLIENT_ID: "${HUB_GITHUB_CLIENT_ID:-}"
       HUB_GITHUB_CLIENT_SECRET: "${HUB_GITHUB_CLIENT_SECRET:-}"
       HUB_BEAU_GITHUB_ID: "${HUB_BEAU_GITHUB_ID:-}"
+      # Explicit alternate human provider; never changes agent bearer auth.
+      HUB_HUMAN_AUTH_MODE: "${HUB_HUMAN_AUTH_MODE:-github}"
+      HUB_CF_ACCESS_ISSUER: "${HUB_CF_ACCESS_ISSUER:-}"
+      HUB_CF_ACCESS_AUDIENCE: "${HUB_CF_ACCESS_AUDIENCE:-}"
+      HUB_CF_ACCESS_ALLOWED_EMAILS: "${HUB_CF_ACCESS_ALLOWED_EMAILS:-}"
     volumes:
       - type: bind
         source: "${HUB_STATE_DIRECTORY:?Set a dedicated protected local ZFS state directory}"

@@ -29,7 +29,7 @@ test("held rollback reports why it needs attention without claiming rollback suc
 
 async function mockLive(
   page: Page,
-  { signedIn = true, events = false, expires = false, canonical = false } = {},
+  { signedIn = true, events = false, expires = false, canonical = false, access = false } = {},
 ) {
   const overview = createDemoOverview(NOW);
   const requests: Request[] = [];
@@ -55,9 +55,10 @@ async function mockLive(
     if (path.endsWith("/auth/me"))
       return respond({
         authenticated: signedIn,
-        actor: signedIn ? "human:42" : null,
-        github_id: signedIn ? 42 : null,
+        actor: signedIn ? access ? "human:cf:" + "a".repeat(64) : "human:42" : null,
+        github_id: signedIn && !access ? 42 : null,
         csrf_token: signedIn ? CSRF : null,
+        ...(access ? { auth_provider: "cloudflare_access", email: signedIn ? "operator@first.example" : null } : {}),
       });
     if (!signedIn)
       return respond({ detail: { code: "sign_in_required" } }, 401);
@@ -404,7 +405,7 @@ test("signed-out live mode shows no sample or private records and makes no priva
     page.getByRole("heading", { name: "Sign in to Engineering Hub." }),
   ).toBeVisible();
   await expect(
-    page.getByRole("link", { name: "Continue with GitHub" }),
+    page.getByRole("link", { name: "Sign in securely" }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "New task", exact: true }),
@@ -945,6 +946,16 @@ test("live profile displays the authenticated principal and GitHub identity, not
   await expect(
     page.locator(".profile").getByText("Beau", { exact: true }),
   ).toHaveCount(0);
+});
+
+test("Access profile displays the verified email and provider without a fake GitHub identity", async ({ page }) => {
+  await mockLive(page, { access: true });
+  await page.goto("/");
+  await expect(page.locator(".profile").getByText("operator@first.example", { exact: true })).toBeVisible();
+  await expect(page.locator(".profile").getByText("Cloudflare Access", { exact: true })).toBeVisible();
+  await expect(page.locator(".profile").getByText(/GitHub ID/)).toHaveCount(0);
+  await page.getByRole("button", { name: "New task", exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
 });
 
 test("a pending topic request does not hold fresh workspace records or human actions hostage", async ({

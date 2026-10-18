@@ -81,7 +81,7 @@ class CanonicalRegistryBridge:
             if not isinstance(agent_bearer, str) or not agent_bearer:
                 raise RegistryAccessDenied(403)
             return agent_bearer
-        if isinstance(principal, str) and re.fullmatch(r'human:[0-9]+', principal):
+        if isinstance(principal, str) and re.fullmatch(r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', principal):
             if self.human_reader is None:
                 raise RegistrySourceUnavailable()
             access = self.human_reader(principal, topic)

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.transport_security import TransportSecuritySettings
@@ -63,6 +63,13 @@ class Settings:
             github_client_id=os.environ.get("HUB_GITHUB_CLIENT_ID", ""),
             github_client_secret=os.environ.get("HUB_GITHUB_CLIENT_SECRET", ""),
             beau_github_id=int(numeric) if numeric else None,
+            human_auth_mode=os.environ.get("HUB_HUMAN_AUTH_MODE", "github"),
+            cloudflare_issuer=os.environ.get("HUB_CF_ACCESS_ISSUER", ""),
+            cloudflare_audience=os.environ.get("HUB_CF_ACCESS_AUDIENCE", ""),
+            cloudflare_allowed_emails=tuple(email.strip().lower() for email in
+                os.environ.get("HUB_CF_ACCESS_ALLOWED_EMAILS", "").split(",") if email.strip()),
+            alternate_origins=tuple(value.strip() for value in
+                os.environ.get("HUB_ALTERNATE_ORIGINS", "").split(",") if value.strip()),
         ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None)
 
 
@@ -241,12 +248,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.owned_pilot_service = owned_pilot_service
+    if settings.auth_config.human_auth_mode == "cloudflare_access":
+        from .cloudflare_access import install_cloudflare_access
+        install_cloudflare_access(app, settings.auth_config.cloudflare_config)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
 
     @app.middleware("http")
     async def security_headers(request, call_next):
-        response = await call_next(request)
+        alternate_hosts = {urlsplit(value).netloc for value in settings.auth_config.alternate_origins}
+        if request.headers.get("host", "").lower() in alternate_hosts:
+            # One browser origin, one cookie scope and one CSRF origin. Never
+            # redirect authenticated API/MCP requests or forward query secrets.
+            if request.method in {"GET", "HEAD"} and not request.url.path.startswith(("/api/", "/mcp")):
+                response = RedirectResponse(settings.auth_config.origin + "/", status_code=303)
+            else:
+                response = JSONResponse({"detail": {"code": "canonical_origin_required"}}, status_code=421)
+        else:
+            response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"

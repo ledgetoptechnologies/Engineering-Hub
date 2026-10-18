@@ -643,26 +643,26 @@ export function HubApp() {
             className="profile"
             title={
               session?.authenticated
-                ? `${session.actor ?? "Authorized operator"} · GitHub ID ${session.github_id ?? "unknown"}`
+                ? session.email ?? `${session.actor ?? "Authorized operator"}`
                 : "Sign-in required"
             }
           >
             <span className="avatar" aria-hidden="true">
-              {demo ? "D" : session?.authenticated ? "GH" : "—"}
+              {demo ? "D" : session?.authenticated ? "EH" : "—"}
             </span>
             <div>
               <strong>
                 {demo
                   ? "Demo workspace"
                   : session?.authenticated
-                    ? session.actor
+                    ? session.email ?? session.actor
                     : "Private workspace"}
               </strong>
               <small>
                 {demo
                   ? "Sample data only"
                   : session?.authenticated
-                    ? `GitHub ID ${session.github_id ?? "unknown"}`
+                    ? session.auth_provider === "cloudflare_access" ? "Cloudflare Access" : `GitHub ID ${session.github_id ?? "unknown"}`
                     : "Sign-in required"}
               </small>
             </div>
@@ -760,17 +760,17 @@ export function HubApp() {
                 : "Sign in to Engineering Hub."}
             </h2>
             <p>
-              Use your authorized GitHub account to see assigned work and record
+              Use your authorized account to see assigned work and record
               decisions. Agent credentials never belong in this browser.
             </p>
             {!loading && (
               <>
                 <a className="primary" href="/api/hub/v1/auth/login">
-                  Continue with GitHub <Icon kind="arrow" />
+                  Sign in securely <Icon kind="arrow" />
                 </a>
                 <p className="small-text">
-                  Dedicated OAuth setup is deferred. Sign-in remains unavailable
-                  until it is configured.
+                  Sign-in is available only after the approved identity provider
+                  is configured. Agent tokens cannot be used here.
                 </p>
                 <a className="text-link" href="/?demo=1">
                   Explore a clearly labelled demo instead →

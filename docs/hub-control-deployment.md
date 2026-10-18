@@ -68,13 +68,94 @@ The image disables Uvicorn access logs. Proxy/access/tracing logs must also omit
 OAuth callback query strings, Authorization/Cookie headers, response cookies,
 request bodies and CSRF values. OAuth codes must not reach operational logs.
 
-Human OAuth remains deliberately unavailable until Beau configures a dedicated
+In default GitHub mode, human OAuth remains unavailable until Beau configures a dedicated
 GitHub OAuth application and the exact numeric GitHub allowlist ID using
 `HUB_GITHUB_CLIENT_ID`, `HUB_GITHUB_CLIENT_SECRET`, and `HUB_BEAU_GITHUB_ID`.
 Until then `/auth/me` reports anonymous and `/auth/login` fails closed. No first-
 user enrollment, agent-token-as-human path, synthetic session, or dev-login
 endpoint is available. The explicit browser demo is sample data only, never
 authentication or permission to write live records.
+
+### Approved alternate: Cloudflare Access human sign-in
+
+Beau selected Access instead of requiring a new GitHub OAuth application for EH.
+The GitHub implementation remains the compatibility default; the alternate is
+selected explicitly, never inferred from a proxy header or a present email.
+This is source/configuration support, **not a created Access application, DNS
+record, tunnel route, changed Ops policy, or live authentication acceptance**.
+
+The agreed browser addresses are:
+
+- Canonical: `https://eh.ledgetopdroneservices.com`
+- Navigation alias: `https://eh.ledgetoptechnologies.com`
+
+Supply the following through the protected Hub deployment environment:
+
+```dotenv
+HUB_HUMAN_AUTH_MODE=cloudflare_access
+HUB_BASE_URL=https://eh.ledgetopdroneservices.com
+HUB_ALTERNATE_ORIGINS=https://eh.ledgetoptechnologies.com
+HUB_CF_ACCESS_ISSUER=https://ledgetoptechnologies.cloudflareaccess.com
+HUB_CF_ACCESS_AUDIENCE=<exact-EH-application-AUD-not-Ops-AUD>
+HUB_CF_ACCESS_ALLOWED_EMAILS=bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com
+```
+
+The team origin above was observed in Ops' unauthenticated HTTPS redirect; verify
+it against the actual Zero Trust account before enrollment. Do not copy the Ops
+AUD, cookies, session JWTs, or client secrets. No GitHub client secret is needed
+in Cloudflare mode. Partial/missing configuration denies human access; invalid
+complete configuration fails startup, and there is no fallback to GitHub.
+
+Configure a **separate EH Access application** using the existing approved sign-in
+provider and only the two exact email selectors above, not a domain-wide rule.
+Keep existing Ops policies unchanged; reusing a broad mutable Ops policy would
+couple its future membership changes to this administrative dashboard. Protect
+both hostnames, with a valid certificate and reachable origin route for each.
+For the alias, prefer an edge navigation redirect to the canonical origin. Hub
+also supports this exact configured alias as defense in depth: GET/HEAD browser
+navigation redirects to the canonical root without forwarding query strings;
+API/MCP/other writes on the alias fail with 421 rather than forwarding credentials.
+Agents must use the canonical machine route, not the browser alias.
+
+The loopback port binding remains unchanged. A `cloudflared` container cannot
+reach `127.0.0.1:8770` in the host namespace through its own loopback. Review the
+actual existing connector/proxy topology before selecting its private origin;
+do not expose 8770 to the whole LAN or mount a Docker socket as a shortcut.
+
+EH validates `Cf-Access-Jwt-Assertion` cryptographically with RS256, the exact team
+issuer and EH audience, mandatory expiry/issued-at/subject/email/app-type claims,
+and its own exact email allowlist. It never trusts the unsigned email header,
+Ops tokens, service identities, or a browser's claim about its role. Keys are
+fetched only from the configured team's HTTPS `/cdn-cgi/access/certs` endpoint,
+with bounded response/time, on-demand cache refresh and failure cooldown, no
+background poller, and no expired-key fallback. Requests lacking an assertion
+cannot use an old local session to bypass Access.
+
+After a verified sign-in, a separate hashed local session and CSRF value are
+issued. Session identity includes issuer, EH audience, subject and email; expiry
+does not outlive the initial Access assertion. Every human API request must still
+carry a currently valid Access assertion. Human writes require the exact
+canonical Origin and the local session's CSRF value. GitHub sessions do not work
+in Access mode; changing providers requires sign-in again. Local logout deletes
+the EH session only, **not the upstream Cloudflare Access session**. A later
+explicit sign-in may therefore succeed without another identity-provider prompt.
+
+Agent bearer authentication and the existing bus port 8765 remain independent.
+Do not put a human-only browser challenge in front of the agents' established
+route. Any separate tunneled machine route needs its own approved machine policy
+and, if required, separate Cloudflare service credentials; an existing MCP bearer
+alone does not satisfy Cloudflare Access. No machine route is enabled here.
+
+Before activation, verify allowed/denied identities at the real Access edge and
+EH, reject wrong-application/expired/forged assertions and direct-origin bypass,
+exercise both hostnames, prove CSRF/logout/expiry, check all three agent routes,
+and confirm existing Ops and message-bus clients still work. Source tests using
+synthetic signing keys are not evidence of these live account/network checks.
+Rollback selects the previous reviewed Hub image/configuration and removes only
+the newly created EH routes/policies after preserving its state; do not alter Ops.
+
+References: [Cloudflare JWT validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/),
+[Access policy management](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/policy-management/).
 
 Outbound network access is still needed for GitHub OAuth and other explicitly
 configured adapters. This container is **not egress-isolated**, an untrusted-code

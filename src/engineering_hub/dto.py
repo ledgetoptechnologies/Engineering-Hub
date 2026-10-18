@@ -15,7 +15,7 @@ ProjectId = Literal['engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-
 Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
-HumanId = Annotated[str, Field(pattern=r'^human:[1-9][0-9]{0,19}$')]
+HumanId = Annotated[str, Field(pattern=r'^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$')]
 RunState = Literal['pending', 'running', 'succeeded', 'failed', 'rolled_back', 'held']
 RunEventState = Literal['running', 'succeeded', 'failed', 'rolled_back', 'held']
 
