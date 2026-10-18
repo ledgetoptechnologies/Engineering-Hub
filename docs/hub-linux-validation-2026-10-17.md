@@ -467,3 +467,53 @@ it did not rerun tests. Production bus source/config/ports remain unchanged from
 the preserved baseline. Subsequent documentation updates do not alter the frozen
 runtime/test sources. Actual installed supervisor and workload restart acceptance
 remain outstanding.
+
+## Actual packaged app: named-volume restart and isolated backup restore
+
+Built the actual control/dashboard image from runtime source
+`80583b2219ce0f886af0aa882c87b26b4c46eb5a`, not the pytest validation image.
+The metadata-only archive verifier independently resolved this Linux/amd64 chain:
+
+- OCI index `sha256:e2dd35f2c151261eeb1668f5826b1c6fdc6ec413c14cea95d9cd8e272ad91567`
+- Platform manifest `sha256:10c12a5ed821e26298ae19fdbec1c61d88189e6cc878bdc3ff4cf48e3571d359`
+- Configuration `sha256:628e38091df71fc7b4855d820a13d59a8f336eac0f3a81c5fd2687af63d8485f`
+
+This is a local build/identity record, not enrolled trusted host provenance or a
+registry publication. The build initially rejected an abbreviated source SHA;
+the successful image was rebuilt with the exact forty-character source identity.
+
+`hub_dashboard_container_smoke.py` passed against that immutable index: actual
+health identifies the exact commit, compiled JS/CSS and dashboard headers load,
+all three synthetic agent identities initialize MCP and discover exactly nine
+Hub tools, anonymous/invalid private access is denied, and human OAuth remains
+disabled. No real bearer or network exposure was used.
+
+The final `hub_durable_container_smoke.py` run also passed. It starts the actual
+default app with a unique named local Docker volume, injects one clearly marked
+synthetic task through the local repository fixture, claims it through the real
+HTTP API, restarts the exact same container and verifies task identity, revision
+2, claimed state and owner. The actual online SQLite backup utility produces a
+0600, quick-checked backup. A helper with the source volume read-only copies only
+that completed backup into a second fresh named volume, verifies identical bytes
+and full integrity, then another actual app reads the same claimed task and
+continues to deny anonymous/invalid access.
+
+Actual filtered Docker metadata verifies nonroot UID/GID10001, network none,
+read-only root, no extra capabilities/privilege/host bind/ports/devices, exact
+volume mounts, 512 MiB memory, one CPU and 64 PIDs. All three uniquely labelled
+containers and both labelled local volumes were removed after the final run.
+No user data was removed. The immutable local image remains available.
+
+Independent source review caught omitted resource-limit inspection and overly
+permissive backup-report comparisons. Both were corrected before the final real
+run; closed reports require valid SHA-256 and positive exact-integer sizes.
+The final focused Windows set passed **84 tests**, including 46 harness tests,
+with the existing Starlette warning only. No new full Linux suite is claimed for
+these harness/documentation additions; packaged application runtime remains the
+already full-suite-tested `80583b2` source.
+
+This verifies default **unenrolled** application storage across a container
+restart and isolated restore. It does not prove an owner-enrolled ledger can be
+copied/re-enrolled, a Docker daemon/host reboot, real OAuth, TrueNAS durability,
+autonomous controller-to-host deployment/rollback, or topic readiness delivery.
+Those gates remain open; a manual local app restart is not the autonomous pilot.

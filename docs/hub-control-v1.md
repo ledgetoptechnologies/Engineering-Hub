@@ -295,11 +295,16 @@ Actual source deployment, scoped reader enrollment, exact-session attestations
 and three-agent reconnect acceptance remain required before claiming end-to-end
 topic readiness. The Hub outbox stream alone cannot prove topic presence.
 
-## Acceptance gates still required
+## Release acceptance checklist
 
-1. Isolated fixture executor: typed allowlisted targets/actions/artifacts, durable
-   command dedupe and fencing, health, rollback, pause and restart reconciliation.
-2. Independently reviewed dashboard; real private OAuth sign-in and CSRF flow.
+1. Fixture/controller source covers typed allowlisted targets/actions/artifacts,
+   durable command dedupe/fencing, health, rollback, pause and restart
+   reconciliation. Frozen Linux tests verify those paths with simulated host
+   responses. A real host adapter and autonomous application pilot are still
+   required; source tests alone do not close this gate.
+2. Dashboard source has independent review and browser regression evidence.
+   Real private GitHub OAuth sign-in and CSRF acceptance still need the dedicated
+   OAuth application Beau deferred. No demo or synthetic session substitutes.
 3. Inventory all existing deployment writers/timers; prove exclusive control of
    one disposable staging pilot before enabling any project target.
 4. TrueNAS storage/UID/mount/backup verification and actual restart acceptance.
@@ -308,6 +313,17 @@ topic readiness. The Hub outbox stream alone cannot prove topic presence.
    review gates are not bypass-proof repository protections.
 6. Topic-level peer reachability and visible queued/unroutable delivery status as
    specified in the active goal addendum above.
+
+Current implementation is not a completed first usable release. Shared task and
+decision persistence, independent review, bounded controller recovery, native
+Hub events and the private dashboard are source-verified. The default deployed
+factory intentionally lacks a host executor, canonical registry and human OAuth
+configuration. Separate operator-injected lifecycle/registry modules do not
+activate merely because their code is in the image. Remaining release work must
+connect those approved providers and verify actual running behavior, not replace
+missing acceptance with another round of fixture-only assertions. See
+`hub-linux-validation-2026-10-17.md` for precise evidence scopes and
+`hub-review-followups.md` for named peer findings and outstanding integration.
 
 The staging PC runs software tests and tiny fixtures, never full LiDAR, OpenSplat
 or photogrammetry workloads. Processing reservations/adapters remain later work.

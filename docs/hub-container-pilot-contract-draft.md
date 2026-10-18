@@ -25,8 +25,9 @@ turning a known pending/running/failed run into a terminal hold. Unpausing and
 advancing the same run consumes its existing phase ledger and submits only the
 next unreserved phase. Actual unknown or failed recovery stays held regardless
 of pause. The dispatcher still classifies an already-accepted paused run as
-`needs_reconciliation`; automatic accepted-run pause/restart recovery is not yet
-implemented or claimed. Both candidate and rollback images must bake their real
+`needs_reconciliation`; the opt-in dispatcher now supports bounded accepted-run
+pause/restart continuation through the proof rules below. This is source behavior,
+not installed service acceptance. Both candidate and rollback images must bake their real
 source commit; null/missing build identity cannot pass the corresponding smoke.
 
 The synchronous pilot client has a bounded 125-second whole-operation deadline
@@ -42,8 +43,9 @@ These tests use synthetic transport, not actual host execution.
 
 ## Ownership and boundaries
 
-The opt-in `pilot_ownership.py` primitive is not integrated with service startup.
-Explicitly constructed container pilot workflows can receive its
+The opt-in `pilot_ownership.py` primitive is integrated with the explicit
+`create_owned_pilot_app` lifecycle, not the default production entrypoint.
+Explicitly constructed container pilot workflows receive its
 live capability; enrolled ledgers refuse workflow/dispatcher mutations without
 one. Guards cover command reservation, dispatch, result persistence and cleanup,
 including revalidation after awaited I/O. Losing ownership preserves uncertain
@@ -141,8 +143,9 @@ events from another executor can finalize the original dispatcher receipt.
 The existing in-process runtime exercises this path on startup snapshots and
 invalidation, with no new timer, watcher or model checks. A remote receipt becoming
 terminal alone still needs a supported external Hub invalidation; this slice adds
-no host-completion push subscription. Supervised startup/shutdown, request-safe
-owned recovery tasks and actual app/reboot acceptance remain required. No
+no host-completion push subscription. Supervised startup/shutdown and request-safe
+owned recovery tasks are implemented by the explicit factory below; deployed
+startup wiring and actual app/reboot acceptance remain required. No
 automatic production recovery is claimed.
 
 Pilot run events now carry optional deterministic `event_id` UUIDs scoped to
