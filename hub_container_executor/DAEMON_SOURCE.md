@@ -6,6 +6,29 @@ synthetic OCI archives, and private temporary generation directories. It has not
 connected to Docker, opened a listener, created a container, or changed host
 permissions.
 
+## Read-only compatibility gate
+
+`python -m scripts.hub_engine_runner_probe` is a separate runner-only probe. It
+requires explicit `--runner-id`, `--daemon-id`, `--architecture`, `--socket`,
+`--api-version` and `--generation-root` bindings. Optional `--variant v8` is
+operator-pinned, not independently proven. Duplicate options are rejected.
+The default timeout is 5000 ms; explicit values are bounded to 100–10000 ms.
+
+Run only on an already-authorized Linux host with an already-accessible daemon
+and existing locked Python runtime. It performs the concrete backend's single
+GET `/v<api-version>/info`, verifies the pinned ID/OS/architecture, and closes the
+connection. The generation root is never created or read. No environment-based
+daemon discovery, image/container operation, state provisioning, listener,
+package install, socket mount or permission change is part of this probe.
+Errors are sanitized; do not pass credentials as arguments.
+
+Success establishes runner transport/identity compatibility only. Its output
+explicitly leaves image, effective profile, driver implementation, deployment
+and rollback unverified. Unit tests use a fake backend; separate Linux transport
+tests exercise the actual HTTPX Unix transport against a **synthetic HTTP
+server**, not Docker. Neither is actual Engine acceptance. The hard-disabled
+full acceptance script remains unchanged.
+
 ## Binding and request surface
 
 `DockerEngineBackend` requires an explicit `DockerEngineBinding`: enrolled runner

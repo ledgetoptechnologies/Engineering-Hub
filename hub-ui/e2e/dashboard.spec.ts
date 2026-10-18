@@ -393,7 +393,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await expect(
     page.getByText("Fixture demo acceptance task", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator('.notice[role="status"]')).toContainText(
     "Demo only; no server changed.",
   );
   await expect(page.getByRole("radio", { checked: true })).toHaveCount(0);
@@ -406,7 +406,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator('.notice[role="status"]')).toContainText(
     "Decision recorded, not an execution grant.",
   );
   await expect(
@@ -755,7 +755,7 @@ test("conflicting decision disables writes until explicit refresh without echoin
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
-  await expect(page.getByRole("alert")).toHaveText(
+  await expect(page.locator('.notice[role="alert"]')).toHaveText(
     "This record changed. Refresh before trying again.",
   );
   await expect(

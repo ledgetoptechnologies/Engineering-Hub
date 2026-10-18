@@ -3,6 +3,23 @@
 This is source/test evidence, not an installed staging worker or production
 deployment. The existing message bus on 8765 is unchanged.
 
+## Candidate dashboard visibility
+
+The private dashboard now has a read-only software validation queue panel. It
+uses the existing human-authenticated `GET /api/hub/v1/work/status?limit=50`,
+without an agent bearer token or any worker mutation controls. Workspace/native
+invalidation and explicit checks refresh it; no scheduled polling is added.
+It shows queue/master pause, closed or worker-specific admission, global counts
+and up to 50 latest jobs with exact targets, blocked reasons and held machine
+reservations. Conditional eligibility is not executor readiness or production
+approval. Queue absence, unavailable/unknown status and authentication loss are
+distinct from an empty queue. Unavailable reads clear old rows; authentication
+loss clears the whole private workspace. Demo mode makes no queue request.
+
+UI unit, build and real-browser fixture checks are local source verification,
+not a deployed NAS dashboard or real Cloudflare sign-in test. Existing endpoints,
+credentials and access policy are unchanged.
+
 ## Scope
 
 - Durable reviewed-task admission with immutable task/commit/artifact targets.
