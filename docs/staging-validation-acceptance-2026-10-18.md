@@ -68,6 +68,13 @@ execution/receipt contract, private provisioning and installed lifecycle still
 need implementation and actual-host acceptance. The default production verifier
 and executable completion/reconciliation provider remain disabled.
 
+After peer review, the configured bootstrap was further hardened to deny claims
+entirely until a trusted server-side exact-worker/action/machine/target policy
+is installed. Merely enabling the queue cannot wedge the machine by reserving
+an unexecutable job. Optional action filters only narrow that policy. The local
+acceptance harness explicitly enrolls its precise synthetic target and bound
+receipt provider; this is not remote executor credential provisioning.
+
 The staged agent API base remains `http://192.168.50.80:8770/api/hub/v1/work`,
 and the Hub MCP listener is `http://192.168.50.80:8770/mcp/`; these new queue
 capabilities are **candidate source**, not live installed endpoints. The old MCP

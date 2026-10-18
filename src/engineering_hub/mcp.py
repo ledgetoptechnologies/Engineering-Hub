@@ -169,7 +169,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         principal = identity(ctx)
         data = work_input(WorkClaim, payload)
         return {'job': invoke(lambda: configured_work().claim(
-            worker=WorkWorker(principal, data.instance_id), lease_seconds=data.lease_seconds))}
+            worker=WorkWorker(principal, data.instance_id), lease_seconds=data.lease_seconds,
+            action_keys=None if data.action_keys is None else tuple(data.action_keys)))}
 
     def hub_work_renew(payload: dict, ctx: Context) -> dict:
         """Renew only this authenticated agent's matching live instance/fence."""

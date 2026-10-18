@@ -35,6 +35,15 @@ queue the authenticated routes return `423 work_queue_not_configured`.
 Enabling the queue is incompatible with the older independently dispatched
 fixture/pilot workflows; do not create competing machine owners.
 
+The flag alone permits coordination, not executable admission. The configured
+queue installs a closed claim policy: `/claim` returns `{"job": null}` and status
+shows `claim_admission_state: unconfigured` / `admission_not_configured`, without
+reserving new work. Trusted server composition must enroll the worker, action,
+environment, physical machine and exact task/commit/artifact before claims can
+succeed, together with appropriate execution-evidence and recovery providers.
+There is no public agent endpoint to install that policy. A process UUID is a
+cooperative instance identifier, not an additional executor credential.
+
 ## Workflow and boundaries
 
 1. Beau creates a Hub task. An agent claims it, proposes a full lowercase
@@ -98,6 +107,12 @@ Queue status/history is shared across agents; use task/job identifiers rather
 than private local notes for handoffs. No automatic replay, scheduler loop, or
 processing worker starts merely by calling these routes.
 
+Claim accepts optional `action_keys`, a nonempty list of at most 32 unique
+registered action keys. It only narrows the server's enrollment policy; naming
+an action does not authorize a caller or a different commit/artifact. Do not
+send this field on renewal. Instance ownership, fencing, production approval and
+fresh independent review still apply before any effect.
+
 ### Agent MCP interface
 
 The candidate Hub MCP URL is `http://192.168.50.80:8770/mcp/`, not the old bus
@@ -152,7 +167,8 @@ job = api("/jobs", {
                "source_commit": os.environ["HUB_SOURCE_COMMIT"],
                "artifact_digest": os.environ["HUB_ARTIFACT_DIGEST"]},
 })
-claimed = api("/claim", {"instance_id": instance_id, "lease_seconds": 60})["job"]
+claimed = api("/claim", {"instance_id": instance_id, "lease_seconds": 60,
+                         "action_keys": ["3d-viewer.validate"]})["job"]
 if claimed is not None:
     # A shared queue may return another eligible reviewed job. Validate the
     # returned action/target against your approved worker before any effect.

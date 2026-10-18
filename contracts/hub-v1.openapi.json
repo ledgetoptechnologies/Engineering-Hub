@@ -2963,6 +2963,25 @@
             "minimum": 1.0,
             "title": "Lease Seconds",
             "default": 60
+          },
+          "action_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$"
+                },
+                "type": "array",
+                "maxItems": 32,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Keys"
           }
         },
         "additionalProperties": false,

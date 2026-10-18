@@ -53,6 +53,14 @@ reservation rather than authorizing another job.
 Before constructing the worker, trusted composition must explicitly install
 `ledger.verify_completion` as the same queue's `completion_verifier`. The worker
 requires that actual bound method, not a callback that accepts worker assertions.
+The normal configured queue also requires explicit server-side admission:
+`claim_verifier(worker, action_key, environment, machine_id, target: WorkTarget)`
+must return the literal `True` for the exact enrolled task/commit/artifact. Its
+default closed policy cannot reserve new work. Scope this policy to the
+trusted worker composition and receipt provider; never copy agent request flags
+into it. Generic explicitly injected test queues are trusted composition, not
+evidence that an actual remote executor has been enrolled. Caller `action_keys`
+can narrow but never broaden this policy.
 Its one-shot entry point is:
 
 ```python

@@ -56,11 +56,22 @@ class WorkInstance(WorkInput):
         return value
 
 
-class WorkClaim(WorkInstance):
+class WorkLease(WorkInstance):
     lease_seconds: int = Field(default=60, ge=1, le=600)
 
 
-class WorkRenew(WorkClaim):
+class WorkClaim(WorkLease):
+    action_keys: list[Key] | None = Field(default=None, min_length=1, max_length=32)
+
+    @field_validator('action_keys')
+    @classmethod
+    def unique_actions(cls, value):
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError('unique registered actions required')
+        return value
+
+
+class WorkRenew(WorkLease):
     fence: int = Field(ge=1, le=2**63 - 1)
 
 
@@ -158,7 +169,8 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
     def claim(payload: WorkClaim, request: Request):
         principal = identity(request, agent)
         return {'job': configured().claim(worker=WorkWorker(principal, payload.instance_id),
-                                          lease_seconds=payload.lease_seconds)}
+                                          lease_seconds=payload.lease_seconds,
+                                          action_keys=None if payload.action_keys is None else tuple(payload.action_keys))}
 
     @app.post('/api/hub/v1/work/jobs/{job_id}/renew')
     def renew(job_id: JobID, payload: WorkRenew, request: Request):

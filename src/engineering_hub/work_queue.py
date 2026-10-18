@@ -71,9 +71,16 @@ class WorkWorker:
         return self.agent + ':' + self.instance_id
 
 
+class ClosedClaimPolicy:
+    """Configured coordination without an enrolled executor cannot reserve work."""
+    def __call__(self, worker, action_key, environment, machine_id, target):
+        return False
+
+
 class WorkQueue:
     def __init__(self, repo, actions, *, approval_verifier=None,
-                 reconciliation_verifier=None, completion_verifier=None, target_verifier=None, clock=time.time, max_jobs=10000):
+                 reconciliation_verifier=None, completion_verifier=None, target_verifier=None,
+                 claim_verifier=None, clock=time.time, max_jobs=10000):
         if type(actions) is not dict or not 1 <= len(actions) <= 256:
             raise HubError('invalid_work_registry')
         self.actions = dict(actions)
@@ -83,13 +90,16 @@ class WorkQueue:
                 raise HubError('invalid_work_registry')
         if type(max_jobs) is not int or not 1 <= max_jobs <= 100000:
             raise HubError('invalid_work_capacity')
-        if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier)):
+        if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier)):
             raise HubError('invalid_work_verifier')
         self.repo, self.clock, self.max_jobs = repo, clock, max_jobs
         self.approval_verifier = approval_verifier
         self.reconciliation_verifier = reconciliation_verifier
         self.completion_verifier = completion_verifier
         self.target_verifier = target_verifier
+        # None is retained only for explicit trusted local composition. The
+        # environment-enabled factory installs ClosedClaimPolicy by default.
+        self.claim_verifier = claim_verifier
         with repo._transaction() as db:
             for statement in '''
                 CREATE TABLE IF NOT EXISTS hub_work_jobs (
@@ -213,10 +223,28 @@ class WorkQueue:
             self._event(db, 'work.submitted', job_id, actor)
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
-    def claim(self, *, worker, lease_seconds=60):
+    def _admitted(self, worker, row):
+        if self.claim_verifier is None:
+            return True
+        try:
+            return self.claim_verifier(worker, row['action_key'], row['environment'], row['machine_id'],
+                                       WorkTarget(**json.loads(row['target']))) is True
+        except Exception:
+            return False
+
+    def claim(self, *, worker, lease_seconds=60, action_keys=None):
         if type(worker) is not WorkWorker:
             raise HubError('invalid_work_worker')
         self._lease(lease_seconds)
+        if action_keys is not None:
+            if type(action_keys) is not tuple or not 1 <= len(action_keys) <= 32:
+                raise HubError('invalid_work_action_filter')
+            for key in action_keys:
+                _key(key)
+                if key not in self.actions:
+                    raise HubError('work_action_not_registered', 403)
+            if len(set(action_keys)) != len(action_keys):
+                raise HubError('invalid_work_action_filter')
         with self.repo._transaction() as db:
             now = self._now()
             self._expire(db, now)
@@ -226,8 +254,12 @@ class WorkQueue:
             # not cached from submission. Production priority is non-preemptive.
             rows = db.execute("SELECT j.* FROM hub_work_jobs j LEFT JOIN hub_work_machines m ON m.machine_id=j.machine_id WHERE j.state='queued' AND m.job_id IS NULL ORDER BY CASE j.environment WHEN 'production' THEN 0 ELSE 1 END,j.sequence").fetchall()
             for row in rows:
+                if action_keys is not None and row['action_key'] not in action_keys:
+                    continue
                 action = self.actions.get(row['action_key'])
                 if action is None or action.machine_id != row['machine_id'] or action.project != row['project'] or action.requires_execution_proof != bool(row['requires_execution_proof']) or row['environment'] not in action.environments or not self._approved(row) or not self._target_verified(row['actor'], row['action_key'], row['environment'], WorkTarget(**json.loads(row['target']))):
+                    continue
+                if not self._admitted(worker, row):
                     continue
                 db.execute('INSERT OR IGNORE INTO hub_work_machines VALUES(?,0,NULL)', (row['machine_id'],))
                 db.execute('UPDATE hub_work_machines SET generation=generation+1,job_id=? WHERE machine_id=?', (row['id'], row['machine_id']))
@@ -266,6 +298,7 @@ class WorkQueue:
                     or action.project != row['project']
                     or action.requires_execution_proof != bool(row['requires_execution_proof'])
                     or row['environment'] not in action.environments
+                    or not self._admitted(worker, row)
                     or not self._approved(row)
                     or not self._target_verified(row['actor'], row['action_key'], row['environment'],
                                                  WorkTarget(**json.loads(row['target'])))):
@@ -370,15 +403,21 @@ class WorkQueue:
                         reason = 'registry_changed'
                     elif not self._approved(row):
                         reason = 'production_approval_required'
+                    elif type(self.claim_verifier) is ClosedClaimPolicy:
+                        reason = 'admission_not_configured'
                     elif not self._target_verified(row['actor'], row['action_key'], row['environment'], WorkTarget(**json.loads(row['target']))):
                         reason = 'target_not_verified'
                     elif db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (row['machine_id'],)).fetchone():
                         reason = 'machine_reserved'
                 item.update(requires_reconciliation=reconciliation,
                             eligible=row['state'] == 'queued' and reason is None,
+                            eligible_requires_worker_admission=self.claim_verifier is not None and type(self.claim_verifier) is not ClosedClaimPolicy,
                             blocked_reason=reason)
                 jobs.append(item)
             return {'paused': paused, 'queue_paused': queue_paused, 'master_paused': master_paused,
+                    'claim_admission_state': ('unconfigured' if type(self.claim_verifier) is ClosedClaimPolicy
+                                              else 'trusted_composition' if self.claim_verifier is None
+                                              else 'worker_policy'),
                     'actions': {key: {'machine_id': action.machine_id, 'project': action.project,
                                      'environments': sorted(action.environments),
                                      'requires_execution_proof': action.requires_execution_proof,

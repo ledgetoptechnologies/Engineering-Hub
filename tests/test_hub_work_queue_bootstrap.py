@@ -33,7 +33,7 @@ def test_default_queue_is_explicitly_unconfigured_and_still_authenticated(tmp_pa
     assert app.state.work_queue is None
 
 
-def test_opt_in_first_version_connects_and_claims_only_verified_staging_work(tmp_path):
+def test_opt_in_first_version_cannot_reserve_without_worker_enrollment(tmp_path):
     app = create_app(settings(tmp_path, work_queue_enabled=True))
     task = reviewed(app.state.repository)
     headers = {'Authorization': 'Bearer test-codex'}
@@ -53,11 +53,13 @@ def test_opt_in_first_version_connects_and_claims_only_verified_staging_work(tmp
         result = client.post('/api/hub/v1/work/claim', headers=headers,
                              json={'instance_id': instance, 'lease_seconds': 60})
         assert result.status_code == 200
-        job = result.json()['job']
-        assert job['id'] == staging.json()['id']  # Unapproved production is ineligible.
-        refused = client.post(f"/api/hub/v1/work/jobs/{job['id']}/complete", headers=headers,
-                              json={'instance_id': instance, 'fence': job['fence'], 'outcome': 'succeeded'})
-        assert refused.status_code == 409  # No real execution proof provider wired.
+        assert result.json()['job'] is None
+        state = client.get('/api/hub/v1/work/status', headers=headers).json()
+        assert state['claim_admission_state'] == 'unconfigured'
+        assert state['counts'] == {'queued': 2}
+        stage = next(job for job in state['jobs'] if job['id'] == staging.json()['id'])
+        assert stage['blocked_reason'] == 'admission_not_configured'
+        assert stage['fence'] is None and not stage['requires_reconciliation']
         assert app.state.repository.get_task(task['id'])['status'] == 'verified'
 
 

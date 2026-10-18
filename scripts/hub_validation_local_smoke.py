@@ -109,6 +109,13 @@ def main():
         profile = ValidationProfile(memory_bytes=2147483648, cpu_millicores=2000,
                                     tmpfs_bytes=268435456)
         worker = WorkWorker('codex', str(uuid4()))
+        # Explicit private test composition, never an agent-supplied policy.
+        # An instance UUID scopes this cooperative fixture, not a new credential.
+        queue.claim_verifier = lambda candidate, action, environment, machine, candidate_target: (
+            candidate == worker and action == 'engineering-hub.validate'
+            and environment == 'staging' and machine == 'local-disposable-engine'
+            and candidate_target == target
+            and getattr(queue.completion_verifier, '__self__', None) is ledger)
         results = []
         production = queue.submit(actor='codex', request_id='unapproved-production',
                                   action_key='engineering-hub.validate', environment='production', target=target)

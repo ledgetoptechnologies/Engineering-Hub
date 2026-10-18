@@ -239,3 +239,52 @@ def test_closed_submission_schema_rejects_extra_authority(rig, change):
                                  {'instance_id': str(uuid4()), 'lease_seconds': 601}])
 def test_closed_claim_schema_does_not_accept_worker_identity(rig, body):
     assert rig[0].post(BASE + '/claim', headers=bearer(), json=body).status_code == 422
+
+
+@pytest.mark.parametrize('keys', [[], ['viewer.check', 'viewer.check'], 'viewer.check',
+                                [True], ['viewer.check'] * 33, ['/private/command']])
+def test_claim_capability_filter_is_bounded_strict_and_unique(rig, keys):
+    response = rig[0].post(BASE + '/claim', headers=bearer(), json={
+        'instance_id': str(uuid4()), 'action_keys': keys})
+    assert response.status_code == 422
+
+
+def test_claim_filter_can_only_narrow_server_enrolled_admission(rig):
+    client, _, queue, _, _, submission, *_ = rig
+    first = client.post(BASE + '/jobs', headers=bearer(), json=submission()).json()
+    second = client.post(BASE + '/jobs', headers=bearer(), json=submission(action_key='viewer.execute')).json()
+    queue.claim_verifier = lambda worker, action, environment, machine, target: (
+        worker.agent == 'hermes' and action == 'viewer.execute' and environment == 'staging' and machine == 'staging-pc'
+        and target.task_id == second['target']['task_id'] and target.source_commit == COMMIT and target.artifact_digest == DIGEST)
+    instance = str(uuid4())
+    request = dict(instance_id=instance, action_keys=['viewer.check'])
+    assert client.post(BASE + '/claim', headers=bearer('hermes'), json=request).json()['job'] is None
+    request['action_keys'] = ['viewer.execute']
+    assert client.post(BASE + '/claim', headers=bearer('codex'), json=request).json()['job'] is None
+    request['action_keys'] = ['unregistered.validate']
+    assert client.post(BASE + '/claim', headers=bearer('hermes'), json=request).status_code == 403
+    request['action_keys'] = ['viewer.execute']
+    result = client.post(BASE + '/claim', headers=bearer('hermes'), json=request).json()['job']
+    assert result['id'] == second['id']
+    assert queue.get_job(first['id'])['state'] == 'queued'
+    # Filtering is claim-only, never silently accepted on renew/completion.
+    response = client.post(BASE + f"/jobs/{result['id']}/renew", headers=bearer('hermes'),
+                           json={**request, 'fence': result['fence']})
+    assert response.status_code == 422
+
+
+def test_claim_filter_does_not_grant_unenrolled_exact_target(rig):
+    client, _, queue, _, _, submission, *_ = rig
+    body = submission(action_key='viewer.execute')
+    body['target']['artifact_digest'] = 'sha256:' + 'd' * 64
+    job = client.post(BASE + '/jobs', headers=bearer(), json=body).json()
+    observed = []
+    def admission(worker, action, environment, machine, target):
+        observed.append(target)
+        return action == 'viewer.execute' and target.source_commit == COMMIT and target.artifact_digest == DIGEST
+    queue.claim_verifier = admission
+    response = client.post(BASE + '/claim', headers=bearer('hermes'), json={
+        'instance_id': str(uuid4()), 'action_keys': ['viewer.execute']})
+    assert response.status_code == 200 and response.json()['job'] is None
+    assert observed and observed[-1].artifact_digest == body['target']['artifact_digest']
+    assert queue.get_job(job['id'])['state'] == 'queued'

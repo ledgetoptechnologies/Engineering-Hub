@@ -26,6 +26,7 @@ def rig(tmp_path):
     repo = HubRepository(tmp_path / 'hub.sqlite3')
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude')
     actions = {'viewer.validate': WorkAction('staging-pc', frozenset({'staging', 'production'}), project='3d-viewer'),
+               'viewer.verify': WorkAction('staging-pc', project='3d-viewer'),
                'tree.validate': WorkAction('staging-pc', project='treedar')}
 
     def target_verified(actor, action, environment, target):
@@ -186,3 +187,40 @@ def test_production_remains_blocked_and_stale_review_not_claimable(rig):
     item = repo.get_task(body['target']['task_id'])
     repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
+
+
+@pytest.mark.parametrize('keys', [[], ['viewer.validate', 'viewer.validate'], 'viewer.validate',
+                                [True], ['viewer.validate'] * 33])
+def test_mcp_claim_filter_strict_shape_and_no_invented_capability(rig, keys):
+    error(call(rig[0], 'hub_work_claim', {'instance_id': str(uuid4()), 'action_keys': keys}), 'invalid_input')
+
+
+def test_mcp_claim_filter_narrows_but_cannot_grant_server_policy(rig):
+    client, _, queue, _, _, payload = rig
+    first = call(client, 'hub_work_submit', payload())
+    second = call(client, 'hub_work_submit', payload(action_key='viewer.verify'))
+    queue.claim_verifier = lambda worker, action, environment, machine, target: (
+        worker.agent == 'hermes' and action == 'viewer.verify' and environment == 'staging' and machine == 'staging-pc'
+        and target.task_id == second['target']['task_id'] and target.source_commit == COMMIT and target.artifact_digest == DIGEST)
+    request = dict(instance_id=str(uuid4()), action_keys=['viewer.validate'])
+    assert call(client, 'hub_work_claim', request, 'test-hermes')['job'] is None
+    request['action_keys'] = ['viewer.verify']
+    assert call(client, 'hub_work_claim', request, 'test-codex')['job'] is None
+    result = call(client, 'hub_work_claim', request, 'test-hermes')['job']
+    assert result['id'] == second['id']
+    assert queue.get_job(first['id'])['state'] == 'queued'
+
+
+def test_mcp_claim_filter_cannot_grant_unenrolled_artifact(rig):
+    client, _, queue, _, _, payload = rig
+    body = payload(action_key='viewer.verify')
+    body['target']['artifact_digest'] = 'sha256:' + 'd' * 64
+    job = call(client, 'hub_work_submit', body)
+    observed = []
+    def admission(worker, action, environment, machine, target):
+        observed.append(target)
+        return action == 'viewer.verify' and target.source_commit == COMMIT and target.artifact_digest == DIGEST
+    queue.claim_verifier = admission
+    assert call(client, 'hub_work_claim', {'instance_id': str(uuid4()), 'action_keys': ['viewer.verify']})['job'] is None
+    assert observed and observed[-1].artifact_digest == body['target']['artifact_digest']
+    assert queue.get_job(job['id'])['state'] == 'queued'
