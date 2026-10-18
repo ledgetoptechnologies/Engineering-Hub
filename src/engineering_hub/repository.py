@@ -8,6 +8,8 @@ import re
 import sqlite3
 import uuid
 
+from .pilot_ownership import PilotOwner
+
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
@@ -26,20 +28,26 @@ def _json(value):
 
 
 class HubRepository:
-    def __init__(self, path, *, execution_principal=None):
+    def __init__(self, path, *, execution_principal=None, pilot_owner=None):
         if execution_principal is not None and (
             not isinstance(execution_principal, str)
             or re.fullmatch(r'executor:[a-z][a-z0-9-]{0,63}', execution_principal) is None
         ):
             raise HubError('invalid_execution_principal')
         self.execution_principal = execution_principal
+        self.pilot_owner = pilot_owner
         self.path = str(path)
         if self.path == ':memory:':
             raise HubError('durable_path_required')
+        self._assert_pilot_owner(None)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
+            # Even WAL configuration is a mutation. A legacy constructor must
+            # not change an enrolled ledger before checking its live owner.
+            self._assert_pilot_owner(db)
             db.execute('PRAGMA journal_mode=WAL')
-            db.executescript('''
+        with self._transaction() as db:
+            schema = '''
                 CREATE TABLE IF NOT EXISTS hub_entities (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS hub_requests (
@@ -63,11 +71,33 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
-            ''')
+            '''
+            # executescript commits an existing transaction implicitly, which
+            # would bypass the final capability check and rollback boundary.
+            for statement in schema.split(';'):
+                if statement.strip():
+                    db.execute(statement)
+
+    def _assert_pilot_owner(self, db):
+        """Require the actual live capability for any enrolled-ledger write."""
+        try:
+            if self.pilot_owner is not None:
+                if type(self.pilot_owner) is not PilotOwner:
+                    raise ValueError()
+                self.pilot_owner.assert_active(self.path)
+            elif db is not None and db.execute("SELECT 1 FROM sqlite_master WHERE name='hub_pilot_owner'").fetchone():
+                raise ValueError()
+        except Exception:
+            raise HubError('pilot_ownership_required', 409) from None
 
     @contextmanager
     def _connection(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        if self.pilot_owner is not None:
+            # Owner enrollment created the database already. Reads or failed
+            # writes must not silently recreate a deleted/replaced ledger.
+            db = sqlite3.connect(Path(self.path).absolute().as_uri() + '?mode=rw', uri=True, timeout=10)
+        else:
+            db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         try:
             yield db
@@ -76,10 +106,13 @@ class HubRepository:
 
     @contextmanager
     def _transaction(self):
+        self._assert_pilot_owner(None)
         with self._connection() as db:
             db.execute('BEGIN IMMEDIATE')
             try:
+                self._assert_pilot_owner(db)
                 yield db
+                self._assert_pilot_owner(db)
                 db.commit()
             except Exception:
                 db.rollback()

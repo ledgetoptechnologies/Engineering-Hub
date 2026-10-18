@@ -19,7 +19,7 @@ def enrolled(tmp_path):
     directory.mkdir(mode=0o700)
     path = directory / 'hub.sqlite'
     with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
-        repo = HubRepository(path, execution_principal=PRINCIPAL)
+        repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
         yield repo, owner
 
 

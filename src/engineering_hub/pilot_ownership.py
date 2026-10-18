@@ -26,6 +26,7 @@ _SCHEMA = ('CREATE TABLE hub_pilot_owner (id INTEGER PRIMARY KEY CHECK(id=1), '
            'version INTEGER NOT NULL, database_id TEXT NOT NULL, device INTEGER NOT NULL, '
            'inode INTEGER NOT NULL, lock_device INTEGER NOT NULL, lock_inode INTEGER NOT NULL, '
            'epoch TEXT NOT NULL, previous_epoch TEXT)')
+_EPOCH_SCHEMA = 'CREATE TABLE hub_pilot_owner_epochs(epoch TEXT PRIMARY KEY, previous_epoch TEXT)'
 _OWNERS = weakref.WeakSet()
 
 
@@ -119,23 +120,32 @@ class PilotOwner:
                 db.execute('BEGIN IMMEDIATE')
                 if fresh:
                     db.execute(_SCHEMA)
+                    db.execute(_EPOCH_SCHEMA)
                     row = (1, 1, str(uuid.uuid4()), *self._database_identity, *self._lock_identity, str(uuid.uuid4()), None)
                     db.execute('INSERT INTO hub_pilot_owner VALUES(?,?,?,?,?,?,?,?,?)', row)
+                    db.execute('INSERT INTO hub_pilot_owner_epochs VALUES(?,?)', (row[7], None))
                 else:
                     row = self._read(db)
                     previous = row[7]
                     epoch = str(uuid.uuid4())
                     db.execute('UPDATE hub_pilot_owner SET epoch=?, previous_epoch=? WHERE id=1', (epoch, previous))
+                    db.execute('INSERT INTO hub_pilot_owner_epochs VALUES(?,?)', (epoch, previous))
                     row = (*row[:7], epoch, previous)
                 self._check_paths()
             self._row = tuple(row)
-            self.epoch = row[7]
-            self.previous_epoch = row[8]
             self._closed = False
             self.assert_active(path)
         except Exception:
             self.close()
             raise PilotOwnershipError() from None
+
+    @property
+    def epoch(self):
+        return self._row[7]
+
+    @property
+    def previous_epoch(self):
+        return self._row[8]
 
     def _check_file(self, fd, name, expected=None):
         opened = os.fstat(fd)
@@ -196,7 +206,47 @@ class PilotOwner:
                 or not _identity(row[7])
                 or (row[8] is not None and (not _identity(row[8]) or row[8] == row[7]))):
             raise PilotOwnershipError()
+        history_schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='hub_pilot_owner_epochs'").fetchone()
+        if history_schema is None or history_schema[0] != _EPOCH_SCHEMA:
+            raise PilotOwnershipError()
+        history = db.execute('SELECT previous_epoch FROM hub_pilot_owner_epochs WHERE epoch=?', (row[7],)).fetchone()
+        if history is None or history[0] != row[8]:
+            raise PilotOwnershipError()
         return row
+
+    def assert_prior_epoch(self, epoch):
+        """Prove historical enrollment ancestry, never authorize a live takeover.
+
+        The caller still needs exact workflow reservation CAS. Arbitrary UUIDs,
+        the current epoch, broken chains and cycles are not historical proof.
+        """
+        try:
+            self.assert_active(self._path)
+            if not _identity(epoch) or epoch == self._row[7]:
+                raise PilotOwnershipError()
+            with self._connect() as db:
+                if self._read(db) != self._row:
+                    raise PilotOwnershipError()
+                cursor, seen, found = self._row[7], set(), False
+                for _ in range(10000):
+                    if cursor is None:
+                        break
+                    if not _identity(cursor) or cursor in seen:
+                        raise PilotOwnershipError()
+                    seen.add(cursor)
+                    entry = db.execute('SELECT previous_epoch FROM hub_pilot_owner_epochs WHERE epoch=?', (cursor,)).fetchone()
+                    if entry is None:
+                        raise PilotOwnershipError()
+                    found = found or cursor == epoch
+                    cursor = entry[0]
+                else:
+                    if cursor is not None:
+                        raise PilotOwnershipError()
+                if not found:
+                    raise PilotOwnershipError()
+            self.assert_active(self._path)
+        except Exception:
+            raise PilotOwnershipError() from None
 
     def assert_active(self, database_path):
         try:

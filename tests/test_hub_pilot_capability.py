@@ -18,7 +18,7 @@ def enrolled(tmp_path):
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
     with PilotOwner(private / 'hub.sqlite', allow_ephemeral_test_storage=True) as owner:
-        repo = HubRepository(private / 'hub.sqlite', execution_principal=PRINCIPAL)
+        repo = HubRepository(private / 'hub.sqlite', execution_principal=PRINCIPAL, pilot_owner=owner)
         yield repo, owner, ContainerPilotTarget.from_manifest(pilot_manifest())
 
 

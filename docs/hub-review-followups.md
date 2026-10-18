@@ -262,3 +262,29 @@ host acceptance remain required before activation.
 Pilot inspection now validates the original canonical command before GET and
 strictly revalidates bounded typed response/echo afterward. It does not insert a
 run binding, update a receipt, change run state, adopt ownership or resend effects.
+
+### Repository barrier follow-up
+
+Claude reply `4bdaf2b3-8cff-433c-a6da-cb4795455080` reviewed the next source
+slice without running tests. It confirmed the descriptor, ephemeral-storage and
+inspection corrections, and identified remaining generic repository mutation
+bypass. A repository-level live-owner barrier is now integrated inside
+`BEGIN IMMEDIATE` and before commit, including constructor schema/WAL protection;
+workflow pre/post-I/O guards remain necessary. This supersedes the earlier
+deliberate task/decision write exception. The frozen combined Linux suite passes
+1,634 tests, including direct unowned mutation refusal and precommit rollback.
+A terminal run left with
+an advance reservation must retain visible terminal status and be reconciled
+from original command evidence, not mistaken for an unaccepted request.
+
+The new explicit prior-epoch recovery module underwent independent subagent
+source review. Findings corrected before acceptance: inconsistent failed history
+must not rewind to running; a foreign run command binding must deny; distinct
+candidate/rollback image roles cannot assert the same container ID; and ordinary
+validation/CAS exceptions must not strand this call's current-epoch inspection
+claim. Owner loss/cancellation intentionally retains in-flight claims. Dedicated
+tests cover original-command GET evidence, repeated occurrence IDs, pause,
+ancestry across idle restarts, exact reservation CAS and one-time repair counting.
+An actual Linux SIGKILL test covers controller lock release and durable receipts,
+with simulated host evidence only. Peer review of the published combined slice
+and actual host acceptance remain separate gates.

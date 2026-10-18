@@ -42,15 +42,16 @@ These tests use synthetic transport, not actual host execution.
 
 ## Ownership and boundaries
 
-The opt-in `pilot_ownership.py` primitive is not integrated with service startup
-or recovery. Explicitly constructed container pilot workflows can receive its
+The opt-in `pilot_ownership.py` primitive is not integrated with service startup.
+Explicitly constructed container pilot workflows can receive its
 live capability; enrolled ledgers refuse workflow/dispatcher mutations without
 one. Guards cover command reservation, dispatch, result persistence and cleanup,
 including revalidation after awaited I/O. Losing ownership preserves uncertain
-reservations, not automatic retry. Boolean-based dispatcher reconciliation is
-unavailable on enrolled ledgers until epoch/evidence-based adoption is implemented.
-This is source integration, not an activated service or generic repository-wide
-write lock. It accepts a new database in an
+reservations, not automatic retry. Boolean-based dispatcher reconciliation remains
+unavailable on enrolled ledgers. Repository transactions now require that same
+exact live capability after BEGIN IMMEDIATE and before commit, including generic
+task/decision/run writes. This is source integration, not an activated service or
+proof that older external writers respect the lock. It accepts a new database in an
 existing private local directory, or the exact enrolled database/lock inodes.
 Un-enrolled existing state is refused; no permission changes, legacy adoption,
 watcher or daemon activation occur. It holds a nonblocking Linux `flock`, binds
@@ -81,6 +82,32 @@ single-process deployment must hold it for all mutation tasks and their shutdown
 check it at each mutation boundary, and use `close_fds=True` for subprocesses.
 Fresh state/enrollment, supervisor cutover and exclusion of other writers remain
 deployment preconditions, not a caller Boolean or an expired lease.
+
+### Explicit prior-epoch crash recovery
+
+`PilotRecovery` is constructor-injected source only, not a startup worker. Epoch
+history is atomically enrolled with the owner row and proven through a bounded,
+validated ancestry chain. Existing enrollment lacking that exact history is
+refused, not automatically upgraded. Public epoch properties are read-only.
+Advance reservations carry a separate atomic epoch/UUID pairing; untagged,
+orphaned or current-epoch active reservations cannot authorize takeover.
+
+Recovery GETs every originally reserved command and verifies its unchanged
+payload, full echo and role evidence; it never POSTs. Unknown, missing, malformed,
+contradictory or phase-inconsistent evidence keeps the target held. Proven
+historical outcomes permit an atomic phase-derived transition, occurrence-scoped
+audit/receipt records and exact reservation release. Ordinary advance may then
+submit only a never-reserved next phase. IDs, fence, manifest and independent
+review stay bound; candidate failure increments the lifetime repair count once.
+Historical smoke receipts do not establish current host health.
+
+Pause allows inspection evidence but no reactivation/release. Repeated explicit
+inspections get distinct occurrences. Ordinary local validation/CAS errors mark
+only their own inspection claim held, allowing a corrected retry; cancellation
+or owner loss conservatively leaves in-flight claims for a later verified owner.
+Dispatcher accepted-pause continuation, normally cleaned-up held runs without an
+advance reservation, supervised startup/shutdown and actual app/reboot acceptance
+still require integration. No automatic production recovery is claimed.
 
 Pilot run events now carry optional deterministic `event_id` UUIDs scoped to
 run, phase and event kind. They are not effect command IDs: the original command

@@ -153,6 +153,8 @@ class ContainerPilotWorkflow:
                     run_id TEXT PRIMARY KEY, binding TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS hub_container_pilot_advances (
                     run_id TEXT PRIMARY KEY, owner TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_container_pilot_advance_epochs (
+                    run_id TEXT PRIMARY KEY, advance_owner TEXT NOT NULL, epoch TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS hub_container_pilot_manifest_views (
                     manifest_digest TEXT PRIMARY KEY, binding TEXT NOT NULL);
             ''')
@@ -190,6 +192,7 @@ class ContainerPilotWorkflow:
                                     client_request_id=client_request_id)
 
     def _target(self, run, *, pin=True):
+        self._assert_pilot_owner()
         target = self.targets.get(run['target'])
         if target is not None:
             self._validate_client_deadline(self.client, target.validated_manifest())
@@ -311,9 +314,13 @@ class ContainerPilotWorkflow:
         owner = str(uuid.uuid4())
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
-            if db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone():
+            if (db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone()
+                    or db.execute('SELECT 1 FROM hub_container_pilot_advance_epochs WHERE run_id=?', (run_id,)).fetchone()):
                 raise HubError('advance_requires_reconciliation', 409)
             db.execute('INSERT INTO hub_container_pilot_advances VALUES(?,?)', (run_id, owner))
+            if self.pilot_owner is not None:
+                db.execute('INSERT INTO hub_container_pilot_advance_epochs VALUES(?,?,?)',
+                           (run_id, owner, self.pilot_owner.epoch))
         try:
             run = self.repo.get_run(run_id)
             target = self._target(run)
@@ -354,7 +361,24 @@ class ContainerPilotWorkflow:
             self._assert_pilot_owner()
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
-                db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?', (run_id, owner))
+                if self.pilot_owner is None:
+                    # Legacy reservations carry no epoch authority. Do not
+                    # remove an inconsistent epoch row introduced meanwhile.
+                    db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=? '
+                               'AND NOT EXISTS (SELECT 1 FROM hub_container_pilot_advance_epochs WHERE run_id=?)',
+                               (run_id, owner, run_id))
+                else:
+                    # Delete only a still-matching pair, in this transaction.
+                    # Mismatched metadata remains evidence, never adoption.
+                    paired = db.execute('SELECT 1 FROM hub_container_pilot_advances a '
+                                        'JOIN hub_container_pilot_advance_epochs e ON e.run_id=a.run_id '
+                                        'WHERE a.run_id=? AND a.owner=? AND e.advance_owner=? AND e.epoch=?',
+                                        (run_id, owner, owner, self.pilot_owner.epoch)).fetchone()
+                    if paired:
+                        db.execute('DELETE FROM hub_container_pilot_advance_epochs '
+                                   'WHERE run_id=? AND advance_owner=? AND epoch=?',
+                                   (run_id, owner, self.pilot_owner.epoch))
+                        db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?', (run_id, owner))
 
     async def inspect(self, run_id, action):
         self._assert_pilot_owner()

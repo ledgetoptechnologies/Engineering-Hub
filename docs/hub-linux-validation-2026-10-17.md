@@ -345,3 +345,32 @@ corrected and re-reviewed with no further concrete defect reported. That review
 did not execute tests. No service entrypoint is activated, and no epoch-tagged
 reservation adoption, real host rollout, OAuth login or reboot acceptance is
 claimed. The final documentation updates postdate the frozen image build.
+
+## Owner ancestry, repository barrier and explicit crash recovery
+
+Frozen image
+`sha256:19e02061561fd0d00213d86f067733b7840f78cb40cb3c71a0a3a35d81c3ee93`
+passed **1,634 Linux tests in 64.27 seconds**, with the existing Starlette
+deprecation only. Same UID 10001, isolated network-none/read-only/private-tmpfs
+harness; no host mounts, Docker socket, ports or credentials. A separate focused
+run of the same image passed **73 tests in 2.84 seconds** for recovery, ancestry,
+epoch reservations and repository barriers.
+
+The new subprocess test SIGKILLs the actual controller after its durable original
+deploy reservation, proves a second owner cannot acquire the live process lock,
+then acquires the successor and GET-recovers the original command. Only the
+never-reserved smoke command is subsequently submitted. Host responses are
+typed simulated evidence: this is not a Docker application effect or reboot test.
+
+An earlier image's full run had 1,632 passes and two failures: the new SIGKILL
+harness omitted the newly required repository capability (corrected in both
+child and successor), and unchanged `test_push_worker` expected one publication
+but observed two. That latter test passed in the final standalone full run; its
+intermittent publication-count behavior is not diagnosed or fixed by this patch.
+Resource warnings were emitted after that failed test's teardown, not in the
+final accepted run. Intermediate images are not substituted for final evidence.
+
+Default service startup is not activated. Accepted-pause dispatcher continuation,
+cleaned-up held runs lacking a stale advance, actual host adapter acceptance,
+real OAuth and reboot/durable-volume acceptance are still required. Documentation
+updates following the final frozen build do not change runtime/test sources.
