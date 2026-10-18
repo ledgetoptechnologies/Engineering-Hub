@@ -84,17 +84,16 @@ selected explicitly, never inferred from a proxy header or a present email.
 This is source/configuration support, **not a created Access application, DNS
 record, tunnel route, changed Ops policy, or live authentication acceptance**.
 
-The agreed browser addresses are:
-
-- Canonical: `https://eh.ledgetopdroneservices.com`
-- Navigation alias: `https://eh.ledgetoptechnologies.com`
+Beau's latest choice is a single browser origin:
+`https://eh.ledgetoptechnologies.com`. This supersedes the earlier two-hostname
+plan. Do not configure the drone-services EH hostname or an alias redirect.
 
 Supply the following through the protected Hub deployment environment:
 
 ```dotenv
 HUB_HUMAN_AUTH_MODE=cloudflare_access
-HUB_BASE_URL=https://eh.ledgetopdroneservices.com
-HUB_ALTERNATE_ORIGINS=https://eh.ledgetoptechnologies.com
+HUB_BASE_URL=https://eh.ledgetoptechnologies.com
+HUB_ALTERNATE_ORIGINS=
 HUB_CF_ACCESS_ISSUER=https://ledgetoptechnologies.cloudflareaccess.com
 HUB_CF_ACCESS_AUDIENCE=<exact-EH-application-AUD-not-Ops-AUD>
 HUB_CF_ACCESS_ALLOWED_EMAILS=bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com
@@ -110,12 +109,11 @@ Configure a **separate EH Access application** using the existing approved sign-
 provider and only the two exact email selectors above, not a domain-wide rule.
 Keep existing Ops policies unchanged; reusing a broad mutable Ops policy would
 couple its future membership changes to this administrative dashboard. Protect
-both hostnames, with a valid certificate and reachable origin route for each.
-For the alias, prefer an edge navigation redirect to the canonical origin. Hub
-also supports this exact configured alias as defense in depth: GET/HEAD browser
-navigation redirects to the canonical root without forwarding query strings;
-API/MCP/other writes on the alias fail with 421 rather than forwarding credentials.
-Agents must use the canonical machine route, not the browser alias.
+the single EH hostname, with a valid certificate and reachable origin route.
+Leave alternate origins empty; no second hostname, DNS record, tunnel route or
+redirect is required for this deployment. The generic code's optional alias
+support does not activate an alias by itself. Configure machine access separately
+from the human-only browser Access policy.
 
 The loopback port binding remains unchanged. A `cloudflared` container cannot
 reach `127.0.0.1:8770` in the host namespace through its own loopback. Review the
@@ -167,7 +165,7 @@ alone does not satisfy Cloudflare Access. No machine route is enabled here.
 
 Before activation, verify allowed/denied identities at the real Access edge and
 EH, reject wrong-application/expired/forged assertions and direct-origin bypass,
-exercise both hostnames, prove CSRF/logout/expiry, check all three agent routes,
+exercise the chosen hostname, prove CSRF/logout/expiry, check all three agent routes,
 and confirm existing Ops and message-bus clients still work. Source tests using
 synthetic signing keys are not evidence of these live account/network checks.
 Rollback selects the previous reviewed Hub image/configuration and removes only
