@@ -61,3 +61,26 @@ def test_empty_tmpfs_mode_does_not_bypass_host_security_options(tmp_path, monkey
     monkeypatch.setattr(fixtures, 'container_inspect', unsafe_options)
     with pytest.raises(DaemonBackendError, match='tmpfs options differ'):
         fixtures.test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path)
+
+
+@pytest.mark.parametrize('change', ['missing-nosuid', 'extra-exec', 'duplicate-noexec'])
+def test_malformed_nonempty_tmpfs_mode_is_rejected(tmp_path, monkeypatch, change):
+    original = fixtures.container_inspect
+
+    def malformed_mode(*args, **kwargs):
+        result = original(*args, **kwargs)
+        mode = result['HostConfig']['Tmpfs']['/tmp']
+        if change == 'missing-nosuid':
+            mode = ','.join(token for token in mode.split(',') if token != 'nosuid')
+        elif change == 'extra-exec':
+            mode += ',exec'
+        else:
+            mode += ',noexec'
+        for mount in result['Mounts']:
+            if mount['Type'] == 'tmpfs':
+                mount['Mode'] = mode
+        return result
+
+    monkeypatch.setattr(fixtures, 'container_inspect', malformed_mode)
+    with pytest.raises(DaemonBackendError, match='scratch mount differs'):
+        fixtures.test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path)
