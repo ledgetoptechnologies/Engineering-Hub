@@ -777,3 +777,54 @@ subscriptions disabled; independent initialize advertises `resources.subscribe`
 false while ordinary authenticated receive works. No polling fallback, bus
 restart or server configuration change was made. A linked read-only diagnostic
 request and evidence were sent to Hermes; acceptance is pending, not assumed.
+
+## October 18: one-owner split listener and packaged-image verification
+
+Source commit `6531c74214253c4c853e209eacff16ee6addf51e` adds a single shared
+core/lifespan with agent and browser ASGI adapters. Both sockets bind before core
+construction; browser bind is hard-coded IPv4 loopback. Listener configuration
+executes inside the owner lifespan, with explicit single-worker settings.
+Startup errors unwind ownership; listener loss drains its peer, and repeated
+caller cancellation cannot release the core before listeners drain. Private
+in-process JWT verification proof avoids double verification without trusting
+public headers or arbitrary request state. No existing bus source changed.
+
+Independent read-only review accepted lifecycle, JWT proof, Compose, smoke and
+publication gate changes; independently executed server/proof/smoke tests:
+**36 passed**. Root's final focused owner/proof/frontend/entrypoint check:
+**32 passed, 1 Windows skip** (Linux owner test). Earlier final focused set
+before the two owner regressions: **66 passed, 1 Windows skip**.
+
+Frozen Linux validation image index
+`sha256:49870470dc8e725245f6dfb0461aab18b3c0c4bb9781e69bd62be5e2d9b1c863`
+contains the final runtime/tests and passed **2,131 tests in 81.08 seconds**,
+exit 0. Same isolated profile/tmpfs as the previous entry. It includes the Linux
+actual PilotOwner frontend test. Warnings: existing Starlette deprecation and an
+unclosed-event-loop ResourceWarning attributed during an executor-client test.
+The latter is not declared fixed: rerunning frontend/server/proof/executor-client
+tests with ResourceWarning promoted to error passed **114 tests in 2.62 seconds**;
+its full-suite origin remains unconfirmed. Workflow and documentation changes
+followed this validation-image snapshot; runtime/tests were unchanged.
+
+Locally built packaged control image, baked source `6531c742...`, index
+`sha256:de9783f80f07a56917e8a5048c2e5e37c201050cc1ca5f4e937016cba626831b`,
+passed the new split smoke using its normal entrypoint plus `--split-ingress`.
+Actual kernel TCP tables show only `127.0.0.1:8771` for browser and `0.0.0.0:8770`
+for agents, no IPv6 Hub listener. Both health endpoints report the exact source;
+all three synthetic agent tokens initialize MCP and list exactly nine tools.
+Missing/invalid tokens fail; agent UI/auth/static routes and browser bearer/MCP
+routes fail; missing/forged Access JWTs fail. The container runs UID/GID568,
+network none, read-only root, no capabilities, no-new-privileges, private cgroup,
+1 CPU/512MiB/128PIDs, private tmpfs and one owned disposable named volume only.
+Recreation preserved a fixture marker, then ownership-verified cleanup removed
+the disposable containers and volume. This proves marker persistence, not task
+durability, an autonomous pilot or host recovery. No registry upload was done.
+
+The Hub-only publication workflow now runs split smoke for PR builds, the exact
+publication candidate before upload, and the authenticated registry digest before
+latest promotion. Existing combined smoke remains. This does not authorize or
+prove live rollout. Beau confirmed same-NAS host-network cloudflared and reserved
+all NAS administration for himself; no agent NAS inspection/change is allowed
+under the current scope. Operator instructions remain gated on a published image.
+Actual Cloudflare login, NAS/LAN isolation, app/reboot acceptance, trusted host
+providers and an owned autonomous pilot remain required. Overall goal incomplete.
