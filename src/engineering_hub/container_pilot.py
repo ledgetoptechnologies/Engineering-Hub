@@ -8,11 +8,14 @@ Fixture actions, manifests and ledgers are deliberately not reused here.
 from dataclasses import asdict, dataclass, field
 import json
 import re
+import sqlite3
 import uuid
+from pathlib import Path
 
 from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse
 from .container_pilot_manifest import PilotManifest
 from .repository import HubError
+from .pilot_ownership import PilotOwner
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,30 @@ class ContainerPilotWorkflow:
         # manifest digest, not a hash of this narrower controller view.
         return target.manifest_digest
 
-    def __init__(self, repo, client, targets):
+    def _assert_pilot_owner(self):
+        """Check live authority, including late enrollment of legacy instances.
+
+        A saved epoch, Boolean or duck-typed object is never a capability. This
+        guard does not adopt stale workflow rows or authorize host effects.
+        """
+        try:
+            if self.pilot_owner is not None:
+                if type(self.pilot_owner) is not PilotOwner:
+                    raise ValueError()
+                self.pilot_owner.assert_active(self.repo.path)
+                return
+            # Read-only mode cannot recreate a deleted/replaced database.
+            db = sqlite3.connect(Path(self.repo.path).absolute().as_uri() + '?mode=ro', uri=True)
+            try:
+                enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE name='hub_pilot_owner'").fetchone()
+            finally:
+                db.close()
+            if enrolled:
+                raise ValueError()
+        except Exception:
+            raise HubError('container_pilot_ownership_unavailable', 409) from None
+
+    def __init__(self, repo, client, targets, *, pilot_owner=None):
         if repo.execution_principal is None:
             raise ValueError('execution_identity_required')
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
@@ -112,10 +138,13 @@ class ContainerPilotWorkflow:
         for target in targets:
             self._validate_client_deadline(client, target.validated_manifest())
         self.repo, self.client = repo, client
+        self.pilot_owner = pilot_owner
+        self._assert_pilot_owner()
         self.targets = {target.target_id: target for target in targets}
         if len(self.targets) != len(targets) or any(not isinstance(t, ContainerPilotTarget) for t in targets):
             raise ValueError('invalid_pilot_targets')
         with repo._connection() as db:
+            self._assert_pilot_owner()
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS hub_container_pilot_commands (
                     run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL,
@@ -131,12 +160,14 @@ class ContainerPilotWorkflow:
             if 'response_json' not in columns:
                 # Preserve legacy unknown/held reservations; never reconstruct
                 # missing evidence or resend because this column was absent.
+                self._assert_pilot_owner()
                 db.execute('ALTER TABLE hub_container_pilot_commands ADD COLUMN response_json TEXT')
         # Pin the operator's manifest interpretation before run creation, not
         # only before the first effect. A restart must not reinterpret the same
         # manifest digest as a different rollback image or source provenance.
         with repo._transaction() as db:
             for target in targets:
+                self._assert_pilot_owner()
                 binding = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
                 db.execute('INSERT OR IGNORE INTO hub_container_pilot_manifest_views VALUES(?,?)', (target.manifest_digest, binding))
                 prior = db.execute('SELECT binding FROM hub_container_pilot_manifest_views WHERE manifest_digest=?', (target.manifest_digest,)).fetchone()[0]
@@ -144,6 +175,7 @@ class ContainerPilotWorkflow:
                     raise HubError('container_pilot_manifest_changed', 409)
 
     def create_run(self, actor, task_id, expected_revision, artifact_digest, target_id, *, client_request_id=None):
+        self._assert_pilot_owner()
         task = self.repo.get_task(task_id)
         target = self.targets.get(target_id)
         if target is not None:
@@ -152,11 +184,12 @@ class ContainerPilotWorkflow:
                 or artifact_digest != target.artifact_digest
                 or task['candidate_commit'] != target.candidate_commit):
             raise HubError('container_pilot_manifest_mismatch', 403)
+        self._assert_pilot_owner()
         return self.repo.create_run(actor, task_id, expected_revision, artifact_digest, target_id,
                                     execution_manifest_digest=target.manifest_digest,
                                     client_request_id=client_request_id)
 
-    def _target(self, run):
+    def _target(self, run, *, pin=True):
         target = self.targets.get(run['target'])
         if target is not None:
             self._validate_client_deadline(self.client, target.validated_manifest())
@@ -167,7 +200,14 @@ class ContainerPilotWorkflow:
                 or run.get('execution_manifest_digest') != target.manifest_digest):
             raise HubError('container_pilot_manifest_mismatch', 403)
         canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+        if not pin:
+            with self.repo._connection() as db:
+                prior = db.execute('SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?', (run['id'],)).fetchone()
+            if prior is not None and prior[0] != canonical:
+                raise HubError('container_pilot_manifest_changed', 409)
+            return target
         with self.repo._transaction() as db:
+            self._assert_pilot_owner()
             db.execute('INSERT OR IGNORE INTO hub_container_pilot_bindings VALUES(?,?)', (run['id'], canonical))
             prior = db.execute('SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?', (run['id'],)).fetchone()[0]
             if prior != canonical:
@@ -175,6 +215,7 @@ class ContainerPilotWorkflow:
         return target
 
     def _event(self, run, event, *, phase, reason=None):
+        self._assert_pilot_owner()
         if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback'}:
             raise ValueError('invalid_pilot_phase')
         event_id = str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:event:' + phase + ':' + event))
@@ -225,14 +266,20 @@ class ContainerPilotWorkflow:
             return 'held'
         return 'succeeded'
 
-    async def _command(self, run, target, action):
-        command = ContainerPilotRequest(
+    @staticmethod
+    def _request(run, target, action):
+        return ContainerPilotRequest(
             schema_version='container_pilot_v1', command_id=str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:' + action)),
             run_id=run['id'], target_id=run['target'], action=action,
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
+
+    async def _command(self, run, target, action):
+        self._assert_pilot_owner()
+        command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
         with self.repo._transaction() as db:
+            self._assert_pilot_owner()
             row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
             if row:
                 if row['payload'] != canonical:
@@ -241,6 +288,7 @@ class ContainerPilotWorkflow:
             db.execute('INSERT INTO hub_container_pilot_commands(run_id,action,payload,state) VALUES(?,?,?,?)',
                        (run['id'], action, canonical, 'unknown'))
         response_json = None
+        self._assert_pilot_owner()
         try:
             response = await self.client.submit_command(command)
             response = self._validated_response(response)
@@ -251,14 +299,18 @@ class ContainerPilotWorkflow:
                 response_json = response.model_dump_json()
         except Exception:
             state = 'held'  # No endpoint, credential or exception output retained.
+        self._assert_pilot_owner()
         with self.repo._transaction() as db:
+            self._assert_pilot_owner()
             db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                        (state, response_json, run['id'], action))
         return state
 
     async def advance(self, run_id):
+        self._assert_pilot_owner()
         owner = str(uuid.uuid4())
         with self.repo._transaction() as db:
+            self._assert_pilot_owner()
             if db.execute('SELECT 1 FROM hub_container_pilot_advances WHERE run_id=?', (run_id,)).fetchone():
                 raise HubError('advance_requires_reconciliation', 409)
             db.execute('INSERT INTO hub_container_pilot_advances VALUES(?,?)', (run_id, owner))
@@ -297,15 +349,33 @@ class ContainerPilotWorkflow:
                 return self._event(run, 'rolled_back', phase='smoke_container_rollback')
             return run
         finally:
+            # Lost ownership preserves the reservation for evidence-only
+            # recovery. Never clear it using a stale process capability.
+            self._assert_pilot_owner()
             with self.repo._transaction() as db:
+                self._assert_pilot_owner()
                 db.execute('DELETE FROM hub_container_pilot_advances WHERE run_id=? AND owner=?', (run_id, owner))
 
     async def inspect(self, run_id, action):
+        self._assert_pilot_owner()
         run = self.repo.get_run(run_id)
-        self._target(run)
+        target = self._target(run, pin=False)
         with self.repo._connection() as db:
             row = db.execute('SELECT payload FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run_id, action)).fetchone()
         if row is None:
             raise HubError('command_not_found', 404)
+        command = self._request(run, target, action)
+        canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if row['payload'] != canonical:
+            raise HubError('container_pilot_manifest_changed', 409)
         # No automatic reconcile, effect replay, release or takeover.
-        return await self.client.get_command(ContainerPilotRequest(**json.loads(row['payload'])))
+        self._assert_pilot_owner()
+        response = await self.client.get_command(command)
+        self._assert_pilot_owner()
+        try:
+            response = self._validated_response(response)
+            if any(getattr(response, key) != value for key, value in command.model_dump().items()):
+                raise ValueError()
+            return response
+        except Exception:
+            raise HubError('container_pilot_inspection_unverified', 409) from None

@@ -326,3 +326,22 @@ the test detects the reviewed POSIX-lock hazard rather than merely exercising
 the success path. Validation does not prove controller ownership integration,
 durable production storage, real application deployment or reboot recovery.
 Documentation-only updates following the image build are not part of its layers.
+
+## Explicit ownership integration and read-only inspection
+
+Frozen combined image
+`sha256:7dd769354665d5b92378448d8463b9eb3b021ac34d0d716c22853ca24748bc3d`
+passed **1,561 Linux tests in 61.43 seconds**, with only the existing Starlette
+deprecation. Same isolated UID 10001/read-only/no-network/no-host-mount harness
+as above. It includes explicit capability guards in the pilot and dispatcher,
+legacy fixture enrollment refusal, test-only ephemeral storage, and inspection
+identity/response validation without ledger mutations. Earlier focused image
+`sha256:80c1b48a20dd27a3de53600c6c399b2e1cc432fdcf061ce873bbb6b663604540`
+passed 58 ownership/capability/dispatcher tests before the later fixture and
+inspection corrections; final combined full-suite evidence supersedes it.
+
+Independent subagent source review found the direct fixture bypass, which was
+corrected and re-reviewed with no further concrete defect reported. That review
+did not execute tests. No service entrypoint is activated, and no epoch-tagged
+reservation adoption, real host rollout, OAuth login or reboot acceptance is
+claimed. The final documentation updates postdate the frozen image build.

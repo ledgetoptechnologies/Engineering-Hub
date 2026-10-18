@@ -247,3 +247,18 @@ integration or production durability. The storage and restore items remain open
 integration gates. Repeated same-phase recovery events also
 still require occurrence identities. No production activation is authorized by
 this review or by acknowledging its message.
+
+The next source slice explicitly gates tmpfs/overlay behind a constructor-only
+test opt-in and documents restored-inode refusal. Container pilot workflows and
+their dispatcher now revalidate exact live owner capabilities at execution/write
+boundaries and after awaits. Review found that rejecting legacy fixture dispatch
+alone left direct/API fixture execution available: FixtureWorkflow now denies
+any enrollment marker at its own boundaries too. Generic task/decision records
+remain outside this execution guard; it is not a universal database write lock.
+An enrolled dispatcher cannot use caller-Boolean reconciliation. Epoch-tagged
+adoption, supervised startup/shutdown, recovery occurrence IDs and actual durable
+host acceptance remain required before activation.
+
+Pilot inspection now validates the original canonical command before GET and
+strictly revalidates bounded typed response/echo afterward. It does not insert a
+run binding, update a receipt, change run state, adopt ownership or resend effects.

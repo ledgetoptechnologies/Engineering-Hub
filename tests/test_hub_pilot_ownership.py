@@ -14,7 +14,13 @@ import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Linux kernel ownership prerequisite')
 
-from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError
+from engineering_hub.pilot_ownership import PilotOwner as ProductionPilotOwner, PilotOwnershipError
+
+
+def PilotOwner(*args, **kwargs):
+    # Explicitly disposable Linux validation storage, never deployment default.
+    kwargs.setdefault('allow_ephemeral_test_storage', True)
+    return ProductionPilotOwner(*args, **kwargs)
 
 
 @pytest.fixture
@@ -28,7 +34,7 @@ def worker(database, script=None):
     source = script or '''
 import sys
 from engineering_hub.pilot_ownership import PilotOwner
-with PilotOwner(sys.argv[1]) as owner:
+with PilotOwner(sys.argv[1], allow_ephemeral_test_storage=True) as owner:
     print(owner.epoch, flush=True)
     sys.stdin.read()
 '''
@@ -92,7 +98,7 @@ def test_sigkill_releases_even_with_raw_fork_child(database):
     child = worker(database, '''
 import os, signal, sys
 from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError
-with PilotOwner(sys.argv[1]) as owner:
+with PilotOwner(sys.argv[1], allow_ephemeral_test_storage=True) as owner:
     pid = os.fork()
     if pid == 0:
         try:
@@ -191,7 +197,7 @@ def test_copied_enrollment_not_adopted(database):
 
 def test_unknown_filesystem_refused(database, monkeypatch):
     import engineering_hub.pilot_ownership as module
-    def deny(fd):
+    def deny(fd, **kwargs):
         raise PilotOwnershipError()
     monkeypatch.setattr(module, '_local_filesystem', deny)
     with pytest.raises(PilotOwnershipError):
@@ -200,7 +206,7 @@ def test_unknown_filesystem_refused(database, monkeypatch):
 
 
 @pytest.mark.parametrize('magic,accepted', [(0xEF53, True), (0x58465342, True), (0x9123683E, True),
-                                           (0x2FC12FC1, True), (0x01021994, True), (0x794C7630, True),
+                                           (0x2FC12FC1, True), (0x01021994, False), (0x794C7630, False),
                                            (0x6969, False), (0xFF534D42, False), (0x65735546, False), (123, False)])
 def test_filesystem_allowlist(magic, accepted, monkeypatch):
     import engineering_hub.pilot_ownership as module
@@ -213,6 +219,30 @@ def test_filesystem_allowlist(magic, accepted, monkeypatch):
     else:
         with pytest.raises(PilotOwnershipError):
             module._local_filesystem(1)
+
+
+@pytest.mark.parametrize('magic', [0x01021994, 0x794C7630, 0x6969, 0xFF534D42])
+def test_ephemeral_storage_requires_explicit_test_opt_in(database, magic, monkeypatch):
+    import engineering_hub.pilot_ownership as module
+    def result(fd, buffer):
+        module.ctypes.cast(buffer, module.ctypes.POINTER(module.ctypes.c_long))[0] = magic
+        return 0
+    monkeypatch.setattr(module.ctypes, 'CDLL', lambda *a, **kw: SimpleNamespace(fstatfs=result))
+    with pytest.raises(PilotOwnershipError):
+        ProductionPilotOwner(database)
+    assert not database.exists()
+    if magic in {0x01021994, 0x794C7630}:
+        module._local_filesystem(1, allow_ephemeral_test_storage=True)
+    else:
+        with pytest.raises(PilotOwnershipError):
+            module._local_filesystem(1, allow_ephemeral_test_storage=True)
+
+
+@pytest.mark.parametrize('value', [1, 'true', None])
+def test_ephemeral_flag_not_coerced(database, value):
+    with pytest.raises(PilotOwnershipError):
+        ProductionPilotOwner(database, allow_ephemeral_test_storage=value)
+    assert not database.exists()
 
 
 def test_foreign_owner_and_no_permission_repair(database, monkeypatch):

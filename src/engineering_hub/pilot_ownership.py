@@ -43,7 +43,7 @@ if hasattr(os, 'register_at_fork'):
     os.register_at_fork(after_in_child=_after_fork)
 
 
-def _local_filesystem(fd):
+def _local_filesystem(fd, *, allow_ephemeral_test_storage=False):
     # Linux statfs is platform ABI-specific. Restrict to the reviewed 64-bit
     # Linux ABI; an oversized aligned buffer avoids depending on trailing fields.
     if sys.platform != 'linux' or ctypes.sizeof(ctypes.c_void_p) != 8 or ctypes.sizeof(ctypes.c_long) != 8:
@@ -52,7 +52,10 @@ def _local_filesystem(fd):
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.fstatfs(ctypes.c_int(fd), ctypes.byref(fields)) != 0:
         raise PilotOwnershipError()
-    if fields[0] not in {0xEF53, 0x58465342, 0x9123683E, 0x2FC12FC1, 0x01021994, 0x794C7630}:
+    allowed = {0xEF53, 0x58465342, 0x9123683E, 0x2FC12FC1}
+    if allow_ephemeral_test_storage is True:
+        allowed |= {0x01021994, 0x794C7630}
+    if fields[0] not in allowed:
         raise PilotOwnershipError()
 
 
@@ -68,12 +71,14 @@ class PilotOwner:
     Failure preserves any newly created database for explicit inspection.
     """
 
-    def __init__(self, database_path):
+    def __init__(self, database_path, *, allow_ephemeral_test_storage=False):
         self._parent_fd = self._lock_fd = None
         self._closed = True
         self._pid = os.getpid()
         _OWNERS.add(self)
         try:
+            if type(allow_ephemeral_test_storage) is not bool:
+                raise PilotOwnershipError()
             import fcntl
             self._fcntl = fcntl
             path = Path(os.path.abspath(os.fspath(database_path)))
@@ -85,12 +90,12 @@ class PilotOwner:
             if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
                 raise PilotOwnershipError()
             self._parent_identity = (parent.st_dev, parent.st_ino)
-            _local_filesystem(self._parent_fd)
+            _local_filesystem(self._parent_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
             self._lock_name = path.name + '.pilot-owner.lock'
             self._lock_fd = os.open(self._lock_name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
                                     0o600, dir_fd=self._parent_fd)
             self._lock_identity = self._check_file(self._lock_fd, self._lock_name)
-            _local_filesystem(self._lock_fd)
+            _local_filesystem(self._lock_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Recheck after acquiring ownership, before any database write.
             self._check_file(self._lock_fd, self._lock_name, self._lock_identity)
@@ -100,7 +105,7 @@ class PilotOwner:
                                      0o600, dir_fd=self._parent_fd)
                 try:
                     self._database_identity = self._check_file(created_fd, path.name)
-                    _local_filesystem(created_fd)
+                    _local_filesystem(created_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
                 finally:
                     # Close a newly created file before SQLite can acquire any
                     # locks. Never raw-open an existing database: closing even

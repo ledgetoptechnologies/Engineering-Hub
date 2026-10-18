@@ -19,6 +19,7 @@ class StagingDispatcher:
         if workflow.repo is not repo or repo.execution_principal is None:
             raise ValueError('dispatcher_repository_identity_required')
         self.repo, self.workflow = repo, workflow
+        self._assert_writer()
         with repo._connection() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS hub_dispatch_cursor (
@@ -30,6 +31,18 @@ class StagingDispatcher:
                     state TEXT NOT NULL, run_id TEXT, reason TEXT,
                     request TEXT NOT NULL, attempt_head INTEGER NOT NULL DEFAULT 0);
             ''')
+
+    def _assert_writer(self):
+        from .container_pilot import ContainerPilotWorkflow
+        if type(self.workflow) is ContainerPilotWorkflow:
+            self.workflow._assert_pilot_owner()
+            return
+        # Legacy fixture dispatch must not silently become a second writer to
+        # an owner-enrolled pilot ledger.
+        with self.repo._connection() as db:
+            enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_pilot_owner'").fetchone()
+        if enrolled:
+            raise HubError('pilot_ownership_required', 409)
 
     @property
     def cursor(self):
@@ -62,6 +75,7 @@ class StagingDispatcher:
 
     def _reserve_next(self):
         """Select/validate/reserve and advance one durable event atomically."""
+        self._assert_writer()
         with self.repo._transaction() as db:
             cursor = db.execute('SELECT sequence FROM hub_dispatch_cursor WHERE id=1').fetchone()[0]
             row = db.execute('SELECT * FROM hub_outbox WHERE sequence>? ORDER BY sequence LIMIT 1', (cursor,)).fetchone()
@@ -93,6 +107,7 @@ class StagingDispatcher:
 
     def _reserve_deferred(self, sequence):
         """Reclaim only proven local nonacceptance, never uncertain effects."""
+        self._assert_writer()
         with self.repo._transaction() as db:
             row = db.execute("SELECT * FROM hub_dispatch_receipts WHERE sequence=? AND state='deferred'",
                              (sequence,)).fetchone()
@@ -120,6 +135,7 @@ class StagingDispatcher:
             return dict(sequence=sequence, owner=owner) if changed == 1 else None
 
     def _record(self, reservation, state, *, run_id=None, reason=None):
+        self._assert_writer()
         with self.repo._transaction() as db:
             db.execute('UPDATE hub_dispatch_receipts SET state=?,run_id=COALESCE(?,run_id),reason=? '
                        'WHERE sequence=? AND owner=?',
@@ -184,6 +200,7 @@ class StagingDispatcher:
             else:
                 # Exact receipt validation must not depend on today's task
                 # candidate: the completed task may already have a new one.
+                self._assert_writer()
                 run = self.repo.create_run(request['actor'], request['task_id'], request['expected_revision'],
                                            request['artifact_digest'], request['target_id'],
                                            execution_manifest_digest=self.workflow._manifest_digest(target),
@@ -220,6 +237,13 @@ class StagingDispatcher:
         local crashes, but unknown executor effects remain held by the workflow.
         A caller must establish quiescence outside this module before invoking.
         """
+        self._assert_writer()
+        with self.repo._connection() as db:
+            enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_pilot_owner'").fetchone()
+        if enrolled:
+            # A caller Boolean cannot adopt an enrolled owner's reservations.
+            # Epoch-tagged, evidence-only adoption is a separate prerequisite.
+            raise HubError('dispatch_owner_recovery_unavailable', 409)
         if type(sequence) is not int or sequence < 1 or confirmed_quiescent is not True:
             raise HubError('dispatch_quiescence_required', 409)
         owner = str(uuid.uuid4())

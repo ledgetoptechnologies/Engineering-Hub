@@ -42,8 +42,15 @@ These tests use synthetic transport, not actual host execution.
 
 ## Ownership and boundaries
 
-The opt-in `pilot_ownership.py` primitive is a prerequisite only, not integrated
-with service startup, dispatch or recovery. It accepts a new database in an
+The opt-in `pilot_ownership.py` primitive is not integrated with service startup
+or recovery. Explicitly constructed container pilot workflows can receive its
+live capability; enrolled ledgers refuse workflow/dispatcher mutations without
+one. Guards cover command reservation, dispatch, result persistence and cleanup,
+including revalidation after awaited I/O. Losing ownership preserves uncertain
+reservations, not automatic retry. Boolean-based dispatcher reconciliation is
+unavailable on enrolled ledgers until epoch/evidence-based adoption is implemented.
+This is source integration, not an activated service or generic repository-wide
+write lock. It accepts a new database in an
 existing private local directory, or the exact enrolled database/lock inodes.
 Un-enrolled existing state is refused; no permission changes, legacy adoption,
 watcher or daemon activation occur. It holds a nonblocking Linux `flock`, binds
@@ -59,9 +66,10 @@ SQLite's process-wide POSIX locks; only SQLite manages existing database opens.
 Acquire ownership before constructing database writers. Fresh creation closes
 its temporary FD before any SQLite connection starts.
 
-The current filesystem allowlist also admits tmpfs/overlay for isolated tests;
-this is not production storage acceptance. Before activation, ephemeral storage
-must be explicitly test-only and the ledger must have verified durable local
+The default filesystem allowlist rejects tmpfs/overlay; isolated tests explicitly
+opt in with `allow_ephemeral_test_storage=True`. That constructor option is not
+exposed through an environment setting or production entrypoint. This is not
+production storage acceptance: the ledger must still have verified durable local
 storage across restart and container recreation. Copying/restoring a database
 changes its pinned identity and intentionally refuses startup. Restores require
 a separately reviewed re-enrollment procedure; deleting the lock or editing the
