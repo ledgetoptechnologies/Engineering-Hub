@@ -28,3 +28,15 @@ def test_legacy_event_without_reason_remains_valid_and_unset():
     legacy = event()
     del legacy['reason']
     assert 'reason' not in RunEventDTO.model_validate(legacy).model_dump(exclude_unset=True)
+
+
+@pytest.mark.parametrize('identity', ['not-a-uuid', 'ABCDEFAB-1234-1234-1234-123456789ABC', 1])
+def test_event_occurrence_identity_is_canonical(identity):
+    with pytest.raises(ValidationError):
+        RunEventDTO.model_validate(event(event_id=identity))
+
+
+def test_event_occurrence_round_trip_preserves_original_command_identity():
+    identity = '00000000-0000-4000-8000-000000000001'
+    result = RunEventDTO.model_validate(event(event_id=identity))
+    assert result.event_id == identity and result.command_id == 'fixture-phase'

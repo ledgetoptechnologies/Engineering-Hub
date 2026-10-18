@@ -277,3 +277,35 @@ It remains application packaging smoke, not controller-driven rollout/rollback,
 coherent durable state, dead-owner recovery, OAuth, TrueNAS or reboot acceptance.
 Claude's independent source review was requested as727d5228-a4d8-495c-928c-513a5443b6a6;
 no review result is inferred from these local passes.
+
+## Recovery ownership and phase-event prerequisites
+
+The frozen source overlay based on `7e266d9` passed **1,528 Linux tests in61.01
+seconds**, with only the existing Starlette deprecation and no resource warnings.
+Validation OCI index:
+`sha256:d574c0a593df8b5409a56885fe2ae6444316aa3985c1c808b20e8a48a12c4e67`.
+It used the same network-none/read-only/no-host-mount/private-tmpfs profile and
+auto-removed. The run includes35 actual Linux ownership cases: process exclusion,
+SIGSTOP refusal, SIGKILL with a surviving fork child, lock replacement, foreign
+or copied state, epoch changes, garbage collection and descriptor cleanup.
+
+Review found two primitive defects before this accepted snapshot: enrollment
+initially pinned only the database inode, not the lock inode; and dropped Python
+owner objects leaked raw descriptors. Both have regressions. An earlier full
+run passed with test subprocess pipe warnings; a cleanup change then failed on
+entering an already-closed stream. Registering idempotent close callbacks fixed
+the test helper; the final full result above is the clean rerun, not a suppressed
+warning. Production ownership code did not change for that test-only correction.
+
+The overlay also includes phase-specific event UUID receipts, legacy dedupe
+preservation, and strict revalidation of injected typed responses before storage.
+Windows focused integration passed273 tests with the Linux cases explicitly
+skipped. UI18 unit/build, current OpenAPI/actual TypeScript fixture checks, and
+wheel/source builds pass. No visual behavior changed in this slice.
+
+These are prerequisites only. `PilotOwner` is not wired into service startup or
+any workflow/dispatcher writer. There is no new recovery endpoint, held-run
+continuation, stale-owner adoption, automatic accepted-pause recovery, default
+worker, credential or permissions change. Remote effects remain the separate
+host adapter's responsibility. No actual controller-driven deployment/rollback,
+private OAuth, native enrollment, TrueNAS migration or PC reboot is proved here.

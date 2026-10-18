@@ -174,15 +174,34 @@ class ContainerPilotWorkflow:
                 raise HubError('container_pilot_manifest_changed', 409)
         return target
 
-    def _event(self, run, event, *, reason=None):
+    def _event(self, run, event, *, phase, reason=None):
+        if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback'}:
+            raise ValueError('invalid_pilot_phase')
+        event_id = str(uuid.uuid5(uuid.UUID(run['id']), 'container_pilot_v1:event:' + phase + ':' + event))
         return self.repo.append_run_event(self.repo.execution_principal, run['id'], event,
-                                         run['id'], run['fencing_generation'], run['revision'], reason=reason)
+                                         run['id'], run['fencing_generation'], run['revision'],
+                                         reason=reason, event_id=event_id)
 
-    def _hold(self, run, reason):
+    def _hold(self, run, reason, *, phase):
         # A failed candidate is not a terminal recovery result. Failed or
         # uncertain rollback must visibly hold the same target reservation,
         # rather than leaving an ordinary candidate-failure label behind.
-        return self._event(run, 'held', reason=reason) if run['status'] in {'pending', 'running', 'failed'} else run
+        return self._event(run, 'held', phase=phase, reason=reason) if run['status'] in {'pending', 'running', 'failed'} else run
+
+    @staticmethod
+    def _validated_response(response):
+        # Frozen Pydantic objects can still be created via model_construct or
+        # copied with unvalidated updates. Revalidate at this injection boundary
+        # before examining booleans/echo fields or storing any asserted receipt.
+        if type(response) is not ContainerPilotResponse:
+            raise ValueError('invalid_pilot_response')
+        # The integer JSON serializer can normalize True to 1 even under
+        # warnings='error', so strict-check the original Python values first.
+        verified = ContainerPilotResponse.model_validate(response.model_dump(warnings='error'), strict=True)
+        payload = verified.model_dump_json(warnings='error')
+        if len(payload.encode('utf-8')) > ContainerPilotClient.RESPONSE_BYTE_LIMIT:
+            raise ValueError('invalid_pilot_response')
+        return ContainerPilotResponse.model_validate_json(payload, strict=True)
 
     @staticmethod
     def _verified_state(response, command, target):
@@ -224,6 +243,7 @@ class ContainerPilotWorkflow:
         response_json = None
         try:
             response = await self.client.submit_command(command)
+            response = self._validated_response(response)
             state = self._verified_state(response, command, target)
             if type(response) is ContainerPilotResponse:
                 # Typed, bounded adapter assertion, not independent Docker proof.
@@ -250,7 +270,7 @@ class ContainerPilotWorkflow:
             if self.repo.get_paused():
                 raise HubError('paused', 423)
             if run['status'] == 'pending':
-                run = self._event(run, 'running')
+                run = self._event(run, 'running', phase='deploy_container')
             if run['status'] == 'running':
                 for action in ('deploy_container', 'smoke_container'):
                     if self.repo.get_paused():
@@ -259,12 +279,12 @@ class ContainerPilotWorkflow:
                         raise HubError('paused', 423)
                     state = await self._command(run, target, action)
                     if state == 'held':
-                        return self._hold(run, 'candidate_outcome_uncertain')
+                        return self._hold(run, 'candidate_outcome_uncertain', phase=action)
                     if state == 'failed':
-                        run = self._event(run, 'failed')
+                        run = self._event(run, 'failed', phase=action)
                         break
                 else:
-                    return self._event(run, 'succeeded')
+                    return self._event(run, 'succeeded', phase='smoke_container')
             if run['status'] == 'failed':
                 for action in ('rollback_container', 'smoke_container_rollback'):
                     if self.repo.get_paused():
@@ -273,8 +293,8 @@ class ContainerPilotWorkflow:
                     if state != 'succeeded':
                         phase = 'rollback' if action == 'rollback_container' else 'rollback_smoke'
                         reason = phase + ('_failed' if state == 'failed' else '_outcome_uncertain')
-                        return self._hold(run, reason)
-                return self._event(run, 'rolled_back')
+                        return self._hold(run, reason, phase=action)
+                return self._event(run, 'rolled_back', phase='smoke_container_rollback')
             return run
         finally:
             with self.repo._transaction() as db:

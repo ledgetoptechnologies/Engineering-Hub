@@ -55,6 +55,9 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_events (
                     run_id TEXT NOT NULL, command_id TEXT NOT NULL, event TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, PRIMARY KEY(run_id,command_id,event));
+                CREATE TABLE IF NOT EXISTS hub_run_event_receipts (
+                    run_id TEXT NOT NULL, event_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    PRIMARY KEY(run_id,event_id));
                 CREATE TABLE IF NOT EXISTS hub_target_fences (
                     target TEXT PRIMARY KEY, generation INTEGER NOT NULL CHECK(generation > 0));
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
@@ -307,7 +310,7 @@ class HubRepository:
     def list_runs(self):
         return self._list('run')
 
-    def append_run_event(self, actor, runid, event, command_id, fencing_generation, expected_revision, *, reason=None):
+    def append_run_event(self, actor, runid, event, command_id, fencing_generation, expected_revision, *, reason=None, event_id=None):
         if self.execution_principal is None or actor != self.execution_principal:
             raise HubError('forbidden', 403)
         command_id = self._text(command_id)
@@ -315,8 +318,17 @@ class HubRepository:
             raise HubError('invalid_event')
         if reason is not None and (event != 'held' or not isinstance(reason, str) or reason not in HELD_REASONS):
             raise HubError('invalid_event')
+        if event_id is not None:
+            try:
+                if not isinstance(event_id, str) or str(uuid.UUID(event_id)) != event_id:
+                    raise ValueError('noncanonical_event_id')
+            except (ValueError, TypeError, AttributeError):
+                raise HubError('invalid_event') from None
         # Preserve the exact legacy fingerprint for omitted reasons.
-        fingerprint = _json([actor, fencing_generation] if reason is None else [actor, fencing_generation, reason])
+        if event_id is None:
+            fingerprint = _json([actor, fencing_generation] if reason is None else [actor, fencing_generation, reason])
+        else:
+            fingerprint = _json([actor, command_id, event, fencing_generation, reason])
         with self._transaction() as db:
             run = self._get(db, runid, 'run')
             if run['execution_actor'] != actor:
@@ -325,7 +337,10 @@ class HubRepository:
                 raise HubError('stale_fence', 409)
             if run['command_id'] is not None and run['command_id'] != command_id:
                 raise HubError('command_conflict', 409)
-            previous = db.execute('SELECT fingerprint FROM hub_events WHERE run_id=? AND command_id=? AND event=?', (runid, command_id, event)).fetchone()
+            if event_id is None:
+                previous = db.execute('SELECT fingerprint FROM hub_events WHERE run_id=? AND command_id=? AND event=?', (runid, command_id, event)).fetchone()
+            else:
+                previous = db.execute('SELECT fingerprint FROM hub_run_event_receipts WHERE run_id=? AND event_id=?', (runid, event_id)).fetchone()
             if previous:
                 if previous['fingerprint'] != fingerprint:
                     raise HubError('event_conflict', 409)
@@ -341,8 +356,13 @@ class HubRepository:
             entry = dict(event=event, actor=actor, command_id=command_id, fencing_generation=fencing_generation)
             if reason is not None:
                 entry['reason'] = reason
+            if event_id is not None:
+                entry['event_id'] = event_id
             run['events'].append(entry)
-            db.execute('INSERT INTO hub_events VALUES(?,?,?,?)', (runid, command_id, event, fingerprint))
+            if event_id is None:
+                db.execute('INSERT INTO hub_events VALUES(?,?,?,?)', (runid, command_id, event, fingerprint))
+            else:
+                db.execute('INSERT INTO hub_run_event_receipts VALUES(?,?,?)', (runid, event_id, fingerprint))
             if event == 'failed':
                 task = self._get(db, run['task_id'], 'task')
                 task['repair_count'] = min(3, task['repair_count'] + 1)

@@ -5,8 +5,9 @@ state or silently dropping public fields. Optional fields absent in the source
 remain absent via response_model_exclude_unset on the REST routes.
 """
 from typing import Annotated, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
@@ -61,6 +62,7 @@ class RunEventDTO(ResponseDTO):
     actor: ExecutorId
     command_id: str
     fencing_generation: int = Field(ge=1)
+    event_id: str | None = None
     reason: Literal['candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                     'rollback_outcome_uncertain', 'rollback_smoke_failed',
                     'rollback_smoke_outcome_uncertain'] | None = None
@@ -70,6 +72,13 @@ class RunEventDTO(ResponseDTO):
         if self.reason is not None and self.event != 'held':
             raise ValueError('only held events carry a hold reason')
         return self
+
+    @field_validator('event_id')
+    @classmethod
+    def canonical_event_id(cls, value):
+        if value is not None and str(UUID(value)) != value:
+            raise ValueError('canonical event identity required')
+        return value
 
 
 class RunDTO(EntityDTO):

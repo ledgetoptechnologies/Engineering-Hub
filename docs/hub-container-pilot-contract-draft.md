@@ -42,6 +42,33 @@ These tests use synthetic transport, not actual host execution.
 
 ## Ownership and boundaries
 
+The opt-in `pilot_ownership.py` primitive is a prerequisite only, not integrated
+with service startup, dispatch or recovery. It accepts a new database in an
+existing private local directory, or the exact enrolled database/lock inodes.
+Un-enrolled existing state is refused; no permission changes, legacy adoption,
+watcher or daemon activation occur. It holds a nonblocking Linux `flock`, binds
+its live capability to the process/FD/path/durable epoch, and rejects replaced
+lock files even if their new inode can be locked. Forked copies close inherited
+descriptors without unlocking the parent's open file description. SIGSTOP does
+not release ownership. Garbage collection and failed construction close only
+owned descriptors; the lock file itself is never unlinked.
+
+This local-kernel primitive does not prove remote commands have stopped, exclude
+legacy writers ignoring it, or support a volume shared between hosts. An eventual
+single-process deployment must hold it for all mutation tasks and their shutdown,
+check it at each mutation boundary, and use `close_fds=True` for subprocesses.
+Fresh state/enrollment, supervisor cutover and exclusion of other writers remain
+deployment preconditions, not a caller Boolean or an expired lease.
+
+Pilot run events now carry optional deterministic `event_id` UUIDs scoped to
+run, phase and event kind. They are not effect command IDs: the original command
+binding and fence stay unchanged. Separate receipt dedupe preserves legacy event
+fingerprints and permits candidate and rollback holds to coexist. This does not
+yet define repeated inspection occurrences or a held-run continuation operation.
+`staging_paused` is retained solely for legacy event records; new safe pause
+boundaries emit no held event. Injected typed responses are strictly revalidated
+in Python-value form and bounded JSON form before verification or retention.
+
 Codex owns the typed controller client, workflow, dispatcher integration and Hub
 presentation. Hermes owns the host adapter and isolated acceptance harness after
 agreement on this contract. Claude independently reviews the candidate and user

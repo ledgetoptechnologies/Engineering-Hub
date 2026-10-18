@@ -2141,6 +2141,17 @@
             "minimum": 1.0,
             "title": "Fencing Generation"
           },
+          "event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
+          },
           "reason": {
             "anyOf": [
               {

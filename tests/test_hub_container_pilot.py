@@ -117,6 +117,10 @@ async def test_success_two_phases_stable_ids_and_reopen_no_posts(repo, target):
     assert await ContainerPilotWorkflow(reopened, next_client, [target]).advance(run['id']) == result
     assert next_client.submissions == []
     assert len(client.submissions) == 2
+    for event, phase in zip(result['events'], ('deploy_container', 'smoke_container')):
+        assert event['command_id'] == run['id']
+        assert event['event_id'] == str(uuid.uuid5(uuid.UUID(run['id']),
+            'container_pilot_v1:event:' + phase + ':' + event['event']))
 
 
 @pytest.mark.asyncio
@@ -214,8 +218,8 @@ async def test_pause_between_rollback_effect_and_smoke_resumes_without_repost(re
 @pytest.mark.asyncio
 async def test_paused_preexisting_failed_run_is_resumable_without_effect(repo, target):
     workflow, run = ready_run(repo, target)
-    run = workflow._event(run, 'running')
-    run = workflow._event(run, 'failed')
+    run = workflow._event(run, 'running', phase='deploy_container')
+    run = workflow._event(run, 'failed', phase='smoke_container')
     repo.set_pause('human:1234', True)
     with pytest.raises(HubError, match='paused') as paused:
         await workflow.advance(run['id'])
@@ -367,6 +371,86 @@ async def test_untrusted_success_evidence_holds(repo, target, alteration):
     workflow, run = ready_run(repo, target, client)
     assert (await workflow.advance(run['id']))['status'] == 'held'
     assert [c.action for c in client.submissions] == (ACTIONS[:2] if alteration == 'health' else ACTIONS[:1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('construction', ['copy', 'construct'])
+@pytest.mark.parametrize('mutation', ['verified_int', 'verified_string', 'bad_container_id',
+    'state_bool', 'policy_bool', 'fence_bool', 'replayed_int', 'oversized'])
+async def test_injected_typed_response_is_revalidated_before_success_or_retention(
+        repo, target, construction, mutation):
+    class UnvalidatedClient(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if mutation in {'verified_int', 'verified_string', 'bad_container_id'}:
+                evidence_changes = {
+                    'verified_int': {'evidence_verified': 1},
+                    'verified_string': {'evidence_verified': 'true'},
+                    'bad_container_id': {'container_id': 'not-a-container'},
+                }[mutation]
+                evidence = (response.evidence.model_copy(update=evidence_changes)
+                    if construction == 'copy' else ContainerPilotEvidence.model_construct(
+                        **(response.evidence.model_dump() | evidence_changes)))
+                changes = {'evidence': evidence}
+            else:
+                changes = {
+                    'state_bool': {'state': True},
+                    'policy_bool': {'policy_revision': True},
+                    'fence_bool': {'fencing_generation': True},
+                    'replayed_int': {'replayed': 1},
+                    'oversized': {'reason': 'x' * (ContainerPilotClient.RESPONSE_BYTE_LIMIT + 1)},
+                }[mutation]
+            return (response.model_copy(update=changes) if construction == 'copy' else
+                    ContainerPilotResponse.model_construct(**(
+                        response.model_dump(exclude={'evidence'}) | {'evidence': response.evidence} | changes)))
+
+    client = UnvalidatedClient()
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][-1]['reason'] == 'candidate_outcome_uncertain'
+    assert [command.action for command in client.submissions] == ACTIONS[:1]
+    with repo._connection() as db:
+        row = db.execute('SELECT state,response_json FROM hub_container_pilot_commands WHERE run_id=?',
+                         (run['id'],)).fetchone()
+    assert row['state'] == 'held'
+    assert row['response_json'] is None
+
+
+@pytest.mark.asyncio
+async def test_phase_event_receipts_do_not_alias_distinct_holds(repo, target):
+    workflow, run = ready_run(repo, target, FakeClient({'deploy_container': TimeoutError()}))
+    candidate_held = await workflow.advance(run['id'])
+    # Explicit internal event exercise only: no workflow recovery or command
+    # submission is introduced by these event receipt transitions.
+    failed = workflow._event(candidate_held, 'failed', phase='deploy_container')
+    rollback_held = workflow._hold(failed, 'rollback_outcome_uncertain', phase='rollback_container')
+    assert rollback_held['status'] == 'held'
+    held_events = [event for event in rollback_held['events'] if event['event'] == 'held']
+    assert [event['reason'] for event in held_events] == [
+        'candidate_outcome_uncertain', 'rollback_outcome_uncertain']
+    assert len({event['event_id'] for event in held_events}) == 2
+    assert all(event['command_id'] == run['id'] for event in rollback_held['events'])
+    assert workflow._event(rollback_held, 'held', phase='rollback_container',
+                           reason='rollback_outcome_uncertain') == rollback_held
+    assert len(workflow.client.submissions) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_running_event_without_receipt_id_remains_safe_to_advance(repo, target):
+    client = FakeClient({'deploy_container': TimeoutError()})
+    workflow, run = ready_run(repo, target, client)
+    legacy_running = repo.append_run_event(PRINCIPAL, run['id'], 'running', run['id'],
+        run['fencing_generation'], run['revision'])
+    assert 'event_id' not in legacy_running['events'][-1]
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    assert result['events'][0] == legacy_running['events'][0]
+    assert result['events'][-1]['event_id'] == str(uuid.uuid5(uuid.UUID(run['id']),
+        'container_pilot_v1:event:deploy_container:held'))
+    assert len(client.submissions) == 1
+    assert await workflow.advance(run['id']) == result
+    assert len(client.submissions) == 1
 
 
 @pytest.mark.asyncio

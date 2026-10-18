@@ -134,12 +134,35 @@ controller/API tests prove unpause resumes only unsubmitted phases, while actual
 uncertainty/failure remains held. Dispatcher accepted-pause receipts still require
 reconciliation; this is not a claim of automatic restart recovery.
 
-The same review identified a latent event-identity constraint: global event dedupe
-currently keys `(run_id, command_id, event)` and pilot uses run ID as command ID.
-Do not add held→failed→held recovery until phase/occurrence identities, preserved
-legacy dedupe and repair-count semantics are reviewed. A second held reason can
-otherwise conflict, and a repeated failed event can be mistaken for a replay.
-No supported recovery operation or lock deletion is introduced by these fixes.
+The same review identified a latent event-identity constraint at `1b9e5dd`:
+global legacy dedupe keys `(run_id, command_id, event)` and pilot uses run ID as
+command ID. The new optional `event_id` receipt namespace preserves that legacy
+path and gives pilot phases separate deterministic identities without changing
+effect command IDs. Candidate and rollback holds no longer collide. Repeated
+inspection occurrences, phase-derived continuation and repair-count semantics
+still need their own reviewed recovery operation; it is not added by this change.
+
+## Recovery prerequisites, not service activation
+
+Claude's `44b155d8-3a0c-42a0-a88f-ce4e90c8ddbe` accepted the pause correction by
+source inspection (no independent test rerun) and agreed with the Linux single-
+owner direction, with explicit inode, fork, filesystem, stopped-process, executor
+fence, held-evidence, accepted-pause and visibility requirements. The source now
+contains a standalone `PilotOwner` primitive only. It is not passed to the
+workflow, dispatcher, default entrypoint or running service.
+
+Root review found lock replacement could let a successor lock a new inode;
+durable enrollment now pins both lock and database identities before epoch
+adoption. Independent functional review found garbage collection leaked raw
+descriptors; close-only finalization and all-descriptor cleanup are tested.
+No lock file is removed. Existing un-enrolled databases are refused. The module
+does not change permissions or exclude legacy writers that ignore the lock.
+
+Injected typed responses also need revalidation: Pydantic `model_copy` and
+`model_construct` bypass normal validation, and JSON serialization can turn a
+Boolean into an integer. Pilot submit now validates original Python values,
+then bounded strict JSON, before verifying or retaining a receipt. This does not
+authenticate actual host effects or create a reconciliation operation.
 
 ## Executor integration review
 

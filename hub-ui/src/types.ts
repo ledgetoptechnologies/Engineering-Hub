@@ -58,6 +58,7 @@ export interface Run extends Versioned {
   execution_manifest_digest: string | null;
   events: Array<{
     event: string;
+    event_id?: string | null;
     actor: string;
     command_id: string;
     fencing_generation: number;
