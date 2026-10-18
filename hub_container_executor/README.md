@@ -50,11 +50,17 @@ not enable itself from import, environment, Hub startup, or a listener.
   private runtime-profile digest. It revalidates the original protected bytes
   and full manifest bindings on every call, exports the bound immutable file
   inventory and rejects future-dated observations. The receipt describes
-  historical enrollment, never current health. The actual observed enroller
-  and independent operator pinning workflow are still required; a caller-authored
+  historical enrollment, never current health. Actual observed enrollment
+  and an independent operator pinning workflow are still required; a caller-authored
   healthy flag plus its hash is not adequate authority.
+- `baseline_observer.py`: one-attempt, dedicated-process observation source for
+  a prepared isolated baseline. It checks the pinned runner, immutable image,
+  effective container profile, frozen backup and unchanged source inventory;
+  fixed probes must have an exact terminal private-journal receipt. It returns
+  private draft bytes only, never publishes, pins, activates or retries them.
+  Tests simulate Engine methods; real daemon observation remains unverified.
 - `runtime_profile.py`: pure shared profile/probe derivation used by the adapter
-  and future enroller. Runtime-profile and probe-set digests remain distinct.
+  and observer. Runtime-profile and probe-set digests remain distinct.
   Profile inputs contain synthetic test secrets; never serialize or log them.
 - `state_provider.py`: explicit private, independently enrolled frozen-baseline
   generation provider for one bounded pilot. Candidate admission reserves count
@@ -106,8 +112,10 @@ Still required before any real acceptance:
    identity (not a backend echo or label). The interface is source-only and no
    concrete driver-identity provider is supplied; without one, effects hold.
    Missing dependencies fail closed.
-   The protected baseline receipt reader and snapshot helper do not supply the
-   missing actual health observer/enroller or authenticate an invented receipt.
+   The receipt reader, snapshot helper and observer source do not supply actual
+   daemon evidence, protected receipt publication or independent pinning. The
+   observer requires an explicit live owner guard and pre-existing isolated
+   baseline; it does not provision these or authenticate an invented receipt.
 3. A private generation provider that uses the tested SQLite copy primitive,
    enforces no migrations/external writes, validates baseline immutability,
    preprovisions uid/gid 10001 access without privileged helper/chown, and applies
