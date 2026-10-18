@@ -379,3 +379,38 @@ The grace follow-up passed the frozen 1,778-test Linux suite, and independent
 subagent source review found no concrete defect in the validation ordering,
 status semantics or Compose consistency. No installed supervisor verification
 or readiness-notification activation is inferred from those results.
+
+### Current artifact handoff gate
+
+A fresh scoped bus/knowledge/repository check after `2dd2457` found no pending
+reply on this build correlation. Sender-scoped receipts show registry request
+`318a11f4-5948-4908-8110-160a35bed352` and the latest Hermes durability INFO
+`1a8735b2-ce93-4a6c-a9e2-0012470979f4` are retained/pending. Claude's durability
+INFO is acknowledged. These lifecycle observations do not prove session delivery,
+execution or a live worker, and no replacement worker was launched.
+
+The existing shared note `agent-bus/engineering-hub/reviews/container-host-6b01bde.md`
+version 1 (SHA-256 `b9c35089be9b7e79bb49fabb8e38797e307c3ef0f852420e1d62391ede01ab5f`)
+reports source-only acceptance of corrections at
+`6b01bde9403e53860e6fd6f8758a12784d5aefcb`. This supersedes the old host scaffold
+rejection, not the actual host acceptance gates. Codex has not obtained or rerun
+that source. The note says the concrete daemon lane
+`work/container-pilot-daemon-source-hermes` / `deleg_ef420dc9` is separate and
+incomplete; a dated note is not authoritative current process status. Trusted
+provenance, runtime identity, baseline/state/secret providers and actual-effect
+SIGKILL/health/rollback acceptance remain absent from Codex's evidence.
+
+Fresh fetch and remote-ref inspection still show host branch `fedfb7b` and
+registry branch `7799056`, no advertised daemon branch, and no local `6b01bde`
+object. No full branch merge or artifact substitution was attempted. Hermes
+handoff request `05426c6f-9af6-4574-a34d-b9d98e1fb5eb` asks for the exact reviewed
+artifacts and an authoritative existing-worker status, without requesting another
+worker or production changes. Its acceptance by the bus is not completion.
+The note's controller 15-second/default 60-second ceiling concern is superseded
+by the published 125-second client and manifest-plus-margin validation.
+
+Current critical path is an obtainable reviewed host/registry handoff, the
+concrete provider integration and an autonomous real application pilot. Human
+GitHub OAuth setup remains explicitly deferred by Beau. These dependencies
+prevent completion of a usable authenticated release; more passing fixture tests
+would not resolve them. The goal remains active, not falsely complete.
