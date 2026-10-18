@@ -14,6 +14,8 @@ dependencies = [
   "pydantic>=2.7,<3",
   "python-multipart>=0.0.9,<1",
   "fastembed>=0.9,<1",
+  "httpx>=0.27,<1",
+  "PyJWT[crypto]>=2.15.1,<3",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,7 @@ agent_message_bus = ["schema.sql", "feedback_schema.sql"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.uv]
 default-groups = ["test"]

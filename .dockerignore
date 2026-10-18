@@ -3,6 +3,13 @@
 **/__pycache__
 **/.pytest_cache
 .env
+**/.env
+**/.env.*
+**/node_modules
+**/dist
+**/test-results
+**/playwright-report
+.test-tmp*
 data
 *.sqlite3
 *.jsonl

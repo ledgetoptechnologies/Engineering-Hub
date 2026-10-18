@@ -1,0 +1,38 @@
+# Independent build: do not change the deployed message-bus image or entrypoint.
+FROM node:24-bookworm-slim AS dashboard
+WORKDIR /ui
+COPY hub-ui/package.json hub-ui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY hub-ui/ ./
+RUN npm run build
+
+FROM python:3.12-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /build
+RUN python -m pip install --no-cache-dir uv==0.11.17
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN uv sync --locked --no-default-groups --no-editable
+
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}" \
+    HUB_UI_DIRECTORY=/app/dashboard HUB_DB=/var/lib/hub/hub.sqlite3
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="Engineering Hub Control" \
+      org.opencontainers.image.source="https://github.com/ledgetoptechnologies/Engineering-Hub" \
+      org.opencontainers.image.revision="${VCS_REF}"
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=dashboard /ui/dist /app/dashboard
+# ARG is read by Python as data, not interpolated into executable shell text.
+# Bake identity into the installed package; runtime VCS_REF cannot override it.
+# An unlabelled developer build stays unknown; malformed claimed IDs fail build.
+RUN python -c "import importlib.resources as r,json,os,re,sys; ref=os.environ['VCS_REF']; ref == 'unknown' or re.fullmatch('[0-9a-f]{40}',ref) or sys.exit('VCS_REF must be unknown or lowercase 40-character SHA'); r.files('engineering_hub').joinpath('_build_identity.json').write_text(json.dumps({'schema_version':1,'build_commit':None if ref == 'unknown' else ref},separators=(',',':')),encoding='utf-8')"
+RUN groupadd --system --gid 568 hub \
+    && useradd --system --uid 568 --gid hub --no-create-home hub \
+    && mkdir -p /var/lib/hub && chown hub:hub /var/lib/hub && chmod 0700 /var/lib/hub
+USER 568:568
+EXPOSE 8770
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["python", "-c", "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"]
+ENTRYPOINT ["python", "-m", "engineering_hub", "--host", "0.0.0.0", "--port", "8770"]

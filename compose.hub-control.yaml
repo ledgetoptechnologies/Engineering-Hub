@@ -1,0 +1,85 @@
+# Standalone TrueNAS Hub control, main-built moving image. Never merge with bus Compose.
+# Replace ONLY the three agent-token placeholders before installation.
+# Private GHCR pulls may require your existing GitHub registry credential in
+# TrueNAS. Never paste credentials into chat or make the package public.
+#
+# State: create /mnt/Plugins/App_Data/Agent_MCP/engineering-hub on local ZFS
+# before installation. ONLY that new directory needs UID/GID 568:568 and rwx
+# access. Do not recursively chown the parent or touch current MCP data/ACLs.
+# Hub uses its own child directory/database; no existing MCP state is replaced.
+#
+# Networking matches Current-MCP.yaml: host mode, Hub listens on port 8770.
+# Existing MCP remains on 8765 with its image/tokens/clients/mount untouched.
+# Port 8770 must be free before you install. No tunnel changes were made.
+# Future tunnel origin: http://192.168.50.80:8770 for a connector that can reach
+# the NAS LAN address. A connector using host networking ON THIS NAS may instead
+# use http://127.0.0.1:8770. A bridge/remote connector must NOT use its localhost.
+# There is no Hub bridge network to join. Configure ingress separately yourself.
+# Browser origin: https://hub.ledgetoptechnologies.com (no aliases).
+# Human sign-in stays unavailable until its separate auth setup is completed.
+#
+# Updates: pull_policy always checks :latest when Compose creates/updates the app.
+# A plain container restart does NOT pull a new image. Use TrueNAS Update/Redeploy
+# with image pull enabled; the main build pipeline must publish the moving tag.
+#
+# Removal/rollback: stop/remove ONLY this app. Preserve its engineering-hub child
+# directory and back it up/snapshot before updates. Image rollback may require a
+# compatible state backup. Never delete/restore the existing MCP's storage.
+name: engineering-hub-control
+services:
+  engineering-hub-control:
+    image: ghcr.io/ledgetoptechnologies/engineering-hub-control:latest
+    pull_policy: always
+    restart: unless-stopped
+    stop_grace_period: 1200s
+    user: "568:568"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    network_mode: host
+    environment:
+      HUB_DB: /var/lib/hub/hub.sqlite3
+      HUB_UI_DIRECTORY: /app/dashboard
+      HUB_SUPERVISOR_STOP_GRACE_SECONDS: "1200"
+      HUB_BASE_URL: https://hub.ledgetoptechnologies.com
+      HUB_ALTERNATE_ORIGINS: ""
+      HERMES_TOKEN: REPLACE_WITH_EXISTING_HERMES_TOKEN
+      CODEX_TOKEN: REPLACE_WITH_EXISTING_CODEX_TOKEN
+      CLAUDE_TOKEN: REPLACE_WITH_EXISTING_CLAUDE_TOKEN
+      AGENT_BUS_ALLOWED_IPS: "192.168.60.92,192.168.20.151"
+      HUB_HUMAN_AUTH_MODE: github
+      HUB_GITHUB_CLIENT_ID: ""
+      HUB_GITHUB_CLIENT_SECRET: ""
+      HUB_BEAU_GITHUB_ID: ""
+      HUB_CF_ACCESS_ISSUER: ""
+      HUB_CF_ACCESS_AUDIENCE: ""
+      HUB_CF_ACCESS_ALLOWED_EMAILS: ""
+    volumes:
+      - type: bind
+        source: /mnt/Plugins/App_Data/Agent_MCP/engineering-hub
+        target: /var/lib/hub
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8770/health',timeout=3); raise SystemExit(0 if json.load(r).get('ok') is True else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

@@ -1,4 +1,23 @@
-# Agent Message Bus
+# Engineering Hub
+
+Engineering Hub is the private development/staging management platform under
+construction. The repository was renamed from `internal-MCP`; its existing Agent
+Message Bus remains independently deployable, with its current image identity,
+port 8765, tokens and persistent storage unchanged.
+
+The additive control-plane implementation is documented in
+[Hub control v1](docs/hub-control-v1.md), with the REST contract in
+[`contracts/hub-v1.openapi.json`](contracts/hub-v1.openapi.json). Its default port
+is 8770 on loopback. Live OAuth and real host dispatch remain disabled until
+their separate setup and acceptance gates pass; fixture tests are not production
+deployment or TrueNAS reboot proof.
+
+The standalone, opt-in [`compose.hub-control.yaml`](compose.hub-control.yaml) and
+[private deployment guide](docs/hub-control-deployment.md) describe its separate
+local state, loopback-only port and activation gates. They do not start a service
+or change the existing bus deployment.
+
+## Existing Agent Message Bus
 
 A self-hosted, authenticated MCP Streamable HTTP service for Hermes, Codex, and Claude Code. It provides durable agent messaging, shared-file storage, audit records, and (when included in a release) shared-knowledge tools. SQLite and artifacts live in the service's persistent data directory.
 
@@ -68,6 +87,12 @@ Stable releases also publish the moving `stable` tag; there is intentionally no 
 Use [`compose.truenas.yaml`](compose.truenas.yaml) as a prebuilt-image compose file (no `build:` block). Before installing, follow [`docs/truenas-deployment.md`](docs/truenas-deployment.md): authenticate TrueNAS to the private package, create a local ZFS data path, set its ownership to UID/GID `568:568`, replace all four secret placeholders, and adjust the LAN bind and client allowlist to the real addresses. For updates, preserve the installed volume mapping and tokens exactly. Verify the selected package is published and back up the existing SQLite database and file objects before pulling/redeploying. A container restart alone does not fetch a newer image.
 
 ## Three-agent integration
+
+The separate Linux-only [fixture executor](hub_executor/CONTRACT.md) and
+`compose.hub-test.yaml` are isolated acceptance tools, not application deployment
+adapters. They do not enable dispatch in the default Hub or modify the existing
+message-bus service. See the [qualified integrated test evidence](docs/hub-linux-validation-2026-10-17.md)
+and the separate [application-pilot contract draft](docs/hub-container-pilot-contract-draft.md).
 
 See [`docs/three-agent-integration.md`](docs/three-agent-integration.md) for the Windows PowerShell Codex and Claude Code setup, the Hermes client snippet, separate-token handling, and the limits around agent wake-ups and shared knowledge. It documents intended setup only; it does not assert that any client is configured.
 

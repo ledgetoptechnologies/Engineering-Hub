@@ -1,0 +1,2628 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Engineering Hub Control",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/hub/v1/auth/login": {
+      "get": {
+        "tags": [
+          "human-auth"
+        ],
+        "summary": "Login",
+        "operationId": "login_api_hub_v1_auth_login_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/auth/callback": {
+      "get": {
+        "tags": [
+          "human-auth"
+        ],
+        "summary": "Callback",
+        "operationId": "callback_api_hub_v1_auth_callback_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/auth/me": {
+      "get": {
+        "tags": [
+          "human-auth"
+        ],
+        "summary": "Me",
+        "operationId": "me_api_hub_v1_auth_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "human-auth"
+        ],
+        "summary": "Logout",
+        "operationId": "logout_api_hub_v1_auth_logout_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/autonomy": {
+      "get": {
+        "summary": "Autonomy Status",
+        "operationId": "autonomy_status_api_hub_v1_autonomy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutonomyDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/topics/{topic}/peers": {
+      "get": {
+        "summary": "Topic Peers",
+        "operationId": "topic_peers_api_hub_v1_topics__topic__peers_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicSnapshot"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/topics/{topic}/preflight": {
+      "get": {
+        "summary": "Topic Preflight",
+        "operationId": "topic_preflight_api_hub_v1_topics__topic__preflight_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          },
+          {
+            "name": "recipient",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "enum": [
+                "codex",
+                "hermes",
+                "claude"
+              ],
+              "type": "string",
+              "title": "Recipient"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicPreflight"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/topics/{topic}/events": {
+      "get": {
+        "summary": "Topic Events",
+        "operationId": "topic_events_api_hub_v1_topics__topic__events_get",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Topic"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "name": "epoch",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Epoch"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/events/status": {
+      "get": {
+        "summary": "Event Status",
+        "operationId": "event_status_api_hub_v1_events_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventStatusDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/events": {
+      "get": {
+        "summary": "Events",
+        "operationId": "events_api_hub_v1_events_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/overview": {
+      "get": {
+        "summary": "Overview",
+        "operationId": "overview_api_hub_v1_overview_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverviewDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/projects": {
+      "get": {
+        "summary": "List Projects",
+        "operationId": "list_projects_api_hub_v1_projects_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/agents": {
+      "get": {
+        "summary": "List Agents",
+        "operationId": "list_agents_api_hub_v1_agents_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentListDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks": {
+      "get": {
+        "summary": "List Tasks",
+        "operationId": "list_tasks_api_hub_v1_tasks_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskListDTO"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Task",
+        "operationId": "create_task_api_hub_v1_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTask"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}": {
+      "get": {
+        "summary": "Get Task",
+        "operationId": "get_task_api_hub_v1_tasks__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}/claim": {
+      "post": {
+        "summary": "Claim",
+        "operationId": "claim_api_hub_v1_tasks__task_id__claim_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Revision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}/candidate": {
+      "post": {
+        "summary": "Candidate",
+        "operationId": "candidate_api_hub_v1_tasks__task_id__candidate_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Candidate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tasks/{task_id}/review": {
+      "post": {
+        "summary": "Review",
+        "operationId": "review_api_hub_v1_tasks__task_id__review_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Review"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/decisions": {
+      "get": {
+        "summary": "List Decisions",
+        "operationId": "list_decisions_api_hub_v1_decisions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionListDTO"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Decision",
+        "operationId": "create_decision_api_hub_v1_decisions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/decisions/{decision_id}/answer": {
+      "post": {
+        "summary": "Answer",
+        "operationId": "answer_api_hub_v1_decisions__decision_id__answer_post",
+        "parameters": [
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Answer"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/pause": {
+      "post": {
+        "summary": "Pause",
+        "operationId": "pause_api_hub_v1_pause_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Pause"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PauseDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/runs": {
+      "get": {
+        "summary": "List Runs",
+        "operationId": "list_runs_api_hub_v1_runs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListDTO"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Run",
+        "operationId": "create_run_api_hub_v1_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/runs/{run_id}/dispatch": {
+      "post": {
+        "summary": "Dispatch",
+        "operationId": "dispatch_api_hub_v1_runs__run_id__dispatch_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/container-pilot/runs": {
+      "post": {
+        "summary": "Create Container Pilot Run",
+        "operationId": "create_container_pilot_run_api_hub_v1_container_pilot_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/container-pilot/runs/{run_id}/dispatch": {
+      "post": {
+        "summary": "Dispatch Container Pilot",
+        "operationId": "dispatch_container_pilot_api_hub_v1_container_pilot_runs__run_id__dispatch_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/container-pilot/runs/{run_id}/recover": {
+      "post": {
+        "summary": "Recover Container Pilot",
+        "operationId": "recover_container_pilot_api_hub_v1_container_pilot_runs__run_id__recover_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Id"
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport"
+          },
+          "chat_readiness": {
+            "type": "string",
+            "title": "Chat Readiness"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "transport",
+          "chat_readiness",
+          "reason"
+        ],
+        "title": "AgentDTO"
+      },
+      "AgentListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "AgentListDTO"
+      },
+      "Answer": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "answer": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Answer"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "answer"
+        ],
+        "title": "Answer"
+      },
+      "AutonomyDTO": {
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "not_started",
+              "native_source_unavailable",
+              "active",
+              "stopped",
+              "failed"
+            ],
+            "title": "State"
+          },
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/DispatchReceiptDTO"
+            },
+            "type": "array",
+            "title": "Receipts"
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DispatchResultDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pilot_lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotLifecycleDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "configured",
+          "state",
+          "running",
+          "receipts"
+        ],
+        "title": "AutonomyDTO"
+      },
+      "Candidate": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "commit"
+        ],
+        "title": "Candidate"
+      },
+      "CapabilitiesDTO": {
+        "properties": {
+          "production": {
+            "type": "boolean",
+            "title": "Production"
+          },
+          "host_dispatch": {
+            "type": "boolean",
+            "title": "Host Dispatch"
+          },
+          "github_merge": {
+            "type": "boolean",
+            "title": "Github Merge"
+          },
+          "processing": {
+            "type": "boolean",
+            "title": "Processing"
+          },
+          "fixture_dispatch": {
+            "type": "boolean",
+            "title": "Fixture Dispatch"
+          },
+          "container_pilot_dispatch": {
+            "type": "boolean",
+            "title": "Container Pilot Dispatch"
+          },
+          "merge_gate_strength": {
+            "type": "string",
+            "const": "not_enforced",
+            "title": "Merge Gate Strength"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "production",
+          "host_dispatch",
+          "github_merge",
+          "processing",
+          "fixture_dispatch",
+          "container_pilot_dispatch",
+          "merge_gate_strength"
+        ],
+        "title": "CapabilitiesDTO"
+      },
+      "DecisionDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Options"
+          },
+          "protected": {
+            "type": "boolean",
+            "title": "Protected"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "answered"
+            ],
+            "title": "Status"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "execution_authorization": {
+            "type": "boolean",
+            "const": false,
+            "title": "Execution Authorization"
+          },
+          "answered_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answered By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "project",
+          "title",
+          "options",
+          "protected",
+          "status",
+          "answer",
+          "execution_authorization"
+        ],
+        "title": "DecisionDTO"
+      },
+      "DecisionListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "DecisionListDTO"
+      },
+      "DispatchReceiptDTO": {
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Sequence"
+          },
+          "entity_id": {
+            "type": "string",
+            "title": "Entity Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "reserved",
+              "running",
+              "needs_reconciliation",
+              "succeeded",
+              "rolled_back",
+              "deferred",
+              "skipped"
+            ],
+            "title": "State"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "attempt_head": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Attempt Head"
+          },
+          "needs_reconciliation": {
+            "type": "boolean",
+            "title": "Needs Reconciliation"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "sequence",
+          "entity_id",
+          "revision",
+          "state",
+          "run_id",
+          "reason",
+          "attempt_head",
+          "needs_reconciliation"
+        ],
+        "title": "DispatchReceiptDTO"
+      },
+      "DispatchResultDTO": {
+        "properties": {
+          "examined": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Examined"
+          },
+          "dispatched": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Dispatched"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          },
+          "more": {
+            "type": "boolean",
+            "title": "More"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "examined",
+          "dispatched",
+          "cursor",
+          "paused",
+          "more"
+        ],
+        "title": "DispatchResultDTO"
+      },
+      "EventStatusDTO": {
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "observer_epoch": {
+            "type": "string",
+            "title": "Observer Epoch"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cursor"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "available",
+          "reason",
+          "observer_epoch",
+          "cursor"
+        ],
+        "title": "EventStatusDTO"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthDTO": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true,
+            "title": "Ok"
+          },
+          "service": {
+            "type": "string",
+            "const": "engineering-hub-control",
+            "title": "Service"
+          },
+          "build_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Commit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ok",
+          "service",
+          "build_commit"
+        ],
+        "title": "HealthDTO"
+      },
+      "NewDecision": {
+        "properties": {
+          "project": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 5,
+            "minItems": 2,
+            "title": "Options"
+          },
+          "protected": {
+            "type": "boolean",
+            "title": "Protected",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "project",
+          "title",
+          "options"
+        ],
+        "title": "NewDecision"
+      },
+      "NewRun": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "task_id": {
+            "type": "string",
+            "maxLength": 36,
+            "minLength": 1,
+            "title": "Task Id"
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Artifact Digest"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Target"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "task_id",
+          "artifact_digest",
+          "target"
+        ],
+        "title": "NewRun"
+      },
+      "NewTask": {
+        "properties": {
+          "project": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "client_request_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "project",
+          "title",
+          "client_request_id"
+        ],
+        "title": "NewTask"
+      },
+      "OverviewDTO": {
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectDTO"
+            },
+            "type": "array",
+            "title": "Projects"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/TaskDTO"
+            },
+            "type": "array",
+            "title": "Tasks"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionDTO"
+            },
+            "type": "array",
+            "title": "Decisions"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunDTO"
+            },
+            "type": "array",
+            "title": "Runs"
+          },
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentDTO"
+            },
+            "type": "array",
+            "title": "Agents"
+          },
+          "autonomy": {
+            "$ref": "#/components/schemas/AutonomyDTO"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/CapabilitiesDTO"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "paused",
+          "projects",
+          "tasks",
+          "decisions",
+          "runs",
+          "agents",
+          "autonomy",
+          "capabilities"
+        ],
+        "title": "OverviewDTO"
+      },
+      "Pause": {
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "paused"
+        ],
+        "title": "Pause"
+      },
+      "PauseDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "const": "pause",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "paused": {
+            "type": "boolean",
+            "title": "Paused"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "paused"
+        ],
+        "title": "PauseDTO"
+      },
+      "PilotLifecycleDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "active",
+              "stopping",
+              "stopped"
+            ],
+            "title": "State"
+          },
+          "required_supervisor_stop_grace_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Required Supervisor Stop Grace Seconds"
+          },
+          "configured_supervisor_stop_grace_seconds": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Configured Supervisor Stop Grace Seconds"
+          },
+          "supervisor_configuration_verified": {
+            "type": "boolean",
+            "const": false,
+            "title": "Supervisor Configuration Verified"
+          },
+          "configuration_source": {
+            "type": "string",
+            "const": "operator_assertion",
+            "title": "Configuration Source"
+          },
+          "tasks": {
+            "$ref": "#/components/schemas/PilotTasksDTO"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "required_supervisor_stop_grace_seconds",
+          "configured_supervisor_stop_grace_seconds",
+          "supervisor_configuration_verified",
+          "configuration_source",
+          "tasks"
+        ],
+        "title": "PilotLifecycleDTO"
+      },
+      "PilotTasksDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "active",
+              "stopping",
+              "stopped"
+            ],
+            "title": "State"
+          },
+          "inflight": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 0.0,
+            "title": "Inflight"
+          },
+          "max_inflight": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Inflight"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "inflight",
+          "max_inflight"
+        ],
+        "title": "PilotTasksDTO"
+      },
+      "ProjectDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "environment": {
+            "type": "string",
+            "const": "staging",
+            "title": "Environment"
+          },
+          "executor_enabled": {
+            "type": "boolean",
+            "title": "Executor Enabled"
+          },
+          "health": {
+            "type": "string",
+            "title": "Health"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "environment",
+          "executor_enabled",
+          "health",
+          "reason"
+        ],
+        "title": "ProjectDTO"
+      },
+      "ProjectListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "ProjectListDTO"
+      },
+      "PublicReachability": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "agent": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "hermes",
+              "claude"
+            ],
+            "title": "Agent"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "unlinked",
+              "linked_unverified",
+              "reachable",
+              "busy_queued",
+              "offline",
+              "unknown_stale"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "no_exact_binding",
+              "no_observer_evidence",
+              "observer_unavailable",
+              "observer_restarted",
+              "binding_generation_mismatch",
+              "evidence_expired",
+              "evidence_in_future",
+              "conflicting_evidence",
+              "stream_only",
+              "session_ready",
+              "session_busy_queue_verified",
+              "session_disconnected",
+              "session_offline",
+              "runtime_readiness_unverified",
+              "inventory_incomplete",
+              "owner_selection_unverified"
+            ],
+            "title": "Reason"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "state_since": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Since"
+          },
+          "last_evidence_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Evidence At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "advisory_only": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory Only",
+            "default": true
+          },
+          "link_state": {
+            "type": "string",
+            "enum": [
+              "linked",
+              "unlinked",
+              "unknown"
+            ],
+            "title": "Link State",
+            "default": "unknown"
+          },
+          "transport_state": {
+            "type": "string",
+            "enum": [
+              "attached",
+              "disconnected",
+              "unverified",
+              "unknown"
+            ],
+            "title": "Transport State",
+            "default": "unknown"
+          },
+          "availability_state": {
+            "type": "string",
+            "enum": [
+              "available",
+              "busy",
+              "offline",
+              "unverified",
+              "unknown"
+            ],
+            "title": "Availability State",
+            "default": "unknown"
+          },
+          "evidence_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "connector_observer",
+                  "runtime_control",
+                  "bus_stream"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Source"
+          },
+          "evidence_level": {
+            "type": "string",
+            "enum": [
+              "runtime_verified",
+              "observed",
+              "unverified"
+            ],
+            "title": "Evidence Level",
+            "default": "unverified"
+          },
+          "snapshot_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Revision"
+          },
+          "binding_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Binding Revision"
+          },
+          "attachment_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attachment Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "agent",
+          "status",
+          "reason"
+        ],
+        "title": "PublicReachability",
+        "description": "Only this safe projection is intended for authenticated REST/MCP/UI reads."
+      },
+      "RecoveryDTO": {
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/RunDTO"
+          },
+          "recovery": {
+            "type": "string",
+            "enum": [
+              "recovered",
+              "held",
+              "paused"
+            ],
+            "title": "Recovery"
+          },
+          "occurrence": {
+            "type": "string",
+            "title": "Occurrence"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run",
+          "recovery",
+          "occurrence"
+        ],
+        "title": "RecoveryDTO"
+      },
+      "Review": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "reject"
+            ],
+            "title": "Verdict"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "commit",
+          "verdict"
+        ],
+        "title": "Review"
+      },
+      "ReviewDTO": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Actor"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "verdict": {
+            "type": "string",
+            "const": "approve",
+            "title": "Verdict"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "commit",
+          "verdict"
+        ],
+        "title": "ReviewDTO"
+      },
+      "Revision": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision"
+        ],
+        "title": "Revision"
+      },
+      "RunDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Artifact Digest"
+          },
+          "policy_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Policy Revision"
+          },
+          "review": {
+            "$ref": "#/components/schemas/ReviewDTO"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "held"
+            ],
+            "title": "Status"
+          },
+          "command_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command Id"
+          },
+          "fencing_generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Fencing Generation"
+          },
+          "created_by": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Created By"
+          },
+          "execution_actor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^executor:[a-z][a-z0-9-]{0,63}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Actor"
+          },
+          "execution_manifest_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Manifest Digest"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/RunEventDTO"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "task_id",
+          "project",
+          "target",
+          "commit",
+          "artifact_digest",
+          "policy_revision",
+          "review",
+          "status",
+          "command_id",
+          "fencing_generation",
+          "created_by",
+          "execution_actor",
+          "execution_manifest_digest",
+          "events"
+        ],
+        "title": "RunDTO"
+      },
+      "RunEventDTO": {
+        "properties": {
+          "event": {
+            "type": "string",
+            "enum": [
+              "running",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "held"
+            ],
+            "title": "Event"
+          },
+          "actor": {
+            "type": "string",
+            "pattern": "^executor:[a-z][a-z0-9-]{0,63}$",
+            "title": "Actor"
+          },
+          "command_id": {
+            "type": "string",
+            "title": "Command Id"
+          },
+          "fencing_generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Fencing Generation"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "candidate_outcome_uncertain",
+                  "staging_paused",
+                  "rollback_failed",
+                  "rollback_outcome_uncertain",
+                  "rollback_smoke_failed",
+                  "rollback_smoke_outcome_uncertain"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "event",
+          "actor",
+          "command_id",
+          "fencing_generation"
+        ],
+        "title": "RunEventDTO"
+      },
+      "RunListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RunDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "RunListDTO"
+      },
+      "TaskDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "project": {
+            "type": "string",
+            "enum": [
+              "engineering-hub",
+              "3d-viewer",
+              "project-alpha",
+              "ledge-top-ops",
+              "treedar"
+            ],
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "assigned",
+              "claimed",
+              "in_review",
+              "verified"
+            ],
+            "title": "Status"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "candidate_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Commit"
+          },
+          "review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repair_count": {
+            "type": "integer",
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Repair Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "revision",
+          "updated_at",
+          "project",
+          "title",
+          "status",
+          "owner",
+          "candidate_commit",
+          "review",
+          "repair_count"
+        ],
+        "title": "TaskDTO"
+      },
+      "TaskListDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TaskDTO"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "TaskListDTO"
+      },
+      "TopicPreflight": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "recipient": {
+            "type": "string",
+            "enum": [
+              "codex",
+              "hermes",
+              "claude"
+            ],
+            "title": "Recipient"
+          },
+          "peer": {
+            "$ref": "#/components/schemas/PublicReachability"
+          },
+          "advisory": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory"
+          },
+          "delivery_guaranteed": {
+            "type": "boolean",
+            "const": false,
+            "title": "Delivery Guaranteed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "recipient",
+          "peer",
+          "advisory",
+          "delivery_guaranteed"
+        ],
+        "title": "TopicPreflight"
+      },
+      "TopicSnapshot": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PublicReachability"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "advisory": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory"
+          },
+          "delivery_guaranteed": {
+            "type": "boolean",
+            "const": false,
+            "title": "Delivery Guaranteed"
+          },
+          "snapshot_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Revision"
+          },
+          "registry_epoch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registry Epoch"
+          },
+          "event_source": {
+            "type": "string",
+            "enum": [
+              "hub_only",
+              "canonical_registry",
+              "none"
+            ],
+            "title": "Event Source",
+            "default": "hub_only"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "items",
+          "advisory",
+          "delivery_guaranteed",
+          "snapshot_revision"
+        ],
+        "title": "TopicSnapshot"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

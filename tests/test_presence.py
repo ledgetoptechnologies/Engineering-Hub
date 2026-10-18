@@ -42,13 +42,10 @@ async def test_registered_subscription_is_not_reported_as_live_presence():
     assert "private-session-id" not in repr(status)
 
 
-def test_disabled_publisher_reports_native_push_unavailable():
+@pytest.mark.asyncio
+async def test_disabled_publisher_reports_native_push_unavailable():
     publisher = PushPublisher(enabled=False)
-
-    async def read_status():
-        return await publisher.presence_status()
-
-    status = asyncio.run(read_status())
+    status = await publisher.presence_status()
     assert status["native_push_available"] is False
 
 

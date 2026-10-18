@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import socket
 import stat
@@ -409,18 +410,23 @@ def test_coordination_profile_mismatch_fails_before_child_launch(tmp_path):
     fake = tmp_path / "fake-hermes"
     fake.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
-    result = main([
+    cli_args = [
         "--url", "https://bus.example.test/mcp", "--agent", "hermes",
         "--token-file", str(tmp_path / "missing-token"),
         "--state-dir", str(tmp_path / "state"), "--hermes-root", str(hermes_root),
         "--executable", str(fake), "--allow-sender", "codex", "--allow-topic", "qa",
         "--coordination",
-    ])
+    ]
+    # main() owns its asyncio.run loop like a fresh CLI process. Keep that
+    # ownership off pytest-asyncio's main-thread cleanup loop.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(main, cli_args).result(timeout=10)
     assert result == 2
     assert not marker.exists()
 
 
-def test_fake_cli_coordination_launch_is_shell_free_profile_and_toolset_bounded(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_fake_cli_coordination_launch_is_shell_free_profile_and_toolset_bounded(tmp_path, monkeypatch):
     async def scenario():
         hermes_root = tmp_path / "isolated-hermes"
         profile_root = hermes_root / "profiles" / PROFILE
@@ -480,10 +486,11 @@ def test_fake_cli_coordination_launch_is_shell_free_profile_and_toolset_bounded(
         assert seen["argv"] == list(args[1:])
         assert message_id in seen["argv"][seen["argv"].index("--query") + 1]
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_real_fake_executable_session_json_and_nonzero_are_fail_closed(tmp_path, caplog):
+@pytest.mark.asyncio
+async def test_real_fake_executable_session_json_and_nonzero_are_fail_closed(tmp_path, caplog):
     async def scenario():
         fake = tmp_path / "fake-hermes"
         config = tmp_path / "fake-hermes.json"
@@ -519,10 +526,11 @@ def test_real_fake_executable_session_json_and_nonzero_are_fail_closed(tmp_path,
         uncertain = await runner.run(str(uuid.uuid4()))
         assert uncertain.outcome == "uncertain"
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_notification_callback_only_sets_event_for_authenticated_inbox_uri():
+@pytest.mark.asyncio
+async def test_notification_callback_only_sets_event_for_authenticated_inbox_uri():
     async def scenario():
         worker = PushWorker.__new__(PushWorker)
         worker.identity = "hermes"
@@ -545,10 +553,11 @@ def test_notification_callback_only_sets_event_for_authenticated_inbox_uri():
         await worker.on_mcp_message(types.ServerNotification(root=event))
         assert worker.notification_event.is_set()
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_initial_head_snapshot_is_one_nonblocking_read_only_call(tmp_path):
+@pytest.mark.asyncio
+async def test_initial_head_snapshot_is_one_nonblocking_read_only_call(tmp_path):
     class SnapshotSession:
         calls = 0
 
@@ -567,10 +576,11 @@ def test_initial_head_snapshot_is_one_nonblocking_read_only_call(tmp_path):
         assert worker.state.cursor == 12
         assert session.calls == 1
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_queue_arrives_while_worker_is_busy_and_survives_shutdown(tmp_path):
+@pytest.mark.asyncio
+async def test_queue_arrives_while_worker_is_busy_and_survives_shutdown(tmp_path):
     class BlockingRunner:
         def __init__(self):
             self.entered = asyncio.Event()
@@ -613,10 +623,11 @@ def test_queue_arrives_while_worker_is_busy_and_survives_shutdown(tmp_path):
         await asyncio.wait_for(dispatcher, timeout=1)
         assert state.queued_ids() == [second["id"]]
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_empty_queue_never_calls_model_runner(tmp_path):
+@pytest.mark.asyncio
+async def test_empty_queue_never_calls_model_runner(tmp_path):
     class CountingRunner:
         calls = 0
 
@@ -636,10 +647,11 @@ def test_empty_queue_never_calls_model_runner(tmp_path):
         worker.queue_event.set()
         await asyncio.wait_for(dispatcher, timeout=1)
 
-    asyncio.run(scenario())
+    await scenario()
 
 
-def test_only_network_failures_reconnect_with_backoff(tmp_path):
+@pytest.mark.asyncio
+async def test_only_network_failures_reconnect_with_backoff(tmp_path):
     class ReconnectingWorker(PushWorker):
         calls = 0
 
@@ -670,7 +682,7 @@ def test_only_network_failures_reconnect_with_backoff(tmp_path):
             await permanent.run_forever()
         assert permanent.calls == 1
 
-    asyncio.run(scenario())
+    await scenario()
 
 
 @pytest.mark.asyncio

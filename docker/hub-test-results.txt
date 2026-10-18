@@ -1,0 +1,7 @@
+Engineering Hub V1 real Docker smoke: PASS
+- isolated container policy and loopback-only port
+- typed authenticated deploy and command-ID dedupe
+- bounded fixture smoke action
+- SQLite and target state survive container restart
+- pause admission persists across restart
+- fixture-only rollback, durable fencing, secret-free evidence

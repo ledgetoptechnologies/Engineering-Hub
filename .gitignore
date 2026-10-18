@@ -4,6 +4,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.test-tmp*/
+.hub-repo-test*/
+hub-ui/node_modules/
+hub-ui/dist/
+hub-ui/test-results/
+hub-ui/playwright-report/
 .coverage
 htmlcov/
 data/
