@@ -84,22 +84,32 @@ describe("live human API boundary", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
-  it("encodes exact-topic reads and keeps preflight advisory", async () => {
+  it("keeps validated topic paths literal, including colons, and preflight advisory", async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockImplementation(async () =>
         response({ advisory: true, delivery_guaranteed: false }),
       );
     const client = new HubClient({ mode: "live", fetchImpl });
-    await client.getTopic("topic/name");
+    await client.getTopic("ops:alerts");
     const result = await client.preflight("topic:name", "hermes");
     await client.getEventsStatus();
     expect(fetchImpl.mock.calls.map((call) => call[0])).toEqual([
-      "/api/hub/v1/topics/topic%2Fname/peers",
-      "/api/hub/v1/topics/topic%3Aname/preflight?recipient=hermes",
+      "/api/hub/v1/topics/ops:alerts/peers",
+      "/api/hub/v1/topics/topic:name/preflight?recipient=hermes",
       "/api/hub/v1/events/status",
     ]);
     expect(result.delivery_guaranteed).toBe(false);
+  });
+
+  it("rejects unsafe or noncanonical topics before any request", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const client = new HubClient({ mode: "live", fetchImpl });
+    for (const topic of ["", "topic/name", "topic%3Aname", ".", "..", "a?x=1", "a#b", "a\\b", "a b", "a\n", "é", "a".repeat(129)]) {
+      await expect(client.getTopic(topic)).rejects.toMatchObject({ status: 422, code: "invalid_topic" });
+      await expect(client.preflight(topic, "hermes")).rejects.toMatchObject({ status: 422, code: "invalid_topic" });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("sanitizes HTML, unknown error bodies and network exceptions", async () => {

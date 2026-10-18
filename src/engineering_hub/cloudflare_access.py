@@ -66,6 +66,40 @@ class CloudflareIdentity:
     expires_at: int
 
 
+# In-process capability only: no HTTP header, boolean state flag or serialized
+# value can impersonate this marker. It is intentionally not public API.
+_VERIFIED_ACCESS_KEY = object()
+_VERIFIED_ACCESS_MARKER = object()
+
+
+def _record_verified_access(scope, config, identity):
+    if type(config) is not CloudflareAccessConfig or type(identity) is not CloudflareIdentity:
+        raise ValueError("Verified Access identity and configuration required")
+    assertions = [value for name, value in scope.get("headers", [])
+                  if name.lower() == b"cf-access-jwt-assertion"]
+    if len(assertions) != 1:
+        raise ValueError("One verified Access assertion required")
+    scope[_VERIFIED_ACCESS_KEY] = (
+        _VERIFIED_ACCESS_MARKER, config, identity, hashlib.sha256(assertions[0]).digest(),
+    )
+
+
+def _verified_access(scope, config):
+    proof = scope.get(_VERIFIED_ACCESS_KEY)
+    if (type(proof) is not tuple or len(proof) != 4
+            or proof[0] is not _VERIFIED_ACCESS_MARKER
+            or type(config) is not CloudflareAccessConfig
+            or type(proof[1]) is not CloudflareAccessConfig or proof[1] != config
+            or type(proof[2]) is not CloudflareIdentity or type(proof[3]) is not bytes):
+        return None
+    assertions = [value for name, value in scope.get("headers", [])
+                  if name.lower() == b"cf-access-jwt-assertion"]
+    if (len(assertions) != 1 or proof[3] != hashlib.sha256(assertions[0]).digest()
+            or proof[2].expires_at <= int(time.time())):
+        return None
+    return proof[2]
+
+
 def _unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -216,6 +250,14 @@ def install_cloudflare_access(app, config: CloudflareAccessConfig | None, *, ver
         path = request.url.path
         if (checker is not None and (path == "/api/hub/v1" or path.startswith("/api/hub/v1/"))
                 and not request.headers.getlist("authorization")):
+            verified = _verified_access(request.scope, config)
+            # Identity state alone is not verification evidence. Clear stale or
+            # injected state before a normal assertion check.
+            request.scope.setdefault("state", {}).pop("cloudflare_identity", None)
+            request.scope["state"].pop("cloudflare_auth_error", None)
+            if verified is not None:
+                request.state.cloudflare_identity = verified
+                return await call_next(request)
             assertions = request.headers.getlist("cf-access-jwt-assertion")
             if assertions:
                 if len(assertions) != 1:

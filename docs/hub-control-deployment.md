@@ -7,7 +7,120 @@ and clients remain unchanged. Do not combine this file with either bus Compose
 file. The control image is built from `docker/Dockerfile.hub-control` and serves
 its compiled dashboard plus the independent Hub API/MCP on container port 8770.
 
+## Operator-only split ingress update (candidate, not deployed)
+
+Beau owns all TrueNAS administration. Agents prepare/review source, images and
+instructions; they must not inspect or change NAS management, containers, ACLs,
+mounts or services on his behalf without new explicit authorization. Beau
+confirmed the existing cloudflared connector runs on this NAS with host networking.
+The NAS clock must be synchronized: Access assertions use strict issued-at,
+not-before and expiry checks. A clock error can deny sign-in; verify time sync
+rather than bypassing JWT validation or extending accepted token lifetimes.
+
+Beau approved a 30-day human sign-in duration. The Hub-only Cloudflare Access
+application was saved and read back as **1 month**; its exact-email policy inherits
+the application duration. Global settings, Ops and agent tokens were not changed.
+The matching candidate source sets the local Access-session ceiling to 30 days,
+still capped by the verified assertion's expiry. GitHub sessions remain eight
+hours. Existing cookies/rows are not extended: after installing that release,
+perform one fresh Hub/Access sign-in to obtain the longer session. Clearing
+cookies, explicit logout, revocation, identity changes or earlier assertion expiry
+can still require sign-in sooner. No automatic/sliding renewal is introduced.
+
+The candidate `--split-ingress` entry point binds the agent front door on the
+existing Hub port8770 and the browser front door **only** on `127.0.0.1:8771`.
+It binds both sockets before constructing the core, creates one repository,
+session store, MCP manager, event feed and optional pilot owner, and runs the core
+lifespan once. Each HTTP listener has its own role guard and no independent
+lifespan or implicit proxy trust. Losing either listener stops its peer before
+the shared core shuts down. HTTP draining has a30second allowance; the declared
+1200second supervisor grace also covers the owned-pilot contract. No executor is
+activated by selecting split ingress.
+
+Only after this source is merged and the matching main-built image is published:
+
+1. Privately save the current Hub configuration and protect its dedicated state
+   with the established snapshot/SQLite backup procedure. Keep agent token values
+   private. Do not change or restore the existing message bus's data or settings.
+2. Update **only** the Hub app using the reviewed `compose.hub-control.yaml`:
+   retain its current three real agent tokens and dedicated state path, pull the
+   tested main image, add the split-ingress command, and configure Hub-specific
+   Cloudflare Access identity. The application AUD is public configuration, not
+   an authentication secret. Both8770 and8771 must be available. Do not set the
+   core to standalone `browser` or `agents` mode: the split runner's one core
+   remains `combined` behind two separately guarded adapters.
+3. Change **only** the Hub tunnel route's service URL to
+   `http://127.0.0.1:8771`. This loopback works because Beau confirmed both
+   applications use host networking on the same NAS. Leave the other route(s),
+   tunnel token, Ops policies and legacy bus8765 untouched.
+4. Verify from another LAN machine that8770's dashboard/assets/auth routes deny
+   access,8771 cannot be reached, and the approved agent clients can still call
+   Hub MCP/API with their existing private token helpers. Also verify the old
+   bus remains reachable. Through public HTTPS, verify no-cookie Access challenge,
+   authorized Hub sign-in, shared task visibility, and logout. A successful
+   health check is not evidence that human sign-in or agent readiness works.
+
+The tunnel should retain the canonical public Host header. Do not use proxy
+forwarded headers as an authentication or source-IP bypass. Existing exact agent
+IP restrictions remain unchanged; investigate an unexpected source rather than
+silently opening all LAN addresses. There is no need to add Nginx for this layout.
+
+If the update fails, stop only the Hub candidate and use the saved, reviewed
+image/configuration and compatible dedicated-state recovery procedure. Keep the
+public Hub route protected or unavailable during rollback; do not knowingly
+re-expose the old combined dashboard on the LAN to declare recovery complete.
+Report any return to combined ingress as a security limitation, not successful
+tunnel-only acceptance. Actual NAS installation, network isolation, browser
+sign-in, restart and reboot acceptance remain operator verification steps.
+
 ## Preconditions and private storage
+
+### Tunnel-only browser ingress: source capability and acceptance gate
+
+The initial host-network Compose serves one combined listener. A Cloudflare
+Access application at the public hostname does **not** hide that listener's
+dashboard from the LAN. Do not call the deployment tunnel-only until direct LAN
+requests to the dashboard, assets and human-auth routes are denied, including
+requests with the public Host header and forged forwarded/identity headers.
+
+The source supports explicit `HUB_INGRESS_MODE` values:
+
+- `combined` is the compatibility default; it does not provide ingress isolation.
+- `agents` admits only health and existing bearer-authenticated Hub API/MCP
+  routes, never the dashboard, assets or human-auth routes. Existing source-IP
+  restrictions and human-only action restrictions still apply.
+- `browser` requires complete Cloudflare Access configuration at startup and a
+  valid Hub-specific assertion on every non-health browser request, including
+  assets and sign-in. Agent Authorization headers and MCP are denied. Existing
+  local sessions, identity pins, Origin and CSRF checks remain required.
+
+`HUB_AGENT_ALLOWED_HOSTS` is an optional comma-separated list of exact MCP
+`host[:port]` values, including bracketed IPv6 where needed. It does not disable
+DNS-rebinding protection or make a Host header evidence of tunnel transit.
+The entry point disables Uvicorn forwarded-header trust; agent source-IP checks
+use the actual connected peer rather than user-supplied proxy claims.
+
+Network isolation remains an independent deployment requirement: the full
+browser origin must be reachable only by the verified tunnel connector/private
+network, while only the agent front door is available on the approved LAN.
+Do not publish the browser listener on all interfaces or assume that a remote
+or bridge-networked connector can reach the NAS host's loopback address.
+
+Two independent app instances sharing local ZFS SQLite can be evaluated for the
+current unowned release, but are **not** the permanent autonomous-pilot design:
+an owner-enrolled ledger intentionally refuses an unrelated second process.
+Browser mode rejects supplied execution components. Never weaken PilotOwner
+guards to accommodate a second frontend. An owned pilot needs a single-owner
+core with authenticated frontends and an explicitly tested single-owner,
+multi-listener lifecycle before activation. The candidate split runner described
+above implements that lifecycle; it does not make two independent processes safe.
+
+Acceptance must cover private browser reachability, agent token/IP access, all
+three identities, cross-frontend task/session/native-event consistency, proper
+disconnect cleanup, and unchanged legacy MCP on 8765. Source tests are not
+TrueNAS, tunnel, signed-in-browser, restart or reboot acceptance. Until the
+topology is verified, retain the existing live configuration and report the
+remaining LAN exposure explicitly.
 
 - Create `/mnt/Plugins/App_Data/Agent_MCP/engineering-hub` on the NAS's local
   ZFS storage, under the established MCP parent but never sharing its database.

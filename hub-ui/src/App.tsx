@@ -27,7 +27,12 @@ const names: Record<string, string> = {
 const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
 const topicDenied = (error: unknown) =>
-  error instanceof HubApiError && error.status === 403 && error.code === "topic_read_forbidden";
+  error instanceof HubApiError && error.status === 403 &&
+  ["topic_read_forbidden", "ingress_forbidden"].includes(error.code);
+const topicDenialText = (error: unknown) =>
+  error instanceof HubApiError && error.code === "ingress_forbidden"
+    ? "The selected topic request was rejected by ingress. Check the topic and retry; workspace records remain available."
+    : "This session cannot read the selected topic. Choose an authorized topic; workspace records remain available.";
 const errorText = (error: unknown) =>
   error instanceof HubApiError
     ? error.status === 401
@@ -243,7 +248,7 @@ export function HubApp() {
             if (topicDenied(error)) {
               setRegistryEpoch(null);
               setTopicStale(true);
-              setTopicError("This session cannot read the selected topic. Choose an authorized topic; workspace records remain available.");
+              setTopicError(topicDenialText(error));
               return;
             }
             if (
@@ -392,7 +397,7 @@ export function HubApp() {
         if (topicDenied(error)) {
           setPeers(null);
           setRegistryEpoch(null);
-          setTopicError("This session cannot read the selected topic. Choose an authorized topic; workspace records remain available.");
+          setTopicError(topicDenialText(error));
         } else if (error instanceof HubApiError && [401, 403].includes(error.status)) {
           setNotice(errorText(error));
           setNoticeError(true);

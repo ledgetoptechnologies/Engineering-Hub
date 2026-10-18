@@ -51,8 +51,18 @@ class Settings:
     agent_auth: AuthSettings
     auth_config: AuthConfig
     ui_directory: Path | None = None
+    ingress_mode: str = "combined"
+    agent_allowed_hosts: tuple[str, ...] = ()
 
     def __post_init__(self):
+        from .ingress import validate_agent_hosts
+        validate_agent_hosts(self.agent_allowed_hosts)
+        if self.ingress_mode not in {"combined", "agents", "browser"}:
+            raise ValueError("Unknown Hub ingress mode")
+        if self.ingress_mode == "browser" and (
+                self.auth_config.human_auth_mode != "cloudflare_access"
+                or self.auth_config.cloudflare_config is None):
+            raise ValueError("Browser ingress requires configured Cloudflare Access")
         # Operator templates must never become usable public bearer credentials.
         for value in (self.agent_auth.hermes_token, self.agent_auth.codex_token,
                       self.agent_auth.claude_token, self.agent_auth.admin_token):
@@ -78,7 +88,10 @@ class Settings:
                 os.environ.get("HUB_CF_ACCESS_ALLOWED_EMAILS", "").split(",") if email.strip()),
             alternate_origins=tuple(value.strip() for value in
                 os.environ.get("HUB_ALTERNATE_ORIGINS", "").split(",") if value.strip()),
-        ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None)
+        ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
+                   ingress_mode=os.environ.get("HUB_INGRESS_MODE", "combined"),
+                   agent_allowed_hosts=tuple(value.strip() for value in
+                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()))
 
 
 class Input(BaseModel):
@@ -147,6 +160,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None):
     settings = settings or Settings.from_env()
+    if settings.ingress_mode == "browser" and any(component is not None for component in (
+            fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service)):
+        raise ValueError("Browser ingress must not own staging execution")
     repo = repository or HubRepository(settings.database)
     if registry_bridge is not None and (type(registry_bridge) is not CanonicalRegistryBridge
                                         or reachability_provider is not None):
@@ -167,7 +183,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 or owned_pilot_service.workflow is not container_pilot_workflow
                 or owned_pilot_service.dispatcher is not staging_dispatcher):
             raise ValueError('owned_pilot_service_mismatch')
-    sessions = SessionStore(settings.database, repository=repo)
+    sessions = SessionStore(settings.database, repository=repo,
+                            session_ttl=settings.auth_config.local_session_ttl_seconds)
     feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
             staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):
@@ -226,7 +243,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     origin = urlsplit(settings.auth_config.origin)
     hub_mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[origin.netloc], allowed_origins=[settings.auth_config.origin],
+        allowed_hosts=list(dict.fromkeys([origin.netloc] + (
+            list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
+        allowed_origins=[settings.auth_config.origin],
     )
     mcp_app = hub_mcp.streamable_http_app()
 
@@ -256,7 +275,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.owned_pilot_service = owned_pilot_service
-    if settings.auth_config.human_auth_mode == "cloudflare_access":
+    if (settings.auth_config.human_auth_mode == "cloudflare_access"
+            and settings.ingress_mode == "combined"):
         from .cloudflare_access import install_cloudflare_access
         install_cloudflare_access(app, settings.auth_config.cloudflare_config)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
@@ -424,6 +444,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                  "reason": "live_presence_adapter_not_configured"}
                 for name in ("hermes", "codex", "claude")]
 
+    @app.head("/health", include_in_schema=False)
     @app.get("/health", response_model=HealthDTO)
     def health():
         # Control service liveness is not host, agent or deployment readiness.
@@ -556,4 +577,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
+    if settings.ingress_mode != "combined":
+        from .ingress import HubIngressMiddleware
+        # Added last so the boundary precedes redirects, auth and static routing.
+        app.add_middleware(HubIngressMiddleware, mode=settings.ingress_mode,
+                           agent_auth=settings.agent_auth,
+                           cloudflare_config=settings.auth_config.cloudflare_config)
     return app

@@ -21,6 +21,13 @@ export class HubApiError extends Error {
     this.name = "HubApiError";
   }
 }
+// This alphabet is the backend's topic contract. Every character is safe in
+// this path segment, including ':'. Encoding it would violate strict ingress.
+export function topicPath(topic: string): string {
+  if (/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.exec(topic)?.[0] !== topic)
+    throw new HubApiError(422, "invalid_topic");
+  return `/topics/${topic}`;
+}
 const knownCodes = new Set([
   "revision_conflict",
   "forbidden",
@@ -37,6 +44,7 @@ const knownCodes = new Set([
   "invalid_topic",
   "invalid_recipient",
   "topic_read_forbidden",
+  "ingress_forbidden",
 ]);
 const fallbackCode = (status: number) =>
   status === 401
@@ -149,8 +157,9 @@ export class HubClient {
     return structuredClone(this.demo);
   }
   async getTopic(topic: string): Promise<TopicSnapshot> {
+    const path = topicPath(topic);
     if (this.mode === "live")
-      return this.request(`/topics/${encodeURIComponent(topic)}/peers`);
+      return this.request(`${path}/peers`);
     this.demoHuman();
     return createDemoTopic(topic);
   }
@@ -264,9 +273,10 @@ export class HubClient {
     return { authenticated: false };
   }
   async preflight(topic: string, recipient: Agent): Promise<TopicPreflight> {
+    const path = topicPath(topic);
     if (this.mode === "live")
       return this.request(
-        `/topics/${encodeURIComponent(topic)}/preflight?recipient=${encodeURIComponent(recipient)}`,
+        `${path}/preflight?recipient=${encodeURIComponent(recipient)}`,
       );
     this.demoHuman();
     const peer = createDemoTopic(topic).items.find(

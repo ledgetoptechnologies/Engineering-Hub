@@ -725,3 +725,178 @@ Coordination INFO `3b3a0568-2b3a-4ba3-845d-0d3857c66110` told Hermes the patch w
 confined to this review checkout; no replacement daemon worker or activation was
 requested. Live bus/ports/data, Ops, DNS, Access policies and credentials remain
 unchanged. Overall release is still incomplete.
+
+## October 18: browser/agent ingress boundary candidate
+
+Starting from main `112a60e629a0555b2a9de2f2812f5c8eeda1e0d1`, the source adds
+opt-in `combined` (unchanged default), `agents`, and `browser` ingress roles.
+The pure-ASGI boundary executes before redirects, static serving and human auth.
+Agent mode retains existing bearer/source-IP authorization but refuses UI and
+human-auth paths; browser mode requires configured Access assertions even for
+index/assets/sign-in, rejects bearer/MCP, and retains local session/CSRF checks.
+Explicit exact agent MCP hosts preserve DNS-rebinding checks. The entry point
+now disables implicit forwarded-header trust. Browser execution injection fails
+closed; no PilotOwner rule is relaxed for a second frontend.
+
+Independent read-only review accepted this bounded source slice and independently
+ran the new ingress plus entrypoint tests: **91 passed**. Implementation-focused
+API/auth/MCP coverage: **218 passed**, one existing Starlette warning. Tests use
+local RSA signatures and mocked JWKS (not live Cloudflare credentials), including
+wrong audience/key/algorithm rejection, all three agents, source-IP/header/path
+spoofing, session/CSRF, multi-body streaming and cancellation propagation.
+
+Frozen working-tree validation image index
+`sha256:3154c9d370cd31d99696b078c8f77ecbf7deb93349cb018628f3670e34ae4eda`
+passed the full Linux suite: **2,083 passed**, **76.08 seconds**, exit 0, one
+existing Starlette/httpx deprecation warning. It contains the candidate runtime
+and tests; this evidence/deployment-document update followed the image build.
+The run used network none, read-only root, UID10001, private cgroup namespace,
+cap-drop ALL, no-new-privileges, two CPUs, 2GiB RAM, 256 PIDs, no host mounts,
+ports, Docker socket or real credentials. Only disposable private tmpfs was
+writable: executable test scratch `/tmp`, and noexec `/validation/data` plus
+`/validation/tests/.test-data`. The named container removed itself after exit.
+
+The first Windows full-suite attempt failed collection because existing bus file
+code imports Linux `fcntl`; it was not counted as acceptance. Two initial Linux
+harness attempts omitted required fixture tmpfs and likewise failed collection.
+The final invocation supplied the already-documented isolated mounts; no test
+assertions or application behavior were weakened to obtain the passing result.
+
+Separately authorized Cloudflare work created a Hub-only Access application and
+exact-two-email Allow policy, without modifying Ops. An unauthenticated public
+request changed from HTML200 to Access-login302. Direct NAS8770 still returned
+HTML200. Origin-side Access configuration, physical browser/agent separation,
+signed-in browser acceptance, cross-frontend shared-state/events, actual TrueNAS
+rollout/reboot, trusted host providers and an owned autonomous pilot remain
+unproven. Two app processes on an unenrolled SQLite database are not a substitute
+for deliberate single-owner integration once the pilot ledger is enrolled.
+
+A post-app-restart native listener recovery attempt also exposed a separate live
+bus fault: version0.6.0 health reports native push `failed`, `OperationalError`,
+subscriptions disabled; independent initialize advertises `resources.subscribe`
+false while ordinary authenticated receive works. No polling fallback, bus
+restart or server configuration change was made. A linked read-only diagnostic
+request and evidence were sent to Hermes; acceptance is pending, not assumed.
+
+## October 18: one-owner split listener and packaged-image verification
+
+Source commit `6531c74214253c4c853e209eacff16ee6addf51e` adds a single shared
+core/lifespan with agent and browser ASGI adapters. Both sockets bind before core
+construction; browser bind is hard-coded IPv4 loopback. Listener configuration
+executes inside the owner lifespan, with explicit single-worker settings.
+Startup errors unwind ownership; listener loss drains its peer, and repeated
+caller cancellation cannot release the core before listeners drain. Private
+in-process JWT verification proof avoids double verification without trusting
+public headers or arbitrary request state. No existing bus source changed.
+
+Independent read-only review accepted lifecycle, JWT proof, Compose, smoke and
+publication gate changes; independently executed server/proof/smoke tests:
+**36 passed**. Root's final focused owner/proof/frontend/entrypoint check:
+**32 passed, 1 Windows skip** (Linux owner test). Earlier final focused set
+before the two owner regressions: **66 passed, 1 Windows skip**.
+
+Frozen Linux validation image index
+`sha256:49870470dc8e725245f6dfb0461aab18b3c0c4bb9781e69bd62be5e2d9b1c863`
+contains the final runtime/tests and passed **2,131 tests in 81.08 seconds**,
+exit 0. Same isolated profile/tmpfs as the previous entry. It includes the Linux
+actual PilotOwner frontend test. Warnings: existing Starlette deprecation and an
+unclosed-event-loop ResourceWarning attributed during an executor-client test.
+The latter is not declared fixed: rerunning frontend/server/proof/executor-client
+tests with ResourceWarning promoted to error passed **114 tests in 2.62 seconds**;
+its full-suite origin remains unconfirmed. Workflow and documentation changes
+followed this validation-image snapshot; runtime/tests were unchanged.
+
+Locally built packaged control image, baked source `6531c742...`, index
+`sha256:de9783f80f07a56917e8a5048c2e5e37c201050cc1ca5f4e937016cba626831b`,
+passed the new split smoke using its normal entrypoint plus `--split-ingress`.
+Actual kernel TCP tables show only `127.0.0.1:8771` for browser and `0.0.0.0:8770`
+for agents, no IPv6 Hub listener. Both health endpoints report the exact source;
+all three synthetic agent tokens initialize MCP and list exactly nine tools.
+Missing/invalid tokens fail; agent UI/auth/static routes and browser bearer/MCP
+routes fail; missing/forged Access JWTs fail. The container runs UID/GID568,
+network none, read-only root, no capabilities, no-new-privileges, private cgroup,
+1 CPU/512MiB/128PIDs, private tmpfs and one owned disposable named volume only.
+Recreation preserved a fixture marker, then ownership-verified cleanup removed
+the disposable containers and volume. This proves marker persistence, not task
+durability, an autonomous pilot or host recovery. No registry upload was done.
+
+The Hub-only publication workflow now runs split smoke for PR builds, the exact
+publication candidate before upload, and the authenticated registry digest before
+latest promotion. Existing combined smoke remains. This does not authorize or
+prove live rollout. Beau confirmed same-NAS host-network cloudflared and reserved
+all NAS administration for himself; no agent NAS inspection/change is allowed
+under the current scope. Operator instructions remain gated on a published image.
+Actual Cloudflare login, NAS/LAN isolation, app/reboot acceptance, trusted host
+providers and an owned autonomous pilot remain required. Overall goal incomplete.
+
+### Stronger shared-record recreation probe
+
+The subsequent smoke-helper enhancement was run against that same packaged
+`6531c742...` image and passed. It seeds one synthetic human-owned fixture task
+through the repository (not a fabricated browser session), claims it through the
+Codex bearer API and creates an open non-authorizing decision through Hermes's
+bearer API. All three agent identities read exact resulting records. After
+container replacement, only GETs verify the original task/decision IDs, full
+fields, status, owner and revisions against private saved expectations. Report:
+`durable_task_decision_recreation: true`. No task/decision is recreated or replayed
+in the replacement. Unit evidence: **31 passed**, one existing warning; includes
+fresh-app transport and deliberately mutated-record failure. This strengthens
+record persistence evidence, not browser authentication or autonomous execution.
+
+The enhanced helper/tests full Linux snapshot index
+`sha256:da8928790b1fd5252341a6e7aa3b99bb5757e28b99876cc88e4fb940c286e347`
+passed **2,133 tests in 80.98 seconds**, exit0, with the same Starlette and
+unclosed-event-loop warning classes. Independent helper review ran its scoped
+18 tests and accepted exact-record and negative mutation coverage.
+
+Claude's review identified a valid legacy topic containing a colon being encoded
+as `%3A`, rejected by strict ingress and treated by UI as global session loss.
+The UI now validates the exact legacy alphabet before HTTP and preserves literal
+colons; topic-specific ingress denial stays local while real auth/global ingress
+denials still clear private state. Canonical registry streaming retains its
+separate narrower alphabet, not a new colon-support claim. UI unit19, full
+Playwright32 and production build passed; independent API review10 passed.
+A real two-socket regression also proved literal-colon peers200 while encoded
+colon remains403 (10 server tests passed). That server-test assertion and the UI
+changes followed the Linux snapshot above; do not imply it included them.
+Both GitHub workflows for prior head7935ef4 succeeded (39166678653/39166678655),
+including actual packaged split smoke; updated source still needs fresh CI.
+
+### Actual application pilot: concrete remaining host composition
+
+Read-only comparison with host overlay `e5ed4d3` confirms the concrete Engine
+backend exists but is not integrated into the control checkout. Actual acceptance
+still needs protected content-addressed/build enrollment, installed-driver
+measurement, immutable private test-secret versions, healthy baseline enrollment,
+exclusive bounded candidate/rollback state generations, and a durable private
+operation journal. Existing mocks do not supply those trusted implementations.
+The explicit application-pilot acceptance entrypoint is still disabled.
+
+Two specific compatibility gates were identified: the host profile rejects the
+control image's fixed `HUB_DB` default, and the pilot requires UID/GID10001 rather
+than the control deployment's568. Resolve these with exact profile/default and
+private-state permission evidence; do not broadly waive environment checks or
+change the working control image just to pass. The isolated pilot expects the
+combined internal8770 target, not the production split-listener layout. Mid-effect
+unknown successes deliberately remain held; durable completed-command recovery
+must not be reported as arbitrary successful crash continuation. Hermes request
+`861ce3b6-44ab-4ad9-a4a2-7774e1be9c73` asks for the bounded source/provider
+composition and isolated evidence only, with all NAS administration excluded.
+
+### Approved 30-day sign-in preference
+
+Following Beau's direct request and action-time confirmation, only the Hub Access
+application duration was saved from24hours to1month and independently read back
+in the browser. Existing Hub policy inherits application duration; Ops/global
+settings, email selectors, agent tokens and TrueNAS were unchanged. The local
+Access-session ceiling now becomes2,592,000seconds, while GitHub and standalone
+SessionStore defaults remain28,800seconds. Verified JWT expiry still caps the
+local session and every browser request still requires a signed assertion.
+No leeway, sliding renewal, identity repinning or retroactive cookie extension.
+
+Implementation auth/ingress/proof tests142passed; independent auth review45passed;
+root reran the broader set including real sockettests: **152passed**, existing
+Starlette warning. Tests use actualRSA/mockedJWKS and a controlled session clock
+for day29/day30, earlier JWT expiry, non-renewal, missing/forged assertions, CSRF
+and logout replay. These prove source behavior, not thirty elapsed real days or
+installation of this updated release. A fresh sign-in after deployment is needed.

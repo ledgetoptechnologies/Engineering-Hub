@@ -157,6 +157,88 @@ def test_access_session_is_hashed_durable_and_not_extended_by_new_jwt(hub):
     assert data["csrf_token"] and headers["X-Hub-CSRF"]
 
 
+def test_access_app_has_thirty_day_fixed_local_ceiling_and_github_stays_eight_hours(hub, tmp_path):
+    client, app, config, assertion, _ = hub
+    day = 24 * 60 * 60
+    now = [int(time.time())]
+    start = now[0]
+    app.state.sessions.clock = lambda: now[0]
+    assert config.local_session_ttl_seconds == app.state.sessions.session_ttl == 30 * day
+    github = AuthConfig("https://github-only.example", beau_github_id=42)
+    github_app = create_app(Settings(tmp_path / "github.db", AuthSettings("h", "c"), github))
+    assert github.local_session_ttl_seconds == github_app.state.sessions.session_ttl == 8 * 60 * 60
+    assert SessionStore(tmp_path / "bare.db").session_ttl == 8 * 60 * 60
+    signed = {"Cf-Access-Jwt-Assertion": assertion(exp=start + 31 * day)}
+    response = client.get(BASE + "/auth/login", headers=signed)
+    assert response.status_code == 303
+    cookie = response.headers["set-cookie"]
+    assert "Max-Age=2592000" in cookie and "Secure" in cookie and "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie
+    with app.state.sessions._read_db() as db:
+        assert db.execute("SELECT expires FROM auth_access_sessions").fetchone()[0] == start + 30 * day
+    now[0] = start + 29 * day
+    assert client.get(BASE + "/overview", headers=signed).status_code == 200
+    for bad in ({}, {"Cf-Access-Jwt-Assertion": "forged"},
+                {"Cf-Access-Jwt-Assertion": assertion(exp=1)},
+                {"Cf-Access-Authenticated-User-Email": EMAILS[0]}):
+        assert client.get(BASE + "/overview", headers=bad).status_code == 401
+    now[0] = start + 30 * day - 1
+    assert client.get(BASE + "/overview", headers=signed).status_code == 200
+    now[0] = start + 30 * day
+    assert client.get(BASE + "/overview", headers=signed).status_code == 401
+    # A newer valid assertion cannot slide or renew the expired local session.
+    assert client.get(BASE + "/overview", headers={
+        "Cf-Access-Jwt-Assertion": assertion(exp=start + 60 * day)}).status_code == 401
+
+
+def test_thirty_day_access_cookie_is_capped_by_earlier_assertion_expiry(hub):
+    client, app, _, assertion, _ = hub
+    day = 24 * 60 * 60
+    now = [int(time.time())]
+    start = now[0]
+    app.state.sessions.clock = lambda: now[0]
+    signed = {"Cf-Access-Jwt-Assertion": assertion(exp=start + 2 * day)}
+    response = client.get(BASE + "/auth/login", headers=signed)
+    assert response.status_code == 303 and "Max-Age=172800" in response.headers["set-cookie"]
+    with app.state.sessions._read_db() as db:
+        assert db.execute("SELECT expires FROM auth_access_sessions").fetchone()[0] == start + 2 * day
+    now[0] = start + 2 * day - 1
+    assert client.get(BASE + "/overview", headers=signed).status_code == 200
+    now[0] = start + 2 * day
+    assert client.get(BASE + "/overview", headers=signed).status_code == 401
+    assert client.get(BASE + "/overview", headers={
+        "Cf-Access-Jwt-Assertion": assertion(exp=start + 31 * day)}).status_code == 401
+
+
+def test_thirty_day_session_logout_revokes_cookie_replay_at_day_twenty_nine(hub):
+    client, app, config, assertion, _ = hub
+    day = 24 * 60 * 60
+    now = [int(time.time())]
+    start = now[0]
+    app.state.sessions.clock = lambda: now[0]
+    headers, _ = sign_in(client, assertion(exp=start + 30 * day))
+    cookie = client.cookies.get(config.cookie_name)
+    now[0] = start + 29 * day
+    assert client.get(BASE + "/overview", headers=headers).status_code == 200
+    assert client.post(BASE + "/pause", headers={key: value for key, value in headers.items()
+                       if key != "X-Hub-CSRF"}, json={"paused": True}).status_code == 403
+    assert client.post(BASE + "/auth/logout", headers=headers).status_code == 200
+    client.cookies.set(config.cookie_name, cookie)
+    assert client.get(BASE + "/overview", headers=headers).status_code == 401
+
+
+def test_existing_short_access_cookie_does_not_extend_after_configuration_change(hub):
+    client, app, _, assertion, _ = hub
+    now = [int(time.time())]
+    start = now[0]
+    app.state.sessions.clock = lambda: now[0]
+    app.state.sessions.session_ttl = 8 * 60 * 60
+    headers, _ = sign_in(client, assertion(exp=start + 30 * 24 * 60 * 60))
+    app.state.sessions.session_ttl = 30 * 24 * 60 * 60
+    now[0] = start + 8 * 60 * 60
+    assert client.get(BASE + "/overview", headers=headers).status_code == 401
+
+
 def test_unconfigured_cloudflare_mode_denies_and_does_not_fall_back(tmp_path):
     config = AuthConfig("https://hub.example", "client", "secret", 42, human_auth_mode="cloudflare_access")
     settings = Settings(tmp_path / "hub.sqlite", AuthSettings("h", "c", claude_token="cl"), config)

@@ -43,8 +43,9 @@ def test_declared_stop_grace_covers_owned_pilot_contract_without_activation():
     hub = service()
     declared = int(hub['environment']['HUB_SUPERVISOR_STOP_GRACE_SECONDS'])
     assert hub['stop_grace_period'] == f'{declared}s'
-    assert declared >= REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
-    assert 'command' not in hub and 'entrypoint' not in hub
+    assert declared >= REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS + 30
+    assert hub['command'] == ['--split-ingress', '--browser-port', '8771']
+    assert 'entrypoint' not in hub
 
 
 def test_only_dedicated_operator_state_bind_no_credential_files_or_source():
@@ -66,7 +67,13 @@ def test_only_dedicated_operator_state_bind_no_credential_files_or_source():
         assert env[optional] == ''
     assert env['HUB_BASE_URL'] == 'https://hub.ledgetoptechnologies.com'
     assert env['HUB_ALTERNATE_ORIGINS'] == ''
-    assert env['HUB_HUMAN_AUTH_MODE'] == 'github'
+    assert env['HUB_HUMAN_AUTH_MODE'] == 'cloudflare_access'
+    assert env['HUB_INGRESS_MODE'] == 'combined'  # One core, outer per-socket guards.
+    assert env['HUB_AGENT_ALLOWED_HOSTS'] == '192.168.50.80:8770,127.0.0.1:8770'
+    assert env['HUB_CF_ACCESS_ISSUER'] == 'https://ledgetoptechnologies.cloudflareaccess.com'
+    assert len(env['HUB_CF_ACCESS_AUDIENCE']) == 64
+    assert set(env['HUB_CF_ACCESS_ALLOWED_EMAILS'].split(',')) == {
+        'bkoltz@ledgetoptechnologies.com', 'beaukoltz@ledgetopdroneservices.com'}
 
 
 def test_image_entrypoint_and_health_are_the_separate_control_service():
@@ -74,9 +81,11 @@ def test_image_entrypoint_and_health_are_the_separate_control_service():
     dockerfile = (ROOT / 'docker' / 'Dockerfile.hub-control').read_text()
     assert 'USER 568:568' in dockerfile
     assert '"engineering_hub"' in dockerfile and '"8770"' in dockerfile
-    assert not {'command', 'entrypoint'} & hub.keys()
+    assert 'entrypoint' not in hub
+    assert hub['command'] == ['--split-ingress', '--browser-port', '8771']
     assert hub['healthcheck']['test'][:3] == ['CMD', 'python', '-c']
-    assert '127.0.0.1:8770/health' in hub['healthcheck']['test'][3]
+    assert '127.0.0.1:' in hub['healthcheck']['test'][3]
+    assert '(8770,8771)' in hub['healthcheck']['test'][3]
 
 
 def test_documented_operator_gates_not_a_deployment_or_egress_claim():
