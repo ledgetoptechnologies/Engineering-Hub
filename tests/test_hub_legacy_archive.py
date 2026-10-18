@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -38,8 +40,52 @@ def _audit_record(previous: str, marker: str) -> dict[str, object]:
     return record
 
 
+def _initialize_v060_stores(db_path: Path, files_root: Path, extraction_root: Path) -> None:
+    """Initialize a synthetic DB through the actual v0.6.0 store code/resources."""
+    source_repo = Path(__file__).resolve().parents[2] / "internal-MCP-messaging"
+    archived = subprocess.run(
+        ["git", "archive", "--format=tar", "v0.6.0", "src/agent_message_bus"],
+        cwd=source_repo, capture_output=True, check=True, timeout=30,
+    )
+    extraction_root.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as source_archive:
+        source_archive.extractall(extraction_root, filter="data")
+    package_root = extraction_root / "src" / "agent_message_bus"
+    package_name = "legacy_bus_v060_" + hashlib.sha256(str(extraction_root).encode()).hexdigest()[:12]
+    package_spec = importlib.util.spec_from_file_location(
+        package_name, package_root / "__init__.py", submodule_search_locations=[str(package_root)],
+    )
+    assert package_spec is not None and package_spec.loader is not None
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[package_name] = package
+    package_spec.loader.exec_module(package)
+
+    def load_module(name: str):
+        module_spec = importlib.util.spec_from_file_location(
+            f"{package_name}.{name}", package_root / f"{name}.py",
+        )
+        assert module_spec is not None and module_spec.loader is not None
+        module = importlib.util.module_from_spec(module_spec)
+        sys.modules[module_spec.name] = module
+        module_spec.loader.exec_module(module)
+        return module
+
+    load_module("database").MessageRepository(db_path)
+    load_module("files").FileRepository(db_path, files_root)
+    load_module("feedback").FeedbackRepository(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert checkpoint is not None and checkpoint[0] == 0
+    finally:
+        connection.close()
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
 def _build_bundle(bundle: Path) -> dict[str, str]:
-    """Create an entirely synthetic v1 bundle with all legacy core tables."""
+    """Build a synthetic archive using the actual v0.6.0 store initialization."""
+
     import sqlite3
 
     bundle.mkdir()
@@ -47,65 +93,8 @@ def _build_bundle(bundle: Path) -> dict[str, str]:
     files_root = bundle / "files"
     (files_root / ".agent-message-bus" / "objects").mkdir(parents=True)
     db_path = bundle / "data" / "messages.sqlite3"
+    _initialize_v060_stores(db_path, files_root, bundle.parent / "legacy-v060-source")
     conn = sqlite3.connect(db_path)
-    conn.executescript(
-        """
-        PRAGMA foreign_keys=ON;
-        CREATE TABLE messages (
-          id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
-          message_type TEXT NOT NULL, priority TEXT NOT NULL, body_json TEXT NOT NULL,
-          status TEXT NOT NULL, correlation_id TEXT, in_reply_to TEXT,
-          hop_count INTEGER NOT NULL, requires_user_approval INTEGER NOT NULL,
-          created_at TEXT NOT NULL, claimed_by TEXT, claim_expires_at TEXT,
-          acknowledged_at TEXT, rejected_at TEXT, rejection_reason TEXT
-        );
-        CREATE TABLE message_delivery_sequence (
-          seq INTEGER PRIMARY KEY AUTOINCREMENT,
-          message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE
-        );
-        CREATE TABLE send_idempotency (
-          sender TEXT NOT NULL, client_request_id TEXT NOT NULL, message_id TEXT NOT NULL,
-          recipient TEXT NOT NULL, created_at TEXT NOT NULL, seq INTEGER NOT NULL,
-          fingerprint_version INTEGER NOT NULL, fingerprint TEXT NOT NULL,
-          PRIMARY KEY (sender, client_request_id)
-        );
-        CREATE TABLE files (
-          path TEXT PRIMARY KEY, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
-          content_type TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          version INTEGER NOT NULL, created_by TEXT, updated_by TEXT, storage_key TEXT
-        );
-        CREATE TABLE file_revisions (
-          path TEXT NOT NULL, version INTEGER NOT NULL, size INTEGER NOT NULL,
-          sha256 TEXT NOT NULL, content_type TEXT NOT NULL, created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL, created_by TEXT, updated_by TEXT,
-          storage_key TEXT NOT NULL, PRIMARY KEY (path, version)
-        );
-        CREATE TABLE knowledge (
-          project TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL,
-          content TEXT NOT NULL, version INTEGER NOT NULL, sha256 TEXT NOT NULL,
-          created_by TEXT NOT NULL, updated_by TEXT NOT NULL, created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL, PRIMARY KEY (project, path)
-        );
-        CREATE TABLE topic_memberships (
-          topic TEXT NOT NULL, agent TEXT NOT NULL, session_hash TEXT NOT NULL,
-          subscription_generation TEXT NOT NULL, stream_generation TEXT NOT NULL,
-          generation TEXT NOT NULL, registered_at TEXT NOT NULL, PRIMARY KEY(topic, agent)
-        );
-        CREATE TABLE feedback_entries (
-          id TEXT PRIMARY KEY, author TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL,
-          description TEXT NOT NULL, project TEXT NOT NULL, severity TEXT NOT NULL,
-          status TEXT NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL, client_request_id TEXT, payload_json TEXT, payload_hash TEXT,
-          UNIQUE(author, client_request_id)
-        );
-        CREATE TABLE feedback_history (
-          feedback_id TEXT NOT NULL REFERENCES feedback_entries(id), revision INTEGER NOT NULL,
-          actor TEXT NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL,
-          PRIMARY KEY(feedback_id, revision)
-        );
-        PRAGMA user_version=2;
-        """
-    )
     marker = "SYNTHETIC-SECRET-MARKER-DO-NOT-REPORT"
     message_id = "synthetic-message-id"
     conn.execute(
@@ -148,18 +137,34 @@ def _build_bundle(bundle: Path) -> dict[str, str]:
         ("legacy/flat.txt", 1, len(b"revision-one"), _sha256(b"revision-one"),
          "text/plain", now, now, "hermes", "hermes", "a" * 64),
     )
-    notes: list[dict[str, str]] = []
+    notes: list[dict[str, object]] = []
     for number in range(1, 66):
-        path = f"notes/note-{number:03}.md"
+        source_path = f"Shared/note-{number:03}.md"
+        path = f"snapshots/20261014T010743Z/{source_path}"
         content = f"Synthetic VaultBridge note {number}; {marker}"
         digest = _sha256(content.encode())
-        notes.append({"destination_path": path, "source_sha256": digest})
+        notes.append({
+            "source_path": source_path,
+            "sha256": digest,
+            "modified": now,
+            "destination_paths": [path],
+        })
         conn.execute(
             "INSERT INTO knowledge VALUES(?,?,?,?,?,?,?,?,?,?)",
             ("vaultbridge", path, f"Synthetic note {number}", content, 1, digest,
              "synthetic", "synthetic", now, now),
         )
-    vb_manifest = json.dumps({"count": 65, "entries": notes}, separators=(",", ":"))
+    vb_manifest = json.dumps({
+        "source": "VaultBridge",
+        "source_url": "http://192.168.50.80:30491",
+        "destination_project": "vaultbridge",
+        "snapshot": "20261014T010743Z",
+        "source_note_count": 65,
+        "verified_note_count": 65,
+        "source_preserved": True,
+        "old_inbox_messages_replayed": False,
+        "notes": notes,
+    }, separators=(",", ":"))
     vb_digest = _sha256(vb_manifest.encode())
     conn.execute(
         "INSERT INTO knowledge VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -194,20 +199,33 @@ def _build_bundle(bundle: Path) -> dict[str, str]:
     return {"marker": marker, "manifest_sha256": _sha256((bundle / "archive-manifest.json").read_bytes())}
 
 
-def _readonly_subprocess_env(tmp_path: Path, bundle: Path) -> dict[str, str]:
+def _readonly_subprocess_env(
+    tmp_path: Path, bundle: Path, *, writable_relative: str | None = None,
+) -> dict[str, str]:
+    """Test shim only: simulate mount flags; it is not kernel-mount evidence."""
     patch_dir = tmp_path / "python-startup"
     patch_dir.mkdir(exist_ok=True)
     realpath = str(bundle.absolute())
     (patch_dir / "sitecustomize.py").write_text(
         "import os\nfrom types import SimpleNamespace\n"
-        "_real_statvfs = os.statvfs\n"
+        "_real_fstatvfs = os.fstatvfs\n"
         f"_bundle = {realpath!r}\n"
-        "def _statvfs(path):\n"
-        "    result = _real_statvfs(path)\n"
-        "    if os.path.abspath(os.fspath(path)) == _bundle:\n"
-        "        return SimpleNamespace(f_flag=result.f_flag | getattr(os, 'ST_RDONLY', 1))\n"
+        f"_writable_relative = {writable_relative!r}\n"
+        "_readonly = getattr(os, 'ST_RDONLY', 1)\n"
+        "def _fstatvfs(fd):\n"
+        "    result = _real_fstatvfs(fd)\n"
+        "    try:\n"
+        "        path = os.path.abspath(os.readlink(f'/proc/self/fd/{fd}'))\n"
+        "        relative = os.path.relpath(path, _bundle)\n"
+        "    except OSError:\n"
+        "        return result\n"
+        "    if path == _bundle or path.startswith(_bundle + os.sep):\n"
+        "        flags = result.f_flag | _readonly\n"
+        "        if relative == _writable_relative:\n"
+        "            flags &= ~_readonly\n"
+        "        return SimpleNamespace(f_flag=flags)\n"
         "    return result\n"
-        "os.statvfs = _statvfs\n",
+        "os.fstatvfs = _fstatvfs\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
@@ -248,13 +266,16 @@ def test_cli_validates_synthetic_v1_bundle_without_emitting_payloads(tmp_path: P
     assert report["source_captured_unverified"]["schema_version"] == 4
     assert report["database"]["pragma_user_version"] == 2
     assert report["database"]["table_counts"]["knowledge"] == 66
+    assert "topic_memberships" not in report["database"]["table_counts"]
+    assert report["database"]["optional_tables_archived"] == []
     assert report["database"]["schema_primary_keys"]["messages"] == ["id"]
     assert set(report["database"]["logical_digests"]) == set(report["database"]["table_counts"])
     assert all(len(digest) == 64 for digest in report["database"]["logical_digests"].values())
     assert report["files"]["current_rows_verified"] == 2
     assert report["files"]["revision_rows_verified"] == 2
     assert report["audit"]["records_verified"] == 2
-    assert report["vaultbridge"]["listed_entries_verified"] == 65
+    assert report["vaultbridge"]["source_notes_verified"] == 65
+    assert report["vaultbridge"]["destination_rows_verified"] == 65
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     source_after = {
         path.relative_to(bundle).as_posix(): path.read_bytes()
@@ -296,6 +317,22 @@ def test_writable_mount_is_refused_before_report_creation(tmp_path: Path) -> Non
     assert result.returncode == 2
     assert result.stderr.strip() == "validation failed: readonly_mount_required"
     assert not report_path.exists()
+
+
+def test_nested_writable_source_mount_is_refused_when_bundle_root_is_readonly(tmp_path: Path) -> None:
+    bundle = tmp_path / "synthetic-bundle"
+    _build_bundle(bundle)
+    report_path = tmp_path / "validation.json"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "validate", "--bundle", str(bundle), "--report", str(report_path)],
+        capture_output=True, text=True,
+        env=_readonly_subprocess_env(tmp_path, bundle, writable_relative="audit.jsonl"), timeout=60,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "validation failed: readonly_mount_required"
+    assert not report_path.exists()
+
 
 
 def test_malformed_audit_secret_is_not_reported(tmp_path: Path) -> None:
@@ -365,6 +402,7 @@ def test_vaultbridge_manifest_checks_listed_rows_without_dropping_unrelated_know
              _sha256(unrelated.encode()), "synthetic", "synthetic",
              "2026-10-14T01:07:43Z", "2026-10-14T01:07:43Z"),
         )
+    connection.close()
     _refresh_inventory(bundle)
     report_path = tmp_path / "validation.json"
     result = subprocess.run(
@@ -374,8 +412,41 @@ def test_vaultbridge_manifest_checks_listed_rows_without_dropping_unrelated_know
 
     assert result.returncode == 0, result.stderr
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["vaultbridge"]["listed_entries_verified"] == 65
+    assert report["vaultbridge"]["source_notes_verified"] == 65
+    assert report["vaultbridge"]["destination_rows_verified"] == 65
     assert report["database"]["table_counts"]["knowledge"] == 67
+
+
+def test_vaultbridge_manifest_requires_source_path_provenance(tmp_path: Path) -> None:
+    bundle = tmp_path / "synthetic-bundle"
+    _build_bundle(bundle)
+    database = bundle / "data" / "messages.sqlite3"
+    with sqlite3.connect(database) as connection:
+        manifest_path = "snapshots/20261014T010743Z/MANIFEST.json"
+        contents = connection.execute(
+            "SELECT content FROM knowledge WHERE project='vaultbridge' AND path=?", (manifest_path,),
+        ).fetchone()[0]
+        manifest = json.loads(contents)
+        manifest["notes"][0]["destination_paths"] = [
+            "snapshots/20261014T010743Z/Shared/not-the-source.md"
+        ]
+        updated = json.dumps(manifest, separators=(",", ":"))
+        connection.execute(
+            "UPDATE knowledge SET content=?,sha256=? WHERE project='vaultbridge' AND path=?",
+            (updated, _sha256(updated.encode()), manifest_path),
+        )
+    connection.close()
+    _refresh_inventory(bundle)
+    report_path = tmp_path / "validation.json"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "validate", "--bundle", str(bundle), "--report", str(report_path)],
+        capture_output=True, text=True, env=_readonly_subprocess_env(tmp_path, bundle), timeout=60,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "validation failed: vaultbridge_archive_invalid"
+    assert not report_path.exists()
+
 
 
 def test_large_synthetic_knowledge_table_verifies_across_batches(tmp_path: Path) -> None:
@@ -392,6 +463,7 @@ def test_large_synthetic_knowledge_table_verifies_across_batches(tmp_path: Path)
                 ("synthetic", f"notes/{number:03}.md", f"Synthetic note {number}", content, 1,
                  _sha256(content.encode()), "synthetic", "synthetic", timestamp, timestamp),
             )
+    connection.close()
     _refresh_inventory(bundle)
     report_path = tmp_path / "validation.json"
     result = subprocess.run(
@@ -494,6 +566,38 @@ def test_sqlite_wal_sidecar_is_rejected_even_when_inventoried(tmp_path: Path) ->
     assert not report_path.exists()
 
 
+def test_optional_topic_memberships_are_digested_as_archive_metadata(tmp_path: Path) -> None:
+    bundle = tmp_path / "synthetic-bundle"
+    _build_bundle(bundle)
+    with sqlite3.connect(bundle / "data" / "messages.sqlite3") as connection:
+        connection.execute(
+            """CREATE TABLE topic_memberships (
+                topic TEXT NOT NULL, agent TEXT NOT NULL, session_hash TEXT NOT NULL,
+                subscription_generation TEXT NOT NULL, stream_generation TEXT NOT NULL,
+                generation TEXT NOT NULL, registered_at TEXT NOT NULL,
+                PRIMARY KEY (topic, agent)
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO topic_memberships VALUES(?,?,?,?,?,?,?)",
+            ("synthetic", "hermes", "a" * 64, "subscription", "stream", "generation", "2026-10-14T01:07:43Z"),
+        )
+    connection.close()
+    _refresh_inventory(bundle)
+    report_path = tmp_path / "validation.json"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "validate", "--bundle", str(bundle), "--report", str(report_path)],
+        capture_output=True, text=True, env=_readonly_subprocess_env(tmp_path, bundle), timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    database = json.loads(report_path.read_text(encoding="utf-8"))["database"]
+    assert database["optional_tables_archived"] == ["topic_memberships"]
+    assert database["table_counts"]["topic_memberships"] == 1
+    assert len(database["logical_digests"]["topic_memberships"]) == 64
+
+
+
 def test_database_rejects_extra_table_with_sqlite_like_prefix(tmp_path: Path) -> None:
     bundle = tmp_path / "synthetic-bundle"
     _build_bundle(bundle)
@@ -502,6 +606,7 @@ def test_database_rejects_extra_table_with_sqlite_like_prefix(tmp_path: Path) ->
     with sqlite3.connect(bundle / "data" / "messages.sqlite3") as connection:
         connection.execute("CREATE TABLE sqliteXextra(secret TEXT)")
         connection.execute("INSERT INTO sqliteXextra VALUES('synthetic hidden table')")
+    connection.close()
     _refresh_inventory(bundle)
     report_path = tmp_path / "validation.json"
     result = subprocess.run(
@@ -533,7 +638,8 @@ def test_semantic_integrity_failures_are_metadata_only(
         audit_path.write_text("".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records))
     elif mutation == "knowledge":
         with sqlite3.connect(bundle / "data" / "messages.sqlite3") as connection:
-            connection.execute("UPDATE knowledge SET content=? WHERE path='notes/note-001.md'", (sentinels["marker"],))
+            connection.execute("UPDATE knowledge SET content=? WHERE path='snapshots/20261014T010743Z/Shared/note-001.md'", (sentinels["marker"],))
+        connection.close()
     elif mutation == "object":
         object_path = bundle / "files" / ".agent-message-bus" / "objects" / ("c" * 64)
         object_path.write_bytes(b"tampered-object")
@@ -543,6 +649,7 @@ def test_semantic_integrity_failures_are_metadata_only(
                 "INSERT INTO feedback_history VALUES(?,?,?,?,?,?)",
                 ("missing-parent", 1, "hermes", "open", sentinels["marker"], "2026-10-14T01:07:43Z"),
             )
+        connection.close()
     _refresh_inventory(bundle)
     report_path = tmp_path / "validation.json"
     result = subprocess.run(

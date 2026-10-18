@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn, TypeGuard
 from urllib.parse import quote
@@ -36,6 +37,9 @@ _IMAGE_REFERENCE = re.compile(
     r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[0-9a-f]{64})\Z"
 )
 _VAULTBRIDGE_MANIFEST = "snapshots/20261014T010743Z/MANIFEST.json"
+_VAULTBRIDGE_SNAPSHOT = "20261014T010743Z"
+_VAULTBRIDGE_PREFIX = f"snapshots/{_VAULTBRIDGE_SNAPSHOT}/"
+_VAULTBRIDGE_SOURCE_URL = "http://192.168.50.80:30491"
 _VAULTBRIDGE_COUNT = 65
 
 _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -61,16 +65,20 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "project", "path", "title", "content", "version", "sha256", "created_by", "updated_by",
         "created_at", "updated_at",
     ),
-    "topic_memberships": (
-        "topic", "agent", "session_hash", "subscription_generation", "stream_generation",
-        "generation", "registered_at",
-    ),
     "feedback_entries": (
         "id", "author", "kind", "title", "description", "project", "severity", "status", "revision",
         "created_at", "updated_at", "client_request_id", "payload_json", "payload_hash",
     ),
     "feedback_history": ("feedback_id", "revision", "actor", "status", "note", "created_at"),
     "sqlite_sequence": ("name", "seq"),
+}
+_OPTIONAL_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    # Introduced after schema v4. Archive/digest when present; never require it
+    # or treat its rows as proof of current transport presence.
+    "topic_memberships": (
+        "topic", "agent", "session_hash", "subscription_generation", "stream_generation",
+        "generation", "registered_at",
+    ),
 }
 _TABLE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "messages": ("id",),
@@ -176,6 +184,11 @@ def _open_relative(root_fd: int, relative: str, *, directory: bool = False) -> i
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent,
             )
+            try:
+                _require_readonly_fd(child)
+            except BaseException:
+                os.close(child)
+                raise
             os.close(parent)
             parent = child
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -184,11 +197,15 @@ def _open_relative(root_fd: int, relative: str, *, directory: bool = False) -> i
         else:
             flags |= getattr(os, "O_NONBLOCK", 0)
         result = os.open(parts[-1], flags, dir_fd=parent)
-        mode = os.fstat(result).st_mode
-        if (directory and not stat.S_ISDIR(mode)) or (not directory and not stat.S_ISREG(mode)):
+        try:
+            mode = os.fstat(result).st_mode
+            if (directory and not stat.S_ISDIR(mode)) or (not directory and not stat.S_ISREG(mode)):
+                _fail("unsafe_source_entry")
+            _require_readonly_fd(result)
+            return result
+        except BaseException:
             os.close(result)
-            _fail("unsafe_source_entry")
-        return result
+            raise
     finally:
         os.close(parent)
 
@@ -231,6 +248,7 @@ def _scan_bundle(root_fd: int, deadline: float) -> tuple[dict[str, dict[str, Any
         nonlocal manifest_data
         _check_deadline(deadline)
         dir_before = os.fstat(directory_fd)
+        _require_readonly_fd(directory_fd)
         if not stat.S_ISDIR(dir_before.st_mode):
             _fail("unsafe_source_entry")
         try:
@@ -287,6 +305,7 @@ def _scan_bundle(root_fd: int, deadline: float) -> tuple[dict[str, dict[str, Any
             except OSError:
                 _fail("unsafe_source_entry")
             try:
+                _require_readonly_fd(file_fd)
                 if _signature(before) != _signature(os.fstat(file_fd)):
                     _fail("source_changed")
                 capture_limit = MAX_MANIFEST_BYTES if relative == MANIFEST_NAME else 0
@@ -384,13 +403,15 @@ def _parse_manifest(data: bytes) -> tuple[dict[str, Any], dict[str, dict[str, An
     return value, entries
 
 
-def _check_mount_is_readonly(root_path: str) -> None:
+def _require_readonly_fd(fd: int) -> None:
+    """Require the kernel's read-only mount flag on this exact opened source."""
     readonly_flag = getattr(os, "ST_RDONLY", None)
-    if readonly_flag is None:
+    fstatvfs = getattr(os, "fstatvfs", None)
+    if readonly_flag is None or fstatvfs is None:
         _fail("readonly_mount_required")
     try:
-        flags = os.statvfs(root_path).f_flag
-    except (AttributeError, OSError):
+        flags = fstatvfs(fd).f_flag
+    except (AttributeError, OSError, TypeError, ValueError):
         _fail("readonly_mount_required")
     if flags & readonly_flag == 0:
         _fail("readonly_mount_required")
@@ -407,7 +428,7 @@ def _check_inventory(files: dict[str, dict[str, Any]], expected: dict[str, dict[
 
 
 def _quoted_identifier(identifier: str) -> str:
-    if identifier not in _TABLE_COLUMNS:
+    if identifier not in _TABLE_COLUMNS and identifier not in _OPTIONAL_TABLE_COLUMNS:
         _fail("database_schema_invalid")
     return '"' + identifier.replace('"', '""') + '"'
 
@@ -491,11 +512,15 @@ def _validate_database(bundle_path: str, root_fd: int, relative_db: str, deadlin
 
         table_rows = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         table_names = {row[0] for row in table_rows}
-        if table_names != set(_TABLE_COLUMNS):
+        if (not set(_TABLE_COLUMNS).issubset(table_names)
+                or not table_names.issubset(set(_TABLE_COLUMNS) | set(_OPTIONAL_TABLE_COLUMNS))):
             _fail("database_schema_invalid")
+        tables_to_verify = [*_TABLE_COLUMNS, *sorted(table_names & set(_OPTIONAL_TABLE_COLUMNS))]
 
         schema_pk: dict[str, list[str]] = {}
-        for table, expected_columns in _TABLE_COLUMNS.items():
+        for table in tables_to_verify:
+            expected_columns = _TABLE_COLUMNS.get(table, _OPTIONAL_TABLE_COLUMNS.get(table))
+            assert expected_columns is not None
             columns_info = connection.execute(f"PRAGMA table_info({_quoted_identifier(table)})").fetchall()
             if tuple(row[1] for row in columns_info) != expected_columns:
                 _fail("database_schema_invalid")
@@ -508,7 +533,7 @@ def _validate_database(bundle_path: str, root_fd: int, relative_db: str, deadlin
         counts: dict[str, int] = {}
         logical_digests: dict[str, str] = {}
         total_rows = 0
-        for table in _TABLE_COLUMNS:
+        for table in tables_to_verify:
             count_row = connection.execute(f"SELECT COUNT(*) FROM {_quoted_identifier(table)}").fetchone()
             count = count_row[0]
             if type(count) is not int or count < 0:
@@ -531,6 +556,7 @@ def _validate_database(bundle_path: str, root_fd: int, relative_db: str, deadlin
             "table_counts": counts,
             "schema_primary_keys": schema_pk,
             "logical_digests": logical_digests,
+            "optional_tables_archived": sorted(set(tables_to_verify) - set(_TABLE_COLUMNS)),
             "rows_verified": total_rows,
         }
     except ArchiveValidationError:
@@ -683,27 +709,66 @@ def _validate_knowledge(connection_path: str, deadline: float) -> dict[str, Any]
                         manifest_contents = content
         if manifest_contents is None:
             _fail("vaultbridge_manifest_missing")
+
         manifest = _exact_keys(
-            _strict_json(manifest_contents.encode("utf-8")), {"count", "entries"},
+            _strict_json(manifest_contents.encode("utf-8")),
+            {
+                "source", "source_url", "destination_project", "snapshot", "source_note_count",
+                "verified_note_count", "source_preserved", "old_inbox_messages_replayed", "notes",
+            },
         )
-        if type(manifest["count"]) is not int or manifest["count"] != _VAULTBRIDGE_COUNT:
+        if (manifest["source"] != "VaultBridge" or manifest["source_url"] != _VAULTBRIDGE_SOURCE_URL
+                or manifest["destination_project"] != "vaultbridge"
+                or manifest["snapshot"] != _VAULTBRIDGE_SNAPSHOT
+                or type(manifest["source_note_count"]) is not int
+                or manifest["source_note_count"] != _VAULTBRIDGE_COUNT
+                or type(manifest["verified_note_count"]) is not int
+                or manifest["verified_note_count"] != _VAULTBRIDGE_COUNT
+                or type(manifest["source_preserved"]) is not bool or manifest["source_preserved"] is not True
+                or type(manifest["old_inbox_messages_replayed"]) is not bool
+                or manifest["old_inbox_messages_replayed"] is not False):
             _fail("vaultbridge_count_invalid")
-        entries = manifest["entries"]
-        if type(entries) is not list or len(entries) != _VAULTBRIDGE_COUNT:
+
+        notes = manifest["notes"]
+        if type(notes) is not list or len(notes) != _VAULTBRIDGE_COUNT:
             _fail("vaultbridge_count_invalid")
-        listed: dict[str, str] = {}
-        for item in entries:
-            entry = _exact_keys(item, {"destination_path", "source_sha256"})
-            path = _safe_relative(entry["destination_path"])
-            if path == _VAULTBRIDGE_MANIFEST or path in listed or not _is_sha256(entry["source_sha256"]):
+        source_paths: set[str] = set()
+        target_hashes: dict[str, str] = {}
+        for item in notes:
+            note = _exact_keys(item, {"source_path", "sha256", "modified", "destination_paths"})
+            source_path = _safe_relative(note["source_path"])
+            if source_path in source_paths or not _is_sha256(note["sha256"]):
                 _fail("vaultbridge_archive_invalid")
-            listed[path] = entry["source_sha256"]
-        for path, expected_sha in listed.items():
+            modified = note["modified"]
+            if type(modified) is not str or not modified or len(modified) > 64:
+                _fail("vaultbridge_archive_invalid")
+            try:
+                datetime.fromisoformat(modified.replace("Z", "+00:00"))
+            except ValueError:
+                _fail("vaultbridge_archive_invalid")
+            destinations = note["destination_paths"]
+            if type(destinations) is not list or len(destinations) != 1:
+                _fail("vaultbridge_archive_invalid")
+            destination = _safe_relative(destinations[0])
+            if destination != _VAULTBRIDGE_PREFIX + source_path or destination in target_hashes:
+                _fail("vaultbridge_archive_invalid")
+            source_paths.add(source_path)
+            target_hashes[destination] = note["sha256"]
+
+        for path, expected_sha in target_hashes.items():
             if not hmac.compare_digest(vaultbridge.get(path, ""), expected_sha):
                 _fail("vaultbridge_digest_mismatch")
+        archived_snapshot_paths = {
+            path for path in vaultbridge
+            if path != _VAULTBRIDGE_MANIFEST and path.startswith(_VAULTBRIDGE_PREFIX)
+        }
+        if archived_snapshot_paths != set(target_hashes):
+            _fail("vaultbridge_archive_invalid")
         return {
             "manifest_path": _VAULTBRIDGE_MANIFEST,
-            "listed_entries_verified": len(listed),
+            "source_notes_verified": len(source_paths),
+            "destination_rows_verified": len(target_hashes),
+            "snapshot": _VAULTBRIDGE_SNAPSHOT,
             "project": "vaultbridge",
         }
     except ArchiveValidationError:
@@ -724,7 +789,7 @@ def validate_bundle(bundle: str | os.PathLike[str]) -> dict[str, Any]:
         root_stat = os.fstat(root_fd)
         if not stat.S_ISDIR(root_stat.st_mode):
             _fail("bundle_not_directory")
-        _check_mount_is_readonly(root_path)
+        _require_readonly_fd(root_fd)
         files_before, dirs_before, manifest_data = _scan_bundle(root_fd, deadline)
         manifest, expected_inventory = _parse_manifest(manifest_data)
         _check_inventory(files_before, expected_inventory)
