@@ -706,10 +706,15 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.snapshot_done = asyncio.Event()
+            self.initial_catchup_done = asyncio.Event()
 
         async def _bootstrap_cursor(self, session):
             await super()._bootstrap_cursor(session)
             self.snapshot_done.set()
+
+        async def _read_catchup(self, session):
+            await super()._read_catchup(session)
+            self.initial_catchup_done.set()
 
     runner = CountingRunner()
     state = WorkerState(tmp_path / "worker-state.sqlite3")
@@ -724,19 +729,35 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
                                 correlation_id="old-job")
         worker.url = url
         task = asyncio.create_task(worker.run_connection())
-        await asyncio.wait_for(worker.snapshot_done.wait(), timeout=5)
-        assert state.cursor == repository.sequence_for(old.id)
-        await asyncio.sleep(0.05)
-        assert runner.calls == []  # initial head snapshot did not replay retained work
+        try:
+            await asyncio.wait_for(worker.snapshot_done.wait(), timeout=5)
+            await asyncio.wait_for(worker.initial_catchup_done.wait(), timeout=5)
+            assert state.cursor == repository.sequence_for(old.id)
+            assert runner.calls == []  # initial head snapshot did not replay retained work
 
-        incoming = repository.insert(sender="codex", recipient="hermes", message_type="REQUEST",
-                                     body={"topic": "qa", "description": "fixture delivery"},
-                                     correlation_id="new-job")
-        assert await app.state.push_publisher.publish_committed("hermes") == 1
-        await asyncio.wait_for(runner.called.wait(), timeout=5)
-        await asyncio.sleep(0)
-        worker.stop_event.set()
-        await asyncio.wait_for(task, timeout=5)
+            incoming = repository.insert(sender="codex", recipient="hermes", message_type="REQUEST",
+                                         body={"topic": "qa", "description": "fixture delivery"},
+                                         correlation_id="new-job")
+            # The actual native commit source must deliver the invalidation;
+            # an extra manual publish races that source and its dirty edges.
+            await asyncio.wait_for(runner.called.wait(), timeout=5)
+            assert app.state.push_publisher.sent_notifications >= 1
+            await asyncio.sleep(0)
+        finally:
+            # End the SDK session in its owning worker task before the server
+            # context exits, including when an assertion/readiness wait fails.
+            worker.stop_event.set()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            except BaseException:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
 
     assert runner.calls == [(incoming.id, None)]
     assert state.cursor == repository.sequence_for(incoming.id)
