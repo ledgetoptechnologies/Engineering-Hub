@@ -7,6 +7,8 @@ include compose.hub-test.yaml
 include docker/hub-test.Dockerfile docker/hub-test-smoke.py docker/hub-test-integration.py
 include docker/hub-test-acceptance-v1.json docker/hub-test-integration-results.json docker/hub-test-results.txt
 recursive-include hub_executor *.py *.md
+recursive-include hub_container_executor *.py *.md
+recursive-include hub_validation_worker *.py *.md
 recursive-include contracts *.json
 recursive-include docs *.md
 recursive-include scripts *.py
