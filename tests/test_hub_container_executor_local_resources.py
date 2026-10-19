@@ -338,11 +338,13 @@ def test_exact_manifest_secret_versions_checked_before_mutable_state(rig, case):
     assert not list(rig.paths["reservations"].iterdir())
 
 
-def test_caller_manifest_and_mutable_binding_platform_are_snapshotted(rig):
+def test_caller_manifest_and_binding_platform_are_independent_snapshots(rig):
     with build(rig) as adapter:
         original_manifest = adapter.manifest.digest()
-        rig.params["binding"].platform.architecture = "arm64"
-        rig.params["manifest"].runner_binding.platform.architecture = "arm64"
+        # Deliberately bypass frozen-model assignment, as an in-process caller
+        # could; ordinary attribute assignment is correctly forbidden.
+        object.__setattr__(rig.params["binding"].platform, "architecture", "arm64")
+        object.__setattr__(rig.params["manifest"].runner_binding.platform, "architecture", "arm64")
         assert adapter.manifest.digest() == original_manifest
         assert adapter.backend.binding.platform.architecture == "amd64"
 

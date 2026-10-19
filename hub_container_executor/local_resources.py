@@ -131,8 +131,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 or not callable(getattr(driver_identity_verifier, "implementation_commit", None))):
             raise LocalResourcesError("Explicit private Linux resource configuration required")
         manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
-        # Frozen dataclasses can contain mutable Pydantic platform objects.
-        # Snapshot and validate both rather than retaining caller-owned models.
+        # Both models are frozen, but a trusted in-process caller can bypass
+        # that restriction. Revalidate independent snapshots, not shared models.
         binding = DockerEngineBinding(
             runner_id=binding.runner_id, daemon_identity=binding.daemon_identity,
             platform=Platform.model_validate(binding.platform.model_dump(mode="json")),
