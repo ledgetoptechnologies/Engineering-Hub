@@ -1,0 +1,8 @@
+# Synthetic archive only. Verify the selected local base image digest at build.
+# This adds no listener, credentials, Docker socket or host-data mount.
+ARG VALIDATION_IMAGE=scratch
+FROM ${VALIDATION_IMAGE}
+USER 0:0
+RUN python -c "from pathlib import Path; from tests.test_hub_legacy_archive import _build_bundle; _build_bundle(Path('/archive-fixture'))"
+USER 10001:10001
+ENTRYPOINT ["python", "scripts/hub_legacy_archive.py", "validate", "--bundle", "/archive-fixture", "--report", "/tmp/archive-report.json"]

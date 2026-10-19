@@ -169,6 +169,14 @@ export interface TopicPreflight {
   peer: PublicReachability;
   advisory: true;
   delivery_guaranteed: false;
+  // Optional while older installed Hub versions do not provide send guidance.
+  guidance?: {
+    recipient_state: "online" | "busy" | "offline" | "unknown" | "unlinked";
+    send_mode: "notify_if_still_reachable" | "queue_only" | "link_first";
+    response_expectation: "may_respond" | "may_be_delayed" | "not_verified";
+    durable_delivery_required: true;
+    receipt_required: true;
+  };
 }
 export interface EventsStatus {
   available: boolean;

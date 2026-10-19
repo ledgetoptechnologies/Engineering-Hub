@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engineering-hub-container-executor"
+version = "0.1.0"
+description = "Optional Linux Engineering Hub container executor library; no service entrypoint"
+requires-python = ">=3.12"
+dependencies = ["agent-message-bus==0.6.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hub_container_executor", "scripts"]
+namespaces = true
+
+[tool.setuptools.package-data]
+hub_container_executor = ["_executor_source.json"]

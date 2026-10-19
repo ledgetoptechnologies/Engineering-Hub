@@ -14,7 +14,7 @@ import threading
 
 import uvicorn
 
-from .owned_tasks import finish_owned
+from .lifecycle import finish_owned
 
 
 class _Listener(uvicorn.Server):

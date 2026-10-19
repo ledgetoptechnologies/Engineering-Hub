@@ -152,6 +152,26 @@ class HubRepository:
     def close(self):
         """Connections are scoped to each operation; no persistent handle exists."""
 
+    def queued_pilot_enrolled(self, db=None):
+        """Persistent exclusion, including for objects created before enrollment."""
+        if db is None:
+            with self._connection() as connection:
+                return self.queued_pilot_enrolled(connection)
+        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name='hub_queued_pilot_policy'").fetchone() is not None
+
+    def _assert_queued_pilot(self, operation, *, db=None, **context):
+        if not self.queued_pilot_enrolled(db):
+            return
+        # The exact trusted local bridge is not a bearer identity, request flag
+        # or callback supplied by a public caller. Its private scoped permit
+        # rechecks the original job, live owner and physical reservation.
+        from .queued_pilot import QueuedContainerPilot
+        bridge = getattr(self, '_queued_pilot', None)
+        if (type(bridge) is not QueuedContainerPilot or bridge.repo is not self
+                or bridge.authorize(operation, db=db, **context) is not True):
+            raise HubError('queued_pilot_admission_required', 409)
+
     @staticmethod
     def _actor(actor, human=False, agent=False):
         valid_human = isinstance(actor, str) and re.fullmatch(r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', actor) is not None
@@ -309,6 +329,11 @@ class HubRepository:
         key = self._text(client_request_id, 128) if client_request_id is not None else None
         fingerprint = hashlib.sha256(_json([task_id, expected_revision, artifact_digest, target, execution_manifest_digest]).encode()).hexdigest()
         with self._transaction() as db:
+            self._assert_queued_pilot('create_run', db=db, actor=actor,
+                task_id=task_id, expected_revision=expected_revision,
+                artifact_digest=artifact_digest, target=target,
+                execution_manifest_digest=execution_manifest_digest,
+                client_request_id=client_request_id)
             if key is not None:
                 prior = db.execute('SELECT fingerprint,run_id FROM hub_run_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
                 if prior:

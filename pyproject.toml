@@ -8,6 +8,7 @@ version = "0.6.0"
 description = "Authenticated shared message and knowledge bus for Hermes, Codex, and Claude Code"
 requires-python = ">=3.12"
 dependencies = [
+  "cryptography>=50.0.2,<51",
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.30,<1",
   "mcp>=1.30,<1.31",

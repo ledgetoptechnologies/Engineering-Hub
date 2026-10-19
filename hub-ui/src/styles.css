@@ -916,6 +916,22 @@ h1 > span {
   font-size: 11px;
   color: #849078;
 }
+.software-queue > p,
+.software-queue article {
+  font-size: 12px;
+  line-height: 1.65;
+}
+.software-queue > p,
+.software-queue article p {
+  margin-top: 9px;
+}
+.software-queue details {
+  margin-top: 10px;
+  font-size: 11px;
+}
+.software-queue summary {
+  cursor: pointer;
+}
 .run-list .small-text {
   margin-top: 7px;
 }

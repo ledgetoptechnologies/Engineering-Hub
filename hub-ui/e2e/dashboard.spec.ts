@@ -208,7 +208,7 @@ test("colon topic passes strict ingress without discarding task or decision reco
   const peers = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/topics/ops:alerts/peers");
   await page.getByRole("button", { name: "Check", exact: true }).click();
   expect((await peers).status()).toBe(200);
-  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
   await expect(page.getByText(mock.overview.decisions[0].title, { exact: true })).toBeVisible();
   await expect(page.getByText(mock.overview.tasks[0].title, { exact: true })).toBeVisible();
@@ -244,7 +244,7 @@ for (const typed of [false, true]) {
     }));
     await page.goto("/");
     if (typed) {
-      await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+      await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
       await page.getByLabel("TOPIC ROOT").fill(deniedTopic);
       await page.getByRole("button", { name: "Check", exact: true }).click();
     }
@@ -263,7 +263,7 @@ test(`canonical topic ACL denial stays local and same-topic ${eventSource} recov
   await mockLive(page, { canonical: true });
   await page.goto("/");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
-  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({
     status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "topic_read_forbidden" } }),
   }));
@@ -275,7 +275,7 @@ test(`canonical topic ACL denial stays local and same-topic ${eventSource} recov
     contentType: "application/json", body: JSON.stringify({ ...createDemoTopic("auto-wake-v1-test", NOW), event_source: eventSource, registry_epoch: null }),
   }));
   await page.getByRole("button", { name: "Check", exact: true }).click();
-  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   await expect(page.getByText("This session cannot read the selected topic.", { exact: false })).toHaveCount(0);
 });
 }
@@ -286,13 +286,13 @@ test("canonical topic invalidation refreshes only topic and source loss leaves w
   const mock = await mockLive(page, { canonical: true });
   await page.goto("/");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
-  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   const overviewReads = mock.reads();
   const topicReads = () => mock.requests.filter((request) => new URL(request.url()).pathname.endsWith("/peers")).length;
   const before = topicReads();
   await emitRegistry(page, "registry.invalidated");
   await expect.poll(topicReads).toBe(before + 1);
-  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   expect(mock.reads()).toBe(overviewReads);
   await emitRegistry(page, "error");
   await expect(codex.getByText("Unknown", { exact: true })).toBeVisible();
@@ -309,7 +309,7 @@ test("canonical terminal recovery takes fresh snapshot and resumes with explicit
   await controllableEvents(page);
   await mockLive(page, { canonical: true });
   await page.goto("/");
-  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Reachable", { exact: true })).toBeVisible();
+  await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
   await emitRegistry(page, "registry.snapshot_required");
   await expect.poll(() => page.evaluate(() => (window as any).__hubStreams.filter((entry: any) => entry.url.includes("/topics/")).length)).toBe(2);
   const sources = await page.evaluate(() => (window as any).__hubStreams.map((entry: any) => ({ url: entry.url, closed: entry.closed })));
@@ -327,7 +327,7 @@ for (const status of [503, 403]) {
     await mockLive(page, { canonical: true });
     await page.goto("/");
     const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
-    await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+    await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
     let release!: () => void;
     let entered!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
@@ -344,13 +344,13 @@ for (const status of [503, 403]) {
       await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
       await pending;
       await emitRegistry(page, "registry.invalidated");
-      await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+      await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
       const response = page.waitForResponse((response) => response.status() === status && response.url().endsWith("/peers"));
       release();
       await response;
       // Flush promise/render work through a browser task boundary, not time polling.
       await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-      await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
+      await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
       await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
       await expect(page.getByText("Topic status unavailable.", { exact: false })).toHaveCount(0);
@@ -393,7 +393,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await expect(
     page.getByText("Fixture demo acceptance task", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator('.notice[role="status"]')).toContainText(
     "Demo only; no server changed.",
   );
   await expect(page.getByRole("radio", { checked: true })).toHaveCount(0);
@@ -406,7 +406,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator('.notice[role="status"]')).toContainText(
     "Decision recorded, not an execution grant.",
   );
   await expect(
@@ -510,7 +510,7 @@ test("SSE invalidation refetches, loss marks routes stale and disables mutations
     page
       .locator(".peer-row")
       .filter({ hasText: "Codex" })
-      .getByText("Reachable", { exact: true }),
+      .getByText("Online · verified", { exact: true }),
   ).toBeVisible();
   const reads = mock.reads();
   await page.clock.runFor(20_000);
@@ -553,12 +553,12 @@ test("each peer expires locally at its own deadline without HTTP refresh", async
   await page.goto("/");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
   const hermes = page.locator(".peer-row").filter({ hasText: "Hermes" });
-  await expect(codex.getByText("Reachable", { exact: true })).toBeVisible();
-  await expect(hermes.getByText("Queued", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
+  await expect(hermes.getByText("Busy", { exact: true })).toBeVisible();
   const reads = mock.reads();
   await page.clock.runFor(1100);
   await expect(codex.getByText("Unknown", { exact: true })).toBeVisible();
-  await expect(hermes.getByText("Queued", { exact: true })).toBeVisible();
+  await expect(hermes.getByText("Busy", { exact: true })).toBeVisible();
   await page.clock.runFor(2100);
   await expect(hermes.getByText("Unknown", { exact: true })).toBeVisible();
   expect(mock.reads()).toBe(reads);
@@ -598,7 +598,7 @@ test("changing topic clears previous peers before the next snapshot arrives", as
     page
       .locator(".peer-row")
       .filter({ hasText: "Codex" })
-      .getByText("Reachable", { exact: true }),
+      .getByText("Online · verified", { exact: true }),
   ).toBeVisible();
   await page.getByLabel("TOPIC ROOT").fill("different-topic");
   await page.getByRole("button", { name: "Check", exact: true }).click();
@@ -667,10 +667,10 @@ for (const lost of ["error", "source_unavailable"] as const) {
     // Evidence may be retained as Unknown or cleared entirely. Neither path
     // may restore a verified route from a response that crossed disconnection.
     await expect(
-      page.locator(".peer-row").getByText("Reachable", { exact: true }),
+      page.locator(".peer-row").getByText("Online · verified", { exact: true }),
     ).toHaveCount(0);
     await expect(
-      page.locator(".peer-row").getByText("Queued", { exact: true }),
+      page.locator(".peer-row").getByText("Busy", { exact: true }),
     ).toHaveCount(0);
   });
 }
@@ -755,7 +755,7 @@ test("conflicting decision disables writes until explicit refresh without echoin
   await page
     .getByRole("button", { name: "Record decision", exact: true })
     .click();
-  await expect(page.getByRole("alert")).toHaveText(
+  await expect(page.locator('.notice[role="alert"]')).toHaveText(
     "This record changed. Refresh before trying again.",
   );
   await expect(
@@ -911,7 +911,7 @@ for (const status of [422, 503]) {
       page
         .locator(".peer-row")
         .filter({ hasText: "Codex" })
-        .getByText("Reachable", { exact: true }),
+        .getByText("Online · verified", { exact: true }),
     ).toBeVisible();
     await page.getByLabel("TOPIC ROOT").fill("unavailable-fixture-topic");
     await page.getByRole("button", { name: "Check", exact: true }).click();

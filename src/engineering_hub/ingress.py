@@ -11,6 +11,7 @@ from fastapi import HTTPException, Request
 from starlette.responses import JSONResponse
 
 from .cloudflare_access import AccessDenied, CloudflareAccessVerifier, _record_verified_access
+from .unified_bus import is_bus_api, BUS_ADMIN_PATH
 
 
 def _within(path, prefix):
@@ -48,8 +49,11 @@ def validate_agent_hosts(hosts):
 
 
 class HubIngressMiddleware:
-    def __init__(self, app, *, mode, agent_auth, cloudflare_config=None):
+    def __init__(self, app, *, mode, agent_auth, cloudflare_config=None, legacy_bus_enabled=False):
         self.app, self.mode, self.agent_auth = app, mode, agent_auth
+        if type(legacy_bus_enabled) is not bool:
+            raise ValueError('Explicit bus ingress enable flag required')
+        self.legacy_bus_enabled = legacy_bus_enabled
         if mode not in {"agents", "browser"}:
             raise ValueError("Separated Hub ingress mode required")
         self.checker = CloudflareAccessVerifier(cloudflare_config) if mode == "browser" else None
@@ -87,8 +91,11 @@ class HubIngressMiddleware:
             await self.app(scope, receive, send)
             return
         if self.mode == "agents":
+            bus_api = self.legacy_bus_enabled and is_bus_api(path)
+            bus_admin = self.legacy_bus_enabled and path == BUS_ADMIN_PATH
             if (_within(path, "/api/hub/v1/auth")
-                    or not (_within(path, "/mcp") or _within(path, "/api/hub/v1"))):
+                    or not (_within(path, "/mcp") or _within(path, "/api/hub/v1")
+                            or bus_api or bus_admin)):
                 await deny()
                 return
             if len(authorizations) != 1:
@@ -96,13 +103,16 @@ class HubIngressMiddleware:
                 return
             try:
                 # Existing identity and source-IP checks, never proxy claims.
-                self.agent_auth.agent(Request(scope))
+                if bus_admin:
+                    self.agent_auth.admin(Request(scope))
+                else:
+                    self.agent_auth.agent(Request(scope))
             except HTTPException as error:
                 await deny("forbidden" if error.status_code == 403 else "unauthorized",
                            403 if error.status_code == 403 else 401)
                 return
         else:
-            if _within(path, "/mcp"):
+            if _within(path, "/mcp") or is_bus_api(path) or _within(path, '/api/admin'):
                 await deny()
                 return
             assertions = [value for name, value in scope.get("headers", [])

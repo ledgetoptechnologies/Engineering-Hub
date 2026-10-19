@@ -1,0 +1,7 @@
+# Synthetic history only; operator verifies the resolved validation base digest.
+ARG VALIDATION_IMAGE=scratch
+FROM ${VALIDATION_IMAGE}
+USER 0:0
+RUN python -c "from pathlib import Path; import hashlib; from tests.test_hub_archive_messages import create; p=Path('/message-reader-fixture.sqlite3'); create(p); print('SYNTHETIC_DATABASE_SHA256='+hashlib.sha256(p.read_bytes()).hexdigest())"
+USER 10001:10001
+ENTRYPOINT ["python"]

@@ -11,9 +11,16 @@ def main():
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--split-ingress", action="store_true")
     parser.add_argument("--browser-port", type=int, default=8771)
+    parser.add_argument("--unified-mcp", action="store_true",
+                        help="Serve existing bus capabilities and Hub tools as one private MCP")
     args = parser.parse_args()
+    if args.unified_mcp and not args.split_ingress:
+        parser.error('--unified-mcp requires --split-ingress')
     if args.split_ingress:
-        from .app import create_app
+        if args.unified_mcp:
+            from .unified_app import create_unified_app as create_app
+        else:
+            from .app import create_app
         from .frontends import HubFrontends
         from .server import serve_frontends
         def pair_factory():

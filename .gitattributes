@@ -1,0 +1,4 @@
+# These historical fixture hashes authenticate original LF bytes across Windows
+# checkouts and git archives; never normalize the expected digests in tests.
+tests/fixtures/legacy_agent_bus_v060/*.py text eol=lf
+tests/fixtures/legacy_agent_bus_v060/*.sql text eol=lf

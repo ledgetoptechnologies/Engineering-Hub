@@ -19,6 +19,7 @@ class _FrontDoor:
         self.ingress = HubIngressMiddleware(
             pair.core, mode=mode, agent_auth=pair.settings.agent_auth,
             cloudflare_config=pair.settings.auth_config.cloudflare_config,
+            legacy_bus_enabled=getattr(pair.core.state, 'embedded_bus', None) is not None,
         )
 
     async def __call__(self, scope, receive, send):
@@ -62,6 +63,12 @@ class HubFrontends:
         self.agents = _FrontDoor(self, "agents")
         self.browser = _FrontDoor(self, "browser")
         core.state.hub_frontends = self
+
+    def close_admission(self):
+        """Deny new HTTP requests without closing the shared core lifespan."""
+        if self.state not in {'active', 'stopping'}:
+            raise RuntimeError('Hub frontend admission is not active')
+        self.state = 'stopping'
 
     @asynccontextmanager
     async def lifespan(self):

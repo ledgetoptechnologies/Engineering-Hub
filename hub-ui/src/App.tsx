@@ -9,6 +9,7 @@ import {
 import type { ReactNode } from "react";
 import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
+import { WorkQueuePanel } from "./WorkQueuePanel";
 import type {
   Decision,
   EventsStatus,
@@ -1008,6 +1009,8 @@ export function HubApp() {
                   not enabled.
                 </p>
               </section>
+              <WorkQueuePanel mode={demo ? "demo" : "live"} refreshToken={data}
+                stale={stale} onUnauthorized={clearPrivateWorkspace} />
               <section className="panel work" id="work">
                 <PanelTitle
                   number="03"
@@ -1147,8 +1150,10 @@ export function HubApp() {
                             : state === "linked_unverified"
                               ? "Unverified"
                               : state === "busy_queued"
-                                ? "Queued"
-                                : pretty(state)}
+                                ? "Busy"
+                                : state === "reachable"
+                                  ? "Online · verified"
+                                  : pretty(state)}
                         </Badge>
                       </div>
                     );

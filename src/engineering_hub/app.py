@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 
 from agent_message_bus.auth import AuthSettings
 from .auth import AuthConfig, SessionStore, build_auth_router, require_human
@@ -23,6 +25,7 @@ from .build_info import read_build_commit
 from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
+from .delivery_guidance import DeliveryGuidance, topic_delivery_guidance
 from .events import NativeHubEventFeed
 from .sse_keepalive import with_keepalive
 from .autonomy import StagingRuntime
@@ -31,6 +34,7 @@ from .registry_bridge import CanonicalRegistryBridge
 from .registry_client import (
     RegistryAccessDenied, RegistrySourceUnavailable, RegistryPointer,
     RegistrySnapshotRequired, validate_topic as validate_registry_topic,
+    validate_origin as validate_registry_origin,
 )
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
@@ -53,8 +57,23 @@ class Settings:
     ui_directory: Path | None = None
     ingress_mode: str = "combined"
     agent_allowed_hosts: tuple[str, ...] = ()
+    work_queue_enabled: bool = False
+    staging_machine_id: str = "staging-pc"
+    registry_enabled: bool = False
+    registry_origin: str | None = None
+    registry_events_enabled: bool = False
 
     def __post_init__(self):
+        if type(self.work_queue_enabled) is not bool:
+            raise ValueError("Explicit work queue enable flag required")
+        if type(self.registry_enabled) is not bool or type(self.registry_events_enabled) is not bool:
+            raise ValueError('Explicit registry flags required')
+        if self.registry_origin is not None:
+            validate_registry_origin(self.registry_origin)
+        if self.registry_enabled and self.registry_origin is None:
+            raise ValueError('Configured registry origin required')
+        if self.registry_events_enabled and not self.registry_enabled:
+            raise ValueError('Registry events require explicit registry enablement')
         from .ingress import validate_agent_hosts
         validate_agent_hosts(self.agent_allowed_hosts)
         if self.ingress_mode not in {"combined", "agents", "browser"}:
@@ -71,6 +90,13 @@ class Settings:
 
     @classmethod
     def from_env(cls):
+        work_queue_flag = os.environ.get("HUB_WORK_QUEUE_ENABLED", "0")
+        if work_queue_flag not in {"0", "1"}:
+            raise ValueError("HUB_WORK_QUEUE_ENABLED must be 0 or 1")
+        registry_flag = os.environ.get('HUB_REGISTRY_ENABLED', '0')
+        registry_events_flag = os.environ.get('HUB_REGISTRY_EVENTS_ENABLED', '0')
+        if registry_flag not in {'0', '1'} or registry_events_flag not in {'0', '1'}:
+            raise ValueError('Hub registry flags must be 0 or 1')
         path = Path(os.environ.get("HUB_DB", "data/hub.sqlite3"))
         bus_path = os.environ.get("AGENT_BUS_DB")
         if bus_path and path.resolve() == Path(bus_path).resolve():
@@ -91,7 +117,12 @@ class Settings:
         ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
                    ingress_mode=os.environ.get("HUB_INGRESS_MODE", "combined"),
                    agent_allowed_hosts=tuple(value.strip() for value in
-                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()))
+                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()),
+                   work_queue_enabled=work_queue_flag == "1",
+                   staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"),
+                   registry_enabled=registry_flag == '1',
+                   registry_origin=os.environ.get('HUB_REGISTRY_ORIGIN'),
+                   registry_events_enabled=registry_events_flag == '1')
 
 
 class Input(BaseModel):
@@ -153,17 +184,65 @@ class TopicPreflight(Input):
     peer: PublicReachability
     advisory: Literal[True]
     delivery_guaranteed: Literal[False]
+    guidance: DeliveryGuidance
 
 
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
-               owned_pilot_service=None):
+               owned_pilot_service=None, work_queue=None, archive_reader=None,
+               queued_pilot_runtime=None, bus_app=None):
     settings = settings or Settings.from_env()
+    bus_mcp = None
+    bus_health = None
+    if bus_app is not None:
+        if (not isinstance(bus_app, Starlette)
+                or settings.ingress_mode == 'browser'
+                or getattr(bus_app.state, 'hub_owner', None) is not None):
+            raise ValueError('Fresh private bus application required')
+        bus_mcp = getattr(bus_app.state, 'mcp', None)
+        service = getattr(bus_app.state, 'service', None)
+        if (type(bus_mcp) is not FastMCP or service is None
+                or service.auth is not settings.agent_auth
+                or bus_mcp.settings.stateless_http
+                or Path(service.repository.path).resolve() == settings.database.resolve()
+                or (settings.database.exists()
+                    and settings.database.samefile(service.repository.path))):
+            raise ValueError('Unified bus identity, stateful transport and separate storage required')
+        bus_health = next((route.endpoint for route in bus_app.routes
+                           if getattr(route, 'path', None) == '/health'), None)
+        if not callable(bus_health):
+            raise ValueError('Unified bus health source required')
+    if settings.registry_enabled:
+        if registry_bridge is not None or reachability_provider is not None:
+            raise ValueError('Choose one explicit registry configuration source')
+        from .registry_client import RegistryClient
+        from .registry_stream import RegistryStream
+        registry_bridge = CanonicalRegistryBridge(
+            RegistryClient(settings.registry_origin),
+            stream=RegistryStream(settings.registry_origin) if settings.registry_events_enabled else None,
+        )
+    if archive_reader is not None:
+        from .archive_messages import ArchiveMessageReader
+        if type(archive_reader) is not ArchiveMessageReader:
+            raise ValueError('Explicit approved archive reader required')
     if settings.ingress_mode == "browser" and any(component is not None for component in (
-            fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service)):
+            fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service, work_queue)):
         raise ValueError("Browser ingress must not own staging execution")
     repo = repository or HubRepository(settings.database)
+    if (work_queue is not None or settings.work_queue_enabled) and any(
+            component is not None for component in (fixture_workflow, staging_dispatcher,
+                                                   container_pilot_workflow, owned_pilot_service)):
+        raise ValueError("Work queue and legacy dispatch require a shared reservation bridge")
+    if work_queue is not None:
+        from .work_queue import WorkQueue
+        if type(work_queue) is not WorkQueue or work_queue.repo is not repo:
+            raise ValueError("Work queue repository identity required")
+    elif settings.work_queue_enabled:
+        if settings.ingress_mode == "browser":
+            raise ValueError("Browser ingress cannot own work scheduling")
+        from .work_queue_config import configured_work_queue
+        work_queue = configured_work_queue(repo, machine_id=settings.staging_machine_id)
     if registry_bridge is not None and (type(registry_bridge) is not CanonicalRegistryBridge
                                         or reachability_provider is not None):
         raise ValueError('one_reachability_source_required')
@@ -183,15 +262,32 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 or owned_pilot_service.workflow is not container_pilot_workflow
                 or owned_pilot_service.dispatcher is not staging_dispatcher):
             raise ValueError('owned_pilot_service_mismatch')
+    feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
+    if queued_pilot_runtime is not None:
+        from .queued_pilot_runtime import QueuedPilotRuntime
+        if (type(queued_pilot_runtime) is not QueuedPilotRuntime
+                or queued_pilot_runtime.bridge.repo is not repo
+                or queued_pilot_runtime.bridge.queue is not work_queue
+                or queued_pilot_runtime.feed is not feed
+                or settings.ingress_mode == 'browser'
+                or any(component is not None for component in (
+                    fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service))
+                or queued_pilot_runtime.status['state'] != 'not_started'
+                or getattr(queued_pilot_runtime, '_application', None) is not None
+                or feed._source is not None):
+            raise ValueError('queued_pilot_application_binding_required')
     sessions = SessionStore(settings.database, repository=repo,
                             session_ttl=settings.auth_config.local_session_ttl_seconds)
-    feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
             staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):
         raise ValueError('dispatcher_workflow_mismatch')
     runtime = StagingRuntime(staging_dispatcher, feed) if staging_dispatcher is not None else None
 
     def autonomy_for():
+        if queued_pilot_runtime is not None:
+            status = queued_pilot_runtime.status
+            return {'configured': True, 'state': status['state'],
+                    'running': status['running'], 'receipts': [], 'queued_pilot': status}
         if runtime is None:
             return {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
         receipts = [{key: value for key, value in item.items() if key != 'owner'}
@@ -236,51 +332,108 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         snapshot = await peers_for(topic, principal=principal, bearer=bearer)
         peer = next(item for item in snapshot['items'] if item['agent'] == recipient)
         return {'topic': topic, 'recipient': recipient, 'peer': peer,
-                'advisory': True, 'delivery_guaranteed': False}
+                'advisory': True, 'delivery_guaranteed': False,
+                'guidance': topic_delivery_guidance(
+                    PublicReachability.model_validate_json(json.dumps(peer))).model_dump()}
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
-                          topic_preflight=preflight_for, autonomy_status=autonomy_for)
+                          topic_preflight=preflight_for, autonomy_status=autonomy_for,
+                          work_queue=work_queue, mcp=bus_mcp)
     origin = urlsplit(settings.auth_config.origin)
-    hub_mcp.settings.transport_security = TransportSecuritySettings(
+    transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=list(dict.fromkeys([origin.netloc] + (
             list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
         allowed_origins=[settings.auth_config.origin],
     )
-    mcp_app = hub_mcp.streamable_http_app()
+    if bus_app is None:
+        hub_mcp.settings.transport_security = transport_security
+        mcp_app = hub_mcp.streamable_http_app()
+    else:
+        # The bus session manager already captured its transport policy during
+        # factory construction. Never pretend changing settings afterward fixes it.
+        actual = hub_mcp.settings.transport_security
+        if (actual is None or not actual.enable_dns_rebinding_protection
+                or set(actual.allowed_hosts or ()) != set(transport_security.allowed_hosts or ())
+                or set(actual.allowed_origins or ()) != set(transport_security.allowed_origins or ())):
+            raise ValueError('Unified transport policy must be installed before bus construction')
 
     @asynccontextmanager
     async def lifespan(app):
+        cleanup_started = False
+
+        async def stop_components():
+            nonlocal cleanup_started
+            cleanup_started = True
+            if owned_pilot_service is not None:
+                await owned_pilot_service.stop(runtime, feed)
+            else:
+                async def drain():
+                    try:
+                        if queued_pilot_runtime is not None:
+                            await queued_pilot_runtime.stop()
+                        if runtime is not None:
+                            await runtime.stop()
+                    finally:
+                        await feed.stop()
+                if queued_pilot_runtime is not None:
+                    from .owned_tasks import finish_owned
+                    await finish_owned(drain())
+                else:
+                    await drain()
+
         try:
             await feed.start()
             if owned_pilot_service is not None:
                 await owned_pilot_service.start(feed)
-            async with hub_mcp.session_manager.run():
-                if runtime is not None:
-                    await runtime.start()
-                yield
-        finally:
-            if owned_pilot_service is not None:
-                await owned_pilot_service.stop(runtime, feed)
-            else:
+            mcp_owner = (bus_app.router.lifespan_context(bus_app) if bus_app is not None
+                         else hub_mcp.session_manager.run())
+            async with mcp_owner:
                 try:
+                    if queued_pilot_runtime is not None:
+                        status = await queued_pilot_runtime.start()
+                        if status['state'] != 'active':
+                            raise HubError('queued_pilot_startup_unavailable', 503)
                     if runtime is not None:
-                        await runtime.stop()
+                        await runtime.start()
+                    yield
                 finally:
-                    await feed.stop()
+                    if bus_app is not None:
+                        # Retain bus identity/publisher/native source while accepted
+                        # Hub work drains; never close its transport underneath it.
+                        await stop_components()
+        finally:
+            if not cleanup_started:
+                await stop_components()
 
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
+    app.state.mcp = hub_mcp
+    app.state.embedded_bus = bus_app
+    if bus_app is not None:
+        bus_app.state.hub_owner = app
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
+    app.state.queued_pilot_runtime = queued_pilot_runtime
+    if queued_pilot_runtime is not None:
+        # One-use application ownership, not transfer of its owner/client.
+        queued_pilot_runtime._application = app
     app.state.owned_pilot_service = owned_pilot_service
+    app.state.registry_bridge = registry_bridge
+    # Explicit read-only capability; caller owns its lifetime. No environment
+    # discovery, archive adoption or automatic close/ownership transfer.
+    app.state.archive_reader = archive_reader
     if (settings.auth_config.human_auth_mode == "cloudflare_access"
             and settings.ingress_mode == "combined"):
         from .cloudflare_access import install_cloudflare_access
         install_cloudflare_access(app, settings.auth_config.cloudflare_config)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
-    app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
+    if bus_app is None:
+        app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
+    else:
+        from .unified_bus import attach_bus_routes
+        attach_bus_routes(app, bus_app)
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -322,6 +475,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if request.headers.get("authorization"):
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
+
+    if archive_reader is not None:
+        from .archive_api import attach_archive_routes
+        attach_archive_routes(app, reader=archive_reader, actor=actor)
 
     def agent(request: Request):
         return settings.agent_auth.agent(request)
@@ -445,14 +602,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 for name in ("hermes", "codex", "claude")]
 
     @app.head("/health", include_in_schema=False)
-    @app.get("/health", response_model=HealthDTO)
-    def health():
+    @app.get("/health", response_model=HealthDTO if bus_app is None else None)
+    async def health(request: Request):
         # Control service liveness is not host, agent or deployment readiness.
         if owned_pilot_service is not None:
             owned_pilot_service.assert_active()
         repo.get_paused()
-        return {"ok": True, "service": "engineering-hub-control",
-                "build_commit": read_build_commit()}
+        result = {"ok": True, "service": "engineering-hub-control",
+                  "build_commit": read_build_commit()}
+        if bus_health is not None:
+            try:
+                response = await bus_health(request)
+                summary = json.loads(response.body)
+                result['bus'] = summary
+                # Existing native connectors read /health.push and its cursor.
+                # Retain that wire contract as well as the nested component view.
+                for key in ('database', 'schema_version', 'version', 'audit', 'semantic', 'push'):
+                    if key in summary:
+                        result[key] = summary[key]
+                push = summary.get('push', {})
+                result['ok'] = (summary.get('ok') is True
+                                and summary.get('database') == 'ok'
+                                and summary.get('audit') == 'ok'
+                                and push.get('state') == 'healthy'
+                                and push.get('subscriptions_enabled') is True)
+            except Exception:
+                result.update(ok=False, bus={'ok': False, 'state': 'unavailable'})
+        return result
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     def overview(request: Request):
@@ -550,6 +726,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/container-pilot/runs", status_code=201, response_model=RunDTO)
     def create_container_pilot_run(payload: NewRun, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if container_pilot_workflow is None:
             raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
         return container_pilot_workflow.create_run(identity, payload.task_id, payload.expected_revision,
@@ -558,6 +736,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/container-pilot/runs/{run_id}/dispatch", response_model=RunDTO)
     async def dispatch_container_pilot(run_id: str, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if container_pilot_workflow is None:
             raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
         if repo.get_run(run_id)['created_by'] != identity:
@@ -569,11 +749,18 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post('/api/hub/v1/container-pilot/runs/{run_id}/recover', response_model=RecoveryDTO)
     async def recover_container_pilot(run_id: str, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if owned_pilot_service is None:
             raise HTTPException(423, detail={'code': 'owned_pilot_not_enabled'})
         if repo.get_run(run_id)['created_by'] != identity:
             raise HTTPException(403, detail={'code': 'forbidden'})
         return await owned_pilot_service.recover(run_id)
+
+    from .work_queue_api import attach_work_queue_routes
+    attach_work_queue_routes(app, repo=repo, queue=work_queue,
+                             actor=actor, agent=agent, human=human)
+    app.state.work_queue = work_queue
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
@@ -582,5 +769,6 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         # Added last so the boundary precedes redirects, auth and static routing.
         app.add_middleware(HubIngressMiddleware, mode=settings.ingress_mode,
                            agent_auth=settings.agent_auth,
-                           cloudflare_config=settings.auth_config.cloudflare_config)
+                           cloudflare_config=settings.auth_config.cloudflare_config,
+                           legacy_bus_enabled=bus_app is not None)
     return app

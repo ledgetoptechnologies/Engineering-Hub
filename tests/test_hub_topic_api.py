@@ -14,7 +14,6 @@ from engineering_hub.reachability import ObserverContext, RouteObservation, Topi
 
 BASE = "/api/hub/v1"
 TOPIC = "hub-build"
-NOW = datetime.now(timezone.utc)
 AUTH = {"Authorization": "Bearer fixture-codex"}
 PRIVATE = "private-session-observer-material"
 
@@ -35,12 +34,15 @@ def make_app(settings, **kwargs):
 
 
 def evidence_for(topic=TOPIC, *, event="ready"):
+    # Build fresh evidence when the test requests it, not at module collection.
+    # A full suite can legitimately take longer than the real 120-second TTL.
+    now = datetime.now(timezone.utc)
     binding = TopicBinding(topic=topic, agent="hermes", session_id=PRIVATE,
                            session_generation=1, connector_generation=1, observer_id=PRIVATE)
-    observer = ObserverContext(observer_id=PRIVATE, epoch=PRIVATE, now=NOW)
+    observer = ObserverContext(observer_id=PRIVATE, epoch=PRIVATE, now=now)
     observation = RouteObservation(
         **binding.model_dump(exclude={"binding_revision"}), observer_epoch=PRIVATE,
-        sequence=1, observed_at=NOW, provenance="runtime_control", event=event,
+        sequence=1, observed_at=now, provenance="runtime_control", event=event,
         native_attachment="verified", runtime_acceptance="idle",
     )
     return {"bindings": (binding,), "observer": observer, "observations": (observation,),
@@ -89,6 +91,10 @@ def test_unconfigured_topic_is_unknown_not_authoritatively_unlinked(settings):
             assert preflight["peer"]["agent"] == recipient
             assert preflight["peer"]["status"] == "unknown_stale"
             assert preflight["advisory"] is True and preflight["delivery_guaranteed"] is False
+            assert preflight['guidance'] == {
+                'recipient_state': 'unknown', 'send_mode': 'queue_only',
+                'response_expectation': 'not_verified',
+                'durable_delivery_required': True, 'receipt_required': True}
 
 
 @pytest.mark.parametrize("topic", ["bad topic", "$private-invalid", "x" * 129, ".invalid", "bad%value"])
@@ -129,11 +135,15 @@ def test_trusted_provider_ready_disconnect_and_exact_topic_projection(settings):
         assert first.json()["peer"]["evidence_level"] == "runtime_verified"
         assert first.json()["peer"]["valid_until"] is not None
         assert first.json()["delivery_guaranteed"] is False
+        assert first.json()['guidance']['recipient_state'] == 'online'
+        assert first.json()['guidance']['send_mode'] == 'notify_if_still_reachable'
         assert PRIVATE not in first.text and "session_id" not in first.text
         state["event"] = "disconnected"
         second = client.get(path, headers=AUTH, params={"recipient": "hermes"})
         assert second.json()["peer"]["status"] == "offline"
         assert second.json()["peer"]["reason"] == "session_disconnected"
+        assert second.json()['guidance']['recipient_state'] == 'offline'
+        assert second.json()['guidance']['send_mode'] == 'queue_only'
         other = client.get(f"{BASE}/topics/different-topic/peers", headers=AUTH).json()
         assert all(peer["status"] == "unlinked" for peer in other["items"])
         assert calls == [TOPIC, TOPIC, "different-topic"]
@@ -174,11 +184,18 @@ def test_provider_failure_degrades_to_unknown_without_private_errors(settings, k
 
 
 def test_mcp_topic_tools_match_rest_and_use_existing_bearer_auth(settings):
-    with TestClient(make_app(settings, reachability_provider=lambda _: evidence_for()), base_url="https://hub.test") as client:
+    # Compare the same snapshot through both protocols, not two observations
+    # whose timestamps differ merely because separate requests were made.
+    evidence = evidence_for()
+    with TestClient(make_app(settings, reachability_provider=lambda _: evidence), base_url="https://hub.test") as client:
         rest = client.get(f"{BASE}/topics/{TOPIC}/peers", headers=AUTH).json()
         assert structured(rpc(client, "hub_topic_peers", {"topic": TOPIC})) == rest
         preflight = structured(rpc(client, "hub_topic_preflight", {"topic": TOPIC, "recipient": "hermes"}))
         assert preflight["peer"]["status"] == "reachable" and preflight["delivery_guaranteed"] is False
+        rest_preflight = client.get(f'{BASE}/topics/{TOPIC}/preflight', headers=AUTH,
+                                    params={'recipient': 'hermes'}).json()
+        assert preflight['guidance'] == rest_preflight['guidance']
+        assert preflight['guidance']['recipient_state'] == 'online'
         for headers in ({}, {"Authorization": "Bearer invalid"}):
             assert rpc(client, "hub_topic_peers", {"topic": TOPIC}, authorization=headers).status_code == 401
 
