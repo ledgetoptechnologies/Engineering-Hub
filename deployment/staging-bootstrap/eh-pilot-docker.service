@@ -1,0 +1,30 @@
+# Proposal only. User-systemd unit; NOT a system-wide User= Docker service.
+# Bootstrap inspection only: no images, containers, executor, issuer or app jobs.
+# No [Install] section: do not enable this unit or turn on linger.
+[Unit]
+Description=Engineering Hub bounded rootless Docker bootstrap
+Requires=dbus.socket
+After=dbus.socket
+ConditionUser=10001
+ConditionPathExists=/usr/bin/newuidmap
+ConditionPathExists=/usr/bin/newgidmap
+
+[Service]
+Type=notify
+NotifyAccess=all
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit
+UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS DOCKER_TLS_VERIFY
+ExecStart=/usr/bin/dockerd-rootless.sh --host=unix://%t/eh-pilot-docker.sock --data-root=%h/docker-data --exec-root=%t/eh-pilot-exec --bridge=none --iptables=false --ip6tables=false
+Restart=no
+TimeoutStartSec=30
+TimeoutStopSec=1200
+RuntimeMaxSec=600
+Delegate=cpu memory pids
+TasksMax=256
+KillMode=mixed
+SendSIGKILL=no
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200

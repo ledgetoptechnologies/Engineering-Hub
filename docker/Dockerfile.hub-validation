@@ -20,6 +20,7 @@ COPY scripts ./scripts
 COPY contracts ./contracts
 COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml compose.hub-test.yaml ./
 COPY docker ./docker
+COPY deployment ./deployment
 COPY docs ./docs
 
 USER 10001:10001

@@ -5,6 +5,12 @@ preparing a disposable, resource-limited pilot on the existing staging PC and
 asked to see the exact setup before activation. This does not authorize changing
 Viewer, PA, production, TrueNAS, current MCP, credentials or Access policies.
 
+Fresh read-only host evidence and a proposed bootstrap-only approval are in
+[`staging-bootstrap-proposal-2026-10-19.md`](staging-bootstrap-proposal-2026-10-19.md).
+Missing UID-map prerequisites, privileged existing operator membership and disabled
+startup requirements prevent treating the installed rootless setup script as a
+drop-in activation command.
+
 ## Scope and ownership
 
 - Hermes: inspect existing host writers and prepare the host-specific boundary

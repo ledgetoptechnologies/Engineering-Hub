@@ -9,6 +9,7 @@ include docker/hub-test-acceptance-v1.json docker/hub-test-integration-results.j
 recursive-include hub_executor *.py *.md
 recursive-include hub_container_executor *.py *.md
 recursive-include hub_validation_worker *.py *.md
+recursive-include deployment/staging-bootstrap *.service *.conf *.md
 recursive-include contracts *.json
 recursive-include docs *.md
 recursive-include scripts *.py
