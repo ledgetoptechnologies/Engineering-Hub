@@ -5,8 +5,10 @@ These tests do not represent installed-host, registry publication or wake proof.
 import json
 import asyncio
 import sys
+import importlib.util
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
@@ -333,7 +335,14 @@ async def native_client(url, token):
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires the actual Linux inotify SQLite event source")
 async def test_native_bus_subscription_survives_hub_composition(tmp_path, monkeypatch):
-    from test_mcp_push import loopback, no_notification, resource_json
+    # pytest's importlib mode deliberately does not put tests/ on sys.path.
+    # Load the existing, side-effect-free loopback helpers by their exact file.
+    spec = importlib.util.spec_from_file_location(
+        "_unified_native_helpers", Path(__file__).with_name("test_mcp_push.py"))
+    assert spec is not None and spec.loader is not None
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    loopback, no_notification, resource_json = helpers.loopback, helpers.no_notification, helpers.resource_json
 
     monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
     bus = create_bus(db_path=tmp_path / "bus.db", audit_path=tmp_path / "audit.jsonl",
