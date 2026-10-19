@@ -470,26 +470,40 @@ test("live task creation uses browser session, same-origin request and CSRF with
   page,
 }) => {
   const mock = await mockLive(page);
-  await page.goto("/");
-  await expect
-    .poll(() =>
-      mock.requests.map(
-        (request) => `${request.method()} ${new URL(request.url()).pathname}`,
-      ),
-    )
-    .toContain("GET /api/hub/v1/overview");
-  await page.getByRole("button", { name: "New task", exact: true }).click();
-  await page
-    .getByLabel("What needs to happen?")
-    .fill("Live fixture human assignment");
-  await page.getByRole("button", { name: "Assign task", exact: true }).click();
-  await expect(
-    page.getByText("Live fixture human assignment", { exact: true }),
-  ).toBeVisible();
-  await expect(page.getByRole("status")).toHaveText("Task assigned.");
-  await expect(page.getByText("Demo workspace.", { exact: true })).toHaveCount(
-    0,
-  );
+  let releaseQueue!: () => void;
+  const queueWaiting = new Promise<void>((resolve) => { releaseQueue = resolve; });
+  // Keep a second legitimate status visible: success must be identified by
+  // its content, not by assuming the entire dashboard has only one live region.
+  await page.route((url) => url.pathname === "/api/hub/v1/work/status", async (route) => {
+    await queueWaiting;
+    await route.fulfill({ status: 423, contentType: "application/json",
+      body: JSON.stringify({ detail: { code: "work_queue_not_configured" } }) });
+  });
+  try {
+    await page.goto("/");
+    await expect
+      .poll(() =>
+        mock.requests.map(
+          (request) => `${request.method()} ${new URL(request.url()).pathname}`,
+        ),
+      )
+      .toContain("GET /api/hub/v1/overview");
+    await page.getByRole("button", { name: "New task", exact: true }).click();
+    await page
+      .getByLabel("What needs to happen?")
+      .fill("Live fixture human assignment");
+    await page.getByRole("button", { name: "Assign task", exact: true }).click();
+    await expect(
+      page.getByText("Live fixture human assignment", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: /^Reading queue status…$/ })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: /^Task assigned\.$/ })).toHaveText("Task assigned.");
+    await expect(page.getByText("Demo workspace.", { exact: true })).toHaveCount(
+      0,
+    );
+  } finally {
+    releaseQueue();
+  }
 });
 
 test("SSE invalidation refetches, loss marks routes stale and disables mutations without polling", async ({
