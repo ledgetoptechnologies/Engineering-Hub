@@ -10,6 +10,15 @@ Independent review accepted these changes. Scoped Linux verification passed
 validation container (synthetic source/mount flags, not actual archived data).
 No live archive bundle, data copy or retrieval API/UI is established by this.
 
+Clean-archive follow-up: Windows `core.autocrlf` also changes hash-pinned bytes
+when exporting an archive unless attributes pin LF. The six current source
+resources still match v0.6.0 in Git; the observed hash mismatch was line-ending
+conversion, not semantic schema drift. `.gitattributes` now preserves original
+LF for the frozen fixture Python/SQL files. A clean archive at `9149352` passed
+all 30 scoped Linux tests in 3.18s (ResourceWarning errors), image index
+`sha256:4460f23a036b8902e434d98609db23cb3b1cb05ecf4998c209910ae72e96bb39`.
+Frozen fixture isolation additionally prevents future current-schema drift.
+
 This helper validates a pre-built, coherent legacy `agent-message-bus` bundle. It does **not** copy, import, restore, initialize, migrate, clean up, or connect to any bus. It has no network client or credential-loading path. The only write is a new JSON metadata report created with exclusive-create semantics and mode `0600`; its parent directory must already exist.
 
 ## Preconditions and use
