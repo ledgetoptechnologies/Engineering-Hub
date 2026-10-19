@@ -18,6 +18,8 @@ The command only prepares a fresh build context using `git archive`; it does not
 build, install dependencies, access the network, or launch services. It stages
 tracked executor Python files, the single image-inspection helper, this packaging
 metadata, and source provenance. It does not stage other scripts or fixtures.
+Use a trusted, exclusively controlled output parent. The freshness checks and
+rename do not implement atomic no-replace publication against concurrent writers.
 
 In an independently approved local Linux build environment with uv 0.11.17 and
 setuptools 84.0.0 already cached, build using `uv build --offline --wheel

@@ -23,6 +23,8 @@ _METADATA = {
 def prepare_archive(archive: bytes, *, revision: str, output_directory: Path) -> Path:
     """Stage an allowlisted git archive into a new directory; no tool invocation.
 
+    The output parent must be trusted and exclusively controlled by this build.
+    Existence checks are not race-free publication against concurrent writers.
     Git's archive comment must match the independently supplied full commit.
     This binds input metadata, not remote provenance or permission to run it.
     """
@@ -39,6 +41,9 @@ def prepare_archive(archive: bytes, *, revision: str, output_directory: Path) ->
             path = PurePosixPath(member.name)
             if path.is_absolute() or ".." in path.parts or "\\" in member.name:
                 raise ValueError("unsafe archive member")
+            raw_name = member.name.removesuffix("/") if member.isdir() else member.name
+            if raw_name != path.as_posix():
+                raise ValueError("noncanonical archive member")
             target = _METADATA.get(member.name)
             if (len(path.parts) == 2 and path.parts[0] == "hub_container_executor"
                     and path.suffix == ".py"):

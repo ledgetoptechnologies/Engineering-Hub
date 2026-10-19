@@ -54,6 +54,8 @@ def test_prepare_stages_only_explicit_library_and_helper(tmp_path):
 @pytest.mark.parametrize("extra", [
     [("../escape", b"", tarfile.REGTYPE)],
     [("/absolute", b"", tarfile.REGTYPE)],
+    [("hub_container_executor/./service.py", b"alias", tarfile.REGTYPE)],
+    [("hub_container_executor//service.py", b"alias", tarfile.REGTYPE)],
     [("hub_container_executor/service.py", b"", tarfile.SYMTYPE)],
     [("hub_container_executor/service.py", b"duplicate", tarfile.REGTYPE)],
 ])
