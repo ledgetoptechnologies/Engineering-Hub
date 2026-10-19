@@ -169,8 +169,12 @@ class TopicPreflight(Input):
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
-               owned_pilot_service=None, work_queue=None):
+               owned_pilot_service=None, work_queue=None, archive_reader=None):
     settings = settings or Settings.from_env()
+    if archive_reader is not None:
+        from .archive_messages import ArchiveMessageReader
+        if type(archive_reader) is not ArchiveMessageReader:
+            raise ValueError('Explicit approved archive reader required')
     if settings.ingress_mode == "browser" and any(component is not None for component in (
             fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service, work_queue)):
         raise ValueError("Browser ingress must not own staging execution")
@@ -302,6 +306,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.owned_pilot_service = owned_pilot_service
+    # Explicit read-only capability; caller owns its lifetime. No environment
+    # discovery, archive adoption or automatic close/ownership transfer.
+    app.state.archive_reader = archive_reader
     if (settings.auth_config.human_auth_mode == "cloudflare_access"
             and settings.ingress_mode == "combined"):
         from .cloudflare_access import install_cloudflare_access
@@ -349,6 +356,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if request.headers.get("authorization"):
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
+
+    if archive_reader is not None:
+        from .archive_api import attach_archive_routes
+        attach_archive_routes(app, reader=archive_reader, actor=actor)
 
     def agent(request: Request):
         return settings.agent_auth.agent(request)

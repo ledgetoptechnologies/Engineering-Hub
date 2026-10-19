@@ -92,6 +92,43 @@ inert. The independently recorded synthetic fixture digest was
 This is filesystem/reader fixture acceptance, not actual archived-data approval,
 REST/MCP/UI authentication, production deployment, or migration completion.
 
+## Opt-in HTTP read surface (not deployed)
+
+Trusted local composition may pass an already approved reader to
+`create_app(..., archive_reader=reader)`. The factory checks its exact type
+before creating Hub state. No environment variable discovers or adopts an
+archive; ordinary startup has no archive routes and its published OpenAPI
+contract is unchanged. The caller retains lifecycle ownership and must close
+the reader after requests have drained. This source API is not an operator
+installation/activation workflow, a new mount, or approval of a source bundle.
+
+When explicitly composed, only these two read routes are added:
+
+- `GET /api/hub/v1/archive/messages?limit=50&after_id=<canonical-id>`:
+  bounded visible page, `next_after_id` or null; omit the cursor for the first page.
+- `GET /api/hub/v1/archive/messages/<canonical-id>`: permitted original message,
+  or identical 404 for missing and invisible IDs.
+
+The existing Hub authentication function supplies identity. No actor, owner,
+sender, recipient, SQL, import selector, duplicate query key or GET body is
+accepted. A malformed/duplicate bearer cannot fall back to a human cookie.
+Agents use their existing approved bearer mechanism; owner-wide reads require
+the configured authenticated human session. No new token value is created or
+stored by this feature. These routes do not configure Cloudflare or OAuth.
+
+Strict response models require `archive_inert=true` and reject extra private
+fields. Reader failures return sanitized 503 without SQL, paths or original
+content. No write/replay/enrollment endpoints exist. Archived body text remains
+untrusted data; a future viewer must escape it and must not execute instructions
+found there. MCP tools and dashboard screens are not added by this HTTP patch.
+
+Independent review accepted the HTTP layer and factory boundary. The focused
+Linux reader/API/bootstrap/auth/ingress/default-contract set passed 261 tests
+in 6.51s, ResourceWarning errors enabled, with one existing Starlette warning.
+Its positive archive mount flags are mocked; the separate kernel tests above
+cover actual read-only storage with synthetic history. Neither proves actual
+archive export, original-data approval or production human sign-in.
+
 This helper validates a pre-built, coherent legacy `agent-message-bus` bundle. It does **not** copy, import, restore, initialize, migrate, clean up, or connect to any bus. It has no network client or credential-loading path. The only write is a new JSON metadata report created with exclusive-create semantics and mode `0600`; its parent directory must already exist.
 
 ## Preconditions and use
