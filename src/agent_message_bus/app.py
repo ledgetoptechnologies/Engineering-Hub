@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
@@ -127,7 +129,12 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 
 def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | None = None,
                auth: AuthSettings | None = None, file_root: str | Path | None = None,
-               push_events_operational: bool | None = None):
+               push_events_operational: bool | None = None,
+               transport_security_settings: TransportSecuritySettings | None = None):
+    # Validate before any database, file or retention work so a bad embedding
+    # configuration fails without side effects.
+    if transport_security_settings is not None and type(transport_security_settings) is not TransportSecuritySettings:
+        raise ValueError("transport_security_settings must be a TransportSecuritySettings or None")
     db_path = db_path or os.environ.get("AGENT_BUS_DB", "data/messages.sqlite3")
     audit_path = audit_path or os.environ.get("AGENT_BUS_AUDIT", "data/audit.jsonl")
     file_root = file_root or os.environ.get("AGENT_BUS_FILE_ROOT", "data/files")
@@ -157,6 +164,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     cursor_reader = MessageCursorReader()
     event_source: SQLiteEventSource | None = None
     mcp = build_mcp(service, push_publisher=push_publisher)
+    if transport_security_settings is not None:
+        # Must precede streamable_http_app(): FastMCP copies these settings into
+        # its session manager when it creates the HTTP app.
+        mcp.settings.transport_security = transport_security_settings
     app = mcp.streamable_http_app()  # Base app preserves FastMCP's session-manager lifespan.
     original_lifespan = app.router.lifespan_context
 
@@ -269,7 +280,22 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     app.state.push_event_source = event_source
     app.state.push_status = push_state
     app.state.push_cursor_reader = cursor_reader
+    app.state.mcp = mcp
+    app.state.auth = auth
     return app
 
 
-app = create_app()
+_default_app = None
+_default_app_lock = threading.Lock()
+
+
+def __getattr__(name: str):
+    # Lazy default instance for `uvicorn agent_message_bus.app:app`. Importing
+    # this module for create_app must not open the database, files or run cleanup.
+    if name != "app":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    global _default_app
+    with _default_app_lock:
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
