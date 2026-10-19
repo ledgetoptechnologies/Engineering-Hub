@@ -37,6 +37,10 @@ services:
       HUB_AGENT_ALLOWED_HOSTS: "192.168.50.80:8770,192.168.50.80:8765,192.168.50.80,127.0.0.1:8770,127.0.0.1:8765,127.0.0.1,localhost:8770,localhost:8765,localhost"
       HUB_WORK_QUEUE_ENABLED: "0"
       HUB_REGISTRY_ENABLED: "0"
+      # Keep 0 through backup/copy/parity/canaries. After those pass, set 1 to
+      # resume the legacy cleanup-at-startup policy on subsequent restarts.
+      # This does not create a new periodic cleanup worker.
+      HUB_BUS_STARTUP_CLEANUP: "0"
       HERMES_TOKEN: REPLACE_WITH_EXISTING_HERMES_TOKEN
       CODEX_TOKEN: REPLACE_WITH_EXISTING_CODEX_TOKEN
       CLAUDE_TOKEN: REPLACE_WITH_EXISTING_CLAUDE_TOKEN

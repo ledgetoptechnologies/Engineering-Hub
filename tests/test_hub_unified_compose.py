@@ -47,6 +47,7 @@ def test_preserves_both_operator_state_roots_and_never_autocreates_them():
     assert env['AGENT_BUS_FILE_ROOT'] == '/var/lib/agent-message-bus/files'
     assert env['CLAIM_LEASE_SECONDS'] == '600'
     assert (env['ACK_RETENTION_DAYS'], env['REJECT_RETENTION_DAYS']) == ('30', '90')
+    assert env['HUB_BUS_STARTUP_CLEANUP'] == '0'
 
 
 def test_existing_protected_tokens_remain_placeholders_not_chat_credentials():
