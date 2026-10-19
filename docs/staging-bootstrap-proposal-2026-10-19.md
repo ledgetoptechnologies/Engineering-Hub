@@ -1,12 +1,22 @@
 # Existing staging PC: bounded rootless bootstrap proposal
 
-Status: **proposal only; needs Beau's specific approval before host changes**.
-This records Codex's fresh read-only observations after Hermes reported MCP
-connectivity trouble. It is not an instruction to run the existing installer,
-activate an executor or deploy an application. The original Hermes preparation
-request remains the single request; this assessment does not reassign it.
+Status: **earlier bootstrap approved and partially installed; clean-environment
+revision not installed or activated**. This records the original Codex read-only
+observations and the subsequent Hermes checkpoint, not an instruction to run the
+existing installer, activate an executor or deploy an application. Hermes remains
+the existing host-operation owner; source review does not reassign that work.
 
-## Observed, not inferred readiness
+Hermes reported in message `b4fb8c7b-bcb0-4149-a436-891a8d79932a` that it
+installed the approved uidmap/libsubid4 prerequisites, locked UID/GID 10001
+`ehpilot` enrollment and three original unit files. It checked the manager's
+resource ceilings, then stopped **before Docker launch** because global SSH/GPG
+socket activation and inherited `SSH_AUTH_SOCK` were not part of the reviewed
+environment. The report says the owned manager/runtime were terminal, runtime
+directory absent and shared daemon/21 containers/15 volumes unchanged. This is
+peer-reported partial bootstrap evidence, not a successful daemon/pilot test or
+current independent host observation. Retain the exact enrollment for review.
+
+## Original pre-installation observations, not current readiness
 
 Read-only SSH used the existing `bkoltz@192.168.50.90` connection, BatchMode and
 strict existing host-key verification. No sudo, package installation, daemon
@@ -91,7 +101,9 @@ on this shared staging PC.
 Exact user-unit/parent-slice/delegation files and post-approval user-runtime,
 manager, start and stop operations are in
 [`deployment/staging-bootstrap`](../deployment/staging-bootstrap/README.md).
-They have not been installed. The target's actual systemd 255 parser accepted
+The earlier versions were subsequently reported installed as described above;
+the revised environment-whitelist unit has not been installed. Before that
+installation, the target's actual systemd 255 parser accepted
 all three configurations with exit zero and no output, using anonymous in-memory
 files and aliases; delegation was checked merged with its existing user@ template.
 Generators/man-page checks were disabled. No files were copied to the target,
