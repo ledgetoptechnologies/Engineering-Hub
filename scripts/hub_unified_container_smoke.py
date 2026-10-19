@@ -25,6 +25,7 @@ from pydantic import AnyUrl
 
 stage, commit = sys.argv[1:]
 base = 'http://127.0.0.1:8770'
+alias_base = 'http://127.0.0.1:8765'
 host = 'hub.ledgetoptechnologies.com'
 root = Path('/var/lib/hub')
 manifest = root / '.unified-smoke.json'
@@ -53,14 +54,14 @@ def snapshot():
     return {'tables': tables, 'files': files, 'audit_bytes': len(audit), 'audit_sha256': hashlib.sha256(audit).hexdigest()}
 
 @asynccontextmanager
-async def client(agent):
+async def client(agent, endpoint=base):
     events = asyncio.Queue()
     async def incoming(message):
         if isinstance(message, types.ServerNotification):
             await events.put(message)
     async with httpx.AsyncClient(headers={'Authorization': 'Bearer ' + tokens[agent], 'Host': host},
                                   timeout=httpx.Timeout(10, read=None), trust_env=False) as http:
-        async with streamable_http_client(base + '/mcp', http_client=http) as (read, write, sid):
+        async with streamable_http_client(endpoint + '/mcp', http_client=http) as (read, write, sid):
             async with ClientSession(read, write, message_handler=incoming) as session:
                 initialized = await session.initialize()
                 yield session, events, sid, initialized
@@ -85,6 +86,12 @@ async def main():
                 await asyncio.sleep(.1)
         if stage != 'seed':
             assert health['build_commit'] == commit and health['bus']['push']['state'] == 'healthy'
+            alias_response = await http.get(alias_base + '/health')
+            alias_health = alias_response.json()
+            assert alias_response.status_code == 200 and alias_health['ok'] is True
+            assert alias_health['build_commit'] == health['build_commit'] == commit
+            assert alias_health['service'] == health['service'] == 'engineering-hub-control'
+            assert alias_health['bus']['push']['state'] == 'healthy'
             # Health does not append an audit event. Compare before any new
             # MCP canary operation, which legitimately appends new records.
             saved = json.loads(manifest.read_text())
@@ -92,7 +99,10 @@ async def main():
         else:
             saved = {}
 
-    async with client('hermes') as (hermes, _, _, _), client('codex') as (codex, events, sid, initialized):
+    # On unified stages Hermes uses the legacy compatibility port while Codex
+    # owns a primary-port session and native subscription. Both must be one bus.
+    hermes_endpoint = base if stage == 'seed' else alias_base
+    async with client('hermes', endpoint=hermes_endpoint) as (hermes, _, _, _), client('codex') as (codex, events, sid, initialized):
         assert {t.name for t in (await codex.list_tools()).tools} == (BUS if stage == 'seed' else BUS | HUB)
         if stage == 'seed':
             args = {'recipient':'codex','message_type':'info','body':{'topic':'unified-cutover'},'client_request_id':'pending-key'}
@@ -135,9 +145,25 @@ async def main():
             assert isinstance(semantic,dict)
             assert (await hermes.call_tool('get_message',{'message_id':saved['pending']})).isError
             async with httpx.AsyncClient(headers={'Host':host}, trust_env=False) as http:
-                assert (await http.post(base+'/mcp',headers={'Mcp-Session-Id':sid(),
-                    'Authorization':'Bearer '+tokens['hermes'],'Accept':'application/json, text/event-stream'},
-                    json={'jsonrpc':'2.0','id':1,'method':'tools/list'})).status_code == 404
+                # Reuse the primary session on the alias, not just a second
+                # authenticated initialization. Independent MCP managers cannot
+                # satisfy this shared-session continuity check.
+                rpc = {'jsonrpc':'2.0','id':1,'method':'tools/list'}
+                same_session_headers = {'Mcp-Session-Id':sid(),
+                    'Authorization':'Bearer '+tokens['codex'],
+                    'Accept':'application/json, text/event-stream','MCP-Protocol-Version':'2025-06-18'}
+                alias_tools = await http.post(alias_base+'/mcp',headers=same_session_headers,json=rpc)
+                assert alias_tools.status_code == 200
+                if alias_tools.headers['content-type'].startswith('text/event-stream'):
+                    data = [line[6:] for line in alias_tools.text.splitlines() if line.startswith('data: ')]
+                    assert len(data) == 1
+                    alias_result = json.loads(data[0])
+                else:
+                    alias_result = alias_tools.json()
+                assert {item['name'] for item in alias_result['result']['tools']} == BUS | HUB
+                foreign_session_headers = {**same_session_headers,'Authorization':'Bearer '+tokens['hermes']}
+                for endpoint in (base, alias_base):
+                    assert (await http.post(endpoint+'/mcp',headers=foreign_session_headers,json=rpc)).status_code == 404
                 assert (await http.get(base+'/api/messages')).status_code == 401
                 assert (await http.get(base+'/api/messages',headers={'Authorization':'Bearer invalid'})).status_code == 401
             await codex.subscribe_resource(AnyUrl('agentbus://inbox/codex'))
@@ -163,6 +189,9 @@ async def main():
     saved['snapshot'] = snapshot()
     manifest.write_text(json.dumps(saved,sort_keys=True))
     print(json.dumps({'stage':stage,'preservation':'passed','tools':24 if stage=='seed' else 33,
+                      'agent_ports':[8770] if stage=='seed' else [8770,8765],
+                      'shared_session_across_agent_ports':'not_applicable' if stage=='seed' else 'passed',
+                      'native_notification_route':'not_applicable' if stage=='seed' else 'alias_to_primary',
                       'table_count':len(saved['snapshot']['tables'])}))
 
 asyncio.run(main())
@@ -246,15 +275,22 @@ def smoke(image, commit):
                                 '--port','8770','--no-access-log','--no-proxy-headers'])
             else:
                 command.extend(['-m','engineering_hub','--split-ingress','--unified-mcp',
-                                '--host','127.0.0.1','--port','8770','--browser-port','8771'])
+                                '--host','127.0.0.1','--port','8770','--browser-port','8771',
+                                '--agent-alias-port','8765'])
             run(*command)
             report = json.loads(run('docker','exec',name,'python','-c',PROBE,stage,commit,timeout=55))
             assert report['stage'] == stage and report['preservation'] == 'passed'
+            if stage != 'seed':
+                assert report['agent_ports'] == [8770,8765]
+                assert report['shared_session_across_agent_ports'] == 'passed'
+                assert report['native_notification_route'] == 'alias_to_primary'
             reports.append(report)
             stop_owned(name,owner)
             names.remove(name)
         return {'source_commit':commit,'resolved_image_id':image_id,'synthetic_legacy_cutover':'passed','stages':reports,
                 'network':'none','native_notifications':'passed','named_volume_recreation':'passed',
+                'compatibility_alias':{'agent_ports':[8770,8765], 'shared_stateful_session':'passed',
+                                       'native_notification_route':'alias_to_primary'},
                 'semantic':'status_only_no_model_download_or_embedding_test',
                 'production_state':'never_opened','legacy_version':'candidate_bus_not_deployed_old_image',
                 'truenas':'not_deployed','reboot':'not_tested','agent_wake':'not_tested'}

@@ -7,6 +7,74 @@ message history, backups, agent credentials or unrelated services.
 
 ## Current implementation checkpoint
 
+### In-place upgrade and port compatibility
+
+Beau confirmed the existing Hub is already running. This is an **in-place
+upgrade**, not a new Hub installation or an empty replacement database.
+`compose.hub-unified.yaml` is a candidate profile for that existing app. Its Hub
+bind follows Beau's subsequently supplied existing Hub Compose, superseding
+Hermes's older prepared artifact:
+`/mnt/Plugins/App_Data/Engineering-Hub/` to `/var/lib/hub`.
+Preserve the existing Compose project identity `e-h-control` and service
+`engineering-hub-control`. Do not append an `engineering-hub` child directory:
+that would select a different database rather than upgrade the existing Hub.
+Its separate legacy bus bind follows Beau's supplied configuration:
+`/mnt/Plugins/App_Data/Agent_MCP` to `/var/lib/agent-message-bus`.
+Neither path is automatically created. Reconcile both against actual installed
+mounts before using the profile; a configuration file is not a container inspect.
+
+The optional `--agent-alias-port 8765` keeps **both** existing agent addresses:
+`http://192.168.50.80:8765/mcp` and `http://192.168.50.80:8770/mcp`.
+Both sockets belong to the **same Uvicorn agent server, Hub core, stateful MCP
+session manager and lifecycle**. No second database writer or MCP stack is
+launched. The browser remains `127.0.0.1:8771`, behind the existing Hub tunnel.
+Defaults are unchanged unless the alias option is explicitly selected.
+Invalid or occupied alias ports fail before core construction and database work.
+
+Actual local image source `9193ff7889ee732ea4c8821ace7b79cb89164a9d` passed the
+updated synthetic 24-to-33-to-33 preservation smoke with both ports: a primary
+session ID reused on the alias returned the same 33 tools; a foreign identity
+was rejected on both; alias-originated sends notified a primary-port subscriber.
+Its image index is
+`sha256:2d20bee4535fef1391c8bdcdb918df5b61f0bc19beb4456881dac58d39276bcb`.
+This is local container evidence, not an installed NAS or agent-wake claim.
+
+The earlier unified release from main
+`132236f1da272849548b0b0b4463a5d2d8934aa2` was privately published by workflow
+`39335110935` at registry digest
+`sha256:3ab836cac7c7834981f5b9b3a568fe6edf147b64fd49d188ecf37743c0f74812`.
+Downloaded publication evidence confirms authenticated registry startup,
+split ingress and synthetic unified preservation; registry and promoted-latest
+manifest hashes match. **That release does not include the alias option** and
+must not be used with this new three-port profile. Wait for the matching
+alias-capable release and its verification before the actual cutover.
+
+### Retention and authentication gates
+
+`HUB_BUS_STARTUP_CLEANUP=0` is the default and explicit preservation-phase
+setting. It prevents startup cleanup from removing retention-eligible records or
+expiring claims before source/copy comparisons. **Cleanup is suspended in this
+mode**; merely keeping retention-day environment values does not run it.
+After copied-state parity and all three client canaries are verified, set it to
+`1` to restore the legacy cleanup-at-startup policy on subsequent starts and
+verify the expected retention transitions. Only exact `0` and `1` are accepted.
+This does not introduce a periodic maintenance worker or permission to replay
+work after a claim expires. The existing admin cleanup endpoint is retained.
+
+Live read-only checks still found the existing Hub serving HTML on LAN port
+8770 and returning 401 for an anonymous protected overview. Therefore its
+working dashboard is not yet proof of the final tunnel-only browser layout.
+Beau's supplied existing Hub Compose has GitHub mode with no GitHub credentials
+and empty Cloudflare fields. This explains why passing Cloudflare's outer login
+does not establish a Hub session; the running old build still reports unauthenticated.
+The candidate profile uses the separately approved Cloudflare Access configuration,
+not an additional GitHub OAuth application. This owner-supplied Compose is stronger
+configuration evidence than the older prepared artifact, but is not an independent
+container mount/image inspection or end-to-end browser authentication test.
+Reconcile the existing approved Hub Access issuer/audience/email policy and
+tunnel upstream before switching to split ingress. Preserve the Hub URL,
+existing data and separate Ops policy; do not overwrite credentials from chat.
+
 Hub integration source, including Claude's bus hooks at
 `fc9efac68a351337b393eda7330ebb414e6d3b85` and the explicit startup-cleanup hook
 at `2b1607b686fe7021e0998df7a67c96d52f61e158`, reuses the
@@ -21,8 +89,9 @@ MCP and bus REST paths before human authentication.
 Hub startup is unchanged. The factory requires existing absolute DB/audit/object
 paths, a separate Hub DB, shared agent authentication, a preconfigured exact
 transport policy and native push. The unified factory explicitly passes
-`startup_cleanup=False`: construction must not run legacy retention before the
-preserved-state comparison. The standalone legacy default remains unchanged.
+`startup_cleanup=False` in preservation mode: construction must not run legacy
+retention before the preserved-state comparison. The explicit post-verification
+mode above restores cleanup. The standalone legacy default remains unchanged.
 Factory-only imports are inert; the default ASGI entry is lazily constructed.
 Unified health retains the old top-level push/cursor fields and also reports its
 bus component. Readiness requires valid audit, healthy DB and native push with
@@ -132,9 +201,10 @@ health, pre-construction authentication and non-forceful fixture-cleanup checks.
    coherent backup, immutable rollback image and configuration. Report exact
    endpoints and evidence. Do not say removed while an old writer remains live.
 
-Expected new public agent endpoint remains the Hub agent listener at
-`http://192.168.50.80:8770/mcp`; browser stays loopback 8771 behind its existing
-tunnel and separate Access policy. Final ports/mounts must match the actual
+The unified owner retains the Hub agent listener at
+`http://192.168.50.80:8770/mcp` and the compatibility address
+`http://192.168.50.80:8765/mcp`; browser stays loopback 8771 behind its existing
+tunnel and separate Access policy. Final mounts must match the actual
 operator inventory before any Compose update. No tunnel, Ops or email-policy
 change is needed merely to unify MCP tools.
 

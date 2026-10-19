@@ -71,7 +71,7 @@ def _listener(app):
 
 async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770,
                           browser_port=8771, stop_event=None, on_ready=None,
-                          install_signals=True):
+                          install_signals=True, agent_alias_port=None):
     """Serve both front doors, starting/stopping the shared core exactly once.
 
     Port zero is supported for isolated tests; operators use explicit fixed
@@ -79,6 +79,8 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
     The factory must construct its core/owner only when invoked. A failed bind
     happens before construction or ownership startup. Loss of either listener
     drains the other, then closes the one shared core. No replacement is spawned.
+    An optional compatibility agent socket shares the same agent server and core;
+    it does not create a second MCP session manager or lifecycle owner.
     """
     if not callable(pair_factory):
         raise ValueError("Hub frontend factory required before owner construction")
@@ -88,18 +90,26 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
             raise ValueError("Hub listener ports must be integers between 0 and 65535")
     if agent_port and agent_port == browser_port:
         raise ValueError("Hub agent and browser ports must be distinct")
+    if agent_alias_port is not None:
+        if type(agent_alias_port) is not int or not 0 <= agent_alias_port <= 65535:
+            raise ValueError("Hub alias port must be an integer between 0 and 65535")
+        if agent_alias_port and agent_alias_port in (agent_port, browser_port):
+            raise ValueError("Hub alias, agent and browser ports must be distinct")
     stop = stop_event if stop_event is not None else asyncio.Event()
     with ExitStack() as stack:
         agent_socket = stack.enter_context(_bind(agent_host, agent_port))
         browser_socket = stack.enter_context(_bind("127.0.0.1", browser_port))
+        agent_sockets = [agent_socket]
+        if agent_alias_port is not None:
+            agent_sockets.append(stack.enter_context(_bind(agent_host, agent_alias_port)))
         if install_signals:
             stack.enter_context(_signal_stop(stop))
         pair = pair_factory()
         async with pair.lifespan():
             # Configuration failure must unwind the core owner too.
             servers = [_listener(pair.agents), _listener(pair.browser)]
-            workers = [asyncio.create_task(server.serve(sockets=[sock]))
-                       for server, sock in zip(servers, (agent_socket, browser_socket))]
+            workers = [asyncio.create_task(server.serve(sockets=sockets))
+                       for server, sockets in zip(servers, (agent_sockets, [browser_socket]))]
             stopped = asyncio.create_task(stop.wait())
 
             async def ready():

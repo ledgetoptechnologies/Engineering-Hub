@@ -18,6 +18,9 @@ def create_unified_app(settings=None):
     listener, job, watcher fallback or second bus is discovered here.
     """
     settings = settings or Settings.from_env()
+    cleanup_flag = os.environ.get('HUB_BUS_STARTUP_CLEANUP', '0')
+    if cleanup_flag not in {'0', '1'}:
+        raise ValueError('HUB_BUS_STARTUP_CLEANUP must be 0 or 1')
     if (settings.ingress_mode != 'combined'
             or settings.auth_config.human_auth_mode != 'cloudflare_access'
             or settings.auth_config.cloudflare_config is None):
@@ -49,6 +52,9 @@ def create_unified_app(settings=None):
                          file_root=paths['AGENT_BUS_FILE_ROOT'],
                          auth=settings.agent_auth,
                          push_events_operational=True,
-                         startup_cleanup=False,
+                         # Preserve every row during the initial parity check.
+                         # After verification the operator may restore the old
+                         # startup-retention behavior explicitly with value 1.
+                         startup_cleanup=cleanup_flag == '1',
                          transport_security_settings=security)
     return create_app(settings, bus_app=bus)
