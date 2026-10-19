@@ -19,6 +19,36 @@ all 30 scoped Linux tests in 3.18s (ResourceWarning errors), image index
 `sha256:4460f23a036b8902e434d98609db23cb3b1cb05ecf4998c209910ae72e96bb39`.
 Frozen fixture isolation additionally prevents future current-schema drift.
 
+## Actual kernel read-only smoke (synthetic data only)
+
+`docker/Dockerfile.hub-archive-acceptance` derives a disposable synthetic bundle
+from a verified local validation image. It creates fixtures only during build;
+runtime remains UID/GID 10001. An omitted base selects `scratch` and cannot run
+the fixture builder; the operator must supply a reviewed validation base.
+BuildKit resolves local tags: verify the actual selected digest in the build
+output, not merely the tag spelling. No production image is published by this.
+
+Root verified base index
+`sha256:4460f23a036b8902e434d98609db23cb3b1cb05ecf4998c209910ae72e96bb39`
+and resulting fixture index
+`sha256:7d314907358d44fb93447bb21d111dfa3502f4aed910e77899334021c5ffc1cc`.
+Actual Linux Docker runs used no network, no host bind mount/socket/credentials,
+all capabilities dropped, no-new-privileges, one CPU, 512 MiB memory and 64 PIDs.
+Only a private 16 MiB `/tmp` tmpfs received the metadata report.
+
+- Read-only root: validator succeeded; real `statvfs` reported read-only, report
+  mode was `0600`, owner UID 10001, and all 65 synthetic VaultBridge notes verified.
+- Writable root: validator rejected with `readonly_mount_required`.
+- Read-only root with a writable anonymous tmpfs at `/archive-fixture/files`:
+  validator rejected with `readonly_mount_required`.
+
+The synthetic archive manifest SHA-256 was
+`210a001cf83d6d258f2d339ec1535881b9b4c80d8332e56d6ab8d6edebbb6756`.
+All runs terminated and their disposable containers were removed with `--rm`.
+This proves the kernel mount checks on fixtures, not coherent export, original
+data parity, NAS deployment, UI retrieval or migration acceptance. The legacy
+live bus remains untouched.
+
 This helper validates a pre-built, coherent legacy `agent-message-bus` bundle. It does **not** copy, import, restore, initialize, migrate, clean up, or connect to any bus. It has no network client or credential-loading path. The only write is a new JSON metadata report created with exclusive-create semantics and mode `0600`; its parent directory must already exist.
 
 ## Preconditions and use
