@@ -93,8 +93,23 @@ class PilotOwner:
             self._parent_identity = (parent.st_dev, parent.st_ino)
             _local_filesystem(self._parent_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
             self._lock_name = path.name + '.pilot-owner.lock'
-            self._lock_fd = os.open(self._lock_name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                    0o600, dir_fd=self._parent_fd)
+            lock_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+            created_lock = False
+            try:
+                self._lock_fd = os.open(self._lock_name, lock_flags, dir_fd=self._parent_fd)
+            except FileNotFoundError:
+                # Never recreate an enrolled database's missing lock. Inode
+                # numbers may be reused immediately, so comparing the newly
+                # created inode with enrollment is not proof of continuity.
+                try:
+                    os.stat(path.name, dir_fd=self._parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise PilotOwnershipError()
+                self._lock_fd = os.open(self._lock_name, lock_flags | os.O_CREAT | os.O_EXCL,
+                                        0o600, dir_fd=self._parent_fd)
+                created_lock = True
             self._lock_identity = self._check_file(self._lock_fd, self._lock_name)
             _local_filesystem(self._lock_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -114,6 +129,10 @@ class PilotOwner:
                     os.close(created_fd)
                 fresh = True
             except FileExistsError:
+                # A database appearing after fresh-lock admission cannot be
+                # adopted, even if a filesystem reused an enrolled inode.
+                if created_lock:
+                    raise PilotOwnershipError()
                 self._database_identity = self._check_database()
             self._check_database(self._database_identity)
             with self._connect() as db:

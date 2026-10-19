@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from uuid import uuid4
 
 import pytest
@@ -186,7 +187,7 @@ def test_live_path_replacement_or_unsafe_sidecar_fails_closed(path, target):
 
 @LINUX
 @pytest.mark.parametrize("attack", ["corrupt", "schema", "row", "sidecar", "dbmode", "missinglock"])
-def test_reopen_rejects_corruption_missing_or_unsafe_state(path, attack):
+def test_reopen_rejects_corruption_missing_or_unsafe_state(path, attack, monkeypatch):
     identity = str(uuid4())
     with journal(path) as store:
         store.begin(identity, "probe")
@@ -201,9 +202,33 @@ def test_reopen_rejects_corruption_missing_or_unsafe_state(path, attack):
     elif attack == "dbmode":
         path.chmod(0o644)
     else:
-        path.with_name(path.name + ".pilot-owner.lock").unlink()
+        lock = path.with_name(path.name + ".pilot-owner.lock")
+        lock.unlink()
+        before_bytes = path.read_bytes()
+        def owner_and_journal_rows():
+            with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+                return (db.execute('SELECT * FROM hub_pilot_owner').fetchall(),
+                        db.execute('SELECT * FROM hub_pilot_owner_epochs ORDER BY epoch').fetchall(),
+                        db.execute('SELECT * FROM private_operation_journal ORDER BY operation_id').fetchall())
+        before_rows = owner_and_journal_rows()
+        real_open = os.open
+        create_attempts = []
+        def guarded_open(filename, flags, *args, **kwargs):
+            if os.fspath(filename) in {lock.name, str(lock)} and flags & os.O_CREAT:
+                create_attempts.append((os.fspath(filename), flags))
+                raise OSError('Regression: attempted to recreate missing journal lock')
+            return real_open(filename, flags, *args, **kwargs)
+        monkeypatch.setattr(os, 'open', guarded_open)
     with pytest.raises(OperationJournalError):
         journal(path, create=False)
+    if attack == 'missinglock':
+        # A sanitized exception alone could be caused by our spy or a later
+        # failure after changing ownership. Verify the missing inode is not
+        # repaired and both enrollment history and pending operation persist.
+        assert create_attempts == []
+        assert not lock.exists() and not lock.is_symlink()
+        assert path.read_bytes() == before_bytes
+        assert owner_and_journal_rows() == before_rows
 
 
 @LINUX

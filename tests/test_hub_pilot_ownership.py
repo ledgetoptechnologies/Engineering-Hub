@@ -8,7 +8,7 @@ import subprocess
 import sys
 import uuid
 from types import SimpleNamespace
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 
 import pytest
 
@@ -277,6 +277,103 @@ def test_second_owner_does_not_mutate_epoch(database):
         first.assert_active(database)
 
 
+@pytest.mark.parametrize('original_active', [False, True])
+def test_missing_enrolled_lock_is_never_recreated_or_epoch_updated(database, monkeypatch, original_active):
+    """Refuse missing locks before O_CREAT, independent of filesystem inode reuse."""
+    import engineering_hub.pilot_ownership as module
+
+    owner = PilotOwner(database)
+    if not original_active:
+        owner.close()
+    lock = database.with_name(database.name + '.pilot-owner.lock')
+
+    def rows():
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+            return (db.execute('SELECT * FROM hub_pilot_owner').fetchall(),
+                    db.execute('SELECT * FROM hub_pilot_owner_epochs ORDER BY epoch').fetchall())
+
+    original_rows = rows()
+    original_bytes = database.read_bytes()
+    lock.unlink()
+    real_open = os.open
+    create_attempts = []
+
+    def guarded_open(path, flags, *args, **kwargs):
+        if os.fspath(path) in {lock.name, str(lock)} and flags & os.O_CREAT:
+            create_attempts.append((os.fspath(path), flags))
+            # Constructor sanitizes underlying errors, so the explicit assertion
+            # below is essential: merely expecting PilotOwnershipError would
+            # wrongly pass even if this spy caused the failure itself.
+            raise OSError('Regression: attempted to recreate enrolled lock')
+        return real_open(path, flags, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(module.os, 'open', guarded_open)
+            with pytest.raises(PilotOwnershipError):
+                PilotOwner(database)
+        assert create_attempts == [], 'Existing enrollment must never attempt O_CREAT for its missing lock'
+        assert not lock.exists() and not lock.is_symlink()
+        assert database.read_bytes() == original_bytes
+        assert rows() == original_rows
+        if original_active:
+            with pytest.raises(PilotOwnershipError):
+                owner.assert_active(database)
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize('race', ['database_appears', 'exclusive_lock_collision'])
+def test_fresh_lock_races_never_fall_back_to_enrollment(database, monkeypatch, race):
+    """Inject a competing path after absence checks, before exclusive lock creation."""
+    import engineering_hub.pilot_ownership as module
+
+    lock = database.with_name(database.name + '.pilot-owner.lock')
+    real_open = os.open
+    lock_attempts, sql_attempts, raced_identity = [], [], []
+
+    def guarded_open(path, flags, *args, **kwargs):
+        if os.fspath(path) in {lock.name, str(lock)}:
+            lock_attempts.append(flags)
+            if flags & os.O_CREAT:
+                assert flags & os.O_EXCL, 'Fresh ownership creation must be exclusive'
+                target = database.name if race == 'database_appears' else lock.name
+                fd = real_open(target, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                               0o600, dir_fd=kwargs['dir_fd'])
+                try:
+                    info = os.fstat(fd)
+                    raced_identity.append((info.st_dev, info.st_ino))
+                finally:
+                    os.close(fd)
+        return real_open(path, flags, *args, **kwargs)
+
+    def forbidden_connect(self):
+        sql_attempts.append(True)
+        raise AssertionError('An ownership admission race must fail before SQLite enrollment')
+
+    with monkeypatch.context() as patched:
+        patched.setattr(module.os, 'open', guarded_open)
+        patched.setattr(ProductionPilotOwner, '_connect', forbidden_connect)
+        with pytest.raises(PilotOwnershipError):
+            PilotOwner(database)
+    assert len(raced_identity) == 1
+    assert len(lock_attempts) == 2
+    assert not lock_attempts[0] & os.O_CREAT
+    assert lock_attempts[1] & os.O_CREAT and lock_attempts[1] & os.O_EXCL
+    assert sql_attempts == [], 'A wrapped spy failure must not be mistaken for admission denial'
+    target = database if race == 'database_appears' else lock
+    info = target.stat()
+    assert (info.st_dev, info.st_ino) == raced_identity[0]
+    assert info.st_mode & 0o777 == 0o600
+    assert target.read_bytes() == b''
+    if race == 'exclusive_lock_collision':
+        assert not database.exists()
+    else:
+        # Preserve the concurrently appearing database and our newly created
+        # lock for inspection; do not enroll or silently remove either one.
+        assert lock.exists()
+
+
 @pytest.mark.parametrize('replacement', ['rename', 'unlink'])
 def test_replaced_lock_never_allows_existing_database_adoption(database, replacement):
     owner = PilotOwner(database)
@@ -288,12 +385,13 @@ def test_replaced_lock_never_allows_existing_database_adoption(database, replace
             lock.rename(lock.with_name('old-lock'))
         else:
             lock.unlink()
-        # Constructor may create a replacement lock, but must not adopt state
-        # protected by the older, still-held inode or mutate its durable epoch.
+        # A missing enrolled lock must not be recreated, even while its old
+        # inode is still held open; durable epoch state must stay untouched.
         with pytest.raises(PilotOwnershipError):
             PilotOwner(database)
         with sqlite3.connect(database) as db:
             assert db.execute('SELECT * FROM hub_pilot_owner').fetchall() == original
+        assert not lock.exists() and not lock.is_symlink()
         with pytest.raises(PilotOwnershipError):
             owner.assert_active(database)
     finally:
@@ -303,6 +401,7 @@ def test_replaced_lock_never_allows_existing_database_adoption(database, replace
         PilotOwner(database)
     with sqlite3.connect(database) as db:
         assert db.execute('SELECT * FROM hub_pilot_owner').fetchall() == original
+    assert not lock.exists() and not lock.is_symlink()
 
 
 def test_garbage_collection_closes_orphaned_capability(database):
