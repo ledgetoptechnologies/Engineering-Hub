@@ -37,6 +37,60 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Split listener lifecycle and immediate admission veto
+
+Tested source `2ec018ae87a1a639a981a0d408f99643755854f5`, development branch
+only. Clean Git archive image index
+`sha256:054e7dc5d4ca1d884f2847d190fae0ad7175327b5b4c0144129be2727a7b36a3`,
+manifest `sha256:c4eae379e56b9e79b6d02fb8dc90e486f50c63e2e48c43aecb3ec054f651411f`,
+config `sha256:898db08c828eb25d716bd549f982dd576dde06ce29de8bc0658a00c9d819e491`.
+Full exact-image Linux suite: **3286 passed, 6 skipped, 4 known warnings**,
+152.42s. Focused split listeners, queued pilot, runtime, frontends, gateway and
+contract checks: **104 passed**, 7.20s, ResourceWarning errors enabled and no
+warnings. All six ownership cases separately passed **6/6**, 0.59s, on that image
+with only CHOWN and synthetic fixture storage. Full warnings were existing
+Starlette, an unclosed test event loop and two deliberate fork deprecations.
+
+Two explicit source runners bind before factories: private agent TCP plus browser
+UDS over one exact private core, and a separate loopback-only public gateway
+accepting only its dedicated HTTPX client. Listener failure/callback failure or
+repeated caller cancellation drains accepted requests before client/socket/core
+release. Exact read-only event subscriptions receive a graceful disconnect;
+ordinary requests and every POST are not force-cancelled by a shutdown timeout.
+Actual pinned h11/ASGI stream behavior, not a generic future protocol promise,
+is tested with open global SSE streams on both frontends.
+
+Review found that listener drain alone would leave queue admission open while a
+slow request finished. Explicit synchronous HTTP/runtime admission vetoes now run
+before the first drain await. A real Linux owner/native-queue regression holds
+one accepted phase and one accepted HTTP request, stops/cancels repeatedly, and
+verifies the second job stays queued while feed/owner/socket remain alive. Only
+the accepted phase finishes; its uncertain unfinished chain remains held.
+Two additional full HTTP/UDS runner cases cover success and healthy rollback
+using signed synthetic Access assertions and typed simulated remote effects.
+Independent review accepted the wiring; the original combined runner is unchanged.
+
+Initial working focus: **1 failed, 59 passed**, 7.00s. A new test sent an agent
+bearer to human-only task creation and held its403 response, so it was not actually
+testing an accepted mutation. The fixture now uses permitted agent decision
+creation, asserts201 and persistence before blocking, then tests shutdown. No
+authentication rule was relaxed to fix that test.
+
+Claude reply `00bcac3e-8c6b-4717-82b8-b5a27834d880` correctly identifies that
+stale socket residue prevents unattended restart. His proposed database flock
+alone is not sufficient endpoint ownership proof: `PilotOwner` closes inherited
+locks after fork, while a child can retain an inherited listener descriptor.
+UID/mode/type are not a generation binding. Endpoint-specific lifecycle ownership,
+durable exact identity metadata, inherited-descriptor handling and crash tests are
+next source work, not implemented recovery. Per-container tmpfs alone does not
+prove shared-socket reachability, namespace reset or reconnect. Unknown residue
+still fails closed; no blind unlink or lease-expiry reassignment was added.
+
+These tests do not establish separate container mounts/process credentials,
+actual immutable Docker deployment/observed health, installed TrueNAS/tunnel,
+independent enrollment, or app/PC reboot acceptance. No live host, MCP endpoint,
+token, port, access policy, service or production deployment was changed.
+
 ### Unified signed-auth workflow over protected Unix transport
 
 Tested source `b17cd728142d31e9aa0d65cba10b03c43d67ba88`, development branch
