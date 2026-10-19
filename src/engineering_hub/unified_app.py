@@ -49,5 +49,6 @@ def create_unified_app(settings=None):
                          file_root=paths['AGENT_BUS_FILE_ROOT'],
                          auth=settings.agent_auth,
                          push_events_operational=True,
+                         startup_cleanup=False,
                          transport_security_settings=security)
     return create_app(settings, bus_app=bus)
