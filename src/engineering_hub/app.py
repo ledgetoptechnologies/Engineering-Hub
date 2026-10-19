@@ -32,6 +32,7 @@ from .registry_bridge import CanonicalRegistryBridge
 from .registry_client import (
     RegistryAccessDenied, RegistrySourceUnavailable, RegistryPointer,
     RegistrySnapshotRequired, validate_topic as validate_registry_topic,
+    validate_origin as validate_registry_origin,
 )
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
@@ -56,10 +57,21 @@ class Settings:
     agent_allowed_hosts: tuple[str, ...] = ()
     work_queue_enabled: bool = False
     staging_machine_id: str = "staging-pc"
+    registry_enabled: bool = False
+    registry_origin: str | None = None
+    registry_events_enabled: bool = False
 
     def __post_init__(self):
         if type(self.work_queue_enabled) is not bool:
             raise ValueError("Explicit work queue enable flag required")
+        if type(self.registry_enabled) is not bool or type(self.registry_events_enabled) is not bool:
+            raise ValueError('Explicit registry flags required')
+        if self.registry_origin is not None:
+            validate_registry_origin(self.registry_origin)
+        if self.registry_enabled and self.registry_origin is None:
+            raise ValueError('Configured registry origin required')
+        if self.registry_events_enabled and not self.registry_enabled:
+            raise ValueError('Registry events require explicit registry enablement')
         from .ingress import validate_agent_hosts
         validate_agent_hosts(self.agent_allowed_hosts)
         if self.ingress_mode not in {"combined", "agents", "browser"}:
@@ -79,6 +91,10 @@ class Settings:
         work_queue_flag = os.environ.get("HUB_WORK_QUEUE_ENABLED", "0")
         if work_queue_flag not in {"0", "1"}:
             raise ValueError("HUB_WORK_QUEUE_ENABLED must be 0 or 1")
+        registry_flag = os.environ.get('HUB_REGISTRY_ENABLED', '0')
+        registry_events_flag = os.environ.get('HUB_REGISTRY_EVENTS_ENABLED', '0')
+        if registry_flag not in {'0', '1'} or registry_events_flag not in {'0', '1'}:
+            raise ValueError('Hub registry flags must be 0 or 1')
         path = Path(os.environ.get("HUB_DB", "data/hub.sqlite3"))
         bus_path = os.environ.get("AGENT_BUS_DB")
         if bus_path and path.resolve() == Path(bus_path).resolve():
@@ -101,7 +117,10 @@ class Settings:
                    agent_allowed_hosts=tuple(value.strip() for value in
                        os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()),
                    work_queue_enabled=work_queue_flag == "1",
-                   staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"))
+                   staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"),
+                   registry_enabled=registry_flag == '1',
+                   registry_origin=os.environ.get('HUB_REGISTRY_ORIGIN'),
+                   registry_events_enabled=registry_events_flag == '1')
 
 
 class Input(BaseModel):
@@ -171,6 +190,15 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None, work_queue=None, archive_reader=None):
     settings = settings or Settings.from_env()
+    if settings.registry_enabled:
+        if registry_bridge is not None or reachability_provider is not None:
+            raise ValueError('Choose one explicit registry configuration source')
+        from .registry_client import RegistryClient
+        from .registry_stream import RegistryStream
+        registry_bridge = CanonicalRegistryBridge(
+            RegistryClient(settings.registry_origin),
+            stream=RegistryStream(settings.registry_origin) if settings.registry_events_enabled else None,
+        )
     if archive_reader is not None:
         from .archive_messages import ArchiveMessageReader
         if type(archive_reader) is not ArchiveMessageReader:
@@ -306,6 +334,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.owned_pilot_service = owned_pilot_service
+    app.state.registry_bridge = registry_bridge
     # Explicit read-only capability; caller owns its lifetime. No environment
     # discovery, archive adoption or automatic close/ownership transfer.
     app.state.archive_reader = archive_reader

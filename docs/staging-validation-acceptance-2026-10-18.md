@@ -24,9 +24,15 @@ Existing shared staging Viewer/PA containers are not a disposable test boundary.
 Read-only local inventory found only Docker Desktop's internal WSL distribution,
 not an existing general-purpose Linux operator environment. No internal WSL
 administration, socket mount, VM provisioning or shared-host service change was
-performed to bypass this prerequisite. Beau has been asked to choose an isolated
-test VM on staging, another Linux test machine, or continued source-only work.
-Host selection is not itself evidence that permissions or an executor exist.
+performed to bypass this prerequisite. Beau chose continued source-only work
+and clarified that the design must use the existing equipment. No additional
+PC or dedicated VM is a prerequisite. Future activation should assess an
+appropriately constrained test setup on the existing staging PC, separate from
+production data and processing workloads; a Compose project name alone is not
+a security or physical-resource reservation boundary. No host provisioning,
+private credential/context change or live service activation follows from this
+hardware clarification. Existing local Docker remains suitable for bounded
+synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 

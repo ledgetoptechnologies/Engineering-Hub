@@ -98,8 +98,26 @@ deadline; new authoritative evidence is required to turn it green again.
 
 ### Current operational gap
 
-The default packaged startup still does **not** inject the canonical registry
-bridge. The bus's `presence_status` reports transport connections only, not
+Packaged startup now supports explicit, default-off canonical registry wiring:
+`HUB_REGISTRY_ENABLED=1` plus `HUB_REGISTRY_ORIGIN` selects the existing read-only
+snapshot adapter. `HUB_REGISTRY_EVENTS_ENABLED=1` separately permits on-demand
+native event streams; it requires registry enablement. Flags accept only `0`
+or `1`. The origin must be HTTPS except literal loopback HTTP, with no userinfo,
+path prefix, query or fragment. Existing deployments/Compose files are not
+changed by this source feature, and the defaults still inject no bridge.
+
+Construction and startup make no registry request or background subscription.
+Authenticated agent reads preserve each request's original bearer; there is no
+stored provider credential, agent impersonation header, cross-agent cache,
+timer scan or automatic reconnect worker. An explicitly injected bridge cannot
+be combined with the configured source. A human session does not inherit an
+agent token: owner dashboard reads still need a separately approved fixed-topic
+reader resolver. This bootstrap deliberately does not create that grant.
+
+The upstream canonical registry and owning-session evidence must actually exist
+and implement the published snapshot/event contracts. Configuring a URL does
+not create that backend, link a session, wake an agent or establish health.
+The bus's `presence_status` reports transport connections only, not
 same-topic selected-runtime readiness. Therefore an unconfigured or unavailable
 source returns **Unknown** and queue-only guidance, never fabricated online
 status. Wiring the owner's published canonical registry, authenticated topic
@@ -111,3 +129,11 @@ Verification: 327 independently run backend presence/registry tests passed;
 19 UI unit tests and the build passed. Two focused real-browser tests against
 mock API fixtures passed for evidence expiry and topic switching. These are not
 production registry, native agent wake, or live dashboard acceptance results.
+
+Source bootstrap verification: 433 focused registry/client/stream/app/ingress/
+default-contract tests passed on Windows, one platform skip, with ResourceWarning
+errors enabled (9.54s; existing Starlette warning). Independent review accepted
+the change and reran 282 focused tests. The SSE test checks the actual upstream
+`/subscribe` path and a forwarded invalidation/cursor, not merely an unavailable
+fallback. Synthetic transports prove the wiring only; no live registry,
+credential, deployment, watcher or equipment was provisioned.
