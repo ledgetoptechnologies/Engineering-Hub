@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from agent_message_bus.app import create_app
 from agent_message_bus.auth import AuthSettings
+
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1] / 'src'
 
 
 def auth():
@@ -29,7 +33,16 @@ def run_isolated(tmp_path, code):
     env.update(AGENT_BUS_DB=str(tmp_path / 'default.sqlite3'), AGENT_BUS_AUDIT=str(tmp_path / 'default-audit.jsonl'),
                AGENT_BUS_FILE_ROOT=str(tmp_path / 'default-files'), HERMES_TOKEN='hermes-test',
                CODEX_TOKEN='codex-test', CLAUDE_TOKEN='claude-test')
-    result = subprocess.run([sys.executable, '-c', textwrap.dedent(code)], cwd=tmp_path, env=env,
+    # Import the checkout under test, not whatever copy is installed in the
+    # environment, even though the child runs with a temporary cwd.
+    source = str(SOURCE_ROOT)
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [source, env.get('PYTHONPATH')]))
+    guard = f"""
+        import agent_message_bus.app as _checked
+        from pathlib import Path as _Path
+        assert _Path(_checked.__file__).resolve().is_relative_to(_Path({source!r}).resolve()), _checked.__file__
+    """
+    result = subprocess.run([sys.executable, '-c', textwrap.dedent(guard) + textwrap.dedent(code)], cwd=tmp_path, env=env,
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
