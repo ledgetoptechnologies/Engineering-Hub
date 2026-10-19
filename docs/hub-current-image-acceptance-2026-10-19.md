@@ -63,6 +63,29 @@ post-check container/volume queries found no test residue. The image is retained
 
 ## Not yet established
 
+### Transfer artifact prepared locally
+
+The exact named digest was exported with Docker image save to a new local file,
+`C:/Users/fstor/Documents/Codex/eh-control-image-9d3d951-fca790.tar`.
+Its actual transfer length is **117,802,496 bytes** and SHA-256 is
+`1d9c3e421e234b797a674c650ee4973e58b94c67cbe83ac7dda24058cd35cf8a`.
+The existing bounded archive-inspection helper independently resolved the OCI
+index/platform-manifest/config chain to the identities above without extracting
+files or importing an image. That helper intentionally skips layer bytes.
+A separate streaming read additionally hashed all **15** exported SHA-256 blobs
+(117,785,165 content bytes), including layer payloads, and every digest matched
+its canonical blob name. No duplicate blob name was accepted. This verifies
+export integrity, not trusted source provenance or a destination import.
+No transfer to staging or remote daemon operation occurred.
+
+The pilot manifest requires distinct candidate/rollback image config IDs; this
+single image cannot fill both roles. Independent review request
+`61caa9af-a05a-4a71-a5b1-5103dc0c1a5a` asks Claude to assess the concrete next
+installation/enrollment requirements. Awaiting that response is not evidence
+of an active execution process or permission to duplicate Hermes's host work.
+
+### Deployment and pilot limits
+
 The default image entrypoint still starts the combined listener; split smoke
 explicitly selects split startup. Do not install the default command as proof
 of the intended private-browser boundary. This does not verify genuine Cloudflare
