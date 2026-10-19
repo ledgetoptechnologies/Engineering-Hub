@@ -88,7 +88,7 @@ def test_worker_specific_status_is_not_an_assertion_of_caller_eligibility(rig):
     assert status['jobs'][0]['eligible_requires_worker_admission']
 
 
-def test_action_filter_only_narrows_server_admission_and_priority(rig):
+def test_action_filter_and_worker_local_denial_cannot_bypass_global_production_priority(rig):
     repo, target, worker = rig
     actions = {name: WorkAction('staging-pc', frozenset({'production', 'staging'}),
                                 project='engineering-hub') for name in ('first', 'second')}
@@ -99,7 +99,11 @@ def test_action_filter_only_narrows_server_admission_and_priority(rig):
     stage = submit(queue, target, request='two', action='second')
     assert queue.claim(worker=worker, action_keys=('first',)) is None
     assert queue.claim(worker=WorkWorker('claude', str(uuid4())), action_keys=('second',)) is None
-    assert queue.claim(worker=worker, action_keys=('second',))['id'] == stage['id']
+    # A worker-local refusal of the production action does not establish that
+    # production is globally unavailable. With no readiness provider, preserve
+    # its same-machine priority barrier rather than starting staging here.
+    assert queue.claim(worker=worker, action_keys=('second',)) is None
+    assert queue.get_job(stage['id'])['state'] == 'queued'
 
 
 @pytest.mark.parametrize('action_keys', [(), [], ['engineering-hub.validate'],

@@ -97,6 +97,24 @@ def error(result, code):
     assert code in str(result)
 
 
+def test_mcp_filtered_claim_preserves_cross_action_machine_production_priority(rig):
+    client, repo, queue, _, task, payload = rig
+    queue.approval_verifier = lambda *args: True  # Synthetic approval, no executor.
+    production = call(client, 'hub_work_submit', payload(
+        environment='production', approval_id='synthetic-reviewed-production'))
+    staging = call(client, 'hub_work_submit', payload(action_key='viewer.verify'))
+    assert 'id' in production and 'id' in staging
+    denied = call(client, 'hub_work_claim', {
+        'instance_id': str(uuid4()), 'action_keys': ['viewer.verify']})
+    assert denied['job'] is None
+    assert queue.get_job(staging['id'])['state'] == 'queued'
+    assert queue.get_job(production['id'])['state'] == 'queued'
+    accepted = call(client, 'hub_work_claim', {
+        'instance_id': str(uuid4()), 'action_keys': ['viewer.validate']}, token='test-hermes')
+    assert accepted['job']['id'] == production['id']
+    assert accepted['job']['machine_id'] == 'staging-pc'
+
+
 def test_discovery_and_every_tool_authentication(rig):
     client = rig[0]
     tools = rpc(client, 'tools/list').json()['result']['tools']

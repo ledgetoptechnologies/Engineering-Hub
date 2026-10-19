@@ -86,6 +86,26 @@ def rig(tmp_path):
         yield client, repo, queue, build, task, submission, sessions, config
 
 
+def test_http_filtered_claim_preserves_cross_action_machine_production_priority(rig):
+    client, repo, queue, _, task, submission, *_ = rig
+    queue.approval_verifier = lambda *args: True  # Synthetic approval, no executor.
+    production = client.post(BASE + '/jobs', headers=bearer(), json=submission(
+        environment='production', approval_id='synthetic-reviewed-production'))
+    staging = client.post(BASE + '/jobs', headers=bearer(), json=submission(
+        task(project='treedar'), action_key='tree.check'))
+    assert production.status_code == staging.status_code == 201
+    denied = client.post(BASE + '/claim', headers=bearer(), json={
+        'instance_id': str(uuid4()), 'action_keys': ['tree.check']})
+    assert denied.status_code == 200 and denied.json()['job'] is None
+    assert queue.get_job(staging.json()['id'])['state'] == 'queued'
+    assert queue.get_job(production.json()['id'])['state'] == 'queued'
+    accepted = client.post(BASE + '/claim', headers=bearer('hermes'), json={
+        'instance_id': str(uuid4()), 'action_keys': ['viewer.check']})
+    assert accepted.status_code == 200
+    assert accepted.json()['job']['id'] == production.json()['id']
+    assert accepted.json()['job']['machine_id'] == 'staging-pc'
+
+
 def test_reads_require_identity_and_all_agents_can_read(rig):
     client = rig[0]
     for path in ('/status', '/jobs'):

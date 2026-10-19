@@ -4,10 +4,17 @@ This is not an executor or an approval service. Registry entries are supplied by
 the operator; no command, endpoint, path or secret is accepted in a job. Existing
 staging dispatch remains responsible for its workflow/review checks. An expired
 reservation holds the physical machine until authoritative reconciliation.
+
+Production priority is machine-wide and non-preemptive, not narrowed by a
+claiming worker or action filter. Valid approved production conservatively
+blocks new same-machine staging even when global executor readiness is unknown.
+Only a trusted local readiness verifier can establish global unavailability;
+agent presence or one worker's denial is not that evidence.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import inspect
 import math
 import re
 import time
@@ -87,7 +94,8 @@ class ClosedClaimPolicy:
 class WorkQueue:
     def __init__(self, repo, actions, *, approval_verifier=None,
                  reconciliation_verifier=None, completion_verifier=None, target_verifier=None,
-                 claim_verifier=None, clock=time.time, max_jobs=10000):
+                 claim_verifier=None, production_readiness_verifier=None,
+                 clock=time.time, max_jobs=10000):
         if type(actions) is not dict or not 1 <= len(actions) <= 256:
             raise HubError('invalid_work_registry')
         self.actions = dict(actions)
@@ -97,7 +105,7 @@ class WorkQueue:
                 raise HubError('invalid_work_registry')
         if type(max_jobs) is not int or not 1 <= max_jobs <= 100000:
             raise HubError('invalid_work_capacity')
-        if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier)):
+        if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier, production_readiness_verifier)):
             raise HubError('invalid_work_verifier')
         self.repo, self.clock, self.max_jobs = repo, clock, max_jobs
         self.approval_verifier = approval_verifier
@@ -107,6 +115,10 @@ class WorkQueue:
         # None is retained only for explicit trusted local composition. The
         # environment-enabled factory installs ClosedClaimPolicy by default.
         self.claim_verifier = claim_verifier
+        # Trusted local composition only, never a public worker flag. Exact
+        # True means globally ready; False proves globally unavailable; anything
+        # else is unknown. Unknown intentionally sacrifices staging liveness.
+        self.production_readiness_verifier = production_readiness_verifier
         with repo._transaction() as db:
             for statement in '''
                 CREATE TABLE IF NOT EXISTS hub_work_jobs (
@@ -239,6 +251,37 @@ class WorkQueue:
         except Exception:
             return False
 
+    def _eligible_target(self, row):
+        """Current registry, approval and target policy, independent of worker."""
+        try:
+            action = self.actions.get(row['action_key'])
+            return (type(action) is WorkAction and action.machine_id == row['machine_id']
+                and action.project == row['project']
+                and action.requires_execution_proof == bool(row['requires_execution_proof'])
+                and row['environment'] in action.environments and self._approved(row)
+                and self._target_verified(row['actor'], row['action_key'], row['environment'],
+                                          WorkTarget(**json.loads(row['target']))))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _production_readiness(row, verifier):
+        if verifier is None:
+            return None
+        try:
+            result = verifier(row['actor'], row['action_key'], row['environment'],
+                              row['machine_id'], WorkTarget(**json.loads(row['target'])))
+            if type(result) is bool:
+                return result
+            if (inspect.iscoroutine(result)
+                    and inspect.getcoroutinestate(result) == inspect.CORO_CREATED):
+                result.close()
+            # Never cancel/close caller-owned started coroutines, Tasks or
+            # Futures. None, errors and every non-Boolean remain unknown.
+        except Exception:
+            pass
+        return None
+
     def claim(self, *, worker, lease_seconds=60, action_keys=None):
         if type(worker) is not WorkWorker:
             raise HubError('invalid_work_worker')
@@ -260,11 +303,33 @@ class WorkQueue:
             # Entire durable queue is bounded. Approval is rechecked at claim,
             # not cached from submission. Production priority is non-preemptive.
             rows = db.execute("SELECT j.* FROM hub_work_jobs j LEFT JOIN hub_work_machines m ON m.machine_id=j.machine_id WHERE j.state='queued' AND m.job_id IS NULL ORDER BY CASE j.environment WHEN 'production' THEN 0 ELSE 1 END,j.sequence").fetchall()
+            # Establish physical-machine precedence before applying the caller's
+            # filters or capability. A different enrolled production worker may
+            # exist; no fabricated identity or agent-presence inference is used.
+            # The SQL order visits production before any staging. Select a
+            # claimable production row immediately, without running callbacks
+            # for later jobs between its admission check and reservation.
+            # Callbacks are point-in-time observations under the SQLite job
+            # transaction, not an atomic snapshot of external policy/readiness.
+            readiness_verifier = self.production_readiness_verifier
+            production_machines = set()
             for row in rows:
+                if row['environment'] == 'production':
+                    if not self._eligible_target(row):
+                        continue
+                    readiness = self._production_readiness(row, readiness_verifier)
+                    if readiness is not False:
+                        production_machines.add(row['machine_id'])
+                elif row['machine_id'] in production_machines:
+                    continue
                 if action_keys is not None and row['action_key'] not in action_keys:
                     continue
-                action = self.actions.get(row['action_key'])
-                if action is None or action.machine_id != row['machine_id'] or action.project != row['project'] or action.requires_execution_proof != bool(row['requires_execution_proof']) or row['environment'] not in action.environments or not self._approved(row) or not self._target_verified(row['actor'], row['action_key'], row['environment'], WorkTarget(**json.loads(row['target']))):
+                if row['environment'] == 'production':
+                    if readiness is False:
+                        continue
+                    if readiness_verifier is not None and readiness is not True:
+                        continue
+                elif not self._eligible_target(row):
                     continue
                 if not self._admitted(worker, row):
                     continue
