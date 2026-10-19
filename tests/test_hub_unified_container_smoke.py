@@ -67,7 +67,10 @@ def test_synthetic_three_stage_plan_profile_graceful_cleanup_and_no_live_environ
         elif args[1] == 'exec':
             assert kwargs['timeout'] == 55
             stage = args[-2]
-            return json.dumps({'stage': stage, 'preservation': 'passed', 'tools': 24 if stage == 'seed' else 33})
+            return json.dumps({'stage': stage, 'preservation': 'passed', 'tools': 24 if stage == 'seed' else 33,
+                               'agent_ports': [8770] if stage == 'seed' else [8770,8765],
+                               'shared_session_across_agent_ports': 'not_applicable' if stage == 'seed' else 'passed',
+                               'native_notification_route': 'not_applicable' if stage == 'seed' else 'alias_to_primary'})
         return ''
 
     def exists(kind, name, actual_owner):
@@ -80,6 +83,8 @@ def test_synthetic_three_stage_plan_profile_graceful_cleanup_and_no_live_environ
     assert not containers and not volumes
     assert report['synthetic_legacy_cutover'] == 'passed'
     assert report['resolved_image_id'] == IMAGE_ID
+    assert report['compatibility_alias'] == {'agent_ports': [8770,8765], 'shared_stateful_session': 'passed',
+                                              'native_notification_route': 'alias_to_primary'}
     assert report['production_state'] == 'never_opened'
     assert report['legacy_version'] == 'candidate_bus_not_deployed_old_image'
     assert report['truenas'] == 'not_deployed' and report['reboot'] == report['agent_wake'] == 'not_tested'
@@ -103,7 +108,9 @@ def test_synthetic_three_stage_plan_profile_graceful_cleanup_and_no_live_environ
         assert all(env[key].startswith('synthetic-unified-') for key in ('HERMES_TOKEN', 'CODEX_TOKEN', 'CLAUDE_TOKEN'))
     assert len(mounted) == 1
     assert 'agent_message_bus.app:app' in runs[0]
+    assert '--agent-alias-port' not in runs[0]
     assert all('--split-ingress' in call and '--unified-mcp' in call for call in runs[1:])
+    assert all(call[call.index('--agent-alias-port') + 1] == '8765' for call in runs[1:])
     assert len([call for call in calls if call[1] == 'kill']) == 3
     removals = [call for call in calls if call[1:3] == ('container', 'rm')]
     assert len(removals) == 3 and all(len(call) == 4 for call in removals)
@@ -157,7 +164,11 @@ def test_probe_compiles_and_records_all_tables_files_audit_before_canaries(monke
     assert 'SELECT name FROM sqlite_master' in module.PROBE
     assert 'audit_bytes' in module.PROBE and 'audit_sha256' in module.PROBE
     assert 'mode=ro' in module.PROBE
-    assert module.PROBE.index("assert snapshot() == saved['snapshot']") < module.PROBE.index("async with client('hermes')")
+    assert module.PROBE.index("assert snapshot() == saved['snapshot']") < module.PROBE.index("async with client('hermes', endpoint=hermes_endpoint)")
     assert 'get_send_receipt' in module.PROBE and 'file_history' in module.PROBE
     assert 'subscribe_resource' in module.PROBE and "events.get(),3" in module.PROBE
     assert 'expected' in module.PROBE and "'acknowledged'" in module.PROBE
+    assert "alias_health['build_commit'] == health['build_commit'] == commit" in module.PROBE
+    assert "alias_tools = await http.post(alias_base+'/mcp',headers=same_session_headers,json=rpc)" in module.PROBE
+    assert "hermes_endpoint = base if stage == 'seed' else alias_base" in module.PROBE
+    assert "client('codex')" in module.PROBE
