@@ -120,7 +120,8 @@ def _profile(value, volume, *, initializer=False, private=False):
             or host.get('DeviceRequests') not in (None, [])
             or host.get('PortBindings') not in (None, {})
             or set(host.get('CapDrop') or []) != {'ALL'}
-            or set(host.get('CapAdd') or []) != ({'CHOWN'} if initializer else set())
+            or set(host.get('CapAdd') or []) not in (
+                ({'CHOWN'}, {'CAP_CHOWN'}) if initializer else (set(),))
             or 'no-new-privileges:true' not in (host.get('SecurityOpt') or [])
             or config.get('User') != ('0:0' if initializer else '10001:10001')
             or len(volumes) != 1 or volumes[0].get('Name') != volume

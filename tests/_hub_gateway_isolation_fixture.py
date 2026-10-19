@@ -15,6 +15,12 @@ from pathlib import Path
 import stat
 import sys
 
+# Direct ``python /validation/tests/<fixture>.py`` sets sys.path[0] to the
+# tests directory, not its source root. Resolve this fixture's own trusted
+# checkout root explicitly; do not depend on caller CWD or PYTHONPATH.
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE_ROOT))
+
 BASE = '/api/hub/v1'
 PRIVATE_ROOT = Path('/private')
 PRIVATE_DATABASE = PRIVATE_ROOT / 'fixture/private/hub.sqlite3'

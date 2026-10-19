@@ -66,6 +66,12 @@ def test_expected_profiles_are_accepted(options):
     load()._profile(profile(**options), 'owned-volume', **options)
 
 
+def test_docker_prefixed_single_chown_capability_is_equivalent():
+    actual = profile(initializer=True)
+    actual['HostConfig']['CapAdd'] = ['CAP_CHOWN']
+    load()._profile(actual, 'owned-volume', initializer=True)
+
+
 @pytest.mark.parametrize('key,value', [
     ('NetworkMode', 'host'), ('ReadonlyRootfs', False), ('Privileged', True),
     ('PidMode', 'host'), ('IpcMode', 'host'), ('CgroupnsMode', 'host'),
