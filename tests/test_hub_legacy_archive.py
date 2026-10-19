@@ -219,9 +219,26 @@ def _initialize_v060_stores(db_path: Path, files_root: Path, extraction_root: Pa
         module_spec.loader.exec_module(module)
         return module
 
-    load_module("database").MessageRepository(db_path)
-    load_module("files").FileRepository(db_path, files_root)
-    load_module("feedback").FeedbackRepository(db_path)
+    database_module = load_module("database")
+    opened_connections = []
+
+    class FixtureMessageRepository(database_module.MessageRepository):
+        def connect(self):
+            connection = super().connect()
+            opened_connections.append(connection)
+            return connection
+
+    # The frozen v0.6.0 MessageRepository uses a connection's transaction
+    # context, which commits/rolls back but does not close it. Keep the frozen
+    # initializer/schema unchanged while explicitly owning its connections:
+    # archive preparation must not depend on cyclic-GC timing to remove WAL.
+    try:
+        FixtureMessageRepository(db_path)
+        load_module("files").FileRepository(db_path, files_root)
+        load_module("feedback").FeedbackRepository(db_path)
+    finally:
+        for opened_connection in opened_connections:
+            opened_connection.close()
     connection = sqlite3.connect(db_path)
     try:
         checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -230,6 +247,28 @@ def _initialize_v060_stores(db_path: Path, files_root: Path, extraction_root: Pa
         connection.close()
     assert not Path(f"{db_path}-wal").exists()
     assert not Path(f"{db_path}-shm").exists()
+
+
+def test_frozen_store_fixture_closes_connections_without_cyclic_gc(tmp_path):
+    import gc
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        files = tmp_path / 'files'
+        files.mkdir()
+        database = tmp_path / 'messages.sqlite3'
+        _initialize_v060_stores(database, files, tmp_path / 'legacy-v060-source')
+        assert not Path(f'{database}-wal').exists()
+        assert not Path(f'{database}-shm').exists()
+        connection = sqlite3.connect(database)
+        try:
+            assert connection.execute('PRAGMA integrity_check').fetchone() == ('ok',)
+        finally:
+            connection.close()
+    finally:
+        if enabled:
+            gc.enable()
 
 
 def _build_bundle(bundle: Path) -> dict[str, str]:
