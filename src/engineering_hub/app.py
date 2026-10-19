@@ -188,7 +188,8 @@ class TopicPreflight(Input):
 def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
-               owned_pilot_service=None, work_queue=None, archive_reader=None):
+               owned_pilot_service=None, work_queue=None, archive_reader=None,
+               queued_pilot_runtime=None):
     settings = settings or Settings.from_env()
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
@@ -239,15 +240,32 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 or owned_pilot_service.workflow is not container_pilot_workflow
                 or owned_pilot_service.dispatcher is not staging_dispatcher):
             raise ValueError('owned_pilot_service_mismatch')
+    feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
+    if queued_pilot_runtime is not None:
+        from .queued_pilot_runtime import QueuedPilotRuntime
+        if (type(queued_pilot_runtime) is not QueuedPilotRuntime
+                or queued_pilot_runtime.bridge.repo is not repo
+                or queued_pilot_runtime.bridge.queue is not work_queue
+                or queued_pilot_runtime.feed is not feed
+                or settings.ingress_mode == 'browser'
+                or any(component is not None for component in (
+                    fixture_workflow, staging_dispatcher, container_pilot_workflow, owned_pilot_service))
+                or queued_pilot_runtime.status['state'] != 'not_started'
+                or getattr(queued_pilot_runtime, '_application', None) is not None
+                or feed._source is not None):
+            raise ValueError('queued_pilot_application_binding_required')
     sessions = SessionStore(settings.database, repository=repo,
                             session_ttl=settings.auth_config.local_session_ttl_seconds)
-    feed = event_feed if event_feed is not None else NativeHubEventFeed(settings.database)
     if staging_dispatcher is not None and (
             staging_dispatcher.repo is not repo or staging_dispatcher.workflow is not configured_workflow):
         raise ValueError('dispatcher_workflow_mismatch')
     runtime = StagingRuntime(staging_dispatcher, feed) if staging_dispatcher is not None else None
 
     def autonomy_for():
+        if queued_pilot_runtime is not None:
+            status = queued_pilot_runtime.status
+            return {'configured': True, 'state': status['state'],
+                    'running': status['running'], 'receipts': [], 'queued_pilot': status}
         if runtime is None:
             return {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
         receipts = [{key: value for key, value in item.items() if key != 'owner'}
@@ -315,6 +333,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             if owned_pilot_service is not None:
                 await owned_pilot_service.start(feed)
             async with hub_mcp.session_manager.run():
+                if queued_pilot_runtime is not None:
+                    status = await queued_pilot_runtime.start()
+                    if status['state'] != 'active':
+                        raise HubError('queued_pilot_startup_unavailable', 503)
                 if runtime is not None:
                     await runtime.start()
                 yield
@@ -322,17 +344,31 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             if owned_pilot_service is not None:
                 await owned_pilot_service.stop(runtime, feed)
             else:
-                try:
-                    if runtime is not None:
-                        await runtime.stop()
-                finally:
-                    await feed.stop()
+                async def drain():
+                    try:
+                        if queued_pilot_runtime is not None:
+                            await queued_pilot_runtime.stop()
+                        if runtime is not None:
+                            await runtime.stop()
+                    finally:
+                        await feed.stop()
+                if queued_pilot_runtime is not None:
+                    from .owned_tasks import finish_owned
+                    # Keep the native source and caller-owned capability alive
+                    # until accepted effects drain, even on repeated cancellation.
+                    await finish_owned(drain())
+                else:
+                    await drain()
 
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
+    app.state.queued_pilot_runtime = queued_pilot_runtime
+    if queued_pilot_runtime is not None:
+        # One-use application ownership, not transfer of its owner/client.
+        queued_pilot_runtime._application = app
     app.state.owned_pilot_service = owned_pilot_service
     app.state.registry_bridge = registry_bridge
     # Explicit read-only capability; caller owns its lifetime. No environment

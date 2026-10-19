@@ -162,13 +162,26 @@ class PilotLifecycleDTO(ResponseDTO):
     tasks: PilotTasksDTO
 
 
+class QueuedPilotJobDTO(ResponseDTO):
+    id: str
+    state: Literal['succeeded', 'failed', 'held']
+
+
+class QueuedPilotRuntimeDTO(ResponseDTO):
+    state: Literal['not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed']
+    running: bool
+    active: bool
+    last_job: QueuedPilotJobDTO | None
+
+
 class AutonomyDTO(ResponseDTO):
     configured: bool
-    state: Literal['disabled', 'not_started', 'native_source_unavailable', 'active', 'stopped', 'failed']
+    state: Literal['disabled', 'not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed']
     running: bool
     receipts: list[DispatchReceiptDTO]
     last_result: DispatchResultDTO | None = None
     pilot_lifecycle: PilotLifecycleDTO | None = None
+    queued_pilot: QueuedPilotRuntimeDTO | None = None
 
 
 class CapabilitiesDTO(ResponseDTO):

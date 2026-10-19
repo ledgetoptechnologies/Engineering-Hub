@@ -181,12 +181,66 @@ Three activation requirements remain explicit:
   lock and a shared Docker daemon alone do not establish writer isolation.
 
 Private adapter credentials must stay out of the browser process. `PilotOwner`
-also prevents an ordinary separate public process from writing its enrolled DB;
-separation therefore needs a reviewed private write/RPC barrier, not shared-file
-access or SMB SQLite. Credential cohabitation is not an accepted risk on Beau's
-behalf. Resolve this composition before installing a factory or host service.
+also prevents an ordinary separate public process from writing its enrolled DB.
+The explicit browser gateway source below supplies a restricted HTTP seam, not
+shared-file access or SMB SQLite. Credential cohabitation is not an accepted risk
+on Beau's behalf. Actual protected transport and process composition must still
+be verified before installing a factory or host service.
 
 Then, only after separately approved activation, verify the existing staging
 host's effective transport, writer exclusion and resource limits, immutable
 image, health/rollback and restart recovery. TrueNAS deployment remains Beau's
 operation; no agent NAS management or production change is implied.
+
+## Explicit private core and browser gateway source
+
+`create_app(..., repository=repo, work_queue=queue, event_feed=feed,
+queued_pilot_runtime=runtime)` now accepts an exact `QueuedPilotRuntime` bound
+to that same queue, repository and native feed. The caller supplies an already
+approved bridge and retains ownership of its private client and `PilotOwner`.
+No setting constructs or activates this runtime automatically. Legacy dispatcher
+and workflow injection remain mutually exclusive with the queue; no second
+reservation authority is introduced. Runtime reuse across app instances and a
+foreign/already-started feed are rejected. An unsupported native source prevents
+this explicit application's startup rather than silently enabling polling.
+
+During the existing core lifespan, the feed starts before the queued runtime.
+Shutdown closes runtime admission and drains accepted work before stopping the
+feed, including repeated caller cancellation. The owner/client must remain alive
+until that lifespan has actually exited; the caller closes them afterward. This
+does not configure or verify a supervisor's stop grace. `/autonomy` and overview
+project sanitized queued-runtime state, not host readiness or deployment proof.
+
+`private_gateway.py` contains inert `PublicBrowserGateway` and
+`PrivateBrowserGateway` APIs. The public process receives no Hub database,
+agent-token configuration or executor credential. A caller-owned, dedicated
+`httpx.AsyncClient` connects to a protected private Unix HTTP socket; the fixed
+internal origin is `http://hub-private.invalid`. Its transport must have no
+proxies or retries. These constructors do not create or verify that socket,
+credentials, process isolation, filesystem permissions or installed lifecycle.
+
+Only an explicit browser route table is exposed: Cloudflare session login/me/
+logout, shared task and decision operations, pause and bounded reads, static UI
+assets and native SSE streams. MCP, worker claims/completion/renewal, direct run
+creation/dispatch/recovery and agent-only work submission are not proxied. Agents
+continue on the private core's original LAN listener, retaining their original
+source-IP and bearer checks. No forwarded client/actor header supplies authority.
+This avoids changing allowlists to trust loopback or a proxy's address.
+
+Original browser Host/Origin, JWT, cookie and CSRF headers reach the private
+receiver, which repeats route admission and independently verifies Cloudflare
+Access before existing core authentication/authorization. Client default auth
+and cookies cannot fill in missing browser credentials. Duplicate Set-Cookie
+headers are preserved. Requests and ordinary responses are bounded, ordinary
+upstream attempts have deadlines, and SSE forwards small events immediately
+without buffering the complete stream. Accepted mutations are never
+automatically retried after lost responses; read the original request/revision
+records before deciding on another action. HTTPX manual streaming requires
+explicit response closure; the gateway drains that cleanup on cancellation.
+See the [HTTPX async streaming contract](https://www.python-httpx.org/async/).
+
+Future operator acceptance must prove that only the loopback tunnel frontend
+is public-facing, the private socket directory/socket admit only intended
+process identities, no public process has the DB or adapter credential, original
+agent source-IP denial still works, and listeners close before owner release.
+The source seam is not a deployment manifest or proof of those properties.
