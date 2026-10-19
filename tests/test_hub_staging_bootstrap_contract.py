@@ -56,6 +56,14 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
     service = _read("eh-pilot-docker.service")["Service"]
     assert {key for key in service if key.startswith("Exec")} == {"ExecStart"}
     assert shlex.split(_one(service, "ExecStart")) == [
+        "/usr/bin/env", "-i",
+        "HOME=%h",
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+        "XDG_RUNTIME_DIR=%t",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus",
+        "NOTIFY_SOCKET=${NOTIFY_SOCKET}",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit",
         "/usr/bin/dockerd-rootless.sh",
         "--host=unix://%t/eh-pilot-docker.sock",
         "--data-root=%h/docker-data",
@@ -64,22 +72,13 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
         "--iptables=false",
         "--ip6tables=false",
     ]
-    environment = {}
-    for assignment in service["Environment"]:
-        for item in shlex.split(assignment):
-            key, value = item.split("=", 1)
-            assert key not in environment
-            environment[key] = value
-    assert environment == {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "DOCKERD_ROOTLESS_ROOTLESSKIT_NET": "none",
-        "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR": "%t/eh-pilot-rootlesskit",
-    }
+    assert "Environment" not in service
     assert "EnvironmentFile" not in service
-    assert set(shlex.split(_one(service, "UnsetEnvironment"))) == {
-        "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH",
-        "DOCKER_TLS", "DOCKER_TLS_VERIFY",
-    }
+    assert "UnsetEnvironment" not in service
+    assert _one(service, "Type") == "notify"
+    assert _one(service, "NotifyAccess") == "all"
+    # Do not suppress the approved setuid mapping helpers as a side effect.
+    assert "NoNewPrivileges" not in service
 
 
 @pytest.mark.parametrize(("key", "expected"), [

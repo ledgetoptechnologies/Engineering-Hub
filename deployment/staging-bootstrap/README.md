@@ -1,8 +1,19 @@
-# Staging bootstrap artifacts — NOT INSTALLED
+# Staging bootstrap artifacts — environment revision NOT INSTALLED
 
-These three files are proposals for Beau's explicit bootstrap-only approval.
-They must not be applied by an agent merely because this document exists. They
-do not install or start the Hub executor, receipt issuer or application pilot.
+These files describe the bounded bootstrap, not an automatic installer. Beau
+approved the earlier bootstrap. Hermes subsequently reported installing the
+reviewed prerequisites, locked `ehpilot` account and three original units, but
+stopped before starting Docker when the new manager exposed unexpected socket
+activation and inherited `SSH_AUTH_SOCK`. Hermes's bus report
+`b4fb8c7b-bcb0-4149-a436-891a8d79932a` says the manager/runtime were stopped and
+the shared daemon's objects were unchanged. That is peer evidence of a safely
+stopped partial bootstrap, not acceptance of an executor or application pilot.
+
+The environment-whitelist revision below has **not** been installed. Reconcile
+the retained exact account, paths and unit hashes with that prior enrollment;
+do not recreate, adopt unknown state or launch services merely because this
+document exists. No executor, receipt issuer or application pilot is activated
+by these artifacts.
 
 ## Exact destinations
 
@@ -32,13 +43,45 @@ Do not add `NoNewPrivileges=yes` to this bootstrap daemon as an unreviewed
 hardening shortcut: the prerequisite UID-mapping helpers need their approved
 setuid behavior. This is not the application's closed container profile.
 
+## Revised daemon environment boundary
+
+`ExecStart` now invokes the real `/usr/bin/env -i` before the fixed rootless
+helper, with seven explicit assignments: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
+`DBUS_SESSION_BUS_ADDRESS`, `NOTIFY_SOCKET`,
+`DOCKERD_ROOTLESS_ROOTLESSKIT_NET` and
+`DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR`. The helper executable and its daemon
+arguments remain absolute/fixed. Inherited SSH/GPG socket pointers, proxy
+settings, Docker executables/flags and rootless child-mode overrides are not
+forwarded to the helper. No shell evaluates this command.
+
+`NOTIFY_SOCKET=${NOTIFY_SOCKET}` deliberately preserves the manager-generated
+endpoint as one argument. Do not replace it with a guessed path, literal dollar
+escape or unbraced word expansion. See the
+[systemd 255 command-line rules](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html#Command%20Lines)
+and [spawned-process environment](https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html#Environment%20Variables%20in%20Spawned%20Processes).
+`Type=notify` and `NotifyAccess=all` are unchanged.
+
+This is a child-environment boundary, **not** a sandbox for an untrusted manager.
+The loader runs before `env`; unreviewed loader overrides are a stop condition.
+It does not prevent global user socket units from starting, remove credentials
+or block same-UID access to known socket/file paths. Inspect unit identities and
+fresh-account ownership/credential-presence metadata without exposing secret
+contents. Do not globally mask SSH/GPG units, import operator credentials or
+claim the absence of an environment variable proves filesystem isolation.
+
+Static and synthetic fixture tests do not prove real systemd notification
+attribution, rootless mappings, daemon network isolation or effective cgroups.
+The revised unit must pass installed-system validation and the bounded owned
+start/stop checks before the bootstrap can be called successful.
+
 ## Preconditions, before privileged changes
 
-Repeat the package simulation, UID/GID/name/subordinate-range collision checks,
-existing host work, effective cleanup endpoint, free memory/disk and absence of
-all proposed new paths/units. Any prior account, slice, runtime directory or
-private data is a conflict, not permission to adopt or repair it. Check the new
-account has no session/linger and its user manager/runtime unit is inactive.
+For an initial installation, repeat package simulation, UID/GID/name/subordinate
+range collision checks and absence of proposed paths/units. For the retained
+approved enrollment, instead verify its manifest, exact identities, hashes and
+ownership; unexpected state remains a conflict, not permission to adopt or repair
+it. In both cases recheck existing host work, cleanup endpoint, free memory/disk,
+no session/linger and inactive dedicated user manager/runtime.
 
 The already observed host has systemd 255, `dbus-user-session` and
 `libpam-systemd`; do not silently install extra packages if later prerequisites
@@ -55,10 +98,12 @@ its service and is not suitable unchanged for this manual-only procedure.
 
 ## Owned user-runtime and manager lifecycle
 
-The following are the reviewed **post-approval** manager operations, not commands
-already executed. Account/path/package provisioning and copying the exact files
-must be completed and checked first. Use the existing approved administrative
-channel; do not change sudoers or put passwords in commands/chat.
+The following are reviewed **post-approval** manager operations, not a receipt
+that this revision was executed. Account/path/package identities and exact unit
+files must be reconciled and checked first, including a controlled replacement
+of the old unit only while its identified owner is terminal. Use the existing
+approved administrative channel; do not change sudoers or put passwords in
+commands/chat.
 
 ```sh
 sudo systemctl daemon-reload
@@ -80,8 +125,8 @@ will be descendants. Abort if anything is already active or outside that parent.
 Inspect the loaded `eh-pilot-docker.service` FragmentPath and all drop-ins against
 the approved hashes. An account-local override is not the approved root-owned
 unit. Confirm it is static/not enabled and no default-target symlink or linger
-was created. The clean environment below sanitizes the systemctl client, not
-the service's inherited user-manager environment. Before starting, inspect the
+was created. The clean environment below sanitizes the systemctl client; the
+unit's separate `env -i` whitelist sanitizes the helper's environment. Before starting, inspect the
 installed rootless helper's supported environment overrides and the effective
 manager/service configuration without printing secret values. Require a protected
 manager environment with no unreviewed binary, flags or child-mode overrides;
