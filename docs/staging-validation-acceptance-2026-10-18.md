@@ -36,6 +36,45 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Queue-to-remote-pilot source integration
+
+Implementation `33e0206c84a28c598eefbb53bdac6b05094b6220`; final tested source
+`12f15aef8dbf414626968b857422b93c5e86401b`, development branch only. Clean Git
+archive image index
+`sha256:36d56fb30aee076bf112f9e858c83d4c84739505451427023caa41626dc36912`,
+manifest `sha256:39380532be7fc788e5343eacb90fd3d0e42b29beb10aad2315bb56cad98e6600`,
+config `sha256:50e7e3afd3beb69fe4d4bc7e1e6702a8b777d38340652c988dccb8fad1dbaa72`.
+Full exact-image Linux suite: **3159 passed, 3 skipped, 4 known warnings**, 150.39s.
+Focused bridge/wire/API/queue/recovery/capability/topic checks: **173 passed**,
+8.06s with ResourceWarning errors and one existing Starlette warning. Three
+ownership checks separately passed **3/3**, 0.31s on the same image.
+
+Independent review accepted the explicit `QueuedContainerPilot` API, persistent
+late-object/repository guards, disabled direct routes and per-phase admission.
+Twenty-five new Linux-owner integration cases plus two wire/API cases verify
+original intent/request/run/fence bindings, held machine exclusion through
+restart, healthy rollback mapped to queue failure, policy revocation, private
+worker admission, malformed proof chains and no effect replay. One wire case
+uses the real client and `PilotASGI` with deliberately synthetic host assertions:
+it loses an accepted smoke response, then GET-only recovery completes the same
+run without another POST. These assertions are not real Engine/health evidence.
+
+The first clean implementation run reported **2 failed, 3157 passed, 3 skipped**,
+157.55s. Both failures were pre-existing topic tests whose module-collection
+timestamp expired under the real 120-second evidence TTL before execution.
+The test-only correction creates evidence when requested and compares one stable
+snapshot for REST/MCP parity. The explicit one-day-old evidence test remains;
+production freshness logic was not changed. Review accepted that narrow fix.
+
+No installed lifecycle factory/native worker loop, host credential, baseline,
+runtime identity issuer, NAS operation, actual remote pilot or reboot acceptance
+is added. Default application queue/pilot exclusion stays enforced. The deployment
+transport is still being discussed: Claude proposes an outbound worker, requiring
+new source APIs/receipt enrollment, while this bridge reuses the existing typed
+host endpoint. Private credential isolation and concrete single-reservation
+failure cases must be resolved before activation. See
+`remote-software-staging-bridge.md`; no new hardware or mandatory VM is required.
+
 ### Remote executor request concurrency
 
 Implementation checkpoint: `e2997979529bb8db1182f1fbfe1f3e3328d210b6`, development
