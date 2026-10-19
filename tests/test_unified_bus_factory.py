@@ -98,6 +98,43 @@ def test_default_transport_security_is_unchanged(tmp_path):
     assert '127.0.0.1:8765' in security.allowed_hosts
 
 
+def seed_retention_rows(tmp_path):
+    from datetime import timedelta
+    from agent_message_bus.database import MessageRepository, iso, now_utc
+    repo = MessageRepository(tmp_path / 'bus.sqlite3')
+    acked = repo.insert(sender='hermes', recipient='codex', message_type='a', body={})
+    repo.claim(acked.id, 'codex'); repo.acknowledge(acked.id, 'codex')
+    claimed = repo.insert(sender='hermes', recipient='codex', message_type='c', body={})
+    repo.claim(claimed.id, 'codex')
+    with repo.connect() as conn:
+        conn.execute('UPDATE messages SET acknowledged_at=? WHERE id=?', (iso(now_utc() - timedelta(days=100)), acked.id))
+        conn.execute('UPDATE messages SET claim_expires_at=? WHERE id=?', (iso(now_utc() - timedelta(minutes=5)), claimed.id))
+    return repo, acked.id, claimed.id
+
+
+def test_skipping_startup_cleanup_preserves_expired_state(tmp_path):
+    repo, acked, claimed = seed_retention_rows(tmp_path)
+    build(tmp_path, startup_cleanup=False)
+    assert repo.get(acked).status == 'acknowledged'
+    assert repo.get(claimed).status == 'claimed'
+
+
+def test_default_startup_cleanup_unchanged(tmp_path):
+    repo, acked, claimed = seed_retention_rows(tmp_path)
+    build(tmp_path)
+    with pytest.raises(Exception):
+        repo.get(acked)
+    assert repo.get(claimed).status == 'pending'
+
+
+@pytest.mark.parametrize('bad', [0, 1, None, 'false'])
+def test_invalid_startup_cleanup_rejected_before_side_effects(tmp_path, bad):
+    with pytest.raises(ValueError, match='startup_cleanup'):
+        build(tmp_path, startup_cleanup=bad)
+    assert not (tmp_path / 'bus.sqlite3').exists()
+    assert not (tmp_path / 'files').exists()
+
+
 @pytest.mark.parametrize('bad', [{'allowed_hosts': ['hub.test']}, 'hub.test', object()])
 def test_invalid_transport_security_rejected_before_side_effects(tmp_path, bad):
     with pytest.raises(ValueError, match='transport_security_settings'):
