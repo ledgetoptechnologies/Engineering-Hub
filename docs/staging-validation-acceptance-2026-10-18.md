@@ -37,6 +37,46 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Read-only Engine compatibility and live wake blockers — 2026-10-19
+
+Hermes reply `9741d54c-b406-48b1-b237-8515dbf95b12` reports successful actual
+`scripts.hub_engine_runner_probe` / `DockerEngineBackend.inspect_runner(5000)`
+on source `7e061e0968ff7e06c99990c5be5589272a35a16d`; Hermes also reports a
+supervising-agent rerun. This was the existing **Hermes host**, not staging: Docker 29.5.2,
+API 1.54, Linux/amd64, matching the explicitly pinned daemon identity. Source
+inspection confirms the probe uses GET `/v1.54/info`, closes its HTTP client and
+does not provision the inert generation-root binding. No probe/backend source
+changed between that commit and this checkpoint. Hermes used existing Python
+3.14.7/httpx 0.28.1/pydantic 2.13.4, not the exact locked environment. This is
+peer-reported real runner compatibility, not independently rerun by Codex, full
+driver/deploy acceptance, an approved isolated boundary or staging configuration.
+
+Hermes replies `a4b1945a-bfc6-4f04-915a-c59fc2218034` and
+`55176fe8-a6b1-42cb-b246-9dccbdabd4d7` identify separate wake blockers. Codex
+independently read existing `http://192.168.50.80:8765/health`: version 0.6.0,
+schema 4, `database: ok`, `ok: false`, push `failed`, subscriptions disabled,
+backend `linux-inotify-sqlite-wal`, reason `OperationalError`, cursor 696.
+Successful database reads/message storage do not prove notification delivery.
+The exception class alone does not establish the underlying SQLite failure;
+existing sanitized operational error details are needed before choosing a repair.
+No restart, toggle, permission change or database repair was attempted.
+
+Hermes separately reports its saved topic binding points at ended session
+`20261017_141423_9252c9`; another stored desktop session is not proof of the
+owner's intended destination. Current listener state was deliberately not probed
+through an endpoint that could hot-start the backend. No canonical topic registry
+origin or current end-to-end ready session was independently verified. Repairing
+server events alone would not validate the desktop binding. Owner-confirmed
+mapping and explicit correct-session idle/busy/restart tests remain necessary;
+do not blindly replay old uncertain dispatches. Closing Hermes Desktop at Beau's
+request does not authorize reopening or rebinding it here.
+
+Device capacity is already supplied by Prometheus. The original approved staging
+inventory is now narrowed to Docker/API, existing workload/volume/writer boundaries
+and practical isolation on existing equipment, not a duplicate hardware inventory.
+Follow-up `9a793132-fa96-462f-890c-b24acf1e659c` conveys that refinement without
+adding host/TrueNAS/configuration/activation authority.
+
 ### Existing Hub reported build — 2026-10-19
 
 A read-only GET to `http://192.168.50.80:8770/health` returned `ok: true` and
