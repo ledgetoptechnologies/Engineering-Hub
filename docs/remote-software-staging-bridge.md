@@ -56,10 +56,10 @@ executor role. Completion requires the original strict command/health evidence,
 matching container chain and quiescent original attempt, not a terminal label.
 
 The current application-factory queue/pilot mutual-exclusion guard stays in force.
-A separately reviewed lifecycle factory is still needed to connect this source
-to installed autonomous scheduling without re-enabling direct dispatch. No service
-composition, transport credentials, host writer exclusion, baseline enrollment
-or runtime identity issuer is supplied here.
+The explicit owned queued-coordinator source described below supplies private
+lifecycle composition without re-enabling direct dispatch. It is not an installed
+autonomous worker. Transport credentials, host writer exclusion, baseline
+enrollment and runtime identity issuance remain separate prerequisites.
 
 ## Explicit native-event runtime
 
@@ -84,6 +84,45 @@ releasing `PilotOwner`. Repeated cancellation of stop waits for accepted work an
 observer cleanup before propagating. The runtime does not close those resources
 itself, detach its sticky veto, install hooks or provide reboot recovery. This
 library does not add an app factory, environment enable flag or installed worker.
+
+## Explicit owned private queued coordinator
+
+`queued_pilot_service.serve_owned_queued_pilot` is an opt-in asynchronous source
+API, not a CLI, environment flag or deployment. The caller supplies exact combined
+Cloudflare Access `Settings`, a complete canonical pilot manifest, staging action
+and matching machine identity, a synchronous dedicated client factory, a mandatory
+additional target verifier and an asserted sufficient supervisor stop budget.
+There is no permissive default verifier. The bridge rechecks that verifier at
+submission, claim and each subsequent effect phase.
+
+Listener binding happens before private construction. One retained operation then
+creates a new persistent `PilotOwner`, exact `ContainerPilotClient`, repository,
+staging-only Engineering Hub action/queue, bridge, native event feed/runtime and
+one private core. No legacy dispatcher or alternate reservation scheduler is
+constructed. The owner uses the normal persistent-filesystem checks: no injected
+owner or ephemeral-storage override is exposed by this service API.
+
+Caller cancellation requests stop and waits for that same retained operation.
+Accepted HTTP/effects and native runtime drain before accepted-client cleanup;
+the client-close attempt finishes before owner cleanup. A cleanup failure is
+reported while remaining owned cleanup is still attempted; success is not assumed.
+Repeated cancellation during client closure must
+keep the owner alive. Partial construction preserves state for inspection and
+attempts closure only for resources accepted by this operation. A wrong-type client return was
+not accepted and remains the factory's responsibility.
+
+The factory must return a newly created, exclusive, unclosed client. Exact type
+validation is not proof of freshness or exclusive ownership; never return a
+borrowed/reused client. The mandatory target callback is a trusted operator veto,
+not independent proof of host exclusivity or machine-wide restore reconciliation.
+Async/misdeclared callback results deny approval; started foreign coroutines and
+Futures are not closed or cancelled. No held job, expired lease or old command is
+adopted, recovered or replayed by this wrapper.
+
+Supervisor grace is an operator assertion, not a host configuration change or
+observed timeout. Actual enrollment, current-host reconciliation, restored-database
+admission safety, private transport, baseline/provenance and writer exclusion must
+be established before activation. Existing entry points/Compose remain unchanged.
 
 Required invariants:
 

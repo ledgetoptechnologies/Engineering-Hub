@@ -37,6 +37,53 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Owned queued-coordinator source — 2026-10-19
+
+Implementation `2ef4333d66223f991e88967e4c1722e89779b9ce`; final tested source
+`6e364635b4be5c5afd3499ee0eccff8ac3f91a46`. Clean Git archive image index
+`sha256:880604187c9226d02f68eece60ac2fc9c31dff944931dd13e441debfff3cd1ec`,
+manifest `sha256:b50f28a984e05e0023939c30f70bea500c578127f5d5e774fa77cae156d58d70`,
+config `sha256:e5e22e109292821c56e86bc5034ca5004b044950dd42e134151028de51c29262`.
+Focused service, public/private gateway, split runner, runtime, ownership-lifecycle
+and push-worker tests: **252 passed**, 16.60s, ResourceWarning and unraisable
+warnings treated as errors, no warnings. Separate CHOWN-only ownership cases:
+**6/6 passed**, 0.57s. Both existing two-container healthy/rollback cases passed;
+their disposable containers and volumes were removed and absence verified.
+
+Final exact-image full Linux suite: **3434 passed, 6 skipped, 4 known warnings**,
+167.51s. Remaining warnings are Starlette, one older unclosed test event loop
+and two deliberate multithreaded-fork deprecations. All execution handles are
+terminal; the focused lifecycle/push tests above remain warning-free.
+
+The new explicit API binds before constructing one persistent owner, exact
+dedicated client, staging-only Engineering Hub queue/bridge, native runtime and
+private core. The retained operation drains before ordered client/owner cleanup
+attempts, including repeated caller cancellation. A mandatory synchronous veto
+adds no implicit host enrollment or restore safety. Thirty-two new Linux service
+cases exercise real TCP/UDS/auth/queue lifecycle with synthetic executor effects;
+the production API has no ephemeral-storage override. Independent source/test
+review accepted the implementation and corrected cleanup-failure documentation.
+
+Initial source-image verification exposed two test-fixture issues. Synchronous
+public CLI unit tests cleared pytest's idle loop reference; scoped test Runners
+now preserve it without altering production asyncio startup. Read-only diagnostic
+paired tests confirmed before/after behavior. The initial full suite had **1
+failed, 3433 passed, 6 skipped, 6 warnings**, 168.22s: the push fixture manually
+published alongside the native source and incorrectly required exactly one
+notification. The corrected fixture waits for actual bootstrap catch-up, relies
+only on native delivery, preserves exact one-message work assertions and drains
+the SDK worker before server teardown. No product notification/coalescing or
+authorization rule was weakened.
+
+The existing two-container smoke still uses its synthetic private composition;
+it is not cross-container proof of the new owned-service API. Neither test proves
+real immutable application deployment, health/rollback authority, TrueNAS
+configuration, reboot/power-loss recovery or machine-wide restored-DB safety.
+Private transport, independent enrollment/baseline/provenance, host writer
+exclusion and actual installed acceptance remain gates. Existing entry points,
+Compose, old live MCP ports/tokens/data and host services are unchanged. Beau's
+existing-equipment/source-only direction requires no extra PC or mandatory VM.
+
 ### Packaged standalone public gateway — 2026-10-19
 
 Tested source `c13d3599a9f5b4b5a41f7fc3d1316acbd764741f`. Clean Git archive
