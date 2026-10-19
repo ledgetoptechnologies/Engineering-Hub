@@ -34,4 +34,5 @@ def test_split_entrypoint_builds_one_core_and_uses_shared_runner(monkeypatch):
     entrypoint.main()
     assert calls == ["create", ("pair", core), ("serve", pair, {
         "agent_host": "0.0.0.0", "agent_port": 8770, "browser_port": 8771,
+        "agent_alias_port": None,
     })]
