@@ -61,6 +61,13 @@ not pending; writer exclusion, bounded resources and a disposable pilot boundary
 remain unproven. Do not provision, change host access, enroll state or activate
 an executor on the strength of this checklist or inventory approval.
 
+Beau subsequently approved preparing a bounded pilot on the existing staging PC,
+with the exact setup presented before activation. The concrete preparation
+proposal and peer requests are in
+[`staging-pilot-preparation-2026-10-19.md`](staging-pilot-preparation-2026-10-19.md).
+That approval does not activate a worker or authorize changes to existing apps,
+TrueNAS, credentials or Access policies.
+
 The shipped `engineering_hub.__main__`/control Docker entry point still constructs
 ordinary `create_app()`. It does **not** select
 `queued_pilot_service.serve_owned_queued_pilot`. Queue configuration alone cannot
