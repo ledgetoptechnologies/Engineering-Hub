@@ -2,7 +2,8 @@
 
 ## First-use readiness audit
 
-Current inspected development source: `0a40d88`. The original goal's GitHub
+Initial readiness-audit source: `0a40d88`; newer verified source checkpoints
+are recorded below. The original goal's GitHub
 human sign-in wording was superseded by Beau's separate Hub Cloudflare Access
 choice. Do not add a second GitHub sign-in flow to satisfy the stale wording.
 No current live installation or authenticated browser session was inspected in
@@ -35,6 +36,61 @@ hardware clarification. Existing local Docker remains suitable for bounded
 synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
+
+### Private browser gateway and queued-core application lifecycle
+
+Implementation `c9742e20dc2677b47f548abc2e4bcd8a4a59b174`; final tested source
+`848667a8a33acac88234515001236f43e4245e7e`, development branch only. Clean Git
+archive image index
+`sha256:411942044db7d24be131c42f086fde9a9d63eb7a0bcda08eb1ac3e7897879059`,
+manifest `sha256:dc61521036f6d244c9156f65a826a6607601789508af92f540b45aed803033ad`,
+config `sha256:adfeb197c2c6f69aa0f5627a0158556b0af458e3d4f9f1d5a191f1bdd4c1dd69`.
+Full exact-image Linux suite: **3225 passed, 3 skipped, 4 known warnings**,
+145.42s. Focused gateway, app, runtime, DTO, queue bootstrap, owned service and
+contract checks: **113 passed**, 4.81s, ResourceWarning errors enabled, one
+Starlette warning. Three ownership checks separately passed **3/3**, 0.30s,
+on the same image with only CHOWN and synthetic fixtures. Full-suite warnings
+were Starlette, an existing unclosed test event loop, and two deliberate fork
+deprecations. Independent review accepted the source, tests and contract diff.
+
+The explicit app parameter binds one existing queued runtime to its exact
+repository, queue and native feed. Startup requires the native source; shutdown
+drains accepted effects before feed closure despite repeated cancellation. The
+caller retains the owner/client until the lifespan exits. No environment flag,
+service installation or replacement scheduler activates this composition.
+
+The browser-only proxy and private receiver expose closed UI/auth/task/decision/
+read/SSE routes and reuse core Cloudflare, session and CSRF checks. They do not
+proxy MCP, private worker operations, direct dispatch or agent work submission.
+Agents keep their original LAN listener and source-IP checks. Request and ordinary
+response bounds, cookie isolation, no transparent mutation retry, immediate SSE
+and cancellation cleanup have regression coverage. The public process must have
+neither the database nor executor credential; actual protected UDS/process
+composition is still an operator acceptance gate, not proved by an injected
+test client. No host or live configuration was changed.
+
+The 43 gateway tests use the actual core/repository and signed synthetic JWTs;
+the eight app cases separately use real Linux `PilotOwner`/native events with
+simulated remote effects. There is not yet one unified gateway-to-enrolled-owner
+acceptance test, an installed private listener, or real remote pilot/reboot proof.
+Machine-wide restore reconciliation and other activation gates below remain.
+
+Verification history: the initial working focus had **1 failed, 104 passed**;
+the app correctly denied unsupported startup, but the test expected an unwrapped
+HubError rather than MCP/AnyIO's ExceptionGroup. The test now checks the actual
+wrapped cause; no product guard was relaxed. Gateway test wrappers were converted
+from nested asyncio.run to pytest-managed async execution to avoid losing the
+test runner's event-loop ownership. Initial clean implementation suite had
+**1 failed, 3224 passed, 3 skipped**, 145.29s: the checked-in OpenAPI snapshot had
+not been regenerated for the new queued-runtime DTO. The existing exporter
+produced the exact additive 78-line schema change; the final clean suite above
+includes that contract check. Windows' initial default pytest temp path was
+inaccessible; fresh explicit temporary paths worked without host permission changes.
+
+Peer evidence notices were bus-accepted for Claude
+`29264b0e-d4d8-4742-ac2e-3b2285fc8853` and Hermes
+`f89ce9c0-69aa-48b1-9fef-1e01a13e794b`. Processing/wake is not verified. No
+receipt-only response, deployment, activation or infrastructure work was requested.
 
 ### Inert native-event queue runtime
 
