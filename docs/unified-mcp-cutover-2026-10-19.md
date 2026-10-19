@@ -7,7 +7,9 @@ message history, backups, agent credentials or unrelated services.
 
 ## Current implementation checkpoint
 
-Hub integration source `925a31e07f46ecfd543bc895059b7e7788bf472a` reuses the
+Hub integration source, including Claude's bus hooks at
+`fc9efac68a351337b393eda7330ebb414e6d3b85` and the explicit startup-cleanup hook
+at `2b1607b686fe7021e0998df7a67c96d52f61e158`, reuses the
 existing stateful bus FastMCP server rather than reimplementing its tools.
 The combined default surface is 24 original tools plus nine Hub tools. Existing
 tool names, session-owner checks, recipient resources, push publisher and the
@@ -18,31 +20,80 @@ MCP and bus REST paths before human authentication.
 `--unified-mcp --split-ingress` explicitly selects the new composition. Plain
 Hub startup is unchanged. The factory requires existing absolute DB/audit/object
 paths, a separate Hub DB, shared agent authentication, a preconfigured exact
-transport policy and native push. It must suppress startup retention until the
-preserved-state comparison is complete. Factory-only imports must be inert.
+transport policy and native push. The unified factory explicitly passes
+`startup_cleanup=False`: construction must not run legacy retention before the
+preserved-state comparison. The standalone legacy default remains unchanged.
+Factory-only imports are inert; the default ASGI entry is lazily constructed.
 Unified health retains the old top-level push/cursor fields and also reports its
 bus component. Readiness requires valid audit, healthy DB and native push with
 subscriptions enabled; HTTP 200 alone is not readiness.
 
-Claude owns the bus factory hooks and their tests. Codex owns Hub composition,
+Claude supplied the integrated bus factory hooks and their tests. Codex owns Hub composition,
 ingress and integration tests. Hermes owns host/bootstrap cleanup and the actual
 deployment inventory/backup/single-writer handoff. No overlapping host mutations.
 These assignments were sent through the existing linked MCP discussion; pending
 messages do not prove receipt or an active execution process.
 
-## Already executed, limited evidence
+## Executed local evidence; not an installed cutover
 
-The Hub integration snapshot passed **247 existing Linux regression tests** in
-17.12 seconds, ResourceWarning and unraisable warnings treated as errors, with
-one known Starlette deprecation warning. The network-none, read-only,
-capability-dropped test container had no host/socket mounts or published ports
-and was removed. This proves existing Hub regressions only, **not** the new
-unified composition: its 26 new tests still need the bus hooks integrated.
+An actual `docker/Dockerfile.hub-control` image was built from the exact
+`2b1607b686fe7021e0998df7a67c96d52f61e158` source archive, using local tag
+`ghcr.io/ledgetoptechnologies/engineering-hub-control:build-local-unified-2b1607b`.
+It is **local only, not published or deployed**. Recorded OCI identities are:
 
-An independent read-only review identified and corrected the stricter unified
-health and pre-construction Cloudflare configuration gates. Source review is
-not deployed acceptance. The existing tested application artifact predates the
-unified changes and must not be deployed as the unified MCP.
+- Index: `sha256:7ad8780fd4789e05c2e58aac14ee17d29fa9bd0ad1f3d42d6a880d1308c46b59`
+- Platform manifest: `sha256:7c74062c98ba5a7937f1eec5df493f9a45993728614022b31cc1ed26fc72aae7`
+- Image config: `sha256:74d22ecb1590517b6b85975e9c5152e56b0fa48253b7748ba8dce32b24350258`
+
+An optional local `docker image save` artifact is
+`C:/Users/fstor/Documents/Codex/eh-control-unified-2b1607b-7ad878.tar`
+(178,923,520 bytes, SHA-256
+`91b4b72f310f22e55e3f8487f789ca86128f845ad63d9e9d9800d178cfaed96b`).
+The existing bounded archive-inspection helper resolved its OCI root/platform/
+config chain to the identities above without extracting it. This is transport
+preparation, not a registry upload, remote import or deployment.
+
+The actual disposable cutover smoke passed three sequential processes over one
+owned named volume: **legacy-only 24 tools → unified 33 tools → recreated unified
+33 tools**. Before any new canary operation on each unified startup, it compared
+row counts and content hashes for all **nine legacy tables**, stored file bytes,
+audit byte count and audit content hash with the previous process's saved state.
+Pending/claimed messages, sender-deduplicated sends and receipts, knowledge CAS,
+versioned file history, feedback and cursor continuity were exercised. Actual
+native resource notifications and cross-agent/session isolation passed. No old
+message was imported as a new event.
+
+That fixture used **synthetic legacy data and the candidate image's own bus
+implementation**, not the older deployed bus image or a production-state copy.
+It ran network-none, read-only, UID/GID 568, all capabilities dropped, no new
+privileges, 512 MiB memory with no extra swap, one CPU and 128 PIDs. It exposed no
+host port, host path or Docker socket. Graceful owned shutdown and disposable
+volume cleanup are fixture checks, not reboot recovery.
+
+The same actual image also passed the default-release and split-ingress smokes,
+and task/decision persistence across recreation. A separate offline semantic
+embedding check passed as UID 568, network-none and local-files-only, producing
+one 384-dimensional embedding. ONNX emitted a read-only telemetry warning; this
+is not proof of production semantic-cache inventory or a full-corpus search.
+
+Linux focused unified/factory validation passed **40 tests in 6.11 seconds** on
+the `2b1607b` overlay, explicitly selecting its checkout with `PYTHONPATH`. An
+earlier focused run passed 80 tests. The preceding full integration snapshot
+`738e4beaef0558c28f0d5ed1ef16cbbdc0740bba` passed **3,707 tests, six skipped and
+three warnings in 204.32 seconds**; that full run predates the startup-cleanup
+addon. The source-selection correction is
+`2798b566cf4c5503e1e7ba59c74ee13630ade4b8`. Its exact Linux source-overlay full
+validation completed: **3,722 passed, six skipped and three warnings in 194.34
+seconds**, with no exclusions or subprocess source-selection workaround. The
+warnings are the known Starlette deprecation and two multithreaded-fork
+deprecations. This is source integration evidence, not installed-host acceptance.
+
+Publication workflow source at
+`bc5c6587e1c9c2377598fa9b93f70c69071744eb` gates upload on the local unified
+preservation smoke, then repeats it after pulling the published registry digest
+before promotion. This is checked-in gating, **not evidence that registry
+publication or promotion has occurred**. Independent review drove the stricter
+health, pre-construction authentication and non-forceful fixture-cleanup checks.
 
 ## Deployment sequence; no old-data deletion
 
@@ -50,10 +101,10 @@ unified changes and must not be deployed as the unified MCP.
    audit, object/history roots, semantic caches, runtime settings and all agent
    clients. Identify any installed topic/registry/session routes absent from this
    checkout. Preserve them or block cutover; tool parity alone is insufficient.
-2. Integrate and independently review Claude's bus hooks. Execute combined
-   discovery, auth/session isolation, claim/ack/reject/deduplicated-send,
-   knowledge CAS, file history, feedback, cursor and native notification tests.
-   Build and pin the actual unified image; semantic model stays available offline.
+2. Complete final-source regression/review and publish/verify the immutable
+   unified image through the gated workflow. Local composition, synthetic state
+   preservation and offline model execution now have evidence above; they do not
+   replace checking the actually installed old version and its capabilities.
 3. Validate that exact image against a coherent **copy** of state first. Never
    construct against the live old paths while the old service can write: bus
    construction opens SQLite and audit locking is process-local. Keep the two
@@ -98,6 +149,15 @@ the current old service has no assumed maintenance-mode switch.
 
 ## Not done yet
 
-No current client configuration, production image, active endpoint or old service
-has changed at this checkpoint. The dedicated-MCP cutover and the full autonomous
-staging/real rollout/rollback/UI/reboot goal remain incomplete.
+Hermes does not currently have an authenticated TrueNAS management channel for
+this operation. The exact installed images, mount layout, full client inventory,
+coherent cold backup and single-writer handoff remain an operator gate. No
+TrueNAS deployment, current client/listener configuration, active endpoint or old
+service was changed by the local checks. No tunnel, Ops, credential or Access
+policy change was made. Do not report the old MCP retired yet.
+
+Still unproved: upgrading the actual deployed old image/state, all three agents'
+installed client canaries and correct-session wake, real NAS/app acceptance,
+reboot recovery and the full autonomous staging rollout/health/rollback pilot.
+The dedicated-MCP priority and the entire original staging-management goal remain
+incomplete; successful container fixtures do not narrow that goal.
