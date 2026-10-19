@@ -78,7 +78,8 @@ Final image sizes and free-space headroom must be measured, not inferred from
 Prometheus's earlier sample.
 
 For each disposable Hub application generation, propose **512 MiB memory with
-matching swap ceiling, 500 millicores, 128 PIDs and 64 MiB `/tmp` tmpfs**. These
+Docker `MemorySwap=Memory` (512 MiB combined, no additional swap), 500 millicores,
+128 PIDs and 64 MiB `/tmp` tmpfs**. These
 fit the existing closed manifest bounds; they are not yet tested sizing for the
 actual release. `/tmp` counts toward the memory ceiling. Exact effective Engine
 inspection must match the reviewed manifest, including `restart=no` and image
