@@ -36,6 +36,45 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Inert native-event queue runtime
+
+Tested source `c05557fdd00f8120e4a8690203b22785ba501e48`, development branch
+only. Clean Git archive image index
+`sha256:6a6385ba2e33ca562cd5541be15c608bdf6f3ea8d40d375df514cef155def298`,
+manifest `sha256:913a965f58354d43d1886aa1b362530981aa627282fa94f1bd64628b2f76c2b1`,
+config `sha256:5b27da3df3150a5ba597d69d4eedb655979b250dc0b0895b5375dd7460d0b0f9`.
+Full exact-image Linux suite: **3174 passed, 3 skipped, 4 warnings**, 149.53s.
+Warnings were the existing Starlette deprecation, an unclosed test event loop,
+and two deliberate multithreaded-fork deprecations. Focused runtime, restore,
+bridge, wire, queue and host-ledger checks: **98 passed**, 6.42s, with
+ResourceWarning errors. Three ownership checks separately passed **3/3**,
+0.30s, on the same image using only CHOWN and synthetic fixtures.
+
+`QueuedPilotRuntime` is an explicitly started library, not an installed worker.
+It subscribes before the initial drain, coalesces native events and runs one
+eligible job at a time without a timer or inbox polling. Stop, source failure
+and manager cancellation immediately veto new effect admission while accepted
+work drains. Independent review accepted the runtime and bridge hooks. Thirteen
+runtime tests cover lifecycle and cancellation; two additional tests reopen a
+real independent host ledger with synthetic effects to check target-fence
+regression and busy-target denial. They do not establish real host acceptance.
+
+The initial working-tree focused run had **1 failed, 97 passed**: the idle test
+read SQLite while measuring native callbacks and did not await quiescence.
+The test now observes actual bridge drain calls and waits for native/runtime
+quiescence; production code was not relaxed to resolve the test synchronization.
+
+Claude accepted the single physical-machine reservation invariant and withdrew
+the requirement to replace this bridge with an outbound pull worker. The next
+source boundary is a restricted public gateway to the private database owner:
+ordinary dashboard writes must not bypass `PilotOwner`, and the public process
+must not receive the executor credential. This is not implemented or activated.
+Machine-wide restore admission also remains closed: retained per-target host
+fences alone do not prove a restored Hub can safely release physical capacity.
+Independent control-generation reconciliation is still required before such
+recovery can be accepted. No lifecycle factory, live service, credential, NAS
+change, deployment or reboot acceptance is implied by this checkpoint.
+
 ### Queue-to-remote-pilot source integration
 
 Implementation `33e0206c84a28c598eefbb53bdac6b05094b6220`; final tested source
@@ -66,13 +105,14 @@ The test-only correction creates evidence when requested and compares one stable
 snapshot for REST/MCP parity. The explicit one-day-old evidence test remains;
 production freshness logic was not changed. Review accepted that narrow fix.
 
-No installed lifecycle factory/native worker loop, host credential, baseline,
+At this earlier checkpoint, no installed lifecycle factory/native worker loop, host credential, baseline,
 runtime identity issuer, NAS operation, actual remote pilot or reboot acceptance
 is added. Default application queue/pilot exclusion stays enforced. The deployment
-transport is still being discussed: Claude proposes an outbound worker, requiring
+transport was still being discussed: Claude proposed an outbound worker, requiring
 new source APIs/receipt enrollment, while this bridge reuses the existing typed
 host endpoint. Private credential isolation and concrete single-reservation
-failure cases must be resolved before activation. See
+failure cases must be resolved before activation. The later runtime checkpoint
+above records Claude's revised position and the remaining isolation gates. See
 `remote-software-staging-bridge.md`; no new hardware or mandatory VM is required.
 
 ### Remote executor request concurrency
