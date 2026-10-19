@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -228,20 +229,48 @@ async def test_cursor_rest_validates_auth_args_and_future_head(cursor_client):
 
 
 @pytest.mark.asyncio
-async def test_since_now_uses_one_head_snapshot_and_observes_concurrent_commit(cursor_client):
+async def test_since_now_uses_one_head_snapshot_and_observes_concurrent_commit(cursor_client, monkeypatch):
     app, client = cursor_client
     headers_h = {"Authorization": "Bearer h-token"}
     headers_c = {"Authorization": "Bearer c-token"}
     old = await client.post("/api/messages", headers=headers_h, json={
         "recipient": "codex", "message_type": "already-here", "body": {},
     })
+    snapshot_taken = asyncio.Event()
+    return_snapshot = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_head = app.state.repository.delivery_head
+    snapshots = []
+
+    def observed_head():
+        # Read the real SQL snapshot in the API's worker thread. Do not guess
+        # from elapsed time whether the request has reached since_now yet.
+        value = original_head()
+        snapshots.append(value)
+        loop.call_soon_threadsafe(snapshot_taken.set)
+        # Force the external commit after the actual snapshot but before its
+        # value is consumed. Process spawn time must not spend the API's
+        # unchanged two-second observation deadline, which starts afterward.
+        assert return_snapshot.wait(20), 'Test did not release the captured snapshot'
+        return value
+
+    monkeypatch.setattr(app.state.repository, 'delivery_head', observed_head)
     waiting = asyncio.create_task(client.get(
         "/api/messages/wait?since_now=true&timeout=2&fields=pointer",
         headers=headers_c,
     ))
-    await asyncio.sleep(0.15)
-    await asyncio.to_thread(_insert_once_in_process, str(app.state.repository.path))
-    response = await asyncio.wait_for(waiting, timeout=2)
+    try:
+        await asyncio.wait_for(snapshot_taken.wait(), timeout=5)
+        assert snapshots == [1]
+        await asyncio.to_thread(_insert_once_in_process, str(app.state.repository.path))
+        return_snapshot.set()
+        response = await asyncio.wait_for(waiting, timeout=2)
+    finally:
+        return_snapshot.set()
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+    assert snapshots == [1]
     assert response.status_code == 200
     assert [item["message_type"] for item in response.json()["messages"]] == ["arrived-during-wait"]
     assert response.json()["messages"][0]["id"] != old.json()["id"]
