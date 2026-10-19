@@ -37,6 +37,19 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Existing Hub reported build — 2026-10-19
+
+A read-only GET to `http://192.168.50.80:8770/health` returned `ok: true` and
+`build_commit: c720f7a82c70230e267a369077211749c30e9360`. The local Git object
+identifies that commit as the 2026-10-18 control-V1 merge, and confirms it is an
+ancestor of the tested development branch. The later queue binding, native pilot
+runtime and owned coordinator commits (`33e0206`, `c05557f`, `2ef4333`) are not in
+that reported source revision. Do not present development-branch tests as proof
+that those additions are installed. This HTTP observation does not independently
+verify the image/provenance, private composition, human sign-in or executor.
+No pull, redeploy or configuration change was performed; direct host inventory
+and separate pilot approval remain pending.
+
 ### Read-only staging telemetry and module assessment — 2026-10-19
 
 Beau separately approved a read-only readiness inventory and supplied Prometheus
