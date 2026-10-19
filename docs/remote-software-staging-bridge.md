@@ -372,3 +372,31 @@ renew an expired claim, release a machine reservation or reconcile an uncertain
 host effect. Existing workflow recovery must still inspect original command
 identities with its independent evidence and authorization. The public transport
 continues to make at most one upstream attempt per submitted request.
+
+### Separate-container verification scope
+
+The next local acceptance fixture uses two disposable, network-disabled
+containers from an explicitly pinned, already-local validation image. Their only
+shared storage is a dedicated ephemeral Unix-socket volume, writable in the
+private container and read-only in the browser container. The private
+container keeps its database, randomly generated synthetic agent credentials and
+synthetic executor canary on private-only temporary storage. The browser
+container receives only the public assertion and opaque task/job identifiers
+needed for its test requests; agent API requests run inside the private fixture.
+No host directory, Docker socket, published port or production credential belongs
+in this test.
+
+Real signed test assertions, session/CSRF handling, independent agent review and
+the native queue should cross that boundary. Executor results remain deliberately
+synthetic, not actual Docker application deployment or independently observed
+health. Container profiles and inaccessible private file paths are checked as
+runtime evidence, not inferred from command-line intent alone.
+
+The browser fixture must additionally observe EROFS when attempting to create a
+file in the socket directory while retaining a working Unix connection. Its
+read-only mount prevents replacement through that mount; this is not a general
+claim of hostile-browser resilience or cryptographic private-peer authentication.
+Other privileged writers could still replace the private endpoint. This test
+also does not prove installed TrueNAS network policy, Cloudflare
+login, physical machine scheduling, power-loss durability or reboot recovery.
+Do not activate a host service or broaden access on the strength of this fixture.

@@ -37,6 +37,64 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Separate-container browser/private-core boundary — 2026-10-19
+
+Source fixture `3536565`, direct-import/capability correction `800993e`, and
+deterministic cursor regression `4ce214b7c65ff7a60baae341755dd5b8c786081b`.
+Clean Git archive image index
+`sha256:3969b9f38eeeec007699fcdcdb094737504fe993f6b345ec7828057a464a9de5`,
+manifest `sha256:9f5c519946f585af643a44687d1148e18b4076e498b0ddae802c626360edc177`,
+config `sha256:491b925601406cc2e4e4d45d8e73e0d47bcbadd9aa10a76e5946b0544de5d574`.
+Focused gateway/harness/split-runner/cursor suite **136 passed**, 10.58s,
+ResourceWarning errors enabled, no warnings. Separate ownership cases **6/6
+passed**, 0.59s. Independent review accepted the harness, fixture and test fix.
+The full exact-image Linux rerun passed **3369 tests**, with **6 skipped and
+4 known warnings**, 160.77s. Warnings remain Starlette, one unclosed test event
+loop and the two deliberate multithreaded-fork deprecations. All test and smoke
+handles are terminal; there is no background worker from this checkpoint.
+
+The unmodified `scripts/hub_private_gateway_isolation_smoke.py` completed both
+healthy and rollback cases on that exact image. Each case creates fresh,
+labelled disposable containers: network none, private PID/mount/IPC namespaces,
+read-only root, dropped capabilities, resource limits, no host binds, published
+ports or Docker socket. Their only shared volume contains the strict Unix
+endpoint and is read-only in the public container. Private database, randomly
+generated synthetic agent bearers and executor canary exist only on private
+temporary storage. The browser demonstrably gets ENOENT for the private paths
+and EROFS on a socket-directory write attempt, yet real HTTP over the Unix
+connection succeeds. Namespace identities differ and private processes are not
+visible from the public fixture. Public repository/owner constructors are also
+guarded by test tripwires.
+
+Real signed synthetic Access assertions, session/CSRF task creation, separate
+agent identities for claim/candidate/review, native queue scheduling and browser
+result reads cross actual container processes. Typed host effects and health
+proof remain synthetic: this is not a real application deploy/health/rollback
+pilot or Cloudflare sign-in acceptance. A read-only socket mount prevents
+replacement through that mount, not all possible privileged-writer attacks or
+cryptographic private-peer authentication. Installed NAS/tunnel policy and
+reboot/power-loss acceptance remain unverified.
+
+Initial smoke attempts stopped on Docker's equivalent CAP_CHOWN spelling and
+direct-script import-path setup; neither loosened the runtime permission limit
+or application auth. A diagnostic run located the import issue; only subsequent
+unmodified harness passes are acceptance evidence. The initial clean `3536565`
+full run was **1 failed, 3367 passed, 6 skipped, 4 known warnings**, 176.66s:
+an existing cursor test's 0.15s sleep did not prove its real SQL head snapshot
+preceded an external process commit under load. The test now synchronizes that
+actual read and commit, asserts exactly one original head value, and retains
+the original API timeout and result checks. No production feed code changed.
+All labelled smoke containers/volumes were removed and absence verified. No
+live MCP, NAS, credentials, policy, production or staging-host service changed.
+
+Claude reply `bdd6423d-65f7-47ff-96b3-86fb7e282321` now accepts endpoint
+lock plus generation provenance and correctly notes that deployments using the
+strict default still refuse residue. A future approved deployment profile must
+explicitly select recovery; source acceptance does not activate it. Startup
+refusal also needs operator-visible supervisor/readiness diagnostics: a process
+that never starts cannot report its own HTTP health. That deployment/visibility
+work remains pending, not implemented by acknowledging his proposal.
+
 ### Opt-in published endpoint recovery
 
 Source `b301ffa9a0d7503b2fa230f5b9dbd5cdf239c4b9` adds an explicit,
