@@ -63,6 +63,12 @@ class HubFrontends:
         self.browser = _FrontDoor(self, "browser")
         core.state.hub_frontends = self
 
+    def close_admission(self):
+        """Deny new HTTP requests without closing the shared core lifespan."""
+        if self.state not in {'active', 'stopping'}:
+            raise RuntimeError('Hub frontend admission is not active')
+        self.state = 'stopping'
+
     @asynccontextmanager
     async def lifespan(self):
         if self.state != "new":

@@ -80,7 +80,12 @@ class QueuedPilotRuntime:
         self._task = asyncio.create_task(self._run())
         return self.status
 
-    async def stop(self):
+    def close_admission(self):
+        """Synchronously veto new phases/claims before listener drain begins.
+
+        Does not cancel or wait for accepted work, close the source, or release
+        ownership. The lifecycle owner must still await stop() afterward.
+        """
         self._identity()
         # Never cancel a task which may be awaiting an accepted remote phase.
         # The bridge veto closes any following phase immediately; the accepted
@@ -89,6 +94,10 @@ class QueuedPilotRuntime:
         self._wakeup.set()
         if self._state not in {'failed', 'native_source_unavailable', 'stopped'}:
             self._state = 'stopping'
+        return self.status
+
+    async def stop(self):
+        self.close_admission()
         try:
             if self._task is not None:
                 await finish_owned(self._task)

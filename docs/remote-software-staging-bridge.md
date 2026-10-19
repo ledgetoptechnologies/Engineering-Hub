@@ -284,3 +284,45 @@ Crash residue deliberately blocks a new bind. Never delete an old socket merely
 because a PID, lock or lease looks stale; original owner quiescence and a separately
 approved recovery procedure are still required. This library does not establish
 unattended restart recovery or the machine-wide restored-database admission barrier.
+
+### Explicit split listener runners
+
+`split_server.py` adds two opt-in async library entry points, with no CLI,
+environment activation, service registration or Compose changes:
+
+- `serve_private_coordinator(pair_factory, socket_path=..., ...)` binds the
+  original agent TCP socket and protected browser Unix socket before invoking
+  the synchronous factory. Its exact new `HubFrontends` core owns one lifespan.
+  The private browser receiver repeats closed-route and Access checks; the
+  original agent listener preserves the real source address. No browser TCP
+  socket is opened by this runner.
+- `serve_public_browser(client_factory, ...)` binds only literal127.0.0.1 before
+  accepting one dedicated HTTPX client from its synchronous factory. It creates
+  the restricted public browser gateway, accepts no database/core/agent settings,
+  and closes that accepted client after listener requests actually drain. Use
+  `create_private_browser_client` for the private Unix transport, not a generic
+  environment-configured client.
+
+These APIs do not prove separate process or filesystem namespaces merely because
+they run separately as tasks in an integration test. The deployment must give
+the public process only its socket connection, without private DB or executor
+credential mounts. Factories remain responsible for resources they construct
+but do not return as valid accepted capabilities. Caller-owned pilot capability
+and client lifetimes still extend beyond private core shutdown.
+
+Shutdown synchronously invokes `HubFrontends.close_admission()` and the exact
+queued runtime's `close_admission()` before the first listener-drain await. These
+are sticky vetoes, not ownership release or effect cancellation. Already accepted
+HTTP mutations and remote phases drain while the owner and feed remain alive.
+The core lifespan exits only after listeners drain. The new private runner denies
+legacy dispatcher/owned-service combinations lacking this admission contract;
+the existing combined runner is unchanged.
+
+The new listeners explicitly disable Uvicorn's forced graceful-shutdown timeout.
+Only known read-only GET event subscriptions, including MCP GET streams, receive
+a shutdown disconnect; ordinary GETs and every POST keep their original receive
+and must finish. Actual pinned h11/ASGI receive-driven behavior is covered by
+real global SSE stop tests. A dependency or protocol change needs revalidation;
+this is not permission to cancel an accepted tool mutation. The operator's actual
+supervisor must also permit terminal drain rather than kill the process on an
+unverified deadline. There is no replacement worker or stale-socket adoption.
