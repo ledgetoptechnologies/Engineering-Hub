@@ -54,6 +54,7 @@ class QueuedContainerPilot:
         self._additional_target_verifier = queue.target_verifier
         self.worker = WorkWorker('executor:container-pilot', self.owner.epoch)
         self._permit = ContextVar('queued-pilot-private-permit', default=None)
+        self._runtime = None
         # Initialize recovery tables before enrollment closes legacy entrypoints.
         self.recovery = PilotRecovery(workflow)
         with self.repo._transaction() as db:
@@ -118,6 +119,16 @@ class QueuedContainerPilot:
             raise HubError('queued_pilot_policy_changed', 409)
         self.target.validated_manifest()
 
+    def _runtime_admission(self):
+        """An attached native runtime can only veto existing authority."""
+        if self._runtime is None:
+            return
+        from .queued_pilot_runtime import QueuedPilotRuntime
+        if (type(self._runtime) is not QueuedPilotRuntime
+                or self._runtime.bridge is not self
+                or self._runtime.admission_allowed() is not True):
+            raise HubError('queued_pilot_runtime_unavailable', 409)
+
     def _review(self, db, actor, target, *, original=None):
         task = self.repo._get(db, target.task_id, 'task')
         review = task.get('review')
@@ -150,6 +161,7 @@ class QueuedContainerPilot:
     def claim_verifier(self, worker, action_key, environment, machine_id, target):
         try:
             self._guard()
+            self._runtime_admission()
             return (worker == self.worker and action_key == self.action_key
                 and environment == 'staging' and machine_id == self.machine_id
                 and type(target) is WorkTarget and target.source_commit == self.target.candidate_commit
@@ -224,6 +236,8 @@ class QueuedContainerPilot:
     def authorize(self, operation, *, db=None, **context):
         """Repository/workflow hook; only our task-local private scope may act."""
         self._guard()
+        if operation in {'create_run', 'advance', 'command'}:
+            self._runtime_admission()
         permit = self._permit.get()
         if permit is None or operation == 'dispatch':
             raise HubError('queued_pilot_admission_required', 409)
@@ -340,6 +354,7 @@ class QueuedContainerPilot:
     async def run_once(self):
         """Claim one eligible staging job; no worker loop or implicit retry."""
         self._guard()
+        self._runtime_admission()
         job = self.queue.claim(worker=self.worker, lease_seconds=600, action_keys=(self.action_key,))
         if job is None:
             return None

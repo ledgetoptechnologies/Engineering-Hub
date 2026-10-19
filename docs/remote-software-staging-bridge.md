@@ -56,10 +56,34 @@ executor role. Completion requires the original strict command/health evidence,
 matching container chain and quiescent original attempt, not a terminal label.
 
 The current application-factory queue/pilot mutual-exclusion guard stays in force.
-A separately reviewed lifecycle factory and native-event runtime are still needed
-to connect this explicit source API to installed autonomous scheduling, without
-re-enabling direct dispatch. No service composition, transport credentials, host
-writer exclusion, baseline enrollment or runtime identity issuer is supplied here.
+A separately reviewed lifecycle factory is still needed to connect this source
+to installed autonomous scheduling without re-enabling direct dispatch. No service
+composition, transport credentials, host writer exclusion, baseline enrollment
+or runtime identity issuer is supplied here.
+
+## Explicit native-event runtime
+
+`QueuedPilotRuntime(bridge, feed)` in `queued_pilot_runtime.py` binds one exact
+bridge to the same-database `NativeHubEventFeed`. Construction starts nothing.
+The caller owns and starts the native feed, then explicitly awaits `start()`.
+The runtime registers its subscription before its initial durable queue drain,
+processes one eligible new job at a time and coalesces subsequent invalidations.
+There is no timer, inbox polling, model invocation or alternate reservation queue.
+
+Once attached, the runtime is an additional veto on claims and every subsequent
+create/advance/remote-command phase. Stop, source failure, wrong process/loop or a
+cancelled manager close that veto immediately. Already accepted phases drain;
+they are not force-cancelled, counted as successful because of cancellation, or
+given permission for another phase. A fully verified terminal phase may still
+record proof-based completion; otherwise the original reservation stays held.
+Held work is never automatically replayed or inspected merely because unrelated
+database activity arrives. `recover(job_id)` remains a separate explicit API.
+
+Await `stop()` before stopping the feed, closing the private host client or
+releasing `PilotOwner`. Repeated cancellation of stop waits for accepted work and
+observer cleanup before propagating. The runtime does not close those resources
+itself, detach its sticky veto, install hooks or provide reboot recovery. This
+library does not add an app factory, environment enable flag or installed worker.
 
 Required invariants:
 
@@ -119,9 +143,10 @@ accepted advance remains held, even if the original local run request can be
 mapped. No replacement run is created. A prior owner's still-unexpired claim may
 be inspected but is not adopted or released until eligible for authoritative
 queue reconciliation. There is no automatic retry, lease timer or recovery worker
-in this module. Unknown or revoked authorization keeps physical capacity held.
+in this module or its native runtime. Unknown or revoked authorization keeps
+physical capacity held.
 
-## Deployment transport remains under review
+## Peer transport review and remaining activation gates
 
 Claude's linked proposal `656d40a9-5860-40b6-828e-8b26abdcd65b` recommends an
 outbound staging-PC worker instead of the current pilot client's inbound host
@@ -132,13 +157,34 @@ verification/reconciliation. Proposed signing keys and new credentials are not
 approved or installed. A signature authenticates an enrolled issuer; by itself
 it does not prove effective isolation or observed application health.
 
-The implemented bridge demonstrates one physical queue reservation with a
-subordinate original-command journal/fence; the latter is not an independent
-capacity scheduler. This source integration does not settle the deployed
-transport or authorize placing private executor credentials in the browser/API
-process. Linked follow-up `54c49733-1798-4c0e-bd12-4d9f88e44f36` asks for a concrete
-conflicting interleaving and the minimal pull alternative, including credential
-isolation. Resolve this before installing a lifecycle factory or host service.
+In follow-up `36945d03-a641-4eaa-bb1c-45de59a99385`, Claude accepted the invariant
+and withdrew the pull-required preference: reuse of the existing push bridge is
+the shorter source path. The host's original-command journal/fence is subordinate
+effect-replay protection, not an independent physical-capacity scheduler. This is
+peer architecture review, not authority to provision an endpoint or credentials.
+
+Three activation requirements remain explicit:
+
+- Release only after verified terminal host-operation evidence. Healthy deployed
+  application containers intentionally remain running; that differs from an
+  unfinished create/stop/probe operation. No operator note, `cancelled` outcome or
+  queue lease expiry substitutes for the original terminal evidence chain.
+- A retained host ledger rejects lower/reused fences for a new run and higher
+  fences while its target is busy. Tests retain the real private ledger across
+  two disposable Hub histories to verify that narrow behavior. This is **not**
+  machine-wide restore reconciliation: historical terminal receipts after a Hub
+  restore do not prove that no newer host work exists. Restore must keep admission
+  closed until independent current-host reconciliation. No persistent anti-restore
+  anchor, generation-floor synchronization API or approved restore procedure is
+  supplied here; do not automatically reset or bump host fences to resume work.
+- Existing CI/manual deployers must be coordinated or excluded. Labels, a sidecar
+  lock and a shared Docker daemon alone do not establish writer isolation.
+
+Private adapter credentials must stay out of the browser process. `PilotOwner`
+also prevents an ordinary separate public process from writing its enrolled DB;
+separation therefore needs a reviewed private write/RPC barrier, not shared-file
+access or SMB SQLite. Credential cohabitation is not an accepted risk on Beau's
+behalf. Resolve this composition before installing a factory or host service.
 
 Then, only after separately approved activation, verify the existing staging
 host's effective transport, writer exclusion and resource limits, immutable
