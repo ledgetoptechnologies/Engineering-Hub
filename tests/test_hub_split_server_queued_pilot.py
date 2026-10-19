@@ -31,7 +31,9 @@ async def until(predicate):
 
 
 @pytest.mark.parametrize('failed_smoke', [False, True], ids=['healthy', 'rollback'])
-async def test_two_runner_http_review_and_native_pilot_flow(pilot_rig, tmp_path, monkeypatch, failed_smoke):
+@pytest.mark.parametrize('recover_socket', [False, True], ids=['strict-socket', 'recoverable-socket'])
+async def test_two_runner_http_review_and_native_pilot_flow(
+        pilot_rig, tmp_path, monkeypatch, failed_smoke, recover_socket):
     rig = pilot_rig
     config, assertion = signed_access(monkeypatch)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude',
@@ -54,6 +56,7 @@ async def test_two_runner_http_review_and_native_pilot_flow(pilot_rig, tmp_path,
     private_ready, public_ready = loop.create_future(), loop.create_future()
     private_task = asyncio.create_task(serve_private_coordinator(pair_factory,
         socket_path=endpoint, agent_host='127.0.0.1', agent_port=0,
+        recover_socket=recover_socket,
         stop_event=private_stop, install_signals=False,
         on_ready=lambda agent, private: private_ready.set_result(agent)))
     public_task = None
@@ -116,6 +119,18 @@ async def test_two_runner_http_review_and_native_pilot_flow(pilot_rig, tmp_path,
     assert not feed.available and runtime.status['state'] == 'stopped'
     assert not endpoint.exists()
     rig.owner.assert_active(rig.repo.path)
+
+
+@pytest.mark.parametrize('option', [None, 1, 'true'])
+async def test_endpoint_recovery_requires_explicit_boolean_before_factory(tmp_path, option):
+    constructed = []
+    def factory():
+        constructed.append(True)
+        raise AssertionError('Invalid option must not construct core')
+    with pytest.raises(ValueError, match='boolean endpoint recovery'):
+        await serve_private_coordinator(factory, socket_path=tmp_path / 'missing' / 'socket',
+            agent_host='127.0.0.1', agent_port=0, recover_socket=option, install_signals=False)
+    assert constructed == []
 
 
 async def test_private_stop_vetoes_new_jobs_before_blocked_http_and_effect_drain(

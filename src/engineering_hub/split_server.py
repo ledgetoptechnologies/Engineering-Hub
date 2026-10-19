@@ -161,7 +161,7 @@ async def _owned_service(operation, stop):
 async def serve_private_coordinator(pair_factory, *, socket_path,
                                     agent_host='0.0.0.0', agent_port=8770,
                                     stop_event=None, on_ready=None,
-                                    install_signals=True):
+                                    install_signals=True, recover_socket=False):
     """Bind agent TCP and protected browser UDS before constructing one owner.
 
     ``on_ready(agent_sockname, private_sockname)`` is an optional notification,
@@ -170,8 +170,13 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     Loss of either listener stops the other before the single pair lifespan
     exits. Cancellation requests a stop, then waits through repeated cancellation
     until listener requests and accepted core work are terminal.
+
+    Recovery is a separate, explicit endpoint protocol. The default preserves
+    rejection of every existing socket; no environment flag enables recovery.
     """
     _options(pair_factory, (agent_port,), stop_event, on_ready, install_signals)
+    if type(recover_socket) is not bool:
+        raise ValueError('Explicit boolean endpoint recovery option required')
     try:
         if type(agent_host) is not str:
             raise ValueError()
@@ -185,7 +190,11 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
             return
         with ExitStack() as stack:
             agent = stack.enter_context(_bind(agent_host, agent_port))
-            browser = stack.enter_context(private_browser_socket(socket_path))
+            socket_context = private_browser_socket
+            if recover_socket:
+                from .recoverable_browser_socket import recoverable_browser_socket
+                socket_context = recoverable_browser_socket
+            browser = stack.enter_context(socket_context(socket_path))
             if install_signals:
                 stack.enter_context(_signal_stop(stop))
             pair = pair_factory()

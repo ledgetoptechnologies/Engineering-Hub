@@ -326,3 +326,49 @@ real global SSE stop tests. A dependency or protocol change needs revalidation;
 this is not permission to cancel an accepted tool mutation. The operator's actual
 supervisor must also permit terminal drain rather than kill the process on an
 unverified deadline. There is no replacement worker or stale-socket adoption.
+
+### Opt-in recovery of a published endpoint generation
+
+`recoverable_browser_socket(path)` is a separate Linux source API. The split
+private runner selects it only with the exact boolean `recover_socket=True`;
+the default remains the strict helper that rejects every existing endpoint.
+No environment setting, migration, configuration change or installed worker is
+enabled by adding this API.
+
+The protocol permanently retains `<leaf>.endpoint.lock`, a private zero-byte
+regular file whose inode is never intentionally unlinked or recreated. An
+exclusive nonblocking kernel flock is held through listener/core drain and final
+socket close. A bounded, canonical `<leaf>.endpoint.json` record binds version1,
+a fresh generation UUID, stable parent identity, exact lock identity and socket
+identity, including socket/lock ctime. The record is written to an exclusive
+temporary file, fsynced, atomically replaced and parent-fsynced before listen.
+The private parent, ancestor and path requirements remain unchanged.
+
+After acquiring that endpoint lock, recovery removes an existing socket only if
+its exact identity matches the fully validated published record and the parent
+and lock still match. Unknown legacy objects, missing/changed lock, malformed or
+missing record, changed identity/mode/ownership and non-socket replacements are
+preserved and denied. A normal close removes only the original socket and keeps
+the lock/record, allowing a new generation under the same lock. No PID age or
+lease timeout is used as evidence.
+
+Fork callbacks close inherited listener, lock and parent descriptors without
+unlocking or unlinking parent state; references are cleared so later cleanup
+cannot close a reused descriptor. The protocol forbids arbitrary duplication or
+transfer of those descriptors. It does not isolate hostile root or equally
+privileged same-UID code. A database flock alone remains insufficient endpoint
+ownership proof and is not substituted here.
+
+Crash recovery is deliberately bounded: a crash after durable publication can
+rebind that exact stale generation, including a crash before listen. A crash
+between bind and publication leaves unknown residue and stays closed. Actual
+power-loss storage semantics, installed supervisor restart behavior and a PC
+reboot are separate acceptance requirements. Keep endpoint storage private and
+durable if this contract is selected; an ephemeral namespace reset is not this
+record-based recovery proof.
+
+Endpoint recovery does not adopt a database owner, replay a message/tool/POST,
+renew an expired claim, release a machine reservation or reconcile an uncertain
+host effect. Existing workflow recovery must still inspect original command
+identities with its independent evidence and authorization. The public transport
+continues to make at most one upstream attempt per submitted request.
