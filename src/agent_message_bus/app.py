@@ -130,11 +130,14 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | None = None,
                auth: AuthSettings | None = None, file_root: str | Path | None = None,
                push_events_operational: bool | None = None,
-               transport_security_settings: TransportSecuritySettings | None = None):
+               transport_security_settings: TransportSecuritySettings | None = None,
+               startup_cleanup: bool = True):
     # Validate before any database, file or retention work so a bad embedding
     # configuration fails without side effects.
     if transport_security_settings is not None and type(transport_security_settings) is not TransportSecuritySettings:
         raise ValueError("transport_security_settings must be a TransportSecuritySettings or None")
+    if type(startup_cleanup) is not bool:
+        raise ValueError("startup_cleanup must be True or False")
     db_path = db_path or os.environ.get("AGENT_BUS_DB", "data/messages.sqlite3")
     audit_path = audit_path or os.environ.get("AGENT_BUS_AUDIT", "data/audit.jsonl")
     file_root = file_root or os.environ.get("AGENT_BUS_FILE_ROOT", "data/files")
@@ -151,7 +154,10 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     audit = AuditLog(audit_path)
     semantic = SemanticIndex(db_path, file_root)
     service = Service(repository, audit, auth, policy_from_env(), files, semantic)
-    cleanup(repository, service.policy)
+    if startup_cleanup:
+        # Skipping preserves expired claims and retention-eligible rows, e.g.
+        # while a migrated copy awaits parity verification.
+        cleanup(repository, service.policy)
     if push_events_operational is not None and not isinstance(push_events_operational, bool):
         raise ValueError("push_events_operational must be True (require), False (disable), or None (auto)")
     require_native_push = push_events_operational is True
