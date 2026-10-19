@@ -94,7 +94,7 @@ not enable itself from import, environment, Hub startup, or a listener.
 - `docker/hub-container-pilot-acceptance.py`: import-safe, hard-disabled gate;
   a concrete acceptance harness and separate live-execution approval are still
   required. This script is not an implemented acceptance runner.
-- `service.py`: explicit owned loopback listener around the existing adapter
+- `service.py`: explicit owned loopback or private Unix listener around the existing adapter
   and ASGI protocol. It binds before an operator resource factory, drains
   accepted HTTP/effects through cancellation, and closes the adapter before
   provider cleanup. It does not discover configuration, authenticate supplied

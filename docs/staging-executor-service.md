@@ -28,6 +28,25 @@ The trusted operator launcher calls the asynchronous function with:
   explicit ownership by the enclosing launcher. Readiness can be asynchronous;
   it reports listener startup, not driver authentication or machine readiness.
 
+### Private Unix transport
+
+`serve_owned_host_executor_unix` uses the same resource and shutdown contract,
+but requires an explicit `socket_path` instead of a TCP host/port. It creates no
+directory and has no TCP fallback. The existing private-socket helper requires
+a canonical, already provisioned mode0700 parent owned by the current UID and
+trusted ancestors, then creates a new mode0600 socket. Existing files, symlinks
+and even stale sockets fail closed before the resource factory. Cleanup removes
+only the original pinned entry; replacement/removal is preserved and reported
+as a sanitized service failure after accepted work drains.
+
+Use the supplied `socket_path` to connect. `on_ready` reports the actual bound
+address, which may use the helper's pinned `/proc/self/fd` spelling; it is not
+an endpoint-discovery contract. HTTP bearer checks remain mandatory. Filesystem
+access is not kernel peer authentication or protection from equally privileged
+UID/root mutation. This listener does not implement the independent launch
+issuer, a remote TLS proxy, new host permissions or installed recovery. A
+separately owned private forwarder is still needed for a remote coordinator.
+
 The socket is bound before the resource factory runs. Bind failure cannot open
 the adapter ledger or acquire its resources. The service validates the exact
 adapter type and required provider presence; those checks do **not** authenticate

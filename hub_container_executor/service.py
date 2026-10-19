@@ -1,4 +1,4 @@
-"""Explicit owned loopback executor listener, not an installed host service.
+"""Explicit owned loopback/private-Unix executor listeners, not installed services.
 
 No configuration, credentials, driver identity, providers or runtime endpoints
 are discovered. A trusted operator factory must freshly dedicate a complete
@@ -15,6 +15,7 @@ import sys
 
 from engineering_hub.lifecycle import finish_owned
 from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+from engineering_hub.private_browser_socket import private_browser_socket
 from engineering_hub.server import _bind, _signal_stop
 from engineering_hub.split_server import _owned_service, _serve_listeners
 
@@ -69,6 +70,17 @@ def _exit_context(manager, exception):
     # cancellation and turn an incomplete listener lifecycle into success.
 
 
+def _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_seconds,
+                          stop_event, on_ready, install_signals):
+    return (_synchronous(resource_factory) and type(bearer_token) is str
+            and bool(bearer_token) and all(33 <= ord(char) <= 126 for char in bearer_token)
+            and type(supervisor_stop_grace_seconds) is int
+            and supervisor_stop_grace_seconds >= REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+            and (stop_event is None or type(stop_event) is asyncio.Event)
+            and (on_ready is None or callable(on_ready))
+            and type(install_signals) is bool)
+
+
 async def serve_owned_host_executor(resource_factory, *, bearer_token,
                                     supervisor_stop_grace_seconds, port,
                                     host='127.0.0.1', stop_event=None,
@@ -92,23 +104,58 @@ async def serve_owned_host_executor(resource_factory, *, bearer_token,
     No force-cancel deadline is applied to accepted work. on_ready receives one
     actual bound socket address after listener startup; no host/port is inferred.
     """
-    if (not _synchronous(resource_factory) or type(bearer_token) is not str
-            or not bearer_token or any(not 33 <= ord(char) <= 126 for char in bearer_token)
-            or type(supervisor_stop_grace_seconds) is not int
-            or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+    if (not _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_seconds,
+                                  stop_event, on_ready, install_signals)
             or type(host) is not str or host not in {'127.0.0.1', '::1'}
-            or type(port) is not int or not 0 <= port <= 65535
-            or stop_event is not None and type(stop_event) is not asyncio.Event
-            or on_ready is not None and not callable(on_ready)
-            or type(install_signals) is not bool):
+            or type(port) is not int or not 0 <= port <= 65535):
         raise ValueError('explicit owned loopback executor configuration required')
+    await _serve_owned_executor(resource_factory, bearer_token=bearer_token,
+        listener_factory=lambda: _bind(host, port), stop_event=stop_event,
+        on_ready=on_ready, install_signals=install_signals)
+
+
+async def serve_owned_host_executor_unix(resource_factory, *, bearer_token,
+                                         supervisor_stop_grace_seconds, socket_path,
+                                         stop_event=None, on_ready=None,
+                                         install_signals=True):
+    """Bind one explicitly selected private Linux Unix socket, then own resources.
+
+    The factory/adapter/provider ownership and shutdown contract is identical to
+    serve_owned_host_executor. No TCP listener, endpoint discovery, directory
+    creation, stale-socket recovery or credential default is provided. The
+    existing private-browser socket helper supplies the transport-only contract:
+    an already provisioned canonical mode0700 directory owned by this UID,
+    trusted ancestors, a new mode0600 socket and exact-inode-only cleanup. It
+    does not grant browser routes or change PilotASGI authentication.
+
+    An existing leaf, including a stale socket or dangling symlink, fails before
+    resource construction. Replacement/removal during service lifetime is
+    preserved and reported as a sanitized service failure after accepted work
+    drains; the socket helper's cleanup-unknown detail is not publicly exposed. These
+    checks do not sandbox same-UID/root filesystem races, authenticate a Unix
+    peer, or establish issuer/TLS/installed-host acceptance. on_ready receives
+    the socket's actual bound address, which may be its pinned /proc/self/fd
+    bind spelling, not a newly discovered endpoint. Connect using socket_path.
+    """
+    if (not _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_seconds,
+                                  stop_event, on_ready, install_signals)
+            or not isinstance(socket_path, (str, os.PathLike))):
+        raise ValueError('explicit owned private Unix executor configuration required')
+    await _serve_owned_executor(resource_factory, bearer_token=bearer_token,
+        listener_factory=lambda: private_browser_socket(socket_path), stop_event=stop_event,
+        on_ready=on_ready, install_signals=install_signals)
+
+
+async def _serve_owned_executor(resource_factory, *, bearer_token, listener_factory,
+                                 stop_event, on_ready, install_signals):
+    """Shared internal lifetime; public APIs alone select the listener policy."""
     stop = stop_event if stop_event is not None else asyncio.Event()
 
     async def operation():
         if stop.is_set():
             return
         with ExitStack() as stack:
-            listener = stack.enter_context(_bind(host, port))
+            listener = stack.enter_context(listener_factory())
             if install_signals:
                 stack.enter_context(_signal_stop(stop))
             manager = resource_factory()
