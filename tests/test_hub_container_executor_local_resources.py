@@ -291,7 +291,11 @@ def test_assembled_state_provider_prepares_candidate_and_reserved_rollback(rig):
         assert candidate.generation_id != rollback.generation_id
         for result in (candidate, rollback):
             actual = rig.paths["generations"] / result.generation_id / "hub.sqlite3"
-            assert actual.read_bytes() == before[1]
+            # SQLite backup preserves database contents, not necessarily every
+            # header byte; hash the actual newly copied generation independently.
+            with closing(sqlite3.connect(actual.as_uri() + "?mode=ro", uri=True)) as db:
+                assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                assert db.execute("SELECT v FROM fixture").fetchall() == [("synthetic approved baseline",)]
             assert result.source_backup_digest == digest(before[1])
             assert result.generation_digest == digest(actual.read_bytes())
             assert result.baseline_unchanged is True
