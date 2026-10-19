@@ -36,6 +36,41 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Remote executor request concurrency
+
+Implementation checkpoint: `e2997979529bb8db1182f1fbfe1f3e3328d210b6`, development
+branch only. A clean Git archive built image index
+`sha256:ab17ca58417b3ab097d29cf764e31cae7b3b4f44832bfde620a3965ed20767d7`,
+manifest `sha256:41dd9f262aaec101bcc246624d6015b811cd96a9b2fb7a1ecf4fb89ef6dae1e7`,
+config `sha256:82830924854acc2f09038a27a3483f099040dbc08cd936e5b59f27962127f785`.
+The full exact-image Linux suite passed **3132 tests, 3 skipped, 4 known warnings**
+in 148.82s. Focused ASGI/client/adapter/daemon tests passed **210/210**, 1.58s,
+with ResourceWarning errors; three ownership checks separately passed **3/3**,
+0.31s, on the same image. The earlier working-tree run passed 3132/3 skipped in
+147.64s; the clean archive result is the authoritative committed-source result.
+An initial ownership-check invocation omitted the test-data tmpfs and failed
+during collection; the corrected isolated invocation passed. No test was
+silently counted from that failed run.
+
+Independent review accepted the bounded adapter offload. Eleven new real-thread
+tests cover submit/get/reconcile responsiveness, busy admission without waiters,
+body deadlines while work is active, repeated cancellation drain, context
+propagation, scheduling failure, exception release, PID and cross-loop behavior.
+The synchronous adapter no longer blocks the ASGI loop, but a cancelled client
+does not stop accepted host work or release its gate early. Busy inspection is
+unavailable rather than queued behind the same private ledger. The wire client
+still treats a non-success response as unknown and never automatically resends.
+
+This is isolated source/HTTPX/SQLite/thread evidence, not remote host or Docker
+driver acceptance. No listener, private credential, Docker context, host mount,
+NAS operation, old MCP endpoint/token/port, production deployment or reboot
+configuration changed. The queue-to-pilot reservation bridge remains unimplemented;
+see `remote-software-staging-bridge.md` for its concrete invariants and tests.
+Current queue/pilot exclusion remains in force. Existing equipment and continued
+source-only work supersede any requirement to provision a new PC or mandatory VM.
+
+### Earlier archive HTTP checkpoint
+
 Opt-in archive HTTP checkpoint: `2ff8f6d`. Clean Git archive image index
 `sha256:804574caae4e73a3ee6902d16c570f587ad959b415aa5c181525409164e2c370`,
 manifest `sha256:5fda5fa8d5a9b1106b7fa92aa444a2825ff71ef6496b05d52e5f6e3ec4484642`,

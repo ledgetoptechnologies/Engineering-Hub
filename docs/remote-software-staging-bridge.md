@@ -41,6 +41,9 @@ Required invariants:
    instance/fence, owner epoch and stable run-creation request ID before creating
    a run. Recover an interrupted creation using the original idempotency record,
    not a new request ID. Persist the resulting run mapping before advancing it.
+   Preserve digest types: the current `ContainerPilotTarget.artifact_digest` and
+   pilot run artifact identify the Docker image config, whereas `manifest_digest`
+   identifies canonical pilot-manifest bytes. Neither is an OCI index digest.
 3. Run creation changes the task's status/revision. The existing queue target
    verifier requires `verified`; the bridge needs a narrowly bound run-aware
    check, not a blanket exception accepting all running tasks or stale reviews.
@@ -48,13 +51,16 @@ Required invariants:
    legacy dispatch and recovery must not bypass the same physical reservation.
    Agent tokens continue to identify agents, not privileged executor instances.
 5. Completion reads the original bound commands, run and verified health proof.
-   Release on verified successful deployment, or on verified healthy rollback
-   recorded as failed validation/deployment. A generic `failed` run, client
+   Release on verified successful deployment, or mark the queue job `failed`
+   after verified healthy rollback while preserving pilot status `rolled_back`.
+   Rollback and its original smoke must bind the same expected container/image.
+   A generic `failed` run, client
    assertion, HTTP success, elapsed lease or cancelled request is insufficient.
 6. An uncertain POST is inspected using its original command identity; never
    resend effects automatically. Uncertain outcomes retain the machine. A new
    process may reconcile original work through the recovery protocol, not adopt
-   an expired queue lease as authority for replay.
+   an expired queue lease as authority for replay. Recovery needs an active
+   `PilotOwner` and validated prior-epoch chain, not just a saved epoch string.
 7. Explicit private enrollment still supplies build provenance, runtime identity,
    healthy baseline, test secrets and constrained transport. A new bridge cannot
    fabricate these from labels, expected commit strings or agent declarations.
