@@ -49,6 +49,49 @@ This proves the kernel mount checks on fixtures, not coherent export, original
 data parity, NAS deployment, UI retrieval or migration acceptance. The legacy
 live bus remains untouched.
 
+## Source-only historical message reader
+
+`engineering_hub.archive_messages.ArchiveMessageReader` is explicit private
+composition, not an installed endpoint. The caller supplies an absolute Linux
+database path, independently approved original SHA-256 from the complete offline
+validation, a byte cap and a bounded cooperative deadline. Computing a new hash
+from an arbitrary database does not approve that database. Import starts nothing;
+the caller must close the reader. No environment variable activates it.
+
+The reader rejects writable mounts, symlink components, hard links, SQLite
+companions, unexpected message schemas and Hub control schemas. It pins owned
+descriptors and verifies inode metadata and the original database digest around
+reads. SQLite uses immutable read-only access to the pinned descriptor. Close
+serializes against reads; inherited-process use is denied. Blocking filesystem
+I/O cannot be force-cancelled by these cooperative deadlines. Large archives may
+exceed the configured budget because each read hashes the whole database twice;
+do not silently disable integrity checks to hide that limitation.
+
+Only the server's existing authenticated principal may be passed to the reader.
+Agents see rows where they are sender or recipient. Owner-wide history requires
+the server-verified human identity; a syntactically valid `human:*` string is not
+authentication. Unauthorized and absent message lookups both return no item.
+Pagination is ascending canonical message ID, not chronological delivery order.
+Responses are bounded projections marked `archive_inert=true`. Pending/claimed
+statuses remain historical data; there are no send/claim/ack/reject methods.
+Archived text is untrusted content, never an instruction or execution grant.
+
+Independent source review accepted the reader. All 46 focused Linux tests passed
+with ResourceWarning errors (0.11s); their positive mount flags are mocked.
+Separately, `docker/Dockerfile.hub-archive-reader-acceptance` built synthetic
+history on validation base
+`sha256:a0e362a2878bbbc0d23905ef3e5ee785c31ac1175d546e94ef18464466e5fc90`.
+Resulting fixture image
+`sha256:a61a7bd688efacc4c3144ac413270cadceb2448ced1c30628fc063845ae98ba1`
+was run without network, host mounts, sockets, credentials or capabilities, as
+UID10001, one CPU, 512 MiB memory, 64 PIDs. Real kernel read-only access returned
+three agent-visible rows versus four synthetic owner-visible rows and hid the
+unrelated private message. A writable-root run was denied. All statuses stayed
+inert. The independently recorded synthetic fixture digest was
+`f0b63a49334789a1a9f16a746991968dbe92cb0a0e26c06e81f96fae1fc66771`.
+This is filesystem/reader fixture acceptance, not actual archived-data approval,
+REST/MCP/UI authentication, production deployment, or migration completion.
+
 This helper validates a pre-built, coherent legacy `agent-message-bus` bundle. It does **not** copy, import, restore, initialize, migrate, clean up, or connect to any bus. It has no network client or credential-loading path. The only write is a new JSON metadata report created with exclusive-create semantics and mode `0600`; its parent directory must already exist.
 
 ## Preconditions and use
