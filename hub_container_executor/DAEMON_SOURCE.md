@@ -101,8 +101,10 @@ checks the actual launched image/config/platform, command, read-only filesystem,
 mounts and process instance. Mutable checkout hashing is development evidence,
 not proof of an immutable installed runtime.
 
-A private signed launch-receipt design was independently reviewed as viable,
-but is not implemented or accepted here. Its launcher must authenticate the
+A private signed launch-receipt consumer is now implemented in
+`runtime_identity.py`; see [the exact protocol and scope](../docs/executor-launch-identity.md).
+Its issuer, authenticated transport and real launch correlation are not installed
+or accepted here. Its launcher must authenticate the
 requesting process (for example, kernel Unix peer credentials), map that live
 process to the real container and bind a fresh provider-generated nonce to its
 container/process-start/boot identity. Inspecting a caller-supplied victim PID

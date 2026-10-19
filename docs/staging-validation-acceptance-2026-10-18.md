@@ -37,6 +37,76 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Independent launch-receipt consumer — 2026-10-19
+
+Source `97894fd38faa89eb6bcf4b9315e28cb56c3d3c82` supplies
+`LaunchReceiptIdentityVerifier` and independently supplied
+`ExecutorReleaseEnrollment`. It implements the existing signed-receipt design,
+not a weaker mutable-source hash or expected-commit echo. Strict canonical bounded
+receipts require a fresh internal nonce, fixed domain-separated Ed25519 signature,
+independent release/issuer/profile pins and a bounded fixed monotonic interval.
+One explicit synchronous issuer exchange occurs at construction; later identity
+checks perform no issuer or daemon I/O. Fork, expiry and close deny future checks,
+without cancelling existing effects. Async misdeclarations cannot adopt/cancel
+foreign work. See [the exact protocol](executor-launch-identity.md).
+
+Independent source review accepted the consumer's bounded scope. Its 84 new cases
+use real Ed25519 verification with ephemeral **synthetic** issuer keys and receipts.
+They cover schema/signature/domain/enrollment failures, nonce replay, exchange and
+parse/crypto budget, fixed expiry despite wall-clock jumps, thread reads, actual
+fork denial before an inherited lock and the real adapter's pre-backend rejection
+path. The adapter backend/build/baseline in these tests remains synthetic.
+No actual authenticated launcher or host process/container mapping is proven.
+
+`cryptography>=50.0.2,<51` is now declared directly. It was already locked and
+installed at **50.0.2** via the previous dependency graph; no package version or
+lock artifact changed. `uv lock --offline --check` passes with the same 65 resolved
+packages. A local Windows collection attempt encountered the existing Linux-only
+`fcntl` package boundary before tests could run; the implementation agent created
+an ignored local `.venv` from existing locked packages. No host service or global
+Python installation was changed. Authoritative execution below is Linux.
+
+The source manifest now includes the optional executor and validation-worker
+packages. An offline `uv build --sdist` from the exact source archive succeeded;
+the resulting `agent_message_bus-0.6.0.tar.gz` has SHA-256
+`4bfb4d02a319e3748c9a025797b562963624e850b47e035149a5bf4df6453f7b`.
+Tar membership independently confirms the executor's identity/resource/service
+modules and validation-worker runtime/service. Extracted `runtime_identity.py`
+matches the archived source SHA-256
+`de086e6dfe8c69cb8b6bab3c80b02df9c1e95964065702982d3fe73d8a9d3c72`.
+This proves retained source, not a wheel-installed or published executor image.
+The production Hub image still omits that optional root-level package; validation
+copies it explicitly. No mutable checkout mount is an installation substitute.
+
+The offline validation overlay uses immutable prior base
+`sha256:99154c6e30832bc4e8b68023daac89b4c0af50a99983fb7aea7df24ff27f0029`
+with the exact new archive's package/tests and updated dependency declaration/lock.
+No dependency installation or version change occurs in that overlay.
+Result image index:
+`sha256:2018849b91d01d02c8385e1662a8a57b25f25949069bea3796f1e98776c3462f`;
+platform manifest:
+`sha256:b4392c9ef729d6419a09e376846ef25db20b0d74eb644f5225d5db78f14cef85`;
+config:
+`sha256:60b2b1308720d0012e59eba5fc16d1a8162b227e9ba8cb5c7d1073ac3bcac724`.
+Focused identity/adapter/resources/service/deadline checks: **191 passed**, 6.17s,
+with ResourceWarning and unraisable warnings treated as errors, no warnings.
+New identity cases alone: **84 passed**, 0.40s, same strict warning profile.
+Separate CHOWN-only ownership cases: **6/6 passed**, 0.58s.
+The full exact-image suite completed: **3641 passed, 6 skipped and 4 warnings**,
+175.69s. The known warning classes remain Starlette, the older unclosed test-loop
+fixture and two deliberate threaded-fork checks; delayed loop garbage collection
+reported at a different test, not evidence that this new test created the loop.
+All build/test execution handles are terminal and owned test-container absence
+was verified.
+
+Tests retain network-none/read-only/capability/resource restrictions, synthetic
+temporary state, no host mounts/socket/public ports and owned-only cleanup.
+Actual issuer authentication, direct kernel peer mapping, independently approved
+immutable executor packaging, host writer/resource isolation, real rollout/health/
+rollback, installed human UI and PC reboot acceptance remain unfulfilled. No
+production, TrueNAS, current MCP, credentials, policy, endpoint, listener or
+automatic-startup change was made.
+
 ### Concrete owned-executor resource assembly — 2026-10-19
 
 `hub_container_executor/local_resources.py` now supplies an explicit synchronous

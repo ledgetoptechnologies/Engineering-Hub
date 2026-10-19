@@ -110,12 +110,16 @@ and minimum remaining free space need an actual enforcement/admission plan.
 5. Explicit composition selecting `serve_owned_queued_pilot`, a dedicated
    `ContainerPilotClient`, protected executor transport, and mandatory exact
    target policy. The shipped ordinary `create_app` entrypoint does not do this.
+   The current Hub image also omits the root-level executor package: the Linux
+   validation image copies it explicitly, but that is not a release artifact.
+   Separate executor packaging and a trusted launcher remain required.
    The explicit `local_host_adapter_resources` context now joins the real backend
    to the existing protected provider implementations. It consumes already
    approved inputs; no installable operator entrypoint selects/provisions them.
-   `TrustedDriverIdentityVerifier` is a protocol, not a
-   concrete installed-source verifier. These are source implementation gaps,
-   not host values that Hermes can fill by choosing a path or setting a flag.
+   The signed launch-receipt consumer now implements the driver identity interface,
+   but its independently trusted issuer/direct transport and actual kernel
+   process/container correlation are not supplied. These are implementation and
+   installation gaps, not host values Hermes can fill by choosing a path or flag.
    A dry configuration validator must remain effect-free; serving/enrollment
    must be separate explicit operations. Rootful Docker capability remains
    host-level authority despite UID 10001 and limited target containers.

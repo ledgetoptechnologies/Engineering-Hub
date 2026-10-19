@@ -120,15 +120,24 @@ context exits only after accepted HTTP and raw executor work has drained.
 
 ## Installation remains separate
 
+The current production Hub Dockerfile installs the `src` distribution and the
+dashboard. It does **not** copy or install the root-level `hub_container_executor`
+package. The validation Dockerfile explicitly copies that package, which is why
+source tests can import it. A passing validation image is not a shipped executor
+artifact; a separate, reviewed executor packaging/launcher composition is still
+required. Do not patch the live MCP image or mount a mutable checkout to hide
+this installation gap.
+
 The smallest next installation path is an independently approved executor release,
 not another permissive configuration layer. A concrete runtime verifier must
 measure the actual imported implementation against an independently protected
 release enrollment in a boundary the executor cannot rewrite. Approval cannot be
 derived from the same mutable checkout, expected manifest commit or Docker backend
 echo being checked. The launcher must also exclude alternative import/code-overlay
-paths. An explicitly approved immutable executor image is another possible trust
-boundary, but its identity must come from independent launcher enrollment, not its
-own backend report. Neither option is implemented or installed by this context.
+paths. The [signed launch-receipt consumer](executor-launch-identity.md) now provides
+the bounded identity interface for an independently approved immutable executor
+artifact. It still requires a real authenticated direct issuer exchange and does
+not install that launcher or establish actual process/container correlation.
 
 Use the [pilot preparation proposal](staging-pilot-preparation-2026-10-19.md)
 for the proposed topology and unresolved host inputs. This function supplies no
