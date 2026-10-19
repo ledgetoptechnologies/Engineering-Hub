@@ -1,4 +1,4 @@
-"""Independent Hub MCP interface; never extends or replaces the existing bus."""
+"""Hub tools, standalone or explicitly registered on the unified bus server."""
 from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -34,9 +34,13 @@ class HubMCPAuthMiddleware:
 
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
-                  work_queue=None) -> FastMCP:
+                  work_queue=None, mcp=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
-    mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
+    if mcp is None:
+        mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
+    elif type(mcp) is not FastMCP or getattr(mcp, '_hub_tools_registered', False):
+        raise ValueError('Fresh explicit MCP registration owner required')
+    mcp._hub_tools_registered = True
 
     def identity(ctx):
         request = ctx.request_context.request

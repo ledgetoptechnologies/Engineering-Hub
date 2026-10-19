@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 
 from agent_message_bus.auth import AuthSettings
 from .auth import AuthConfig, SessionStore, build_auth_router, require_human
@@ -189,8 +191,28 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None, work_queue=None, archive_reader=None,
-               queued_pilot_runtime=None):
+               queued_pilot_runtime=None, bus_app=None):
     settings = settings or Settings.from_env()
+    bus_mcp = None
+    bus_health = None
+    if bus_app is not None:
+        if (not isinstance(bus_app, Starlette)
+                or settings.ingress_mode == 'browser'
+                or getattr(bus_app.state, 'hub_owner', None) is not None):
+            raise ValueError('Fresh private bus application required')
+        bus_mcp = getattr(bus_app.state, 'mcp', None)
+        service = getattr(bus_app.state, 'service', None)
+        if (type(bus_mcp) is not FastMCP or service is None
+                or service.auth is not settings.agent_auth
+                or bus_mcp.settings.stateless_http
+                or Path(service.repository.path).resolve() == settings.database.resolve()
+                or (settings.database.exists()
+                    and settings.database.samefile(service.repository.path))):
+            raise ValueError('Unified bus identity, stateful transport and separate storage required')
+        bus_health = next((route.endpoint for route in bus_app.routes
+                           if getattr(route, 'path', None) == '/health'), None)
+        if not callable(bus_health):
+            raise ValueError('Unified bus health source required')
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -316,31 +338,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
-                          work_queue=work_queue)
+                          work_queue=work_queue, mcp=bus_mcp)
     origin = urlsplit(settings.auth_config.origin)
-    hub_mcp.settings.transport_security = TransportSecuritySettings(
+    transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=list(dict.fromkeys([origin.netloc] + (
             list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
         allowed_origins=[settings.auth_config.origin],
     )
-    mcp_app = hub_mcp.streamable_http_app()
+    if bus_app is None:
+        hub_mcp.settings.transport_security = transport_security
+        mcp_app = hub_mcp.streamable_http_app()
+    else:
+        # The bus session manager already captured its transport policy during
+        # factory construction. Never pretend changing settings afterward fixes it.
+        actual = hub_mcp.settings.transport_security
+        if (actual is None or not actual.enable_dns_rebinding_protection
+                or set(actual.allowed_hosts or ()) != set(transport_security.allowed_hosts or ())
+                or set(actual.allowed_origins or ()) != set(transport_security.allowed_origins or ())):
+            raise ValueError('Unified transport policy must be installed before bus construction')
 
     @asynccontextmanager
     async def lifespan(app):
-        try:
-            await feed.start()
-            if owned_pilot_service is not None:
-                await owned_pilot_service.start(feed)
-            async with hub_mcp.session_manager.run():
-                if queued_pilot_runtime is not None:
-                    status = await queued_pilot_runtime.start()
-                    if status['state'] != 'active':
-                        raise HubError('queued_pilot_startup_unavailable', 503)
-                if runtime is not None:
-                    await runtime.start()
-                yield
-        finally:
+        cleanup_started = False
+
+        async def stop_components():
+            nonlocal cleanup_started
+            cleanup_started = True
             if owned_pilot_service is not None:
                 await owned_pilot_service.stop(runtime, feed)
             else:
@@ -354,15 +378,41 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                         await feed.stop()
                 if queued_pilot_runtime is not None:
                     from .owned_tasks import finish_owned
-                    # Keep the native source and caller-owned capability alive
-                    # until accepted effects drain, even on repeated cancellation.
                     await finish_owned(drain())
                 else:
                     await drain()
 
+        try:
+            await feed.start()
+            if owned_pilot_service is not None:
+                await owned_pilot_service.start(feed)
+            mcp_owner = (bus_app.router.lifespan_context(bus_app) if bus_app is not None
+                         else hub_mcp.session_manager.run())
+            async with mcp_owner:
+                try:
+                    if queued_pilot_runtime is not None:
+                        status = await queued_pilot_runtime.start()
+                        if status['state'] != 'active':
+                            raise HubError('queued_pilot_startup_unavailable', 503)
+                    if runtime is not None:
+                        await runtime.start()
+                    yield
+                finally:
+                    if bus_app is not None:
+                        # Retain bus identity/publisher/native source while accepted
+                        # Hub work drains; never close its transport underneath it.
+                        await stop_components()
+        finally:
+            if not cleanup_started:
+                await stop_components()
+
     app = FastAPI(title="Engineering Hub Control", version="0.1.0", docs_url=None,
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
+    app.state.mcp = hub_mcp
+    app.state.embedded_bus = bus_app
+    if bus_app is not None:
+        bus_app.state.hub_owner = app
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.queued_pilot_runtime = queued_pilot_runtime
@@ -379,7 +429,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .cloudflare_access import install_cloudflare_access
         install_cloudflare_access(app, settings.auth_config.cloudflare_config)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
-    app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
+    if bus_app is None:
+        app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
+    else:
+        from .unified_bus import attach_bus_routes
+        attach_bus_routes(app, bus_app)
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -548,14 +602,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 for name in ("hermes", "codex", "claude")]
 
     @app.head("/health", include_in_schema=False)
-    @app.get("/health", response_model=HealthDTO)
-    def health():
+    @app.get("/health", response_model=HealthDTO if bus_app is None else None)
+    async def health(request: Request):
         # Control service liveness is not host, agent or deployment readiness.
         if owned_pilot_service is not None:
             owned_pilot_service.assert_active()
         repo.get_paused()
-        return {"ok": True, "service": "engineering-hub-control",
-                "build_commit": read_build_commit()}
+        result = {"ok": True, "service": "engineering-hub-control",
+                  "build_commit": read_build_commit()}
+        if bus_health is not None:
+            try:
+                response = await bus_health(request)
+                summary = json.loads(response.body)
+                result['bus'] = summary
+                # Existing native connectors read /health.push and its cursor.
+                # Retain that wire contract as well as the nested component view.
+                for key in ('database', 'schema_version', 'version', 'audit', 'semantic', 'push'):
+                    if key in summary:
+                        result[key] = summary[key]
+                push = summary.get('push', {})
+                result['ok'] = (summary.get('ok') is True
+                                and summary.get('database') == 'ok'
+                                and summary.get('audit') == 'ok'
+                                and push.get('state') == 'healthy'
+                                and push.get('subscriptions_enabled') is True)
+            except Exception:
+                result.update(ok=False, bus={'ok': False, 'state': 'unavailable'})
+        return result
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     def overview(request: Request):
@@ -696,5 +769,6 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         # Added last so the boundary precedes redirects, auth and static routing.
         app.add_middleware(HubIngressMiddleware, mode=settings.ingress_mode,
                            agent_auth=settings.agent_auth,
-                           cloudflare_config=settings.auth_config.cloudflare_config)
+                           cloudflare_config=settings.auth_config.cloudflare_config,
+                           legacy_bus_enabled=bus_app is not None)
     return app

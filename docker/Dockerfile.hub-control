@@ -13,6 +13,11 @@ RUN python -m pip install --no-cache-dir uv==0.11.17
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN uv sync --locked --no-default-groups --no-editable
+# Unified MCP retains offline semantic search from the existing bus. Bake the
+# same model rather than silently dropping that capability or downloading at runtime.
+RUN mkdir -p /opt/fastembed-cache \
+    && /opt/venv/bin/python -c "from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed-cache', providers=['CPUExecutionProvider'], threads=2); list(model.embed(['Engineering Hub semantic model image preparation.']))" \
+    && chmod -R a+rX /opt/fastembed-cache
 
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}" \
@@ -23,6 +28,7 @@ LABEL org.opencontainers.image.title="Engineering Hub Control" \
       org.opencontainers.image.revision="${VCS_REF}"
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/fastembed-cache /opt/fastembed-cache
 COPY --from=dashboard /ui/dist /app/dashboard
 # ARG is read by Python as data, not interpolated into executable shell text.
 # Bake identity into the installed package; runtime VCS_REF cannot override it.
