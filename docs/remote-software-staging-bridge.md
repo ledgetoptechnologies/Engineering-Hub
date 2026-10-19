@@ -244,3 +244,43 @@ is public-facing, the private socket directory/socket admit only intended
 process identities, no public process has the DB or adapter credential, original
 agent source-IP denial still works, and listeners close before owner release.
 The source seam is not a deployment manifest or proof of those properties.
+
+### Protected Unix-socket lifecycle library
+
+`private_browser_socket(path)` in `private_browser_socket.py` supplies an explicit
+Linux-only context manager for a caller's existing server, not a service launcher.
+It requires an already provisioned, canonical private directory owned by the
+current UID with mode0700. Every ancestor must be root/current-UID owned and
+not group/world writable, except a root-owned sticky directory such as `/tmp`.
+Directory traversal uses no-follow descriptor-relative opens and identity checks.
+The path is bounded to107 UTF-8 bytes, with a restricted leaf name. Every existing
+leaf, including a stale socket or dangling symlink, is rejected without change.
+
+Binding uses the pinned parent descriptor, creates a nonblocking noninheritable
+AF_UNIX listener and sets the new socket to0600 before it is yielded. Cleanup
+closes descriptors and removes only the unchanged original socket in the unchanged
+namespace. Parent/leaf replacement, permission or ownership changes preserve the
+unknown objects and report a sanitized failure. An inherited child never unlinks
+the parent's listening endpoint. This does not defend against hostile root or
+equally privileged same-UID mutations, and it does not configure container mounts.
+
+`create_private_browser_client(path)` validates an existing protected socket and
+returns a dedicated, caller-owned HTTPX client with exact UDS transport, retries0,
+no environment proxy/auth, no redirect following and no TCP fallback. Construction
+does not connect or adopt a database/owner. Close the client explicitly; stop the
+server before leaving the socket context. Use a separate socket directory, not
+the private database directory. Actual deployment must keep the public gateway's
+mounts free of coordinator data and executor credentials.
+
+The unified Linux tests perform browser signed-assertion login, shared task
+creation, agent candidate/review/submission, pause/unpause and native-event queue
+execution against one real `PilotOwner`. Both in-process and actual UVicorn/HTTPX
+Unix transport cover success and healthy rollback with typed synthetic host
+effects. Wrong source IP remains denied even with a forged forwarding header.
+These are isolated container integration tests, not an actual Docker deployment,
+installed NAS tunnel, independent host health observation or PC reboot acceptance.
+
+Crash residue deliberately blocks a new bind. Never delete an old socket merely
+because a PID, lock or lease looks stale; original owner quiescence and a separately
+approved recovery procedure are still required. This library does not establish
+unattended restart recovery or the machine-wide restored-database admission barrier.
