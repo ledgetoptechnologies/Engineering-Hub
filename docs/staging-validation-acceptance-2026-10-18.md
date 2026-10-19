@@ -30,6 +30,23 @@ Host selection is not itself evidence that permissions or an executor exist.
 
 ## Latest verified source
 
+Opt-in archive HTTP checkpoint: `2ff8f6d`. Clean Git archive image index
+`sha256:804574caae4e73a3ee6902d16c570f587ad959b415aa5c181525409164e2c370`,
+manifest `sha256:5fda5fa8d5a9b1106b7fa92aa444a2825ff71ef6496b05d52e5f6e3ec4484642`,
+config `sha256:f4ba03c77fb6f9498ef2cbd25a2717949a85f20b407da2bf28b015ca2e08c682`.
+Full exact-image Linux suite: **3073 passed, 3 skipped, 4 known warnings**,
+145.33s; the three owner-change checks separately passed **3/3**, 0.31s.
+Focused archive/auth/ingress/default-contract tests passed **261/261**, 6.51s,
+with ResourceWarning errors and one existing Starlette warning. Independent
+review accepted the HTTP projection and explicit factory boundary. Default
+startup still adds no archive routes or schemas; no environment variable adopts
+a bundle. Existing authentication supplies principals; selectors, duplicate
+bearers, write verbs and private response fields are denied. Caller retains
+reader shutdown ownership. This is ASGI/SQLite fixture evidence, not live data,
+NAS setup, production sign-in or installed archive retrieval acceptance.
+
+### Earlier archive reader checkpoint
+
 Archive reader checkpoint: `fb2694c`, following reviewed archive integration
 and synthetic kernel-mount acceptance. Clean Git archive image index
 `sha256:c444022da7d69346a20e8fc329fd47ac6d900006ad8cf1c03a7108614c78c0a7`,
