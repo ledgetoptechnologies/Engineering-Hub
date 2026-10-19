@@ -1,5 +1,33 @@
 # Software staging checkpoint — 2026-10-18
 
+## First-use readiness audit
+
+Current inspected development source: `0a40d88`. The original goal's GitHub
+human sign-in wording was superseded by Beau's separate Hub Cloudflare Access
+choice. Do not add a second GitHub sign-in flow to satisfy the stale wording.
+No current live installation or authenticated browser session was inspected in
+this audit; earlier source/test evidence is not fresh deployment evidence.
+
+| Requirement | Current evidence | Remaining first-use gate |
+| --- | --- | --- |
+| Shared task, review and decision records | Repository/API/dashboard source and earlier isolated HTTP tests | Verify installed release and authorized human UI against the intended database |
+| Browser-only tunnel, LAN agent interface | `server.py` binds browser loopback and separate agent socket; split tests recorded below | Beau-owned NAS/tunnel deployment and actual allowed/denied browser checks |
+| Software queue and production-first priority | `work_queue.py` and reviewed-target policy in `work_queue_config.py` | Default admission is deliberately closed; a queue flag alone installs no executor or production authority |
+| Remote container execution | `ContainerPilotClient`, `OwnedPilotService`, `PilotASGI` and `HostAdapter` exist as explicit injected APIs | Concrete private host composition, protected build/baseline enrollment, trusted driver identity, installation and effective network/credential boundary |
+| Local validation executor | `OwnedValidationService` composes a local `WorkQueue`, private receipts and native feed | It is not a remote queue client; do not mount Hub SQLite over SMB to make it remote |
+| Health, rollback and recovery | Frozen state, observer draft, fixed probes, held outcomes and recovery source tests | Real isolated daemon/image/profile/health/deploy/rollback and installed restart acceptance; drafts are not approved enrollments |
+| Agent topic availability | Registry client/bridge and evidence-aware preflight source | Canonical registry injection and actual participant session/runtime evidence; transport subscription is not an awake agent |
+| Preserve existing MCP data and compatibility | Old 8765 service left untouched; offline archive validator integrated with frozen legacy fixtures | Operator-produced coherent read-only bundle, actual validation and separately authorized retrieval/copy; no replay of archived messages |
+
+The next real pilot requires an approved isolated Linux executor boundary.
+Existing shared staging Viewer/PA containers are not a disposable test boundary.
+Read-only local inventory found only Docker Desktop's internal WSL distribution,
+not an existing general-purpose Linux operator environment. No internal WSL
+administration, socket mount, VM provisioning or shared-host service change was
+performed to bypass this prerequisite. Beau has been asked to choose an isolated
+test VM on staging, another Linux test machine, or continued source-only work.
+Host selection is not itself evidence that permissions or an executor exist.
+
 ## Latest verified source
 
 Baseline observer checkpoint:
