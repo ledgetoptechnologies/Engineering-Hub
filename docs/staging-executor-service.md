@@ -69,7 +69,66 @@ operation, which inspects original operations without replay. No reconciliation
 is called automatically by the service. Lease expiry does not prove that an
 effect stopped.
 
+## Concrete local resource assembly
+
+`hub_container_executor.local_resources.local_host_adapter_resources` is the
+explicit synchronous resource context for this listener. A trusted launcher may
+bind its operator-reviewed arguments using `functools.partial` and pass that
+zero-argument factory to `serve_owned_host_executor`. This is source composition,
+not a configuration or enrollment endpoint. No ordinary Hub entrypoint selects
+it automatically.
+
+It assembles the real local content stores, versioned test-secret resolver,
+operator-enrolled build verifier, protected baseline reader, frozen SQLite state
+provisioner, private operation journal, Docker Engine backend and host adapter.
+Both candidate and rollback records are checked against the explicitly supplied
+build enrollments and their OCI metadata before writable state is opened.
+Enrollment must already have been independently approved; the helper must not
+derive an approval from the record it is checking.
+
+The operator supplies the exact manifest and daemon binding; pre-provisioned
+private paths; independent build enrollments; baseline receipt and runtime-profile
+digest pins; immutable test-secret bindings; explicit journal/reservation
+create-or-reopen choices; and a caller-owned driver-identity verifier. There is
+no default verifier, test transport, temporary-storage override, environment
+discovery, permission repair or directory provisioning. A callable verifier
+interface is not evidence that its implementation is trustworthy.
+
+The daemon binding's generation root is the only generation root. Dedicated
+ledger and journal parent directories, content/receipt/secret roots and state
+reservation storage must be mutually disjoint from application generations and
+each other. This stricter composition contract keeps application writes away
+from executor keys, receipts, journals and approval material. It does not retrofit
+the same restriction into unrelated existing callers of the underlying classes.
+Current UID/GID must be 10001 in the process's user namespace; this does not prove
+the initial-host identity or establish a usable rootless bind-mount mapping.
+
+Construction reads protected local metadata but sends no Docker requests or
+health probes and starts no jobs. Historical receipt verification is not fresh
+health evidence; the state provider's actual backup and baseline-file byte checks
+still occur at operation admission. Journal/reservation creation and adapter
+ledger opening are real local writes, not a dry run or one transaction across
+files. The adapter ledger retains its existing guarded create/reopen semantics.
+Partial state is preserved for operator inspection after failure, not deleted,
+automatically adopted or retried.
+
+All acquired resources register cleanup immediately in dependency order. Exit
+closes the adapter before its backend/journal/state/read-only providers and
+attempts remaining cleanup even if an individual close fails. The supplied
+driver verifier remains caller-owned. When used by the owned listener, this
+context exits only after accepted HTTP and raw executor work has drained.
+
 ## Installation remains separate
+
+The smallest next installation path is an independently approved executor release,
+not another permissive configuration layer. A concrete runtime verifier must
+measure the actual imported implementation against an independently protected
+release enrollment in a boundary the executor cannot rewrite. Approval cannot be
+derived from the same mutable checkout, expected manifest commit or Docker backend
+echo being checked. The launcher must also exclude alternative import/code-overlay
+paths. An explicitly approved immutable executor image is another possible trust
+boundary, but its identity must come from independent launcher enrollment, not its
+own backend report. Neither option is implemented or installed by this context.
 
 Use the [pilot preparation proposal](staging-pilot-preparation-2026-10-19.md)
 for the proposed topology and unresolved host inputs. This function supplies no

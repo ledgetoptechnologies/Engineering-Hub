@@ -110,15 +110,18 @@ and minimum remaining free space need an actual enforcement/admission plan.
 5. Explicit composition selecting `serve_owned_queued_pilot`, a dedicated
    `ContainerPilotClient`, protected executor transport, and mandatory exact
    target policy. The shipped ordinary `create_app` entrypoint does not do this.
-   No installable operator entrypoint currently joins the real backend to these
-   provider objects. `TrustedDriverIdentityVerifier` is a protocol, not a
+   The explicit `local_host_adapter_resources` context now joins the real backend
+   to the existing protected provider implementations. It consumes already
+   approved inputs; no installable operator entrypoint selects/provisions them.
+   `TrustedDriverIdentityVerifier` is a protocol, not a
    concrete installed-source verifier. These are source implementation gaps,
    not host values that Hermes can fill by choosing a path or setting a flag.
    A dry configuration validator must remain effect-free; serving/enrollment
    must be separate explicit operations. Rootful Docker capability remains
    host-level authority despite UID 10001 and limited target containers.
    The subsequent [owned executor service seam](staging-executor-service.md)
-   supplies the listener/resource lifecycle only. It does not supply the missing
+   supplies the listener/resource lifecycle and explicit local provider assembly.
+   It does not supply the missing
    trusted installation/enrollment configuration or activate the host.
 6. Writer selectors and application job-state evidence: image watcher, cleanup,
    Viewer worker, PA cron and any manual/CI deployer. Specify coordination or

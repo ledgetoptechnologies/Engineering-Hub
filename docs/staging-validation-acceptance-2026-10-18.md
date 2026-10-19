@@ -37,6 +37,85 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Concrete owned-executor resource assembly — 2026-10-19
+
+`hub_container_executor/local_resources.py` now supplies an explicit synchronous
+resource context for the owned executor listener. It uses the real protected
+content/secret/baseline/state/journal providers and the Docker backend's actual
+Unix-socket transport, not a permissive replacement provider. No transport request
+is made during assembly or cleanup. Both image records require independent build
+enrollment; baseline receipt/profile pins and the caller-owned driver verifier
+remain explicit. Current namespace UID/GID, exact binding, canonical disjoint
+private roots and known duplicate directory identities are checked before writes.
+Those snapshots are not hostile mount-race exclusion or actual daemon enrollment.
+
+All constructed resources register reverse-order cleanup immediately; individual
+cleanup failures do not skip the remaining closers. Journal/reservation creation
+choices are explicit. The adapter ledger retains its existing guarded create/reopen
+semantics. Partial state is preserved after failure; there is no atomic multi-file
+transaction, automatic retry/adoption or installed service. See
+[`staging-executor-service.md`](staging-executor-service.md).
+
+Implementation commit `396a86849446f8106ea1ae08aa1e109275579eb1` and follow-ups
+`840ff6956dcf06a95b6d3c7a72dfcaff0d943e99`,
+`061c7709225cbb73a53e95dfc536998816580871`,
+`d32face7c8f3c67dca7fe6fec772a464ae4358ab` and
+`13d4ecf62534c2b05860040c1ab82af7b2d53a78` include 36 new cases. Real private files,
+SQLite ledgers/locks, actual listener HTTP and off-loop provider cleanup are tested.
+The fixture's build approval, baseline receipt and driver authority are synthetic;
+the driver fake deliberately raises if sampled during construction. Missing or
+tampered baseline bytes are rejected at operation admission, not claimed to be
+fully hashed by the constructor. A positive case actually prepares distinct
+candidate and same-run reserved rollback SQLite generations, verifies database
+integrity/contents and actual generation hashes, and preserves original files.
+These state-only copies are not Docker deployment/health/rollback acceptance.
+
+Independent review accepted source, tests and documentation. The initial `840ff69`
+focused run had **1 failure, 34 passes**, 1.38s: a new fixture attempted ordinary
+assignment to a correctly frozen platform model. The corrected test explicitly
+bypasses freezing only on its caller-owned object to test independent snapshots;
+no production model guard was relaxed. `061c770` focused checks passed
+**284, with 3 skips and one existing threaded-fork warning**, 11.42s; its full run
+passed **3556, with 6 skips and 4 known warnings**, 176.15s.
+
+The added positive-copy case initially produced **1 failure, 35 passes**, 1.33s
+on `d32face`: it incorrectly expected a SQLite backup to preserve every header
+byte. A separate diagnostic confirmed the assertion's byte-27 change-counter
+difference (`01` versus `02`). The correction checks semantic contents/integrity
+and independently hashes the actual new generation. No state-copy safety check,
+quota, baseline enrollment or source-file immutability requirement was relaxed.
+
+An initial network-disabled normal Dockerfile build could not install `uv`: the
+floating Python base tag resolved a newer uncached base. It failed before tests
+ran. Validation instead overlays the exact tracked Git archive's optional executor
+package, tests and docs onto the already-local immutable validation base
+`sha256:9e6313574745eef5562874406ec0ff140f02c734da12bbddf180fcf723f99da4`.
+The intervening Git diff contains no other runtime/dependency changes or deleted
+files. This is an offline validation overlay, not a newly built distributable
+release image or evidence of a deployment workflow publishing successfully.
+
+Final `13d4ecf` validation image index:
+`sha256:99154c6e30832bc4e8b68023daac89b4c0af50a99983fb7aea7df24ff27f0029`;
+platform manifest:
+`sha256:c2f20c6be09e16c58da5b9b76a8198b22e93a2762834ca1d9505087e3bc708cd`;
+config:
+`sha256:8e4c5967bda795228d272f31a0c1a0f571e81a66da86eee13837258b85241971`.
+Focused checks passed **285, with 3 root-only skips and one existing threaded-fork
+warning**, 11.33s, with ResourceWarning and unraisable warnings treated as errors.
+Separate CHOWN-only ownership cases passed **6/6**, 0.57s. The final full-suite
+run completed: **3557 passed, 6 skipped and 4 known warnings**, 174.98s. These
+warnings are Starlette, the older mixed-loop fixture and two deliberate
+threaded-fork checks. Independently compared source/test SHA-256 values match
+the exact archived files copied into the image. All build/test execution handles
+are terminal; owned test containers auto-removed and absence was verified.
+
+Tests run network-none, read-only, capability-dropped, without host mounts, Docker
+socket or published ports, using private bounded tmpfs. Only the ownership test
+container adds CHOWN. The normal test `/tmp` permits execution for existing fake
+CLI fixtures; the application profile's no-exec restriction is unchanged. No
+TrueNAS, staging host, production deployment, current MCP, credentials, policies,
+listener registration or automatic startup was modified.
+
 ### Owned host-executor listener composition — 2026-10-19
 
 Beau asked Codex to continue available local work while Hermes has MCP connection
