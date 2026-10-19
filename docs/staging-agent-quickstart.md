@@ -124,6 +124,34 @@ blocked. Answered ordinary Hub decisions explicitly do not authorize execution.
 Do not use a decision ID, arbitrary approval string, or queue completion as
 permission to deploy, merge or promote.
 
+Production precedence is checked across actions and workers on the same physical
+machine, before the caller's action filter. A staging-only worker cannot bypass
+an approved, currently verified production candidate merely because it cannot
+run that candidate. Invalid, stale, removed or unapproved production is excluded.
+Other machines remain independent; already-running work is not preempted.
+
+Trusted local composition may inject `production_readiness_verifier(actor,
+action_key, environment, machine_id, WorkTarget)`; no public payload, environment
+flag or agent token installs it. It must assess all actually enrolled execution
+paths, not one worker's denial or Prometheus/transport presence:
+
+For an otherwise-valid queued production candidate:
+
+| Readiness result | New production claim | New same-machine staging |
+| --- | --- | --- |
+| Literal `True` | Still requires existing approval, target and worker admission | Waits behind production |
+| Literal `False` (authoritatively unavailable) | Denied | May proceed if otherwise admitted |
+| `None`, error or non-Boolean | Denied when the callback is configured | Conservatively waits |
+| No callback | Existing production worker-admission rules remain | Conservatively waits behind valid production |
+
+Unknown readiness can deliberately delay staging; there is no fabricated global
+readiness provider here. The callback governs new admission only, not renewal or
+preemption of accepted work. Callbacks are point-in-time observations inside the
+SQLite job transaction, not an atomic snapshot of external systems. Status/UI
+eligibility remains advisory and does not evaluate this readiness callback or
+promise a claim. Keep one canonical action/machine registry; use `action_keys`
+to narrow a worker, not a worker-specific registry that hides other production.
+
 The initial action keys are `<project>.validate`, including
 `engineering-hub.validate` and `3d-viewer.validate`. Inspect `GET /work/status`
 for the actual registry, proof policy, effective pause state and blocking reason.

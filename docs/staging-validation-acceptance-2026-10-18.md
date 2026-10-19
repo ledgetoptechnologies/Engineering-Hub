@@ -37,6 +37,64 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Machine-wide production precedence — 2026-10-19
+
+Hermes characterization `9fc1fee6-9499-475c-8d49-a166e665e7af` exposed an actual
+priority gap: action-filtered claims could take staging on a physical machine
+while approved, current production for another action remained queued. Independent
+regressions against the old source reproduced **3 failures, 8 passes**, 0.81s.
+The old worker-local admission expectation was deliberately corrected to the
+requested cross-workload physical-machine policy; no approval check was relaxed.
+
+Tested source `7579b06c9e5d752aaa10c0ad54b4a8bba2043d51` uses one production-first
+ordered claim pass in the existing SQLite transaction. Production registry,
+approval, review/target and readiness observations precede action/worker filters.
+Ready or unknown valid production blocks new same-machine staging regardless of
+which worker can claim it. Other physical machines proceed independently. Removed,
+rebound, stale or unapproved production does not become a barrier. Already-running
+work, lease/fence ownership, renewal and authoritative held reconciliation remain
+unchanged. Selecting production immediately avoids a temporary two-pass design's
+expanded cached-policy window; external policy snapshots are not atomic.
+
+The optional private `production_readiness_verifier` provides worker-independent
+readiness only, not approval or worker authority. Literal False excludes that
+production candidate from both new production claims and staging precedence;
+configured unknown/error/non-Boolean denies new production and keeps the staging
+barrier. Without a provider, existing production worker admission remains, while
+unknown global readiness conservatively blocks new staging. No provider or host
+readiness is fabricated; unknown can intentionally delay staging. The callback is
+admission-only and is not invoked by status, renewal or accepted-work continuation.
+Unstarted coroutine results are closed; foreign started coroutines/Futures are not
+cancelled or closed. Public schema, environment activation, identities, registry
+and persistent job schemas are unchanged. Trusted compositions must share one
+canonical action/machine registry, not hide production with per-worker registries.
+
+Independent source/test review accepted the final single-pass implementation,
+34 priority regressions, the changed legacy expectation and actual HTTP/MCP filter
+parity cases. Windows focused checks before the final loop simplification:
+**158 passed**, one known Starlette warning, 9.16s; the final loop's core/priority/
+admission checks: **95 passed**, 3.91s. The clean final-source Linux image index is
+`sha256:a91324d865756d6afcb87f4b9426d150b810687dd7ce50af881add78d0695aba`,
+manifest `sha256:61ac9fff6b77c9617387e284733d4d9507de476c98cd28e0fc5a77a8de0a6a67`,
+config `sha256:b1f5c2f4c08f6590a1d26b67bc28712930083cedfe6d97131e87e4731a7126d8`.
+Focused exact-image queue/API/MCP, bridge, owned-service, runtime and gateway
+checks: **232 passed**, one known Starlette warning, 12.69s; ResourceWarning and
+unraisable warnings treated as errors. Separate CHOWN-only ownership cases:
+**6/6 passed**, 0.59s. Both existing disposable two-container synthetic healthy/
+rollback cases passed; their owned containers/volumes were removed and absence
+verified. These tests do not prove a real production job or enrolled runtime.
+
+The final exact-image full Linux suite completed: **3470 passed, 6 skipped,
+4 known warnings**, 169.73s. Remaining warnings are Starlette, one older unclosed
+test event loop and two deliberate multithreaded-fork deprecations. No test failed
+on the final image; all execution handles are terminal.
+
+Dashboard eligibility already states advisory/conditional, not claim readiness.
+The new callback/priority barrier is evaluated at claim, not by read-only status;
+this limitation is explicit in the agent quickstart. No new SDK, scheduler,
+polling worker, host provisioning, production approval, deployment, MCP repair,
+NAS management, port/token/config change or old-message replay occurred.
+
 ### Read-only Engine compatibility and live wake blockers — 2026-10-19
 
 Hermes reply `9741d54c-b406-48b1-b237-8515dbf95b12` reports successful actual
