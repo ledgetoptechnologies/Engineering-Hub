@@ -76,6 +76,16 @@ not enable itself from import, environment, Hub startup, or a listener.
   importing it does not construct an app or bind a socket. GET, reconcile and
   submit body reads share a configurable bounded request-body deadline, separate
   from the manifest's command budget, and bodyless routes consume and reject bytes.
+  Synchronous adapter operations run off the request event loop behind one
+  non-waiting admission gate. Other valid operations receive `503 command_busy`
+  rather than building an unbounded executor queue. This includes inspection:
+  the adapter may hold its private ledger transaction during an operation, so
+  an inspection must not consume another blocked thread. Authentication and body
+  deadlines remain responsive. Repeated request cancellation drains the accepted
+  raw executor future before releasing the gate; it is not cancellation of the
+  container or proof of quiescence. A forked app cannot inherit this authority.
+  Any uncertain response still requires inspection of the original command;
+  callers must not interpret a transport failure as permission to replay a POST.
 - `daemon_backend.py`: concrete operator-pinned Unix Engine HTTP driver, verified
   only with fake transports and synthetic OCI archives. Its tmpfs/hard-link
   corrections passed independent source review; see `DAEMON_SOURCE.md` for

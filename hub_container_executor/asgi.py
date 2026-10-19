@@ -5,10 +5,14 @@ import asyncio
 import hmac
 import json
 import math
+import os
 import re
+import threading
+from contextvars import copy_context
 from uuid import UUID
 
 from engineering_hub.container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
+from engineering_hub.owned_tasks import finish_owned
 from scripts.inspect_hub_image_identity import IdentityError, strict_json
 
 MAX_REQUEST_BYTES = 8192
@@ -30,6 +34,10 @@ class PilotASGI:
         self._adapter = adapter
         self._authorization = ("Bearer " + bearer_token).encode("ascii")
         self._request_body_timeout_seconds = float(request_body_timeout_seconds)
+        self._pid = os.getpid()
+        # No waiting admission queue and no executor work during construction.
+        # The non-loop-bound gate also protects explicit cross-loop callers.
+        self._operation = threading.Lock()
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
@@ -67,7 +75,9 @@ class PilotASGI:
             if body:
                 await self._error(send, 400, "invalid_payload")
                 return
-            response = self._adapter.get(command_id)
+            accepted, response = await self._invoke(send, self._adapter.get, command_id)
+            if not accepted:
+                return
             if response is None:
                 await self._error(send, 404, "command_not_found")
             else:
@@ -93,7 +103,9 @@ class PilotASGI:
             if body:
                 await self._error(send, 400, "invalid_payload")
                 return
-            response = self._adapter.reconcile(command_id)
+            accepted, response = await self._invoke(send, self._adapter.reconcile, command_id)
+            if not accepted:
+                return
             if response is None:
                 await self._error(send, 404, "command_not_found")
             else:
@@ -122,8 +134,29 @@ class PilotASGI:
         except (IdentityError, ValueError, TypeError, UnicodeError, RecursionError):
             await self._error(send, 400, "invalid_payload")
             return
-        response = self._adapter.submit(request)
+        accepted, response = await self._invoke(send, self._adapter.submit, request)
+        if not accepted:
+            return
         await self._response(send, 200, response)
+
+    async def _invoke(self, send, method, argument):
+        # Never touch a mutex inherited from another process. A fork must build
+        # its own explicitly enrolled adapter/app, not adopt accepted work.
+        if os.getpid() != self._pid:
+            await self._error(send, 503, "executor_unavailable")
+            return False, None
+        if not self._operation.acquire(blocking=False):
+            await self._error(send, 503, "command_busy")
+            return False, None
+        try:
+            # Use the raw executor Future, not an abandonable to_thread Task:
+            # finish_owned shields accepted work through repeated cancellation.
+            # Keep the gate until the underlying call has actually terminated.
+            context = copy_context()
+            future = asyncio.get_running_loop().run_in_executor(None, context.run, method, argument)
+            return True, await finish_owned(future)
+        finally:
+            self._operation.release()
 
     async def _read_body(self, receive, headers, *, allow_missing_length: bool):
         deadline = asyncio.get_running_loop().time() + self._request_body_timeout_seconds
