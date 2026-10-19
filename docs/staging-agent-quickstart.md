@@ -46,6 +46,48 @@ cooperative instance identifier, not an additional executor credential.
 
 ## Workflow and boundaries
 
+### First-use handoff on the existing staging PC
+
+Current checkpoint: source `6e364635b4be5c5afd3499ee0eccff8ac3f91a46`, documented
+in `staging-validation-acceptance-2026-10-18.md`. No extra PC or mandatory VM is
+required, but an existing host is not automatically an approved executor boundary.
+Beau currently permits source-only work. Do not provision, change host access,
+enroll state or activate an executor on the strength of this checklist.
+
+The shipped `engineering_hub.__main__`/control Docker entry point still constructs
+ordinary `create_app()`. It does **not** select
+`queued_pilot_service.serve_owned_queued_pilot`. Queue configuration alone cannot
+bridge this gap. `docker/hub-container-pilot-acceptance.py` is intentionally
+disabled, not an acceptance command to run repeatedly until it succeeds.
+
+Before implementing an installable private composition, collect these inputs
+through separately authorized work, without putting credentials in this document:
+
+| Required input | Existing source contract | Evidence needed |
+| --- | --- | --- |
+| Physical host and constrained executor scope | `DockerEngineBinding` in `hub_container_executor/daemon_backend.py` | Pinned runner/daemon, Linux platform, explicit socket/API and generation-root locations; exclusion from production data and other host writers |
+| Immutable candidate and rollback images | `PilotManifest` in `src/engineering_hub/container_pilot_manifest.py`; `hub_container_executor/build_enrollment.py` | Immutable runnable OCI index/platform-manifest digest chain, corresponding config IDs, source commits, build provenance and independently approved build records; a config ID is not a runnable image reference, and a moving tag or matching health string is insufficient |
+| Trusted running driver | `TrustedDriverIdentityVerifier` in `hub_container_executor/backend.py` | Independently enrolled implementation/launcher identity and verifier, not test assertions or a self-issued claim |
+| Healthy rollback baseline and separate candidate state | `baseline_observer.py`, `baseline_receipt.py`, `baseline_snapshot.py`, `state_provider.py` | Authoritative healthy baseline, coherent backup and protected receipt; observer drafts and file copies alone are not approval |
+| Private transport and test-only secrets | `ContainerPilotClient`, `hub_container_executor/asgi.py`, manifest secret slots | Approved controller-to-executor path and secure secret resolver; do not reuse live MCP data or expose the Docker socket to agents/browser |
+| Ownership, shutdown and restore handling | `PilotOwner`, `serve_owned_queued_pilot`, endpoint generation protocol | Persistent local storage, single writer, verified supervisor drain budget and explicit handling of database restore/current physical-host state; expired leases do not release uncertain work |
+
+For a separately approved read-only inventory, reuse
+`scripts/hub_engine_runner_probe.py`; it already accepts explicit pinned bindings
+and makes a bounded Engine info observation. It does not discover credentials,
+provision its generation root, pull an image or launch containers. An `ok` result
+proves only the stated runner observation, **not** driver identity, image/profile,
+deployment or rollback. Do not invent pins from a synthetic fixture to satisfy it.
+
+After the inputs and host boundary are independently reviewed, prepare the
+explicit installation/entry-point wiring and obtain separate execution approval.
+The first real pilot must target a separate disposable Hub instance, not replace
+its controller, Viewer/PA, the live MCP or production. Record actual immutable
+candidate deployment, health evidence, a deliberate failed candidate and verified
+rollback, durable held handling and installed restart behavior. Keep container
+fixture results separate from host/reboot acceptance. Stop at any missing input;
+do not substitute a permissive callback or edit held SQL to make the pilot pass.
+
 1. Beau creates a Hub task. An agent claims it, proposes a full lowercase
    40-character candidate commit, and a **different** agent approves that exact
    commit using the existing `/api/hub/v1/tasks/...` review workflow.
