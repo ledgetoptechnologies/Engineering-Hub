@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def service():
     document = yaml.safe_load((ROOT / 'compose.hub-unified.yaml').read_text())
-    assert document['name'] == 'engineering-hub-control'
+    assert document['name'] == 'e-h-control'
     assert set(document['services']) == {'engineering-hub-control'}
     return document['services']['engineering-hub-control']
 
@@ -36,7 +36,7 @@ def test_one_existing_hub_with_both_original_mcp_ports_and_no_extra_owner():
 def test_preserves_both_operator_state_roots_and_never_autocreates_them():
     hub = service()
     assert [(v['source'], v['target']) for v in hub['volumes']] == [
-        ('/mnt/Plugins/App_Data/Engineering-Hub/engineering-hub', '/var/lib/hub'),
+        ('/mnt/Plugins/App_Data/Engineering-Hub/', '/var/lib/hub'),
         ('/mnt/Plugins/App_Data/Agent_MCP', '/var/lib/agent-message-bus')]
     assert all(v['type'] == 'bind' and v['bind']['create_host_path'] is False
                for v in hub['volumes'])

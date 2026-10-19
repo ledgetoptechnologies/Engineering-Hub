@@ -12,8 +12,12 @@ message history, backups, agent credentials or unrelated services.
 Beau confirmed the existing Hub is already running. This is an **in-place
 upgrade**, not a new Hub installation or an empty replacement database.
 `compose.hub-unified.yaml` is a candidate profile for that existing app. Its Hub
-bind follows Hermes's operator artifact:
-`/mnt/Plugins/App_Data/Engineering-Hub/engineering-hub` to `/var/lib/hub`.
+bind follows Beau's subsequently supplied existing Hub Compose, superseding
+Hermes's older prepared artifact:
+`/mnt/Plugins/App_Data/Engineering-Hub/` to `/var/lib/hub`.
+Preserve the existing Compose project identity `e-h-control` and service
+`engineering-hub-control`. Do not append an `engineering-hub` child directory:
+that would select a different database rather than upgrade the existing Hub.
 Its separate legacy bus bind follows Beau's supplied configuration:
 `/mnt/Plugins/App_Data/Agent_MCP` to `/var/lib/agent-message-bus`.
 Neither path is automatically created. Reconcile both against actual installed
@@ -60,8 +64,13 @@ work after a claim expires. The existing admin cleanup endpoint is retained.
 Live read-only checks still found the existing Hub serving HTML on LAN port
 8770 and returning 401 for an anonymous protected overview. Therefore its
 working dashboard is not yet proof of the final tunnel-only browser layout.
-Hermes's prepared operator file has GitHub mode and empty Cloudflare fields;
-it may be stale and must not be mistaken for actual installed authentication.
+Beau's supplied existing Hub Compose has GitHub mode with no GitHub credentials
+and empty Cloudflare fields. This explains why passing Cloudflare's outer login
+does not establish a Hub session; the running old build still reports unauthenticated.
+The candidate profile uses the separately approved Cloudflare Access configuration,
+not an additional GitHub OAuth application. This owner-supplied Compose is stronger
+configuration evidence than the older prepared artifact, but is not an independent
+container mount/image inspection or end-to-end browser authentication test.
 Reconcile the existing approved Hub Access issuer/audience/email policy and
 tunnel upstream before switching to split ingress. Preserve the Hub URL,
 existing data and separate Ops policy; do not overwrite credentials from chat.

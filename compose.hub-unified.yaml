@@ -3,13 +3,13 @@
 # in docs/unified-mcp-cutover-2026-10-19.md. Stop BOTH old writers and take a
 # coherent bus+Hub backup/test copy first. Never start this over live bus data.
 # Keep the existing TrueNAS app identity, protected tokens and Hub state.
-# These source paths follow Beau's legacy Compose and Hermes's Hub artifact;
+# These source paths follow Beau's supplied legacy and existing Hub Compose;
 # verify them against the actual installed mounts before using this file.
 # Both existing MCP ports share ONE core/transport/lifespan. Browser is loopback.
 # Keep the existing Hub tunnel/policy; its upstream must be 127.0.0.1:8771.
 # Never copy tokens from chat. Replace the four placeholders privately using
 # the existing protected agent/admin values, and do not share the filled file.
-name: engineering-hub-control
+name: e-h-control
 services:
   engineering-hub-control:
     image: ghcr.io/ledgetoptechnologies/engineering-hub-control:latest
@@ -61,7 +61,7 @@ services:
       HUB_CF_ACCESS_ALLOWED_EMAILS: "bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com"
     volumes:
       - type: bind
-        source: /mnt/Plugins/App_Data/Engineering-Hub/engineering-hub
+        source: /mnt/Plugins/App_Data/Engineering-Hub/
         target: /var/lib/hub
         bind:
           create_host_path: false
