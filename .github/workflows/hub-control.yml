@@ -43,6 +43,8 @@ jobs:
         run: python scripts/hub_release_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
       - name: Isolated split ingress bindings and authentication
         run: python scripts/hub_split_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
+      - name: Isolated preserved bus state and unified native notifications
+        run: python scripts/hub_unified_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
   publish:
     needs: verify
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -90,6 +92,7 @@ jobs:
           set -eu
           python scripts/hub_release_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-startup.json
           python scripts/hub_split_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-split-startup.json
+          python scripts/hub_unified_container_smoke.py --image "$BUILD_IMAGE" --commit "$GITHUB_SHA" > hub-local-unified-startup.json
       - name: Publish unique build tag and verify authenticated registry read
         run: |
           set -eu
@@ -101,6 +104,7 @@ jobs:
           docker pull "$PACKAGE@$DIGEST"
           python scripts/hub_release_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-startup.json
           python scripts/hub_split_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-split-startup.json
+          python scripts/hub_unified_container_smoke.py --image "$PACKAGE@$DIGEST" --commit "$GITHUB_SHA" > hub-registry-unified-startup.json
       - name: Require private package and current main before latest promotion
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
