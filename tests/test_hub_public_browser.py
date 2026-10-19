@@ -12,6 +12,18 @@ import pytest
 from engineering_hub import public_browser as module
 
 
+@pytest.fixture(autouse=True)
+def preserve_pytest_loop_policy(monkeypatch):
+    # pytest-asyncio installs an idle policy loop after asynchronous tests.
+    # Standalone asyncio.run() clears that reference without owning/closing
+    # it. Exercise the CLI's own loop in a Runner that does not replace that
+    # caller-owned policy loop; the real installed command is tested in Docker.
+    def run(awaitable):
+        with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+            return runner.run(awaitable)
+    monkeypatch.setattr(asyncio, 'run', run)
+
+
 @pytest.mark.parametrize('path', [None, b'/socket/browser.sock', '', 'relative.sock',
     '//socket/browser.sock', '/socket/../browser.sock', '/socket//browser.sock',
     '/socket/browser.sock/', '/', '/socket/.hidden', '/socket/a\x00b',
