@@ -5,6 +5,7 @@ is exercised. Factory freshness, dedication, and trustworthy provider cleanup
 remain caller preconditions, not properties inferred from an exact-type check.
 """
 import asyncio
+from copy import deepcopy
 from contextlib import contextmanager
 import os
 import socket
@@ -448,14 +449,16 @@ async def test_paused_held_receipt_survives_explicit_service_restart_without_rep
         await asyncio.wait_for(serving, 8)
     assert_closed(state)
     previous_events = list(state.backend.events)
-    fresh_root = state.root / 'fresh-providers'
-    fresh_root.mkdir(mode=0o700)
-    seed, fresh_backend, _, fresh_manifest = make_fixture(fresh_root)
-    assert fresh_manifest.digest() == state.manifest.digest()
     provider_names = ('record_store', 'metadata_store', 'provenance_verifier', 'backend',
         'baseline_provider', 'state_provisioner', 'secret_resolver', 'driver_identity_verifier')
-    providers = {name: getattr(seed, name) for name in provider_names}
-    seed.close()
+    # Reopen with new provider objects over the original exact synthetic
+    # enrollment. make_fixture would mint new build invocation UUIDs, producing
+    # a different manifest rather than testing recovery of this command.
+    providers = deepcopy({name: getattr(state.adapter, name) for name in provider_names})
+    assert all(providers[name] is not getattr(state.adapter, name) for name in provider_names)
+    fresh_backend = providers['backend']
+    assert fresh_backend.manifest.digest() == state.manifest.digest()
+    fresh_backend.events.clear()
     entered, exited = [], []
     @contextmanager
     def reopened_factory():
