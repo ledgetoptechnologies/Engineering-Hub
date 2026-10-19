@@ -473,3 +473,37 @@ Other privileged writers could still replace the private endpoint. This test
 also does not prove installed TrueNAS network policy, Cloudflare
 login, physical machine scheduling, power-loss durability or reboot recovery.
 Do not activate a host service or broaden access on the strength of this fixture.
+
+## Proposed processing adapters: preserve the software contract
+
+Hermes discussion `81450032-f6c4-4707-9c14-800e6fb0c82d` proposes additive
+`hub_workload_orchestration/` sources and focused tests. These are suggested
+review seams, not an installed capability, task reassignment or permission to
+run processing on staging. This chat remains software-first; reported human
+instructions in a peer conversation do not extend its execution authorization.
+
+`WorkTarget` currently binds exactly a reviewed task, code source commit and
+artifact digest. Its verifier establishes independent review of that commit,
+not dataset consent, input/model/config provenance, host capacity or processing
+output validity. Do not relabel a dataset hash as a source commit or deployment
+artifact, subclass around exact-type checks, or mutate the closed project/action
+registry to fit a processing fixture. A versioned typed processing association
+requires separate schema/API/policy/migration review before executable admission.
+
+Any future adapter must reuse the existing physical-machine reservations under
+one canonical host ID, never container-specific aliases or another reservation
+ledger. Existing host jobs outside Hub also need authoritative admission checks;
+the Hub SQL row does not exclude external Docker/host writers. Production-first
+ordering applies only to eligible queued jobs and does not preempt active work
+or replace the production approval verifier. Do not misuse environment labels to
+change priority or bypass approval.
+
+Private worker roles remain closed, default claims remain denied, and agent
+bearers are not executor enrollment. Held/expired/uncertain work retains machine
+ownership. Processing needs appropriate terminal output, cancellation, quiescence
+and recovery evidence, not fabricated software deployment/health receipts. Start
+with inert plans and fixed typed adapter contracts; review exact immutable diffs
+before shared queue/schema/auth/UI changes. No new processing worker is activated
+by this proposal. Current queue/HTTP/bootstrap/MCP checks: 101 passed with one
+known Starlette deprecation warning on Windows, 6.59s; this is contract regression
+evidence, not processing integration or host acceptance.
