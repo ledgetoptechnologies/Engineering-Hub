@@ -7,6 +7,78 @@ message history, backups, agent credentials or unrelated services.
 
 ## Current implementation checkpoint
 
+### Published alias-capable candidate and installed-client evidence
+
+The alias-capable main release `abd956740c2dda65911cc0601ee86210a8a2a6c6`
+is published and independently checked at
+`ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:5e64a12a3355fa073b73fbe737a90ba131f1a1c21e18fdfee83064057b5d6042`.
+Workflow `39340339288` passed candidate and authenticated registry-image checks;
+the original registry manifest and promoted `latest` manifest hashes match.
+The older release discussed below is historical, not the installation candidate.
+Do not substitute an unverified moving `latest` tag for the recorded digest.
+
+The subsequent main `74782aa08a38f811f4f11b26b42c49b83f11179f` release also
+passed workflow `39341366339` and was verified at immutable registry digest
+`sha256:c812b07cd48a955f69e694fde95bcdd433a9a4716168c7a57ffcd8fb9af4e3c0`.
+Downloaded original/promoted manifest hashes match that digest; actual pulled
+image tests again pass both ports/shared session/native alias notification and
+synthetic nine-table preservation across recreation. This includes the source
+bootstrap-unit whitelist update, not installation of that unit on staging.
+Neither published release establishes actual NAS data or client acceptance.
+
+Claude's read-only installed-client report at 2026-10-19 23:20 UTC identifies
+the old endpoint as bus version 0.6.0/schema 4 with 24 tools, recipient inbox
+resource/template, `/api/messages/wait`, and no deployed topic-registry routes
+in that service. His routing registry is client-local, supplemented by knowledge
+documents; transport presence is not session readiness. This is a collaborator's
+runtime report, not a Codex inspection of the installed image or database.
+Preserve those local registries/cursors and knowledge records; disabling the new
+optional registry bridge is not a loss of a verified existing server capability.
+Other agents must still confirm their own actual dependencies.
+
+### Operator acceptance gates before updating the existing app
+
+1. Record the actual two container IDs, image digests, mount sources, effective
+   numeric UID/GID, schema and semantic-index/cache locations. Inspect only
+   selected metadata, never full environment/credentials. Record old ownership
+   and permissions of both DBs and their WAL/SHM siblings, audit and objects.
+   UID/GID 568 must have the required access. A mismatch is a stop condition,
+   not permission to recursively chown existing data or weaken ACLs.
+2. First test coherent copies with the exact candidate. For the live window,
+   stop **both** old bus and existing Hub writers, verify both terminal, then
+   snapshot/backup both state roots including their dependent datasets. Record
+   actual snapshot identifiers and a tested restore procedure. Never snapshot
+   an assumed dataset name or treat a live SQLite file copy as coherent.
+3. Check measured memory for the current services and model workload. The
+   reviewed Compose retains 512 MiB; previous bounded synthetic tests do not
+   establish sufficient headroom for the live corpus/concurrency. Do not
+   silently raise limits to an arbitrary value or proceed after an OOM.
+4. Coordinate the split image and tunnel upstream in the same window: Codex's
+   read-only Cloudflare dashboard inspection on 2026-10-19 showed the Hub route
+   in the Ledge Top Technologies tunnel using `http://192.168.50.80:8770`.
+   Recheck that route at installation rather than assuming it cannot change.
+   After confirming
+   the connector's network namespace can reach host loopback, use browser-only
+   `http://127.0.0.1:8771`. If it cannot, stop and resolve the private connector
+   path; do not bind browser ingress publicly as a workaround. Confirm browser
+   login and both allowed identities, denied identity/LAN human access, and
+   `/mcp`/bus REST denial through the public hostname even with an agent bearer.
+5. Reserve a five-minute initial health-verification window after startup. Any
+   failed DB/audit/push component, OOM/restart, cursor regression, parity or
+   identity failure stops acceptance. Do not wait indefinitely or call HTTP 200
+   healthy. Preserve diagnostics without secrets and quiesce the new owner
+   before recovery; do not start the old owner alongside it.
+6. Recovery is **not** blindly rolling datasets back: retain a coherent copy of
+   all post-cutover writes before any restore. Even unchanged schema 4 alone
+   does not prove downgrade compatibility. Verify old-image compatibility on
+   copies, reconcile new writes, and choose an operator-reviewed recovery plan
+   before making an older snapshot authoritative. Preserve both old app
+   definitions/images and backups until all three installed clients, native
+   wake, human UI and restart acceptance pass.
+
+These gates are not evidence of execution. The published container fixtures
+still use synthetic candidate-bus data, not the deployed older image/state.
+
 ### In-place upgrade and port compatibility
 
 Beau confirmed the existing Hub is already running. This is an **in-place
