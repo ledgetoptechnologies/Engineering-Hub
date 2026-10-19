@@ -111,6 +111,8 @@ class StagingDispatcher:
         return rows, head
 
     def _assert_writer(self):
+        if self.repo.queued_pilot_enrolled():
+            raise HubError('queued_pilot_legacy_dispatch_forbidden', 409)
         from .container_pilot import ContainerPilotWorkflow
         if type(self.workflow) is ContainerPilotWorkflow:
             self.workflow._assert_pilot_owner()

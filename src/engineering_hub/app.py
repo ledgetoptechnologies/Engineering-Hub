@@ -617,6 +617,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/container-pilot/runs", status_code=201, response_model=RunDTO)
     def create_container_pilot_run(payload: NewRun, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if container_pilot_workflow is None:
             raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
         return container_pilot_workflow.create_run(identity, payload.task_id, payload.expected_revision,
@@ -625,6 +627,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/container-pilot/runs/{run_id}/dispatch", response_model=RunDTO)
     async def dispatch_container_pilot(run_id: str, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if container_pilot_workflow is None:
             raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
         if repo.get_run(run_id)['created_by'] != identity:
@@ -636,6 +640,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post('/api/hub/v1/container-pilot/runs/{run_id}/recover', response_model=RecoveryDTO)
     async def recover_container_pilot(run_id: str, request: Request):
         identity = agent(request)
+        if repo.queued_pilot_enrolled():
+            raise HTTPException(423, detail={'code': 'queued_pilot_direct_route_disabled'})
         if owned_pilot_service is None:
             raise HTTPException(423, detail={'code': 'owned_pilot_not_enabled'})
         if repo.get_run(run_id)['created_by'] != identity:

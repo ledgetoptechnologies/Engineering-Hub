@@ -19,6 +19,7 @@ from .repository import AGENTS, PROJECTS, HubError
 # A fixed private control-plane worker role, never an agent bearer identity.
 # Public REST/MCP derive their worker from authenticated AGENTS and cannot select it.
 SOFTWARE_VALIDATION_EXECUTOR = 'executor:software-validation'
+CONTAINER_PILOT_EXECUTOR = 'executor:container-pilot'
 
 
 def _key(value):
@@ -70,7 +71,7 @@ class WorkWorker:
         except ValueError:
             valid = False
         if (type(self.agent) is not str
-                or self.agent not in {*AGENTS, SOFTWARE_VALIDATION_EXECUTOR} or not valid):
+                or self.agent not in {*AGENTS, SOFTWARE_VALIDATION_EXECUTOR, CONTAINER_PILOT_EXECUTOR} or not valid):
             raise HubError('invalid_work_worker')
 
     def encoded(self):

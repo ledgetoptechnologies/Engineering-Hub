@@ -133,6 +133,7 @@ class PilotRecovery:
 
     async def recover(self, run_id):
         self._guard()
+        self.repo._assert_queued_pilot('recover', run_id=run_id)
         occurrence = str(uuid.uuid4())
         try:
             return await self._recover(run_id, occurrence)

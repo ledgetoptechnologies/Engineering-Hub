@@ -285,6 +285,7 @@ class ContainerPilotWorkflow:
 
     async def _command(self, run, target, action):
         self._assert_pilot_owner()
+        self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
         with self.repo._transaction() as db:
@@ -298,6 +299,7 @@ class ContainerPilotWorkflow:
                        (run['id'], action, canonical, 'unknown'))
         response_json = None
         self._assert_pilot_owner()
+        self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         try:
             response = await self.client.submit_command(command)
             response = self._validated_response(response)
@@ -317,6 +319,7 @@ class ContainerPilotWorkflow:
 
     async def advance(self, run_id):
         self._assert_pilot_owner()
+        self.repo._assert_queued_pilot('advance', run_id=run_id)
         owner = str(uuid.uuid4())
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
@@ -409,6 +412,7 @@ class ContainerPilotWorkflow:
 
     async def inspect(self, run_id, action):
         self._assert_pilot_owner()
+        self.repo._assert_queued_pilot('inspect', run_id=run_id, action=action)
         run = self.repo.get_run(run_id)
         target = self._target(run, pin=False)
         with self.repo._connection() as db:

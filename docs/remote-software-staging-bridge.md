@@ -1,6 +1,6 @@
 # Remote software staging: next integration boundary
 
-Status: source design, not an enabled service or host installation. Beau selected
+Status: explicit source API, not an enabled service or host installation. Beau selected
 source-only work with existing equipment; no extra PC or mandatory VM. Hub's
 control database stays local on TrueNAS, with a constrained software executor on
 the existing staging PC. Processing workers remain separate. Existing Viewer/PA
@@ -23,13 +23,43 @@ A new launcher on the staging PC cannot reach the NAS-local queue by itself.
 Do not share the Hub SQLite database over SMB, borrow another agent's SSH
 credential, or treat an arbitrary Docker context as an approved executor.
 
-## Missing queue-to-pilot bridge
+## Implemented private queue-to-pilot bridge
 
-The next implementation should bind a privately claimed queue job to exactly one
-durable pilot run before sending any remote command. This is not implemented by
-the ASGI concurrency correction. Keep the current queue/pilot mutual-exclusion
-guard until every executable pilot admission participates in the same reservation
-authority; do not just remove that guard to connect the modules.
+`engineering_hub.queued_pilot.QueuedContainerPilot(queue, workflow, *, action_key,
+machine_id)` binds a privately claimed queue job to one durable pilot run before
+sending any remote command. Both objects must share the same repository and live
+`PilotOwner`; the principal is `executor:container-pilot`. It enrolls one explicitly
+registered staging-only Engineering Hub action and one complete immutable pilot
+manifest. This is not the default `configured_work_queue` action registry, a
+remote worker daemon or a public enrollment API. No environment flag enables it.
+
+Construction persists policy and intent-table schemas, attaches the exact bridge
+to its repository and installs bound queue policies. It preserves an existing
+target verifier as an additional per-effect constraint, and rejects competing
+claim/completion/reconciliation policies. Existing legacy dispatcher tables,
+unbound active pilot runs and unbound physical reservations prevent enrollment;
+this is not an implicit migration or adoption tool. Reopening requires the same
+enrolled action/machine/manifest. A missing in-process bridge cannot bypass the
+persisted marker, even through an older already-constructed repository/workflow.
+
+`await bridge.run_once()` claims at most one eligible job with a 600-second lease,
+persists original intent, creates/maps the original run, then advances the existing
+remote workflow. It returns the queue result or `None` when no work is claimable.
+`await bridge.recover(job_id)` inspects original held work through `PilotRecovery`;
+it does not submit remote effect commands. These methods start no watcher or loop.
+
+Run creation enforces admission within its transaction before idempotency lookup.
+Each remote phase rechecks the current owner, physical queue fence, lease, review,
+registry and original run binding. Direct pilot HTTP routes and legacy dispatch
+are disabled after enrollment. Public agent bearers cannot select the private
+executor role. Completion requires the original strict command/health evidence,
+matching container chain and quiescent original attempt, not a terminal label.
+
+The current application-factory queue/pilot mutual-exclusion guard stays in force.
+A separately reviewed lifecycle factory and native-event runtime are still needed
+to connect this explicit source API to installed autonomous scheduling, without
+re-enabling direct dispatch. No service composition, transport credentials, host
+writer exclusion, baseline enrollment or runtime identity issuer is supplied here.
 
 Required invariants:
 
@@ -44,9 +74,11 @@ Required invariants:
    Preserve digest types: the current `ContainerPilotTarget.artifact_digest` and
    pilot run artifact identify the Docker image config, whereas `manifest_digest`
    identifies canonical pilot-manifest bytes. Neither is an OCI index digest.
-3. Run creation changes the task's status/revision. The existing queue target
-   verifier requires `verified`; the bridge needs a narrowly bound run-aware
-   check, not a blanket exception accepting all running tasks or stale reviews.
+3. Run creation increments the task's revision but leaves its status `verified`.
+   Candidate failure also changes revision/repair count, not review authority.
+   Preserve the existing verified-source and independent-review checks, and bind
+   the exact original task/review to the run. Do not introduce an exception for
+   arbitrary running tasks or stale reviews based on an assumed status change.
 4. Only the private executor may advance its bound run. Public pilot routes,
    legacy dispatch and recovery must not bypass the same physical reservation.
    Agent tokens continue to identify agents, not privileged executor instances.
@@ -73,6 +105,40 @@ sides of run mapping, duplicate attempts, wrong manifest/machine/epoch, stale
 review/fence, two competing machine jobs, unknown POST without resend, healthy
 rollback, held outcome and restart inspection of the original run. Such tests
 prove coordination and protocol behavior, not Docker or remote-host acceptance.
+
+Current integration tests use actual Linux `PilotOwner` locks, the real repository,
+queue and workflow, and typed simulated host evidence. The wire test additionally
+uses `ContainerPilotClient` through `PilotASGI`: a lost successful smoke response
+holds the job, then GET-only recovery reads the original command identities and
+releases it without another POST. Public-API tests deny direct dispatch/recovery
+and private-worker impersonation. This does not authenticate simulated host
+assertions as real image, deployment or health evidence.
+
+Recovery deliberately remains conservative. A creation-only interruption with no
+accepted advance remains held, even if the original local run request can be
+mapped. No replacement run is created. A prior owner's still-unexpired claim may
+be inspected but is not adopted or released until eligible for authoritative
+queue reconciliation. There is no automatic retry, lease timer or recovery worker
+in this module. Unknown or revoked authorization keeps physical capacity held.
+
+## Deployment transport remains under review
+
+Claude's linked proposal `656d40a9-5860-40b6-828e-8b26abdcd65b` recommends an
+outbound staging-PC worker instead of the current pilot client's inbound host
+endpoint. This could keep private host transport credentials off the Hub, but
+requires source that is not currently present: remote executor enrollment,
+pre-effect live-claim API, scoped owned-claim retrieval and authenticated receipt
+verification/reconciliation. Proposed signing keys and new credentials are not
+approved or installed. A signature authenticates an enrolled issuer; by itself
+it does not prove effective isolation or observed application health.
+
+The implemented bridge demonstrates one physical queue reservation with a
+subordinate original-command journal/fence; the latter is not an independent
+capacity scheduler. This source integration does not settle the deployed
+transport or authorize placing private executor credentials in the browser/API
+process. Linked follow-up `54c49733-1798-4c0e-bd12-4d9f88e44f36` asks for a concrete
+conflicting interleaving and the minimal pull alternative, including credential
+isolation. Resolve this before installing a lifecycle factory or host service.
 
 Then, only after separately approved activation, verify the existing staging
 host's effective transport, writer exclusion and resource limits, immutable
