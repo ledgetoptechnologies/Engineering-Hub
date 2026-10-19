@@ -37,6 +37,58 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Staging runtime inventory received — 2026-10-19
+
+Hermes completed the approved narrow read-only inventory in reply
+`ad625a54-f4e5-44f7-9340-310edb8ac167` to
+`de1534f4-623f-426f-8955-9f02fb32e322`. This is peer-reported runtime evidence,
+not a second Codex SSH inspection or executor enrollment. Prometheus remains
+the device-capacity source; no duplicate hardware inventory is needed.
+
+The report identifies Docker 29.5.2 / API 1.54 (daemon-reported minimum 1.40,
+not the pilot feature floor), daemon
+`4a562438-a128-4837-acb6-f85fd207ebee`, on the staging PC. Its one shared
+rootful daemon hosts two PA web/cron/database stacks, Viewer API/worker/proxy
+and node-exporter: 21 containers (10 running, 11 exited) and 15 local named
+volumes at the observation. No NodeODX container or existing separate/rootless
+daemon was found in the checked locations. These are snapshot observations,
+not proof of absence across every possible context or future scheduled work.
+
+Viewer API/worker share writable `/mnt/ViewerStaging` CIFS and a nested local
+data overlay. PA web/cron share their project volumes, with distinct database
+volumes. PA containers have no configured CPU/memory/PID limits. Viewer limits
+are API 1 GiB / 2 CPU / 256 PIDs, worker 1 GiB / 1 CPU / 256 PIDs, proxy
+128 MiB / 0.5 CPU / 64 PIDs; configured limits are not reserved spare capacity.
+Do not sum those limits or infer idle jobs from healthy web endpoints.
+
+`viewer-staging.service` was stable/active, with no restart and no active
+rollout observed; its long-lived Compose supervisor is not a new deployment.
+`/etc/cron.d/staging-image-watch` invokes `staging-image-watch-run`, whose
+behavior has not yet been inspected. A cleanup timer was active but not
+executing at the snapshot. Both remain potential writers; an idle snapshot
+cannot exclude their next invocation. The separate PA egress service was
+reported failed, with its timer active; it was not changed or repaired.
+
+The next host-readiness evidence is therefore **writer behavior and a bounded
+pilot boundary**, not another hardware scan. Before activation, inspect the
+image-watcher/cleanup selectors and actual Viewer/PA job state under appropriate
+read-only authority; identify how concurrent starts, cleanup and deploys will
+be excluded or coordinated for the exact pilot resources. Do not infer that
+inspection approval permits stopping timers, changing limits or provisioning.
+On the existing equipment, propose a disposable test-only instance with dedicated
+local state, network, image/volume ownership and explicit resource budget,
+without mounting existing application data or exposing the shared Docker socket
+to agents or the browser. Effective authority and physical-host contention must
+be assessed; a Compose name, label or separate daemon alone is insufficient.
+The current report does not prove that boundary or authorize enrollment.
+
+This inventory did not start, stop or modify host jobs, provision or install
+anything, change credentials/permissions/mounts, perform cleanup, interrupt or
+restart services, or manage TrueNAS. The
+inventory request is answered; pilot execution, actual immutable application
+health/rollback and installed restart acceptance remain incomplete. Hermes's
+ongoing adapter work is not duplicated or treated as a verified running handle.
+
 ### Machine-wide production precedence — 2026-10-19
 
 Hermes characterization `9fc1fee6-9499-475c-8d49-a166e665e7af` exposed an actual
@@ -145,8 +197,9 @@ runtime and owned coordinator commits (`33e0206`, `c05557f`, `2ef4333`) are not 
 that reported source revision. Do not present development-branch tests as proof
 that those additions are installed. This HTTP observation does not independently
 verify the image/provenance, private composition, human sign-in or executor.
-No pull, redeploy or configuration change was performed; direct host inventory
-and separate pilot approval remain pending.
+No pull, redeploy or configuration change was performed. The later staging
+inventory above answers the narrow host-runtime request, but does not establish
+an isolated executor boundary or replace separate pilot approval.
 
 ### Read-only staging telemetry and module assessment — 2026-10-19
 

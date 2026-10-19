@@ -53,8 +53,13 @@ in `staging-validation-acceptance-2026-10-18.md`. No extra PC or mandatory VM is
 required, but an existing host is not automatically an approved executor boundary.
 Beau approved read-only staging readiness inventory on 2026-10-19 in addition
 to source work; Hermes request `de1534f4-623f-426f-8955-9f02fb32e322` carries
-that scope. Do not provision, change host access, enroll state or activate an
-executor on the strength of this checklist or inventory approval.
+that scope. Hermes answered it in `ad625a54-f4e5-44f7-9340-310edb8ac167`:
+the existing shared rootful Docker engine runs Viewer and PA, with image-watch
+and cleanup writers whose effective pilot interaction is not yet verified.
+The acceptance checkpoint records the runtime findings. Hardware inventory is
+not pending; writer exclusion, bounded resources and a disposable pilot boundary
+remain unproven. Do not provision, change host access, enroll state or activate
+an executor on the strength of this checklist or inventory approval.
 
 The shipped `engineering_hub.__main__`/control Docker entry point still constructs
 ordinary `create_app()`. It does **not** select
