@@ -37,6 +37,48 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Unified signed-auth workflow over protected Unix transport
+
+Tested source `b17cd728142d31e9aa0d65cba10b03c43d67ba88`, development branch
+only. Clean Git archive image index
+`sha256:8e5dd34fe20aad4d903637a9255b11057806304edfbf4aa690d934c0a62169cd`,
+manifest `sha256:79735be2064d80f795a1577dcf89b286dfaa5aa7389a3286b8aaedb69a24711b`,
+config `sha256:f9b29d04e0b95905efc9ac1e95403df81ae92b444c0cdf18b4e8ca95110fa0f8`.
+Full exact-image Linux suite: **3250 passed, 6 skipped, 4 known warnings**,
+152.81s. Focused socket, gateway, app, runtime, contract and unified-flow checks:
+**90 passed, 3 skipped**, 4.52s with ResourceWarning errors and no warnings.
+All six owner-change cases separately passed **6/6**, 0.59s, against that same
+image with only CHOWN and synthetic fixture storage. Full warnings were the
+existing Starlette deprecation, unclosed test event loop and two deliberate
+multithreaded-fork deprecations. Independent source review accepted the changes.
+
+Four unified cases combine real Linux `PilotOwner`, one private core lifespan,
+signed synthetic Access assertions, browser sessions/tasks/decisions, original
+source-IP agent authentication, independent candidate review, reviewed queue
+submission, pause/unpause and native-event execution. Both in-process ASGI and
+actual UVicorn/HTTPX Unix transport test success and healthy rollback. Remote
+effect/health assertions remain deliberately synthetic; these are not real Docker
+deployments or independent observed application health. Browser execution and
+actor/executor spoofing, self-review, and a wrong IP with forged forwarding
+headers remain denied. No second database writer or scheduler was introduced.
+
+The explicit Linux socket helper requires a provisioned current-UID0700 directory,
+safe root/current-UID ancestors and a new leaf. It creates a nonblocking0600 socket,
+never adopts stale paths, and preserves replaced/unknown parent or leaf objects.
+Tests cover permissions, symlinks, namespace replacement, child cleanup, actual
+HTTP transport and foreign UID checks. Review identified that final-parent0700
+alone would not protect against renaming through a nonsticky writable ancestor;
+the source now rejects that ancestor and has regression coverage. Synthetic
+CHOWN fixtures restore their own original directory ownership in teardown;
+the library does not repair ownership or permission errors.
+
+Actual protected process/mount composition still needs acceptance. Root or an
+equally privileged same-UID process is not isolated by path checks. Crash residue
+intentionally prevents a new bind, so no unattended restart acceptance follows.
+Real host writer exclusion, independent provenance/baseline/health, remote pilot,
+machine-wide restored-database reconciliation and app/PC reboot gates remain.
+The existing live MCP, NAS, tokens, ports and production deployments were untouched.
+
 ### Private browser gateway and queued-core application lifecycle
 
 Implementation `c9742e20dc2677b47f548abc2e4bcd8a4a59b174`; final tested source
@@ -71,8 +113,9 @@ test client. No host or live configuration was changed.
 
 The 43 gateway tests use the actual core/repository and signed synthetic JWTs;
 the eight app cases separately use real Linux `PilotOwner`/native events with
-simulated remote effects. There is not yet one unified gateway-to-enrolled-owner
-acceptance test, an installed private listener, or real remote pilot/reboot proof.
+simulated remote effects. At this earlier checkpoint there was not yet a unified
+gateway-to-enrolled-owner test. The newer source above adds that test, but not
+an installed private listener or real remote pilot/reboot proof.
 Machine-wide restore reconciliation and other activation gates below remain.
 
 Verification history: the initial working focus had **1 failed, 104 passed**;
