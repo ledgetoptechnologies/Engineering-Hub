@@ -30,6 +30,23 @@ Host selection is not itself evidence that permissions or an executor exist.
 
 ## Latest verified source
 
+Archive reader checkpoint: `fb2694c`, following reviewed archive integration
+and synthetic kernel-mount acceptance. Clean Git archive image index
+`sha256:c444022da7d69346a20e8fc329fd47ac6d900006ad8cf1c03a7108614c78c0a7`,
+manifest `sha256:83f36dc9281d4ede8d8cbde759c006dfe99b36c99af373c580d50fe4e33da51e`,
+config `sha256:16050420978709e98c910f6785aa78e002a408392c9c37e5c1eaca46002f1577`.
+Full exact-image Linux suite: **3037 passed, 3 skipped, 4 known warnings**,
+144.50s. The three owner-change checks separately passed **3/3**, 0.31s.
+The source-only reader has 46 focused passing tests with ResourceWarning errors.
+Independent review accepted its sender/recipient ACL and immutable read boundary.
+Separate synthetic kernel checks verified read-only access, denied writable
+mounts, and preserved private-message visibility (see `hub_archive/README.md`).
+This adds no installed REST/MCP/UI route, actual archive adoption or replay;
+actual coherent export, authenticated read-surface integration and original
+data acceptance remain required. The full staging pilot gates above also remain.
+
+### Earlier baseline observer checkpoint
+
 Baseline observer checkpoint:
 `5fa2e8494ad6f4c7fc9bb40319105d8650013892`, development branch only.
 A clean Git archive produced image index
