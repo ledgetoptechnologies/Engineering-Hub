@@ -37,6 +37,62 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Opt-in published endpoint recovery
+
+Source `b301ffa9a0d7503b2fa230f5b9dbd5cdf239c4b9` adds an explicit,
+default-off recoverable Unix endpoint to the split private runner. Clean Git
+archive image index
+`sha256:e975111951b75069820ca84fe743507d51eb35f35ea27689d0d09553e11eadd1`,
+manifest `sha256:bc373398926c419107d6a8aa9c3c545da9c91d5d4f1f684138e370157db348f6`,
+config `sha256:95160814ca6f1a84c0a17972ed9c6ba14b3eead767ca93669c1c02f44770c459`.
+Focused recovery, split runners, queue runtime, strict transport and contract:
+**112 passed, 3 skipped**, 17.33s, ResourceWarning errors enabled, no warnings.
+Separate CHOWN-only ownership cases: **6/6 passed**, 0.59s.
+The initial full run was **1 failed, 3326 passed, 6 skipped, 4 known warnings**,
+162.29s: an older archive fixture left a SQLite connection open, so its
+no-WAL assertion failed after checkpoint. This is not a green full-suite result.
+
+The 36 new recovery cases include real subprocess SIGKILL, publication-cut
+boundaries, live competing ownership, malformed/replaced identity preservation,
+fork descriptor closure, and reconnect through the same HTTPX client and browser
+gateway after the private endpoint restarts. An endpoint-specific flock and
+durable exact generation record authorize removal only of the matching stale
+socket. Unknown or prepublication residue is preserved and denied. Defaults and
+the original runner are unchanged; no service or configuration was activated.
+
+Independent source/test review accepted this scope. Claude's processed reply
+`d1624ea9-dcb5-4981-9be7-4aabf552a6e9` agrees about inherited-listener closure
+and no job/lease authority, but proposes connect-probe-only stale detection.
+A separate isolated Linux experiment retained an open, bound, not-yet-listening
+Unix socket: connect returned ECONNREFUSED while both its owner FD and pathname
+still existed. Thus refusal alone is not ownership provenance, especially with
+the runner's bind-before-owner-factory ordering. The conservative generation
+protocol is retained; this is not represented as peer approval of that protocol.
+
+These tests establish process-crash endpoint recovery after publication, not
+power-loss durability, PC reboot, installed supervisor behavior, separate
+container credentials/mounts, job replay, machine reservation release, or a
+machine-wide restored-database barrier. No live NAS, MCP ports, tokens, Access
+policy or production workload changed. Existing equipment remains the target.
+
+Test-only follow-up `fd32522f18afb5c05c19c6360ad645840bfb4929` explicitly
+closes connections opened by the unchanged frozen archive initializer. Frozen
+resource hashes, checkpoint and no-sidecar assertions remain unchanged. An added
+regression disables cyclic garbage collection and checks database integrity and
+absence of WAL/SHM. Independent review accepted the fixture-only change.
+Clean archive image index
+`sha256:a6400665b2ee3c8d42cebef066e05b42703d759ce4609a85f003d079456f9154`,
+manifest `sha256:59b945d340aa29bdb6ca7a25b15a211154105f54b10179a2272c16a6ff3aa3c9`,
+config `sha256:426e59ff536ab9581f85f9ae099d78c7dc808940164bd3f94d0fd1b6f2d3fa96`:
+expanded focused archive/recovery/runner/runtime/contract checks **143 passed,
+3 skipped**, 20.73s, ResourceWarning errors enabled, no warnings; separate
+CHOWN-only ownership checks **6/6 passed**, 0.81s.
+Full exact-image Linux rerun: **3328 passed, 6 skipped, 4 known warnings**,
+165.52s. Warnings remain Starlette deprecation, one unclosed test event loop
+and two deliberate multithreaded-fork deprecations. All execution handles are
+terminal. This successful rerun includes the new deterministic fixture regression;
+the initial failed result above remains recorded rather than overwritten.
+
 ### Split listener lifecycle and immediate admission veto
 
 Tested source `2ec018ae87a1a639a981a0d408f99643755854f5`, development branch
@@ -82,7 +138,8 @@ alone is not sufficient endpoint ownership proof: `PilotOwner` closes inherited
 locks after fork, while a child can retain an inherited listener descriptor.
 UID/mode/type are not a generation binding. Endpoint-specific lifecycle ownership,
 durable exact identity metadata, inherited-descriptor handling and crash tests are
-next source work, not implemented recovery. Per-container tmpfs alone does not
+were next source work at this historical checkpoint; the opt-in implementation
+and verification above now cover published endpoint generations. Per-container tmpfs alone does not
 prove shared-socket reachability, namespace reset or reconnect. Unknown residue
 still fails closed; no blind unlink or lease-expiry reassignment was added.
 
