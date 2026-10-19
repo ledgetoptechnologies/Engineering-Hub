@@ -27,6 +27,7 @@ PRIVATE_DATABASE = PRIVATE_ROOT / 'fixture/private/hub.sqlite3'
 PRIVATE_CANARY = PRIVATE_ROOT / 'adapter-canary'
 PRIVATE_RUNTIME = PRIVATE_ROOT / 'runtime.json'
 PUBLIC_SESSION = Path('/tmp/hub-isolation-browser.json')
+PUBLIC_PORT = 8771
 
 
 def emit(value):
@@ -165,26 +166,17 @@ async def private(args):
         patcher.undo()
 
 
-async def public(args):
-    from engineering_hub.private_browser_socket import create_private_browser_client
-    from engineering_hub.split_server import serve_public_browser
-    from engineering_hub.repository import HubRepository
-    from engineering_hub.pilot_ownership import PilotOwner
+async def public_ready():
+    import httpx
 
-    def forbidden(*_, **__):
-        raise AssertionError('Public role must never construct private state')
-
-    # Executable tripwires, not alternate repository implementations. The
-    # public runner must remain solely a dedicated UDS HTTP client.
-    HubRepository.__init__ = forbidden
-    PilotOwner.__init__ = forbidden
-
-    def on_ready(address):
-        save(ready_path('public'), {'ready': True, 'port': address[1], **namespaces()})
-        emit({'ready': True, 'role': 'public'})
-
-    await serve_public_browser(lambda: create_private_browser_client(Path(args.socket)),
-                               browser_port=0, on_ready=on_ready)
+    async with httpx.AsyncClient(trust_env=False, timeout=1.0) as client:
+        # The real public gateway permits this route and forwards it over UDS.
+        # No assertion is supplied: only the private receiver's auth rejection
+        # proves the entire transport is ready. A 502 is not readiness.
+        response = await client.get('http://127.0.0.1:' + str(PUBLIC_PORT) + BASE + '/auth/me',
+                                    headers={'Host': 'hub.example'})
+        assert response.status_code == 401
+    emit({'ready': True, 'port': PUBLIC_PORT, **namespaces()})
 
 
 async def browser_start(args):
@@ -284,6 +276,20 @@ def public_probe():
     names = {'CODEX_TOKEN', 'HERMES_TOKEN', 'CLAUDE_TOKEN', 'AGENT_TOKEN', 'GITHUB_TOKEN',
              'GH_TOKEN', 'CLOUDFLARE_API_TOKEN', 'CF_API_TOKEN', 'OPENAI_API_KEY'}
     assert not names.intersection(os.environ)
+    port = format(PUBLIC_PORT, '04X')
+    listeners = []
+    for protocol in ('tcp', 'tcp6'):
+        with open('/proc/net/' + protocol, 'r') as stream:
+            raw = stream.read(1048577)
+        assert len(raw) <= 1048576
+        for line in raw.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != '0A':
+                continue
+            address, number = fields[1].split(':')
+            if number == port:
+                listeners.append((protocol, address))
+    assert listeners == [('tcp', '0100007F')]
     # Numeric PIDs can coincide in distinct namespaces. Check actual visible
     # command lines for the private fixture role, not a coincident PID number.
     for path in Path('/proc').iterdir():
@@ -296,12 +302,12 @@ def public_probe():
         assert b'private' not in command
     emit({'private_paths_absent': True, 'private_role_visible': False,
           'no_agent_env': True, 'socket_volume_only_endpoint': socket_volume_only_endpoint,
-          'public_socket_mount_readonly': True, **namespaces()})
+          'public_socket_mount_readonly': True, 'public_loopback_only': True, **namespaces()})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('role', choices=['private', 'public', 'ready', 'assertion',
+    parser.add_argument('role', choices=['private', 'ready', 'assertion',
         'browser-start', 'agents', 'browser-finish', 'public-probe'])
     parser.add_argument('--socket', default='/socket/private/browser.sock')
     parser.add_argument('--case', choices=['healthy', 'rollback'], default='healthy')
@@ -311,13 +317,16 @@ def main():
     parser.add_argument('--job')
     args = parser.parse_args()
     if args.role == 'ready':
-        emit(load(ready_path(args.ready_role)))
+        if args.ready_role == 'public':
+            asyncio.run(public_ready())
+        else:
+            emit(load(ready_path(args.ready_role)))
     elif args.role == 'assertion':
         emit({'assertion': load(PRIVATE_RUNTIME)['assertion']})
     elif args.role == 'public-probe':
         public_probe()
     else:
-        asyncio.run({'private': private, 'public': public, 'browser-start': browser_start,
+        asyncio.run({'private': private, 'browser-start': browser_start,
             'agents': agents, 'browser-finish': browser_finish}[args.role](args))
 
 

@@ -18,7 +18,7 @@ import httpx
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .ingress import HubIngressMiddleware
-from .owned_tasks import finish_owned
+from .lifecycle import finish_owned
 
 
 PRIVATE_ORIGIN = 'http://hub-private.invalid'

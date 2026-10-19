@@ -16,8 +16,7 @@ import ipaddress
 
 import httpx
 
-from .frontends import HubFrontends
-from .owned_tasks import finish_owned
+from .lifecycle import finish_owned
 from .private_browser_socket import private_browser_socket
 from .private_gateway import PrivateBrowserGateway, PublicBrowserGateway, _is_events
 from .server import _bind, _listener, _signal_stop
@@ -175,6 +174,9 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     rejection of every existing socket; no environment flag enables recovery.
     """
     _options(pair_factory, (agent_port,), stop_event, on_ready, install_signals)
+    # The public-only process must not import the private application factory
+    # or its database/executor dependencies merely to own a browser listener.
+    from .frontends import HubFrontends
     if type(recover_socket) is not bool:
         raise ValueError('Explicit boolean endpoint recovery option required')
     try:

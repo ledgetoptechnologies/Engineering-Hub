@@ -226,10 +226,13 @@ def _case(docker, image, case):
             containers[name] = None
             extra = (['--tmpfs', '/private:' + _PRIVATE_OPTIONS]
                      if role == 'private' else [])
+            command = (['-m', 'engineering_hub.public_browser', '--socket',
+                        '/socket/private/browser.sock', '--port', '8771']
+                       if role == 'public' else [_FIXTURE, role, '--socket',
+                            '/socket/private/browser.sock', '--case', case])
             identifier = docker('container', 'create', '--name', name, *base,
                 '--mount', mount + (',readonly' if role == 'public' else ''),
-                '--user', '10001:10001', *extra, image, _FIXTURE, role,
-                '--socket', '/socket/private/browser.sock', '--case', case)
+                '--user', '10001:10001', *extra, image, *command)
             containers[name] = identifier
             value = _owned_container(docker, name, identifier, owner)
             _profile(value, volume, private=role == 'private')
@@ -247,6 +250,7 @@ def _case(docker, image, case):
                 or probe.get('private_role_visible') is not False
                 or probe.get('socket_volume_only_endpoint') is not True
                 or probe.get('public_socket_mount_readonly') is not True
+                or probe.get('public_loopback_only') is not True
                 or private.get('private_paths_present') is not True
                 or type(private.get('pid_namespace')) is not str
                 or type(private.get('mount_namespace')) is not str
