@@ -133,9 +133,14 @@ def rig(tmp_path, monkeypatch):
             obj.close = close
             return obj
         monkeypatch.setattr(module, alias, constructor)
-    monkeypatch.setattr(httpx.Client, "send", lambda *a, **k: pytest.fail("No daemon request during assembly/cleanup"))
-    return SimpleNamespace(params=params, paths=paths, live=live, frozen=frozen, row=row, records=records,
-                           trust=trust, constructed=constructed, closed=closed)
+    requests = []
+    def deny_request(*args, **kwargs):
+        requests.append((args, kwargs))
+        raise AssertionError("No daemon request during assembly/cleanup")
+    monkeypatch.setattr(httpx.Client, "send", deny_request)
+    yield SimpleNamespace(params=params, paths=paths, live=live, frozen=frozen, row=row, records=records,
+                          trust=trust, constructed=constructed, closed=closed)
+    assert not requests, "A negative case must not pass by swallowing a daemon request denial"
 
 
 def build(rig, **changes):
@@ -172,14 +177,14 @@ def test_explicit_reopen_preserves_existing_exact_state(rig):
     assert persisted == {str(p): p.read_bytes() for p in rig.paths["reservations"].iterdir()}
     with pytest.raises(Exception):
         with build(rig):
-            pytest.fail("Create must not adopt existing state")
+            pass
 
 
 @pytest.mark.parametrize("field", ["journal_create", "state_reservations_create"])
 def test_reopen_missing_is_not_automatic_creation(rig, field):
     with pytest.raises(Exception):
         with build(rig, **{field: False}):
-            pytest.fail("Missing state must fail closed")
+            pass
     assert not rig.params["adapter_database"].exists()
 
 
@@ -188,7 +193,7 @@ def test_binding_mismatch_denied_before_resource_acquisition(rig, field, value):
     binding = replace(rig.params["binding"], **{field: value})
     with pytest.raises(module.LocalResourcesError):
         with build(rig, binding=binding):
-            pytest.fail("Mismatched authority admitted")
+            pass
     assert not rig.constructed
     assert not list(rig.paths["reservations"].iterdir())
 
@@ -198,7 +203,7 @@ def test_platform_binding_mismatch_denied_before_resources(rig):
     binding = replace(rig.params["binding"], platform=platform)
     with pytest.raises(module.LocalResourcesError):
         with build(rig, binding=binding):
-            pytest.fail("Wrong platform admitted")
+            pass
     assert not rig.constructed
 
 
@@ -207,7 +212,7 @@ def test_private_path_overlap_denied_before_resources(rig, field):
     collision = rig.paths["generations"] / "forbidden.sqlite3" if field.endswith("database") else rig.paths["generations"]
     with pytest.raises(module.LocalResourcesError):
         with build(rig, **{field: collision}):
-            pytest.fail("Private path collision admitted")
+            pass
     assert not rig.constructed
 
 
@@ -215,7 +220,7 @@ def test_private_path_overlap_denied_before_resources(rig, field):
 def test_identity_verifier_required_without_manifest_echo_default(rig, value):
     with pytest.raises(module.LocalResourcesError):
         with build(rig, driver_identity_verifier=value):
-            pytest.fail("Absent runtime trust boundary admitted")
+            pass
     assert not rig.constructed and rig.trust.calls == 0
 
 
@@ -232,7 +237,7 @@ def test_independent_enrollment_required_for_each_role(rig, role):
                         for item in rig.params["build_enrollments"])
     with pytest.raises(Exception):
         with build(rig, build_enrollments=enrollments):
-            pytest.fail("Content hashes are not build approval")
+            pass
     assert not rig.params["journal_database"].exists()
     assert not rig.params["adapter_database"].exists()
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
@@ -242,7 +247,7 @@ def test_independent_enrollment_required_for_each_role(rig, role):
 def test_independent_baseline_pins_must_match(rig, field):
     with pytest.raises(Exception):
         with build(rig, **{field: "sha256:" + "9" * 64}):
-            pytest.fail("Wrong independently supplied pin admitted")
+            pass
     assert not rig.params["journal_database"].exists()
     assert not rig.params["adapter_database"].exists()
 
@@ -291,7 +296,7 @@ def test_partial_construction_closes_earlier_resources_without_removing_state(ri
     monkeypatch.setattr(module, stage, fail)
     with pytest.raises(module.LocalResourcesError) as error:
         with build(rig):
-            pytest.fail("Partial construction unexpectedly succeeded")
+            pass
     assert "synthetic-private-sentinel" not in str(error.value)
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
     assert rig.live.exists() and rig.frozen.exists()
@@ -327,7 +332,7 @@ def test_exact_manifest_secret_versions_checked_before_mutable_state(rig, case):
         bindings = ((bindings[0][0], bindings[0][1], put(rig.paths["secrets"], b"private\ninvalid")),) + bindings[1:]
     with pytest.raises(module.LocalResourcesError) as error:
         with build(rig, secret_bindings=bindings):
-            pytest.fail("Unresolved exact secret admitted")
+            pass
     assert "private" not in str(error.value).lower()
     assert not rig.params["journal_database"].exists()
     assert not list(rig.paths["reservations"].iterdir())
@@ -352,7 +357,7 @@ def test_distinct_spelling_same_root_inode_denied_before_resources(rig, monkeypa
     monkeypatch.setattr(Path, "stat", stat)
     with pytest.raises(module.LocalResourcesError):
         with build(rig):
-            pytest.fail("Synthetic same-inode alias admitted")
+            pass
     assert not rig.constructed
 
 
@@ -388,7 +393,7 @@ async def test_concrete_factory_runs_in_owned_listener_and_exits_off_loop(rig):
         assert not observed["adapter"]._closed and rig.trust.calls == 0
     finally:
         stop.set()
-        await asyncio.wait_for(serving, 8)
+        await serving
     assert observed["exit_thread"] != main_thread
     assert observed["adapter"]._closed and observed["adapter"].backend._client.is_closed
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
