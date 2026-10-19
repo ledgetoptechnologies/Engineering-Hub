@@ -51,8 +51,10 @@ cooperative instance identifier, not an additional executor credential.
 Current checkpoint: source `6e364635b4be5c5afd3499ee0eccff8ac3f91a46`, documented
 in `staging-validation-acceptance-2026-10-18.md`. No extra PC or mandatory VM is
 required, but an existing host is not automatically an approved executor boundary.
-Beau currently permits source-only work. Do not provision, change host access,
-enroll state or activate an executor on the strength of this checklist.
+Beau approved read-only staging readiness inventory on 2026-10-19 in addition
+to source work; Hermes request `de1534f4-623f-426f-8955-9f02fb32e322` carries
+that scope. Do not provision, change host access, enroll state or activate an
+executor on the strength of this checklist or inventory approval.
 
 The shipped `engineering_hub.__main__`/control Docker entry point still constructs
 ordinary `create_app()`. It does **not** select

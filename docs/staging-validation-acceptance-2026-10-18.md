@@ -37,6 +37,41 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Read-only staging telemetry and module assessment — 2026-10-19
+
+Beau separately approved a read-only readiness inventory and supplied Prometheus
+at `http://192.168.50.80:30104`. Codex queried its existing HTTP query API only;
+no SSH or host-management access, installs, mounts, container effects or service
+changes occurred.
+The staging target `192.168.50.90:9100` was reporting `up=1`. Query evaluation
+around 2026-10-19 14:06 UTC showed:
+
+| Observation | Value | Scope limitation |
+| --- | --- | --- |
+| Logical CPUs | 6 idle-mode CPU series | Not a CPU model or reservation |
+| Total / available RAM | 8,185,819,136 / 5,543,014,400 bytes (about 7.6 / 5.2 GiB) | Point-in-time availability, not a job allocation |
+| Root filesystem | ext4, 105,089,261,568 bytes total; 15,000,563,712 available (about 14.0 GiB free), reported writable | Exporter observation, not mount/identity/durability acceptance |
+| `/mnt/Staging` | CIFS from `//192.168.50.80/Staging`, 911,607,070,720 bytes available | NAS data storage, not approved local SQLite/owner state |
+| Other staging mounts | Two CIFS paths under `Ai_Storage/Shared/Staging`, each reporting 1,077,750,398,976 bytes available | May share underlying capacity; do not add these values or assume separate quotas |
+| Platform / sample freshness | Linux x86_64; memory sample approximately 15.7 seconds old at the follow-up query | Does not prove Docker API, driver identity, network isolation or agent-session availability |
+
+Root disk headroom must be included in the proposed pilot budget: image layers,
+build cache, candidate/baseline state and logs can exceed container scratch limits.
+Do not authorize a build/pull/cleanup from these readings. Do not move the private
+controller/runner SQLite databases to CIFS to bypass local storage requirements.
+Hermes's direct inventory request is still awaiting a relevant reply in the
+returned inbox scope; telemetry is not a substitute for that host evidence.
+
+Hermes module-design reply `99fa8d6c-b50d-47e7-beab-adf506aebe4d` was claimed and
+evaluated against the earlier Claude proposal: both favor local Git workspaces,
+immutable candidate/test evidence and declarative fixed actions rather than
+unversioned uploads or hot-loading plugins into Hub/MCP. Privileged adapters stay
+behind typed private interfaces; UI panels initially use reviewed Hub builds.
+GitHub need not be a roundtrip for every local edit, but local Git is not an
+off-host backup. This is architectural agreement, not implementation approval or
+proof of an installed module platform. Prioritize one real bounded pilot before
+adding extension distribution/hot swapping. No new module service was created.
+
 ### Owned queued-coordinator source — 2026-10-19
 
 Implementation `2ef4333d66223f991e88967e4c1722e89779b9ce`; final tested source
