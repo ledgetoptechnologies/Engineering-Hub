@@ -137,3 +137,10 @@ the change and reran 282 focused tests. The SSE test checks the actual upstream
 `/subscribe` path and a forwarded invalidation/cursor, not merely an unavailable
 fallback. Synthetic transports prove the wiring only; no live registry,
 credential, deployment, watcher or equipment was provisioned.
+
+A clean Git archive of `1f2009a` also passed the focused Linux set: 434 tests,
+8.13s, ResourceWarning errors enabled, one existing Starlette warning. Validation
+image index `sha256:8bfb6a65efbd0c13487e847741d6861b3ec916a39840c623402ff3cf4b6af3a6`;
+the container had no network or host mounts, read-only root, UID10001, dropped
+capabilities and bounded CPU/memory/PIDs. This remains synthetic source wiring,
+not an installed or healthy canonical presence backend.
