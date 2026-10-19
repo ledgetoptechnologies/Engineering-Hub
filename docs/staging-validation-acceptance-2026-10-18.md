@@ -37,6 +37,95 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Owned host-executor listener composition — 2026-10-19
+
+Beau asked Codex to continue available local work while Hermes has MCP connection
+issues. New `hub_container_executor/service.py` supplies explicit owned loopback
+serving around the existing `PilotASGI` and `HostAdapter`; it does not start from
+ordinary Hub configuration. The socket binds before a synchronous operator
+resource context is entered. Exact adapter type, known open/current-process/idle
+state and non-null provider checks deny obvious invalid compositions, but do not
+prove fresh exclusive ownership, provider authenticity or host enrollment.
+
+The service closes new HTTP admission on stop, drains accepted HTTP/raw executor
+work through repeated caller cancellation, closes the accepted adapter off-loop,
+then exits the provider context off-loop. The trusted context owns partial entry
+failure and provider cleanup, including attempts after individual cleanup errors.
+No context suppression can turn a failed listener into a successful service.
+Uvicorn can close the listening FD before accepted work drains: port closure is
+not evidence of terminal work or ledger release. No new queue, claim adoption,
+automatic reconcile/replay, dynamic module/config loader or host discovery exists.
+See [`staging-executor-service.md`](staging-executor-service.md) for the contract.
+
+Code/test commit `e86520b5039cd4b956628abab7d692f2db343929` initially produced
+**2 failures, 149 passes**, 13.96s in a strict focused run. One restart fixture
+mistakenly minted new build invocation IDs and thus a different manifest; test
+follow-up `8303c5b4ddaf5240810ef3eaee8c01df72988f9b` instead reopens the original
+exact synthetic enrollment with new provider objects. No production guard or
+target identity was relaxed. The second issue is the older mixed async/sync
+test-loop warning: old image `a91324d...` independently reproduced **1 failure,
+36 passes**, 6.51s with the existing queued-service tests followed by ASGI tests
+and ResourceWarning/unraisable warnings as errors. Its five ASGI tests alone
+passed, 0.34s. No warning filter or existing test was changed to hide it.
+
+Clean `8303c5b` archive image index
+`sha256:0863db4d386689fc660ebfdbe35a55003739d89854f9e6547fd9c4ea9c5ecd45`,
+platform manifest `sha256:5e0bd4e69115b8e8423e17cb63d1cf473c47f0d58aa76a686f10daa30b47135c`,
+config `sha256:c2e8f77a35a9217eebe70b9893e39025ff09adea7f442219e852d40c7cacfec1`:
+**146 focused checks passed**, 13.60s, with ResourceWarning/unraisable warnings
+as errors and no warnings; six CHOWN-only ownership cases passed, 0.58s.
+The initial full validation run had **2 failures, 3516 passes, 6 skips and
+4 known warnings**, 173.19s. Both failures were existing fake executable tests
+blocked by the validation container's `/tmp` no-exec mount. The same two tests
+passed **2/2**, 1.13s with explicit executable `/tmp` in the disposable validation
+container. This changes no application/pilot runtime profile: its closed target
+tmpfs remains no-exec. Two initially mistyped owner-test selectors collected no
+tests; the corrected six-case run above is the evidence. Containerd identifies
+the runnable local image by the OCI index, not its config digest; initial config-
+ID launch attempts found no image and started no tests.
+
+Independent source/test/documentation review accepted the service and its 48
+new cases. Test commit `7354750fe9db7359d120f65c271add9b982b9928` adds three
+actual controller-to-executor integration cases. Public TCP, protected browser
+UDS, private coordinator TCP, native queue events and executor TCP are real.
+Human task creation uses a signed synthetic Access assertion; Codex cannot
+self-review, and the distinct Claude fixture reviews the exact source before
+submission. Test-only operator admission is restricted to that actual task,
+machine, action, source and artifact, not a blanket permissive callback.
+
+The healthy and failed-candidate/healthy-rollback paths verify controller run/job
+rows against host ledger receipts and original-command HTTP GETs without extra
+effects. Cancellation during an actual remote phase drains the accepted host
+command but leaves the controller job held and its machine reservation retained;
+no follow-on probe or POST replay is inferred from host command success. Provider
+barriers are released before cleanup even on failed assertions. These remain
+synthetic daemon/build/baseline/health/state providers, not real Docker rollout.
+
+Final clean `7354750` archive image index:
+`sha256:9e6313574745eef5562874406ec0ff140f02c734da12bbddf180fcf723f99da4`;
+platform manifest:
+`sha256:37be9f75528fd169d668b9fd2e4c9809fa1e40ecdf7f0dd921a8ffcc4661100a`;
+config:
+`sha256:5d394a7d335d0789e398e617e125f1087af7e3b6267ede6fb302c4fdd2c6956a`.
+The three integration cases passed, 4.83s. Combined new service/integration and
+existing private service/split/public lifecycle checks: **149 passed**, 17.55s,
+ResourceWarning/unraisable warnings treated as errors, no warnings. Separate
+CHOWN-only owner checks: **6/6 passed**, 0.57s. The unchanged two-container gateway
+isolation harness passed both healthy and expected-rollback cases; it does not
+run the new executor composition across containers. Owned smoke containers and
+volumes were removed and absence verified.
+
+The final full exact-image Linux suite completed: **3521 passed, 6 skipped,
+4 known warnings**, 175.16s. Warnings are Starlette, the older mixed-loop test
+fixture and two deliberate threaded-fork checks. The disposable full-suite test
+container explicitly permits `/tmp` execution for its fake executable fixtures;
+it remains network-none/read-only/capability-dropped, with no host mounts or
+published ports. No pilot target runtime restriction was relaxed. All build/test
+execution handles are terminal; this is not PC-reboot or installed acceptance.
+
+Nothing was installed/activated on staging or TrueNAS, and no live MCP/ports,
+tokens, credentials, Access policy, production deployment or listener changed.
+
 ### Staging runtime inventory received — 2026-10-19
 
 Hermes completed the approved narrow read-only inventory in reply

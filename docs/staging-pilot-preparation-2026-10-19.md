@@ -117,6 +117,9 @@ and minimum remaining free space need an actual enforcement/admission plan.
    A dry configuration validator must remain effect-free; serving/enrollment
    must be separate explicit operations. Rootful Docker capability remains
    host-level authority despite UID 10001 and limited target containers.
+   The subsequent [owned executor service seam](staging-executor-service.md)
+   supplies the listener/resource lifecycle only. It does not supply the missing
+   trusted installation/enrollment configuration or activate the host.
 6. Writer selectors and application job-state evidence: image watcher, cleanup,
    Viewer worker, PA cron and any manual/CI deployer. Specify coordination or
    exclusion before the first effect; do not stop existing services implicitly.
