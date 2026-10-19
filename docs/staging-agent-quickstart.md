@@ -53,11 +53,14 @@ cooperative instance identifier, not an additional executor credential.
    exact reviewed source commit, and `sha256:` artifact digest. The target is
    immutable after submission. A digest identifies the requested artifact; it
    does not by itself prove provenance or execution success.
-3. A worker uses its own authenticated agent identity and a fresh canonical UUID
-   for **this process instance** to claim work. Keep that UUID stable only within
-   the process. The server supplies a fencing generation; retain the returned
-   job ID, instance UUID and fence for renewals/completion. Another agent or
-   restarted process must not impersonate that lease.
+3. Agent-facing claim calls derive the worker identity from the authenticated
+   agent bearer and a fresh canonical UUID for **this process instance**. That
+   does not authorize an executable action or let an agent select a private
+   executor role. Actual execution needs explicitly enrolled trusted composition;
+   the private local validation/pilot bridges are not remote bearer clients.
+   The server supplies a fencing generation; retain the returned job ID,
+   instance UUID and fence for renewals/completion. Another agent or restarted
+   process must not impersonate that lease.
 4. Renew before lease expiry. Expiry or an uncertain external outcome holds the
    physical machine for authoritative reconciliation; it does not prove work
    stopped and does not permit replay. Do not retry external effects merely
@@ -112,6 +115,15 @@ registered action keys. It only narrows the server's enrollment policy; naming
 an action does not authorize a caller or a different commit/artifact. Do not
 send this field on renewal. Instance ownership, fencing, production approval and
 fresh independent review still apply before any effect.
+
+The explicit source-only `QueuedContainerPilot` integration is documented in
+`remote-software-staging-bridge.md`. It binds one private staging job to one
+original remote pilot run; it supplies no installed event worker, listener,
+credential or approved host. Public pilot routes and legacy dispatch are denied
+after its durable enrollment. The ordinary application factory still rejects
+mixing queue and pilot dispatch; do not remove that guard or install the bridge
+merely to try the API example below. Outbound-worker versus private host-endpoint
+deployment remains under review, with no host provisioning approved.
 
 ### Agent MCP interface
 
