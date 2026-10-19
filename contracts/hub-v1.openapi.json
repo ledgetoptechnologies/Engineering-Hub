@@ -1375,6 +1375,7 @@
               "not_started",
               "native_source_unavailable",
               "active",
+              "stopping",
               "stopped",
               "failed"
             ],
@@ -1405,6 +1406,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/PilotLifecycleDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "queued_pilot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueuedPilotRuntimeDTO"
               },
               {
                 "type": "null"
@@ -2403,6 +2414,73 @@
         ],
         "title": "PublicReachability",
         "description": "Only this safe projection is intended for authenticated REST/MCP/UI reads."
+      },
+      "QueuedPilotJobDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed",
+              "held"
+            ],
+            "title": "State"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "state"
+        ],
+        "title": "QueuedPilotJobDTO"
+      },
+      "QueuedPilotRuntimeDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "native_source_unavailable",
+              "active",
+              "stopping",
+              "stopped",
+              "failed"
+            ],
+            "title": "State"
+          },
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "active": {
+            "type": "boolean",
+            "title": "Active"
+          },
+          "last_job": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QueuedPilotJobDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "running",
+          "active",
+          "last_job"
+        ],
+        "title": "QueuedPilotRuntimeDTO"
       },
       "RecoveryDTO": {
         "properties": {
