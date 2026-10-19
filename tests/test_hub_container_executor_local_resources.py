@@ -26,6 +26,7 @@ from hub_container_executor import local_resources as module
 from hub_container_executor.adapter import HostAdapter
 from hub_container_executor.build_enrollment import BuildEnrollment
 from hub_container_executor.daemon_backend import DockerEngineBackend, DockerEngineBinding
+from hub_container_executor.state_provider import StateProvisionError
 from tests.test_hub_container_executor_build_record import canonical, digest, make_record
 
 pytestmark = pytest.mark.skipif(os.getuid() != 10001 or os.getgid() != 10001,
@@ -258,7 +259,7 @@ def test_pinned_receipt_inventory_must_match_actual_baseline(rig):
                                        digest="sha256:" + "9" * 64)]
     pin = put(rig.paths["receipts"], canonical(row))
     with build(rig, baseline_receipt_digest=pin) as adapter:
-        with pytest.raises(Exception):
+        with pytest.raises(StateProvisionError):
             adapter.state_provisioner.prepare_candidate(adapter.manifest, str(uuid4()),
                 adapter.baseline_provider.enrolled_baseline(adapter.manifest), str(uuid4()),
                 deadline_monotonic=time.monotonic() + 5)
@@ -268,12 +269,34 @@ def test_pinned_receipt_inventory_must_match_actual_baseline(rig):
 def test_wrong_frozen_backup_does_not_become_new_baseline(rig):
     rig.frozen.write_bytes(b"not enrolled SQLite bytes")
     with build(rig) as adapter:
-        with pytest.raises(Exception):
+        with pytest.raises(StateProvisionError):
             adapter.state_provisioner.prepare_candidate(adapter.manifest, str(uuid4()),
                 adapter.baseline_provider.enrolled_baseline(adapter.manifest), str(uuid4()),
                 deadline_monotonic=time.monotonic() + 5)
         assert set(rig.paths["generations"].iterdir()) == {rig.live.parent, rig.frozen}
     assert rig.frozen.read_bytes() == b"not enrolled SQLite bytes"
+
+
+def test_assembled_state_provider_prepares_candidate_and_reserved_rollback(rig):
+    before = rig.live.read_bytes(), rig.frozen.read_bytes()
+    run = str(uuid4())
+    with build(rig) as adapter:
+        baseline = adapter.baseline_provider.enrolled_baseline(adapter.manifest)
+        candidate = adapter.state_provisioner.prepare_candidate(
+            adapter.manifest, run, baseline, str(uuid4()),
+            deadline_monotonic=time.monotonic() + 5)
+        rollback = adapter.state_provisioner.prepare_rollback(
+            adapter.manifest, run, baseline, str(uuid4()),
+            deadline_monotonic=time.monotonic() + 5)
+        assert candidate.generation_id != rollback.generation_id
+        for result in (candidate, rollback):
+            actual = rig.paths["generations"] / result.generation_id / "hub.sqlite3"
+            assert actual.read_bytes() == before[1]
+            assert result.source_backup_digest == digest(before[1])
+            assert result.generation_digest == digest(actual.read_bytes())
+            assert result.baseline_unchanged is True
+        assert rig.trust.calls == 0  # State-only preparation is not runtime identity proof.
+    assert before == (rig.live.read_bytes(), rig.frozen.read_bytes())
 
 
 def test_body_failure_closes_every_owned_handle_and_preserves_durable_state(rig):
