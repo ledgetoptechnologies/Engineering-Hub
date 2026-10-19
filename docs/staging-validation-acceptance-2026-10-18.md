@@ -37,6 +37,50 @@ synthetic tests. Host selection is not evidence that an executor exists.
 
 ## Latest verified source
 
+### Packaged standalone public gateway — 2026-10-19
+
+Tested source `c13d3599a9f5b4b5a41f7fc3d1316acbd764741f`. Clean Git archive
+image index
+`sha256:ec3b2c7bac174182e19b8d257f62ea61572738848bcb955b0e167f240f0555e6`,
+manifest `sha256:9044298260db7c8348ef6aeca39e971d8a1cc2cfec84bd9cd9334b119bcc4920`,
+config `sha256:04583b30f26ab79843def6aa4401d87b395a4f7c37749b459323375d804e1d08`.
+Focused CLI, gateway, split runners, native runtime and owned-task tests:
+**193 passed**, 9.76s, ResourceWarning errors enabled, no warnings. Separate
+CHOWN-only ownership cases: **6/6 passed**, 0.59s.
+
+Full exact-image Linux suite: **3402 passed, 6 skipped, 4 known warnings**,
+162.37s. Warnings remain Starlette, one unclosed test event loop and two deliberate
+multithreaded-fork deprecations. All handles are terminal. Initial Windows import
+guard failure exposed the dependency described below and passed after the helper
+extraction; no new Linux product-test failure occurred at this checkpoint.
+
+The two-container smoke now launches the actual installed module
+`python -m engineering_hub.public_browser --socket PATH --port 8771`, not a
+test-only public service function. Both healthy and rollback cases passed on
+the exact image above, retaining private-state ENOENT, read-only socket EROFS,
+separate namespaces and real native-queue workflow checks. A new kernel socket
+probe verifies only IPv4 loopback listens on 8771, with no IPv6 listener. Readiness
+uses a real 401 from the allowed unauthenticated auth/me route across UDS, not an
+invented public health endpoint. Executor/health outcomes remain synthetic.
+
+The new CLI takes explicit normalized socket/port arguments, has no private
+environment fallback and sanitizes argument/startup errors. Import/help are
+inert. An isolated import guard initially exposed private repository dependencies
+through the shared cleanup module. `finish_owned` was moved text-identically to
+state-free `lifecycle.py`, preserving the same-object `owned_tasks` export; the
+private frontend import is now local to its runner. The guard now proves public
+runner/client imports do not load app/repository/pilot-owner modules. Existing
+cancellation, repeated-stop and drain tests remain part of verification.
+Independent source review accepted the CLI and exact helper extraction.
+
+The original `__main__`, production Docker entry point, Compose and health
+checks are unchanged. They still select the older combined process; they do not
+activate this CLI or an autonomous private factory. A future approved deployment
+needs explicit entry-point/readiness wiring and real private manifest, transport,
+baseline and host enrollment. No production factory was synthesized from tests.
+No live NAS, MCP ports, tokens, services, permissions or Access policy changed.
+Disposable smoke containers and volumes were removed and absence verified.
+
 ### Separate-container browser/private-core boundary — 2026-10-19
 
 Source fixture `3536565`, direct-import/capability correction `800993e`, and

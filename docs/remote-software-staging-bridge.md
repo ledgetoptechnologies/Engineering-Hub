@@ -194,6 +194,40 @@ operation; no agent NAS management or production change is implied.
 
 ## Explicit private core and browser gateway source
 
+### Standalone public process command
+
+The opt-in public entry point is:
+
+```text
+python -m engineering_hub.public_browser --socket /run/hub/browser.sock --port 8771
+```
+
+This is a source invocation example, not permission to install or activate it.
+The socket path is explicit, absolute and normalized; the port is 1–65535 and
+defaults to 8771. The listener is always IPv4 loopback. No environment settings,
+database, agent bearer, private factory, recovery option or TCP fallback is
+constructed by this entry point. Existing filesystem/client and listener-drain
+checks remain authoritative. Invalid arguments and startup failures are
+sanitized; `--help` does not import or start the service.
+
+The shared cleanup function now lives in the state-free `lifecycle` module;
+`owned_tasks.finish_owned` remains an identical-object compatibility export.
+Private application imports stay inside the private runner, so importing the
+public runner/client does not load the app, repository or pilot-owner modules.
+
+The old `python -m engineering_hub --split-ingress` still serves two frontends
+inside one process. `compose.hub-control.yaml` and the production image's old
+entry point/health check remain unchanged; appending the new module name to that
+Compose command would not select the new process. A separately reviewed
+deployment needs explicit entry-point and public-specific readiness wiring.
+The restricted gateway does not expose `/health`; do not broaden its routes to
+reuse the combined health check. The isolated fixture observes a 401 response on
+the allowed, unauthenticated `/api/hub/v1/auth/me` path to verify transport
+readiness, not successful human sign-in or executor readiness.
+
+This public launcher does not supply an autonomous private factory, host
+enrollment, provenance, baseline or deployment approval.
+
 `create_app(..., repository=repo, work_queue=queue, event_feed=feed,
 queued_pilot_runtime=runtime)` now accepts an exact `QueuedPilotRuntime` bound
 to that same queue, repository and native feed. The caller supplies an already
