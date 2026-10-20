@@ -6,13 +6,14 @@ No credentials, accounts, mounts, privileges or production MCP configuration are
 provisioned by this work. An independently built, enrolled immutable executor
 image and actual host validation remain missing.
 
-## Three explicit source APIs
+## Explicit source APIs
 
 | Component | Contract |
 | --- | --- |
 | `launch_supervisor.LaunchSupervisor` | Initial-host-root operator API taking explicit `enrollment_file`, `signing_key_file`, `journal_file` and `create_journal`. `launch()` performs one enrolled container create/start; `serve_one_receipt()` serves one direct authenticated init-process exchange. No installer, background worker or automatic recovery is supplied. |
 | `launch_transport.UnixLaunchReceiptTransport` | Consumer-owned synchronous transport taking explicit `socket_path`, `expected_issuer_uid` and `expected_issuer_gid`. `issue_receipt(nonce=..., timeout_ms=...)` makes one direct connection with no discovery, relay, TCP or retry. |
 | `installed_runner` | Fixed direct-init entry point `/opt/venv/bin/python -I -m hub_container_executor.installed_runner --config /operator/runner.json`. `load_configuration()` loads the protected read-only configuration; `run_installed_executor()` obtains verified launch identity before assembling providers and serving the private executor API. |
+| `installed_coordinator` | Separate opt-in colocated TEST pilot. `validate --config <path>` reads protected configuration and validates its data only; `serve --config <path>` resolves TEST credentials and selects the existing owned queued-pilot lifecycle through a fresh private Unix client. It does not replace the deployed unified MCP. |
 
 The supervisor consumes independent root-protected release/image/profile/daemon
 enrollment and an existing raw Ed25519 private key. It does not generate approval

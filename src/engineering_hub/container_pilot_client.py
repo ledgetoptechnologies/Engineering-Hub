@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -93,6 +94,14 @@ def _reject_constant(value):
     raise ValueError("non-finite JSON number")
 
 
+def _validate_credential_and_timeout(service_token, timeout_seconds, maximum):
+    if (not isinstance(service_token, str) or not service_token
+            or any(not 33 <= ord(character) <= 126 for character in service_token)):
+        raise ValueError("invalid container pilot credential")
+    if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= maximum:
+        raise ValueError("container pilot timeout must be positive and bounded")
+
+
 class ContainerPilotClient:
     """Explicit bounded operations, separate from the existing fixture executor."""
 
@@ -118,11 +127,7 @@ class ContainerPilotClient:
             raise ValueError("invalid container pilot origin")
         if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "::1"}:
             raise ValueError("container pilot requires HTTPS except literal loopback")
-        if (not isinstance(service_token, str) or not service_token
-                or any(not 33 <= ord(character) <= 126 for character in service_token)):
-            raise ValueError("invalid container pilot credential")
-        if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= self.MAX_TIMEOUT_SECONDS:
-            raise ValueError("container pilot timeout must be positive and bounded")
+        _validate_credential_and_timeout(service_token, timeout_seconds, self.MAX_TIMEOUT_SECONDS)
         self.__token = service_token
         self.__timeout_seconds = timeout_seconds
         self.__client = httpx.AsyncClient(
@@ -131,6 +136,39 @@ class ContainerPilotClient:
             timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0)),
             follow_redirects=False, trust_env=False, transport=transport,
         )
+
+    @classmethod
+    def for_private_unix(cls, path, service_token, *, timeout_seconds=125.0):
+        """Create an inert dedicated Linux UDS client; caller owns ``aclose``.
+
+        Requires a current-UID mode0700 parent, mode0600 socket and trusted
+        no-follow ancestors. Path checks are not kernel peer authentication or
+        isolation from same-UID/root mutation after validation. This is a local
+        connection, not a remote transport or endpoint-discovery mechanism.
+        There is no TCP fallback, environment proxy, retry or injected callback.
+        The loopback URL is only the HTTP origin over the explicit Unix socket;
+        the existing bearer, response identity and whole deadline remain in use.
+        """
+        from .private_browser_socket import (
+            _path, _private_parent, _socket_entry, _check_parent,
+        )
+        # Deny bad credentials/budgets before allocating the owned transport.
+        _validate_credential_and_timeout(service_token, timeout_seconds, cls.MAX_TIMEOUT_SECONDS)
+        fd = None
+        try:
+            target = _path(path)
+            fd, parent_identity = _private_parent(target)
+            entry = _socket_entry(target, fd)
+            _check_parent(target, fd, parent_identity)
+            _socket_entry(target, fd, entry)
+            transport = httpx.AsyncHTTPTransport(uds=str(target), retries=0, trust_env=False)
+            return cls("http://127.0.0.1", service_token,
+                       timeout_seconds=timeout_seconds, transport=transport)
+        except Exception:
+            raise ValueError("invalid private container pilot socket") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def __repr__(self):
         return "ContainerPilotClient(credential=<redacted>)"

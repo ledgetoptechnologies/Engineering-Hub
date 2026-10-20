@@ -7,9 +7,11 @@ Viewer, PA, production, TrueNAS, current MCP, credentials or Access policies.
 
 Fresh read-only host evidence and a proposed bootstrap-only approval are in
 [`staging-bootstrap-proposal-2026-10-19.md`](staging-bootstrap-proposal-2026-10-19.md).
-Missing UID-map prerequisites, privileged existing operator membership and disabled
-startup requirements prevent treating the installed rootless setup script as a
-drop-in activation command.
+That proposal records earlier observations, not current installed-pilot readiness.
+The dedicated account and subordinate-ID allocation now exist, but actual
+container mappings, independent issuer installation and the full-pilot resource
+budget remain unverified. Neither the setup script nor the prepared source is a
+drop-in activation command. See the current read-only handoff below.
 
 ## Scope and ownership
 
@@ -49,10 +51,11 @@ available storage and existing watcher selectors before any creation:
 | Private controller/executor transport | Host-local authenticated UDS preferred; exact endpoint, peer protection and secret resolver still to be supplied |
 | Persistence | Private owner/intent/receipt state remains durable across process restart; disposable application data is not a substitute for that state |
 
-Prefer a dedicated rootless test daemon on the same PC **if** the installed host
-supports the required isolation/cgroup features and resource accounting. No new
-PC or VM is required. Rootless is a proposal, not an already installed capability;
-do not install or enable it merely to satisfy this document. Do not fall back to
+Use the dedicated rootless test boundary on the same PC only after the actual
+host supports the required isolation/cgroup features and resource accounting.
+No new PC or VM is required. Bootstrap account/unit preparation is not proof of
+an active, accepted container runtime; the dedicated runtime is currently stopped.
+Do not install or enable anything merely to satisfy this document. Do not fall back to
 the existing shared rootful socket without a separately reviewed and approved
 authority/writer boundary. A second daemon still shares physical resources and
 does not itself coordinate Viewer workers, PA cron or host cleanup.
@@ -116,16 +119,23 @@ and minimum remaining free space need an actual enforcement/admission plan.
 5. Explicit composition selecting `serve_owned_queued_pilot`, a dedicated
    `ContainerPilotClient`, protected executor transport, and mandatory exact
    target policy. The shipped ordinary `create_app` entrypoint does not do this.
-   The current Hub image also omits the root-level executor package: the Linux
-   validation image copies it explicitly, but that is not a release artifact.
-   Separate executor packaging and a trusted launcher remain required.
+   The ordinary Hub image still omits the root-level executor package. Separate
+   optional wheel packaging, concrete Unix launch-receipt transport, host-root
+   supervisor and fixed installed-runner module now exist; source landed in
+   [PR7](https://github.com/ledgetoptechnologies/Engineering-Hub/pull/7).
+   The optional consumer-image recipe and wheel verification landed in
+   [PR8](https://github.com/ledgetoptechnologies/Engineering-Hub/pull/8)
+   (main `59ee49c`), not as a change to the deployed Hub entrypoint.
    The explicit `local_host_adapter_resources` context now joins the real backend
    to the existing protected provider implementations. It consumes already
-   approved inputs; no installable operator entrypoint selects/provisions them.
-   The signed launch-receipt consumer now implements the driver identity interface,
-   but its independently trusted issuer/direct transport and actual kernel
-   process/container correlation are not supplied. These are implementation and
-   installation gaps, not host values Hermes can fill by choosing a path or flag.
+   approved inputs. The installed runner obtains a direct signed launch receipt
+   before constructing mutable providers. The concrete supervisor checks actual
+   Engine peer/process/profile/mapping evidence and issues that receipt from an
+   independently protected key/enrollment. These implementations do not install
+   that host authority, supply its approval, or prove the real host measurements.
+   Explicit queued-coordinator and local-UDS client source wiring now exist;
+   [installation and readiness](installed-pilot-coordinator.md) remain unproved.
+   No default ordinary Hub command selects this pilot.
    A dry configuration validator must remain effect-free; serving/enrollment
    must be separate explicit operations. Rootful Docker capability remains
    host-level authority despite UID 10001 and limited target containers.
@@ -145,6 +155,71 @@ and minimum remaining free space need an actual enforcement/admission plan.
 
 These become a concrete, independently reviewed installation artifact. Until
 resolved, this document is not a Compose file or runnable installation command.
+
+## Current read-only operator handoff
+
+The October 19 read-only SSH snapshot found `ehpilot` UID/GID 10001, private
+mode 0700 home `/var/lib/eh-pilot`, and separate subordinate UID/GID allocations
+`200000:65536`. The user manager and slice were inactive, there were no UID 10001
+processes, and `/run/user/10001/eh-pilot-docker.sock` was absent. These are a
+point-in-time observation, not permission to start it or proof that other host
+writers are absent. The configured `user-10001.slice` ceiling is **1 GiB memory,
+no swap, one CPU-equivalent and 256 tasks**; while inactive, it supplies no actual
+daemon/container cgroup-enforcement evidence. Shared root-filesystem available
+space was **13,901,606,912 bytes** (approximately 13.9 GB, 87% used), not a reserved
+pilot allocation or enforced disk quota.
+
+The root-owned installed bootstrap unit still has `RuntimeMaxSec=600`,
+`TimeoutStopSec=1200`, `Restart=no` and `SendSIGKILL=no`. Its ten-minute lifetime
+is not a full-pilot lifecycle and must be reconciled with the source's minimum
+**1120-second** drain grace. A timeout does not establish quiescence or authorize
+forcing an unknown operation terminal.
+
+The local optional image's runtime manifest
+`sha256:53581ae334b5bc10860a43a5d39ed623655ad964d27b6f5583d8a7b2275e9a75`
+has verified OCI descriptor/layer hashes and installed-runner/image-default
+checks. It used the independently recorded **local** core artifact, not the
+published core digest default in the optional recipe. This is local artifact
+evidence, not release enrollment, source attestation, host installation, direct
+issuer acceptance or a completed application pilot.
+
+The smallest remaining operator decisions and prerequisites are:
+
+1. Approve an aggregate budget and bounded lifecycle for the exact setup. The
+   original baseline, candidate and newly restored rollback can all remain live;
+   current adapter behavior does not first stop the failed candidate. At the
+   proposed 512 MiB/128 PID per-generation profile, **three generations alone total
+   1.5 GiB and 384 PIDs**, plus daemon, executor, controller/gateway, cache and
+   scratch overhead. This is incompatible with the existing 1 GiB/256-task bootstrap
+   ceiling as a guaranteed budget. Per-container caps and sequential phases do
+   not fix that mismatch. Do not silently raise limits or weaken profiles.
+2. Separately approve and install the host-root issuer's immutable code and
+   dependencies, independent root-private signing key, closed enrollment,
+   durable journal and new protected socket parent. Keep them outside daemon-
+   readable mounts. Library/image inclusion of issuer code grants no such
+   authority. No key generation, root installation or activation is authorized
+   by this document.
+3. Measure actual daemon and container UID/GID maps, supplementary groups,
+   namespaces, mount access and effective cgroup limits before provisioning
+   mapped-owner files. Allocation arithmetic is not an observed mapping.
+   Expected issuer `SO_PEERCRED` UID/GID are interpreted in the consumer user
+   namespace; the issuer process's peer GID is **not** the socket file's access
+   group. Neither may be guessed from matching numeric labels.
+4. Independently provision and enroll disjoint private stores, exact config
+   bytes, same-absolute-path generations, immutable build records, distinct TEST
+   credentials and a healthy disposable baseline/frozen backup. Retain physical-
+   machine queue ownership and exclusion of image watchers, cleanup, Viewer,
+   PA cron and other deployers; do not borrow live MCP credentials or data.
+5. Select the private controller connection explicitly. Local-UDS coordinator
+   source wiring does not establish installed reachability. A staging-local pilot does not demonstrate
+   TrueNAS-to-staging remote access: the Unix-only executor has no installed
+   authenticated remote forwarder. Any later TLS/SSH-UDS gateway and private-path
+   access require their own exact reviewed topology, not broader NAS/root access.
+6. Present that concrete artifact, host change set, stop/drain procedure and
+   retained-evidence plan for approval before activation. Actual direct-PID1
+   receipt, resource enforcement, validate/deploy/health/rollback and restart
+   reconciliation remain acceptance gates. The launcher preserves uncertain
+   outcomes; it does not automatically adopt or relaunch held work after restart.
 
 ## Activation and acceptance sequence to present to Beau
 
