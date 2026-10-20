@@ -27,6 +27,22 @@ claim that the live integration already provides it.
 
 ## Implemented contract
 
+### Hub connections versus topic readiness
+
+In unified mode, `/api/hub/v1/overview`, `/api/hub/v1/agents` and MCP
+`hub_overview` expose a redacted snapshot of the embedded bus's active streams
+and inbox subscriptions. This is a connection to this server process only:
+it does not prove a running model, correct-topic session, wake delivery or task
+completion. No observed stream does not mean the agent is offline. Standalone
+Hub instances without the embedded bus leave this observation absent/unknown.
+
+Connection snapshots include `observed_at` and a maximum 30-second `valid_until`.
+The dashboard expires them locally; it does not poll or start a listener.
+Use Refresh for a new snapshot. Malformed or failed observations are unavailable,
+not connected. Topic tracking is independently labelled `not_configured` only
+when no topic observer is configured; a configured observer failure remains
+unavailable/unverified. A bus connection never upgrades topic readiness.
+
 The REST contract is `contracts/hub-v1.openapi.json`; the running service exposes
 `/openapi.json`. `/api/hub/v1/overview` supplies tasks, decisions, runs, configured
 projects and explicit capability flags. Unknown host/agent state is not online.

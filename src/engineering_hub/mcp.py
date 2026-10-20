@@ -34,7 +34,7 @@ class HubMCPAuthMiddleware:
 
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
-                  work_queue=None, mcp=None) -> FastMCP:
+                  work_queue=None, mcp=None, agent_status=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -76,13 +76,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('reachability_source_unavailable') from None
 
     @mcp.tool()
-    def hub_overview(ctx: Context) -> dict:
+    async def hub_overview(ctx: Context) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state."""
         identity(ctx)
         result = {"tasks": invoke(repo.list_tasks), "decisions": invoke(repo.list_decisions),
                   "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
         if autonomy_status is not None:
             result['autonomy'] = invoke(autonomy_status)
+        if agent_status is not None:
+            result['agents'] = await agent_status()
         return result
 
     @mcp.tool()

@@ -122,11 +122,25 @@ class ProjectDTO(ResponseDTO):
     reason: str
 
 
+class AgentConnectionDTO(ResponseDTO):
+    state: Literal['connected', 'not_observed', 'unavailable']
+    source: Literal['embedded_bus']
+    scope: Literal['this_server_process']
+    observed_at: str | None
+    valid_until: str | None
+    active_streams: int | None = Field(ge=0)
+    inbox_subscriptions: int | None = Field(ge=0)
+    subscribed: bool | None
+    last_stream_write_at: str | None
+    native_push_available: bool | None
+
+
 class AgentDTO(ResponseDTO):
     id: AgentId
     transport: str
     chat_readiness: str
     reason: str
+    connection: AgentConnectionDTO | None = None
 
 
 class DispatchResultDTO(ResponseDTO):

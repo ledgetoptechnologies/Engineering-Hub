@@ -1350,6 +1350,123 @@
   },
   "components": {
     "schemas": {
+      "AgentConnectionDTO": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "not_observed",
+              "unavailable"
+            ],
+            "title": "State"
+          },
+          "source": {
+            "type": "string",
+            "const": "embedded_bus",
+            "title": "Source"
+          },
+          "scope": {
+            "type": "string",
+            "const": "this_server_process",
+            "title": "Scope"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "active_streams": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Streams"
+          },
+          "inbox_subscriptions": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inbox Subscriptions"
+          },
+          "subscribed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subscribed"
+          },
+          "last_stream_write_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Stream Write At"
+          },
+          "native_push_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Push Available"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "source",
+          "scope",
+          "observed_at",
+          "valid_until",
+          "active_streams",
+          "inbox_subscriptions",
+          "subscribed",
+          "last_stream_write_at",
+          "native_push_available"
+        ],
+        "title": "AgentConnectionDTO"
+      },
       "AgentDTO": {
         "properties": {
           "id": {
@@ -1372,6 +1489,16 @@
           "reason": {
             "type": "string",
             "title": "Reason"
+          },
+          "connection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentConnectionDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -3150,6 +3277,16 @@
             ],
             "title": "Event Source",
             "default": "hub_only"
+          },
+          "tracking": {
+            "type": "string",
+            "enum": [
+              "not_configured",
+              "configured",
+              "unavailable"
+            ],
+            "title": "Tracking",
+            "default": "unavailable"
           }
         },
         "additionalProperties": false,
