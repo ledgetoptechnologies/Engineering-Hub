@@ -1,6 +1,7 @@
 include README.md CONTEXT.md uv.lock Dockerfile compose.yaml compose.truenas.yaml .env.example .dockerignore
 recursive-include docker *.sh
 include docker/Dockerfile.hub-control
+include docker/Dockerfile.hub-executor
 include docker/Dockerfile.hub-validation docker/Dockerfile.hub-validation.dockerignore
 include compose.hub-control.yaml
 include compose.hub-test.yaml

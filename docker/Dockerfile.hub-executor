@@ -1,0 +1,33 @@
+# Optional consumer image only; does not install or activate the host issuer.
+# Use a prepared, trusted context containing ONLY this recipe, executor.whl and
+# validate_executor_wheel.py (the reviewed verify_hub_executor_wheel.py source).
+ARG CORE_IMAGE=ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:805d1f825d9b4ac29061de36fd637873c746a8f44dcbd61b7d54053d24f1b45c
+FROM ${CORE_IMAGE} AS core
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS python-runtime
+
+FROM python-runtime AS executor-installer
+ARG CORE_IMAGE
+ARG EXECUTOR_WHEEL_SHA256
+ARG SOURCE_COMMIT
+WORKDIR /build
+# pip requires a valid fixed PEP 427 filename, not the context's executor.whl.
+COPY executor.whl /build/engineering_hub_container_executor-0.1.0-py3-none-any.whl
+COPY validate_executor_wheel.py /build/validate_executor_wheel.py
+# Build arguments are read as data, never interpolated into Python/shell code.
+# The validator checks the immutable core reference and independently supplied
+# wheel hash/commit before pip sees the wheel. No dependency or tool fetching.
+RUN --network=none python -I -c "import os,re,runpy,sys; expected=os.environ.get('EXECUTOR_WHEEL_SHA256',''); commit=os.environ.get('SOURCE_COMMIT',''); core=os.environ.get('CORE_IMAGE',''); re.fullmatch('[0-9a-f]{64}',expected) and re.fullmatch('[0-9a-f]{40}',commit) or sys.exit('Explicit wheel SHA-256 and source commit required'); sys.argv=['/build/validate_executor_wheel.py','--wheel','/build/engineering_hub_container_executor-0.1.0-py3-none-any.whl','--sha256',expected,'--source-commit',commit,'--core-image',core]; runpy.run_path(sys.argv[0],run_name='__main__')" \
+    && python -I -m pip install --no-deps --no-index --no-compile --no-cache-dir --disable-pip-version-check --target /executor-site /build/engineering_hub_container_executor-0.1.0-py3-none-any.whl
+
+# Copy the pinned runtime filesystem, not its OCI configuration: inherited
+# Python-image ENV/entrypoint/user cannot silently widen the enrolled profile.
+FROM scratch
+COPY --from=python-runtime / /
+COPY --from=core /opt/venv/ /opt/venv/
+COPY --from=executor-installer /executor-site/ /opt/venv/lib/python3.12/site-packages/
+ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
+WORKDIR /
+USER 10001:10001
+ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.installed_runner"]
+CMD ["--config", "/operator/runner.json"]
