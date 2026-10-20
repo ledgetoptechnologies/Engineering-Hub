@@ -1,81 +1,63 @@
-# IN-PLACE UPGRADE of the EXISTING TrueNAS Hub app, not a second installation.
-# Candidate only: use a published alias-capable image AFTER the operator gates
-# in docs/unified-mcp-cutover-2026-10-19.md. Stop BOTH old writers and take a
-# coherent bus+Hub backup/test copy first. Never start this over live bus data.
-# Keep the existing TrueNAS app identity, protected tokens and Hub state.
-# These source paths follow Beau's supplied legacy and existing Hub Compose;
-# verify them against the actual installed mounts before using this file.
-# Both existing MCP ports share ONE core/transport/lifespan. Browser is loopback.
-# Keep the existing Hub tunnel/policy; its upstream must be 127.0.0.1:8771.
-# Never copy tokens from chat. Replace the four placeholders privately using
-# the existing protected agent/admin values, and do not share the filled file.
+# Proxy-accessible UI profile; requires the release adding --browser-host.
+# Existing Hub upgrade; NOT deployed or accepted by this file.
+# Before startup: stop BOTH writers, back up, then copy preserved bus state to
+# /mnt/Plugins/App_Data/Engineering-Hub/agent-message-bus/ without overwriting.
+# Old MCP must remain stopped. Do not delete its old directory or create empty history.
+# Agent clients must move to http://192.168.50.80:8770/mcp; no alias listener.
+# Existing bridged tunnel: Hub-only origin http://192.168.50.80:8771.
+# UI is network-reachable but requires a valid Hub Access JWT before assets/API.
+# No tunnel Host Network change, no Ops integration, no new connector.
 name: e-h-control
 services:
   engineering-hub-control:
     image: ghcr.io/ledgetoptechnologies/engineering-hub-control:latest
     pull_policy: always
-    command: [--split-ingress, --unified-mcp, --browser-port, "8771", --agent-alias-port, "8765"]
+    command: [--split-ingress, --unified-mcp, --browser-host, "0.0.0.0", --browser-port, "8771"]
+    network_mode: host
+    user: "568:568"
     restart: unless-stopped
     stop_grace_period: 1200s
-    user: "568:568"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    pids_limit: 128
-    mem_limit: 512m
-    memswap_limit: 512m
-    cpus: 1.0
-    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"]
-    network_mode: host
     environment:
       HUB_DB: /var/lib/hub/hub.sqlite3
       HUB_UI_DIRECTORY: /app/dashboard
-      HUB_SUPERVISOR_STOP_GRACE_SECONDS: "1200"
       HUB_BASE_URL: https://hub.ledgetoptechnologies.com
-      HUB_ALTERNATE_ORIGINS: ""
-      HUB_INGRESS_MODE: combined
-      HUB_AGENT_ALLOWED_HOSTS: "192.168.50.80:8770,192.168.50.80:8765,192.168.50.80,127.0.0.1:8770,127.0.0.1:8765,127.0.0.1,localhost:8770,localhost:8765,localhost"
-      HUB_WORK_QUEUE_ENABLED: "0"
-      HUB_REGISTRY_ENABLED: "0"
-      # Keep 0 through backup/copy/parity/canaries. After those pass, set 1 to
-      # resume the legacy cleanup-at-startup policy on subsequent restarts.
-      # This does not create a new periodic cleanup worker.
-      HUB_BUS_STARTUP_CLEANUP: "0"
+      HUB_HUMAN_AUTH_MODE: cloudflare_access
+      HUB_CF_ACCESS_ISSUER: https://ledgetoptechnologies.cloudflareaccess.com
+      HUB_CF_ACCESS_AUDIENCE: fdd1c44b308a90db171fb2d801f8d91149259878438ccddc389eb3a534b8ee35
+      HUB_CF_ACCESS_ALLOWED_EMAILS: "bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com"
       HERMES_TOKEN: REPLACE_WITH_EXISTING_HERMES_TOKEN
       CODEX_TOKEN: REPLACE_WITH_EXISTING_CODEX_TOKEN
       CLAUDE_TOKEN: REPLACE_WITH_EXISTING_CLAUDE_TOKEN
       ADMIN_TOKEN: REPLACE_WITH_EXISTING_ADMIN_TOKEN
       AGENT_BUS_ALLOWED_IPS: "192.168.60.92,192.168.20.151"
-      AGENT_BUS_DB: /var/lib/agent-message-bus/messages.sqlite3
-      AGENT_BUS_AUDIT: /var/lib/agent-message-bus/audit.jsonl
-      AGENT_BUS_FILE_ROOT: /var/lib/agent-message-bus/files
+      HUB_AGENT_ALLOWED_HOSTS: "192.168.50.80:8770,192.168.50.80,127.0.0.1:8770,127.0.0.1,localhost:8770,localhost"
+      AGENT_BUS_DB: /var/lib/hub/agent-message-bus/messages.sqlite3
+      AGENT_BUS_AUDIT: /var/lib/hub/agent-message-bus/audit.jsonl
+      AGENT_BUS_FILE_ROOT: /var/lib/hub/agent-message-bus/files
       CLAIM_LEASE_SECONDS: "600"
       ACK_RETENTION_DAYS: "30"
       REJECT_RETENTION_DAYS: "90"
-      HUB_HUMAN_AUTH_MODE: cloudflare_access
-      HUB_GITHUB_CLIENT_ID: ""
-      HUB_GITHUB_CLIENT_SECRET: ""
-      HUB_BEAU_GITHUB_ID: ""
-      HUB_CF_ACCESS_ISSUER: https://ledgetoptechnologies.cloudflareaccess.com
-      HUB_CF_ACCESS_AUDIENCE: fdd1c44b308a90db171fb2d801f8d91149259878438ccddc389eb3a534b8ee35
-      HUB_CF_ACCESS_ALLOWED_EMAILS: "bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com"
+      HUB_BUS_STARTUP_CLEANUP: "0"
     volumes:
       - type: bind
         source: /mnt/Plugins/App_Data/Engineering-Hub/
         target: /var/lib/hub
         bind:
           create_host_path: false
-      - type: bind
-        source: /mnt/Plugins/App_Data/Agent_MCP
-        target: /var/lib/agent-message-bus
-        bind:
-          create_host_path: false
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"]
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import json,urllib.request; p=urllib.request.build_opener(urllib.request.ProxyHandler({})); results=[json.load(p.open('http://127.0.0.1:'+str(port)+'/health',timeout=3)) for port in (8765,8770,8771)]; raise SystemExit(0 if all(r.get('ok') is True for r in results) and len({r.get('build_commit') for r in results}) == 1 else 1)"
+        - "import json,urllib.request; p=urllib.request.build_opener(urllib.request.ProxyHandler({})); results=[json.load(p.open('http://127.0.0.1:'+str(port)+'/health',timeout=3)) for port in (8770,8771)]; raise SystemExit(0 if all(r.get('ok') is True for r in results) and len({r.get('build_commit') for r in results}) == 1 else 1)"
       interval: 30s
       timeout: 12s
       retries: 3

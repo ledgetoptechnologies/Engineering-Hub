@@ -11,6 +11,9 @@ def main():
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--split-ingress", action="store_true")
     parser.add_argument("--browser-port", type=int, default=8771)
+    parser.add_argument("--browser-host", default=None,
+                        help="Numeric browser IP for split ingress (default: 127.0.0.1); "
+                             "non-loopback access still requires Cloudflare Access authentication")
     parser.add_argument("--agent-alias-port", type=int,
                         help="Optional compatibility port sharing the existing agent listener owner")
     parser.add_argument("--unified-mcp", action="store_true",
@@ -20,6 +23,8 @@ def main():
         parser.error('--unified-mcp requires --split-ingress')
     if args.agent_alias_port is not None and not args.split_ingress:
         parser.error('--agent-alias-port requires --split-ingress')
+    if args.browser_host is not None and not args.split_ingress:
+        parser.error('--browser-host requires --split-ingress')
     if args.split_ingress:
         if args.unified_mcp:
             from .unified_app import create_unified_app as create_app
@@ -30,6 +35,7 @@ def main():
         def pair_factory():
             return HubFrontends(create_app())
         asyncio.run(serve_frontends(pair_factory, agent_host=args.host, agent_port=args.port,
+                                    browser_host="127.0.0.1" if args.browser_host is None else args.browser_host,
                                     browser_port=args.browser_port, agent_alias_port=args.agent_alias_port))
         return
     # OAuth callback URLs contain short-lived codes. Never log query strings.

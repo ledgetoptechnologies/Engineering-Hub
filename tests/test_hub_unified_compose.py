@@ -17,10 +17,11 @@ def service():
     return document['services']['engineering-hub-control']
 
 
-def test_one_existing_hub_with_both_original_mcp_ports_and_no_extra_owner():
+def test_one_existing_hub_with_proxy_browser_and_no_alias_or_extra_owner():
     hub = service()
-    assert hub['command'] == ['--split-ingress', '--unified-mcp', '--browser-port', '8771',
-                               '--agent-alias-port', '8765']
+    assert hub['command'] == ['--split-ingress', '--unified-mcp', '--browser-host', '0.0.0.0',
+                              '--browser-port', '8771']
+    assert '--agent-alias-port' not in hub['command']
     assert hub['network_mode'] == 'host'
     assert not {'build', 'entrypoint', 'container_name', 'ports', 'depends_on'} & hub.keys()
     assert hub['image'] == 'ghcr.io/ledgetoptechnologies/engineering-hub-control:latest'
@@ -33,18 +34,18 @@ def test_one_existing_hub_with_both_original_mcp_ports_and_no_extra_owner():
     assert hub['tmpfs'] == ['/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777']
 
 
-def test_preserves_both_operator_state_roots_and_never_autocreates_them():
+def test_one_operator_state_root_and_preserved_nested_bus_paths():
     hub = service()
     assert [(v['source'], v['target']) for v in hub['volumes']] == [
-        ('/mnt/Plugins/App_Data/Engineering-Hub/', '/var/lib/hub'),
-        ('/mnt/Plugins/App_Data/Agent_MCP', '/var/lib/agent-message-bus')]
+        ('/mnt/Plugins/App_Data/Engineering-Hub/', '/var/lib/hub')]
     assert all(v['type'] == 'bind' and v['bind']['create_host_path'] is False
                for v in hub['volumes'])
     env = hub['environment']
     assert env['HUB_DB'] == '/var/lib/hub/hub.sqlite3'
-    assert env['AGENT_BUS_DB'] == '/var/lib/agent-message-bus/messages.sqlite3'
-    assert env['AGENT_BUS_AUDIT'] == '/var/lib/agent-message-bus/audit.jsonl'
-    assert env['AGENT_BUS_FILE_ROOT'] == '/var/lib/agent-message-bus/files'
+    assert env['AGENT_BUS_DB'] == '/var/lib/hub/agent-message-bus/messages.sqlite3'
+    assert env['AGENT_BUS_AUDIT'] == '/var/lib/hub/agent-message-bus/audit.jsonl'
+    assert env['AGENT_BUS_FILE_ROOT'] == '/var/lib/hub/agent-message-bus/files'
+    assert '/mnt/Plugins/App_Data/Agent_MCP' not in str(hub)
     assert env['CLAIM_LEASE_SECONDS'] == '600'
     assert (env['ACK_RETENTION_DAYS'], env['REJECT_RETENTION_DAYS']) == ('30', '90')
     assert env['HUB_BUS_STARTUP_CLEANUP'] == '0'
@@ -72,14 +73,15 @@ def test_closed_worker_defaults_and_separate_approved_cloudflare_identity(monkey
     assert settings.auth_config.human_auth_mode == 'cloudflare_access'
     assert settings.auth_config.cloudflare_config is not None
     assert settings.auth_config.local_session_ttl_seconds == 30 * 24 * 60 * 60
-    assert {'192.168.50.80:8765', '192.168.50.80:8770'} <= set(settings.agent_allowed_hosts)
+    assert '192.168.50.80:8770' in settings.agent_allowed_hosts
+    assert not any(':8765' in value for value in settings.agent_allowed_hosts)
     assert settings.agent_auth.allowed_ips == frozenset({'192.168.60.92', '192.168.20.151'})
 
 
-def test_health_covers_all_three_sockets_and_stop_grace_is_not_shortened():
+def test_health_covers_two_sockets_and_stop_grace_is_not_shortened():
     hub = service()
     assert hub['healthcheck']['test'][:3] == ['CMD', 'python', '-c']
-    assert '(8765,8770,8771)' in hub['healthcheck']['test'][3]
+    assert '(8770,8771)' in hub['healthcheck']['test'][3]
+    assert '8765' not in hub['healthcheck']['test'][3]
     assert hub['healthcheck']['timeout'] == '12s'
     assert hub['stop_grace_period'] == '1200s'
-    assert hub['environment']['HUB_SUPERVISOR_STOP_GRACE_SECONDS'] == '1200'
