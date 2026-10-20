@@ -158,6 +158,12 @@ the bounded identity interface for an independently approved immutable executor
 artifact. It still requires a real authenticated direct issuer exchange and does
 not install that launcher or establish actual process/container correlation.
 
+The companion [concrete launcher, direct transport and fixed runner](executor-installed-launcher.md)
+now supply source implementations for that composition, including closed runner
+configuration and independent issuer checks. They remain uninstalled and require
+an independently packaged executor release plus actual host/peer validation;
+their existence does not establish pilot readiness.
+
 Use the [pilot preparation proposal](staging-pilot-preparation-2026-10-19.md)
 for the proposed topology and unresolved host inputs. This function supplies no
 JSON/module-name loader, public enrollment endpoint, installed driver-identity
