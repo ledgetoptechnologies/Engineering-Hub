@@ -62,6 +62,8 @@ def prepare_archive(archive: bytes, *, revision: str, output_directory: Path) ->
         "src/hub_container_executor/service.py",
         "src/hub_container_executor/local_resources.py",
         "src/hub_container_executor/runtime_identity.py",
+        "src/hub_container_executor/installed_runner.py",
+        "src/hub_container_executor/launch_transport.py",
     }
     if not required.issubset(selected):
         raise ValueError("archive lacks required executor packaging files")

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "engineering-hub-container-executor"
 version = "0.1.0"
-description = "Optional Linux Engineering Hub container executor library; no service entrypoint"
+description = "Optional Linux Engineering Hub container executor with explicit installed-runner module"
 requires-python = ">=3.12"
 dependencies = ["agent-message-bus==0.6.0"]
 
