@@ -70,15 +70,17 @@ class PilotOwner:
     The operator must supply an existing private 0700 directory. No directory,
     permission, existing database enrollment, or legacy-state migration is made.
     Failure preserves any newly created database for explicit inspection.
+    require_existing=True also forbids creating a database or lock: only exact
+    prior enrollment can be reopened (advancing its owned process epoch).
     """
 
-    def __init__(self, database_path, *, allow_ephemeral_test_storage=False):
+    def __init__(self, database_path, *, allow_ephemeral_test_storage=False, require_existing=False):
         self._parent_fd = self._lock_fd = None
         self._closed = True
         self._pid = os.getpid()
         _OWNERS.add(self)
         try:
-            if type(allow_ephemeral_test_storage) is not bool:
+            if type(allow_ephemeral_test_storage) is not bool or type(require_existing) is not bool:
                 raise PilotOwnershipError()
             import fcntl
             self._fcntl = fcntl
@@ -98,6 +100,8 @@ class PilotOwner:
             try:
                 self._lock_fd = os.open(self._lock_name, lock_flags, dir_fd=self._parent_fd)
             except FileNotFoundError:
+                if require_existing:
+                    raise PilotOwnershipError()
                 # Never recreate an enrolled database's missing lock. Inode
                 # numbers may be reused immediately, so comparing the newly
                 # created inode with enrollment is not proof of continuity.
@@ -116,24 +120,29 @@ class PilotOwner:
             # Recheck after acquiring ownership, before any database write.
             self._check_file(self._lock_fd, self._lock_name, self._lock_identity)
             fresh = False
-            try:
-                created_fd = os.open(path.name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                     0o600, dir_fd=self._parent_fd)
-                try:
-                    self._database_identity = self._check_file(created_fd, path.name)
-                    _local_filesystem(created_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
-                finally:
-                    # Close a newly created file before SQLite can acquire any
-                    # locks. Never raw-open an existing database: closing even
-                    # an unrelated FD releases this process's POSIX inode locks.
-                    os.close(created_fd)
-                fresh = True
-            except FileExistsError:
-                # A database appearing after fresh-lock admission cannot be
-                # adopted, even if a filesystem reused an enrolled inode.
-                if created_lock:
-                    raise PilotOwnershipError()
+            if require_existing:
+                # Never raw-open/close an existing SQLite inode: that would
+                # release this process's POSIX locks. _connect uses mode=rw so
+                # deletion cannot turn explicit startup into fresh enrollment.
                 self._database_identity = self._check_database()
+            else:
+                try:
+                    created_fd = os.open(path.name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                         0o600, dir_fd=self._parent_fd)
+                    try:
+                        self._database_identity = self._check_file(created_fd, path.name)
+                        _local_filesystem(created_fd, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
+                    finally:
+                        # Close a newly created file before SQLite can acquire
+                        # locks. Never raw-open an existing database.
+                        os.close(created_fd)
+                    fresh = True
+                except FileExistsError:
+                    # A database appearing after fresh-lock admission cannot
+                    # be adopted, even if an enrolled inode number was reused.
+                    if created_lock:
+                        raise PilotOwnershipError()
+                    self._database_identity = self._check_database()
             self._check_database(self._database_identity)
             with self._connect() as db:
                 db.execute('BEGIN IMMEDIATE')

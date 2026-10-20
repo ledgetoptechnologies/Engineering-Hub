@@ -73,3 +73,54 @@ A synthetic transport test proves composition behavior only. A private TEST
 database on the NAS may prove remote mechanics, but does not prove integration
 with the existing live dashboard's records. Container recreation, actual NAS
 acceptance and machine reboot acceptance remain separate checks.
+
+## Installed selector (opt-in source)
+
+The separate entrypoint is intentionally not selected by ordinary Hub startup:
+
+```text
+python -m engineering_hub.unified_pilot_startup validate --config /var/lib/hub/settings.json --pilot-config /var/lib/hub/private/pilot.json
+python -m engineering_hub.unified_pilot_startup serve --config /var/lib/hub/settings.json --pilot-config /var/lib/hub/private/pilot.json
+```
+
+`validate` reads the existing non-secret deployment settings and protected pilot
+profile. It does not read agent environment tokens, the executor credential or
+CA file, acquire an owner, bind a socket, contact an executor or modify a database.
+Its result means configuration shape is valid, not installed readiness.
+
+`serve` is the explicit activation operation. It retains the current process UID
+(including the NAS app's UID568), existing three agent tokens, deployment-selected
+Hub and bus paths, and agent8770/browser8771. `PilotOwner(require_existing=True)`
+requires both the existing database and ownership lock; missing state is never
+created or adopted. It rotates an already valid owner epoch under the normal
+ownership protocol, so do not use `serve` as a read-only probe.
+
+The closed pilot profile contains:
+
+- `schema`: `engineering-hub.unified-pilot.v1`.
+- `manifest`: the full existing canonical pilot manifest.
+- `machine_id`: `staging-pc`; `action_key`: `engineering-hub:container-pilot`.
+- Explicit `allowed_actors` and canonical `allowed_task_ids`; these are an
+  additional veto, not task assignment, independent review or execution proof.
+- `executor`: `https_origin`, `ca_file`, `ca_sha256`, `credential_file` and
+  `credential_sha256`. Both hashes use the `sha256:` prefix. Never put a bearer
+  value in this JSON. The endpoint needs a certificate matching its actual DNS
+  name or IP address; verification is never disabled for a LAN address.
+- `supervisor_stop_grace_seconds`, at least the existing1120-second requirement.
+  This field does not change or verify the installed supervisor.
+
+The credential may live in a private0700 child of the existing EH mount, with
+current-UID ownership, mode0600, no links and trusted ancestors. Downloadable bus
+content and collisions with database/settings/profile/CA/audit files are rejected.
+No extra host mount is mandatory. Inspect actual NAS permissions before setup;
+the selector never changes them. A separate read-only secret mount is an optional
+deployment choice, not a change to the current Compose.
+
+Serving verifies the protected credential digest and refuses reuse of an existing
+agent/admin bearer. It verifies the CA digest, then builds TLS trust from those
+same captured bytes. The dedicated client enforces certificate and hostname
+verification, no system/environment CA or proxy discovery, no TLS key-log
+environment handling, no redirect and no transport retry. This follows the
+explicit-context APIs in [Python SSL](https://docs.python.org/3/library/ssl.html)
+and [HTTPX](https://www.python-httpx.org/advanced/ssl/); the actual configured
+network route still needs independent acceptance.
