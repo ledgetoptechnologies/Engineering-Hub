@@ -1,69 +1,24 @@
-# Proxy-accessible UI profile; requires the release adding --browser-host.
-# Existing Hub upgrade; NOT deployed or accepted by this file.
-# Before startup: stop BOTH writers, back up, then copy preserved bus state to
-# /mnt/Plugins/App_Data/Engineering-Hub/agent-message-bus/ without overwriting.
-# Old MCP must remain stopped. Do not delete its old directory or create empty history.
-# Agent clients must move to http://192.168.50.80:8770/mcp; no alias listener.
-# Existing bridged tunnel: Hub-only origin http://192.168.50.80:8771.
-# UI is network-reachable but requires a valid Hub Access JWT before assets/API.
-# No tunnel Host Network change, no Ops integration, no new connector.
+# Requires the settings-file release. Configure settings.json and preserved bus
+# state inside Engineering-Hub before startup; never delete the old source.
 name: e-h-control
 services:
   engineering-hub-control:
     image: ghcr.io/ledgetoptechnologies/engineering-hub-control:latest
     pull_policy: always
-    command: [--split-ingress, --unified-mcp, --browser-host, "0.0.0.0", --browser-port, "8771"]
-    network_mode: host
-    user: "568:568"
     restart: unless-stopped
     stop_grace_period: 1200s
+    network_mode: host
+    command: [--config, /var/lib/hub/settings.json]
     environment:
-      HUB_DB: /var/lib/hub/hub.sqlite3
-      HUB_UI_DIRECTORY: /app/dashboard
-      HUB_BASE_URL: https://hub.ledgetoptechnologies.com
-      HUB_HUMAN_AUTH_MODE: cloudflare_access
-      HUB_CF_ACCESS_ISSUER: https://ledgetoptechnologies.cloudflareaccess.com
-      HUB_CF_ACCESS_AUDIENCE: fdd1c44b308a90db171fb2d801f8d91149259878438ccddc389eb3a534b8ee35
-      HUB_CF_ACCESS_ALLOWED_EMAILS: "bkoltz@ledgetoptechnologies.com,beaukoltz@ledgetopdroneservices.com"
       HERMES_TOKEN: REPLACE_WITH_EXISTING_HERMES_TOKEN
       CODEX_TOKEN: REPLACE_WITH_EXISTING_CODEX_TOKEN
       CLAUDE_TOKEN: REPLACE_WITH_EXISTING_CLAUDE_TOKEN
       ADMIN_TOKEN: REPLACE_WITH_EXISTING_ADMIN_TOKEN
-      AGENT_BUS_ALLOWED_IPS: "192.168.60.92,192.168.20.151"
-      HUB_AGENT_ALLOWED_HOSTS: "192.168.50.80:8770,192.168.50.80,127.0.0.1:8770,127.0.0.1,localhost:8770,localhost"
-      AGENT_BUS_DB: /var/lib/hub/agent-message-bus/messages.sqlite3
-      AGENT_BUS_AUDIT: /var/lib/hub/agent-message-bus/audit.jsonl
-      AGENT_BUS_FILE_ROOT: /var/lib/hub/agent-message-bus/files
-      CLAIM_LEASE_SECONDS: "600"
-      ACK_RETENTION_DAYS: "30"
-      REJECT_RETENTION_DAYS: "90"
-      HUB_BUS_STARTUP_CLEANUP: "0"
     volumes:
-      - type: bind
-        source: /mnt/Plugins/App_Data/Engineering-Hub/
-        target: /var/lib/hub
-        bind:
-          create_host_path: false
+      - /mnt/Plugins/App_Data/Engineering-Hub:/var/lib/hub
+    # Bound the control plane; these are not processing-worker resources.
     cpus: 1.0
     mem_limit: 512m
     memswap_limit: 512m
-    pids_limit: 128
-    read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"]
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import json,urllib.request; p=urllib.request.build_opener(urllib.request.ProxyHandler({})); results=[json.load(p.open('http://127.0.0.1:'+str(port)+'/health',timeout=3)) for port in (8770,8771)]; raise SystemExit(0 if all(r.get('ok') is True for r in results) and len({r.get('build_commit') for r in results}) == 1 else 1)"
-      interval: 30s
-      timeout: 12s
-      retries: 3
-      start_period: 15s
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"

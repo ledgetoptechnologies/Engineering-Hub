@@ -9,6 +9,11 @@ The default browser bind remains `127.0.0.1`. The explicit operator flag
 addresses are accepted. The operator profile in `compose.hub-unified.yaml`
 uses this flag and requires the new release; older images reject it.
 
+The current operator profile now selects these same listeners through persisted
+`--config /var/lib/hub/settings.json`, rather than a long environment/flag list.
+See [small deployment](simple-hub-deployment.md) for the current Compose and
+one-time settings file. Older profiles remain historical, not deployment advice.
+
 | Use | Destination |
 | --- | --- |
 | Agents and internal MCP | `http://192.168.50.80:8770/mcp` |

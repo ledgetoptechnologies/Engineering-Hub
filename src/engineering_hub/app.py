@@ -4,7 +4,7 @@ import os
 import json
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -89,7 +89,7 @@ class Settings:
                 raise ValueError("Replace agent-token placeholders before starting Hub")
 
     @classmethod
-    def from_env(cls):
+    def from_env(cls, deployment=None):
         work_queue_flag = os.environ.get("HUB_WORK_QUEUE_ENABLED", "0")
         if work_queue_flag not in {"0", "1"}:
             raise ValueError("HUB_WORK_QUEUE_ENABLED must be 0 or 1")
@@ -97,12 +97,17 @@ class Settings:
         registry_events_flag = os.environ.get('HUB_REGISTRY_EVENTS_ENABLED', '0')
         if registry_flag not in {'0', '1'} or registry_events_flag not in {'0', '1'}:
             raise ValueError('Hub registry flags must be 0 or 1')
-        path = Path(os.environ.get("HUB_DB", "data/hub.sqlite3"))
-        bus_path = os.environ.get("AGENT_BUS_DB")
+        path = (deployment.hub_database if deployment is not None else
+                Path(os.environ.get("HUB_DB", "data/hub.sqlite3")))
+        bus_path = (deployment.bus_paths['AGENT_BUS_DB'] if deployment is not None else
+                    os.environ.get("AGENT_BUS_DB"))
         if bus_path and path.resolve() == Path(bus_path).resolve():
             raise ValueError("Hub requires a separate database")
         numeric = os.environ.get("HUB_BEAU_GITHUB_ID")
-        return cls(path, AuthSettings.from_env(), AuthConfig(
+        agent_auth = AuthSettings.from_env()
+        if deployment is not None:
+            agent_auth = replace(agent_auth, allowed_ips=frozenset(deployment.allowed_ips))
+        auth_config = deployment.auth_config if deployment is not None else AuthConfig(
             base_url=os.environ.get("HUB_BASE_URL", "https://hub.invalid"),
             github_client_id=os.environ.get("HUB_GITHUB_CLIENT_ID", ""),
             github_client_secret=os.environ.get("HUB_GITHUB_CLIENT_SECRET", ""),
@@ -114,10 +119,13 @@ class Settings:
                 os.environ.get("HUB_CF_ACCESS_ALLOWED_EMAILS", "").split(",") if email.strip()),
             alternate_origins=tuple(value.strip() for value in
                 os.environ.get("HUB_ALTERNATE_ORIGINS", "").split(",") if value.strip()),
-        ), Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
+        )
+        return cls(path, agent_auth, auth_config,
+                   Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
                    ingress_mode=os.environ.get("HUB_INGRESS_MODE", "combined"),
-                   agent_allowed_hosts=tuple(value.strip() for value in
-                       os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip()),
+                   agent_allowed_hosts=(deployment.allowed_hosts if deployment is not None else
+                       tuple(value.strip() for value in
+                             os.environ.get("HUB_AGENT_ALLOWED_HOSTS", "").split(",") if value.strip())),
                    work_queue_enabled=work_queue_flag == "1",
                    staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"),
                    registry_enabled=registry_flag == '1',
