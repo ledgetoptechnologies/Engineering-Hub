@@ -36,7 +36,11 @@ a dedicated standard Nginx TLS proxy to the staging executor's private Unix
 socket. A custom Python proxy or a second distributed scheduler is unnecessary.
 Nginx supports both [Unix-socket upstreams](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass)
 and [TLS server configuration](https://nginx.org/en/docs/http/ngx_http_ssl_module.html).
-This is an implementation choice, not a claim of installed or tested networking.
+This is not a claim of installed NAS-to-staging networking.
+
+The optional [NGINX template and acceptance notes](executor-nginx-https.md)
+now include an isolated actual NGINX TLS-to-UDS smoke. That proves the synthetic
+wire boundary only, not the NAS route, host UID mapping or executor activation.
 
 The proxy must expose only the submit, exact-command inspection and reconcile
 routes; preserve the caller's bearer without injecting credentials; allow only
