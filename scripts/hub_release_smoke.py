@@ -70,7 +70,7 @@ def smoke(image, commit):
             remove_owned('container', name, owner)
             names.remove(name)
         return {"source_commit": commit, "image_smoke": "passed", "canonical_host": "hub.ledgetoptechnologies.com",
-                "authenticated_agents": 3, "mcp_tools": 9, "human_sign_in": "disabled",
+                "authenticated_agents": 3, "mcp_tools": 10, "human_sign_in": "disabled",
                 "named_volume_recreation": "passed", "network": "none", "truenas": "not_deployed"}
     finally:
         for name in names:

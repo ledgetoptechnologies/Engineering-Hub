@@ -44,6 +44,8 @@ class TaskDTO(EntityDTO):
     candidate_commit: Commit | None
     review: ReviewDTO | None
     repair_count: int = Field(ge=0, le=3)
+    scope: Literal['staging'] | None = None
+    proposed_by: AgentId | None = None
 
 
 class DecisionDTO(EntityDTO):

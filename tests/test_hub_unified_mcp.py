@@ -39,7 +39,7 @@ BUS_TOOLS = {
 }
 HUB_TOOLS = {
     "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate", "hub_task_review",
-    "hub_decision_request", "hub_run_list", "hub_topic_peers", "hub_topic_preflight",
+    "hub_decision_request", "hub_run_list", "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
 }
 
 
@@ -120,7 +120,7 @@ def test_one_stateful_session_lists_exactly_bus_and_hub_tools(composed):
     with TestClient(core, base_url=BASE) as client:
         session = initialize(client)
         listed = result(rpc(client, "tools/list", session=session))["tools"]
-        assert len(listed) == 33
+        assert len(listed) == 34
         assert {tool["name"] for tool in listed} == BUS_TOOLS | HUB_TOOLS
         assert content(client, session, "hub_overview")["tasks"] == []
         assert bus.state.service.repository is bus.state.repository

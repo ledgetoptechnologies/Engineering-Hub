@@ -491,6 +491,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def agent(request: Request):
         return settings.agent_auth.agent(request)
 
+    from .task_proposal_api import attach_staging_task_routes
+    attach_staging_task_routes(app, repo=repo, agent=agent)
+
     def original_bearer(request):
         scheme, _, bearer = request.headers.get('authorization', '').partition(' ')
         return bearer if scheme.lower() == 'bearer' else None
@@ -660,30 +663,30 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return {"items": agents()}
 
-    @app.get("/api/hub/v1/tasks", response_model=TaskListDTO)
+    @app.get("/api/hub/v1/tasks", response_model=TaskListDTO, response_model_exclude_unset=True)
     def list_tasks(request: Request):
         actor(request)
         return {"items": repo.list_tasks()}
 
-    @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO)
+    @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):
         return repo.create_task(human(request, mutation=True), payload.project,
                                 payload.title, payload.client_request_id)
 
-    @app.get("/api/hub/v1/tasks/{task_id}", response_model=TaskDTO)
+    @app.get("/api/hub/v1/tasks/{task_id}", response_model=TaskDTO, response_model_exclude_unset=True)
     def get_task(task_id: str, request: Request):
         actor(request)
         return repo.get_task(task_id)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/claim", response_model=TaskDTO)
+    @app.post("/api/hub/v1/tasks/{task_id}/claim", response_model=TaskDTO, response_model_exclude_unset=True)
     def claim(task_id: str, payload: Revision, request: Request):
         return repo.claim_task(agent(request), task_id, payload.expected_revision)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/candidate", response_model=TaskDTO)
+    @app.post("/api/hub/v1/tasks/{task_id}/candidate", response_model=TaskDTO, response_model_exclude_unset=True)
     def candidate(task_id: str, payload: Candidate, request: Request):
         return repo.set_candidate(agent(request), task_id, payload.expected_revision, payload.commit)
 
-    @app.post("/api/hub/v1/tasks/{task_id}/review", response_model=TaskDTO)
+    @app.post("/api/hub/v1/tasks/{task_id}/review", response_model=TaskDTO, response_model_exclude_unset=True)
     def review(task_id: str, payload: Review, request: Request):
         return repo.review_task(agent(request), task_id, payload.expected_revision,
                                 payload.commit, payload.verdict)

@@ -72,7 +72,7 @@ def simulation(monkeypatch, module, *, fail=None):
             volumes.discard(args[-1])
         elif args[1] == "exec" and args[-2] == module.PROBE:
             stdout = json.dumps({"split_image_smoke": "passed", "build_commit": "b" * 40 if fail == "probe" else commit,
-                                 "authenticated_agents": 3, "mcp_tools": 9, "agent_bind": "0.0.0.0:8770",
+                                 "authenticated_agents": 3, "mcp_tools": 10, "agent_bind": "0.0.0.0:8770",
                                  "browser_bind": "127.0.0.1:8771", "human_sign_in": "not_tested", "network": "none"})
         elif args[1] == "exec" and args[-2] == module.DURABILITY_PROBE:
             stdout = json.dumps({"durable_records_verified": fail != "durable",
@@ -148,7 +148,7 @@ def test_probe_compiles_and_contains_no_fake_login_or_network_dependency(monkeyp
     tree = ast.parse(module.PROBE)
     assert any(isinstance(node, ast.Assert) for node in tree.body)
     for required in ("/proc/net/tcp", "/proc/net/tcp6", "00000000", "0100007F", "expected_commit",
-                     "expected_tools", "len(tools) == 9", "os.getuid() == 568", "ProxyHandler({})",
+                     "expected_tools", "len(tools) == 10", "os.getuid() == 568", "ProxyHandler({})",
                      "X-Forwarded-For", "CF-Access-Authenticated-User-Email", "forged"):
         assert required in module.PROBE
     assert "https://" not in module.PROBE

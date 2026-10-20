@@ -100,6 +100,48 @@
         }
       }
     },
+    "/api/hub/v1/staging/tasks": {
+      "post": {
+        "tags": [
+          "staging-tasks"
+        ],
+        "summary": "Propose an unclaimed staging-only task as an authenticated agent",
+        "description": "Persists scope and proposer; does not approve, execute, enroll a worker or authorize production.",
+        "operationId": "propose_api_hub_v1_staging_tasks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StagingTaskProposal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/autonomy": {
       "get": {
         "summary": "Autonomy Status",
@@ -2834,6 +2876,36 @@
         ],
         "title": "RunListDTO"
       },
+      "StagingTaskProposal": {
+        "properties": {
+          "project": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Project"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "client_request_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "project",
+          "title",
+          "client_request_id"
+        ],
+        "title": "StagingTaskProposal"
+      },
       "TaskDTO": {
         "properties": {
           "id": {
@@ -2917,6 +2989,34 @@
             "maximum": 3.0,
             "minimum": 0.0,
             "title": "Repair Count"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "staging"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "proposed_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposed By"
           }
         },
         "additionalProperties": false,
