@@ -184,6 +184,7 @@ class TopicSnapshot(Input):
     snapshot_revision: str | None
     registry_epoch: str | None = None
     event_source: Literal['hub_only', 'canonical_registry', 'none'] = 'hub_only'
+    tracking: Literal['not_configured', 'configured', 'unavailable'] = 'unavailable'
 
 
 class TopicPreflight(Input):
@@ -305,6 +306,24 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             result['pilot_lifecycle'] = owned_pilot_service.status
         return result
 
+    async def agents_for():
+        result = [{"id": name, "transport": "unknown", "chat_readiness": "unverified",
+                   "reason": "live_presence_adapter_not_configured"}
+                  for name in ("hermes", "codex", "claude")]
+        if bus_app is not None:
+            from agent_message_bus.push import PushPublisher
+            from .bus_connection import project_bus_connections, unavailable_connections
+            try:
+                publisher = bus_app.state.push_publisher
+                if type(publisher) is not PushPublisher:
+                    raise ValueError('Bus publisher unavailable')
+                connections = project_bus_connections(await publisher.presence_status())
+            except Exception:
+                connections = unavailable_connections()
+            for item in result:
+                item['connection'] = connections[item['id']]
+        return result
+
     async def peers_for(topic, *, principal=None, bearer=None):
         if not isinstance(topic, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic):
             raise HubError('invalid_topic', 422)
@@ -314,7 +333,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             except ValueError:
                 raise HubError('invalid_topic', 422) from None
             try:
-                return await registry_bridge.snapshot(principal, topic, agent_bearer=bearer)
+                return {**await registry_bridge.snapshot(principal, topic, agent_bearer=bearer),
+                        'tracking': 'configured'}
             except RegistryAccessDenied:
                 raise HubError('topic_read_forbidden', 403) from None
             except Exception:
@@ -329,10 +349,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 if observer is not None:
                     evidence['observer'] = observer.model_copy(
                         update={'now': datetime.now(timezone.utc)})
-                return project_topic_snapshot(topic, **evidence)
+                return {**project_topic_snapshot(topic, **evidence), 'tracking': 'configured'}
             except Exception:
-                pass  # Unavailable/malformed source is unknown, not unlinked.
-        return project_topic_snapshot(topic)
+                return {**project_topic_snapshot(topic), 'tracking': 'unavailable'}
+        return {**project_topic_snapshot(topic), 'tracking': 'not_configured'}
 
     async def preflight_for(topic, recipient, *, principal=None, bearer=None):
         if recipient not in {'codex', 'hermes', 'claude'}:
@@ -346,7 +366,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
-                          work_queue=work_queue, mcp=bus_mcp)
+                          work_queue=work_queue, mcp=bus_mcp,
+                          agent_status=agents_for if bus_app is not None else None)
     origin = urlsplit(settings.auth_config.origin)
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -607,11 +628,6 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                  "executor_enabled": False, "health": "unknown",
                  "reason": "inventory_and_acceptance_required"} for key, name in PROJECTS]
 
-    def agents():
-        return [{"id": name, "transport": "unknown", "chat_readiness": "unverified",
-                 "reason": "live_presence_adapter_not_configured"}
-                for name in ("hermes", "codex", "claude")]
-
     @app.head("/health", include_in_schema=False)
     @app.get("/health", response_model=HealthDTO if bus_app is None else None)
     async def health(request: Request):
@@ -642,11 +658,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return result
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
-    def overview(request: Request):
+    async def overview(request: Request):
         actor(request)
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_tasks(), "decisions": repo.list_decisions(),
-                "runs": repo.list_runs(), "agents": agents(), "autonomy": autonomy_for(),
+                "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
                                  "fixture_dispatch": fixture_workflow is not None,
@@ -658,10 +674,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         actor(request)
         return {"items": projects()}
 
-    @app.get("/api/hub/v1/agents", response_model=AgentListDTO)
-    def list_agents(request: Request):
+    @app.get("/api/hub/v1/agents", response_model=AgentListDTO, response_model_exclude_unset=True)
+    async def list_agents(request: Request):
         actor(request)
-        return {"items": agents()}
+        return {"items": await agents_for()}
 
     @app.get("/api/hub/v1/tasks", response_model=TaskListDTO, response_model_exclude_unset=True)
     def list_tasks(request: Request):

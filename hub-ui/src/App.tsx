@@ -11,6 +11,7 @@ import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { WorkQueuePanel } from "./WorkQueuePanel";
 import type {
+  AgentSummary,
   Decision,
   EventsStatus,
   Overview,
@@ -27,6 +28,46 @@ const names: Record<string, string> = {
 };
 const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
+
+function observationTime(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || timestamp > Date.now() + 30_000) return null;
+  return new Date(timestamp).toLocaleString();
+}
+
+function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
+  const connection = agent.connection;
+  const observed = observationTime(connection?.observed_at);
+  const observedAt = Date.parse(connection?.observed_at ?? "");
+  const deadline = connection?.valid_until ? Date.parse(connection.valid_until) : NaN;
+  const boundedDeadline = Number.isFinite(deadline) && Number.isFinite(observedAt) &&
+    deadline > observedAt && deadline <= observedAt + 30_000;
+  const fresh = boundedDeadline && deadline > Date.now();
+  const expired = observed && boundedDeadline && !fresh;
+  const countsValid = connection && Number.isInteger(connection.active_streams) &&
+    connection.active_streams! >= 0 && Number.isInteger(connection.inbox_subscriptions) &&
+    connection.inbox_subscriptions! >= 0;
+  const knownSource = connection?.source === "embedded_bus" && connection.scope === "this_server_process";
+  const connected = !stale && fresh && observed && countsValid && knownSource && connection?.state === "connected" &&
+    connection.active_streams! > 0;
+  const notObserved = !stale && fresh && observed && countsValid && knownSource && connection?.state === "not_observed" &&
+    connection.active_streams === 0;
+  return (
+    <div className="hub-connection-row">
+      <strong>{names[agent.id] ?? "Unknown agent"}</strong>
+      <span>{stale ? "Hub connection snapshot unverified" : !connection ? "Hub connection unknown" : expired ? "Hub connection snapshot expired" : connected ? "Connected to Hub" :
+        notObserved ? "No active push stream observed" : "Hub connection unavailable"}</span>
+      {!stale && fresh && observed && countsValid && knownSource && connection?.state !== "unavailable" && (
+        <small>{connection!.active_streams} active stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)</small>
+      )}
+      {observed && <small>Snapshot observed: {observed}</small>}
+      {!stale && fresh && observed && knownSource && connection?.state !== "unavailable" && observationTime(connection?.last_stream_write_at) && (
+        <small>Last stream write: {observationTime(connection?.last_stream_write_at)}</small>
+      )}
+    </div>
+  );
+}
 const topicDenied = (error: unknown) =>
   error instanceof HubApiError && error.status === 403 &&
   ["topic_read_forbidden", "ingress_forbidden"].includes(error.code);
@@ -414,7 +455,7 @@ export function HubApp() {
   }, [client, demo, session?.authenticated, topic, registryEpoch, registryRetry, clearPrivateWorkspace]);
 
   useEffect(() => {
-    const deadlines = (peers?.items ?? [])
+    const topicDeadlines = (peers?.items ?? [])
       .filter(
         (peer) =>
           ["reachable", "busy_queued"].includes(peer.status) &&
@@ -422,6 +463,10 @@ export function HubApp() {
       )
       .map((peer) => Date.parse(peer.valid_until!))
       .filter((time) => time > Date.now());
+    const deadlines = [...topicDeadlines, ...(data?.agents ?? [])
+      .map((agent) => Math.min(Date.parse(agent.connection?.valid_until ?? ""),
+        Date.parse(agent.connection?.observed_at ?? "") + 30_000))
+      .filter((time) => Number.isFinite(time) && time > Date.now())];
     if (!deadlines.length) return;
     // Local expiry only: no HTTP, inbox, model, or status polling.
     const timer = setTimeout(
@@ -429,7 +474,7 @@ export function HubApp() {
       Math.min(...deadlines) - Date.now() + 10,
     );
     return () => clearTimeout(timer);
-  }, [peers, expiryTick]);
+  }, [peers, data, expiryTick]);
 
   async function mutate(operation: () => Promise<unknown>, success: string) {
     setWorking(true);
@@ -513,7 +558,7 @@ export function HubApp() {
   const peerState = (peer: PublicReachability) =>
     (!demo && (stale || topicStale)) ||
     (["reachable", "busy_queued"].includes(peer.status) &&
-      (!peer.valid_until || Date.parse(peer.valid_until) <= Date.now()))
+      (!peer.valid_until || !Number.isFinite(Date.parse(peer.valid_until)) || Date.parse(peer.valid_until) <= Date.now()))
       ? "unknown_stale"
       : peer.status;
 
@@ -1091,8 +1136,19 @@ export function HubApp() {
               <section className="panel" id="agents">
                 <PanelTitle number="04" title="Agents & topic" />
                 <p className="panel-description">
-                  Connected to this conversation, not just connected somewhere.
+                  Hub transport and readiness in this conversation are separate observations.
                 </p>
+                <h3 className="agent-section-title">Hub connection snapshots</h3>
+                <div className="hub-connection-list">
+                  {data.agents.map((agent) => (
+                    <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />
+                  ))}
+                </div>
+                <p className="panel-footnote">
+                  A push stream or inbox subscription does not prove the agent is running a model,
+                  attached to this topic, or ready to receive work. Missing streams do not mean offline.
+                </p>
+                <h3 className="agent-section-title">Topic readiness</h3>
                 <form className="topic-form" onSubmit={checkTopic}>
                   <label htmlFor="topic-root">TOPIC ROOT</label>
                   <div>
@@ -1115,8 +1171,12 @@ export function HubApp() {
                     {topicError}
                   </p>
                 )}
+                {peers?.tracking === "not_configured" && !topicError && (
+                  <p className="topic-tracking">{!demo && (stale || topicStale)
+                    ? "Topic readiness: Snapshot unverified" : "Topic readiness: Not tracked yet"}</p>
+                )}
                 <div className="peer-list">
-                  {peers?.items.map((peer) => {
+                  {peers?.tracking !== "not_configured" && peers?.items.map((peer) => {
                     const state = peerState(peer);
                     return (
                       <div className="peer-row" key={peer.agent}>

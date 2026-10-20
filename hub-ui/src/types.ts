@@ -83,6 +83,18 @@ export interface AgentSummary {
   transport: string;
   chat_readiness: string;
   reason: string;
+  connection?: {
+    state: "connected" | "not_observed" | "unavailable";
+    source: "embedded_bus";
+    scope: "this_server_process";
+    observed_at: string | null;
+    valid_until: string | null;
+    active_streams: number | null;
+    inbox_subscriptions: number | null;
+    subscribed: boolean | null;
+    last_stream_write_at: string | null;
+    native_push_available: boolean | null;
+  };
 }
 export interface AutonomyStatus {
   configured: boolean;
@@ -157,6 +169,7 @@ export interface PublicReachability {
 }
 export type TopicPeer = PublicReachability;
 export interface TopicSnapshot {
+  tracking?: "not_configured" | "configured" | "unavailable";
   registry_epoch?: string | null;
   event_source?: "hub_only" | "canonical_registry" | "none";
   topic: string;

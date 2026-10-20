@@ -1,10 +1,106 @@
 import { expect, test } from "@playwright/test";
 import type { Page, Request } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import type { AgentSummary, TopicSnapshot } from "../src/types";
 
 const NOW = new Date("2026-10-17T18:00:00.000Z");
 const ORIGIN = "http://127.0.0.1:5174";
 const CSRF = "fixture-human-only-csrf";
+
+const hubConnection = (state: "connected" | "not_observed" = "connected"): NonNullable<AgentSummary["connection"]> => ({
+  state, source: "embedded_bus", scope: "this_server_process", observed_at: NOW.toISOString(),
+  valid_until: new Date(NOW.getTime() + 30_000).toISOString(), active_streams: state === "connected" ? 1 : 0,
+  inbox_subscriptions: 0, subscribed: false, last_stream_write_at: NOW.toISOString(), native_push_available: true,
+});
+
+test("Hub connection snapshots remain distinct from unconfigured topic readiness", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page, { tracking: "not_configured" });
+  mock.overview.agents[0].connection = hubConnection();
+  mock.overview.agents[1].connection = hubConnection("not_observed");
+  await page.goto("/");
+  const rows = page.locator(".hub-connection-row");
+  await expect(rows.filter({ hasText: "Codex" })).toContainText("Connected to Hub");
+  await expect(rows.filter({ hasText: "Codex" })).toContainText("0 inbox subscription(s)");
+  await expect(rows.filter({ hasText: "Hermes" })).toContainText("No active push stream observed");
+  await expect(rows.filter({ hasText: "Claude" })).toContainText("Hub connection unknown");
+  await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toBeVisible();
+  await expect(page.locator(".peer-row")).toHaveCount(0);
+  await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Missing streams do not mean offline.", { exact: false })).toBeVisible();
+});
+
+test("Hub connection observations expire locally without polling", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page, { tracking: "not_configured" });
+  mock.overview.agents[0].connection = hubConnection();
+  await page.goto("/");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  const reads = mock.reads();
+  await page.clock.runFor(30_100);
+  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub connection snapshot expired", { exact: true })).toBeVisible();
+  expect(mock.reads()).toBe(reads);
+});
+
+test("loss of overview event feed invalidates connection and not-configured topic snapshots", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  await controllableEvents(page);
+  const mock = await mockLive(page, { events: true, tracking: "not_configured" });
+  mock.overview.agents[0].connection = hubConnection();
+  await page.goto("/");
+  await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
+  await emit(page, "invalidate");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await emit(page, "error");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub connection snapshot unverified", { exact: true })).toHaveCount(3);
+  await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Topic readiness: Snapshot unverified", { exact: true })).toBeVisible();
+});
+
+test("configured-but-unknown topic remains unverified while Hub transport is connected", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page, { tracking: "configured" });
+  mock.overview.agents[0].connection = hubConnection();
+  await page.route("**/api/hub/v1/topics/*/peers", (route) => {
+    const snapshot = createDemoTopic("auto-wake-v1-test", NOW);
+    snapshot.tracking = "configured";
+    snapshot.items = snapshot.items.map((item) => ({ ...item, status: "unknown_stale", reason: "observer_unavailable" }));
+    return route.fulfill({ json: snapshot });
+  });
+  await page.goto("/");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.locator(".peer-row").getByText("Unknown", { exact: true })).toHaveCount(3);
+  await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
+});
+
+test("topic errors do not erase independent Hub connection snapshots", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  mock.overview.agents[0].connection = hubConnection();
+  await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
+  await page.goto("/");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.getByText("Topic status unavailable.", { exact: false })).toBeVisible();
+  await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
+  await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
+  await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
+  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub connection snapshot unverified", { exact: true })).toHaveCount(3);
+});
+
+test("invalid or future connection timestamps never render current connection evidence or HTML", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page);
+  mock.overview.agents[0].connection = { ...hubConnection(), observed_at: "<img src=x onerror=alert(1)>" };
+  mock.overview.agents[1].connection = { ...hubConnection(), observed_at: new Date(NOW.getTime() + 60_000).toISOString() };
+  mock.overview.agents[2].connection = { ...hubConnection(), valid_until: "not-a-date", last_stream_write_at: "<script>alert(1)</script>" };
+  await page.goto("/");
+  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub connection unavailable", { exact: true })).toHaveCount(3);
+  await expect(page.locator(".hub-connection-row img, .hub-connection-row script")).toHaveCount(0);
+});
 
 test("agent staging proposals show proposer and scope without implying ownership", async ({ page }) => {
   const mock = await mockLive(page);
@@ -65,7 +161,7 @@ test("held rollback reports why it needs attention without claiming rollback suc
 
 async function mockLive(
   page: Page,
-  { signedIn = true, events = false, expires = false, canonical = false, access = false, bootstrap = false, bootstrapDenied = false } = {},
+  { signedIn = true, events = false, expires = false, canonical = false, access = false, bootstrap = false, bootstrapDenied = false, tracking = undefined as TopicSnapshot["tracking"] } = {},
 ) {
   const overview = createDemoOverview(NOW);
   const requests: Request[] = [];
@@ -168,6 +264,7 @@ async function mockLive(
         path.split("/topics/")[1].replace("/peers", ""),
       );
       const snapshot = createDemoTopic(topic, NOW);
+      if (tracking) snapshot.tracking = tracking;
       if (canonical) {
         snapshot.event_source = "canonical_registry";
         snapshot.registry_epoch = "12345678-1234-1234-1234-123456789abc";

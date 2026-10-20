@@ -745,6 +745,25 @@ h1 > span {
 .peer-list {
   margin-top: 15px;
 }
+.agent-section-title {
+  margin-top: 18px;
+  font-size: 12px;
+}
+.hub-connection-row {
+  display: grid;
+  gap: 3px;
+  padding: 10px 0;
+  border-bottom: 1px solid #edf0e7;
+  font-size: 11px;
+}
+.hub-connection-row small {
+  color: #65705f;
+  font-size: 10px;
+}
+.topic-tracking {
+  color: #65705f;
+  font-size: 12px;
+}
 .peer-row {
   display: flex;
   align-items: center;
