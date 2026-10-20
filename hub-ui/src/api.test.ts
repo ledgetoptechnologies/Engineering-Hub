@@ -8,6 +8,41 @@ const response = (body: unknown, status = 200) =>
   });
 
 describe("live human API boundary", () => {
+  it("automatically bootstraps only a missing Cloudflare session using same-origin POST", async () => {
+    const authenticated = { authenticated: true, actor: "human:cf:fixture", csrf_token: "csrf", github_id: null, auth_provider: "cloudflare_access" };
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ authenticated: false, auth_provider: "cloudflare_access" }))
+      .mockResolvedValueOnce(response(authenticated));
+    expect(await new HubClient({ mode: "live", fetchImpl }).getSession()).toEqual(authenticated);
+    expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual(["/api/hub/v1/auth/me", "/api/hub/v1/auth/bootstrap"]);
+    const options = fetchImpl.mock.calls[1][1]!;
+    expect(options).toMatchObject({ method: "POST", credentials: "same-origin", redirect: "error", body: "{}" });
+    const headers = options.headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
+    expect(headers.Origin).toBeUndefined(); // Browser supplies the real Origin.
+    expect(headers["X-Hub-CSRF"]).toBeUndefined();
+  });
+
+  it("never bootstraps GitHub or an existing authenticated Cloudflare session", async () => {
+    for (const session of [{ authenticated: false }, { authenticated: true, auth_provider: "cloudflare_access" }]) {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response(session));
+      expect(await new HubClient({ mode: "live", fetchImpl }).getSession()).toEqual(session);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("does not retry failed bootstrap or override an explicitly suppressed session", async () => {
+    const signedOut = { authenticated: false, auth_provider: "cloudflare_access" };
+    const denied = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(signedOut))
+      .mockResolvedValueOnce(response({ detail: "denied" }, 403));
+    await expect(new HubClient({ mode: "live", fetchImpl: denied }).getSession()).rejects.toMatchObject({ status: 403 });
+    expect(denied).toHaveBeenCalledTimes(2);
+    const suppressed = vi.fn<typeof fetch>().mockImplementation(async () => response(signedOut));
+    expect(await new HubClient({ mode: "live", fetchImpl: suppressed }).getSession()).toEqual(signedOut);
+    expect(suppressed).toHaveBeenCalledTimes(2);
+  });
+
   it("preserves the exact topic ACL denial code without downgrading other forbidden failures", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code: "topic_read_forbidden" } }, 403));
     await expect(new HubClient({ mode: "live", fetchImpl }).getTopic("topic")).rejects.toMatchObject({ status: 403, code: "topic_read_forbidden" });

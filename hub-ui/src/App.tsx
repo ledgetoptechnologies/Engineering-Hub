@@ -225,6 +225,9 @@ export function HubApp() {
         setSession(nextSession);
         if (!nextSession.authenticated) {
           clearPrivateWorkspace();
+          // Retain only the unauthenticated response's public provider hint;
+          // private workspace/session data was cleared above.
+          setSession(nextSession);
           return false;
         }
         setPeers(null);
@@ -775,8 +778,9 @@ export function HubApp() {
                   Sign in securely <Icon kind="arrow" />
                 </a>
                 <p className="small-text">
-                  Sign-in is available only after the approved identity provider
-                  is configured. Agent tokens cannot be used here.
+                  {session?.auth_provider === "cloudflare_access"
+                    ? "Cloudflare Access protects this workspace. If you signed out, continue to open a new Hub session."
+                    : "Sign-in is available only after the approved identity provider is configured. Agent tokens cannot be used here."}
                 </p>
                 <a className="text-link" href="/?demo=1">
                   Explore a clearly labelled demo instead →

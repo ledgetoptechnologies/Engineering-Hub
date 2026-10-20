@@ -307,7 +307,17 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
     provider = github_client or GitHubIdentityProvider(config)
     router = APIRouter(prefix="/api/hub/v1/auth", tags=["human-auth"])
     state_cookie = config.cookie_name + "_oauth"
+    signed_out_cookie = config.cookie_name + "_signed_out"
     cookie_options = {"httponly": True, "secure": config.secure, "samesite": "lax", "path": "/"}
+
+    def session_response(session):
+        valid = session is not None
+        data = {"authenticated": valid, "actor": session["actor"] if valid else None,
+                "csrf_token": session["csrf_token"] if valid else None,
+                "github_id": session["github_id"] if valid else None}
+        if config.human_auth_mode == "cloudflare_access":
+            data.update(auth_provider="cloudflare_access", email=session["email"] if valid else None)
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     @router.get("/login")
     async def login(request: Request):
@@ -322,6 +332,7 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
             response = RedirectResponse("/", status_code=303)
             response.set_cookie(config.cookie_name, session["cookie_token"],
                                 max_age=max(0, int(session["expires"] - auth_store.clock())), **cookie_options)
+            response.delete_cookie(signed_out_cookie, **cookie_options)
             response.headers["Cache-Control"] = "no-store"
             return response
         if not config.github_client_id or not config.github_client_secret or config.beau_github_id is None:
@@ -365,14 +376,38 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
 
     @router.get("/me")
     async def me(request: Request):
-        session = human_session(request, config, auth_store)
-        valid = session is not None
-        data = {"authenticated": valid, "actor": session["actor"] if valid else None,
-                             "csrf_token": session["csrf_token"] if valid else None,
-                             "github_id": session["github_id"] if valid else None}
-        if config.human_auth_mode == "cloudflare_access":
-            data.update(auth_provider="cloudflare_access", email=session["email"] if valid else None)
-        return JSONResponse(data, headers={"Cache-Control": "no-store"})
+        return session_response(human_session(request, config, auth_store))
+
+    @router.post("/bootstrap")
+    async def bootstrap(request: Request):
+        # A first-party UI may establish its CSRF-protected local session from
+        # an independently verified Access identity, without another login click.
+        # GET /me remains read-only and GitHub still requires its OAuth flow.
+        if config.human_auth_mode != "cloudflare_access":
+            raise HTTPException(404, "Not found")
+        if config.cloudflare_config is None:
+            raise HTTPException(503, "Human sign-in is not configured")
+        identity = getattr(request.state, "cloudflare_identity", None)
+        if request.headers.get("authorization") or type(identity) is not CloudflareIdentity:
+            raise HTTPException(getattr(request.state, "cloudflare_auth_error", 401), "Human sign-in required")
+        if request.headers.get("origin") != config.origin:
+            raise HTTPException(403, "Request verification failed")
+        if request.cookies.get(signed_out_cookie):
+            # This marker only suppresses convenience sign-in; it cannot grant
+            # access. Explicit /login clears it after fresh identity verification.
+            return session_response(None)
+        existing = human_session(request, config, auth_store)
+        if existing is not None:
+            return session_response(existing)  # Never rotate CSRF or slide expiry.
+        if request.cookies.get(config.cookie_name):
+            # Do not silently replace an expired, revoked or mismatched session.
+            raise HTTPException(401, "Human sign-in required")
+        session = auth_store.create_cloudflare_session(config, identity)
+        current = auth_store.cloudflare_session_for(session["cookie_token"], config, identity)
+        response = session_response(current)
+        response.set_cookie(config.cookie_name, session["cookie_token"],
+                            max_age=max(0, int(session["expires"] - auth_store.clock())), **cookie_options)
+        return response
 
     @router.post("/logout")
     async def logout(request: Request):
@@ -383,6 +418,8 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
             auth_store.delete_session(request.cookies.get(config.cookie_name))
         response = JSONResponse({"authenticated": False}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(config.cookie_name, **cookie_options)
+        if config.human_auth_mode == "cloudflare_access":
+            response.set_cookie(signed_out_cookie, "1", max_age=int(auth_store.session_ttl), **cookie_options)
         return response
 
     return router
