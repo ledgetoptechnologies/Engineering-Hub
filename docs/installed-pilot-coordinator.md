@@ -69,13 +69,17 @@ This pilot uses an ordinary private Hub core, not a second production message bu
 ## Packaging and live acceptance
 
 Use independently approved immutable core and optional wheel artifacts containing
-both this module and `ContainerPilotClient.for_private_unix`. The previous
-published core default in the executor image recipe predates that client method;
-its version string alone does not establish compatibility. The earlier locally
-tested executor wheel/image did not contain this coordinator module. Rebuild and
-verify installed paths, source hashes and exact entrypoint for this role before
-claiming installed coordinator readiness. Do not mount a mutable checkout as a
-substitute or silently change the executor's fixed entrypoint.
+both this module and `ContainerPilotClient.for_private_unix`. The recipe now pins
+the verified `f40ada02...` core (main `cb7b790...`) instead of the earlier
+`805d1f8...` default that predates that client method. Current wheel/archive
+checks require both coordinator and launch-supervisor modules. The earlier
+locally tested executor wheel/image did not contain this coordinator module;
+the changed source does not update those old artifacts. Rebuild and run
+`scripts/hub_executor_image_smoke.py` against the exact new image/source to check
+installed paths, source hashes, client compatibility and fixed entrypoint.
+Neither version strings nor this offline import check establish installed
+coordinator readiness. Do not mount a mutable checkout as a substitute or
+silently change the executor's fixed entrypoint.
 
 A colocated Unix connection is not remote reachability. TrueNAS-to-staging still
 needs an explicitly reviewed authenticated forwarding boundary with correct

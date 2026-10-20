@@ -1,7 +1,7 @@
 # Optional consumer image only; does not install or activate the host issuer.
 # Use a prepared, trusted context containing ONLY this recipe, executor.whl and
 # validate_executor_wheel.py (the reviewed verify_hub_executor_wheel.py source).
-ARG CORE_IMAGE=ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:805d1f825d9b4ac29061de36fd637873c746a8f44dcbd61b7d54053d24f1b45c
+ARG CORE_IMAGE=ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:f40ada02aed973b7bbb8ad47c50dc40ce0dfff39b99b9b8a42eb07955dfebcad
 FROM ${CORE_IMAGE} AS core
 
 FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS python-runtime

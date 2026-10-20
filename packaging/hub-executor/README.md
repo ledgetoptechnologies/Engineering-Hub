@@ -2,8 +2,10 @@
 
 This separate packaging project installs the Linux-only `hub_container_executor`
 library and its existing `scripts.inspect_hub_image_identity` dependency. The
-package includes the explicit `hub_container_executor.installed_runner` module
-and direct launch-receipt transport. It does not change the core distribution,
+package requires the explicit `hub_container_executor.installed_runner`,
+`installed_coordinator`, and `launch_supervisor` modules plus the direct
+launch-receipt transport. A self-consistent wheel or archive missing these
+installation components is rejected. It does not change the core distribution,
 provide a console-script wrapper, provision an issuer, or activate an executor.
 `agent-message-bus==0.6.0` must be installed from
 the independently pinned core artifact, not merely resolved by version from a
@@ -61,7 +63,9 @@ an offline, dependency-free installation. Embedded metadata is not independent
 provenance; approval of the expected wheel hash and commit remains external.
 
 `CORE_IMAGE` defaults to the published Hub control artifact at
-`ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:805d1f825d9b4ac29061de36fd637873c746a8f44dcbd61b7d54053d24f1b45c`.
+`ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:f40ada02aed973b7bbb8ad47c50dc40ce0dfff39b99b9b8a42eb07955dfebcad`
+(main source `cb7b790ecc0e46b9134130c6cbb87387f80a371b`). This replaces the
+earlier `805d1f8...` default, which predates the coordinator's private Unix client.
 An explicit override must also be a full digest reference. This stage is only a
 source of `/opt/venv`, never executed during the build. Registry access may
 require authentication configured outside the context. A locally validated
@@ -84,3 +88,27 @@ defaults without checkout access. Real PID1 receipt exchange, rootless mappings,
 effective mount/cgroup permissions, provisioned TEST slots, resource budgets and
 real validate/deploy/health/rollback remain separate gates. The recipe does not
 grant access to a Docker daemon or any host path by itself.
+
+## Offline installed-image compatibility check
+
+After loading the explicitly built executor image, run:
+
+```text
+python scripts/hub_executor_image_smoke.py --image engineering-hub-executor:build-<unique-build> --commit <exact-40-character-source-commit>
+```
+
+The helper never pulls. It resolves the selected build tag (or full executor
+digest reference) to its local image ID, checks fixed runner defaults, and runs
+one fixed inert import probe under UID/GID 10001, isolated Python, read-only root,
+no capabilities, no new privileges, no network, no host mounts or secrets, and
+256 MiB/no additional swap, one CPU and 64 PIDs. It checks installed module paths
+and source hashes against the packaged source record and refuses a core lacking
+`ContainerPilotClient.for_private_unix`. It verifies the actual container's
+effective isolation/resources and removes only its independently labelled test
+container. It does not invoke runner/coordinator serving or the root supervisor.
+
+This is artifact consistency/compatibility, not independent build approval,
+issuer exchange, kernel mapping/cgroup acceptance for the intended installed
+topology, a real queued deployment, TrueNAS integration or reboot recovery.
+The helper is not a general command loader, executor installer or a replacement
+for the independently approved immutable release enrollment.
