@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -136,6 +137,38 @@ class ContainerPilotClient:
             timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 5.0)),
             follow_redirects=False, trust_env=False, transport=transport,
         )
+
+    @classmethod
+    def for_verified_https(cls, origin, service_token, ca_pem, *, timeout_seconds=125.0):
+        """Inert dedicated HTTPS client using only explicitly captured CA bytes.
+
+        No environment CA/proxy/key-log discovery, redirects or transport retries.
+        The caller must independently provision and pin those CA bytes and the
+        endpoint hostname. Trust in a CA is not host/executor enrollment proof.
+        """
+        try:
+            parsed = urlsplit(origin)
+            if (type(origin) is not str or parsed.scheme != 'https' or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.path or parsed.query
+                    or parsed.fragment or origin != 'https://' + parsed.netloc
+                    or not origin.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in origin)
+                    or '\\' in origin):
+                raise ValueError()
+            parsed.port
+            _validate_credential_and_timeout(service_token, timeout_seconds, cls.MAX_TIMEOUT_SECONDS)
+            if type(ca_pem) is not bytes or not 0 < len(ca_pem) <= 1024 * 1024:
+                raise ValueError()
+            # create_default_context() can honor SSLKEYLOGFILE. A bare client
+            # context does not discover environment key logging or default CAs.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.check_hostname = True
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_verify_locations(cadata=ca_pem.decode('ascii'))
+        except Exception:
+            raise ValueError('Invalid verified executor HTTPS configuration') from None
+        transport = httpx.AsyncHTTPTransport(verify=context, trust_env=False, retries=0)
+        return cls(origin, service_token, timeout_seconds=timeout_seconds, transport=transport)
 
     @classmethod
     def for_private_unix(cls, path, service_token, *, timeout_seconds=125.0):
