@@ -55,7 +55,7 @@ BUS = {'send_message','get_send_receipt','presence_status','receive_messages','w
  'knowledge_list','knowledge_search','semantic_search','semantic_status','file_put','file_get',
  'file_list','file_history','feedback_submit','feedback_get','feedback_list','feedback_update','bus_info'}
 HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_task_review',
- 'hub_decision_request','hub_run_list','hub_topic_peers','hub_topic_preflight'}
+ 'hub_decision_request','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose'}
 
 async def call(session, name, args=None):
     result = await session.call_tool(name, args or {})
@@ -117,7 +117,7 @@ async def main():
         fields = line.split()
         assert not (fields[3] == '0A' and int(fields[1].split(':')[1],16) in (8765,8770,8771))
     print(json.dumps({'settings_profile':'passed','build_commit':commit,'authenticated_agents':3,
-        'mcp_tools':33,'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
+        'mcp_tools':34,'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
         'agent_bind':'0.0.0.0:8770','browser_bind':'0.0.0.0:8771','alias':'none'}))
 
 asyncio.run(asyncio.wait_for(main(),50))

@@ -1041,6 +1041,9 @@ export function HubApp() {
                         <span>
                           <strong>{task.title}</strong>
                           <small>{projectName(task.project)}</small>
+                          {task.scope === "staging" && task.proposed_by && (
+                            <small>Staging proposal · {names[task.proposed_by]}</small>
+                          )}
                         </span>
                         <span className="owner">
                           <span className="mini-avatar">

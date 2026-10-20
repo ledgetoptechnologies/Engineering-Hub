@@ -6,6 +6,18 @@ const NOW = new Date("2026-10-17T18:00:00.000Z");
 const ORIGIN = "http://127.0.0.1:5174";
 const CSRF = "fixture-human-only-csrf";
 
+test("agent staging proposals show proposer and scope without implying ownership", async ({ page }) => {
+  const mock = await mockLive(page);
+  mock.overview.tasks[0].scope = "staging";
+  mock.overview.tasks[0].proposed_by = "hermes";
+  mock.overview.tasks[0].owner = null;
+  mock.overview.tasks[0].status = "assigned";
+  await page.goto("/");
+  const row = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[0].title });
+  await expect(row.getByText("Staging proposal · Hermes", { exact: true })).toBeVisible();
+  await expect(row.locator(".owner")).toContainText("Unclaimed");
+});
+
 test("Cloudflare opens the workspace without an extra sign-in click and respects sign-out", async ({ page }) => {
   const mock = await mockLive(page, { signedIn: false, access: true, bootstrap: true });
   await page.goto("/");

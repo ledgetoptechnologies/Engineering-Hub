@@ -32,6 +32,8 @@ export interface Task extends Versioned {
   candidate_commit: string | null;
   review: Review | null;
   repair_count: number;
+  scope?: "staging" | null;
+  proposed_by?: Agent | null;
 }
 export interface Decision extends Versioned {
   project: ProjectId;

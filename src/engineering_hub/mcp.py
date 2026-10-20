@@ -86,6 +86,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return result
 
     @mcp.tool()
+    def hub_staging_task_propose(project: str, title: str, client_request_id: str, ctx: Context) -> dict:
+        """Create an unclaimed staging-only task, not approval or execution.
+
+        Reuse a request ID only for the same payload. An independent agent must
+        review an exact candidate; registered execution admission is separate.
+        """
+        return invoke(repo.propose_staging_task, identity(ctx), project, title, client_request_id)
+
+    @mcp.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:
         """Read an assigned Hub task."""
         identity(ctx)
@@ -196,7 +205,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             job_id=data.job_id, worker=WorkWorker(principal, data.instance_id),
             fence=data.fence, outcome=data.outcome, evidence_id=data.evidence_id))
 
-    # Default/off deployments preserve the established nine-tool contract and
+    # Default/off deployments expose task proposals but
     # must not advertise an unconfigured worker/admission capability.
     if work_queue is not None:
         for operation in (hub_work_status, hub_work_jobs, hub_work_get, hub_work_submit,

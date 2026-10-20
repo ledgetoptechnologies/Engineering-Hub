@@ -242,6 +242,44 @@ class HubRepository:
     def list_tasks(self):
         return self._list('task')
 
+    def propose_staging_task(self, actor, project, title, client_request_id):
+        """An agent may propose work, never grant execution or production authority."""
+        self._actor(actor, agent=True)
+        self._project(project)
+        title, key = self._text(title), self._text(client_request_id, 128)
+        fingerprint = hashlib.sha256(_json(['staging_task_proposal', project, title]).encode()).hexdigest()
+        with self._transaction() as db:
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'task')
+            item = self._save(db, actor, 'task.proposed', 'task', dict(
+                id=str(uuid.uuid4()), project=project, title=title, status='assigned',
+                owner=None, candidate_commit=None, review=None, repair_count=0,
+                scope='staging', proposed_by=actor), new=True)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
+    def task_allows_environment(self, task_id, environment, *, db=None):
+        """Persisted proposal scope is an unconditional veto, not an approval.
+
+        Legacy taskless coordination targets retain their existing semantics.
+        Scope is never accepted from a queue caller or changed by task updates.
+        """
+        if db is None:
+            with self._connection() as connection:
+                return self.task_allows_environment(task_id, environment, db=connection)
+        row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (task_id,)).fetchone()
+        if row is None:
+            return True
+        task = json.loads(row['data'])
+        if 'scope' not in task and 'proposed_by' not in task:
+            return True
+        return (task.get('scope') == 'staging' and type(task.get('proposed_by')) is str
+                and task['proposed_by'] in AGENTS
+                and environment == 'staging')
+
     def get_task(self, identity):
         return self._read(identity, 'task')
 

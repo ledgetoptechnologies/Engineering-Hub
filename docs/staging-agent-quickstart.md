@@ -112,9 +112,21 @@ rollback, durable held handling and installed restart behavior. Keep container
 fixture results separate from host/reboot acceptance. Stop at any missing input;
 do not substitute a permissive callback or edit held SQL to make the pilot pass.
 
-1. Beau creates a Hub task. An agent claims it, proposes a full lowercase
+1. Beau creates a Hub task, or an authenticated agent creates an unclaimed
+   **staging-only** task using `hub_staging_task_propose` or
+   `POST /api/hub/v1/staging/tasks`. The strict payload is
+   `{"project":"engineering-hub","title":"Verify candidate","client_request_id":"unique-request"}`.
+   Reuse the request ID only for the identical project/title; identity is derived
+   from the existing agent bearer, never a supplied actor or owner. Persisted
+   `scope: staging` and `proposed_by` remain visible in task records and the UI;
+   the transactional audit records `task.proposed`. Creation grants no review,
+   worker enrollment, execution, infrastructure or production authority. Existing
+   human-only `POST /tasks` is unchanged. An agent claims the task, proposes a full lowercase
    40-character candidate commit, and a **different** agent approves that exact
    commit using the existing `/api/hub/v1/tasks/...` review workflow.
+   Agent-proposed staging scope is an unconditional queue veto for production
+   admission, including direct queue submission and claim/restart revalidation,
+   even if a separately configured production approval verifier returns true.
 2. The task's owning agent submits a registered action, environment, task UUID,
    exact reviewed source commit, and `sha256:` artifact digest. The target is
    immutable after submission. A digest identifies the requested artifact; it

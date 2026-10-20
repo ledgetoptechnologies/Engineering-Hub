@@ -134,7 +134,7 @@ def test_discovery_and_every_tool_authentication(rig):
 def test_unconfigured_mcp_queue_never_claims_readiness(rig):
     with rig[3](None) as client:
         names = {tool['name'] for tool in rpc(client, 'tools/list').json()['result']['tools']}
-        assert len(names) == 9 and not TOOLS & names
+        assert len(names) == 10 and not TOOLS & names
         assert call(client, 'hub_work_status', {}).get('isError') is True
         response = client.get('/api/hub/v1/work/status', headers={'Authorization': 'Bearer test-codex'})
         assert response.status_code == 423

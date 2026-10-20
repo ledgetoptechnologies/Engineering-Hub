@@ -78,7 +78,7 @@ def test_real_app_passes_configured_queue_to_authenticated_mcp(tmp_path):
             'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
         assert response.status_code == 200
         tools = {tool['name'] for tool in response.json()['result']['tools']}
-        assert len(tools) == 16 and 'hub_work_status' in tools
+        assert len(tools) == 17 and 'hub_work_status' in tools
         response = client.post('/mcp/', headers=headers, json={
             'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
             'params': {'name': 'hub_work_status', 'arguments': {'payload': {}}}})

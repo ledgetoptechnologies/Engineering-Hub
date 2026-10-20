@@ -183,6 +183,8 @@ class WorkQueue:
         return action.project
 
     def _target_verified(self, actor, action_key, environment, target):
+        if not self.repo.task_allows_environment(target.task_id, environment):
+            return False
         if self.target_verifier is None:
             return False
         try:
@@ -227,6 +229,8 @@ class WorkQueue:
         target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
         with self.repo._transaction() as db:
+            if not self.repo.task_allows_environment(target.task_id, environment, db=db):
+                raise HubError('work_target_not_verified', 403)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
                 if old['fingerprint'] != fingerprint:

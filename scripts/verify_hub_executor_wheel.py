@@ -25,6 +25,7 @@ DIST = 'engineering_hub_container_executor-0.1.0.dist-info'
 PROVENANCE = 'hub_container_executor/_executor_source.json'
 REQUIRED = frozenset('hub_container_executor/' + name + '.py' for name in (
     '__init__', 'service', 'local_resources', 'runtime_identity', 'installed_runner',
+    'installed_coordinator', 'launch_supervisor',
     'launch_transport')) | {'scripts/inspect_hub_image_identity.py', PROVENANCE,
                             DIST + '/METADATA', DIST + '/WHEEL', DIST + '/RECORD'}
 
