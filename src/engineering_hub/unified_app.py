@@ -10,7 +10,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .app import Settings, create_app
 
 
-def create_unified_app(settings=None):
+def create_unified_app(settings=None, *, bus_paths=None):
     """Open an operator-selected, already quiesced legacy state directory.
 
     Existing writer exclusion and a coherent backup are operator preconditions;
@@ -27,7 +27,7 @@ def create_unified_app(settings=None):
         raise ValueError('Unified Hub requires one shared split-frontends core')
     paths = {}
     for name in ('AGENT_BUS_DB', 'AGENT_BUS_AUDIT', 'AGENT_BUS_FILE_ROOT'):
-        value = os.environ.get(name)
+        value = bus_paths.get(name) if bus_paths is not None else os.environ.get(name)
         if not value or not Path(value).is_absolute():
             raise ValueError('Explicit existing absolute bus paths required')
         paths[name] = Path(value)

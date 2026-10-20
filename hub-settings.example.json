@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "base_url": "https://hub.ledgetoptechnologies.com",
+  "cloudflare_access": {
+    "issuer": "https://ledgetoptechnologies.cloudflareaccess.com",
+    "audience": "fdd1c44b308a90db171fb2d801f8d91149259878438ccddc389eb3a534b8ee35",
+    "allowed_emails": ["bkoltz@ledgetoptechnologies.com", "beaukoltz@ledgetopdroneservices.com"]
+  },
+  "agent_allowed_hosts": ["192.168.50.80:8770", "192.168.50.80", "127.0.0.1:8770", "127.0.0.1", "localhost:8770", "localhost"],
+  "agent_allowed_ips": ["192.168.60.92", "192.168.20.151"]
+}
