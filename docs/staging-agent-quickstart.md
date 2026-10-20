@@ -1,9 +1,17 @@
 # Engineering Hub staging coordination: agent quickstart
 
-These are the **new candidate image's** HTTP endpoints. They are not available
-on TrueNAS until Beau installs that image and explicitly enables the queue.
-This document does not report a deployment, active worker, or successful staging
-execution. Keep the existing message bus and clients unchanged during rollout.
+## Verified deployment checkpoint — 2026-10-20
+
+The unified Hub is now reachable on TrueNAS at `192.168.50.80:8770` and
+Codex's authenticated MCP client has reconnected there after the app restart.
+The old port 8765 is retired; there is no alias listener. Existing agent tokens
+remain separate from human Cloudflare Access authentication.
+
+This is **not yet an active staging executor**. The live overview reports all
+project executors disabled, autonomy unconfigured, and no live presence adapter
+for Codex, Claude or Hermes. Listed projects are records, not working deployment
+integrations. The queue and pilot sections below describe optional source
+capabilities and prerequisites, not installed or accepted workflows.
 
 ## Connections and operator configuration
 
@@ -11,12 +19,14 @@ execution. Keep the existing message bus and clients unchanged during rollout.
 | --- | --- | --- |
 | Agent coordination API | `http://192.168.50.80:8770/api/hub/v1/work` | Existing distinct Codex, Claude, or Hermes bearer token |
 | Human dashboard | `https://hub.ledgetoptechnologies.com` | Separate Hub Cloudflare Access application plus local Hub session/CSRF |
-| Browser origin on TrueNAS | `http://127.0.0.1:8771` | Cloudflared host-network origin; verified Access assertion still required |
-| Existing production message bus | Existing port `8765` | Existing message-bus token; **not** a work-queue endpoint |
+| Browser origin on TrueNAS | `http://192.168.50.80:8771` | Existing bridged cloudflared tunnel; verified Access assertion still required |
+| Unified agent message bus | `http://192.168.50.80:8770/mcp` | Existing distinct agent bearer tokens; **not** proof of worker readiness |
 
-The split-ingress deployment keeps the browser origin loopback-only while the
-agent listener remains LAN-accessible. The actual installed listener/tunnel
-topology must be verified; this source change alone does not secure the network.
+The current settings-file deployment binds both ingress ports on the LAN. The
+browser ingress requires a verified Access assertion before serving protected
+HTML, assets or APIs; a LAN connection or spoofed email header is insufficient.
+This is application-level origin protection, not physical LAN isolation. The
+agent listener is separate and does not accept human sessions as agent tokens.
 LAN HTTP does not encrypt bearer tokens: use only the approved trusted LAN, or
 arrange an authenticated encrypted transport before crossing an untrusted network.
 Do not put tokens in commands, Git, chat, URLs, logs, or example files.

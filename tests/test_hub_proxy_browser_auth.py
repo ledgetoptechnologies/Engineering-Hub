@@ -81,6 +81,24 @@ def test_proxy_signed_browser_login_session_and_csrf(signed_browser):
     assert len(endpoint["requests"]) == 1
 
 
+def test_proxy_browser_bootstraps_session_without_login_redirect(signed_browser):
+    client, sign, _, _ = signed_browser
+    headers = {"CF-Access-Jwt-Assertion": sign(), "Origin": ORIGIN}
+    assert client.get("/", headers=headers).text == "private-dashboard"
+    assert client.get(BASE + "/auth/me", headers=headers).json()["authenticated"] is False
+    response = client.post(BASE + "/auth/bootstrap", headers=headers, json={})
+    assert response.status_code == 200
+    session = response.json()
+    assert session["authenticated"] is True
+    assert response.headers["cache-control"] == "no-store"
+    assert client.get(BASE + "/overview", headers=headers).status_code == 200
+    body = {"project": "engineering-hub", "title": "Bootstrapped browser task",
+            "client_request_id": "proxy-bootstrap-test"}
+    assert client.post(BASE + "/tasks", headers=headers, json=body).status_code == 403
+    assert client.post(BASE + "/tasks", headers={**headers, "X-Hub-CSRF": session["csrf_token"]},
+                       json=body).status_code == 201
+
+
 @pytest.mark.parametrize("invalid", ["issuer", "audience", "expired", "email", "unsigned", "signature"])
 def test_proxy_invalid_real_assertions_deny_assets_and_api_even_with_session(signed_browser, invalid):
     client, sign, claims, _ = signed_browser

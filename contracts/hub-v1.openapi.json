@@ -62,6 +62,25 @@
         }
       }
     },
+    "/api/hub/v1/auth/bootstrap": {
+      "post": {
+        "tags": [
+          "human-auth"
+        ],
+        "summary": "Bootstrap",
+        "operationId": "bootstrap_api_hub_v1_auth_bootstrap_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/auth/logout": {
       "post": {
         "tags": [

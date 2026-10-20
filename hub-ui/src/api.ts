@@ -91,7 +91,10 @@ export class HubClient {
     body?: unknown,
     csrf?: string,
   ): Promise<T> {
-    if (body !== undefined && !csrf)
+    // Bootstrap has no local CSRF secret yet. Its dedicated server boundary
+    // requires the browser's exact Origin and a verified Access assertion.
+    const bootstrap = path === "/auth/bootstrap";
+    if (body !== undefined && !csrf && !bootstrap)
       throw new HubApiError(403, "csrf_required");
     let response: Response;
     try {
@@ -103,7 +106,7 @@ export class HubClient {
           Accept: "application/json",
           ...(body === undefined
             ? {}
-            : { "Content-Type": "application/json", "X-Hub-CSRF": csrf! }),
+            : { "Content-Type": "application/json", ...(csrf ? { "X-Hub-CSRF": csrf } : {}) }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
@@ -147,9 +150,11 @@ export class HubClient {
   }
 
   async getSession(): Promise<Session> {
-    return this.mode === "demo"
-      ? { ...this.demoSession }
-      : this.request("/auth/me");
+    if (this.mode === "demo") return { ...this.demoSession };
+    const session = await this.request<Session>("/auth/me");
+    if (!session.authenticated && session.auth_provider === "cloudflare_access")
+      return this.request("/auth/bootstrap", {});
+    return session;
   }
   async getOverview(): Promise<Overview> {
     if (this.mode === "live") return this.request("/overview");

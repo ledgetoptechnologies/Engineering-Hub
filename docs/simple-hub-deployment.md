@@ -33,6 +33,17 @@ Configure allowed users and login/session policy in the Cloudflare dashboard;
 Hub only verifies the resulting signed identity and applies its local allowlist.
 There is no separate GitHub login and no dependency on Ops.
 
+The dashboard automatically establishes its local Hub session after Cloudflare
+Access authentication. Its same-origin `POST /api/hub/v1/auth/bootstrap` still
+requires the verified, explicitly allowed Access identity; it never accepts an
+agent token or an unsigned identity header. `GET /auth/me` remains read-only.
+The local cookie supplies Hub's CSRF boundary, not a second identity provider.
+Existing valid sessions retain their original expiry and CSRF token. An expired
+or revoked cookie requires explicit sign-in rather than silently being replaced.
+Signing out suppresses automatic local sign-in, including after a page reload;
+the explicit sign-in link opens a new session using the verified Access identity.
+Hub sign-out does not revoke the separate Cloudflare Access session.
+
 This version reads settings at startup; edit the file and restart to change it.
 A browser settings editor is not implemented by this release. Missing, malformed,
 duplicate, unknown or credential-bearing configuration fails closed. It does

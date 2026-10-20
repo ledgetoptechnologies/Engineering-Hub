@@ -65,6 +65,119 @@ def sign_in(client, token):
     return {**headers, "Origin": "https://hub.example", "X-Hub-CSRF": data["csrf_token"]}, data
 
 
+def test_bootstrap_verified_access_without_extra_login_click_and_no_session_renewal(hub):
+    client, app, config, assertion, _ = hub
+    headers = {"Cf-Access-Jwt-Assertion": assertion(), "Origin": config.origin}
+    assert client.get(BASE + "/auth/me", headers=headers).json()["authenticated"] is False
+    response = client.post(BASE + "/auth/bootstrap", headers=headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["authenticated"] and data["auth_provider"] == "cloudflare_access"
+    cookie = response.headers["set-cookie"]
+    assert "Secure" in cookie and "HttpOnly" in cookie and "SameSite=lax" in cookie
+    assert response.headers["cache-control"] == "no-store"
+    token = client.cookies.get(config.cookie_name)
+    with app.state.sessions._read_db() as db:
+        before = db.execute("SELECT * FROM auth_access_sessions").fetchall()
+    again = client.post(BASE + "/auth/bootstrap", headers=headers)
+    assert again.status_code == 200 and again.json() == data
+    assert "set-cookie" not in again.headers
+    assert client.cookies.get(config.cookie_name) == token
+    with app.state.sessions._read_db() as db:
+        assert db.execute("SELECT * FROM auth_access_sessions").fetchall() == before
+    assert client.get(BASE + "/overview", headers=headers).status_code == 200
+    assert client.post(BASE + "/pause", headers=headers, json={"paused": True}).status_code == 403
+    assert client.post(BASE + "/pause", headers={**headers, "X-Hub-CSRF": data["csrf_token"]},
+                       json={"paused": True}).status_code == 200
+
+
+@pytest.mark.parametrize("origin", [None, "null", "https://evil.example", "https://hub.example.evil"])
+def test_bootstrap_requires_exact_origin_before_creating_session(hub, origin):
+    client, app, _, assertion, _ = hub
+    headers = {"Cf-Access-Jwt-Assertion": assertion()}
+    if origin is not None:
+        headers["Origin"] = origin
+    response = client.post(BASE + "/auth/bootstrap", headers=headers)
+    assert response.status_code == 403 and "set-cookie" not in response.headers
+    with app.state.sessions._read_db() as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='auth_access_sessions'").fetchone()
+
+
+@pytest.mark.parametrize("override", [
+    {"email": "other@first.example"}, {"aud": ["ops-audience"]},
+    {"iss": "https://other.cloudflareaccess.com"}, {"exp": 1}, {"type": "service"},
+])
+def test_bootstrap_never_accepts_invalid_assertion(hub, override):
+    client, _, config, assertion, _ = hub
+    response = client.post(BASE + "/auth/bootstrap", headers={
+        "Origin": config.origin, "Cf-Access-Jwt-Assertion": assertion(**override)})
+    assert response.status_code == 401 and "set-cookie" not in response.headers
+
+
+@pytest.mark.parametrize("identity_headers", [
+    {}, {"Cf-Access-Authenticated-User-Email": EMAILS[0]},
+    {"Cf-Access-Jwt-Assertion": "forged"}, {"Authorization": "Bearer test-codex"},
+])
+def test_bootstrap_never_uses_unsigned_identity_or_agent_bearer(hub, identity_headers):
+    client, _, config, _, _ = hub
+    response = client.post(BASE + "/auth/bootstrap", headers={"Origin": config.origin, **identity_headers})
+    assert response.status_code == 401 and "set-cookie" not in response.headers
+
+
+def test_bootstrap_does_not_replace_revoked_cookie_or_repin_subject(hub):
+    client, app, config, assertion, _ = hub
+    headers, _ = sign_in(client, assertion())
+    token = client.cookies.get(config.cookie_name)
+    app.state.sessions.delete_cloudflare_session(token)
+    response = client.post(BASE + "/auth/bootstrap", headers=headers)
+    assert response.status_code == 401 and "set-cookie" not in response.headers
+    client.cookies.clear()
+    response = client.post(BASE + "/auth/bootstrap", headers={
+        "Origin": config.origin, "Cf-Access-Jwt-Assertion": assertion(sub="different-subject")})
+    assert response.status_code == 403 and "set-cookie" not in response.headers
+
+
+def test_bootstrap_does_not_extend_expired_cookie_with_new_assertion(hub):
+    client, app, config, assertion, _ = hub
+    headers, _ = sign_in(client, assertion())
+    token = client.cookies.get(config.cookie_name)
+    with app.state.sessions._read_db() as db:
+        before = db.execute("SELECT * FROM auth_access_sessions").fetchall()
+    app.state.sessions.clock = lambda: before[0][-1] + 1
+    response = client.post(BASE + "/auth/bootstrap", headers={
+        "Origin": config.origin, "Cf-Access-Jwt-Assertion": assertion(exp=int(time.time()) + 600)})
+    assert response.status_code == 401 and "set-cookie" not in response.headers
+    assert client.cookies.get(config.cookie_name) == token
+    with app.state.sessions._read_db() as db:
+        assert db.execute("SELECT * FROM auth_access_sessions").fetchall() == before
+
+
+def test_bootstrap_does_not_fall_back_from_bearer_to_valid_access(hub):
+    client, _, config, assertion, _ = hub
+    response = client.post(BASE + "/auth/bootstrap", headers={
+        "Origin": config.origin, "Cf-Access-Jwt-Assertion": assertion(),
+        "Authorization": "Bearer test-codex"})
+    assert response.status_code == 401 and "set-cookie" not in response.headers
+
+
+def test_logout_suppresses_automatic_bootstrap_until_explicit_login(hub):
+    client, _, config, assertion, _ = hub
+    headers, _ = sign_in(client, assertion())
+    response = client.post(BASE + "/auth/logout", headers=headers)
+    assert response.status_code == 200
+    marker = client.cookies.get(config.cookie_name + "_signed_out")
+    assert marker == "1"
+    cookie = response.headers["set-cookie"]
+    assert "HttpOnly" in cookie and "Secure" in cookie and "SameSite=lax" in cookie
+    for _ in range(2):
+        response = client.post(BASE + "/auth/bootstrap", headers=headers)
+        assert response.status_code == 200 and response.json()["authenticated"] is False
+        assert "set-cookie" not in response.headers
+    sign_in(client, assertion())
+    assert client.cookies.get(config.cookie_name + "_signed_out") is None
+    assert client.post(BASE + "/auth/bootstrap", headers=headers).json()["authenticated"] is True
+
+
 @pytest.mark.parametrize("email", EMAILS)
 def test_exact_allowed_identities_can_create_tasks_answer_and_pause(hub, email):
     client, app, _, assertion, requests = hub

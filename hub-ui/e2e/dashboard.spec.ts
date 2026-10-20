@@ -6,6 +6,30 @@ const NOW = new Date("2026-10-17T18:00:00.000Z");
 const ORIGIN = "http://127.0.0.1:5174";
 const CSRF = "fixture-human-only-csrf";
 
+test("Cloudflare opens the workspace without an extra sign-in click and respects sign-out", async ({ page }) => {
+  const mock = await mockLive(page, { signedIn: false, access: true, bootstrap: true });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Sign out", exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toHaveCount(0);
+  expect(mock.requests.filter((request) => request.url().endsWith("/auth/bootstrap"))).toHaveLength(1);
+  await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toBeVisible();
+  await expect(page.getByText("Cloudflare Access protects this workspace.", { exact: false })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign out", exact: true })).toHaveCount(0);
+});
+
+test("failed Cloudflare bootstrap stays closed without redirect or retry loops", async ({ page }) => {
+  const mock = await mockLive(page, { signedIn: false, access: true, bootstrapDenied: true });
+  await page.goto("/");
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task" })).toBeDisabled();
+  expect(mock.requests.filter((request) => request.url().endsWith("/auth/bootstrap"))).toHaveLength(1);
+  expect(mock.reads()).toBe(0);
+  expect(new URL(page.url()).pathname).toBe("/");
+});
+
 test("held rollback reports why it needs attention without claiming rollback success", async ({ page }) => {
   const mock = await mockLive(page);
   mock.overview.runs.push({
@@ -29,7 +53,7 @@ test("held rollback reports why it needs attention without claiming rollback suc
 
 async function mockLive(
   page: Page,
-  { signedIn = true, events = false, expires = false, canonical = false, access = false } = {},
+  { signedIn = true, events = false, expires = false, canonical = false, access = false, bootstrap = false, bootstrapDenied = false } = {},
 ) {
   const overview = createDemoOverview(NOW);
   const requests: Request[] = [];
@@ -60,6 +84,19 @@ async function mockLive(
         csrf_token: signedIn ? CSRF : null,
         ...(access ? { auth_provider: "cloudflare_access", email: signedIn ? "operator@first.example" : null } : {}),
       });
+    if (path.endsWith("/auth/bootstrap")) {
+      expect(request.method()).toBe("POST");
+      const headers = await request.allHeaders();
+      expect(headers.origin).toBe(ORIGIN);
+      expect(headers.authorization).toBeUndefined();
+      expect(headers["x-hub-csrf"]).toBeUndefined();
+      if (bootstrapDenied) return respond({ detail: "denied" }, 403);
+      signedIn = bootstrap;
+      return respond({ authenticated: signedIn, auth_provider: "cloudflare_access",
+        actor: signedIn ? "human:cf:" + "a".repeat(64) : null,
+        csrf_token: signedIn ? CSRF : null, github_id: null,
+        email: signedIn ? "operator@first.example" : null });
+    }
     if (!signedIn)
       return respond({ detail: { code: "sign_in_required" } }, 401);
     if (request.method() === "POST") {
@@ -70,6 +107,11 @@ async function mockLive(
       expect(headers["cookie"]).toContain(
         "hub_session=fixture-browser-session",
       );
+      if (path.endsWith("/auth/logout")) {
+        signedIn = false;
+        bootstrap = false; // Models the server's HttpOnly logout suppression.
+        return respond({ authenticated: false });
+      }
       if (path.endsWith("/tasks")) {
         const payload = request.postDataJSON();
         expect(payload.client_request_id).toMatch(/^[0-9a-f-]{36}$/);
