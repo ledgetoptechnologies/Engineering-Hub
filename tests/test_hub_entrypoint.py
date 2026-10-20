@@ -25,11 +25,22 @@ def test_split_entrypoint_builds_one_core_and_uses_shared_runner(monkeypatch):
     monkeypatch.setattr(app, "create_app", lambda: calls.append("create") or core)
     monkeypatch.setattr(frontends, "HubFrontends", lambda value: calls.append(("pair", value)) or pair)
 
-    async def run(value, **kwargs):
-        assert calls == []  # Construction occurs only after the runner binds.
-        calls.append(("serve", value(), kwargs))
+    pending, completed = object(), []
+    def serve(value, **kwargs):
+        assert calls == []
+        def construct():
+            calls.append(("serve", value(), kwargs))
+        completed.append(construct)
+        return pending
 
-    monkeypatch.setattr(server, "serve_frontends", run)
+    def run(value):
+        assert value is pending
+        assert calls == []  # Construction occurs inside the runner, not the CLI.
+        completed.pop()()
+
+    monkeypatch.setattr(server, "serve_frontends", serve)
+    # Test CLI forwarding without replacing pytest-asyncio's policy event loop.
+    monkeypatch.setattr(entrypoint.asyncio, "run", run)
     monkeypatch.setattr(entrypoint.uvicorn, "run", lambda *args, **kwargs: calls.append("unexpected"))
     entrypoint.main()
     assert calls == ["create", ("pair", core), ("serve", pair, {
