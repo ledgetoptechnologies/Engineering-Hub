@@ -1,5 +1,12 @@
 # Priority: Engineering Hub becomes the agents' sole MCP
 
+**Current deployment directions:** Beau subsequently approved an authenticated
+LAN-reachable UI behind the existing proxy, no 8765 alias, and only the
+Engineering-Hub host mount with preserved bus state nested inside it. See
+[the current proxy deployment guide](proxy-browser-deployment.md) and current
+`compose.hub-unified.yaml`. Earlier loopback, alias and separate bus-mount
+checkpoints below are historical evidence, not the current operator profile.
+
 Beau explicitly requested this cutover and retirement of the old service, while
 keeping the full staging-management goal. This supersedes the earlier instruction
 to leave both services permanently separate. It does **not** authorize deleting

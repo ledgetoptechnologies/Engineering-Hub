@@ -1,7 +1,7 @@
-"""One lifecycle owner, a LAN agent socket, and a loopback-only browser socket.
+"""One lifecycle owner, a LAN agent socket, and an authenticated browser socket.
 
-This runner neither configures the host nor creates a tunnel. The host-network
-cloudflared connector must be configured separately to use the browser socket.
+This runner neither configures the host nor creates a tunnel. The proxy
+connector must be configured separately to use the browser socket.
 """
 import asyncio
 from contextlib import ExitStack, contextmanager
@@ -70,12 +70,13 @@ def _listener(app):
 
 
 async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770,
-                          browser_port=8771, stop_event=None, on_ready=None,
+                          browser_host="127.0.0.1", browser_port=8771, stop_event=None, on_ready=None,
                           install_signals=True, agent_alias_port=None):
     """Serve both front doors, starting/stopping the shared core exactly once.
 
     Port zero is supported for isolated tests; operators use explicit fixed
-    ports. Browser bind is deliberately not configurable away from loopback.
+    ports. Browser bind defaults to loopback; a proxy-reachable numeric address
+    requires the configured Cloudflare Access frontend, never a bare ASGI pair.
     The factory must construct its core/owner only when invoked. A failed bind
     happens before construction or ownership startup. Loss of either listener
     drains the other, then closes the one shared core. No replacement is spawned.
@@ -85,6 +86,9 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
     if not callable(pair_factory):
         raise ValueError("Hub frontend factory required before owner construction")
     ipaddress.ip_address(agent_host)
+    if not isinstance(browser_host, str) or "%" in browser_host:
+        raise ValueError("Hub browser host must be a numeric IP address without a scope ID")
+    browser_address = ipaddress.ip_address(browser_host)
     for port in (agent_port, browser_port):
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("Hub listener ports must be integers between 0 and 65535")
@@ -98,13 +102,17 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
     stop = stop_event if stop_event is not None else asyncio.Event()
     with ExitStack() as stack:
         agent_socket = stack.enter_context(_bind(agent_host, agent_port))
-        browser_socket = stack.enter_context(_bind("127.0.0.1", browser_port))
+        browser_socket = stack.enter_context(_bind(browser_host, browser_port))
         agent_sockets = [agent_socket]
         if agent_alias_port is not None:
             agent_sockets.append(stack.enter_context(_bind(agent_host, agent_alias_port)))
         if install_signals:
             stack.enter_context(_signal_stop(stop))
         pair = pair_factory()
+        if not browser_address.is_loopback:
+            from .frontends import HubFrontends
+            if not isinstance(pair, HubFrontends):
+                raise ValueError("Non-loopback browser bind requires authenticated HubFrontends")
         async with pair.lifespan():
             # Configuration failure must unwind the core owner too.
             servers = [_listener(pair.agents), _listener(pair.browser)]
