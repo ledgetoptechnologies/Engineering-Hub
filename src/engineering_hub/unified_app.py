@@ -18,6 +18,16 @@ def create_unified_app(settings=None, *, bus_paths=None):
     listener, job, watcher fallback or second bus is discovered here.
     """
     settings = settings or Settings.from_env()
+    return create_app(settings, bus_app=_create_unified_bus(settings, bus_paths=bus_paths))
+
+
+def _create_unified_bus(settings, *, bus_paths=None):
+    """Internal composition seam; construct only the explicitly selected bus.
+
+    No lifespan is entered here. The containing Hub remains its single owner.
+    This is also used by the explicit pre-enrolled queued-pilot service, never
+    selected by the default factory or an environment worker switch.
+    """
     cleanup_flag = os.environ.get('HUB_BUS_STARTUP_CLEANUP', '0')
     if cleanup_flag not in {'0', '1'}:
         raise ValueError('HUB_BUS_STARTUP_CLEANUP must be 0 or 1')
@@ -47,7 +57,7 @@ def create_unified_app(settings=None, *, bus_paths=None):
     )
     # Factory import is inert; only this explicit operation may construct it.
     from agent_message_bus.app import create_app as create_bus_app
-    bus = create_bus_app(db_path=paths['AGENT_BUS_DB'],
+    return create_bus_app(db_path=paths['AGENT_BUS_DB'],
                          audit_path=paths['AGENT_BUS_AUDIT'],
                          file_root=paths['AGENT_BUS_FILE_ROOT'],
                          auth=settings.agent_auth,
@@ -57,4 +67,3 @@ def create_unified_app(settings=None, *, bus_paths=None):
                          # startup-retention behavior explicitly with value 1.
                          startup_cleanup=cleanup_flag == '1',
                          transport_security_settings=security)
-    return create_app(settings, bus_app=bus)
