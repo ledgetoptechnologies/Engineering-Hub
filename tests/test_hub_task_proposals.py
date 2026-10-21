@@ -183,7 +183,7 @@ def test_http_and_mcp_equivalence_and_existing_human_boundary(tmp_path):
         result_body = result.get('structuredContent') or json.loads(result['content'][0]['text'])
         assert result_body == item
         overview = client.get(BASE + '/overview', headers=headers).json()
-        assert overview['tasks'][0] == item
+        assert overview['tasks'][0] == dict(item, state_since=item['updated_at'])
         schema = client.get('/openapi.json').json()['paths'][BASE + '/staging/tasks']['post']
         assert 'staging-only' in schema['summary']
         # Complete the proposal -> claim -> candidate -> independent review ->

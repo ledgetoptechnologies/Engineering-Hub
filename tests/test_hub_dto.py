@@ -94,11 +94,12 @@ def test_rest_overview_and_lists_preserve_exact_source_shapes(hub):
     with TestClient(app, base_url='https://hub.test') as client:
         overview = client.get(PREFIX + '/overview', headers=HEADERS).json()
         assert_exact(OverviewDTO, overview)
-        assert overview['tasks'] == repo.list_tasks()
+        assert overview['tasks'] == repo.list_task_views()
+        assert [{k: v for k, v in item.items() if k != 'state_since'} for item in overview['tasks']] == repo.list_tasks()
         assert overview['decisions'] == [decision]
         assert overview['runs'] == [run]
         assert overview['autonomy'] == {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
-        for path, expected in [('tasks', repo.list_tasks()), ('decisions', [decision]), ('runs', [run])]:
+        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision]), ('runs', [run])]:
             assert client.get(PREFIX + '/' + path, headers=HEADERS).json() == {'items': expected}
         assert client.get(PREFIX + '/tasks/' + task['id'], headers=HEADERS).json() == repo.get_task(task['id'])
 
@@ -125,7 +126,8 @@ def test_openapi_response_objects_reference_closed_typed_schemas(hub):
 def test_unknown_source_field_fails_closed_without_exposing_value(hub, monkeypatch):
     settings, repo = hub
     task = list(task_states(repo))[-1]
-    monkeypatch.setattr(repo, 'list_tasks', lambda: [{**task, 'service_token': 'private-sentinel'}])
+    # /tasks reads list_task_views; an unknown field there must still fail closed.
+    monkeypatch.setattr(repo, 'list_task_views', lambda: [{**task, 'service_token': 'private-sentinel'}])
     app = create_app(settings, repository=repo)
     with TestClient(app, base_url='https://hub.test', raise_server_exceptions=False) as client:
         response = client.get(PREFIX + '/tasks', headers=HEADERS)

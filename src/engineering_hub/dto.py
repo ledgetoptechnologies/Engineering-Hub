@@ -46,6 +46,8 @@ class TaskDTO(EntityDTO):
     repair_count: int = Field(ge=0, le=3)
     scope: Literal['staging'] | None = None
     proposed_by: AgentId | None = None
+    # Audited time the task entered its current status; derived, never stored.
+    state_since: str | None = None
 
 
 class DecisionDTO(EntityDTO):

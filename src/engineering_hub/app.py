@@ -667,7 +667,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     async def overview(request: Request):
         actor(request)
         return {"paused": repo.get_paused(), "projects": projects(),
-                "tasks": repo.list_tasks(), "decisions": repo.list_decisions(),
+                "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
@@ -688,7 +688,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.get("/api/hub/v1/tasks", response_model=TaskListDTO, response_model_exclude_unset=True)
     def list_tasks(request: Request):
         actor(request)
-        return {"items": repo.list_tasks()}
+        return {"items": repo.list_task_views()}
 
     @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):

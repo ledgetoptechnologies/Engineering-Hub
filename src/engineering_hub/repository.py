@@ -13,6 +13,9 @@ from .pilot_ownership import PilotOwner
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
+# Audit actions that set a task's status. Run bookkeeping saves the task without
+# changing it, so those actions must not reset how long a task has been waiting.
+TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                          'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
 
@@ -241,6 +244,36 @@ class HubRepository:
 
     def list_tasks(self):
         return self._list('task')
+
+    def list_task_views(self):
+        """Response copies of tasks plus the audited time each entered its current status.
+
+        state_since is derived from the audit log, never stored on the task, and is
+        None when no status action was recorded. Tasks and audit rows are read in one
+        snapshot, and the status action is chosen by revision (never wall-clock order)
+        bounded by each returned task's revision, so a concurrent write or a clock
+        change cannot attach a newer time to an older status.
+        """
+        marks = ','.join('?' * len(TASK_STATUS_ACTIONS))
+        with self._connection() as db:
+            db.execute('BEGIN')
+            try:
+                tasks = [json.loads(row['data']) for row in db.execute(
+                    "SELECT data FROM hub_entities WHERE kind='task' ORDER BY rowid")]
+                audit = db.execute(
+                    f'SELECT entity_id, revision, created_at FROM hub_audit WHERE action IN ({marks})',
+                    TASK_STATUS_ACTIONS).fetchall()
+            finally:
+                db.rollback()
+        bound = {task['id']: task['revision'] for task in tasks}
+        best = {}
+        for row in audit:
+            limit = bound.get(row['entity_id'])
+            if limit is None or row['revision'] > limit:
+                continue
+            if row['entity_id'] not in best or row['revision'] > best[row['entity_id']][0]:
+                best[row['entity_id']] = (row['revision'], row['created_at'])
+        return [dict(task, state_since=best[task['id']][1] if task['id'] in best else None) for task in tasks]
 
     def propose_staging_task(self, actor, project, title, client_request_id):
         """An agent may propose work, never grant execution or production authority."""

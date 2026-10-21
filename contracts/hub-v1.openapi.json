@@ -3357,6 +3357,17 @@
               }
             ],
             "title": "Proposed By"
+          },
+          "state_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Since"
           }
         },
         "additionalProperties": false,

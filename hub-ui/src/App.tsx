@@ -11,6 +11,7 @@ import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { WorkQueuePanel } from "./WorkQueuePanel";
 import { NotesPanel } from "./NotesPanel";
+import { answeredBy, relativeAge, waitingOn } from "./dashboardText";
 import type {
   AgentSummary,
   Decision,
@@ -19,6 +20,7 @@ import type {
   ProjectId,
   PublicReachability,
   Session,
+  Task,
   TopicSnapshot,
 } from "./types";
 
@@ -27,6 +29,11 @@ const names: Record<string, string> = {
   hermes: "Hermes",
   claude: "Claude",
 };
+/** Two letters from an email's local part ("bkoltz@…" -> "BK"); "?" when unknown. */
+function initials(value: string | null | undefined): string {
+  const letters = (value ?? "").split("@")[0].replace(/[^A-Za-z]/g, "");
+  return letters ? letters.slice(0, 2).toUpperCase() : "?";
+}
 const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
 
@@ -34,7 +41,13 @@ function observationTime(value: string | null | undefined): string | null {
   if (!value) return null;
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp) || timestamp > Date.now() + 30_000) return null;
-  return new Date(timestamp).toLocaleString();
+  return `${new Date(timestamp).toLocaleString()} (${relativeAge(value)})`;
+}
+
+function stateAge(task: Task): string {
+  const age = relativeAge(task.state_since);
+  return age ? `In this state since ${new Date(Date.parse(task.state_since!)).toLocaleString()} (${age})`
+    : "Time in this state not recorded";
 }
 
 function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
@@ -61,6 +74,10 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
         notObserved ? "No active push stream observed" : "Hub connection unavailable"}</span>
       {!stale && fresh && observed && countsValid && knownSource && connection?.state !== "unavailable" && (
         <small>{connection!.active_streams} active stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)</small>
+      )}
+      {connected && (
+        <small>{connection!.inbox_subscriptions! > 0 ? "Inbox subscription observed: new messages can be pushed to this agent."
+          : "No active inbox subscription observed. Delivery may still happen another way; this alone does not show the agent is ready."}</small>
       )}
       {observed && <small>Snapshot observed: {observed}</small>}
       {!stale && fresh && observed && knownSource && connection?.state !== "unavailable" && observationTime(connection?.last_stream_write_at) && (
@@ -547,6 +564,11 @@ export function HubApp() {
         item.status === "open" &&
         (project === "all" || item.project === project),
     ) ?? [];
+  // Answered decisions are history, not waiting work. Shown separately so an
+  // answer's limits stay visible without becoming a new approval request.
+  const recentAnswers = (data?.decisions.filter(
+    (item) => item.status === "answered" && (project === "all" || item.project === project),
+  ) ?? []).sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 3);
   const tasks =
     data?.tasks.filter(
       (item) => project === "all" || item.project === project,
@@ -665,14 +687,17 @@ export function HubApp() {
               ↗
             </span>
           </button>
+          <a className="nav-item" href="#decisions">
+            <Icon kind="folder" /> Needs Beau
+          </a>
           <a className="nav-item" href="#work">
-            <Icon kind="folder" /> Assigned work
+            <Icon kind="folder" /> Work in motion
           </a>
           <a className="nav-item" href="#notes">
             <Icon kind="folder" /> Shared notes
           </a>
           <a className="nav-item" href="#agents">
-            <Icon kind="agents" /> Agent connections
+            <Icon kind="agents" /> Agents
           </a>
         </nav>
         <div className="sidebar-section">
@@ -706,7 +731,7 @@ export function HubApp() {
             }
           >
             <span className="avatar" aria-hidden="true">
-              {demo ? "D" : session?.authenticated ? "EH" : "—"}
+              {demo ? "D" : session?.authenticated ? initials(session.email ?? session.actor) : "—"}
             </span>
             <div>
               <strong>
@@ -843,25 +868,22 @@ export function HubApp() {
               <div>
                 <span className="stat-label">NEEDS YOUR INPUT</span>
                 <strong>
-                  {openDecisions.length.toString().padStart(2, "0")}
-                  <span className="stat-note">decisions</span>
+                  {openDecisions.length}
+                  <span className="stat-note">{openDecisions.length === 1 ? "decision" : "decisions"}</span>
                 </strong>
               </div>
               <div>
-                <span className="stat-label">ASSIGNED WORK</span>
+                <span className="stat-label">WORK IN MOTION</span>
                 <strong>
-                  {tasks.length.toString().padStart(2, "0")}
-                  <span className="stat-note">tracked tasks</span>
+                  {tasks.length}
+                  <span className="stat-note">{tasks.length === 1 ? "task" : "tasks"}</span>
                 </strong>
               </div>
               <div>
-                <span className="stat-label">ACTIVE STAGING TARGETS</span>
+                <span className="stat-label">STAGING TARGETS SET UP</span>
                 <strong>
-                  {projects
-                    .filter((item) => item.executor_enabled)
-                    .length.toString()
-                    .padStart(2, "0")}
-                  <span className="stat-note">individually gated</span>
+                  {projects.filter((item) => item.executor_enabled).length}
+                  <span className="stat-note">of {projects.length} projects</span>
                 </strong>
               </div>
               <div className="feed-summary">
@@ -970,6 +992,29 @@ export function HubApp() {
                     </form>
                   ))
                 )}
+                {recentAnswers.length > 0 && (
+                  <div className="recent-answers" aria-label="Recent answers">
+                    <h3>Recent answers</h3>
+                    {recentAnswers.map((decision) => (
+                      <div className="recent-answer" key={decision.id}>
+                        <strong>{decision.title}</strong>
+                        <small>
+                          {projectName(decision.project)} · Answered{" "}
+                          {answeredBy(decision.answered_by, session?.actor)}{" "}
+                          {observationTime(decision.updated_at) ?? ""}
+                        </small>
+                        <p>Answer: {decision.answer}</p>
+                        {decision.protected && (
+                          <small>
+                            This answer did not by itself authorize running
+                            anything. Run approval and run status are tracked
+                            separately.
+                          </small>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <p className="panel-footnote">
                   Only your signed-in session can answer. Agents can request,
                   not approve.
@@ -994,13 +1039,17 @@ export function HubApp() {
                         <small>
                           {item.executor_enabled
                             ? "Staging target enabled"
-                            : "Awaiting inventory & acceptance"}
+                            : "No staging target yet. Setting one up needs an inventory of the target and your acceptance."}
                         </small>
                       </div>
                       <Badge
                         tone={item.health === "healthy" ? "forest" : "neutral"}
                       >
-                        {pretty(item.health)}
+                        {!item.executor_enabled && item.health === "unknown"
+                          ? "Not set up yet"
+                          : item.health === "unknown"
+                            ? "Health unknown"
+                            : pretty(item.health)}
                       </Badge>
                     </div>
                   ))}
@@ -1013,10 +1062,14 @@ export function HubApp() {
                     <span>
                       <strong>
                         {data.paused
-                          ? "New staging work paused"
-                          : "New staging work not paused"}
+                          ? "Emergency pause on: new staging work is blocked"
+                          : "Emergency pause off"}
                       </strong>
-                      <small>Autonomy: {pretty(data.autonomy.state)}</small>
+                      <small>
+                        {!data.autonomy.configured
+                          ? "Automatic runner not set up. Agents only act on the tasks shown here."
+                          : `Automatic runner: ${pretty(data.autonomy.state)}`}
+                      </small>
                     </span>
                   </div>
                   <button
@@ -1093,6 +1146,8 @@ export function HubApp() {
                           {task.scope === "staging" && task.proposed_by && (
                             <small>Staging proposal · {names[task.proposed_by]}</small>
                           )}
+                          <small className="task-waiting">{waitingOn(task, (id) => names[id] ?? id)}</small>
+                          <small title={task.state_since ?? undefined}>{stateAge(task)}</small>
                         </span>
                         <span className="owner">
                           <span className="mini-avatar">
@@ -1124,7 +1179,8 @@ export function HubApp() {
                         <p>
                           Independent reviewer:{" "}
                           <strong>
-                            {task.review ? names[task.review.actor] : "Pending"}
+                            {task.review ? names[task.review.actor]
+                              : task.status === "in_review" ? "None assigned yet" : "Not requested yet"}
                           </strong>{" "}
                           · Repairs used: {task.repair_count}/3
                         </p>
@@ -1137,21 +1193,26 @@ export function HubApp() {
                   ))}
                 </div>
               </section>
-              <section className="panel" id="agents">
-                <PanelTitle number="04" title="Agents & topic" />
+              <section className="panel agents-panel" id="agents">
+                <PanelTitle number="04" title="Agents" />
                 <p className="panel-description">
-                  Hub transport and readiness in this conversation are separate observations.
+                  Whether each agent's app is connected to the Hub, and whether it can be
+                  reached on a specific conversation topic. These are checked separately.
                 </p>
-                <h3 className="agent-section-title">Hub connection snapshots</h3>
+                <div className="agents-columns">
+                <div>
+                <h3 className="agent-section-title">Connected to the Hub</h3>
                 <div className="hub-connection-list">
                   {data.agents.map((agent) => (
                     <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />
                   ))}
                 </div>
                 <p className="panel-footnote">
-                  A push stream or inbox subscription does not prove the agent is running a model,
-                  attached to this topic, or ready to receive work. Missing streams do not mean offline.
+                  Connected means the agent's app is linked to the Hub. It doesn't prove the agent
+                  is working on anything right now, and not connected doesn't mean it's offline.
                 </p>
+                </div>
+                <div>
                 <h3 className="agent-section-title">Topic readiness</h3>
                 <form className="topic-form" onSubmit={checkTopic}>
                   <label htmlFor="topic-root">TOPIC ROOT</label>
@@ -1191,7 +1252,7 @@ export function HubApp() {
                           <strong>{names[peer.agent]}</strong>
                           <small>
                             {state === "unknown_stale"
-                              ? "No current, verified route"
+                              ? "Can't confirm it's reachable right now"
                               : state === "busy_queued"
                                 ? "Bound session can queue work"
                                 : state === "reachable"
@@ -1233,20 +1294,23 @@ export function HubApp() {
                 <div className="advisory">
                   <span>↳</span>
                   <p>
-                    Reachability is advisory. Accepted mail stays durable when a
-                    peer is offline; a connection is not a delivery or
-                    completion receipt.
+                    This is a best guess. Messages are kept even when an agent
+                    is offline, and being reachable doesn't mean a message was
+                    read or acted on.
                   </p>
                 </div>
                 <p className="panel-footnote">
                   {demo
                     ? "All agent states above are illustrative fixtures."
-                    : "Live registry and owning-session evidence are required. The Hub event feed alone does not prove topic readiness."}
+                    : "An agent shows as unknown until the Hub can confirm its live session for this topic."}
                 </p>
+                </div>
+                </div>
               </section>
               <NotesPanel mode={demo ? "demo" : "live"} selectedProject={project}
                 knownProjects={data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? []}
                 csrf={session?.csrf_token ?? null} writable={!!session?.authenticated}
+                viewerActor={session?.actor ?? null}
                 onUnauthorized={clearPrivateWorkspace} />
             </div>
             <footer className="page-footer">

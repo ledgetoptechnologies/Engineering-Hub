@@ -231,7 +231,8 @@ def test_reopened_app_preserves_tasks_decisions_sessions_and_pause(hub):
         reopened.cookies.update(client.cookies)
         response = reopened.get(BASE + "/overview")
         assert response.status_code == 200
-        assert response.json()["tasks"] == [item]
+        # The overview adds the audited state_since; it must survive a reopen.
+        assert response.json()["tasks"] == [dict(item, state_since=item["updated_at"])]
         assert response.json()["decisions"] == [decision]
         assert response.json()["paused"] is True
         assert reopened.get(BASE + "/auth/me").json()["actor"] == "human:42"
