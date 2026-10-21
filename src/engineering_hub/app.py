@@ -204,6 +204,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     settings = settings or Settings.from_env()
     bus_mcp = None
     bus_health = None
+    notes_repository = None
     if bus_app is not None:
         if (not isinstance(bus_app, Starlette)
                 or settings.ingress_mode == 'browser'
@@ -222,6 +223,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                            if getattr(route, 'path', None) == '/health'), None)
         if not callable(bus_health):
             raise ValueError('Unified bus health source required')
+        from agent_message_bus.knowledge import KnowledgeRepository
+        notes_repository = KnowledgeRepository(service.repository.path)
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -504,6 +507,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if request.headers.get("authorization"):
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
+
+    from .notes_api import attach_notes_routes
+    attach_notes_routes(app, repository=notes_repository, actor=actor)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes
