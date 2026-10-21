@@ -1,4 +1,24 @@
-# Staging bootstrap artifacts — bounded network preflight verified
+# Staging bootstrap artifacts — supported rootless mode
+
+## Current mode supersedes the earlier daemon-network requirement
+
+The current proposal explicitly sets `DETACH_NETNS=true`, the supported standard
+mode for the installed Docker29.5.2. Requiring a private **daemon** network
+namespace was an overconstraint: forcing false later prevented container startup
+at this version's AppArmor availability check. Do not change host AppArmor or
+sysctls to bypass it. Rootless Docker has no per-container AppArmor enforcement.
+
+The earlier preflight observations below are retained as historical evidence,
+not a requirement to reinstall their unit hashes. An inert consumer has now
+independently verified private, loopback-only networking, seccomp, no capabilities,
+mapped identities and effective resource limits. The daemon and consumer were
+stopped cleanly; an application/rollback pilot has **not** passed. See the
+[actual diagnostic and limitations](../../docs/staging-runtime-diagnostic-2026-10-20.md).
+No host is updated automatically by this source proposal. The original1GiB
+bootstrap remains an empty-daemon inspection only, not the separately approved
+3.25GiB application-pilot budget.
+
+## Historical bootstrap observations
 
 These files describe the bounded bootstrap, not an automatic installer. Beau
 approved the earlier bootstrap. Hermes subsequently reported installing the
@@ -64,8 +84,9 @@ termination within ten minutes. Stop grace is 1200 seconds with no forced SIGKIL
 that does not finish is not quiescence or permission to abandon ownership.
 
 RootlessKit networking is `none`, with
-`DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false` explicitly disabling detached
-network mode. Docker bridge/iptables are disabled and Docker listens only on
+`DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true` explicitly selecting standard
+detached mode. The daemon may use the host network namespace; this is not
+container network isolation. Docker bridge/iptables are disabled and Docker listens only on
 `%t/eh-pilot-docker.sock`. No CLI context is created or selected.
 Do not add `NoNewPrivileges=yes` to this bootstrap daemon as an unreviewed
 hardening shortcut: the prerequisite UID-mapping helpers need their approved
@@ -90,15 +111,15 @@ escape or unbraced word expansion. See the
 and [spawned-process environment](https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html#Environment%20Variables%20in%20Spawned%20Processes).
 `Type=notify` and `NotifyAccess=all` are unchanged.
 
-The installed Docker29.5.2 rootless helper supports the explicit `false` override
-and otherwise defaults to adding `--detach-netns`. In that mode the child daemon
+The installed Docker29.5.2 rootless helper defaults to adding `--detach-netns`.
+The current unit explicitly preserves that supported standard mode. The child daemon
 runs in the host network namespace even though RootlessKit retains a separate
 network namespace file. See the official
 [RootlessKit v3.0.0 network documentation](https://github.com/rootless-containers/rootlesskit/blob/v3.0.0/docs/network.md#detaching-network-namespace).
 Therefore `NET=none`, a detached namespace file or a rootless security label alone
-is not isolation evidence. Do not remove the explicit `false` assignment or
-replace it with an empty value: the installed helper treats unset/empty as its
-default. Recheck the installed helper's supported behavior before any later
+is not isolation evidence. Do not restore the earlier `false` workaround or
+claim that a detached namespace handle proves consumer isolation.
+Recheck the installed helper's supported behavior before any later
 version upgrade; these source tests do not execute that helper.
 
 This is a child-environment boundary, **not** a sandbox for an untrusted manager.
@@ -111,7 +132,7 @@ claim the absence of an environment variable proves filesystem isolation.
 
 Static and synthetic fixture tests do not prove real systemd notification
 attribution, rootless mappings, daemon network isolation or effective cgroups.
-The network-corrected unit must pass installed-system validation and the bounded owned
+The current unit must pass installed-system validation and the bounded owned
 start/stop checks before the bootstrap can be called successful.
 
 ## Preconditions, before privileged changes
@@ -183,11 +204,14 @@ sudo -u ehpilot -- env -i PATH=/usr/bin:/bin \
 Record its InvocationID, main PID/start identity and actual cgroup placement.
 Within ten minutes, use only the explicit new socket for read-only Engine info;
 inspect rootless/daemon identity, Unix endpoint, namespace maps and kernel limits.
-Inspect the actual `dockerd` peer PID's network namespace against the host PID1
-namespace and require them to differ; verify no external interfaces or routes
-(IPv4 and IPv6). A RootlessKit state-file namespace is not a substitute for the
-daemon PID's namespace. If any isolation check fails, retain that failure as
-evidence and follow the owned-stop procedure; do not start a container to probe it.
+Record the actual `dockerd` peer PID's network namespace against host PID1;
+equality is expected in this standard detached mode, not a consumer-isolation
+failure or pass. A RootlessKit state-file namespace is not a substitute for a
+consumer's measured namespace. Record AppArmor as unavailable, not passed.
+If any required identity, resource or ownership check fails, retain that failure
+and follow the owned-stop procedure. Do not start containers under this
+bootstrap-only procedure; later consumer diagnostics need their own approved
+scope and effective network/seccomp/cgroup checks.
 No image/container operations, API exposure, worker registration, issuer or
 application startup is allowed. Do not interpret the service's active state or a
 configuration readback as a container resource stress test.
