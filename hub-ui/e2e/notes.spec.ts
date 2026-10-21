@@ -128,7 +128,8 @@ test("create then edit; a concurrent save shows both versions and replaces only 
   expect(state.posts.map(post => post.body.expected_version)).toEqual([0, 1, 2]);
   expect(state.notes.find(note => note.path === "handoffs/pilot.md")!.content).toBe("My edit");
   const updated = panel.getByRole("article", { name: "Pilot handoff" }).getByTitle(human);
-  await expect(updated).toHaveText("Person eeeeeeee");
+  // The fixture viewer is this same Cloudflare human, so their own edit reads "You".
+  await expect(updated).toHaveText("You");
 });
 
 test("unsaved edits are not dropped by opening another note or switching project", async ({ page }) => {
