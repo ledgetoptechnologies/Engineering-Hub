@@ -574,7 +574,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
     .getByRole("button", { name: "Pause new work", exact: true })
     .click();
   await expect(
-    page.getByText("New staging work paused", { exact: true }),
+    page.getByText("Emergency pause on: new staging work is blocked", { exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   await page
@@ -582,7 +582,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
     .getByRole("button", { name: "Resume new work", exact: true })
     .click();
   await expect(
-    page.getByText("New staging work not paused", { exact: true }),
+    page.getByText("Emergency pause off", { exact: true }),
   ).toBeVisible();
   expect(writes).toEqual([]);
 });
@@ -1036,9 +1036,10 @@ test("protected decision requires explicit choice and separate confirmation; can
     .getByRole("dialog", { name: "Confirm protected decision", exact: true })
     .getByRole("button", { name: "Confirm decision", exact: true })
     .click();
-  await expect(page.getByRole("status")).toHaveText(
-    "Decision recorded, not an execution grant.",
-  );
+  // The queue panel may briefly show its own "Reading queue status…" status
+  // while the overview refreshes after the write.
+  await expect(page.getByRole("status").filter({ hasText: /^Decision recorded, not an execution grant\.$/ }))
+    .toHaveText("Decision recorded, not an execution grant.");
   const writes = mock.requests.filter((request) => request.method() === "POST");
   expect(writes).toHaveLength(1);
   expect(new URL(writes[0].url()).pathname).toBe(

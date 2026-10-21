@@ -13,6 +13,9 @@ from .pilot_ownership import PilotOwner
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
+# Audit actions that set a task's status. Run bookkeeping saves the task without
+# changing it, so those actions must not reset how long a task has been waiting.
+TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                          'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
 
@@ -241,6 +244,20 @@ class HubRepository:
 
     def list_tasks(self):
         return self._list('task')
+
+    def list_task_views(self):
+        """Response copies of tasks plus the audited time each entered its current status.
+
+        state_since is derived from the audit log, never stored on the task, and is
+        None when no status action was recorded.
+        """
+        tasks = self.list_tasks()
+        with self._connection() as db:
+            marks = ','.join('?' * len(TASK_STATUS_ACTIONS))
+            since = {row['entity_id']: row['since'] for row in db.execute(
+                f'SELECT entity_id, MAX(created_at) AS since FROM hub_audit WHERE action IN ({marks}) '
+                'GROUP BY entity_id', TASK_STATUS_ACTIONS)}
+        return [dict(task, state_since=since.get(task['id'])) for task in tasks]
 
     def propose_staging_task(self, actor, project, title, client_request_id):
         """An agent may propose work, never grant execution or production authority."""

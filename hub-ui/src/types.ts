@@ -34,6 +34,8 @@ export interface Task extends Versioned {
   repair_count: number;
   scope?: "staging" | null;
   proposed_by?: Agent | null;
+  /** Audited time the task entered its current status; null when not recorded. */
+  state_since?: string | null;
 }
 export interface Decision extends Versioned {
   project: ProjectId;

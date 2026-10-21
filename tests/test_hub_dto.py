@@ -94,11 +94,12 @@ def test_rest_overview_and_lists_preserve_exact_source_shapes(hub):
     with TestClient(app, base_url='https://hub.test') as client:
         overview = client.get(PREFIX + '/overview', headers=HEADERS).json()
         assert_exact(OverviewDTO, overview)
-        assert overview['tasks'] == repo.list_tasks()
+        assert overview['tasks'] == repo.list_task_views()
+        assert [{k: v for k, v in item.items() if k != 'state_since'} for item in overview['tasks']] == repo.list_tasks()
         assert overview['decisions'] == [decision]
         assert overview['runs'] == [run]
         assert overview['autonomy'] == {'configured': False, 'state': 'disabled', 'running': False, 'receipts': []}
-        for path, expected in [('tasks', repo.list_tasks()), ('decisions', [decision]), ('runs', [run])]:
+        for path, expected in [('tasks', repo.list_task_views()), ('decisions', [decision]), ('runs', [run])]:
             assert client.get(PREFIX + '/' + path, headers=HEADERS).json() == {'items': expected}
         assert client.get(PREFIX + '/tasks/' + task['id'], headers=HEADERS).json() == repo.get_task(task['id'])
 
