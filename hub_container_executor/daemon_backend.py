@@ -1352,7 +1352,14 @@ class DockerEngineBackend:
                 raise DaemonBackendError("compiled probe output exceeds its byte limit")
         return bytes(output)
 
-    def _one_probe(self, container_id, probe, budget_ms, deadline, source_commit):
+    def _one_probe(self, container_id, probe, budget_ms, deadline, source_commit, *, readiness=False,
+                   readiness_deadline=None):
+        if type(readiness) is not bool or readiness and probe.kind != "health_json":
+            raise DaemonBackendError("invalid health readiness classification")
+        if readiness_deadline is not None and (not readiness
+                or type(readiness_deadline) is not float
+                or not 0 < readiness_deadline < float('inf')):
+            raise DaemonBackendError("invalid health readiness admission deadline")
         probe_deadline = min(deadline, time.monotonic() + budget_ms / 1000)
         self._remaining(probe_deadline)
         create_body = {
@@ -1366,6 +1373,10 @@ class DockerEngineBackend:
                     probe.expectation_id, str(probe.max_response_bytes), str(budget_ms), source_commit],
         }
         self._assert_runner(probe_deadline)
+        # A slow runner read must not admit a new exec after the grace cutoff.
+        # Once admitted, that exact attempt retains its ordinary request budget.
+        if readiness_deadline is not None and time.monotonic() >= readiness_deadline:
+            raise DaemonBackendError("health readiness admission deadline exceeded")
         raw_create = self._read_response(
             "POST", self._route("/containers/" + container_id + "/exec"),
             probe_deadline, expected_status=201, json_body=create_body,
@@ -1405,6 +1416,11 @@ class DockerEngineBackend:
                 raise DaemonBackendError("compiled probe status evidence differs")
             return True
         if inspected["ExitCode"] == 1 and report["ok"] is False:
+            if readiness and report["status"] == 0:
+                # The unchanged program reports zero for transport/read
+                # unavailability, not exclusively connection refusal. Only a
+                # proven terminal exact report permits another read-only exec.
+                return None
             return False
         raise DaemonBackendError("compiled probe process outcome is ambiguous")
 
@@ -1415,15 +1431,20 @@ class DockerEngineBackend:
                 or any(type(probe) is not Probe for probe in probes)
                 or tuple((probe.kind, probe.path, probe.expected_status, probe.expectation_id)
                          for probe in probes) != _PROBE_PROFILE
-                or any(probe.method != "GET" for probe in probes)):
+                or any(probe.method != "GET" for probe in probes)
+                or any(type(probe.startup_grace_ms) is not int
+                       or not 0 <= probe.startup_grace_ms <= 30_000
+                       or probe.startup_grace_ms > 0 and probe.kind != "health_json"
+                       for probe in probes)):
             raise DaemonBackendError("only the shared compiled probe profile is supported")
         if (type(timeout_ms) is not tuple or len(timeout_ms) != _MAX_PROBES
                 or any(type(value) is not int or not 1 <= value <= 10_000
                        for value in timeout_ms)
                 or any(value > probe.timeout_ms for value, probe in zip(timeout_ms, probes, strict=True))
-                or sum(timeout_ms) > 120_000):
+                or sum(timeout_ms) + sum(probe.startup_grace_ms for probe in probes) > 120_000):
             raise DaemonBackendError("compiled probe budgets are invalid")
-        deadline = time.monotonic() + sum(timeout_ms) / 1000
+        deadline = time.monotonic() + (
+            sum(timeout_ms) + sum(probe.startup_grace_ms for probe in probes)) / 1000
         observation = self._known_container(container_id, "running", deadline)
         if (type(observation) is not ContainerObservation
                 or observation.container_id != container_id
@@ -1445,9 +1466,38 @@ class DockerEngineBackend:
         self._remaining(deadline)
         self._journal_begin(operation_id, "probe")
         health_ok = True
-        for probe, budget in zip(probes, timeout_ms, strict=True):
+        for index, (probe, budget) in enumerate(zip(probes, timeout_ms, strict=True)):
             self._remaining(deadline)
-            healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit)
+            if probe.startup_grace_ms:
+                grace_deadline = time.monotonic() + probe.startup_grace_ms / 1000
+                health_deadline = min(deadline - sum(timeout_ms[index + 1:]) / 1000,
+                                      grace_deadline + budget / 1000)
+                if time.monotonic() + budget / 1000 > health_deadline:
+                    raise DaemonBackendError("ordinary health request budget unavailable")
+                while True:
+                    healthy = self._one_probe(container_id, probe, budget, health_deadline,
+                                              image.source_commit, readiness=True,
+                                              readiness_deadline=grace_deadline)
+                    if healthy is not None:
+                        break
+                    remaining_grace = grace_deadline - time.monotonic()
+                    if remaining_grace <= 0:
+                        healthy = False
+                        break
+                    time.sleep(min(.1, remaining_grace))
+                    # A last attempt begun just before expiry keeps its ordinary
+                    # request budget, but no new exec may begin at/after expiry.
+                    if time.monotonic() >= grace_deadline:
+                        healthy = False
+                        break
+                    if time.monotonic() + budget / 1000 > health_deadline:
+                        # The preceding attempt is proven terminal/unavailable;
+                        # unmet readiness policy is not permission to truncate
+                        # a new request or consume the later asset/auth budgets.
+                        healthy = False
+                        break
+            else:
+                healthy = self._one_probe(container_id, probe, budget, deadline, image.source_commit)
             health_ok = health_ok and healthy
             self._remaining(deadline)
         self._journal_complete(operation_id, "probe", container_id)

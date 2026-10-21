@@ -48,6 +48,8 @@ snapshot=FrozenBaselineSnapshot(saved['sha256'], saved['size_bytes'],
 manifest, record, blobs=make_record('rollback')
 data=manifest.model_dump(mode='json',by_alias=True)
 data['state_policy']['baseline_backup_digest']=snapshot.sha256
+if case in ('grace_budget','grace_budget_refusal'):
+    data['probes']['rollback'][0]['startup_grace_ms']=1000
 manifest=PilotManifest.from_bytes(json.dumps(data).encode())
 image=verify_fixture(manifest,record,blobs,FakeTrust(),role='rollback')
 record_store=FakeStore({manifest.rollback.provenance.attestation_digest:record})
@@ -104,6 +106,9 @@ def probes(container_id,actual_probes,operation_id,budgets):
     calls['probe']+=1
     assert container_id==cid and actual_probes==manifest.probes.rollback
     assert len(budgets)==3 and all(type(value) is int and value>0 for value in budgets)
+    if case in ('grace_budget','grace_budget_refusal'):
+        assert budgets==tuple(probe.timeout_ms for probe in actual_probes)
+        assert actual_probes[0].startup_grace_ms==1000
     journal.begin(operation_id,'probe')
     if case!='pending_operation':
         journal.completed(operation_id,'probe','d'*64 if case=='wrong_operation_container' else cid)
@@ -140,6 +145,10 @@ try:
         provenance_verifier=FakeTrust(),secret_resolver=Resolver(),snapshot=snapshot,generation_root=root,
         source_generation_id='baseline-one',frozen_leaf='frozen.sqlite3',container_id=cid,owner_guard=guard,
         allow_ephemeral_test_storage=True)
+    if case=='grace_budget_refusal':
+        actual_budget=observer._budget
+        full_probe_budget=sum(p.timeout_ms+p.startup_grace_ms for p in manifest.probes.rollback)
+        observer._budget=lambda deadline,maximum: min(actual_budget(deadline,maximum),full_probe_budget-1) if maximum==120000 else actual_budget(deadline,maximum)
     report['constructor_probe_calls']=calls['probe']
     try:
         draft=observer.observe(operation)
@@ -208,6 +217,18 @@ def test_observed_draft_matches_protected_reader_without_publication_or_replay(r
     assert report['receipt']['observation']['health'] == 'healthy'
     assert report['root_entries'] == ['baseline-one', 'frozen.sqlite3']
     assert original_bytes(rig[1]) == before
+
+
+def test_observer_passes_ordinary_probe_tuple_and_accounts_for_explicit_grace(rig):
+    report, _ = observe(rig,'grace_budget')
+    assert report['ok'] is True and report['calls']['probe']==1
+    assert report['receipt']['observation']['health']=='healthy'
+
+
+def test_observer_refuses_grace_if_full_sequence_budget_is_unavailable(rig):
+    report, _ = observe(rig,'grace_budget_refusal')
+    assert report['ok'] is False and report['calls']['probe']==0
+    assert report['one_attempt_denied'] is True and 'receipt' not in report
 
 
 @pytest.mark.parametrize('case', ['wrong_runner', 'wrong_image', 'wrong_profile', 'wrong_selection', 'wrong_status',

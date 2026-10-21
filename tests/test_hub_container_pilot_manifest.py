@@ -83,6 +83,70 @@ def test_positive_canonical_vector():
     assert parse(dict(reversed(list(data.items())))).digest() == manifest.digest()
 
 
+def test_zero_startup_grace_preserves_legacy_bytes_and_probe_digest():
+    from hub_container_executor.runtime_profile import probe_set_digest
+    data = make_manifest_data()
+    legacy = parse(data)
+    expected_probes = json.dumps(data['probes']['candidate'], sort_keys=True,
+                                separators=(',', ':')).encode()
+    for role in ('candidate', 'rollback'):
+        for probe in data['probes'][role]:
+            probe['startup_grace_ms'] = 0
+    explicit_zero = parse(data)
+    assert explicit_zero.canonical_bytes() == legacy.canonical_bytes()
+    assert explicit_zero.digest() == 'sha256:e984626ae49fb99716d41cbab2e2cafcf356ef27bcc81a48f720731c5c752bc7'
+    assert probe_set_digest(explicit_zero.probes.candidate) == 'sha256:' + hashlib.sha256(expected_probes).hexdigest()
+    assert all('startup_grace_ms' not in row for row in explicit_zero.model_dump(mode='json')['probes']['candidate'])
+
+
+def test_positive_health_startup_grace_is_explicit_canonical_policy_and_budget():
+    from hub_container_executor.runtime_profile import probe_set_digest
+    data = make_manifest_data()
+    data['probes']['candidate'][0]['startup_grace_ms'] = 30000
+    with pytest.raises(ValueError):
+        parse(data)  # 3s ordinary probes +30s grace exceeds30s command.
+    data['timeouts']['total_command_ms'] = 33000
+    manifest = parse(data)
+    assert manifest.probes.candidate[0].startup_grace_ms == 30000
+    assert PilotManifest.from_bytes(manifest.canonical_bytes()).canonical_bytes() == manifest.canonical_bytes()
+    assert probe_set_digest(manifest.probes.candidate) != probe_set_digest(manifest.probes.rollback)
+    assert manifest.model_dump(mode='json')['probes']['candidate'][0]['startup_grace_ms'] == 30000
+
+
+def test_zero_grace_serializer_respects_normal_pydantic_exclusion_options():
+    probe = parse(make_manifest_data()).probes.candidate[0]
+    assert 'startup_grace_ms' not in probe.model_dump(exclude_defaults=True)
+    assert 'startup_grace_ms' not in probe.model_dump(exclude_unset=True)
+    assert 'startup_grace_ms' not in probe.model_dump(exclude={'startup_grace_ms'})
+    assert probe.model_dump(include={'kind'}) == {'kind': 'health_json'}
+
+
+@pytest.mark.parametrize('value', [True, False, 0.0, 1.0, None, -1, 30001, '1'])
+def test_invalid_startup_grace_is_never_hidden_by_serialization(value):
+    data = make_manifest_data()
+    data['probes']['candidate'][0]['startup_grace_ms'] = value
+    with pytest.raises(ValueError):
+        parse(data)
+    manifest = parse(make_manifest_data())
+    bad_probe = manifest.probes.candidate[0].model_copy(update={'startup_grace_ms': value})
+    bad_probes = manifest.probes.model_copy(update={'candidate': (bad_probe, *manifest.probes.candidate[1:])})
+    with pytest.raises(ValueError):
+        manifest.model_copy(update={'probes': bad_probes}).canonical_bytes()
+
+
+@pytest.mark.parametrize('index', [1, 2])
+def test_startup_grace_cannot_apply_to_assets_or_auth(index):
+    data = make_manifest_data()
+    data['probes']['candidate'][index]['startup_grace_ms'] = 1
+    with pytest.raises(ValueError):
+        parse(data)
+    manifest = parse(make_manifest_data())
+    probes = list(manifest.probes.candidate)
+    probes[index] = probes[index].model_copy(update={'startup_grace_ms': 1})
+    with pytest.raises(ValueError):
+        manifest.model_copy(update={'probes': manifest.probes.model_copy(update={'candidate': tuple(probes)})}).canonical_bytes()
+
+
 @pytest.mark.parametrize("path,value", [
     ("policy_revision", True), ("policy_revision", 2), ("policy_revision", 1.0), ("policy_revision", "1"),
     ("campaign_id", "1398CF6D-CEBD-4F79-A913-BE70321970C9"), ("campaign_id", "not-a-uuid"),

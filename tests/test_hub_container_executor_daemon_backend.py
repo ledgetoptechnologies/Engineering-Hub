@@ -771,7 +771,8 @@ def test_create_rejects_profile_mismatch_and_symlink_generation_before_post(tmp_
     backend.close()
 
 
-def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candidate"):
+def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candidate",
+                  reports=None, exec_state=None, start_callback=None):
     manifest, image, blobs = verified_image(role)
     generation = safe_generation(tmp_path)
     profile = make_profile(image)
@@ -781,9 +782,11 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
                                    container_id=container_id, status="running")
     requests = []
     exec_number = 0
+    current_probe = None
+    current_report = None
 
     def handler(request):
-        nonlocal exec_number
+        nonlocal exec_number, current_probe, current_report
         path = request.url.raw_path.decode("ascii").split("?", 1)[0]
         requests.append((request.method, path, request.content))
         if path.endswith("/info"):
@@ -797,21 +800,31 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
             return httpx.Response(200, json=inspection)
         if path.endswith("/containers/" + container_id + "/exec"):
             exec_number += 1
+            arguments = json.loads(request.content)['Cmd']
+            current_probe = next(probe for probe in manifest.probes.candidate
+                                 if probe.expectation_id == arguments[7])
             return httpx.Response(201, json={"Id": f"{exec_number:064x}"})
         if path.endswith("/exec/" + f"{exec_number:064x}" + "/start"):
             if lose_start:
                 raise httpx.ReadTimeout("synthetic response loss")
-            if first_report is not None and exec_number == 1:
+            if start_callback is not None:
+                start_callback(exec_number)
+            if reports is not None and exec_number <= len(reports):
+                report = reports[exec_number - 1]
+            elif first_report is not None and exec_number == 1:
                 report = first_report
             else:
-                probe = manifest.probes.candidate[exec_number - 1]
+                probe = current_probe
                 report = {"expectation_id": probe.expectation_id,
                           "ok": True, "status": probe.expected_status}
+            current_report = report
             raw = json_bytes(report)
             frame = bytes([1, 0, 0, 0]) + len(raw).to_bytes(4, "big") + raw
             return httpx.Response(200, content=frame)
         if path.endswith("/exec/" + f"{exec_number:064x}" + "/json"):
-            exit_code = 1 if first_report is not None and exec_number == 1 else 0
+            exit_code = 0 if current_report.get('ok') is True else 1
+            if exec_state is not None and exec_number == 1:
+                return httpx.Response(200, json={"ID": f"{exec_number:064x}", **exec_state})
             return httpx.Response(200, json={"ID": f"{exec_number:064x}",
                                              "Running": False, "ExitCode": exit_code})
         raise AssertionError(f"unexpected fake route: {request.method} {path}")
@@ -938,6 +951,225 @@ def test_compiled_probe_failure_is_verified_unhealthy_and_timeout_stays_unknown(
     assert sum(path.endswith("/exec") for _, path, _ in requests) == 1
     assert sum(path.endswith("/start") for _, path, _ in requests) == 1
     backend.close()
+
+
+class ProbeClock:
+    def __init__(self):
+        self.value = 100.0
+        self.sleeps = []
+
+    def now(self):
+        return self.value
+
+    def sleep(self, seconds):
+        assert 0 < seconds <= .1
+        self.sleeps.append(seconds)
+        self.value = round(self.value + seconds, 9)
+
+
+def readiness_probes(manifest, grace=1000, *, timeout=None):
+    update = {'startup_grace_ms': grace}
+    if timeout is not None:
+        update['timeout_ms'] = timeout
+    return (manifest.probes.candidate[0].model_copy(update=update), *manifest.probes.candidate[1:])
+
+
+def run_readiness(backend, probes):
+    return backend.run_compiled_probes('c' * 64, probes,
+        '4c96d3f7-19c5-5ff4-a29e-302f6f661009', tuple(p.timeout_ms for p in probes))
+
+
+def test_readiness_retries_only_proven_terminal_health_under_one_journal_operation(tmp_path, monkeypatch):
+    import hub_container_executor.daemon_backend as module
+    unavailable = {'expectation_id': 'hub_health_v1', 'ok': False, 'status': 0}
+    backend, manifest, _image, requests = probe_fixture(tmp_path, reports=[unavailable])
+    clock = ProbeClock()
+    monkeypatch.setattr(module.time, 'monotonic', clock.now)
+    monkeypatch.setattr(module.time, 'sleep', clock.sleep)
+    journal = []
+    monkeypatch.setattr(backend, '_journal_begin', lambda *args: journal.append(('begin', args)))
+    monkeypatch.setattr(backend, '_journal_complete', lambda *args: journal.append(('complete', args)))
+    try:
+        result = run_readiness(backend, readiness_probes(manifest))
+        assert result.health == 'healthy' and result.evidence_verified
+        creates = [(index, json.loads(body)) for index, (method, path, body) in enumerate(requests)
+                   if method == 'POST' and path.endswith('/exec')]
+        assert [row['Cmd'][4] for _, row in creates] == ['health_json', 'health_json', 'application_assets', 'auth_denial']
+        assert len(journal) == 2 and [row[0] for row in journal] == ['begin', 'complete']
+        assert journal[0][1][1] == journal[1][1][1] == 'probe'
+        # The terminal GET for the first exec precedes creation of its successor.
+        assert any(method == 'GET' and path.endswith('/exec/' + f'{1:064x}' + '/json')
+                   for method, path, _ in requests[:creates[1][0]])
+        assert clock.sleeps == [.1]
+        assert not any(path.endswith('/containers/create') or '/kill' in path or
+                       path.endswith('/containers/' + 'c' * 64 + '/start') for _, path, _ in requests)
+    finally:
+        backend.close()
+
+
+def test_readiness_grace_exhaustion_is_verified_unhealthy_without_lifecycle_replay(tmp_path, monkeypatch):
+    import hub_container_executor.daemon_backend as module
+    unavailable = {'expectation_id': 'hub_health_v1', 'ok': False, 'status': 0}
+    backend, manifest, _image, requests = probe_fixture(tmp_path, reports=[unavailable] * 2)
+    clock = ProbeClock()
+    monkeypatch.setattr(module.time, 'monotonic', clock.now)
+    monkeypatch.setattr(module.time, 'sleep', clock.sleep)
+    try:
+        result = run_readiness(backend, readiness_probes(manifest, grace=200))
+        assert result.health == 'unhealthy' and result.evidence_verified is True
+    finally:
+        kinds = [json.loads(body)['Cmd'][4] for method, path, body in requests
+                 if method == 'POST' and path.endswith('/exec')]
+        assert kinds == ['health_json', 'health_json', 'application_assets', 'auth_denial']
+        assert clock.value == pytest.approx(100.2)
+        backend.close()
+
+
+def test_last_health_attempt_can_finish_after_grace_with_ordinary_budget(tmp_path, monkeypatch):
+    import hub_container_executor.daemon_backend as module
+    clock = ProbeClock()
+    starts = []
+    durations = [9.9, 9.9, 9.8, 9.0]
+    def elapsed(number):
+        starts.append(clock.value)
+        if number <= len(durations):
+            clock.value += durations[number - 1]
+    unavailable = {'expectation_id': 'hub_health_v1', 'ok': False, 'status': 0}
+    backend, manifest, _image, requests = probe_fixture(tmp_path, reports=[unavailable] * 3,
+                                                      start_callback=elapsed)
+    monkeypatch.setattr(module.time, 'monotonic', clock.now)
+    monkeypatch.setattr(module.time, 'sleep', clock.sleep)
+    try:
+        result = run_readiness(backend, readiness_probes(manifest, grace=30000, timeout=10000))
+        assert result.health == 'healthy'
+        assert starts[3] == pytest.approx(129.9) and clock.value == pytest.approx(138.9)
+        calls = [json.loads(body) for method, path, body in requests if method == 'POST' and path.endswith('/exec')]
+        assert [call['Cmd'][9] for call in calls[:4]] == ['10000'] * 4
+        assert len(calls) == 6  # four terminal health attempts, assets once, auth once.
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('inspection_delay', [25.0, 35.0])
+def test_readiness_reserves_full_assets_auth_budgets_after_initial_inspection(tmp_path, monkeypatch, inspection_delay):
+    import hub_container_executor.daemon_backend as module
+    clock = ProbeClock()
+    unavailable = {'expectation_id': 'hub_health_v1', 'ok': False, 'status': 0}
+    def elapsed(_):
+        clock.value = round(clock.value + 9.9, 9)
+    backend, manifest, _image, requests = probe_fixture(tmp_path, reports=[unavailable], start_callback=elapsed)
+    original = backend._known_container
+    def delayed_known(*args):
+        clock.value += inspection_delay
+        return original(*args)
+    monkeypatch.setattr(backend, '_known_container', delayed_known)
+    monkeypatch.setattr(module.time, 'monotonic', clock.now)
+    monkeypatch.setattr(module.time, 'sleep', clock.sleep)
+    probes = tuple(probe.model_copy(update={'timeout_ms': 10000,
+                    'startup_grace_ms': 30000 if index == 0 else 0})
+                   for index, probe in enumerate(manifest.probes.candidate))
+    try:
+        if inspection_delay == 35.0:
+            with pytest.raises(DaemonBackendError, match='ordinary health request budget unavailable'):
+                run_readiness(backend, probes)
+            assert not any(path.endswith('/exec') for _, path, _ in requests)
+        else:
+            result = run_readiness(backend, probes)
+            assert result.health == 'unhealthy' and result.evidence_verified is True
+            calls = [json.loads(body) for method,path,body in requests if method=='POST' and path.endswith('/exec')]
+            assert [call['Cmd'][4] for call in calls] == ['health_json','application_assets','auth_denial']
+            assert [call['Cmd'][9] for call in calls] == ['10000'] * 3
+            assert clock.value < 160.0
+    finally:
+        backend.close()
+
+
+def test_runner_validation_cannot_admit_retry_exec_after_grace_cutoff(tmp_path, monkeypatch):
+    import hub_container_executor.daemon_backend as module
+    clock = ProbeClock()
+    unavailable = {'expectation_id':'hub_health_v1','ok':False,'status':0}
+    backend,manifest,_image,requests = probe_fixture(tmp_path,reports=[unavailable])
+    original = backend._assert_runner
+    def slow_retry(deadline):
+        creates = sum(path.endswith('/exec') for _,path,_ in requests)
+        terminal = any(path.endswith('/exec/'+f'{1:064x}'+'/json') for _,path,_ in requests)
+        if creates == 1 and terminal:
+            clock.value += .2
+        return original(deadline)
+    monkeypatch.setattr(module.time,'monotonic',clock.now)
+    monkeypatch.setattr(module.time,'sleep',clock.sleep)
+    monkeypatch.setattr(backend,'_assert_runner',slow_retry)
+    try:
+        with pytest.raises(DaemonBackendError,match='readiness admission deadline'):
+            run_readiness(backend,readiness_probes(manifest,grace=200))
+        assert sum(path.endswith('/exec') for _,path,_ in requests)==1
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('status', [200, 401, 403, 500, 503])
+def test_readiness_does_not_retry_known_bad_http_health(tmp_path, status):
+    backend, manifest, _image, requests = probe_fixture(tmp_path,
+        first_report={'expectation_id': 'hub_health_v1', 'ok': False, 'status': status})
+    try:
+        assert run_readiness(backend, readiness_probes(manifest)).health == 'unhealthy'
+        assert sum(path.endswith('/exec') for _, path, _ in requests) == 3
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('case', ['lost_start', 'still_running', 'exit2', 'bad_report', 'expired',
+                                 'ok_true_status0', 'exit0_false', 'bool_status'])
+def test_readiness_uncertain_or_malformed_execution_never_retried(tmp_path, monkeypatch, case):
+    import hub_container_executor.daemon_backend as module
+    clock = ProbeClock()
+    report = {'expectation_id': 'hub_health_v1', 'ok': False, 'status': 0}
+    if case == 'bad_report':
+        report['extra'] = 'not-a-closed-report'
+    if case == 'ok_true_status0':
+        report['ok'] = True
+    if case == 'bool_status':
+        report['status'] = False
+    state = {'Running': True, 'ExitCode': 1} if case == 'still_running' else (
+        {'Running': False, 'ExitCode': 2} if case == 'exit2' else (
+        {'Running': False, 'ExitCode': 0} if case == 'exit0_false' else None))
+    def expire(_):
+        if case == 'expired':
+            clock.value += 2
+    backend, manifest, _image, requests = probe_fixture(tmp_path, first_report=report,
+        lose_start=case == 'lost_start', exec_state=state, start_callback=expire)
+    monkeypatch.setattr(module.time, 'monotonic', clock.now)
+    monkeypatch.setattr(module.time, 'sleep', clock.sleep)
+    completed = []
+    monkeypatch.setattr(backend, '_journal_complete', lambda *args: completed.append(args))
+    try:
+        with pytest.raises(DaemonBackendError):
+            run_readiness(backend, readiness_probes(manifest))
+        assert sum(path.endswith('/exec') for _, path, _ in requests) == 1
+        assert not completed and not clock.sleeps
+    finally:
+        backend.close()
+
+
+def test_compiled_script_remains_exact_reviewed_bytes():
+    from hub_container_executor.daemon_backend import _PROBE_SCRIPT
+    assert hashlib.sha256(_PROBE_SCRIPT.encode()).hexdigest() == '381424f410e82c22c9afb2ccb60fe47cf1480bb0d82c646be38739209e386d58'
+
+
+@pytest.mark.parametrize('index,value', [(0,False),(0,0.0),(0,None),(0,-1),(0,30001),(1,1),(2,1)])
+def test_invalid_bypassed_grace_is_denied_before_exec_or_journal(tmp_path, monkeypatch, index, value):
+    backend,manifest,_image,requests = probe_fixture(tmp_path)
+    probes = list(manifest.probes.candidate)
+    probes[index] = probes[index].model_copy(update={'startup_grace_ms':value})
+    journal=[]
+    monkeypatch.setattr(backend,'_journal_begin',lambda *args:journal.append(args))
+    try:
+        before=len(requests)
+        with pytest.raises(DaemonBackendError):
+            run_readiness(backend,tuple(probes))
+        assert len(requests)==before and not journal
+    finally:
+        backend.close()
 
 
 def test_inspect_operation_without_trusted_private_journal_is_unknown_and_read_only(tmp_path):

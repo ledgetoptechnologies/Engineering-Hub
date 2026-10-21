@@ -4,6 +4,51 @@ import hub_container_executor.adapter as adapter_module
 from tests.test_hub_container_executor_adapter import make_fixture, command
 
 
+def test_readiness_policy_requires_full_budget_without_starving_later_probes(tmp_path, monkeypatch):
+    adapter, backend, _state, manifest = make_fixture(tmp_path, startup_grace_ms=1000)
+    clock = [100.0]
+    monkeypatch.setattr(adapter_module.time, 'monotonic', lambda: clock[0])
+    try:
+        assert adapter._probe_timeouts(manifest.probes.candidate, 104.0) == (1000, 1000, 1000)
+        with pytest.raises(adapter_module._Held):
+            adapter._probe_timeouts(manifest.probes.candidate, 103.999)
+        assert 'probe' not in backend.events
+    finally:
+        adapter.close()
+
+
+def test_zero_grace_retains_legacy_greedy_budget_allocation(tmp_path, monkeypatch):
+    adapter, _backend, _state, manifest = make_fixture(tmp_path)
+    monkeypatch.setattr(adapter_module.time, 'monotonic', lambda: 100.0)
+    try:
+        assert adapter._probe_timeouts(manifest.probes.candidate, 101.5) == (1000, 499, 1)
+    finally:
+        adapter.close()
+
+
+def test_smoke_refuses_insufficient_readiness_budget_without_new_probe_or_lifecycle(tmp_path, monkeypatch):
+    adapter, backend, _state, manifest = make_fixture(tmp_path, startup_grace_ms=1000)
+    clock = [100.0]
+    monkeypatch.setattr(adapter_module.time, 'monotonic', lambda: clock[0])
+    deployed = adapter.submit(command(manifest, 'deploy_container'))
+    assert deployed.state == 'succeeded'
+    original = backend.inspect_container
+    def delayed_inspection(*args):
+        observation = original(*args)
+        clock[0] += 27.0  # 3s remains, below explicit4s readiness sequence.
+        return observation
+    monkeypatch.setattr(backend, 'inspect_container', delayed_inspection)
+    before = {kind: backend.events.count(kind) for kind in ('probe', 'create', 'start', 'stop')}
+    try:
+        result = adapter.submit(command(manifest, 'smoke_container', run_id=deployed.run_id))
+        assert result.state == 'held' and result.reason == 'inspect_required'
+        assert {kind: backend.events.count(kind) for kind in before} == before
+        rows = adapter.ledger.operation_rows(result.command_id)
+        assert rows[-1]['kind'] == 'probe' and rows[-1]['status'] == 'intent'
+    finally:
+        adapter.close()
+
+
 def test_expired_durable_intent_does_not_start_effect_callback(tmp_path, monkeypatch):
     adapter, backend, state, manifest = make_fixture(tmp_path, command_budget_ms=300)
     clock = [100.0]
