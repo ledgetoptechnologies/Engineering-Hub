@@ -1093,21 +1093,38 @@ class DockerEngineBackend:
         if config_info.get("Volumes") not in (None, {}):
             raise DaemonBackendError("container declares unexpected volumes")
         generation_id = self._container_generations.get(container_id)
+        state = data.get("State")
+        if not isinstance(state, dict):
+            raise DaemonBackendError("daemon container state metadata is invalid")
+        status = state.get("Status")
+        if type(status) is not str or status not in {"created", "running", "exited"}:
+            raise DaemonBackendError("daemon container state is unsupported")
+        # Pinned Moby 568f755 daemon/volumes_unix.go keeps HostConfig.Tmpfs
+        # separate from MountPoints, including while running. Inspect.Mounts
+        # therefore need not contain /tmp. The fully checked HostConfig below
+        # is daemon configuration evidence, not independent kernel mount proof.
+        never_started = (state.get("Status") == "created"
+                         and state.get("Running") is False
+                         and type(state.get("Pid")) is int and state["Pid"] == 0
+                         and state.get("StartedAt") == "0001-01-01T00:00:00Z")
         mounts = data.get("Mounts")
         host_mounts = host.get("Mounts")
-        if not isinstance(mounts, list) or len(mounts) != 2 or not isinstance(host_mounts, list) or len(host_mounts) != 1:
+        if (not isinstance(mounts, list) or len(mounts) not in (1, 2)
+                or (len(mounts) == 1 and status == "created" and not never_started)
+                or not isinstance(host_mounts, list) or len(host_mounts) != 1):
             raise DaemonBackendError("container has additional or missing mounts")
         bind_mounts = [item for item in mounts if isinstance(item, dict)
                        and item.get("Type") == "bind"]
         tmp_mounts = [item for item in mounts if isinstance(item, dict)
                       and item.get("Type") == "tmpfs"]
-        if len(bind_mounts) != 1 or len(tmp_mounts) != 1:
+        if (len(bind_mounts) != 1 or len(tmp_mounts) != len(mounts) - 1
+                or len(tmp_mounts) not in (0, 1)):
             raise DaemonBackendError("container mount types are unsupported")
         bind = bind_mounts[0]
         source_value = bind.get("Source")
         state_destination = bind.get("Destination")
         if (type(source_value) is not str or state_destination != "/var/lib/hub"
-                or bind.get("RW") is not True or bind.get("Mode") != "rw"
+                or bind.get("RW") is not True or bind.get("Mode") not in ("", "rw")
                 or bind.get("Propagation") != "rprivate"):
             raise DaemonBackendError("container state mount is unsafe")
         source = Path(source_value)
@@ -1121,13 +1138,16 @@ class DockerEngineBackend:
         if source != enrolled_source:
             raise DaemonBackendError("container state mount is outside enrolled root")
         configured_mount = host_mounts[0]
+        # Pinned Moby mount.Mount.ReadOnly is bool with json:",omitempty";
+        # absent means false. Present null/0/strings are never that default.
         if (not isinstance(configured_mount, dict) or configured_mount.get("Type") != "bind"
+                or set(configured_mount) - {"Type", "Source", "Target", "ReadOnly"}
                 or configured_mount.get("Source") != str(enrolled_source)
                 or configured_mount.get("Target") != "/var/lib/hub"
-                or configured_mount.get("ReadOnly") is not False):
+                or ("ReadOnly" in configured_mount and configured_mount["ReadOnly"] is not False)):
             raise DaemonBackendError("container host bind configuration differs")
-        tmp_mount = tmp_mounts[0]
-        if (tmp_mount.get("Destination") != "/tmp" or tmp_mount.get("RW") is not True
+        tmp_mount = tmp_mounts[0] if tmp_mounts else None
+        if tmp_mount is not None and (tmp_mount.get("Destination") != "/tmp" or tmp_mount.get("RW") is not True
                 or tmp_mount.get("Source") not in ("", None)):
             raise DaemonBackendError("container scratch mount is unsafe")
         tmp_options = host.get("Tmpfs")
@@ -1150,7 +1170,7 @@ class DockerEngineBackend:
             tmp_size = int(size_token[5:])
         except ValueError:
             raise DaemonBackendError("container tmpfs size is invalid") from None
-        mount_mode = tmp_mount.get("Mode")
+        mount_mode = tmp_mount.get("Mode") if tmp_mount is not None else ""
         if type(mount_mode) is not str:
             raise DaemonBackendError("container scratch mount mode is unavailable")
         if not 1024**2 <= tmp_size <= _FIXED_TMPFS_SIZE_MAX:
@@ -1243,9 +1263,6 @@ class DockerEngineBackend:
             image.runnable_reference, image.platform_manifest_digest,
             image.image_config_id, image.platform,
         )
-        status = (data.get("State") or {}).get("Status")
-        if status not in {"created", "running", "exited"}:
-            status = "unknown"
         self._container_profiles.setdefault(container_id, profile)
         self._container_generations.setdefault(container_id, generation_id)
         return ContainerObservation(container_id, expected_image, profile,

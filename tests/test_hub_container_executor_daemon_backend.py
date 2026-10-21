@@ -460,6 +460,154 @@ def container_inspect(image, profile, source, container_id="c" * 64, status="cre
     }
 
 
+def engine29_inspection_fixture(tmp_path, *, status="created", reported_tmpfs=False):
+    """Engine29 keeps HostConfig.Tmpfs separate from top-level MountPoints."""
+    manifest, image, blobs = verified_image()
+    generation = safe_generation(tmp_path)
+    profile = make_profile(image)
+    body = container_inspect(image, profile, generation, status=status)
+    body["HostConfig"]["Mounts"][0].pop("ReadOnly")
+    body["Mounts"][0]["Mode"] = ""
+    body["State"].update(Running=status == "running", Pid=123 if status == "running" else 0,
+                         StartedAt="2026-10-21T00:00:00Z" if status == "running" else "0001-01-01T00:00:00Z")
+    if not reported_tmpfs:
+        body["Mounts"] = body["Mounts"][:1]
+    archive = oci_archive(image, blobs)
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        if "/images/" in request.url.path and request.url.path.endswith("/json"):
+            return httpx.Response(200, json=docker_config(image))
+        if "/images/" in request.url.path and request.url.path.endswith("/get"):
+            return httpx.Response(200, content=archive)
+        if request.url.path.endswith("/containers/" + "c" * 64 + "/json"):
+            return httpx.Response(200, json=body)
+        raise AssertionError("unexpected diagnostic fixture request")
+
+    backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(handler))
+    backend.inspect_image(image, 5000)
+    return backend, body, profile, requests
+
+
+@pytest.mark.parametrize("status", ["created", "running", "exited"])
+@pytest.mark.parametrize("reported_tmpfs", [False, True])
+@pytest.mark.parametrize("readonly_present", [False, True])
+@pytest.mark.parametrize("mode", ["", "rw"])
+def test_engine29_inspection_accepts_omitted_false_and_hostconfig_tmpfs(
+        tmp_path, status, reported_tmpfs, readonly_present, mode):
+    backend, body, profile, requests = engine29_inspection_fixture(
+        tmp_path, status=status, reported_tmpfs=reported_tmpfs)
+    body["Mounts"][0]["Mode"] = mode
+    if readonly_present:
+        body["HostConfig"]["Mounts"][0]["ReadOnly"] = False
+    try:
+        observed = backend.inspect_container("c" * 64, 3000)
+        assert observed is not None and observed.profile == profile and observed.status == status
+        assert all(method == "GET" for method, _ in requests)
+        assert backend.operation_journal is None
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("bad", [None, True, 0, 1, "false", "", [], {}])
+def test_engine29_present_readonly_requires_exact_false(tmp_path, bad):
+    backend, body, _profile, _requests = engine29_inspection_fixture(tmp_path)
+    body["HostConfig"]["Mounts"][0]["ReadOnly"] = bad
+    try:
+        with pytest.raises(DaemonBackendError, match="host bind configuration differs"):
+            backend.inspect_container("c" * 64, 3000)
+    finally:
+        backend.close()
+
+
+def test_engine29_created_to_running_inspects_configuration_without_inventing_top_level_tmpfs(tmp_path):
+    backend, body, profile, requests = engine29_inspection_fixture(tmp_path)
+    try:
+        created = backend.inspect_container("c" * 64, 3000)
+        assert created is not None and created.status == "created" and created.profile == profile
+        previous_profiles = dict(backend._container_profiles)
+        body["State"].update(Status="running", Running=True, Pid=123,
+                             StartedAt="2026-10-21T00:00:00Z")
+        observed = backend.inspect_container("c" * 64, 3000)
+        assert observed is not None and observed.status == "running" and observed.profile == profile
+        assert len(body["Mounts"]) == 1 and "Tmpfs" in body["HostConfig"]
+        assert backend._container_profiles == previous_profiles
+        assert all(method == "GET" for method, _ in requests)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("change", [
+    "unknown", "missing-status", "status-list", "status-dict", "status-int", "pid-positive", "pid-false",
+    "missing-pid", "running-true", "running-zero", "missing-running", "started",
+    "missing-started", "bad-state", "extra-mount", "wrong-source", "wrong-target",
+    "readonly-observed", "rw-one", "shared", "bad-mode", "extra-host-bind-option",
+    "extra-host-volume-option", "missing-tmpfs", "extra-tmpfs", "tmpfs-exec",
+    "tmpfs-wrong-mode", "tmpfs-wrong-size",
+])
+def test_engine29_hostconfig_only_tmpfs_does_not_relax_state_mount_or_host_policy(tmp_path, change):
+    backend, body, _profile, requests = engine29_inspection_fixture(tmp_path)
+    state, bind, configured = body["State"], body["Mounts"][0], body["HostConfig"]["Mounts"][0]
+    host = body["HostConfig"]
+    if change in {"running", "exited", "unknown"}:
+        state["Status"] = change
+    elif change == "missing-status":
+        state.pop("Status")
+    elif change in {"status-list", "status-dict", "status-int"}:
+        state["Status"] = {"status-list": [], "status-dict": {}, "status-int": 0}[change]
+    elif change in {"pid-positive", "pid-false", "missing-pid"}:
+        if change == "missing-pid": state.pop("Pid")
+        else: state["Pid"] = 1 if change == "pid-positive" else False
+    elif change in {"running-true", "running-zero", "missing-running"}:
+        if change == "missing-running": state.pop("Running")
+        else: state["Running"] = True if change == "running-true" else 0
+    elif change == "started": state["StartedAt"] = "2026-10-21T00:00:00Z"
+    elif change == "missing-started": state.pop("StartedAt")
+    elif change == "bad-state": body["State"] = []
+    elif change == "extra-mount": body["Mounts"].append(dict(bind))
+    elif change == "wrong-source": bind["Source"] += "-foreign"
+    elif change == "wrong-target": bind["Destination"] = "/elsewhere"
+    elif change == "readonly-observed": bind["RW"] = False
+    elif change == "rw-one": bind["RW"] = 1
+    elif change == "shared": bind["Propagation"] = "rshared"
+    elif change == "bad-mode": bind["Mode"] = "ro"
+    elif change == "extra-host-bind-option": configured["BindOptions"] = {"Propagation": "rshared"}
+    elif change == "extra-host-volume-option": configured["VolumeOptions"] = {}
+    elif change == "missing-tmpfs": host.pop("Tmpfs")
+    elif change == "extra-tmpfs": host["Tmpfs"]["/other"] = host["Tmpfs"]["/tmp"]
+    elif change == "tmpfs-exec": host["Tmpfs"]["/tmp"] = host["Tmpfs"]["/tmp"].replace("noexec", "exec")
+    elif change == "tmpfs-wrong-mode": host["Tmpfs"]["/tmp"] = host["Tmpfs"]["/tmp"].replace("1777", "0777")
+    elif change == "tmpfs-wrong-size": host["Tmpfs"]["/tmp"] = "rw,noexec,nosuid,size=0,mode=1777"
+    try:
+        with pytest.raises(DaemonBackendError):
+            backend.inspect_container("c" * 64, 3000)
+        assert all(method == "GET" for method, _ in requests)
+        assert backend.operation_journal is None
+        assert backend._container_profiles == {} and backend._container_generations == {}
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("status", ["created", "running", "exited"])
+@pytest.mark.parametrize("change", ["wrong-target", "readonly", "foreign-source", "bad-mode", "missing-host-tmpfs"])
+def test_engine29_any_reported_tmpfs_and_host_configuration_remain_checked(tmp_path, status, change):
+    backend, body, _profile, _requests = engine29_inspection_fixture(tmp_path, status=status, reported_tmpfs=True)
+    scratch = body["Mounts"][1]
+    if change == "wrong-target": scratch["Destination"] = "/elsewhere"
+    elif change == "readonly": scratch["RW"] = False
+    elif change == "foreign-source": scratch["Source"] = "/foreign"
+    elif change == "bad-mode": scratch["Mode"] = "rw,exec,nosuid,size=67108864"
+    else: body["HostConfig"].pop("Tmpfs")
+    try:
+        with pytest.raises(DaemonBackendError):
+            backend.inspect_container("c" * 64, 3000)
+        assert backend._container_profiles == {} and backend._container_generations == {}
+    finally:
+        backend.close()
+
+
 def _exercise_create_closed_profile(tmp_path):
     from hub_container_executor.backend import ContainerPlan
 
@@ -942,7 +1090,8 @@ def test_explicit_private_journal_records_backend_ack_and_inspection_never_uses_
     backend.close()
 
 
-def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_path):
+@pytest.mark.parametrize("engine29_metadata", [False, True])
+def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_path, engine29_metadata):
     manifest, image, blobs = verified_image()
     generation = safe_generation(tmp_path)
     profile = make_profile(image)
@@ -962,8 +1111,14 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
         if "/images/" in path and path.endswith("/get"):
             return httpx.Response(200, content=archive)
         if path.endswith("/containers/" + container_id + "/json"):
-            return httpx.Response(200, json=container_inspect(
-                image, profile, generation, container_id, current["status"]))
+            body = container_inspect(image, profile, generation, container_id, current["status"])
+            if engine29_metadata:
+                body["HostConfig"]["Mounts"][0].pop("ReadOnly")
+                body["Mounts"][0]["Mode"] = ""
+                body["Mounts"] = body["Mounts"][:1]
+                if current["status"] == "created":
+                    body["State"].update(Running=False, Pid=0, StartedAt="0001-01-01T00:00:00Z")
+            return httpx.Response(200, json=body)
         if path.endswith("/containers/" + container_id + "/start"):
             current["status"] = "running"
             return httpx.Response(204)
