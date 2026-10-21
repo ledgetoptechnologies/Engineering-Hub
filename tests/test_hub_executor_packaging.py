@@ -23,7 +23,7 @@ def archive(extra=(), *, comment=REVISION, omit=None):
     members += [(f"hub_container_executor/{name}", b"# inert fixture\n", tarfile.REGTYPE)
                 for name in ("__init__.py", "service.py", "local_resources.py", "runtime_identity.py",
                              "installed_runner.py", "installed_coordinator.py", "launch_supervisor.py",
-                             "launch_transport.py")]
+                             "launch_transport.py", "configuration_commitment.py")]
     members += [("scripts/not_shipped.py", b"raise RuntimeError()", tarfile.REGTYPE),
                 ("hub_executor/fixtures.py", b"fixture", tarfile.REGTYPE)]
     members += list(extra)
@@ -47,7 +47,7 @@ def test_prepare_stages_only_explicit_library_and_helper(tmp_path):
         f"src/hub_container_executor/{name}" for name in (
             "__init__.py", "service.py", "local_resources.py", "runtime_identity.py",
             "installed_runner.py", "installed_coordinator.py", "launch_supervisor.py",
-            "launch_transport.py", "_executor_source.json")}
+            "launch_transport.py", "configuration_commitment.py", "_executor_source.json")}
     record = json.loads((out / "src/hub_container_executor/_executor_source.json").read_text())
     assert record["source_commit"] == REVISION
     assert record["source_archive_sha256"] == hashlib.sha256(data).hexdigest()
@@ -75,6 +75,7 @@ def test_invalid_members_do_not_publish_output(tmp_path, extra):
     {"omit": "hub_container_executor/installed_coordinator.py"},
     {"omit": "hub_container_executor/launch_supervisor.py"},
     {"omit": "hub_container_executor/launch_transport.py"},
+    {"omit": "hub_container_executor/configuration_commitment.py"},
 ])
 def test_missing_or_mismatched_source_denied(tmp_path, kwargs):
     with pytest.raises(ValueError):
