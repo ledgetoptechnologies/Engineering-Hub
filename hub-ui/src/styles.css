@@ -1025,6 +1025,121 @@ dialog::backdrop {
   background: #152e2399;
   backdrop-filter: blur(2px);
 }
+.panel.notes {
+  grid-column: 1 / -1;
+}
+.notes .panel-action {
+  display: flex;
+  gap: 8px;
+}
+.notes-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: center;
+  margin-bottom: 14px;
+  font-size: 11px;
+  color: #60764e;
+}
+.notes-controls form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.notes-controls input,
+.notes-controls select,
+.note-editor .field input {
+  padding: 7px 9px;
+  border: 1px solid #d9e0d0;
+  border-radius: 5px;
+  background: #fbfcf8;
+  color: #334d31;
+  font-size: 12px;
+  min-width: 0;
+  max-width: 100%;
+}
+.notes-layout {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr);
+  gap: 18px;
+}
+.notes-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.note-link {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  font-size: 11px;
+  color: #7e8f65;
+  overflow-wrap: anywhere;
+}
+.note-link strong {
+  font-size: 13px;
+  font-weight: 550;
+  color: #334d31;
+}
+.note-link:hover,
+.note-link.current {
+  background: #f4f7ef;
+  border-color: #dfe5d3;
+}
+.note-view h3,
+.note-editor h3 {
+  font-size: 15px;
+  font-weight: 550;
+  margin: 6px 0;
+}
+.note-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #334d31;
+  background: #fbfcf7;
+  border: 1px solid #e5eadc;
+  border-radius: 6px;
+  padding: 14px;
+  margin: 12px 0;
+  max-height: 60vh;
+  overflow: auto;
+}
+.note-editor fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.note-editor .field textarea {
+  min-height: 240px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.note-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.note-conflict details {
+  margin-top: 8px;
+}
+@media (max-width: 1150px) {
+  .notes-layout {
+    grid-template-columns: 1fr;
+  }
+}
 @media (min-width: 1600px) {
   .main {
     padding: 0 65px;
