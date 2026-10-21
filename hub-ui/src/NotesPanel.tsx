@@ -61,7 +61,9 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   const [draft, setDraft] = useState<Draft | null>(null);
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [saving, setSaving] = useState(false);
-  const [notice, setNotice] = useState<{ kind: "status" | "alert"; text: string } | null>(null);
+  // stale_read marks the warning from a failed re-read, so only a later
+  // successful read clears it; other notices are left alone.
+  const [notice, setNotice] = useState<{ kind: "status" | "alert"; text: string; stale_read?: true } | null>(null);
   const listGeneration = useRef(0), docGeneration = useRef(0), saveGeneration = useRef(0);
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
@@ -135,18 +137,22 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
 ${selected}`;
     // A re-read of the same note keeps it visible until the fresh copy arrives;
     // switching notes or projects clears it so another note's body never shows.
-    const rereading = key !== null && key === shownKey.current;
+    if (selected === null || mode === "demo") {
+      setDoc(null); shownKey.current = null; setDocState("idle");
+      return () => { docGeneration.current++; controller.abort(); };
+    }
+    const rereading = key === shownKey.current;
     if (!rereading) { setDoc(null); shownKey.current = null; }
-    if (selected === null || mode === "demo") { setDocState("idle"); return () => { docGeneration.current++; controller.abort(); }; }
     if (!rereading) setDocState("loading");
     void readNote(project, selected, controller.signal).then(value => {
       if (docGeneration.current !== current || controller.signal.aborted) return;
       shownKey.current = key; setDoc(value); setDocState("loaded");
+      setNotice(previous => previous?.stale_read ? null : previous);
     }).catch(error => {
       if (docGeneration.current !== current || controller.signal.aborted) return;
       if (deny(error)) return;
       if (rereading) {
-        setNotice({ kind: "alert", text: `${readError(error)} The note shown may be out of date.` });
+        setNotice({ kind: "alert", text: `${readError(error)} The note shown may be out of date.`, stale_read: true });
         return;
       }
       setDocState("failed"); setNotice({ kind: "alert", text: readError(error) });

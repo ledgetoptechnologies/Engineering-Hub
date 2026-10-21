@@ -342,3 +342,31 @@ test("a failed re-read keeps the note but says it may be out of date", async ({ 
   await expect(panel.getByText("The note shown may be out of date.", { exact: false })).toBeVisible();
   await expect(view.locator(".item-overline")).toContainText("v1");
 });
+
+test("a successful re-read clears only the out-of-date warning", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  const view = panel.getByRole("article", { name: "Shared notes runbook" });
+  await expect(view.locator(".item-overline")).toContainText("v1");
+  state.docStatus = 503;
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  const warning = panel.getByText("The note shown may be out of date.", { exact: false });
+  await expect(warning).toBeVisible();
+  state.docStatus = 200;
+  bump(state, "runbooks/shared-notes.md", "Recovered v2");
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect(view.locator("pre")).toHaveText("Recovered v2");
+  await expect(warning).toHaveCount(0);
+  // A save notice is not a read warning and survives a later re-read.
+  await view.getByRole("button", { name: "Edit" }).click();
+  await panel.getByLabel("Content").fill("Mine v3");
+  await panel.getByRole("button", { name: "Save note" }).click();
+  const saved = panel.getByText('Saved "Shared notes runbook" as version 3.', { exact: true });
+  await expect(saved).toBeVisible();
+  const reads = state.docReads;
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect.poll(() => state.docReads).toBe(reads + 1);
+  await expect(saved).toBeVisible();
+});
