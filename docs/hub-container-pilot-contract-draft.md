@@ -318,6 +318,33 @@ Health is checked inside the exact selected container, never at an agent URL.
 Candidate and rollback each require the complete compiled health/app-assets/auth-
 denial probe sequence. Memory/CPU/PID/scratch/timeouts and retention are bounded.
 
+The health probe alone may explicitly opt into `startup_grace_ms` (strict integer
+0–30000; default 0). Zero is omitted from canonical serialization, including an
+explicit zero, so legacy manifest bytes and probe-set digests remain unchanged.
+A positive value is hashed policy, not an implicit global startup delay. The
+compiled HTTP program and each ordinary request timeout (at most 10 seconds) are
+unchanged; app-assets and auth-denial still execute once each.
+
+Within this upper readiness window, another health GET execution is admitted
+only after the prior execution is proved terminal with exact exit 1 and a closed
+`ok:false/status:0` report. Status 0 covers transport/read unavailability, not only
+connection refusal. A nonzero HTTP response violating health/source expectations
+fails without retry; malformed, lost or nonterminal execution evidence holds the
+original operation, with no further attempt. One durable probe operation covers
+the bounded sequence. No application create/start/stop is retried by readiness.
+
+The grace clock never renews. A last admitted attempt may finish after grace
+expiry using its ordinary timeout; no new exec is admitted after expiry. Health
+also reserves the complete later asset/auth budgets. If an initial full health
+request cannot fit, the operation holds before exec; if another cannot fit after
+a proved-terminal unavailable result, readiness ends unmet. This is an upper
+window, not a promised sleep or a claim that the application is intrinsically
+unhealthy. Grace plus all ordinary probe budgets must fit the unchanged command
+deadline (maximum 120 seconds). Positive-policy adapter admission requires the
+whole planned sequence; baseline observation accounts for grace too. Deadline or
+caller cancellation is never proof that an unknown execution stopped, and never
+permission for a lifecycle retry or forced cleanup.
+
 All three agent secrets refer to distinct opaque **test-only versioned slots**,
 never values, hashes of weak secrets or a mutable latest alias. No resolver or
 credential is provisioned by this schema. Image defaults are selected through

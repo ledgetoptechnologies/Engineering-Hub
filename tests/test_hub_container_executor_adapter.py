@@ -176,7 +176,8 @@ class FakeBackend:
 
 def make_fixture(tmp_path, *, include_verifier=True, late_create=False, bad_runner=False,
                  alter_profile=False, terminal_start=False, driver_identity_commit="manifest",
-                 include_driver_identity=True, command_budget_ms=None, state_delay_seconds=0):
+                 include_driver_identity=True, command_budget_ms=None, state_delay_seconds=0,
+                 startup_grace_ms=0):
     candidate_manifest, candidate_raw, candidate_blobs = make_record("candidate")
     rollback_manifest, rollback_raw, rollback_blobs = make_record("rollback")
     manifest_data = make_manifest_data()
@@ -194,6 +195,9 @@ def make_fixture(tmp_path, *, include_verifier=True, late_create=False, bad_runn
         for role_probes in manifest_data["probes"].values():
             for probe in role_probes:
                 probe["timeout_ms"] = probe_budget
+    if startup_grace_ms:
+        for role_probes in manifest_data['probes'].values():
+            role_probes[0]['startup_grace_ms'] = startup_grace_ms
     manifest = PilotManifest.from_bytes(canonical(manifest_data))
 
     records = {digest(candidate_raw): candidate_raw, digest(rollback_raw): rollback_raw}

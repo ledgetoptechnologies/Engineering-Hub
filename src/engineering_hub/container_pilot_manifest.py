@@ -13,7 +13,7 @@ import json
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 SHA256 = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 Commit = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
@@ -205,12 +205,29 @@ class Probe(_Closed):
     expectation_id: Literal["hub_health_v1", "hub_app_assets_v1", "hub_auth_denied_v1"]
     max_response_bytes: Annotated[int, Field(ge=1024, le=2 * 1024**2)]
     timeout_ms: Annotated[int, Field(ge=100, le=10_000)]
+    startup_grace_ms: Annotated[int, Field(ge=0, le=30_000)] = 0
 
     @model_validator(mode="after")
     def compiled_expectation(self):
         if (self.kind, self.path, self.expected_status, self.expectation_id) not in PROBE_PROFILE:
             raise ValueError("probe does not match compiled expectation")
+        if self.startup_grace_ms and self.kind != "health_json":
+            raise ValueError("startup grace is restricted to the compiled health probe")
         return self
+
+    @model_serializer(mode="wrap")
+    def backward_compatible_grace(self, handler):
+        # Omit only this exact integer default, preserving all legacy manifest
+        # bytes and probe-set hashes. Validate before omission: model_copy or
+        # model_construct must not hide False/0.0 behind equality with zero.
+        if (type(self.startup_grace_ms) is not int
+                or not 0 <= self.startup_grace_ms <= 30_000
+                or self.startup_grace_ms > 0 and self.kind != "health_json"):
+            raise ValueError("invalid health startup grace")
+        result = handler(self)
+        if self.startup_grace_ms == 0:
+            result.pop("startup_grace_ms", None)
+        return result
 
 
 class Probes(_Closed):
@@ -313,7 +330,7 @@ class PilotManifest(_Closed):
         if self.candidate.image_config_id == self.rollback.image_config_id:
             raise ValueError("candidate and rollback must select distinct image config IDs")
         for probes in (self.probes.candidate, self.probes.rollback):
-            if sum(p.timeout_ms for p in probes) > self.timeouts.total_command_ms:
+            if sum(p.timeout_ms + p.startup_grace_ms for p in probes) > self.timeouts.total_command_ms:
                 raise ValueError("probe sequence exceeds command deadline")
         return self
 

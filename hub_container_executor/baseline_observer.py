@@ -208,7 +208,8 @@ class BaselineObserver:
             _require(self._storage(root_fd, root_identity, generation_fd, generation_identity, deadline) == frozen_identity)
             probes = self.manifest.probes.rollback
             budgets = tuple(probe.timeout_ms for probe in probes)
-            _require(sum(budgets) <= self._budget(deadline, 120000))
+            _require(sum(budgets) + sum(probe.startup_grace_ms for probe in probes)
+                     <= self._budget(deadline, 120000))
             outcome = self.backend.run_compiled_probes(self.container_id, probes, operation_id, budgets)
             self._scope(deadline)
             _require(type(outcome) is ProbeObservation and outcome.container_id == self.container_id

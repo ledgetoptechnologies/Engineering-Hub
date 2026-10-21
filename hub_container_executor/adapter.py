@@ -278,6 +278,13 @@ class HostAdapter:
 
     def _probe_timeouts(self, probes: tuple[Probe, ...], deadline: float) -> tuple[int, ...]:
         remaining = self._timeout(deadline, self.manifest.timeouts.total_command_ms)
+        if any(probe.startup_grace_ms for probe in probes):
+            # Explicit readiness must fit in full; never spend its grace while
+            # silently starving the ordinary health/assets/auth request budgets.
+            planned = sum(probe.timeout_ms + probe.startup_grace_ms for probe in probes)
+            if remaining < planned:
+                raise _Held("inspect_required")
+            return tuple(probe.timeout_ms for probe in probes)
         budgets = []
         for index, probe in enumerate(probes):
             reserve_for_later = len(probes) - index - 1
