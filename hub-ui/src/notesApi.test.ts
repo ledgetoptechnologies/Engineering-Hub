@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { isNotePath, listNotes, NoteConflictError, parseNoteDocument, parseNoteList, readNote, saveNote } from "./notesApi";
+import { isNotePath, listNotes, MAX_NOTE_REQUEST_BYTES, NoteConflictError, noteRequestBytes, parseNoteDocument, parseNoteList, readNote, saveNote } from "./notesApi";
 
 const human = "human:cf:" + "e".repeat(64);
 function meta(path = "runbooks/a.md") { return {
@@ -70,7 +70,7 @@ describe("shared notes client", () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const base = { project: "engineering-hub", path: "a.md", title: "T", content: "", expected_version: 0 };
     await expect(saveNote(base, "", fetchImpl)).rejects.toMatchObject({ code: "csrf_required" });
-    await expect(saveNote({ ...base, content: "é".repeat(32 * 1024 + 1) }, "c", fetchImpl)).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(saveNote({ ...base, content: "é".repeat(32 * 1024 + 1) }, "c", fetchImpl)).rejects.toMatchObject({ code: "note_too_large" });
     await expect(saveNote({ ...base, path: "../x" }, "c", fetchImpl)).rejects.toMatchObject({ code: "invalid_input" });
     await expect(saveNote({ ...base, title: "  " }, "c", fetchImpl)).rejects.toMatchObject({ code: "invalid_input" });
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -99,5 +99,17 @@ describe("shared notes client", () => {
     const fetchImpl = vi.fn<typeof fetch>();
     await expect(listNotes({ project: "../x" }, signal(), fetchImpl)).rejects.toMatchObject({ code: "invalid_input" });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it("budgets the whole escaped JSON request, not just the content", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const draft = { project: "engineering-hub", path: "a.md", title: "T", content: "\n".repeat(40000), expected_version: 0 };
+    expect(noteRequestBytes(draft)).toBeGreaterThan(MAX_NOTE_REQUEST_BYTES);
+    await expect(saveNote(draft, "c", fetchImpl)).rejects.toMatchObject({ status: 413, code: "note_too_large" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it("maps a gateway 413 to note_too_large", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code: "invalid_note" } }, 413));
+    await expect(saveNote({ project: "engineering-hub", path: "a.md", title: "T", content: "x", expected_version: 0 }, "c", fetchImpl))
+      .rejects.toMatchObject({ status: 413, code: "note_too_large" });
   });
 });

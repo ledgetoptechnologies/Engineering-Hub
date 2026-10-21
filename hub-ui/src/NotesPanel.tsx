@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { HubApiError, type HubMode } from "./api";
 import {
-  isNotePath, isNoteProject, listNotes, MAX_NOTE_CONTENT_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
-  NoteConflictError, noteContentBytes, readNote, saveNote, type NoteDocument, type NoteList,
+  isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
+  NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
 } from "./notesApi";
 
 export interface NotesPanelProps {
@@ -14,8 +14,11 @@ export interface NotesPanelProps {
   writable: boolean;
   onUnauthorized: () => void;
 }
-interface Draft { base: NoteDocument | null; path: string; title: string; content: string; expected: number }
-interface Conflict { current: number; latest: NoteDocument | null; latestState: "loading" | "loaded" | "missing" | "failed" }
+/** expected > 0 on a new note is an accepted overwrite of exactly accepted.project/path. */
+interface Draft { base: NoteDocument | null; path: string; title: string; content: string; expected: number;
+  accepted: { project: string; path: string } | null }
+/** Bound to the exact project and path that conflicted; never applied to another note. */
+interface Conflict { project: string; path: string; current: number; latest: NoteDocument | null; latestState: "loading" | "loaded" | "missing" | "failed" }
 type Search = { kind: "query" | "prefix"; text: string };
 
 export const DEFAULT_NOTES_PROJECT = "engineering-hub";
@@ -147,30 +150,39 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   function startNew() {
     if (!confirmDiscard()) return;
     closeEditor(); setNotice(null);
-    setDraft({ base: null, path: "", title: "", content: "", expected: 0 });
+    setDraft({ base: null, path: "", title: "", content: "", expected: 0, accepted: null });
   }
   function startEdit() {
     if (!doc) return;
     setNotice(null); setConflict(null);
-    setDraft({ base: doc, path: doc.path, title: doc.title, content: doc.content, expected: doc.version });
+    setDraft({ base: doc, path: doc.path, title: doc.title, content: doc.content, expected: doc.version,
+      accepted: { project: doc.project, path: doc.path } });
   }
   function cancelEdit() {
     if (!confirmDiscard()) return;
     closeEditor();
   }
-  async function loadLatest(current: number, path: string, generation: number) {
+  async function loadLatest(current: number, conflictProject: string, path: string, generation: number) {
     try {
-      const latest = await readNote(project, path, new AbortController().signal);
-      if (saveGeneration.current === generation) setConflict({ current, latest, latestState: "loaded" });
+      const latest = await readNote(conflictProject, path, new AbortController().signal);
+      if (saveGeneration.current === generation)
+        setConflict({ project: conflictProject, path, current, latest, latestState: "loaded" });
     } catch (error) {
       if (saveGeneration.current !== generation || deny(error)) return;
-      setConflict({ current, latest: null, latestState: error instanceof HubApiError && error.code === "note_not_found" ? "missing" : "failed" });
+      setConflict({ project: conflictProject, path, current, latest: null,
+        latestState: error instanceof HubApiError && error.code === "note_not_found" ? "missing" : "failed" });
     }
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!draft || saving || !csrf) return;
     const generation = ++saveGeneration.current, savedProject = project;
+    // Defense in depth: a version is only ever sent for the note it was accepted for.
+    if (draft.expected > 0 && (draft.accepted?.project !== savedProject || draft.accepted.path !== draft.path)) {
+      setDraft({ ...draft, expected: 0, accepted: null });
+      setNotice({ kind: "alert", text: "The path changed after a version was accepted. Nothing was saved. Review and save again." });
+      return;
+    }
     setSaving(true); setNotice(null);
     try {
       const saved = await saveNote({ project: savedProject, path: draft.path, title: draft.title,
@@ -185,19 +197,23 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
       setSaving(false);
       if (deny(error)) return;
       if (error instanceof NoteConflictError) {
-        setConflict({ current: error.currentVersion, latest: null, latestState: "loading" });
-        void loadLatest(error.currentVersion, draft.path, generation);
+        setConflict({ project: savedProject, path: draft.path, current: error.currentVersion, latest: null, latestState: "loading" });
+        void loadLatest(error.currentVersion, savedProject, draft.path, generation);
         return;
       }
-      setNotice({ kind: "alert", text: error instanceof HubApiError && (error.code === "invalid_note" || error.status === 422)
+      setNotice({ kind: "alert", text: error instanceof HubApiError && error.code === "note_too_large"
+        ? "This note is too large for the Hub to accept. Shorten it and try again. Your edits are still here."
+        : error instanceof HubApiError && (error.code === "invalid_note" || error.status === 422)
         ? "The server rejected this note. Check the path, title and size, then try again."
         : `${error instanceof HubApiError && error.status === 503 ? readError(error) : "The note could not be saved."} Your edits are still here.` });
     }
   }
   function keepMine() {
-    if (!draft || !conflict) return;
-    // Explicit, visible choice to replace the newer version the user has just seen.
-    setDraft({ ...draft, expected: conflict.current }); setConflict(null);
+    if (!draft || !conflict || conflict.project !== project || conflict.path !== draft.path) return;
+    if (conflict.latestState === "loaded" && conflict.latest?.path !== draft.path) return;
+    // Explicit, visible choice to replace the newer version the user has just seen, for this path only.
+    setDraft({ ...draft, expected: conflict.current, accepted: { project: conflict.project, path: conflict.path } });
+    setConflict(null);
     setNotice({ kind: "status", text: `Saving now replaces version ${conflict.current}.` });
   }
   function useLatest() {
@@ -208,8 +224,10 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   }
 
   const pathValid = draft ? isNotePath(draft.path) : true;
-  const bytes = draft ? noteContentBytes(draft.content) : 0;
-  const draftValid = !!draft && pathValid && draft.title.trim() !== "" && bytes <= MAX_NOTE_CONTENT_BYTES;
+  const bytes = draft ? noteRequestBytes({ project, path: draft.path, title: draft.title, content: draft.content,
+    expected_version: draft.expected }) : 0;
+  const draftValid = !!draft && pathValid && draft.title.trim() !== "" && bytes <= MAX_NOTE_REQUEST_BYTES;
+  const pathLocked = !!draft && (draft.base !== null || conflict !== null || draft.expected > 0);
   const canWrite = writable && !!csrf && mode === "live";
   const listMessages: Record<string, string> = {
     loading: "Reading notes…", demo: "Demo: notes are not loaded in demo mode.",
@@ -276,9 +294,9 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
             be asked before anything is replaced.</p>}
           <fieldset disabled={saving}>
             <label className="field">Path
-              <input value={draft.path} readOnly={draft.base !== null} maxLength={512} spellCheck={false} required
+              <input value={draft.path} readOnly={pathLocked} maxLength={512} spellCheck={false} required
                 placeholder="runbooks/staging-checklist.md" aria-invalid={!pathValid}
-                onChange={event => setDraft({ ...draft, path: event.target.value })} />
+                onChange={event => { if (!pathLocked) setDraft({ ...draft, path: event.target.value, expected: 0, accepted: null }); }} />
             </label>
             {draft.path !== "" && !pathValid && <p className="notice error">Use a relative path like
               folder/name.md with no leading slash, backslashes, empty parts, "." or "..".</p>}
@@ -290,8 +308,11 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
               <textarea value={draft.content} rows={14} spellCheck
                 onChange={event => setDraft({ ...draft, content: event.target.value })} />
             </label>
-            <p className={bytes > MAX_NOTE_CONTENT_BYTES ? "notice error" : "panel-footnote"}>
-              {Math.ceil(bytes / 1024)} of {MAX_NOTE_CONTENT_BYTES / 1024} KB.{dirty ? " Unsaved changes." : ""}</p>
+            {draft.base === null && draft.expected > 0 && <p className="panel-footnote">Saving replaces version {draft.expected} of
+              this path. The path is locked; cancel to choose another.</p>}
+            <p className={bytes > MAX_NOTE_REQUEST_BYTES ? "notice error" : "panel-footnote"}>
+              {Math.ceil(bytes / 1024)} of {MAX_NOTE_REQUEST_BYTES / 1024} KB, including path and title.
+              {bytes > MAX_NOTE_REQUEST_BYTES ? " Too large to save." : ""}{dirty ? " Unsaved changes." : ""}</p>
           </fieldset>
           {conflict && <div role="alert" className="notice error note-conflict">
             <p>{conflict.current === 0 ? "This note was deleted after you opened it."
@@ -301,6 +322,7 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
             {conflict.latestState === "failed" && <p>The latest version could not be loaded.</p>}
             {conflict.latest && <details open><summary>Latest saved version (v{conflict.latest.version} by <Actor id={conflict.latest.updated_by} />, {when(conflict.latest.updated_at)})</summary>
               <h4>{conflict.latest.title}</h4><pre className="note-content">{conflict.latest.content}</pre></details>}
+            {draft.base === null && <p>The path is locked while this conflict is open. Cancel to choose a different path.</p>}
             <div className="note-actions">
               {conflict.latest && <button type="button" className="secondary" onClick={keepMine}>Replace version {conflict.current} with mine</button>}
               {conflict.latest && <button type="button" className="secondary" onClick={useLatest}>Discard mine, keep latest</button>}

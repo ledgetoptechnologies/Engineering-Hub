@@ -182,3 +182,77 @@ test("notes authentication loss removes the private workspace", async ({ page })
   await expect(panel).toHaveCount(0);
   await expect(page.getByText("Shared notes runbook", { exact: false })).toHaveCount(0);
 });
+
+test("a new-note path collision can never be applied to a different existing note", async ({ page }) => {
+  const state = await fixture(page);
+  state.notes.push({ project: "engineering-hub", path: "b.md", title: "Note B", content: "B unseen", version: 1, updated_by: "codex" });
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: "New note" }).click();
+  const editor = panel.getByRole("form", { name: "New note" });
+  await editor.getByLabel("Path").fill("runbooks/shared-notes.md");
+  await editor.getByLabel("Title").fill("Mine");
+  await editor.getByLabel("Content").fill("my text");
+  await editor.getByRole("button", { name: "Save note" }).click();
+  const conflict = editor.getByRole("alert");
+  await expect(conflict.getByText("A note already exists at this path (version 1).", { exact: false })).toBeVisible();
+  // Before Replace: the path cannot be retargeted to B.
+  await expect(editor.getByLabel("Path")).toHaveAttribute("readonly", "");
+  await conflict.getByRole("button", { name: "Replace version 1 with mine" }).click();
+  // After Replace: still locked, and the accepted version names this path only.
+  await expect(editor.getByLabel("Path")).toHaveAttribute("readonly", "");
+  await expect(editor.getByText("Saving replaces version 1 of", { exact: false })).toBeVisible();
+  await editor.getByLabel("Path").press("End");
+  await editor.getByLabel("Path").pressSequentially("x");
+  await expect(editor.getByLabel("Path")).toHaveValue("runbooks/shared-notes.md");
+  page.once("dialog", dialog => void dialog.accept());
+  await editor.getByRole("button", { name: "Cancel" }).click();
+  // A fresh new note at B starts from version 0 and conflicts instead of overwriting.
+  await panel.getByRole("button", { name: "New note" }).click();
+  const second = panel.getByRole("form", { name: "New note" });
+  await second.getByLabel("Path").fill("b.md");
+  await second.getByLabel("Title").fill("Mine");
+  await second.getByRole("button", { name: "Save note" }).click();
+  await expect(second.getByRole("alert").getByText("A note already exists at this path (version 1).", { exact: false })).toBeVisible();
+  expect(state.posts.map(post => [post.body.path, post.body.expected_version])).toEqual([["runbooks/shared-notes.md", 0], ["b.md", 0]]);
+  expect(state.notes.find(note => note.path === "b.md")!.content).toBe("B unseen");
+  expect(state.notes.find(note => note.path === "runbooks/shared-notes.md")!.version).toBe(1);
+});
+
+test("Replace then save writes only the accepted path at the accepted version", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: "New note" }).click();
+  const editor = panel.getByRole("form", { name: "New note" });
+  await editor.getByLabel("Path").fill("runbooks/shared-notes.md");
+  await editor.getByLabel("Title").fill("Mine");
+  await editor.getByLabel("Content").fill("my text");
+  await editor.getByRole("button", { name: "Save note" }).click();
+  await editor.getByRole("alert").getByRole("button", { name: "Replace version 1 with mine" }).click();
+  await editor.getByRole("button", { name: "Save note" }).click();
+  await expect(panel.getByText('Saved "Mine" as version 2.', { exact: true })).toBeVisible();
+  expect(state.posts.map(post => [post.body.path, post.body.expected_version])).toEqual([["runbooks/shared-notes.md", 0], ["runbooks/shared-notes.md", 1]]);
+});
+
+test("notes over the gateway request budget are blocked locally and a 413 keeps the draft", async ({ page }) => {
+  const state = await fixture(page);
+  await page.route("**/api/hub/v1/notes", async route => route.request().method() === "POST"
+    ? route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ detail: { code: "gateway_body_too_large" } }) })
+    : route.fallback());
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: "New note" }).click();
+  const editor = panel.getByRole("form", { name: "New note" });
+  await editor.getByLabel("Path").fill("big.md");
+  await editor.getByLabel("Title").fill("Big");
+  // 40,000 quote marks are 40 KB of content but 80 KB once JSON-escaped.
+  await editor.getByLabel("Content").fill('"'.repeat(40000));
+  await expect(editor.getByText("Too large to save.", { exact: false })).toBeVisible();
+  await expect(editor.getByRole("button", { name: "Save note" })).toBeDisabled();
+  await editor.getByLabel("Content").fill("small enough");
+  await editor.getByRole("button", { name: "Save note" }).click();
+  await expect(panel.getByText("This note is too large for the Hub to accept.", { exact: false })).toBeVisible();
+  await expect(editor.getByLabel("Content")).toHaveValue("small enough");
+  expect(state.notes.find(note => note.path === "big.md")).toBeUndefined();
+});

@@ -13,10 +13,12 @@ export const NOTE_LIST_LIMIT = 50;
 export const MAX_NOTE_CONTENT_BYTES = 64 * 1024;
 export const MAX_NOTE_TITLE_CHARS = 200;
 export const MAX_NOTE_PATH_CHARS = 512;
+/** The private gateway caps the whole JSON request body, not just the content. */
+export const MAX_NOTE_REQUEST_BYTES = 65536;
 const projectPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const actorPattern = /^[^\u0000-\u001f\u007f]{1,128}$/;
 const knownCodes = new Set(["notes_version_conflict", "notes_unavailable", "notes_integrity_failure", "note_not_found",
-  "invalid_note", "choose_note_search_or_prefix", "human_session_required", "forbidden", "csrf_required"]);
+  "invalid_note", "choose_note_search_or_prefix", "note_too_large", "human_session_required", "forbidden", "csrf_required"]);
 
 export function isNoteProject(value: string): boolean { return projectPattern.exec(value)?.[0] === value; }
 /** Mirrors KnowledgeRepository.validate_path so the form can explain errors before saving. */
@@ -79,13 +81,13 @@ export function parseNoteDocument(value: unknown, project: string, path: string)
 }
 
 async function failure(response: Response): Promise<never> {
-  let code = response.status === 503 ? "notes_unavailable" : response.status === 404 ? "note_not_found"
+  let code = response.status === 413 ? "note_too_large" : response.status === 503 ? "notes_unavailable" : response.status === 404 ? "note_not_found"
     : response.status === 409 ? "notes_version_conflict" : response.status === 422 ? "invalid_note" : "notes_request_failed";
   let current: number | null = null;
   if (response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     try {
       const detail = object(object(await response.json()).detail);
-      if (typeof detail.code === "string" && knownCodes.has(detail.code)) code = detail.code;
+      if (typeof detail.code === "string" && knownCodes.has(detail.code) && response.status !== 413) code = detail.code;
       if (Number.isSafeInteger(detail.current_version) && (detail.current_version as number) >= 0)
         current = detail.current_version as number;
     } catch { /* Never reflect proxy HTML or raw server exceptions. */ }
@@ -120,17 +122,24 @@ export async function readNote(project: string, path: string, signal: AbortSigna
   return parseNoteDocument(await json(response), project, path);
 }
 export interface NoteDraft { project: string; path: string; title: string; content: string; expected_version: number }
+function requestBody(draft: NoteDraft): string {
+  return JSON.stringify({ project: draft.project, path: draft.path, title: draft.title,
+    content: draft.content, expected_version: draft.expected_version });
+}
+/** Exact bytes the browser will send, including JSON escaping of newlines and quotes. */
+export function noteRequestBytes(draft: NoteDraft): number { return noteContentBytes(requestBody(draft)); }
 export async function saveNote(draft: NoteDraft, csrf: string, fetchImpl: typeof fetch = globalThis.fetch): Promise<NoteDocument> {
   if (!csrf) throw new HubApiError(403, "csrf_required");
   if (!isNoteProject(draft.project) || !isNotePath(draft.path) || !draft.title.trim()
-      || draft.title.length > MAX_NOTE_TITLE_CHARS || noteContentBytes(draft.content) > MAX_NOTE_CONTENT_BYTES
-      || !Number.isSafeInteger(draft.expected_version) || draft.expected_version < 0)
+      || draft.title.length > MAX_NOTE_TITLE_CHARS || !Number.isSafeInteger(draft.expected_version) || draft.expected_version < 0)
     throw new HubApiError(422, "invalid_input");
+  const body = requestBody(draft);
+  if (noteContentBytes(draft.content) > MAX_NOTE_CONTENT_BYTES || noteContentBytes(body) > MAX_NOTE_REQUEST_BYTES)
+    throw new HubApiError(413, "note_too_large");
   const response = await fetchImpl.call(globalThis, "/api/hub/v1/notes", {
     method: "POST", credentials: "same-origin", redirect: "error", cache: "no-store",
     headers: { Accept: "application/json", "Content-Type": "application/json", "X-Hub-CSRF": csrf },
-    body: JSON.stringify({ project: draft.project, path: draft.path, title: draft.title,
-      content: draft.content, expected_version: draft.expected_version }),
+    body,
   });
   const saved = parseNoteDocument(await json(response), draft.project, draft.path);
   if (saved.version !== draft.expected_version + 1) return invalid();
