@@ -80,9 +80,11 @@ def prepare_record(*, source_commit: str, context_digest: str, recipe_digest: st
     })
     manifest, config = identity.strict_json(manifest_raw), identity.strict_json(config_raw)
     manifest_digest, config_digest = sha(manifest_raw), sha(config_raw)
-    if (type(manifest) is not dict or type(config) is not dict
-            or manifest.get("config", {}).get("digest") != config_digest
-            or manifest.get("config", {}).get("size") != len(config_raw)):
+    if type(manifest) is not dict or type(config) is not dict:
+        raise ValueError("Raw selected metadata chain mismatch")
+    descriptor = manifest.get("config")
+    if (type(descriptor) is not dict or descriptor.get("digest") != config_digest
+            or descriptor.get("size") != len(config_raw)):
         raise ValueError("Raw selected metadata chain mismatch")
     record = {
         "schema_version": "hub_container_build_record_v1",
