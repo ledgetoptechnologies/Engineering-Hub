@@ -27,7 +27,7 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row")).toHaveCount(0);
   await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Missing streams do not mean offline.", { exact: false })).toBeVisible();
+  await expect(page.getByText("not connected doesn't mean it's offline.", { exact: false })).toBeVisible();
 });
 
 test("Hub connection observations expire locally without polling", async ({ page }) => {

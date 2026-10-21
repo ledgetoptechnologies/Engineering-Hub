@@ -29,6 +29,11 @@ const names: Record<string, string> = {
   hermes: "Hermes",
   claude: "Claude",
 };
+/** Two letters from an email's local part ("bkoltz@…" -> "BK"); "?" when unknown. */
+function initials(value: string | null | undefined): string {
+  const letters = (value ?? "").split("@")[0].replace(/[^A-Za-z]/g, "");
+  return letters ? letters.slice(0, 2).toUpperCase() : "?";
+}
 const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
 
@@ -682,14 +687,17 @@ export function HubApp() {
               ↗
             </span>
           </button>
+          <a className="nav-item" href="#decisions">
+            <Icon kind="folder" /> Needs Beau
+          </a>
           <a className="nav-item" href="#work">
-            <Icon kind="folder" /> Assigned work
+            <Icon kind="folder" /> Work in motion
           </a>
           <a className="nav-item" href="#notes">
             <Icon kind="folder" /> Shared notes
           </a>
           <a className="nav-item" href="#agents">
-            <Icon kind="agents" /> Agent connections
+            <Icon kind="agents" /> Agents
           </a>
         </nav>
         <div className="sidebar-section">
@@ -723,7 +731,7 @@ export function HubApp() {
             }
           >
             <span className="avatar" aria-hidden="true">
-              {demo ? "D" : session?.authenticated ? "EH" : "—"}
+              {demo ? "D" : session?.authenticated ? initials(session.email ?? session.actor) : "—"}
             </span>
             <div>
               <strong>
@@ -860,25 +868,22 @@ export function HubApp() {
               <div>
                 <span className="stat-label">NEEDS YOUR INPUT</span>
                 <strong>
-                  {openDecisions.length.toString().padStart(2, "0")}
-                  <span className="stat-note">decisions</span>
+                  {openDecisions.length}
+                  <span className="stat-note">{openDecisions.length === 1 ? "decision" : "decisions"}</span>
                 </strong>
               </div>
               <div>
-                <span className="stat-label">ASSIGNED WORK</span>
+                <span className="stat-label">WORK IN MOTION</span>
                 <strong>
-                  {tasks.length.toString().padStart(2, "0")}
-                  <span className="stat-note">tracked tasks</span>
+                  {tasks.length}
+                  <span className="stat-note">{tasks.length === 1 ? "task" : "tasks"}</span>
                 </strong>
               </div>
               <div>
-                <span className="stat-label">ACTIVE STAGING TARGETS</span>
+                <span className="stat-label">STAGING TARGETS SET UP</span>
                 <strong>
-                  {projects
-                    .filter((item) => item.executor_enabled)
-                    .length.toString()
-                    .padStart(2, "0")}
-                  <span className="stat-note">individually gated</span>
+                  {projects.filter((item) => item.executor_enabled).length}
+                  <span className="stat-note">of {projects.length} projects</span>
                 </strong>
               </div>
               <div className="feed-summary">
@@ -1188,21 +1193,26 @@ export function HubApp() {
                   ))}
                 </div>
               </section>
-              <section className="panel" id="agents">
-                <PanelTitle number="04" title="Agents & topic" />
+              <section className="panel agents-panel" id="agents">
+                <PanelTitle number="04" title="Agents" />
                 <p className="panel-description">
-                  Hub transport and readiness in this conversation are separate observations.
+                  Whether each agent's app is connected to the Hub, and whether it can be
+                  reached on a specific conversation topic. These are checked separately.
                 </p>
-                <h3 className="agent-section-title">Hub connection snapshots</h3>
+                <div className="agents-columns">
+                <div>
+                <h3 className="agent-section-title">Connected to the Hub</h3>
                 <div className="hub-connection-list">
                   {data.agents.map((agent) => (
                     <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />
                   ))}
                 </div>
                 <p className="panel-footnote">
-                  A push stream or inbox subscription does not prove the agent is running a model,
-                  attached to this topic, or ready to receive work. Missing streams do not mean offline.
+                  Connected means the agent's app is linked to the Hub. It doesn't prove the agent
+                  is working on anything right now, and not connected doesn't mean it's offline.
                 </p>
+                </div>
+                <div>
                 <h3 className="agent-section-title">Topic readiness</h3>
                 <form className="topic-form" onSubmit={checkTopic}>
                   <label htmlFor="topic-root">TOPIC ROOT</label>
@@ -1242,7 +1252,7 @@ export function HubApp() {
                           <strong>{names[peer.agent]}</strong>
                           <small>
                             {state === "unknown_stale"
-                              ? "No current, verified route"
+                              ? "Can't confirm it's reachable right now"
                               : state === "busy_queued"
                                 ? "Bound session can queue work"
                                 : state === "reachable"
@@ -1284,20 +1294,23 @@ export function HubApp() {
                 <div className="advisory">
                   <span>↳</span>
                   <p>
-                    Reachability is advisory. Accepted mail stays durable when a
-                    peer is offline; a connection is not a delivery or
-                    completion receipt.
+                    This is a best guess. Messages are kept even when an agent
+                    is offline, and being reachable doesn't mean a message was
+                    read or acted on.
                   </p>
                 </div>
                 <p className="panel-footnote">
                   {demo
                     ? "All agent states above are illustrative fixtures."
-                    : "Live registry and owning-session evidence are required. The Hub event feed alone does not prove topic readiness."}
+                    : "An agent shows as unknown until the Hub can confirm its live session for this topic."}
                 </p>
+                </div>
+                </div>
               </section>
               <NotesPanel mode={demo ? "demo" : "live"} selectedProject={project}
                 knownProjects={data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? []}
                 csrf={session?.csrf_token ?? null} writable={!!session?.authenticated}
+                viewerActor={session?.actor ?? null}
                 onUnauthorized={clearPrivateWorkspace} />
             </div>
             <footer className="page-footer">

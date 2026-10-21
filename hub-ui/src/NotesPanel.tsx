@@ -12,6 +12,8 @@ export interface NotesPanelProps {
   knownProjects: { id: string; name: string }[];
   csrf: string | null;
   writable: boolean;
+  /** The signed-in actor, so the viewer's own edits read "You". */
+  viewerActor?: string | null;
   onUnauthorized: () => void;
 }
 /** expected > 0 on a new note is an accepted overwrite of exactly accepted.project/path. */
@@ -31,11 +33,14 @@ function when(value: string): string {
   return `${date.toLocaleString()} (${age})`;
 }
 /** Cloudflare humans are "human:cf:<64 hex>"; show a short, stable label and keep the full id in a tooltip. */
-export function actorLabel(actor: string): string {
+export function actorLabel(actor: string, viewer?: string | null): string {
+  if (viewer && actor === viewer) return "You";
   const human = /^human:cf:([a-f0-9]{8})[a-f0-9]{56}$/.exec(actor);
   return human ? `Person ${human[1]}` : actor;
 }
-function Actor({ id }: { id: string }) { return <span title={id}>{actorLabel(id)}</span>; }
+function Actor({ id, viewer }: { id: string; viewer?: string | null }) {
+  return <span title={id}>{actorLabel(id, viewer)}</span>;
+}
 function readError(error: unknown): string {
   if (!(error instanceof HubApiError)) return "Notes could not be read. Use Refresh to retry.";
   if (error.code === "note_not_found") return "That note no longer exists.";
@@ -44,7 +49,8 @@ function readError(error: unknown): string {
   return "Notes could not be read. Use Refresh to retry.";
 }
 
-export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writable, onUnauthorized }: NotesPanelProps) {
+export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writable, viewerActor, onUnauthorized }: NotesPanelProps) {
+  const detailRef = useRef<HTMLDivElement>(null);
   const [project, setProject] = useState(DEFAULT_NOTES_PROJECT);
   const [projectDraft, setProjectDraft] = useState(DEFAULT_NOTES_PROJECT);
   const [searchDraft, setSearchDraft] = useState<Search>({ kind: "query", text: "" });
@@ -164,6 +170,8 @@ ${selected}`;
     if (!confirmDiscard()) return;
     // Opening the note that is already open re-reads it.
     closeEditor(); setNotice(null); setSelected(path); setDocRevision(value => value + 1);
+    if (window.matchMedia("(max-width: 1150px)").matches)
+      requestAnimationFrame(() => detailRef.current?.scrollIntoView({ block: "start", behavior: "smooth" }));
   }
   function startNew() {
     if (!confirmDiscard()) return;
@@ -305,11 +313,11 @@ ${latest.path}`;
               aria-current={item.path === selected ? "true" : undefined} onClick={() => open(item.path)}>
               <strong>{item.title}</strong>
               <span>{item.path}</span>
-              <span>v{item.version} · <Actor id={item.updated_by} /> · {when(item.updated_at)}</span>
+              <span>v{item.version} · <Actor id={item.updated_by} viewer={viewerActor} /> · {when(item.updated_at)}</span>
             </button></li>)}</ul>
         </>}
       </div>
-      <div className="notes-detail">
+      <div className="notes-detail" ref={detailRef}>
         {draft ? <form className="note-editor" onSubmit={event => void submit(event)} aria-label={draft.base ? "Edit note" : "New note"}>
           <h3>{draft.base ? `Editing ${draft.base.path}` : `New note in ${project}`}</h3>
           {draft.base && <p className="panel-footnote">Based on version {draft.base.version}. If someone saves first, you will
@@ -342,7 +350,7 @@ ${latest.path}`;
               : `A note already exists at this path (version ${conflict.current}).`} Nothing was saved. Your text is still here.</p>
             {conflict.latestState === "loading" && <p>Loading the latest version…</p>}
             {conflict.latestState === "failed" && <p>The latest version could not be loaded.</p>}
-            {conflict.latest && <details open><summary>Latest saved version (v{conflict.latest.version} by <Actor id={conflict.latest.updated_by} />, {when(conflict.latest.updated_at)})</summary>
+            {conflict.latest && <details open><summary>Latest saved version (v{conflict.latest.version} by <Actor id={conflict.latest.updated_by} viewer={viewerActor} />, {when(conflict.latest.updated_at)})</summary>
               <h4>{conflict.latest.title}</h4><pre className="note-content">{conflict.latest.content}</pre></details>}
             {draft.base === null && <p>The path is locked while this conflict is open. Cancel to choose a different path.</p>}
             <div className="note-actions">
@@ -362,7 +370,7 @@ ${latest.path}`;
         : doc ? <article className="note-view" aria-label={doc.title}>
           <div className="item-overline">{doc.project}<span>v{doc.version}</span></div>
           <h3>{doc.title}</h3>
-          <p className="panel-footnote">{doc.path} · Updated by <Actor id={doc.updated_by} />, {when(doc.updated_at)} · Created by <Actor id={doc.created_by} />, {when(doc.created_at)}</p>
+          <p className="panel-footnote">{doc.path} · Updated by <Actor id={doc.updated_by} viewer={viewerActor} />, {when(doc.updated_at)} · Created by <Actor id={doc.created_by} viewer={viewerActor} />, {when(doc.created_at)}</p>
           <pre className="note-content">{doc.content}</pre>
           {canWrite && <div className="note-actions"><button className="secondary" type="button" onClick={startEdit}>Edit</button></div>}
         </article>
