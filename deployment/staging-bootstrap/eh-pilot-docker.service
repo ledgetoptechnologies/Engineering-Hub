@@ -12,7 +12,11 @@ ConditionPathExists=/usr/bin/newgidmap
 [Service]
 Type=notify
 NotifyAccess=all
-ExecStart=/usr/bin/env -i HOME=%h PATH=/usr/bin:/bin:/usr/sbin:/sbin XDG_RUNTIME_DIR=%t DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus NOTIFY_SOCKET=${NOTIFY_SOCKET} DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit /usr/bin/dockerd-rootless.sh --host=unix://%t/eh-pilot-docker.sock --data-root=%h/docker-data --exec-root=%t/eh-pilot-exec --bridge=none --iptables=false --ip6tables=false
+# Supported detached mode: dockerd may share the host network namespace.
+# NET=none is not consumer isolation. Any later consumer requires independently
+# verified NetworkMode=none, no published ports, effective limits and seccomp.
+# Docker rootless mode does not provide per-container AppArmor enforcement.
+ExecStart=/usr/bin/env -i HOME=%h PATH=/usr/bin:/bin:/usr/sbin:/sbin XDG_RUNTIME_DIR=%t DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus NOTIFY_SOCKET=${NOTIFY_SOCKET} DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit /usr/bin/dockerd-rootless.sh --host=unix://%t/eh-pilot-docker.sock --data-root=%h/docker-data --exec-root=%t/eh-pilot-exec --bridge=none --iptables=false --ip6tables=false
 Restart=no
 TimeoutStartSec=30
 TimeoutStopSec=1200

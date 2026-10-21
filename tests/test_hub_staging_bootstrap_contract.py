@@ -63,7 +63,7 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
         "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus",
         "NOTIFY_SOCKET=${NOTIFY_SOCKET}",
         "DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none",
-        "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true",
         "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit",
         "/usr/bin/dockerd-rootless.sh",
         "--host=unix://%t/eh-pilot-docker.sock",
@@ -82,16 +82,20 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
     assert "NoNewPrivileges" not in service
 
 
-def test_bootstrap_explicitly_keeps_daemon_inside_non_detached_network_namespace():
+def test_bootstrap_explicitly_selects_supported_detached_mode_not_consumer_isolation():
     argv = shlex.split(_one(_read("eh-pilot-docker.service")["Service"], "ExecStart"))
     helper = argv.index("/usr/bin/dockerd-rootless.sh")
     assignments = [arg for arg in argv[2:helper]
                    if arg.startswith("DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=")]
-    # NET=none alone is insufficient: installed helper29.5.2 defaults this
-    # override to true, which makes RootlessKit execute dockerd on host netns.
-    assert assignments == ["DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false"]
+    # The installed29.5.2 supported default is detached. Forcing false lets
+    # its AppArmor availability check reach an inaccessible profile list.
+    # Consumer isolation must be measured separately; no daemon netns claim.
+    assert assignments == ["DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true"]
     assert "DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none" in argv[2:helper]
     assert not any(arg.startswith("--detach-netns") for arg in argv)
+    source = (ARTIFACTS / "eh-pilot-docker.service").read_text()
+    assert "NET=none is not consumer isolation" in source
+    assert "does not provide per-container AppArmor enforcement" in source
 
 
 @pytest.mark.parametrize(("key", "expected"), [
