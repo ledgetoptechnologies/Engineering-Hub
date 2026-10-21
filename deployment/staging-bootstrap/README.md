@@ -1,4 +1,4 @@
-# Staging bootstrap artifacts — environment revision NOT INSTALLED
+# Staging bootstrap artifacts — bounded network preflight verified
 
 These files describe the bounded bootstrap, not an automatic installer. Beau
 approved the earlier bootstrap. Hermes subsequently reported installing the
@@ -9,8 +9,34 @@ activation and inherited `SSH_AUTH_SOCK`. Hermes's bus report
 the shared daemon's objects were unchanged. That is peer evidence of a safely
 stopped partial bootstrap, not acceptance of an executor or application pilot.
 
-The environment-whitelist revision below has **not** been installed. Reconcile
-the retained exact account, paths and unit hashes with that prior enrollment;
+The earlier environment-whitelist unit (SHA-256
+`61d47f98edbf5f2ea43687d2f8356820ea55bdc389d43ee898461ddc47a0d08b`)
+was installed and tested during Beau's approved isolated staging preflight on
+2026-10-20. The daemon started under the measured 1 GiB/no-swap/one-CPU/256-task
+parent slice, with zero containers. Its observed daemon UID/GID maps were
+`0 -> 10001 (length 1)` and `1 -> 200000 (length 65536)`. These are **daemon**
+mapping observations, not container-consumer UID mapping acceptance. Crucially,
+the daemon's network namespace matched the host: bootstrap network isolation
+failed. The owned daemon, manager and runtime were then safely stopped; the
+existing rootful workload identities and states were preserved. That preflight
+did not activate an application, executor, issuer or autostart.
+
+The network correction below (unit SHA-256
+`40c395d618e82f0d6a6a2fbf29c5aa2e723dd2e929fb3ecaa27d38e1b57cb7ff`)
+was installed and live-validated in the repeated approved preflight. The actual
+`dockerd` peer PID had a network namespace distinct from host PID1, only `lo`, no
+IPv4 routes and no non-loopback IPv6 routes. The measured parent caps remained
+1 GiB/no swap/one CPU/256 tasks. The child environment contained none of the
+SSH-agent/proxy/credential canary names checked by the preflight. Engine state
+remained zero images/containers. The owned daemon, manager and runtime were
+stopped cleanly, with no remaining UID10001 processes or runtime path; all 21
+existing rootful container identities, images and states were preserved. There
+was no forced kill, app job or autostart. Root-private evidence and the preceding
+unit backup are retained at `/var/lib/eh-pilot-preflight-network-20261020`.
+
+This is a bounded daemon preflight, **not** container-consumer mapping, resource
+stress, issuer/controller enrollment, application pilot or reboot acceptance.
+Reconcile the retained exact account, paths and unit hashes with that enrollment;
 do not recreate, adopt unknown state or launch services merely because this
 document exists. No executor, receipt issuer or application pilot is activated
 by these artifacts.
@@ -37,8 +63,10 @@ inspection interval. RuntimeMaxSec initiates stopping; it does not guarantee
 termination within ten minutes. Stop grace is 1200 seconds with no forced SIGKILL. A stop
 that does not finish is not quiescence or permission to abandon ownership.
 
-RootlessKit networking is `none`, Docker bridge/iptables are disabled and Docker
-listens only on `%t/eh-pilot-docker.sock`. No CLI context is created or selected.
+RootlessKit networking is `none`, with
+`DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false` explicitly disabling detached
+network mode. Docker bridge/iptables are disabled and Docker listens only on
+`%t/eh-pilot-docker.sock`. No CLI context is created or selected.
 Do not add `NoNewPrivileges=yes` to this bootstrap daemon as an unreviewed
 hardening shortcut: the prerequisite UID-mapping helpers need their approved
 setuid behavior. This is not the application's closed container profile.
@@ -46,9 +74,10 @@ setuid behavior. This is not the application's closed container profile.
 ## Revised daemon environment boundary
 
 `ExecStart` now invokes the real `/usr/bin/env -i` before the fixed rootless
-helper, with seven explicit assignments: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
+helper, with eight explicit assignments: `HOME`, `PATH`, `XDG_RUNTIME_DIR`,
 `DBUS_SESSION_BUS_ADDRESS`, `NOTIFY_SOCKET`,
-`DOCKERD_ROOTLESS_ROOTLESSKIT_NET` and
+`DOCKERD_ROOTLESS_ROOTLESSKIT_NET`,
+`DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS` and
 `DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR`. The helper executable and its daemon
 arguments remain absolute/fixed. Inherited SSH/GPG socket pointers, proxy
 settings, Docker executables/flags and rootless child-mode overrides are not
@@ -61,6 +90,17 @@ escape or unbraced word expansion. See the
 and [spawned-process environment](https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html#Environment%20Variables%20in%20Spawned%20Processes).
 `Type=notify` and `NotifyAccess=all` are unchanged.
 
+The installed Docker29.5.2 rootless helper supports the explicit `false` override
+and otherwise defaults to adding `--detach-netns`. In that mode the child daemon
+runs in the host network namespace even though RootlessKit retains a separate
+network namespace file. See the official
+[RootlessKit v3.0.0 network documentation](https://github.com/rootless-containers/rootlesskit/blob/v3.0.0/docs/network.md#detaching-network-namespace).
+Therefore `NET=none`, a detached namespace file or a rootless security label alone
+is not isolation evidence. Do not remove the explicit `false` assignment or
+replace it with an empty value: the installed helper treats unset/empty as its
+default. Recheck the installed helper's supported behavior before any later
+version upgrade; these source tests do not execute that helper.
+
 This is a child-environment boundary, **not** a sandbox for an untrusted manager.
 The loader runs before `env`; unreviewed loader overrides are a stop condition.
 It does not prevent global user socket units from starting, remove credentials
@@ -71,7 +111,7 @@ claim the absence of an environment variable proves filesystem isolation.
 
 Static and synthetic fixture tests do not prove real systemd notification
 attribution, rootless mappings, daemon network isolation or effective cgroups.
-The revised unit must pass installed-system validation and the bounded owned
+The network-corrected unit must pass installed-system validation and the bounded owned
 start/stop checks before the bootstrap can be called successful.
 
 ## Preconditions, before privileged changes
@@ -143,6 +183,11 @@ sudo -u ehpilot -- env -i PATH=/usr/bin:/bin \
 Record its InvocationID, main PID/start identity and actual cgroup placement.
 Within ten minutes, use only the explicit new socket for read-only Engine info;
 inspect rootless/daemon identity, Unix endpoint, namespace maps and kernel limits.
+Inspect the actual `dockerd` peer PID's network namespace against the host PID1
+namespace and require them to differ; verify no external interfaces or routes
+(IPv4 and IPv6). A RootlessKit state-file namespace is not a substitute for the
+daemon PID's namespace. If any isolation check fails, retain that failure as
+evidence and follow the owned-stop procedure; do not start a container to probe it.
 No image/container operations, API exposure, worker registration, issuer or
 application startup is allowed. Do not interpret the service's active state or a
 configuration readback as a container resource stress test.
