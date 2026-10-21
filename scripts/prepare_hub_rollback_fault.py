@@ -65,7 +65,9 @@ def prepare_context(*, base_image: str, base_source_commit: str,
     for value in (base_source_commit, fixture_source_commit):
         if type(value) is not str or not _COMMIT.fullmatch(value):
             raise ValueError("Lowercase full source commits required")
-    command = ["/opt/venv/bin/python", "-I", "-c", _FAULT_SCRIPT, "/app/dashboard"]
+    # -I ignores PYTHONDONTWRITEBYTECODE; -B is required to avoid importing
+    # pathlib/stat writing unrelated .pyc files into the build layer.
+    command = ["/opt/venv/bin/python", "-I", "-B", "-c", _FAULT_SCRIPT, "/app/dashboard"]
     recipe = (
         "# TEST ONLY: intentionally unservable dashboard; never promote.\n"
         f"FROM {base_image}\n"

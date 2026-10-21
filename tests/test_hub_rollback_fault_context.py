@@ -84,7 +84,7 @@ def test_exact_embedded_fault_only_removes_required_index(tmp_path):
     outside = tmp_path / "hub.sqlite3"
     outside.write_bytes(b"unchanged database fixture")
     command = fault_command()
-    assert command[0:2] == ["/opt/venv/bin/python", "-I"]
+    assert command[0:3] == ["/opt/venv/bin/python", "-I", "-B"]
     assert command[-1] == "/app/dashboard"
     # Substitute interpreter and disposable directory only; execute the exact
     # embedded deletion program. No installed container or application touched.
