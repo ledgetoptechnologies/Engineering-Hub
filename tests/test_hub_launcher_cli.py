@@ -51,6 +51,11 @@ def harness(module, monkeypatch, *, failure=None, stop_at='wait', close_failure=
         def launch(self):
             self.perform('launch')
 
+        def wait_for_receipt_request(self, *, timeout_ms, stop_requested):
+            assert timeout_ms == 60000
+            self.perform('readiness')
+            return not stop_requested()
+
         def serve_one_receipt(self):
             self.perform('receipt')
 
@@ -133,7 +138,7 @@ def test_exact_order_one_launch_receipt_wait_explicit_stop_close_restore(module,
     assert module.main(ARGS + ['--execute', '--create-journal']) == 0
     assert calls == ['handlers', ('construct', {
         'enrollment_file': ARGS[1], 'signing_key_file': ARGS[3],
-        'journal_file': ARGS[5], 'create_journal': True}), 'launch', 'receipt',
+        'journal_file': ARGS[5], 'create_journal': True}), 'launch', 'readiness', 'receipt',
         ('wait', 60), 'stop', 'close', ('restore', [('synthetic', 'old')])]
     assert capsys.readouterr().out == 'receipt_served\nstopped\n'
 
@@ -147,21 +152,21 @@ def test_stop_before_launch_nonzero_no_stopped_claim(module, monkeypatch, capsys
     assert capsys.readouterr().out == 'interrupted_before_launch\n'
 
 
-@pytest.mark.parametrize('stop_at', ['launch', 'receipt'])
+@pytest.mark.parametrize('stop_at', ['launch', 'readiness', 'receipt'])
 def test_flag_only_stop_at_native_boundaries_is_once(module, monkeypatch, stop_at):
     calls = harness(module, monkeypatch, stop_at=stop_at)
     assert module.main(ARGS + ['--execute', '--create-journal']) == 0
     assert calls.count('launch') == calls.count('stop') == calls.count('close') == 1
-    assert calls.count('receipt') == (0 if stop_at == 'launch' else 1)
+    assert calls.count('receipt') == (1 if stop_at == 'receipt' else 0)
     assert not any(isinstance(item, tuple) and item[0] == 'wait' for item in calls)
 
 
-@pytest.mark.parametrize('failure', ['construct', 'launch', 'receipt', 'stop'])
+@pytest.mark.parametrize('failure', ['construct', 'launch', 'readiness', 'receipt', 'stop'])
 def test_native_exception_no_retry_no_automatic_cleanup_and_redacted(module, monkeypatch, capsys, failure):
     calls = harness(module, monkeypatch, failure=failure, stop_at='receipt')
     assert module.main(ARGS + ['--execute', '--create-journal']) == 2
     assert calls.count('launch') <= 1 and calls.count('receipt') <= 1 and calls.count('stop') <= 1
-    if failure in ('construct', 'launch', 'receipt'):
+    if failure in ('construct', 'launch', 'readiness', 'receipt'):
         assert 'stop' not in calls
     assert calls.count('close') == (0 if failure == 'construct' else 1)
     assert calls[-1][0] == 'restore'
