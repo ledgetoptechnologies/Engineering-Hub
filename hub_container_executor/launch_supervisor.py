@@ -40,6 +40,7 @@ from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
                                SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES)
 from .launch_transport import REQUEST_PROTOCOL, MAX_REQUEST_BYTES
+from .configuration_commitment import configuration_commitment
 
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -623,8 +624,11 @@ class LaunchSupervisor:
             data = _strict(raw, 1024**2)
             _require(type(data) is dict and set(data) == {'schema', 'release', 'image', 'profile', 'daemon',
                 'socket_path', 'consumer_host_uid', 'consumer_host_gid', 'receipt_lifetime_seconds',
-                'request_timeout_ms', 'launch_timeout_ms'})
-            _require(data['schema'] == 'executor_launch_supervisor_v1')
+                'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'})
+            _require(data['schema'] == 'executor_launch_supervisor_v2')
+            self._configuration_raw_digest = data['configuration_raw_digest']
+            _require(type(self._configuration_raw_digest) is str
+                     and _SHA.fullmatch(self._configuration_raw_digest))
             release = dict(data['release'])
             _require(type(release.get('public_key')) is str and _HEX.fullmatch(release['public_key']))
             release['public_key'] = bytes.fromhex(release['public_key'])
@@ -712,8 +716,12 @@ class LaunchSupervisor:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
                 try:
                     raw = os.read(fd, 65537)
-                    _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info)
-                             and 'sha256:' + hashlib.sha256(raw).hexdigest() == mount.content_digest)
+                    _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info))
+                    commitment = configuration_commitment(raw)
+                    _require(commitment.raw_digest == self._configuration_raw_digest
+                             and commitment.content_digest == mount.content_digest
+                             and commitment.release == self.release
+                             and commitment.release.launch_profile_digest == self.profile.digest())
                 finally:
                     os.close(fd)
             if role in self._source_pins:

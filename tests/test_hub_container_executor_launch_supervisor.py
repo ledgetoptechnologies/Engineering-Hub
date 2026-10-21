@@ -9,12 +9,14 @@ import asyncio
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
+import hashlib
 import http.server
 import json
 import os
 from pathlib import Path
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import sys
@@ -33,10 +35,13 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from engineering_hub.container_pilot_manifest import Platform
+from engineering_hub.container_pilot_manifest import PilotManifest
 from hub_container_executor import launch_supervisor as launch
+from hub_container_executor.configuration_commitment import configuration_commitment
 from hub_container_executor.launch_transport import UnixLaunchReceiptTransport
 from hub_container_executor.runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVerifier
 from tests.test_hub_container_executor_daemon_backend import verified_image, oci_archive
+from tests.test_hub_container_executor_installed_runner import configuration
 
 
 def profile_data(root='/operator/hub-pilot-synthetic'):
@@ -710,18 +715,63 @@ def root_file_constructor_fixture(short_root, root_journal):
     with fake_engine_http(short_root, image=image, blobs=blobs) as (pin, requests):
         raw_profile = profile_data(str(short_root / 'hub-pilot-constructor'))
         issuer_path = str(short_root / 'issuer' / 'issuer.sock')
+        Path(issuer_path).parent.mkdir(mode=0o700)
+        issuer = socket.socket(socket.AF_UNIX)
+        issuer.bind(issuer_path)
+        os.chown(issuer_path, 0, 110001)
+        os.chmod(issuer_path, 0o660)
         for mount in raw_profile['mounts']:
-            if mount['role'] == 'engine_socket': mount['source'] = pin.socket_path
+            if mount['role'] == 'engine_socket':
+                mount['source'] = pin.socket_path
+                info = os.stat(pin.socket_path)
+                mount.update(uid=info.st_uid, gid=info.st_gid, mode=stat.S_IMODE(info.st_mode))
             if mount['role'] == 'issuer_socket': mount['source'] = issuer_path
-        profile = launch.ExecutorLaunchProfile.model_validate(raw_profile)
+            if mount['role'] not in {'engine_socket', 'issuer_socket'}:
+                path = Path(mount['source'])
+                path.parent.mkdir(mode=0o700, exist_ok=True)
+                if mount['kind'] == 'directory': path.mkdir(mode=0o700)
+                else: path.touch(mode=0o600)
+                os.chown(path, mount['uid'], mount['gid'])
         release = ExecutorReleaseEnrollment('synthetic-root-files',
             signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw),
             image.source_commit, image.runnable_reference, image.platform_manifest_digest,
-            image.image_config_id, image.platform, profile.digest())
+            image.image_config_id, image.platform, 'sha256:' + '0' * 64)
         release_data, image_data = asdict(release), asdict(image)
         release_data['platform'] = image_data['platform'] = image.platform.model_dump(mode='json')
         release_data['public_key'] = release.public_key.hex()
-        data = dict(schema='executor_launch_supervisor_v1', release=release_data,
+        # A SINGLE actual canonical runner drives C -> profile D -> final runner
+        # bytes -> independently pinned raw SHA. No fixed-point/hash patching.
+        runner = configuration()
+        runner['manifest']['driver']['implementation_commit'] = image.source_commit
+        runner['manifest']['runner_binding']['daemon_identity'] = pin.daemon_id
+        runner['docker_binding'].update(daemon_identity=pin.daemon_id,
+            api_version=pin.api_version, unix_socket_path=launch._TARGETS['engine_socket'],
+            generation_root=next(m['source'] for m in raw_profile['mounts'] if m['role'] == 'generations'))
+        manifest = PilotManifest.from_bytes(launch._canonical(runner['manifest']))
+        for row in runner['resources']['build_enrollments']:
+            row['manifest_digest'] = manifest.digest()
+        runner['release_enrollment'] = {**release_data, 'public_key_hex': release_data['public_key']}
+        runner['release_enrollment'].pop('public_key')
+        runner['launch_transport']['socket_path'] = launch._TARGETS['issuer_socket']
+        runner['resources'].update(
+            adapter_database=launch._TARGETS['state'] + '/adapter/state.sqlite3',
+            journal_database=launch._TARGETS['state'] + '/journal/state.sqlite3',
+            reservation_root=launch._TARGETS['state'] + '/reservations',
+            record_root=launch._TARGETS['records'], metadata_root=launch._TARGETS['metadata'],
+            baseline_receipt_root=launch._TARGETS['baseline'], secret_root=launch._TARGETS['secrets'],
+            frozen_backup=runner['docker_binding']['generation_root'] + '/frozen.sqlite3')
+        for mount in raw_profile['mounts']:
+            if mount['role'] == 'config':
+                mount['content_digest'] = configuration_commitment(launch._canonical(runner)).content_digest
+        profile = launch.ExecutorLaunchProfile.model_validate(raw_profile)
+        release_data['launch_profile_digest'] = runner['release_enrollment']['launch_profile_digest'] = profile.digest()
+        runner_raw = launch._canonical(runner)
+        commitment = configuration_commitment(runner_raw)
+        assert commitment.content_digest == next(m.content_digest for m in profile.mounts if m.role == 'config')
+        config_path = Path(next(m.source for m in profile.mounts if m.role == 'config'))
+        config_path.write_bytes(runner_raw)
+        data = dict(schema='executor_launch_supervisor_v2', configuration_raw_digest=commitment.raw_digest,
+            release=release_data,
             image=image_data, profile=profile.model_dump(mode='json'), daemon=asdict(pin),
             socket_path=issuer_path, consumer_host_uid=110001, consumer_host_gid=110001,
             receipt_lifetime_seconds=30, request_timeout_ms=1000, launch_timeout_ms=1000)
@@ -731,8 +781,11 @@ def root_file_constructor_fixture(short_root, root_journal):
                                              serialization.NoEncryption()))
         enrollment.chmod(0o600)
         key.chmod(0o600)
-        yield data, dict(enrollment_file=str(enrollment), signing_key_file=str(key),
-                         journal_file=str(journal), create_journal=True), requests
+        try:
+            yield data, dict(enrollment_file=str(enrollment), signing_key_file=str(key),
+                             journal_file=str(journal), create_journal=True), requests
+        finally:
+            issuer.close()
 
 
 def test_whole_constructor_reads_protected_root_files_without_engine_effects(short_root, root_journal):
@@ -744,6 +797,7 @@ def test_whole_constructor_reads_protected_root_files_without_engine_effects(sho
             assert requests == [] and authority._consumer is None and authority._listener is None
             assert Path(kwargs['journal_file']).is_file()
             authority._guard()
+            authority._pin_sources()
         finally:
             authority.close()
         assert Path(kwargs['signing_key_file']).is_file() and Path(kwargs['enrollment_file']).is_file()
@@ -751,7 +805,8 @@ def test_whole_constructor_reads_protected_root_files_without_engine_effects(sho
 
 
 @pytest.mark.parametrize('mutation', ['public-key', 'profile-pin', 'extra-field', 'consumer-mapping',
-                                    'key-mode', 'enrollment-mode', 'key-symlink'])
+                                    'key-mode', 'enrollment-mode', 'key-symlink',
+                                    'missing-raw-pin', 'invalid-raw-pin', 'legacy-v1'])
 def test_whole_constructor_rejects_invalid_authority_before_journal_or_engine_effects(short_root, root_journal, mutation):
     with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
         enrollment, key = Path(kwargs['enrollment_file']), Path(kwargs['signing_key_file'])
@@ -759,6 +814,9 @@ def test_whole_constructor_rejects_invalid_authority_before_journal_or_engine_ef
         elif mutation == 'profile-pin': data['release']['launch_profile_digest'] = 'sha256:' + '0' * 64
         elif mutation == 'extra-field': data['unapproved'] = True
         elif mutation == 'consumer-mapping': data['consumer_host_uid'] += 1
+        elif mutation == 'missing-raw-pin': data.pop('configuration_raw_digest')
+        elif mutation == 'invalid-raw-pin': data['configuration_raw_digest'] = 'not-a-digest'
+        elif mutation == 'legacy-v1': data['schema'] = 'executor_launch_supervisor_v1'
         elif mutation == 'key-mode': key.chmod(0o644)
         elif mutation == 'enrollment-mode': enrollment.chmod(0o644)
         elif mutation == 'key-symlink':
@@ -769,6 +827,59 @@ def test_whole_constructor_rejects_invalid_authority_before_journal_or_engine_ef
         with pytest.raises(launch.LaunchSupervisorError):
             launch.LaunchSupervisor(**kwargs)
         assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+@pytest.mark.parametrize('mutation', ['raw-pin', 'normalized-as-raw', 'commitment-pin', 'self-digest', 'other-field',
+                                    'noncanonical', 'duplicate-key', 'missing-self', 'other-release'])
+def test_same_runner_bytes_must_satisfy_raw_commitment_and_independent_release(short_root, root_journal, mutation):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        config_mount = next(mount for mount in data['profile']['mounts'] if mount['role'] == 'config')
+        path = Path(config_mount['source'])
+        raw = path.read_bytes()
+        runner = json.loads(raw)
+        if mutation == 'raw-pin': data['configuration_raw_digest'] = 'sha256:' + '0' * 64
+        elif mutation == 'normalized-as-raw': data['configuration_raw_digest'] = config_mount['content_digest']
+        elif mutation == 'commitment-pin':
+            config_mount['content_digest'] = 'sha256:' + '0' * 64
+            # Preserve root profile consistency but do not silently approve runner changes.
+            data['release']['launch_profile_digest'] = launch.ExecutorLaunchProfile.model_validate(data['profile']).digest()
+        else:
+            if mutation == 'self-digest': runner['release_enrollment']['launch_profile_digest'] = 'sha256:' + '0' * 64
+            elif mutation == 'other-field': runner['exchange_timeout_ms'] += 1
+            elif mutation == 'missing-self': runner['release_enrollment'].pop('launch_profile_digest')
+            elif mutation == 'other-release': runner['release_enrollment']['issuer_id'] = 'different-issuer'
+            raw = launch._canonical(runner)
+            if mutation == 'noncanonical': raw += b'\n'
+            elif mutation == 'duplicate-key': raw = raw[:-1] + b',"schema":"duplicate"}'
+            path.write_bytes(raw)
+            # Even pinning changed raw bytes cannot defeat C or the root self-D equality.
+            data['configuration_raw_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            assert requests == [] and authority._consumer is None
+        finally:
+            authority.close()
+
+
+def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (_, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            authority._pin_sources()
+            path = Path(authority._mounts['config'].source)
+            original_inode = path.stat().st_ino
+            runner = json.loads(path.read_bytes())
+            runner['exchange_timeout_ms'] += 1
+            path.write_bytes(launch._canonical(runner))
+            assert path.stat().st_ino == original_inode
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            assert requests == [] and authority._consumer is None
+        finally:
+            authority.close()
 
 
 @pytest.mark.parametrize('terminate', [True, False])
