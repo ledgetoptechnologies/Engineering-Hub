@@ -40,22 +40,34 @@ def parse(argv):
     return args
 
 
-async def check(args):
+async def check(args, *, progress=None):
+    # Only fixed local stage names are public. Never use exception text or inputs.
+    def stage(name):
+        if progress is not None:
+            progress['phase'] = name
+
     # Existing protected reader enforces no-follow stable retained bytes,
     # current UID0600 credential and private0700 parent, trusted ancestors.
+    stage('credential_read')
     credential = read_protected_file(Path(args.credential_file), maximum_bytes=4096)
+    stage('ca_read')
     ca = read_protected_file(Path(args.ca_file), maximum_bytes=1024 * 1024, private=False)
+    stage('material_validation')
     if (not hmac.compare_digest('sha256:' + hashlib.sha256(credential).hexdigest(), args.credential_sha256)
             or not hmac.compare_digest('sha256:' + hashlib.sha256(ca).hexdigest(), args.ca_sha256)
             or not credential or not all(33 <= value <= 126 for value in credential)):
         raise ValueError('Invalid protected connection material')
+    stage('tls_client_setup')
     client = ContainerPilotClient.for_verified_https(args.origin, credential.decode('ascii'), ca,
                                                      timeout_seconds=10.0)
     try:
+        stage('transport_auth_probe')
         result = await client.probe_connection(args.unknown_command_id)
         return result
     finally:
         active_error = sys.exc_info()[1]
+        if active_error is None:
+            stage('client_cleanup')
         try:
             async with asyncio.timeout(CLOSE_TIMEOUT_SECONDS):
                 await client.aclose()
@@ -66,9 +78,10 @@ async def check(args):
 
 
 def main(argv=None):
+    progress = {'phase': 'arguments'}
     try:
         args = parse(argv)
-        result = asyncio.run(check(args))
+        result = asyncio.run(check(args, progress=progress))
         print(json.dumps(result, sort_keys=True), flush=True)
         return 0
     except BaseException as error:
@@ -76,7 +89,8 @@ def main(argv=None):
             return 0
         # Do not reflect parser values, origin, paths, digests or TLS errors.
         print(json.dumps({'state': 'connection_check_failed', 'automatic_retry': False,
-                          'command_posts': 0, 'reconciliation_posts': 0}), flush=True)
+                          'command_posts': 0, 'reconciliation_posts': 0,
+                          'phase': progress['phase']}), flush=True)
         return 2
 
 

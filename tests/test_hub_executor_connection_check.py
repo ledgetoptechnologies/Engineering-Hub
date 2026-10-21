@@ -143,7 +143,51 @@ def test_digest_mismatch_precedes_transport(monkeypatch, capsys):
         def for_verified_https(cls, *a, **k): raise AssertionError('must not allocate')
     monkeypatch.setattr(cli, 'ContainerPilotClient', Forbidden)
     assert cli.main(args_for()) == 2
-    assert 'wrong' not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert 'wrong' not in output
+    assert json.loads(output)['phase'] == 'material_validation'
+
+
+@pytest.mark.parametrize('failure_phase', [
+    'credential_read', 'ca_read', 'tls_client_setup',
+    'transport_auth_probe', 'client_cleanup',
+])
+def test_cli_fixed_phase_diagnostics_never_reflect_failures(monkeypatch, capsys, failure_phase):
+    secret_error = TOKEN + ' /private/ https://sensitive.invalid/'
+
+    def fail():
+        raise RuntimeError(secret_error)
+
+    def reader(path, **kwargs):
+        phase = 'credential_read' if str(path).endswith('executor-token') else 'ca_read'
+        if failure_phase == phase:
+            fail()
+        return TOKEN.encode() if phase == 'credential_read' else b'public test CA'
+
+    class Fake:
+        @classmethod
+        def for_verified_https(cls, *args, **kwargs):
+            if failure_phase == 'tls_client_setup':
+                fail()
+            return cls()
+
+        async def probe_connection(self, command):
+            if failure_phase == 'transport_auth_probe':
+                fail()
+            return {'state': 'transport_auth_verified'}
+
+        async def aclose(self):
+            if failure_phase == 'client_cleanup':
+                fail()
+
+    monkeypatch.setattr(cli, 'read_protected_file', reader)
+    monkeypatch.setattr(cli, 'ContainerPilotClient', Fake)
+    assert cli.main(args_for()) == 2
+    output = capsys.readouterr()
+    assert json.loads(output.out)['phase'] == failure_phase
+    assert TOKEN not in output.out + output.err
+    assert '/private/' not in output.out + output.err
+    assert 'sensitive.invalid' not in output.out + output.err
 
 
 def test_response_cleanup_bounded_after_exchange_timeout():

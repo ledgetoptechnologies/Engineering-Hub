@@ -29,6 +29,13 @@ the supplied SHA256 digests privately, then delegates all TLS policy to
 digests, file paths, response bodies or detailed exceptions. No agent environment
 tokens, environment CA/proxy discovery, or production credentials are needed.
 
+Failures include only a fixed local `phase`: `arguments`, `credential_read`,
+`ca_read`, `material_validation`, `tls_client_setup`, `transport_auth_probe`,
+or `client_cleanup`. This identifies which check needs inspection without
+reflecting inputs or exception text. A probe failure remains the reported phase
+if cleanup also fails; phase reporting does not diagnose the underlying TLS,
+network or authorization cause and never authorizes an automatic retry.
+
 ## Operator invocation after publication and separate approval
 
 Run inside the actual NAS Hub container as its normal UID. Provision the CA and
@@ -65,7 +72,7 @@ inspect the failed result rather than resubmitting work.
 
 ## Local checks performed
 
-21 pure/mocked pytest cases cover exact request/auth sequence, unexpected or
+26 pure/mocked pytest cases cover exact request/auth sequence, unexpected or
 redirect statuses, duplicate JSON, oversized body, echo, nonfinite JSON,
 wrong second response, one shared body-read deadline, invalid UUID, protected
 reader/factory wiring, closed flags/sanitized errors, digest mismatch before
@@ -76,7 +83,7 @@ synthetic401/404 protocol responses, while wrong CA and wrong hostname fail
 before any HTTP request reaches the test handler. Those are real local TLS
 handshakes, not an enrolled executor or NAS-route test.
 
-The combined Windows client/startup/renderer focus passed153 cases;17 Linux-only
+The combined Windows client/startup/renderer focus passed158 cases;17 Linux-only
 permission/ownership cases were skipped and are not claimed covered. Linux
 validation and the actual NAS container's permissions/network route remain
 separate acceptance requirements. Existing shared HTTPS/protected-reader tests
