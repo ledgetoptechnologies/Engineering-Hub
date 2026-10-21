@@ -326,6 +326,85 @@ def test_actual_direct_peer_exchange_is_consumed_by_existing_signature_verifier(
         authority.serve_one_receipt()
 
 
+def test_actual_delayed_connect_readiness_preserves_short_exchange_budget(synthetic_issuer):
+    """Real Unix/pidfd/signature slice; Engine/profile remain synthetic."""
+    authority, path, checks = synthetic_issuer
+    authority._request_ms = 100
+    waiting = threading.Event()
+    results, startup_seconds = [], []
+
+    def serve_after_ready():
+        started = time.monotonic()
+        waiting.set()
+        try:
+            assert authority.wait_for_receipt_request(timeout_ms=1000)
+            startup_seconds.append(time.monotonic() - started)
+            results.append(authority.serve_one_receipt())
+        except BaseException as error:
+            results.append(error)
+
+    serving = threading.Thread(target=serve_after_ready)
+    serving.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    verified = None
+    try:
+        assert waiting.wait(1)
+        time.sleep(.25)  # Startup delay exceeds the enrolled 100ms accept budget.
+        verified = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+            max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+        assert verified.implementation_commit() == 'c' * 40
+    finally:
+        if verified is not None:
+            verified.close()
+        transport.close()
+        serving.join(timeout=3)
+    assert not serving.is_alive() and len(results) == 1 and isinstance(results[0], str)
+    assert .2 <= startup_seconds[0] < 1 and authority._request_ms == 100
+    assert len(checks) == 4 and not authority._issuance_open and not authority._held
+    with authority._journal.transaction() as db:
+        assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+
+
+def test_actual_retained_consumer_pidfd_exit_aborts_readiness(synthetic_issuer):
+    """Only the disposable child is terminated; no container/Engine exists."""
+    authority, _, checks = synthetic_issuer
+    child = subprocess.Popen([sys.executable, '-I', '-B', '-c', 'import time; time.sleep(10)'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    results = []
+    waiting = threading.Event()
+    serving = None
+    try:
+        authority._consumer.close()
+        authority._consumer = launch._Process(child.pid)
+
+        def wait_owned():
+            waiting.set()
+            try:
+                results.append(authority.wait_for_receipt_request(timeout_ms=1000))
+            except BaseException as error:
+                results.append(error)
+
+        serving = threading.Thread(target=wait_owned)
+        serving.start()
+        assert waiting.wait(1)
+        child.terminate()  # Exact test-owned child only, not supervisor escalation.
+        child.wait(timeout=3)
+        serving.join(timeout=3)
+        assert not serving.is_alive() and len(results) == 1
+        assert isinstance(results[0], launch.LaunchSupervisorError)
+        assert authority._held and not authority._issuance_open and checks == []
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone() == (0,)
+            assert db.execute('SELECT state FROM launch').fetchone() == ('held',)
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=3)
+        if serving is not None:
+            serving.join(timeout=3)
+
+
 @pytest.mark.parametrize('mutation', ['extra-selector', 'trailing', 'second-frame', 'no-halfclose', 'oversize'])
 def test_issuer_rejects_selectors_trailing_frames_and_missing_eof_before_issuance(synthetic_issuer, mutation):
     authority, path, _ = synthetic_issuer

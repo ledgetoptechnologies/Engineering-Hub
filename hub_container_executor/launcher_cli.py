@@ -12,6 +12,11 @@ and all accepted jobs externally: the native stop deadline is at most 120 second
 not the application's much longer busy-work grace period. This command does not
 prove drain, provide busy-work recovery, or install restart/boot behavior.
 
+Cold-start listener readiness has a separate maximum 60-second wait clipped by
+the enrolled receipt expiry. It observes the owned consumer, not an Engine poll;
+the authenticated exchange retains its original enrolled deadline. Stop signals
+during readiness cancel that wait before one explicit owned graceful stop.
+
 --wait-seconds bounds ONLY waiting after the one receipt exchange. It does not
 extend receipt authority and is not a total-process deadline. Native enrollment
 operation deadlines remain authoritative. Expiry or any uncertain native outcome
@@ -126,10 +131,16 @@ def _execute(options):
                 code, phase = 130, 'interrupted_before_launch'
             else:
                 supervisor.launch()
-                # No scans/logs/delays between launch and the single exchange.
+                # Cold-start imports must not consume the frame-exchange budget.
+                # The callback reads a signal flag only, outside native locks.
                 if not stop.requested:
-                    supervisor.serve_one_receipt()
-                    print('receipt_served', flush=True)
+                    ready = supervisor.wait_for_receipt_request(timeout_ms=60000,
+                        stop_requested=lambda: stop.requested)
+                    if ready and not stop.requested:
+                        supervisor.serve_one_receipt()
+                        print('receipt_served', flush=True)
+                    elif not stop.requested:
+                        raise RuntimeError('receipt readiness unavailable')
                 requested = stop.requested or _wait_for_stop(stop, options.wait_seconds)
                 if requested:
                     # Explicit signal only. Caller must already have drained.

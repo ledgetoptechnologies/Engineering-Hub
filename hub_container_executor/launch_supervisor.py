@@ -940,6 +940,46 @@ class LaunchSupervisor:
             size -= len(part)
         return b''.join(parts)
 
+    def wait_for_receipt_request(self, *, timeout_ms, stop_requested=None):
+        """Bound cold-start readiness separately from the unchanged exchange.
+
+        This observes only our retained listener and consumer pidfd. Readiness
+        is not authenticated identity or permission to issue; serve_one_receipt
+        still performs every existing guard and uses its original whole-exchange
+        deadline. No Engine operation or key read occurs here. A trusted optional
+        flag-reader runs outside the mutex; True cancels without an effect so
+        the caller can explicitly request owned graceful stop. Uncertainty and
+        timeout hold the original launch, never retry or adopt a consumer.
+        """
+        _require(self._pid == os.getpid())
+        _require(type(timeout_ms) is int and 1 <= timeout_ms <= 60000
+                 and (stop_requested is None or callable(stop_requested)))
+        deadline = time.monotonic() + timeout_ms / 1000
+        try:
+            while True:
+                cancelled = False if stop_requested is None else stop_requested()
+                _require(type(cancelled) is bool)
+                with self._mutex:
+                    _require(not self._closed and not self._held and self._issuance_open
+                             and self._consumer is not None
+                             and type(self._listener) is socket.socket
+                             and self._listener.fileno() >= 0)
+                    self._consumer.check()
+                    if cancelled:
+                        return False
+                    deadline = min(deadline, self._expires)
+                    _remaining(deadline)
+                    ready, _, _ = select.select([self._listener, self._consumer.fd], [], [],
+                        min(0.1, _remaining(deadline)))
+                    _remaining(deadline)
+                    _require(self._consumer.fd not in ready)
+                    if self._listener in ready:
+                        return True
+        except BaseException:
+            with self._mutex:
+                self._hold()
+            raise LaunchSupervisorError() from None
+
     def serve_one_receipt(self):
         """One direct init-peer exchange; caller explicitly chooses to serve it."""
         _require(self._pid == os.getpid())
