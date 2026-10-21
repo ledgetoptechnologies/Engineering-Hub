@@ -20,6 +20,8 @@ async function fixture(page: Page) {
     posts: [] as { body: Record<string, unknown>; csrf: string | undefined }[],
     listStatus: 200, truncated: false, slowProject: null as string | null,
     release: null as (() => void) | null,
+    docStatus: 200, docReads: 0, slowDocPath: null as string | null,
+    releaseDoc: null as (() => void) | null,
   };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
@@ -42,6 +44,13 @@ async function fixture(page: Page) {
       return respond({ items, truncated: state.truncated });
     }
     if (path === "/api/hub/v1/notes/document") {
+      state.docReads++;
+      const requested = url.searchParams.get("path");
+      if (state.slowDocPath === requested) {
+        state.slowDocPath = null;
+        await new Promise<void>(resolve => { state.releaseDoc = resolve; });
+      }
+      if (state.docStatus !== 200) return respond({ detail: { code: "notes_unavailable" } }, state.docStatus);
       const note = state.notes.find(item => item.project === url.searchParams.get("project") && item.path === url.searchParams.get("path"));
       return note ? respond({ ...meta(note), content: note.content }) : respond({ detail: { code: "note_not_found" } }, 404);
     }
@@ -255,4 +264,81 @@ test("notes over the gateway request budget are blocked locally and a 413 keeps 
   await expect(panel.getByText("This note is too large for the Hub to accept.", { exact: false })).toBeVisible();
   await expect(editor.getByLabel("Content")).toHaveValue("small enough");
   expect(state.notes.find(note => note.path === "big.md")).toBeUndefined();
+});
+
+function bump(state: Awaited<ReturnType<typeof fixture>>, path: string, content: string) {
+  const note = state.notes.find(item => item.path === path)!;
+  Object.assign(note, { content, version: note.version + 1, updated_by: "codex" });
+}
+
+test("Refresh and re-opening the open note both re-read its current version", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  const view = panel.getByRole("article", { name: "Shared notes runbook" });
+  await expect(view.locator(".item-overline")).toContainText("v1");
+  bump(state, "runbooks/shared-notes.md", "Saved by an agent as v2");
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect(view.locator("pre")).toHaveText("Saved by an agent as v2");
+  await expect(view.locator(".item-overline")).toContainText("v2");
+  await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toContainText("v2");
+  bump(state, "runbooks/shared-notes.md", "Saved again as v3");
+  const reads = state.docReads;
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await expect(view.locator("pre")).toHaveText("Saved again as v3");
+  expect(state.docReads).toBe(reads + 1);
+  expect(state.posts).toHaveLength(0);
+});
+
+test("Refresh while editing keeps the draft and still blocks a silent overwrite", async ({ page }) => {
+  const state = await fixture(page);
+  const dialogs: string[] = [];
+  page.on("dialog", dialog => { dialogs.push(dialog.message()); void dialog.dismiss(); });
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit" }).click();
+  const editor = panel.getByRole("form", { name: "Edit note" });
+  await editor.getByLabel("Content").fill("my unsaved draft");
+  bump(state, "runbooks/shared-notes.md", "Agent v2");
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect.poll(() => state.docReads).toBeGreaterThan(1);
+  await expect(editor.getByLabel("Content")).toHaveValue("my unsaved draft");
+  expect(dialogs).toEqual([]);
+  await editor.getByRole("button", { name: "Save note" }).click();
+  await expect(editor.getByRole("alert").getByText("Someone saved version 2 after you opened version 1.", { exact: false })).toBeVisible();
+  expect(state.notes.find(note => note.path === "runbooks/shared-notes.md")!.content).toBe("Agent v2");
+});
+
+test("a slow re-read of the previous note never replaces the newly opened note", async ({ page }) => {
+  const state = await fixture(page);
+  state.notes.push({ project: "engineering-hub", path: "b.md", title: "Second note", content: "B body", version: 1, updated_by: "codex" });
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await expect(panel.getByRole("article", { name: "Shared notes runbook" })).toBeVisible();
+  bump(state, "runbooks/shared-notes.md", "late A body");
+  state.slowDocPath = "runbooks/shared-notes.md";
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect.poll(() => state.releaseDoc !== null).toBe(true);
+  await panel.getByRole("button", { name: /Second note/ }).click();
+  await expect(panel.getByRole("article", { name: "Second note" }).locator("pre")).toHaveText("B body");
+  state.releaseDoc!();
+  await page.waitForTimeout(300);
+  await expect(panel.getByRole("article", { name: "Second note" })).toBeVisible();
+  await expect(panel.getByText("late A body", { exact: true })).toHaveCount(0);
+});
+
+test("a failed re-read keeps the note but says it may be out of date", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  const view = panel.getByRole("article", { name: "Shared notes runbook" });
+  await expect(view.locator(".item-overline")).toContainText("v1");
+  state.docStatus = 503;
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect(panel.getByText("The note shown may be out of date.", { exact: false })).toBeVisible();
+  await expect(view.locator(".item-overline")).toContainText("v1");
 });

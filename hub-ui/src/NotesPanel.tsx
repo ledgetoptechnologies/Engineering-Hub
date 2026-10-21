@@ -52,6 +52,8 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   const [list, setList] = useState<NoteList | null>(null);
   const [listState, setListState] = useState("loading");
   const [listRevision, setListRevision] = useState(0);
+  // Bumped to re-read the selected document (Refresh, or re-opening the open note).
+  const [docRevision, setDocRevision] = useState(0);
   const [listError, setListError] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [doc, setDoc] = useState<NoteDocument | null>(null);
@@ -125,27 +127,37 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
     return () => { listGeneration.current++; controller.abort(); };
   }, [mode, project, search, listRevision]);
 
+  const shownKey = useRef<string | null>(null);
   useEffect(() => {
     const current = ++docGeneration.current;
     const controller = new AbortController();
-    setDoc(null);
+    const key = selected === null ? null : `${project}
+${selected}`;
+    // A re-read of the same note keeps it visible until the fresh copy arrives;
+    // switching notes or projects clears it so another note's body never shows.
+    const rereading = key !== null && key === shownKey.current;
+    if (!rereading) { setDoc(null); shownKey.current = null; }
     if (selected === null || mode === "demo") { setDocState("idle"); return () => { docGeneration.current++; controller.abort(); }; }
-    setDocState("loading");
+    if (!rereading) setDocState("loading");
     void readNote(project, selected, controller.signal).then(value => {
       if (docGeneration.current !== current || controller.signal.aborted) return;
-      setDoc(value); setDocState("loaded");
+      shownKey.current = key; setDoc(value); setDocState("loaded");
     }).catch(error => {
       if (docGeneration.current !== current || controller.signal.aborted) return;
       if (deny(error)) return;
+      if (rereading) {
+        setNotice({ kind: "alert", text: `${readError(error)} The note shown may be out of date.` });
+        return;
+      }
       setDocState("failed"); setNotice({ kind: "alert", text: readError(error) });
     });
     return () => { docGeneration.current++; controller.abort(); };
-  }, [mode, project, selected]);
+  }, [mode, project, selected, docRevision]);
 
   function open(path: string) {
-    if (path === selected && !draft) return;
     if (!confirmDiscard()) return;
-    closeEditor(); setNotice(null); setSelected(path);
+    // Opening the note that is already open re-reads it.
+    closeEditor(); setNotice(null); setSelected(path); setDocRevision(value => value + 1);
   }
   function startNew() {
     if (!confirmDiscard()) return;
@@ -189,7 +201,9 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
         content: draft.content, expected_version: draft.expected }, csrf);
       if (saveGeneration.current !== generation) return;
       setDraft(null); setConflict(null); setSaving(false);
-      docGeneration.current++; setSelected(saved.path); setDoc(saved); setDocState("loaded");
+      docGeneration.current++; shownKey.current = `${savedProject}
+${saved.path}`;
+      setSelected(saved.path); setDoc(saved); setDocState("loaded");
       setListRevision(value => value + 1);
       setNotice({ kind: "status", text: `Saved "${saved.title}" as version ${saved.version}.` });
     } catch (error) {
@@ -220,6 +234,8 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
     if (!conflict?.latest) return;
     const latest = conflict.latest;
     closeEditor(); docGeneration.current++;
+    shownKey.current = `${project}
+${latest.path}`;
     setSelected(latest.path); setDoc(latest); setDocState("loaded"); setListRevision(value => value + 1);
   }
 
@@ -241,7 +257,7 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
     <div className="panel-title"><h2>Shared notes</h2>
       <span className="panel-action">
         <button className="secondary" type="button" disabled={mode === "demo" || listState === "loading"}
-          onClick={() => setListRevision(value => value + 1)}>Refresh</button>
+          onClick={() => { setListRevision(value => value + 1); if (selected !== null) setDocRevision(value => value + 1); }}>Refresh</button>
         {canWrite && <button className="primary" type="button" onClick={startNew}>New note</button>}
       </span></div>
     <p className="panel-description">Durable project notes shared with the agents. Notes are context only. They do not approve
