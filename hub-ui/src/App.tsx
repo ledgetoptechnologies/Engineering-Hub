@@ -10,6 +10,7 @@ import type { ReactNode } from "react";
 import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { WorkQueuePanel } from "./WorkQueuePanel";
+import { NotesPanel } from "./NotesPanel";
 import type {
   AgentSummary,
   Decision,
@@ -667,6 +668,9 @@ export function HubApp() {
           <a className="nav-item" href="#work">
             <Icon kind="folder" /> Assigned work
           </a>
+          <a className="nav-item" href="#notes">
+            <Icon kind="folder" /> Shared notes
+          </a>
           <a className="nav-item" href="#agents">
             <Icon kind="agents" /> Agent connections
           </a>
@@ -1240,6 +1244,10 @@ export function HubApp() {
                     : "Live registry and owning-session evidence are required. The Hub event feed alone does not prove topic readiness."}
                 </p>
               </section>
+              <NotesPanel mode={demo ? "demo" : "live"} selectedProject={project}
+                knownProjects={data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? []}
+                csrf={session?.csrf_token ?? null} writable={!!session?.authenticated}
+                onUnauthorized={clearPrivateWorkspace} />
             </div>
             <footer className="page-footer">
               <span>
