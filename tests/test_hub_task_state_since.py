@@ -38,6 +38,27 @@ def test_state_since_tracks_status_changes_only(hub):
     assert [item["state_since"] for item in listed] == [verified["state_since"]]
 
 
+def test_status_time_is_bounded_by_returned_revision_and_ordered_by_revision(hub):
+    client, app, settings = hub
+    created = new_task(client, human_headers(client, app, settings))
+    response = client.post(f"{BASE}/tasks/{created['id']}/claim", headers=agent_headers(),
+                           json={"expected_revision": created["revision"]})
+    claimed = response.json()
+    repo = app.state.repository
+    with repo._transaction() as db:
+        # A status action for a revision this snapshot's task does not have yet
+        # (as if a concurrent claim/review committed between two reads).
+        db.execute("INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)",
+                   ("codex", "task.candidate", created["id"], claimed["revision"] + 1, "2099-01-01T00:00:00+00:00"))
+    assert overview_task(client, created["id"])["state_since"] == claimed["updated_at"]
+    with repo._transaction() as db:
+        # Clock moved backwards: the current revision's action has an earlier
+        # wall time than an older one. Revision order must win.
+        db.execute("UPDATE hub_audit SET created_at=? WHERE entity_id=? AND revision=?",
+                   ("2000-01-01T00:00:00+00:00", created["id"], claimed["revision"]))
+    assert overview_task(client, created["id"])["state_since"] == "2000-01-01T00:00:00+00:00"
+
+
 def test_state_since_is_derived_not_stored(hub):
     client, app, settings = hub
     created = new_task(client, human_headers(client, app, settings))

@@ -13,6 +13,14 @@ export function relativeAge(value: string | null | undefined, now = Date.now()):
   return `${Math.floor(hours / 24)}d ago`;
 }
 
+/** Attribute an answer to the viewer only when the recorded human is exactly them. */
+export function answeredBy(answeredByActor: string | null | undefined, viewerActor: string | null | undefined): string {
+  if (!answeredByActor) return "(answerer not recorded)";
+  if (viewerActor && answeredByActor === viewerActor) return "by you";
+  if (answeredByActor.startsWith("human:")) return "by another authorized person";
+  return "(answerer not recorded)";
+}
+
 /** Who or what a task is waiting on, derived only from its recorded status and review. */
 export function waitingOn(task: Task, agentName: (id: string) => string): string {
   if (task.status === "assigned") return "Waiting for an agent to claim it.";

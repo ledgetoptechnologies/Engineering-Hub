@@ -11,7 +11,7 @@ import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { WorkQueuePanel } from "./WorkQueuePanel";
 import { NotesPanel } from "./NotesPanel";
-import { relativeAge, waitingOn } from "./dashboardText";
+import { answeredBy, relativeAge, waitingOn } from "./dashboardText";
 import type {
   AgentSummary,
   Decision,
@@ -995,7 +995,7 @@ export function HubApp() {
                         <strong>{decision.title}</strong>
                         <small>
                           {projectName(decision.project)} · Answered{" "}
-                          {decision.answered_by?.startsWith("human:") ? "by you " : ""}
+                          {answeredBy(decision.answered_by, session?.actor)}{" "}
                           {observationTime(decision.updated_at) ?? ""}
                         </small>
                         <p>Answer: {decision.answer}</p>

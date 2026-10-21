@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { relativeAge, waitingOn } from "./dashboardText";
+import { answeredBy, relativeAge, waitingOn } from "./dashboardText";
 import type { Task } from "./types";
 
 const name = (id: string) => ({ codex: "Codex", claude: "Claude", hermes: "Hermes" })[id] ?? id;
@@ -23,6 +23,14 @@ describe("dashboard wording", () => {
   });
   it("never presents an unreviewed in-review task as actively reviewed", () => {
     expect(waitingOn(task({ status: "in_review", owner: "codex" }), name)).toContain("No reviewer assigned");
+  });
+  it("attributes an answer to the viewer only on an exact actor match", () => {
+    const me = "human:cf:" + "a".repeat(64), other = "human:cf:" + "b".repeat(64);
+    expect(answeredBy(me, me)).toBe("by you");
+    expect(answeredBy(other, me)).toBe("by another authorized person");
+    expect(answeredBy(me, null)).toBe("by another authorized person");
+    expect(answeredBy(null, me)).toBe("(answerer not recorded)");
+    expect(answeredBy("codex", me)).toBe("(answerer not recorded)");
   });
   it("formats relative age from real timestamps only", () => {
     const now = Date.parse("2026-10-21T01:00:00Z");

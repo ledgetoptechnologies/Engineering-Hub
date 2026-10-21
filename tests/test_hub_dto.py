@@ -126,7 +126,8 @@ def test_openapi_response_objects_reference_closed_typed_schemas(hub):
 def test_unknown_source_field_fails_closed_without_exposing_value(hub, monkeypatch):
     settings, repo = hub
     task = list(task_states(repo))[-1]
-    monkeypatch.setattr(repo, 'list_tasks', lambda: [{**task, 'service_token': 'private-sentinel'}])
+    # /tasks reads list_task_views; an unknown field there must still fail closed.
+    monkeypatch.setattr(repo, 'list_task_views', lambda: [{**task, 'service_token': 'private-sentinel'}])
     app = create_app(settings, repository=repo)
     with TestClient(app, base_url='https://hub.test', raise_server_exceptions=False) as client:
         response = client.get(PREFIX + '/tasks', headers=HEADERS)

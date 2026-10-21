@@ -35,7 +35,7 @@ function overview() {
   return value;
 }
 
-async function fixture(page: Page) {
+async function fixture(page: Page, answeredBy = human) {
   const state = { writes: 0 };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -43,7 +43,11 @@ async function fixture(page: Page) {
     if (request.method() !== "GET") { state.writes++; return respond({}, 405); }
     if (path.endsWith("/auth/me")) return respond({ authenticated: true, actor: human, github_id: null,
       auth_provider: "cloudflare_access", email: "operator@example.test", csrf_token: "fixture-csrf" });
-    if (path.endsWith("/overview")) return respond(overview());
+    if (path.endsWith("/overview")) {
+      const value = overview();
+      (value.decisions[0] as { answered_by?: string }).answered_by = answeredBy;
+      return respond(value);
+    }
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported",
       observer_epoch: "fixture", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
@@ -66,6 +70,14 @@ test("answered decisions are history, not a new approval request", async ({ page
   await expect(answers.getByText("did not by itself authorize running anything", { exact: false })).toBeVisible();
   await expect(answers.getByRole("button")).toHaveCount(0);
   expect(state.writes).toBe(0);
+});
+
+test("an answer by a different authorized person is not attributed to the viewer", async ({ page }) => {
+  await fixture(page, "human:cf:" + "f".repeat(64));
+  await page.goto("/");
+  const answers = page.locator("#decisions").getByLabel("Recent answers");
+  await expect(answers.getByText("Answered by another authorized person", { exact: false })).toBeVisible();
+  await expect(answers.getByText("by you", { exact: false })).toHaveCount(0);
 });
 
 test("unconfigured projects and runner read as not set up, not as faults", async ({ page }) => {
