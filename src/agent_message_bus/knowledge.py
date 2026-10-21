@@ -123,7 +123,8 @@ class KnowledgeRepository:
             raise KnowledgeError("content must be valid UTF-8") from exc
         if len(content_bytes) > MAX_CONTENT_BYTES:
             raise KnowledgeError(f"content exceeds {MAX_CONTENT_BYTES} UTF-8 bytes")
-        if not isinstance(author, str) or not author or len(author) > 64:
+        # Cloudflare human actors include a full SHA-256 identity binding.
+        if not isinstance(author, str) or not author or len(author) > 128:
             raise KnowledgeError("author must be a non-empty identity")
         if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
             raise KnowledgeError("expected_version must be a non-negative integer")

@@ -88,6 +88,9 @@ Use [`compose.truenas.yaml`](compose.truenas.yaml) as a prebuilt-image compose f
 
 ## Three-agent integration
 
+For durable shared notes, work tracking and the human dashboard interface, see
+[`docs/shared-notes-and-tracking.md`](docs/shared-notes-and-tracking.md).
+
 The separate Linux-only [fixture executor](hub_executor/CONTRACT.md) and
 `compose.hub-test.yaml` are isolated acceptance tools, not application deployment
 adapters. They do not enable dispatch in the default Hub or modify the existing
