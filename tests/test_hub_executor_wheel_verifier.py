@@ -99,12 +99,12 @@ def test_valid_raw_crlf_wheel_matches_external_pins_without_import_or_extraction
     path, digest, marker = wheel(tmp_path)
     assert b"\r\n" in path.read_bytes()  # Raw ZIP bytes must survive text-mode translation.
     assert verify(path, digest) == dict(source_commit=COMMIT, wheel_sha256=digest,
-        core_image=CORE, python_files_verified=10)
+        core_image=CORE, python_files_verified=11)
     assert not marker.exists()
     assert sorted(item.name for item in tmp_path.iterdir()) == ["executor.whl"]
 
 
-@pytest.mark.parametrize('module', ['installed_coordinator', 'launch_supervisor', 'configuration_commitment'])
+@pytest.mark.parametrize('module', ['installed_coordinator', 'launch_supervisor', 'launcher_cli', 'configuration_commitment'])
 def test_rejects_self_consistent_wheel_missing_current_installation_module(tmp_path, module):
     def mutate(files):
         del files['hub_container_executor/' + module + '.py']

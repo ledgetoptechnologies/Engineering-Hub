@@ -56,3 +56,13 @@ def test_exact_native_record_shape_chain_and_honest_preparation_identity():
 def test_wrong_source_digest_identity_or_metadata_denied(change):
     with pytest.raises((ValueError, TypeError)):
         prepare_record(**inputs(**change))
+
+
+@pytest.mark.parametrize("descriptor", [None, [], "not-a-descriptor", 1, False, {}])
+def test_malformed_manifest_config_descriptor_has_consistent_value_error(descriptor):
+    args = inputs()
+    manifest = json.loads(args["manifest_raw"])
+    manifest["config"] = descriptor
+    args["manifest_raw"] = canonical(manifest)
+    with pytest.raises(ValueError, match="^Raw selected metadata chain mismatch$"):
+        prepare_record(**args)

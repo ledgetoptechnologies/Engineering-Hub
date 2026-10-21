@@ -35,7 +35,7 @@ package = root / 'hub_container_executor'
 record = json.loads((package / '_executor_source.json').read_bytes())
 assert record['schema_version'] == 1 and record['source_commit'] == sys.argv[1]
 names = ('service', 'local_resources', 'runtime_identity', 'installed_runner',
-         'installed_coordinator', 'launch_supervisor', 'launch_transport', 'configuration_commitment')
+         'installed_coordinator', 'launch_supervisor', 'launcher_cli', 'launch_transport', 'configuration_commitment')
 for name in names:
     module = importlib.import_module('hub_container_executor.' + name)
     path = pathlib.Path(module.__file__)
