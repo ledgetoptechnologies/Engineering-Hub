@@ -67,6 +67,18 @@ Linux PID1 delivery, TrueNAS shell availability, UID/ZFS permissions, writer
 exclusion, backup, enrollment, app startup or reboot recovery. Actual image
 packaging and container acceptance are required before the operator window.
 
+The existing `scripts/hub_release_smoke.py` now includes a packaged-PID1 gate:
+after its normal recreation checks, it reuses only that unique owner-labeled
+synthetic CI volume. It compares bounded raw-file snapshots before/during/after
+standby, never opens SQLite, disables healthchecking/restart, uses UID568 with
+no network/host mounts/host ports and the existing resource limits, then demands
+one real Docker SIGTERM stop with the same container/image, exit0, no OOM and
+the exact stopped marker. Nonzero exit or changed bytes cannot pass. Cleanup
+force-removal of an owned disposable CI fixture is not a successful stop.
+This gate has been added to source, not yet observed passing on the new image;
+mock planning tests are not container acceptance. It uses the existing image
+build/test flow rather than a separate build or a TrueNAS operation.
+
 The exact helper source (SHA256
 `928f3239310e9c69503ffa924ce06c61babfa08ba1e7c939c0928b5010a831d8`)
 also passed two disposable Python3.12 source-process checks on staging Linux:
