@@ -127,6 +127,7 @@ def test_cleanup_refuses_unknown_owner(monkeypatch):
 def test_probe_fixed_installed_paths_and_required_core_api():
     assert 'installed_coordinator' in MODULE.PROBE and 'launch_supervisor' in MODULE.PROBE
     assert 'configuration_commitment' in MODULE.PROBE
+    assert 'launcher_cli' in MODULE.PROBE
     assert 'for_private_unix' in MODULE.PROBE
     assert '/opt/venv/lib/python3.12/site-packages' in MODULE.PROBE
     assert 'run_installed_executor(' not in MODULE.PROBE

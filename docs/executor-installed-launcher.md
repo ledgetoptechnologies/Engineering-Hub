@@ -1,16 +1,20 @@
 # Concrete executor launch and receipt composition
 
-Status: **source implementation, not installed readiness or pilot acceptance**.
+Status: **optional source implementation, not general installed readiness**.
 Importing these modules installs nothing and launches no service or container.
 No credentials, accounts, mounts, privileges or production MCP configuration are
-provisioned by this work. An independently built, enrolled immutable executor
-image and actual host validation remain missing.
+provisioned by this work. The separately documented
+[bounded TEST pilot](staging-pilot-acceptance-2026-10-21.md) used an independently
+enrolled artifact and the native API, with actual queue/rollback/shutdown evidence.
+That does not install the new reusable CLI below, establish a general installer,
+or prove live NAS dispatch or reboot recovery.
 
 ## Explicit source APIs
 
 | Component | Contract |
 | --- | --- |
 | `launch_supervisor.LaunchSupervisor` | Initial-host-root operator API taking explicit `enrollment_file`, `signing_key_file`, `journal_file` and `create_journal`. `launch()` performs one enrolled container create/start; `serve_one_receipt()` serves one direct authenticated init-process exchange. No installer, background worker or automatic recovery is supplied. |
+| `launcher_cli` | Explicit installed host-root command composing that existing API, one receipt exchange and a bounded wait for an explicit stop signal. No provisioning, implicit launch, force/retry, service registration or reboot recovery. |
 | `launch_transport.UnixLaunchReceiptTransport` | Consumer-owned synchronous transport taking explicit `socket_path`, `expected_issuer_uid` and `expected_issuer_gid`. `issue_receipt(nonce=..., timeout_ms=...)` makes one direct connection with no discovery, relay, TCP or retry. |
 | `installed_runner` | Fixed direct-init entry point `/opt/venv/bin/python -I -m hub_container_executor.installed_runner --config /operator/runner.json`. `load_configuration()` loads the protected read-only configuration; `run_installed_executor()` obtains verified launch identity before assembling providers and serving the private executor API. |
 | `installed_coordinator` | Separate opt-in colocated TEST pilot. `validate --config <path>` reads protected configuration and validates its data only; `serve --config <path>` resolves TEST credentials and selects the existing owned queued-pilot lifecycle through a fresh private Unix client. It does not replace the deployed unified MCP. |
@@ -132,6 +136,62 @@ executor socket and separate versioned TEST bearer binding. It contains no
 private signing key or literal secret values. Application TEST slots and the
 executor bearer slot must be distinct. Parsing does not prove these inputs were
 independently enrolled.
+
+## Reusable explicit host launcher
+
+Use the independently verified optional wheel in an approved **host** Python
+environment, not by overriding the consumer container's PID1 entrypoint. The
+wheel preparation, wheel validator and offline image import probe require the
+`launcher_cli` module; presence in an artifact is not permission to run it.
+
+The operator supplies existing independently protected enrollment and signing
+key files, an existing root-private local journal parent, and a **fresh** journal
+path. There are no campaign-specific PID, inode or daemon constants in this CLI;
+the native supervisor validates the independently enrolled current identities.
+It does not generate those enrollments from observations or create their parents.
+
+```text
+python -I -B -m hub_container_executor.launcher_cli \
+  --enrollment-file <existing-protected-enrollment> \
+  --signing-key-file <existing-protected-key> \
+  --journal-file <fresh-root-private-journal-path> \
+  --wait-seconds 1200 --execute --create-journal
+```
+
+Without `--execute`, valid arguments return `not_executed`: no native supervisor
+is constructed and no key, enrollment, Engine or journal is opened. This is **not**
+an installation/readiness validator. Execution additionally requires Linux,
+host root, the native kernel facilities, main-thread signal handling and explicit
+fresh-journal consent. Native construction can create the journal and its lock;
+an interruption before launch may therefore leave them present. Never delete,
+reset, reuse or adopt retained journal/lock/socket evidence to retry this command.
+
+The same process performs one `launch()`, immediately one `serve_one_receipt()`,
+then waits. `SIGUSR1`, `SIGTERM` and `SIGINT` only set a flag; native operations
+are never invoked from a signal handler or a second thread. A stop during the
+synchronous exchange is considered only after that exchange succeeds. A request
+after launch but before the exchange skips issuance and requests one stop.
+No failed native operation is retried or converted into automatic cleanup.
+
+**Drain the coordinator and all admitted jobs before requesting launcher stop.**
+The native supervisor's stop deadline is at most 120 seconds; it is not the
+services' at-least-1120-second busy-work grace allowance. The CLI does not prove
+drain. Signal only the retained, independently verified owning launcher process;
+do not select a process by a guessed PID, name, or newest-session lookup.
+
+`--wait-seconds` accepts 1–3600 and bounds **only the wait after issuance**. It
+does not extend receipt authority or bound all native operations together. Expiry
+returns nonzero and closes descriptors only; it does not terminate a container.
+Schedule the explicit owned stop before that wait expires. A native error also
+returns nonzero without force, removal, adoption, replacement or POST retry.
+Treat retained state as requiring reconciliation, not as successful shutdown.
+
+Output uses fixed non-secret phase names; `stopped`/exit 0 is emitted only after
+the one native graceful stop and descriptor/handler cleanup succeed. Source/mock
+tests exercise ordering, cancellation boundaries, failure/expiry, restoration
+and argument validation. They do not prove real kernel signals, installed CLI
+behavior, immutable host installation or reboot recovery. The earlier actual
+TEST shutdown exercised the underlying API, not this new CLI wrapper.
 
 ## Lifecycle and evidence limits
 

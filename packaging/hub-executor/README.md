@@ -3,10 +3,15 @@
 This separate packaging project installs the Linux-only `hub_container_executor`
 library and its existing `scripts.inspect_hub_image_identity` dependency. The
 package requires the explicit `hub_container_executor.installed_runner`,
-`installed_coordinator`, and `launch_supervisor` modules plus the direct
+`installed_coordinator`, `launch_supervisor`, and `launcher_cli` modules plus the direct
 launch-receipt transport. A self-consistent wheel or archive missing these
 installation components is rejected. It does not change the core distribution,
 provide a console-script wrapper, provision an issuer, or activate an executor.
+The explicit `python -I -B -m hub_container_executor.launcher_cli` operation is
+documented in [the host-launcher contract](../../docs/executor-installed-launcher.md)
+in the source repository. Packaging it does not install a root service, generate
+enrollment or keys, or authorize activation. Its bounded wait is not reboot or
+busy-work drain recovery.
 `agent-message-bus==0.6.0` must be installed from
 the independently pinned core artifact, not merely resolved by version from a
 registry. The version requirement alone does not authenticate that artifact.

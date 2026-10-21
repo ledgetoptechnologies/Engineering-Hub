@@ -65,6 +65,7 @@ def prepare_archive(archive: bytes, *, revision: str, output_directory: Path) ->
         "src/hub_container_executor/installed_runner.py",
         "src/hub_container_executor/installed_coordinator.py",
         "src/hub_container_executor/launch_supervisor.py",
+        "src/hub_container_executor/launcher_cli.py",
         "src/hub_container_executor/launch_transport.py",
         "src/hub_container_executor/configuration_commitment.py",
     }
