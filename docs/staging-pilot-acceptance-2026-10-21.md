@@ -77,6 +77,43 @@ No credentials or database copies are included. Shared Hub note:
 
 ## Integration corrections and remaining gates
 
+### Separate live dashboard observation
+
+After the TEST campaign, a read-only browser check of the existing
+`https://hub.ledgetoptechnologies.com/` session at approximately 20:55 UTC
+on 2026-10-21 showed the authorized LTDS email and `Cloudflare Access`, with
+the dashboard visible and no extra sign-in gate. An explicit workspace refresh
+completed and displayed current transport snapshots for all three agents.
+An explicit Shared notes refresh changed the list from 15 to 17 entries; opening
+`runbooks/bounded-pilot-5550-baseline-checkpoint.md` displayed version 7 and its
+current queued-rollback evidence. This verifies an agent-written note is readable
+in the actual authenticated human UI, not only through an isolated API fixture.
+
+Separate direct-origin GET probes from the authorized workstation also passed:
+
+| Probe | Actual response |
+| --- | --- |
+| Browser root on NAS port 8771, no assertion, public Hub Host | 401 `access_required` |
+| Same request plus spoofed allowed-email header | 401 `access_required` |
+| Same plus malformed test assertion | 401 `access_required` |
+| Agent overview on port 8770 without a token | 401 `unauthorized` |
+
+These requests used no cookies or credentials, no proxy or redirect, and changed
+no configuration. They prove these specific direct-origin rejection cases, not
+every invalid-signature/issuer/audience combination or network isolation.
+
+This observation did not log out, create a new login, change a note or decision,
+inspect cookies, or modify any service. It does not verify the deployed image
+revision, the other allowed email, 30-day session expiry,
+human-edit conflict handling, reboot recovery or exact-session wake. In the
+refreshed view Codex had active transport streams but zero observed inbox
+subscriptions; the UI correctly did not equate transport connectivity with
+topic readiness. The live software queue remained unconfigured and no staging
+target was enrolled. The isolated TEST pilot must not be described as live
+NAS-to-staging dispatch.
+
+### Client corrections
+
 Two pre-submission client failures were reconciled before the first POST:
 Linux pathname sockets exceeded `sun_path`; the corrected executor observer uses
 a retained, identity-checked directory FD. The browser-only socket correctly
@@ -90,7 +127,7 @@ against the default Windows temporary directory had four setup permission errors
 a fresh dedicated test directory resolved those without product changes.
 
 Still separate: publication of the executor fix, approved deployment/activation,
-actual TrueNAS and authenticated dashboard acceptance, reboot/session recovery,
+actual TrueNAS acceptance and the remaining authenticated-dashboard checks above, reboot/session recovery,
 and incremental project enrollment. External collaborators additionally need
 enforced project authorization and separate revocable identities before access.
 No production, PA/Viewer, TrueNAS, Cloudflare or live MCP changes were made by

@@ -1,5 +1,20 @@
 # TrueNAS SCALE deployment guide
 
+> **Historical standalone bus guide — not current Hub installation instructions.**
+> Use the [current unified Hub deployment guide](simple-hub-deployment.md).
+> The approved layout uses agent port 8770, browser port 8771, no 8765 alias,
+> and only `/mnt/Plugins/App_Data/Engineering-Hub` as the host storage root.
+> Human identity uses separate Hub Cloudflare Access, not Ops or GitHub OAuth.
+> Do not recreate the old bus or its storage from the instructions below.
+> The original version, publication and service-status statements are preserved
+> historical context, not assertions about the currently running deployment.
+> The [2026-10-21 bounded TEST acceptance](staging-pilot-acceptance-2026-10-21.md)
+> records isolated staging workflow and shutdown evidence, plus separately
+> qualified live browser observations. Complete TrueNAS, identity/session,
+> reboot and production acceptance remain separate.
+
+## Historical standalone bus instructions
+
 This is an operator guide, not a deployment record. The prepared Compose file is [`../compose.truenas.yaml`](../compose.truenas.yaml); no image has been published and no TrueNAS service has been changed by this work. The image tag is `0.2.0`, so wait until the matching GHCR package version exists before installing it.
 
 ## Before opening the app editor

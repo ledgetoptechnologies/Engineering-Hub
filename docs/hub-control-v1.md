@@ -1,5 +1,20 @@
 # Engineering Hub control-plane build
 
+> **Current deployment and evidence:** use the
+> [current unified Hub deployment guide](simple-hub-deployment.md), not the
+> original separate-service instructions below. The approved layout uses agent
+> port 8770, browser port 8771, no 8765 alias, and only the
+> `/mnt/Plugins/App_Data/Engineering-Hub` host storage root. Human identity uses
+> separate Hub Cloudflare Access, not Ops or the original GitHub OAuth plan.
+> Source support and published images are not proof of live configuration.
+> The [2026-10-21 bounded TEST acceptance](staging-pilot-acceptance-2026-10-21.md)
+> records the real queued failure/rollback and shutdown checks, plus separately
+> qualified live browser observations. It does not establish complete TrueNAS,
+> identity/session, reboot or production acceptance. Historical design and
+> checkpoint evidence below is preserved.
+
+## Historical initial deployment design
+
 This is an additive, independently deployed service. It does **not** replace or
 change the current message bus, its port 8765, image name, tokens, storage or
 native push listener. Default control service port is 8770 on loopback only.
@@ -104,6 +119,11 @@ isolated build test; no publishing worker is activated by importing it.
 
 ## Opt-in autonomous staging
 
+The following describes the original dispatcher source and its fixture-only
+checkpoint. Its pending-pilot statements are historical; the later native queued
+TEST workflow has separate actual evidence in the acceptance record linked above.
+Neither source path is enabled by ordinary Hub startup.
+
 `StagingDispatcher` selects durable `task.reviewed` events only when the task's
 current revision, independent review, exact candidate and operator-owned fixture
 manifest agree. Each event has a durable reservation and stable run request key;
@@ -129,7 +149,11 @@ receipts. The current configured driver is fixture-only; no source test or
 MockTransport result establishes a real application rollout or staging target
 activation. Host inventory and real HTTP/container acceptance remain gates.
 
-## Private configuration
+## Historical standalone private configuration
+
+This section records the original standalone profile and deferred OAuth setup.
+It is not the current installation path; use the unified deployment guide linked
+above for persisted settings, agent tokens and Cloudflare Access verification.
 
 The opt-in, standalone `compose.hub-control.yaml` profile and
 [`hub-control-deployment.md`](hub-control-deployment.md) provide the private
@@ -311,7 +335,13 @@ Actual source deployment, scoped reader enrollment, exact-session attestations
 and three-agent reconnect acceptance remain required before claiming end-to-end
 topic readiness. The Hub outbox stream alone cannot prove topic presence.
 
-## Release acceptance checklist
+## Historical release acceptance checklist
+
+This checklist and the implementation-status paragraph below record the earlier
+checkpoint, not current remaining-work claims. The OAuth choice was superseded
+by separate Hub Cloudflare Access, and the bounded real TEST pilot has since
+passed as documented in the linked acceptance record. That record does not close
+the separate live deployment, browser, reboot or production acceptance gates.
 
 1. Fixture/controller source covers typed allowlisted targets/actions/artifacts,
    durable command dedupe/fencing, health, rollback, pause and restart
