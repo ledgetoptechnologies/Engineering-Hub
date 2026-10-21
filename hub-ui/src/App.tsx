@@ -11,6 +11,7 @@ import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { WorkQueuePanel } from "./WorkQueuePanel";
 import { NotesPanel } from "./NotesPanel";
+import { answeredBy, relativeAge, waitingOn } from "./dashboardText";
 import type {
   AgentSummary,
   Decision,
@@ -19,6 +20,7 @@ import type {
   ProjectId,
   PublicReachability,
   Session,
+  Task,
   TopicSnapshot,
 } from "./types";
 
@@ -34,7 +36,13 @@ function observationTime(value: string | null | undefined): string | null {
   if (!value) return null;
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp) || timestamp > Date.now() + 30_000) return null;
-  return new Date(timestamp).toLocaleString();
+  return `${new Date(timestamp).toLocaleString()} (${relativeAge(value)})`;
+}
+
+function stateAge(task: Task): string {
+  const age = relativeAge(task.state_since);
+  return age ? `In this state since ${new Date(Date.parse(task.state_since!)).toLocaleString()} (${age})`
+    : "Time in this state not recorded";
 }
 
 function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
@@ -61,6 +69,10 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
         notObserved ? "No active push stream observed" : "Hub connection unavailable"}</span>
       {!stale && fresh && observed && countsValid && knownSource && connection?.state !== "unavailable" && (
         <small>{connection!.active_streams} active stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)</small>
+      )}
+      {connected && (
+        <small>{connection!.inbox_subscriptions! > 0 ? "Inbox subscription observed: new messages can be pushed to this agent."
+          : "No active inbox subscription observed. Delivery may still happen another way; this alone does not show the agent is ready."}</small>
       )}
       {observed && <small>Snapshot observed: {observed}</small>}
       {!stale && fresh && observed && knownSource && connection?.state !== "unavailable" && observationTime(connection?.last_stream_write_at) && (
@@ -547,6 +559,11 @@ export function HubApp() {
         item.status === "open" &&
         (project === "all" || item.project === project),
     ) ?? [];
+  // Answered decisions are history, not waiting work. Shown separately so an
+  // answer's limits stay visible without becoming a new approval request.
+  const recentAnswers = (data?.decisions.filter(
+    (item) => item.status === "answered" && (project === "all" || item.project === project),
+  ) ?? []).sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 3);
   const tasks =
     data?.tasks.filter(
       (item) => project === "all" || item.project === project,
@@ -970,6 +987,29 @@ export function HubApp() {
                     </form>
                   ))
                 )}
+                {recentAnswers.length > 0 && (
+                  <div className="recent-answers" aria-label="Recent answers">
+                    <h3>Recent answers</h3>
+                    {recentAnswers.map((decision) => (
+                      <div className="recent-answer" key={decision.id}>
+                        <strong>{decision.title}</strong>
+                        <small>
+                          {projectName(decision.project)} · Answered{" "}
+                          {answeredBy(decision.answered_by, session?.actor)}{" "}
+                          {observationTime(decision.updated_at) ?? ""}
+                        </small>
+                        <p>Answer: {decision.answer}</p>
+                        {decision.protected && (
+                          <small>
+                            This answer did not by itself authorize running
+                            anything. Run approval and run status are tracked
+                            separately.
+                          </small>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <p className="panel-footnote">
                   Only your signed-in session can answer. Agents can request,
                   not approve.
@@ -994,13 +1034,17 @@ export function HubApp() {
                         <small>
                           {item.executor_enabled
                             ? "Staging target enabled"
-                            : "Awaiting inventory & acceptance"}
+                            : "No staging target yet. Setting one up needs an inventory of the target and your acceptance."}
                         </small>
                       </div>
                       <Badge
                         tone={item.health === "healthy" ? "forest" : "neutral"}
                       >
-                        {pretty(item.health)}
+                        {!item.executor_enabled && item.health === "unknown"
+                          ? "Not set up yet"
+                          : item.health === "unknown"
+                            ? "Health unknown"
+                            : pretty(item.health)}
                       </Badge>
                     </div>
                   ))}
@@ -1013,10 +1057,14 @@ export function HubApp() {
                     <span>
                       <strong>
                         {data.paused
-                          ? "New staging work paused"
-                          : "New staging work not paused"}
+                          ? "Emergency pause on: new staging work is blocked"
+                          : "Emergency pause off"}
                       </strong>
-                      <small>Autonomy: {pretty(data.autonomy.state)}</small>
+                      <small>
+                        {!data.autonomy.configured
+                          ? "Automatic runner not set up. Agents only act on the tasks shown here."
+                          : `Automatic runner: ${pretty(data.autonomy.state)}`}
+                      </small>
                     </span>
                   </div>
                   <button
@@ -1093,6 +1141,8 @@ export function HubApp() {
                           {task.scope === "staging" && task.proposed_by && (
                             <small>Staging proposal · {names[task.proposed_by]}</small>
                           )}
+                          <small className="task-waiting">{waitingOn(task, (id) => names[id] ?? id)}</small>
+                          <small title={task.state_since ?? undefined}>{stateAge(task)}</small>
                         </span>
                         <span className="owner">
                           <span className="mini-avatar">
@@ -1124,7 +1174,8 @@ export function HubApp() {
                         <p>
                           Independent reviewer:{" "}
                           <strong>
-                            {task.review ? names[task.review.actor] : "Pending"}
+                            {task.review ? names[task.review.actor]
+                              : task.status === "in_review" ? "None assigned yet" : "Not requested yet"}
                           </strong>{" "}
                           · Repairs used: {task.repair_count}/3
                         </p>

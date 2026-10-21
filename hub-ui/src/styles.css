@@ -1140,6 +1140,36 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 }
+.recent-answers {
+  border-top: 1px solid var(--line);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+.recent-answers h3 {
+  font-size: 11px;
+  font-weight: 550;
+  color: #7e8f65;
+  margin: 0 0 8px;
+}
+.recent-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.recent-answer small {
+  font-size: 10px;
+  color: #8a9381;
+}
+.recent-answer p {
+  margin: 0;
+  color: #334d31;
+}
+.task-waiting {
+  color: #60764e;
+}
 @media (min-width: 1600px) {
   .main {
     padding: 0 65px;
