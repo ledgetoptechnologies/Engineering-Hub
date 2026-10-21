@@ -63,6 +63,7 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
         "DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus",
         "NOTIFY_SOCKET=${NOTIFY_SOCKET}",
         "DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false",
         "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/eh-pilot-rootlesskit",
         "/usr/bin/dockerd-rootless.sh",
         "--host=unix://%t/eh-pilot-docker.sock",
@@ -79,6 +80,18 @@ def test_bootstrap_has_only_explicit_local_daemon_exec_no_application_commands()
     assert _one(service, "NotifyAccess") == "all"
     # Do not suppress the approved setuid mapping helpers as a side effect.
     assert "NoNewPrivileges" not in service
+
+
+def test_bootstrap_explicitly_keeps_daemon_inside_non_detached_network_namespace():
+    argv = shlex.split(_one(_read("eh-pilot-docker.service")["Service"], "ExecStart"))
+    helper = argv.index("/usr/bin/dockerd-rootless.sh")
+    assignments = [arg for arg in argv[2:helper]
+                   if arg.startswith("DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=")]
+    # NET=none alone is insufficient: installed helper29.5.2 defaults this
+    # override to true, which makes RootlessKit execute dockerd on host netns.
+    assert assignments == ["DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false"]
+    assert "DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none" in argv[2:helper]
+    assert not any(arg.startswith("--detach-netns") for arg in argv)
 
 
 @pytest.mark.parametrize(("key", "expected"), [

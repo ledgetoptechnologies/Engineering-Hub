@@ -26,6 +26,7 @@ HELPER = "/usr/bin/dockerd-rootless.sh"
 EXPECTED_NAMES = {
     "HOME", "PATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "NOTIFY_SOCKET",
     "DOCKERD_ROOTLESS_ROOTLESSKIT_NET", "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR",
+    "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS",
 }
 CANARIES = {
     "HOME": "/fixture-untrusted-home", "PATH": "/fixture-untrusted-path",
@@ -39,6 +40,7 @@ CANARIES = {
     "_DOCKERD_ROOTLESS_CHILD": "fixture-not-a-child",
     "DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS": "fixture-unused-flags",
     "DOCKERD_ROOTLESS_ROOTLESSKIT_NET": "fixture-wrong-network",
+    "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS": "true",
     "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR": "/fixture-wrong-state",
     "HTTP_PROXY": "fixture-unused-proxy", "HTTPS_PROXY": "fixture-unused-proxy",
     "ALL_PROXY": "fixture-unused-proxy", "AWS_ACCESS_KEY_ID": "synthetic-not-a-real-key",
@@ -94,12 +96,36 @@ def test_real_env_filters_canaries_and_preserves_only_modeled_whitelist(private_
         "XDG_RUNTIME_DIR": str(private_root),
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(private_root / "bus"),
         "NOTIFY_SOCKET": notify, "DOCKERD_ROOTLESS_ROOTLESSKIT_NET": "none",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS": "false",
         "DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR": str(private_root / "eh-pilot-rootlesskit"),
     }
     assert not (set(environment) & (set(CANARIES) - EXPECTED_NAMES))
     arguments = _run_fixture(argv, "import json,sys; print(json.dumps(sys.argv[1:]))")
     assert arguments.returncode == 0, "Synthetic argv fixture failed"
     assert json.loads(arguments.stdout) == argv[index + 1:]
+
+
+@pytest.mark.parametrize("mutation", ["reviewed", "missing", "true", "empty"])
+def test_modeled_helper_default_requires_explicit_non_detached_override(private_root, mutation):
+    argv = _modeled_argv(private_root, "@unused-fixture-notify")
+    index = next(index for index, value in enumerate(argv)
+                 if value.startswith("DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS="))
+    if mutation == "missing":
+        argv.pop(index)
+    elif mutation != "reviewed":
+        argv[index] = "DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=" + ("true" if mutation == "true" else "")
+    # Models the installed helper's ${VARIABLE:-true} selection only. No
+    # RootlessKit, namespace operation or daemon is executed by this fixture.
+    script = """
+import os,json
+value=os.environ.get('DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS') or 'true'
+print(json.dumps({'detach':value,'net':os.environ.get('DOCKERD_ROOTLESS_ROOTLESSKIT_NET')}))
+"""
+    result = _run_fixture(argv, script)
+    assert result.returncode == 0
+    modeled = json.loads(result.stdout)
+    assert modeled['net'] == 'none'
+    assert modeled['detach'] == ('false' if mutation == 'reviewed' else 'true')
 
 
 NOTIFY_FIXTURE = """
