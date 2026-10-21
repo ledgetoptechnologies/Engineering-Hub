@@ -801,12 +801,33 @@ class LaunchSupervisor:
         # Tmpfs configuration is checked above; actual mount flags below.
         _require(not observed)
         _require(not state.get('Restarting') and not state.get('Paused') and not state.get('Dead'))
-        _require(state.get('Running') is running)
-        if running:
+        _require(type(state.get('Running')) is bool)
+        if running is not None:
+            _require(state['Running'] is running)
+        if state['Running']:
             _require(state.get('Status') == 'running' and type(state.get('Pid')) is int and state['Pid'] > 0
                      and info.get('Path') == self.profile.entrypoint[0]
                      and info.get('Args') == list((*self.profile.entrypoint[1:], *self.profile.command)))
         return state
+
+    def _wait_stopped(self, deadline):
+        """Reconcile Engine accounting after kernel exit, without another effect.
+
+        A readable pidfd can precede Docker's terminal state. Only the exact
+        validated profile still reporting our original PID is worth waiting
+        for. Changed profiles, malformed states and GET failures fail closed.
+        """
+        while True:
+            _remaining(deadline)
+            self._guard(allow_held=True)
+            state = self._inspect(deadline, running=None)
+            _remaining(deadline)
+            if not state['Running']:
+                _require(state.get('Status') == 'exited'
+                         and type(state.get('Pid')) is int and state['Pid'] == 0)
+                return
+            _require(state['Pid'] == self._consumer.pid)
+            time.sleep(min(0.05, _remaining(deadline)))
 
     def launch(self):
         """One bounded real create/start. Any uncertain effect stays held forever."""
@@ -996,7 +1017,7 @@ class LaunchSupervisor:
                 self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
                                   deadline, statuses=(204,))
                 _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
-                self._inspect(deadline, running=False)
+                self._wait_stopped(deadline)
                 self._journal.state(self._launch_id, 'stopped', self._record())
                 self._remove_owned_socket()
             except BaseException:
