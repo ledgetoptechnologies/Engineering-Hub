@@ -57,6 +57,9 @@ def test_isolated_568_profile_and_owned_recreation_plan(monkeypatch):
             stdout = json.dumps({'image_smoke': 'passed', 'build_commit': commit})
         return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
     monkeypatch.setattr(module.subprocess, 'run', fake)
+    # This test covers the existing normal-startup plan. Standby is tested
+    # independently below; real Docker acceptance is the CI smoke itself.
+    monkeypatch.setattr(module, 'standby_pid1_acceptance', lambda *args: {'mock_only': True})
     result = module.smoke('ghcr.io/ledgetoptechnologies/engineering-hub-control:build-test', commit)
     runs = [c for c in calls if c[1] == 'run']
     assert len(runs) == 2
@@ -123,3 +126,63 @@ def test_probe_sets_canonical_host_on_each_request_not_opener_defaults(monkeypat
             namespace[method]('/health')
         else:
             namespace[method]('tools/list', {}, 'synthetic-fixture')
+
+
+@pytest.mark.parametrize('failure', [None, 'forced_exit', 'changed_bytes', 'wrong_generation',
+                                    'init_wrapper', 'wrong_pid1'])
+def test_standby_owned_pid1_stop_and_raw_preservation(monkeypatch, failure):
+    module = load(monkeypatch)
+    def observed(ended=False):
+        return {'Id': 'other' if ended and failure == 'wrong_generation' else 'own-id',
+            'Image': 'same-image', 'State': {'Running': not ended, 'Pid': 0 if ended else 1234,
+                'ExitCode': 137 if failure == 'forced_exit' else 0, 'OOMKilled': False},
+            'Config': {'User': '568:568', 'Entrypoint': ['python'], 'Cmd': module.STANDBY_ARGS,
+                'Labels': {'hub.release-owner': 'owner'}, 'Healthcheck': {'Test': ['NONE']},
+                'StopSignal': 'SIGTERM'},
+            'HostConfig': {'NetworkMode': 'none', 'RestartPolicy': {'Name': 'no'},
+                'PidMode': '', 'Init': failure == 'init_wrapper'}}
+    inspections = [observed(), observed(True)]
+    logs = [[module.STARTED], [module.STARTED, module.STOPPED]]
+    calls, removed, names = [], [], []
+    def run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ('docker', 'inspect'):
+            return json.dumps([inspections.pop(0)])
+        if args[:2] == ('docker', 'logs'):
+            return '\n'.join(json.dumps(item) for item in logs.pop(0))
+        if args[:2] == ('docker', 'exec'):
+            return json.dumps(['tini'] if failure == 'wrong_pid1' else ['python', *module.STANDBY_ARGS])
+        return 'own-id'
+    snapshots = iter([{'bytes': 'same'},
+                      {'bytes': 'changed' if failure == 'changed_bytes' else 'same'},
+                      {'bytes': 'same'}])
+    monkeypatch.setattr(module, 'run', run)
+    monkeypatch.setattr(module, 'snapshot_volume', lambda *args: next(snapshots))
+    monkeypatch.setattr(module, 'remove_owned', lambda *args: removed.append(args))
+    if failure:
+        with pytest.raises(AssertionError):
+            module.standby_pid1_acceptance('exact-image', 'owner', 'volume', names)
+        assert names == ['hub-release-owner-standby']  # retained for outer owned cleanup
+        assert removed == []
+    else:
+        result = module.standby_pid1_acceptance('exact-image', 'owner', 'volume', names)
+        assert result['maintenance_pid1'] == 'passed'
+        assert result['all_writers_stopped'] == 'not_established'
+        assert names == [] and len(removed) == 1
+        assert calls.count(('docker', 'stop', '--time', '10', 'hub-release-owner-standby')) == 1
+    creation = calls[0]
+    assert '--no-healthcheck' in creation and '--restart=no' in creation
+    assert creation[creation.index('--network') + 1] == 'none'
+    assert creation[creation.index('--user') + 1] == '568:568'
+    assert creation[creation.index('--entrypoint') + 1] == 'python'
+
+
+def test_raw_snapshot_has_no_database_import(monkeypatch):
+    import ast
+    module = load(monkeypatch)
+    tree = ast.parse(module.RAW_SNAPSHOT)
+    imported = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names]
+    assert 'sqlite3' not in imported
+    assert 'connect(' not in module.RAW_SNAPSHOT
+    compile(tree, '<raw-fixture-snapshot>', 'exec')

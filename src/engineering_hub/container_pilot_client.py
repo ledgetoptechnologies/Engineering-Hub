@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import ssl
+import sys
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -254,6 +255,66 @@ class ContainerPilotClient:
         if result.model_dump(include=set(ContainerPilotRequest.model_fields)) != expected.model_dump():
             raise HeldProtocolError(expected.command_id)
         return result
+
+    async def probe_connection(self, command_id: str) -> dict:
+        """Two GET-only transport/auth probes; no provenance or workflow claim.
+
+        Exchange/body phase has one <=10s deadline. Response cleanup has its
+        own cooperative <=min(1s, configured timeout) allowance per response.
+        The caller must select a fresh canonical UUID. Never submit/reconcile.
+        """
+        try:
+            if type(command_id) is not str or str(UUID(command_id)) != command_id:
+                raise ValueError()
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("invalid connection probe identity") from None
+        path = "/v1/container-pilot/commands/" + command_id
+        results = []
+        try:
+            async with asyncio.timeout(min(10.0, self.__timeout_seconds)):
+                for authenticated, status, code in (
+                        (False, 401, "unauthorized"), (True, 404, "command_not_found")):
+                    request = self.__client.build_request("GET", path)
+                    if not authenticated:
+                        request.headers.pop("authorization", None)
+                    response = await self.__client.send(request, stream=True)
+                    try:
+                        if response.status_code != status:
+                            raise ValueError()
+                        content = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(content) + len(chunk) > self.RESPONSE_BYTE_LIMIT:
+                                raise ValueError()
+                            content.extend(chunk)
+                        text = bytes(content).decode("utf-8")
+                        if self.__token in text:
+                            raise ValueError()
+                        body = json.loads(text, object_pairs_hook=_unique_object,
+                                          parse_constant=_reject_constant)
+                        if self.__token in json.dumps(body, ensure_ascii=False):
+                            raise ValueError()
+                        if body != {"error": {"code": code}}:
+                            raise ValueError()
+                        results.append({"method": "GET", "status": status,
+                                        "authorization_present": authenticated})
+                    finally:
+                        active_error = sys.exc_info()[1]
+                        try:
+                            async with asyncio.timeout(min(1.0, self.__timeout_seconds)):
+                                await response.aclose()
+                        except BaseException:
+                            # A cleanup failure must not replace cancellation
+                            # already requested by the caller/exchange timer.
+                            if isinstance(active_error, asyncio.CancelledError):
+                                raise active_error
+                            raise
+        except Exception:
+            raise ContainerPilotClientError("Executor connection check failed") from None
+        return {"schema": "engineering-hub.executor-connection-check.v1",
+                "state": "transport_auth_verified", "probes": results,
+                "api_get_count": 2, "command_posts": 0, "reconciliation_posts": 0,
+                "agent_token_reuse_checked": False, "executor_provenance_verified": False,
+                "idle_verified": False, "workflow_verified": False}
 
     async def submit_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
         return await self._command("POST", "/v1/container-pilot/commands", command, submit=True)
