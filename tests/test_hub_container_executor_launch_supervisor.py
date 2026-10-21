@@ -883,7 +883,9 @@ def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, 
 
 
 @pytest.mark.parametrize('terminate', [True, False])
-def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(root_journal, terminate):
+@pytest.mark.parametrize('accounting_lag', [0, 2])
+def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
+        root_journal, terminate, accounting_lag):
     authority, events = synthetic_launcher(root_journal)
     child = None
     try:
@@ -894,7 +896,10 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
         authority._consumer = launch._Process(child.pid)
         authority._launch_ms = 1000 if terminate else 100
         original = authority._engine.json
+        stop_sent = False
+        delayed_reads = 0
         def fake_sigterm(method, route, deadline, **kwargs):
+            nonlocal stop_sent, delayed_reads
             if method == 'POST' and route == '/containers/' + 'a' * 64 + '/kill?signal=SIGTERM':
                 with root_journal.transaction() as db:
                     assert db.execute('SELECT state FROM launch').fetchone() == ('term_reserved',)
@@ -902,8 +907,15 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
                 if terminate:
                     child.terminate()  # Only this exact disposable test-owned child.
                     authority._engine.running = False
+                stop_sent = True
                 return 204, None
             code, info = original(method, route, deadline, **kwargs)
+            if method == 'GET' and stop_sent and terminate:
+                if delayed_reads < accounting_lag:
+                    delayed_reads += 1
+                    info['State'].update(Running=True, Status='running', Pid=child.pid)
+                else:
+                    info['State'].update(Running=False, Status='exited', Pid=0)
             if method == 'GET' and authority._engine.running:
                 info['State']['Pid'] = child.pid
             return code, info
@@ -912,6 +924,7 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
         if terminate:
             authority.graceful_stop()
             child.wait(timeout=3)
+            assert delayed_reads == accounting_lag
             assert events[-1] == 'synthetic-owned-socket-cleanup'
             expected_state = 'stopped'
         else:
