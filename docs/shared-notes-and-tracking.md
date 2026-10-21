@@ -63,8 +63,10 @@ UTF-8 content, but browser gateways cap the entire JSON request at 64KiB, so
 browser edits must leave room for metadata and JSON escaping.
 
 Browser writes require the existing authenticated human session, exact Origin and
-CSRF protection. Agent identity is derived from authentication, not submitted
-author fields. Missing shared-store wiring must return unavailable, never fall
+CSRF protection. Agents may also use these HTTP routes on the internal agent
+listener with their existing bearer credentials; the browser listener rejects
+bearer credentials. Both interfaces derive authors from authentication, not
+submitted author fields. Missing shared-store wiring must return unavailable, never fall
 back to a new empty notes database. UI content must render as text or sanitized
 Markdown, never executable raw HTML. Notes never grant permissions or approve
 jobs. Dashboard source/API availability does not mean a deployed container has

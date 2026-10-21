@@ -33,7 +33,7 @@ def test_invalid_artifact_never_calls_docker(monkeypatch,image,commit):
         module.smoke(image,commit)
 
 
-@pytest.mark.parametrize('fail_probe',[False,True])
+@pytest.mark.parametrize('fail_probe',[False,True,'missing_note','wrong_version'])
 def test_owned_plan_uses_packaged_settings_only_and_cleans_up(monkeypatch,fail_probe):
     module = load(monkeypatch)
     calls, stopped, volumes = [], [], []
@@ -53,21 +53,34 @@ def test_owned_plan_uses_packaged_settings_only_and_cleans_up(monkeypatch,fail_p
                               'Privileged':False,'ReadonlyRootfs':True},
                 'Mounts':[{'Type':'volume','Name':volume,'Destination':'/var/lib/hub'}]})
         if args[1] == 'exec':
-            if fail_probe:
+            if fail_probe is True:
                 raise RuntimeError('Synthetic probe failure')
-            return json.dumps({'settings_profile':'passed','build_commit':COMMIT})
+            generation = sum(call[1] == 'exec' for call in calls)
+            report = {'settings_profile':'passed','build_commit':COMMIT,
+                      'preserved_note':'passed','notes_authenticated_agents':3,
+                      'note_version':1+3*generation}
+            if fail_probe == 'missing_note':
+                report.pop('preserved_note')
+            elif fail_probe == 'wrong_version':
+                report['note_version'] = 1
+            return json.dumps(report)
         return ''
     monkeypatch.setattr(module,'run',run)
     monkeypatch.setattr(module,'stop_owned',lambda name,owner: stopped.append((name,owner)))
     monkeypatch.setattr(module,'remove_owned_volume',lambda name,owner: volumes.append((name,owner)))
-    if fail_probe:
+    if fail_probe is True:
         with pytest.raises(RuntimeError,match='Synthetic probe failure'):
+            module.smoke(IMAGE,COMMIT)
+    elif fail_probe:
+        with pytest.raises((KeyError, AssertionError)):
             module.smoke(IMAGE,COMMIT)
     else:
         report = module.smoke(IMAGE,COMMIT)
         assert report['recreations'] == 2 and len(report['stages']) == 3
         assert report['network'] == 'none' and report['truenas'] == 'not_deployed'
         assert report['host_mounts'] is report['host_ports'] is False
+        assert [stage['note_version'] for stage in report['stages']] == [4,7,10]
+        assert all(stage['notes_authenticated_agents'] == 3 for stage in report['stages'])
     runs = [args for args in calls if args[1] == 'run']
     assert len(runs) == (2 if fail_probe else 4)
     for args in runs:

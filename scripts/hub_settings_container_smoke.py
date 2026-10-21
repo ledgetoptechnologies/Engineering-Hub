@@ -15,6 +15,7 @@ SEED = r'''
 import json, os
 from pathlib import Path
 from agent_message_bus.database import MessageRepository
+from agent_message_bus.knowledge import KnowledgeRepository, entry_dict
 from engineering_hub.repository import HubRepository
 assert os.getuid() == os.getgid() == 568
 root = Path('/var/lib/hub')
@@ -25,6 +26,9 @@ bus.mkdir()
 repo = MessageRepository(bus / 'messages.sqlite3')
 message = repo.insert(sender='hermes', recipient='codex', message_type='info',
                       body={'topic':'settings-smoke','fixture':'preserved'})
+note = KnowledgeRepository(bus / 'messages.sqlite3').put(
+    project='engineering-hub', path='notes/settings-smoke.md', title='Synthetic settings note',
+    content='settings-note: durable synthetic tracking only', author='hermes', expected_version=0)
 task = HubRepository(root / 'hub.sqlite3').create_task(
     'human:123', 'treedar', 'Synthetic settings persistence', 'settings-fixture')
 settings = {'schema_version':1,'base_url':'https://hub.ledgetoptechnologies.com',
@@ -33,7 +37,7 @@ settings = {'schema_version':1,'base_url':'https://hub.ledgetoptechnologies.com'
     'agent_allowed_hosts':['hub.ledgetoptechnologies.com','127.0.0.1:8770'],
     'agent_allowed_ips':['127.0.0.1']}
 (root / 'settings.json').write_text(json.dumps(settings))
-(root / '.settings-smoke.json').write_text(json.dumps({'message':message.id,'task':task}))
+(root / '.settings-smoke.json').write_text(json.dumps({'message':message.id,'task':task,'note':entry_dict(note)}))
 print(json.dumps({'seed':'passed'}))
 '''
 
@@ -80,10 +84,15 @@ async def main():
                     await asyncio.sleep(.1)
         for value in ({}, {'Authorization':'Bearer invalid'}):
             assert (await http.get(base+'/api/messages',headers=value)).status_code == 401
-        for path in ('/', '/index.html', '/assets/example.js', '/api/hub/v1/auth/login', '/api/hub/v1/overview'):
+        for path in ('/', '/index.html', '/assets/example.js', '/api/hub/v1/auth/login', '/api/hub/v1/overview',
+                     '/api/hub/v1/notes?project=engineering-hub',
+                     '/api/hub/v1/notes/document?project=engineering-hub&path=notes/settings-smoke.md'):
             for value in ({}, {'CF-Access-Jwt-Assertion':'forged'},
                           {'CF-Access-Authenticated-User-Email':'fixture@example.invalid'}):
                 assert (await http.get(browser+path,headers=value)).status_code == 401
+                assert (await http.post(browser+'/api/hub/v1/notes',headers=value,
+                    json={'project':'engineering-hub','path':'notes/forbidden.md','title':'Forbidden',
+                          'content':'Must never be saved','expected_version':0})).status_code == 401
         assert (await http.get(browser+'/mcp')).status_code == 403
         assert (await http.get(browser+'/',headers={'Authorization':'Bearer '+os.environ['CODEX_TOKEN']})).status_code == 403
         for agent in ('hermes','codex','claude'):
@@ -97,6 +106,36 @@ async def main():
                         await call(session,'hub_overview')
                         task = await call(session,'hub_task_get',{'task_id':saved['task']['id']})
                         assert task == saved['task'], 'Preserved Hub task changed'
+                        note = saved['note']
+                        note_key = {'project':note['project'],'path':note['path']}
+                        assert await call(session,'knowledge_get',note_key) == note, 'Preserved MCP note changed'
+                        metadata = {key:value for key,value in note.items() if key != 'content'}
+                        listed = await call(session,'knowledge_list',{'project':note['project'],'path_prefix':'notes'})
+                        assert listed == {'documents':[metadata]}
+                        searched = await call(session,'knowledge_search',{'project':note['project'],'query':'settings-note'})
+                        assert len(searched['results']) == 1
+                        assert all(searched['results'][0][key] == note[key]
+                                   for key in ('project','path','title','version','sha256'))
+                        response = await client.get(base+'/api/hub/v1/notes/document',params=note_key)
+                        assert response.status_code == 200 and response.json() == note
+                        write = {**note_key,'title':note['title'],'content':note['content']+'; checked by '+agent,
+                                 'expected_version':note['version']}
+                        conflict = await client.post(base+'/api/hub/v1/notes',
+                            json={**write,'expected_version':note['version']-1})
+                        assert conflict.status_code == 409
+                        assert conflict.json()['detail'] == {'code':'notes_version_conflict',
+                                                             'current_version':note['version']}
+                        assert await call(session,'knowledge_get',note_key) == note, 'Failed CAS changed note'
+                        response = await client.post(base+'/api/hub/v1/notes',json=write)
+                        assert response.status_code == 200
+                        updated = response.json()
+                        assert updated['version'] == note['version']+1 and updated['updated_by'] == agent
+                        assert updated['created_by'] == 'hermes' and updated['created_at'] == note['created_at']
+                        assert updated['content'] == write['content']
+                        assert await call(session,'knowledge_get',note_key) == updated
+                        response = await client.get(base+'/api/hub/v1/notes/document',params=note_key)
+                        assert response.status_code == 200 and response.json() == updated
+                        saved['note'] = updated
                         message = await session.call_tool('get_message',{'message_id':saved['message']})
                         if agent == 'codex':
                             assert not message.isError
@@ -105,6 +144,7 @@ async def main():
                             assert data['body'] == {'topic':'settings-smoke','fixture':'preserved'}
                         else:
                             assert message.isError, 'Foreign inbox was readable'
+    Path('/var/lib/hub/.settings-smoke.json').write_text(json.dumps(saved))
     listeners = {}
     for line in Path('/proc/net/tcp').read_text().splitlines()[1:]:
         fields = line.split()
@@ -118,6 +158,7 @@ async def main():
         assert not (fields[3] == '0A' and int(fields[1].split(':')[1],16) in (8765,8770,8771))
     print(json.dumps({'settings_profile':'passed','build_commit':commit,'authenticated_agents':3,
         'mcp_tools':34,'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
+        'preserved_note':'passed','notes_authenticated_agents':3,'note_version':saved['note']['version'],
         'agent_bind':'0.0.0.0:8770','browser_bind':'0.0.0.0:8771','alias':'none'}))
 
 asyncio.run(asyncio.wait_for(main(),50))
@@ -171,6 +212,8 @@ def smoke(image, commit):
             assert actual['Mounts'][0]['Name'] == volume and actual['Mounts'][0]['Destination'] == '/var/lib/hub'
             report = json.loads(run('docker','exec',name,'python','-c',PROBE,commit,timeout=60))
             assert report['settings_profile'] == 'passed' and report['build_commit'] == commit
+            assert report['preserved_note'] == 'passed' and report['notes_authenticated_agents'] == 3
+            assert report['note_version'] == 1 + 3 * (iteration + 1)
             reports.append(report)
             stop_owned(name,owner)
             names.remove(name)
