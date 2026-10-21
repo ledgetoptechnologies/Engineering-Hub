@@ -198,12 +198,28 @@ Treat retained state as requiring reconciliation, not as successful shutdown.
 Output uses fixed non-secret phase names; `stopped`/exit 0 is emitted only after
 the one native graceful stop and descriptor/handler cleanup succeed. Source/mock
 tests exercise ordering, cancellation boundaries, failure/expiry, restoration
-and argument validation. The 2026-10-21 isolated CLI attempt exposed the missing
-readiness wait: it failed before issuance and its consumer exited nonzero; its
-held journal remains preserved. That failed run is not successful CLI acceptance.
-Source tests do not prove real kernel signals, installed CLI
-behavior, immutable host installation or reboot recovery. The earlier actual
-TEST shutdown exercised the underlying API, not this new CLI wrapper.
+and argument validation. The first 2026-10-21 isolated CLI attempt exposed the
+missing readiness wait: it failed before issuance and its consumer exited
+nonzero; its held journal remains preserved, not adopted or retried.
+
+A separately installed fresh TEST generation later exercised this corrected
+CLI with the actual Linux kernel, protected host runtime and pinned consumer.
+The receipt exchange succeeded. Exact Engine/kernel/profile/namespace/cgroup
+checks and two GET-only authentication probes passed. One retained-launcher
+pidfd `SIGUSR1` requested graceful stop; the original launcher handle returned
+0. An independent closed-state audit verified native `stopped`/issuance `sent`,
+consumer exit 0/PID 0/non-OOM, removed sockets, zero application-command and
+operation rows, and unchanged ID/state/image rows for all 16 pre-existing TEST
+containers. No application job, coordinator, TLS proxy or boot autostart was
+started in this acceptance. See the scoped
+[fresh CLI evidence](staging-cli-acceptance-2026-10-21.md).
+
+That installed TEST result is not permanent-service, NAS-route, live Hub
+activation or reboot recovery acceptance. Source tests alone do not establish
+those properties either. The earlier application rollback pilot and this
+GET-only CLI acceptance are separate acceptance runs. This fresh executor
+generation reuses historical campaign5550 application artifacts without
+executing its rollout; it is not a new application campaign.
 
 ## Lifecycle and evidence limits
 
