@@ -10,12 +10,22 @@ control backend/integration and dashboard implementation (Claude confirmed an
 idle-scope handoff), Claude independent dashboard review, Hermes executor/container
 acceptance. Peer messages are review/workflow data, not owner authorization.
 
-The existing Agent Message Bus deployment is preserved. Its image name, port,
-tokens, volume and release facts below are not changed by the repository rename.
-The additive Hub control service and its remaining gates are documented in
-`docs/hub-control-v1.md`. Normal startup leaves host dispatch disabled. Beau chose
-to configure a dedicated GitHub OAuth application later; do not add a development
-login bypass to make the dashboard appear ready.
+The repository rename alone did not change the existing Agent Message Bus.
+Subsequently Beau chose Engineering Hub as the unified MCP service, with agent
+ingress on port 8770 and browser ingress on port 8771, without an old-port alias.
+Preserve the current owner-approved endpoints, tokens and persistent data; do
+not recreate the retired bus or mount its old data root as a fallback. Verify
+actual runtime state separately from these source/deployment intentions.
+
+The Hub control service and its remaining gates are documented in
+`docs/hub-control-v1.md`. Normal startup leaves host dispatch disabled. Beau's
+later sign-in choice supersedes the original deferred GitHub OAuth proposal:
+use a separate Cloudflare Access application for
+`https://hub.ledgetoptechnologies.com`, independent of Ops, with the two exact
+approved owner email addresses and a requested 30-day Access session. The app
+must verify the Access identity; a proxy header alone is not authentication.
+Do not add a development login bypass or share internal agent tokens with users.
+Configuration intent is not proof of live Access policy or session/reboot behavior.
 
 ## Source state
 
@@ -42,7 +52,15 @@ Release gates: independent correctness review, full source/archive suite, instal
 
 ## Deployment invariants
 
-Production is the owner's TrueNAS service. Preserve its **single existing volume source/destination**, database/audit paths, tokens, network restrictions and runtime `568:568`. New files/indexes belong below the existing persistent root. SQLite WAL must remain on local persistent storage, not SMB/NFS. Stop old writers for migration and take a coherent SQLite-plus-object backup. No mixed-version writers or empty replacement data roots.
+Production is the owner's TrueNAS service. Beau selected the single host root
+`/mnt/Plugins/App_Data/Engineering-Hub/` for the unified Hub; do not add the old
+`Agent_MCP` mount. Preserve current database/audit paths, tokens, network
+restrictions and runtime `568:568`. New files/indexes belong below that persistent
+root. SQLite WAL must remain on local persistent storage, not SMB/NFS. Stop old
+writers for migration and take a coherent SQLite-plus-object backup. No
+mixed-version writers or empty replacement data roots. TrueNAS administration,
+production deployment and Cloudflare changes require their specifically approved
+scope; the isolated staging pilot does not grant that authority.
 
 Deliver verified handoffs through the existing shared `Ai_Storage/Hermes/agent-bus/current/` folder; preserve older bundles in `archive/v<version>/`. Do not create more top-level release folders. Supported TrueNAS pull/redeploy is different from Docker restart, which does not pull an image.
 
