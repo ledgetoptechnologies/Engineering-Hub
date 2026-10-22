@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { audit, blocking } from "./audit";
+import { audit, blocking, type Finding } from "./audit";
 
 // Layout audit: every page and every dialog, at desktop and phone sizes, in demo mode (no API).
 // It fails on sideways scrolling, controls drawn outside the window, unlabeled controls and images without alt text,
@@ -16,7 +16,6 @@ for (const size of sizes) {
     const report: Record<string, Finding[]> = {};
     test.afterAll(async () => {
       await test.info().attach(`audit-${size.name}.json`, { body: JSON.stringify(report, null, 2), contentType: "application/json" });
-      if (process.env.AUDIT_OUT) (await import("node:fs")).writeFileSync(`${process.env.AUDIT_OUT}/audit-${size.name}.json`, JSON.stringify(report, null, 2));
     });
 
     for (const path of pages) test(`page ${path}`, async ({ page }) => {
@@ -25,7 +24,7 @@ for (const size of sizes) {
       await page.waitForTimeout(150);
       const findings = await audit(page, "page", size.width);
       report[`page ${path}`] = findings;
-      if (process.env.AUDIT_OUT) await page.screenshot({ path: `${process.env.AUDIT_OUT}/${size.name}${path.replace(/\//g, "_") || "_home"}.png`, fullPage: true });
+      await page.screenshot({ path: test.info().outputPath(`${size.name}${path.replace(/\//g, "_") || "_home"}.png`), fullPage: true });
       expect.soft(blocking(findings), JSON.stringify(blocking(findings), null, 1)).toEqual([]);
     });
 
@@ -41,7 +40,7 @@ for (const size of sizes) {
       for (const more of await page.locator("dialog[open] details:not([open]) > summary").all()) await more.click();
       const findings = await audit(page, "dialog", size.width);
       report[`dialog ${dialog.label}`] = findings;
-      if (process.env.AUDIT_OUT) await page.screenshot({ path: `${process.env.AUDIT_OUT}/${size.name}_dialog_${dialog.label.replace(/ /g, "-")}.png` });
+      await page.screenshot({ path: test.info().outputPath(`${size.name}_dialog_${dialog.label.replace(/ /g, "-")}.png`) });
       expect.soft(blocking(findings), JSON.stringify(blocking(findings), null, 1)).toEqual([]);
     });
   });
