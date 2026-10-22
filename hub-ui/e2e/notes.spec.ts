@@ -75,7 +75,7 @@ const panelOf = (page: Page) => page.getByRole("region", { name: "Shared notes" 
 test("notes render as inert text with metadata, counts and truncation", async ({ page }) => {
   const state = await fixture(page);
   state.truncated = true;
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await expect(panel.getByText("1 note in engineering-hub.", { exact: false })).toBeVisible();
   await expect(panel.getByText("Showing the first 50.", { exact: false })).toBeVisible();
@@ -91,7 +91,7 @@ test("notes render as inert text with metadata, counts and truncation", async ({
 
 test("create then edit; a concurrent save shows both versions and replaces only on explicit choice", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
@@ -135,7 +135,7 @@ test("create then edit; a concurrent save shows both versions and replaces only 
 test("unsaved edits are not dropped by opening another note or switching project", async ({ page }) => {
   const state = await fixture(page);
   state.notes.push({ project: "engineering-hub", path: "b.md", title: "Second note", content: "two", version: 1, updated_by: "codex" });
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await panel.getByRole("button", { name: "Edit" }).click();
@@ -158,7 +158,7 @@ test("unsaved edits are not dropped by opening another note or switching project
 
 test("a slow list for the previous project never replaces the current project's notes", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await expect(panel.getByText("1 note in engineering-hub.", { exact: false })).toBeVisible();
   state.slowProject = "engineering-hub";
@@ -176,7 +176,7 @@ test("a slow list for the previous project never replaces the current project's 
 test("an older server without notes says so instead of showing an empty list", async ({ page }) => {
   const state = await fixture(page);
   state.listStatus = 404;
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await expect(panel.getByText("This server does not have shared notes yet.", { exact: false })).toBeVisible();
   await expect(panel.getByText("No notes in", { exact: false })).toHaveCount(0);
@@ -184,7 +184,7 @@ test("an older server without notes says so instead of showing an empty list", a
 
 test("notes authentication loss removes the private workspace", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toBeVisible();
   state.listStatus = 401;
@@ -196,7 +196,7 @@ test("notes authentication loss removes the private workspace", async ({ page })
 test("a new-note path collision can never be applied to a different existing note", async ({ page }) => {
   const state = await fixture(page);
   state.notes.push({ project: "engineering-hub", path: "b.md", title: "Note B", content: "B unseen", version: 1, updated_by: "codex" });
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
@@ -231,7 +231,7 @@ test("a new-note path collision can never be applied to a different existing not
 
 test("Replace then save writes only the accepted path at the accepted version", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
@@ -250,7 +250,7 @@ test("notes over the gateway request budget are blocked locally and a 413 keeps 
   await page.route("**/api/hub/v1/notes", async route => route.request().method() === "POST"
     ? route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ detail: { code: "gateway_body_too_large" } }) })
     : route.fallback());
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
@@ -274,7 +274,7 @@ function bump(state: Awaited<ReturnType<typeof fixture>>, path: string, content:
 
 test("Refresh and re-opening the open note both re-read its current version", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
@@ -296,7 +296,7 @@ test("Refresh while editing keeps the draft and still blocks a silent overwrite"
   const state = await fixture(page);
   const dialogs: string[] = [];
   page.on("dialog", dialog => { dialogs.push(dialog.message()); void dialog.dismiss(); });
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await panel.getByRole("button", { name: "Edit" }).click();
@@ -315,7 +315,7 @@ test("Refresh while editing keeps the draft and still blocks a silent overwrite"
 test("a slow re-read of the previous note never replaces the newly opened note", async ({ page }) => {
   const state = await fixture(page);
   state.notes.push({ project: "engineering-hub", path: "b.md", title: "Second note", content: "B body", version: 1, updated_by: "codex" });
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await expect(panel.getByRole("article", { name: "Shared notes runbook" })).toBeVisible();
@@ -333,7 +333,7 @@ test("a slow re-read of the previous note never replaces the newly opened note",
 
 test("a failed re-read keeps the note but says it may be out of date", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
@@ -346,7 +346,7 @@ test("a failed re-read keeps the note but says it may be out of date", async ({ 
 
 test("a successful re-read clears only the out-of-date warning", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });

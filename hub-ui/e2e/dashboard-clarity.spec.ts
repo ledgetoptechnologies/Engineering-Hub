@@ -60,7 +60,7 @@ async function fixture(page: Page, answeredBy = human) {
 
 test("answered decisions are history, not a new approval request", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/inbox");
   const decisions = page.locator("#decisions");
   await expect(decisions.getByRole("heading", { name: "Nothing waiting on you." })).toBeVisible();
   const answers = decisions.getByLabel("Recent answers");
@@ -74,7 +74,7 @@ test("answered decisions are history, not a new approval request", async ({ page
 
 test("an answer by a different authorized person is not attributed to the viewer", async ({ page }) => {
   await fixture(page, "human:cf:" + "f".repeat(64));
-  await page.goto("/");
+  await page.goto("/#/inbox");
   const answers = page.locator("#decisions").getByLabel("Recent answers");
   await expect(answers.getByText("Answered by another authorized person", { exact: false })).toBeVisible();
   await expect(answers.getByText("by you", { exact: false })).toHaveCount(0);
@@ -82,7 +82,7 @@ test("an answer by a different authorized person is not attributed to the viewer
 
 test("unconfigured projects and runner read as not set up, not as faults", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/staging");
   const staging = page.locator("#staging");
   await expect(staging.getByText("Not set up yet", { exact: true })).toHaveCount(5);
   await expect(staging.getByText("Unknown", { exact: true })).toHaveCount(0);
@@ -93,7 +93,7 @@ test("unconfigured projects and runner read as not set up, not as faults", async
 
 test("work cards show who they wait on and audited age", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/work");
   const work = page.locator("#work");
   const card = work.locator("details", { hasText: "Review and merge claude/benchmark" });
   await expect(card.getByText("Waiting for an independent review. No reviewer assigned; any agent except Claude can review.", { exact: true })).toBeVisible();
@@ -107,7 +107,7 @@ test("work cards show who they wait on and audited age", async ({ page }) => {
 
 test("connected agents state whether an inbox subscription was observed without claiming readiness", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/#/agents");
   const agents = page.locator("#agents");
   await expect(agents.getByText("Inbox subscription observed: new messages can be pushed to this agent.", { exact: true })).toHaveCount(1);
   await expect(agents.getByText("No active inbox subscription observed.", { exact: false })).toHaveCount(2);

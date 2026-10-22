@@ -51,8 +51,10 @@ function readError(error: unknown): string {
 
 export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writable, viewerActor, onUnauthorized }: NotesPanelProps) {
   const detailRef = useRef<HTMLDivElement>(null);
-  const [project, setProject] = useState(DEFAULT_NOTES_PROJECT);
-  const [projectDraft, setProjectDraft] = useState(DEFAULT_NOTES_PROJECT);
+  // A project page opens on that project's notes; elsewhere the default.
+  const initialProject = selectedProject !== "all" && isNoteProject(selectedProject) ? selectedProject : DEFAULT_NOTES_PROJECT;
+  const [project, setProject] = useState(initialProject);
+  const [projectDraft, setProjectDraft] = useState(initialProject);
   const [searchDraft, setSearchDraft] = useState<Search>({ kind: "query", text: "" });
   const [search, setSearch] = useState<Search>({ kind: "query", text: "" });
   const [list, setList] = useState<NoteList | null>(null);

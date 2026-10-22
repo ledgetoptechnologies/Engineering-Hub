@@ -1,91 +1,31 @@
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
-import { WorkQueuePanel } from "./WorkQueuePanel";
 import { NotesPanel } from "./NotesPanel";
-import { answeredBy, relativeAge, waitingOn } from "./dashboardText";
+import type { Hub } from "./hub";
+import { href, useRoute, type Route } from "./router";
+import { Badge, Icon, Modal, PageHeader, pretty, type IconKind } from "./ui";
+import { HomePage } from "./pages/HomePage";
+import { InboxPage, ProjectPage, ProjectsPage, WorkPage } from "./pages/WorkPages";
+import { AgentsPage, StagingPage } from "./pages/SystemPages";
+import { openDecisions } from "./pages/decisions";
 import type {
-  AgentSummary,
   Decision,
   EventsStatus,
   Overview,
   ProjectId,
   PublicReachability,
   Session,
-  Task,
   TopicSnapshot,
 } from "./types";
 
-const names: Record<string, string> = {
-  codex: "Codex",
-  hermes: "Hermes",
-  claude: "Claude",
-};
 /** Two letters from an email's local part ("bkoltz@…" -> "BK"); "?" when unknown. */
 function initials(value: string | null | undefined): string {
   const letters = (value ?? "").split("@")[0].replace(/[^A-Za-z]/g, "");
   return letters ? letters.slice(0, 2).toUpperCase() : "?";
 }
-const pretty = (value: string) =>
-  value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
 
-function observationTime(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp) || timestamp > Date.now() + 30_000) return null;
-  return `${new Date(timestamp).toLocaleString()} (${relativeAge(value)})`;
-}
-
-function stateAge(task: Task): string {
-  const age = relativeAge(task.state_since);
-  return age ? `In this state since ${new Date(Date.parse(task.state_since!)).toLocaleString()} (${age})`
-    : "Time in this state not recorded";
-}
-
-function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
-  const connection = agent.connection;
-  const observed = observationTime(connection?.observed_at);
-  const observedAt = Date.parse(connection?.observed_at ?? "");
-  const deadline = connection?.valid_until ? Date.parse(connection.valid_until) : NaN;
-  const boundedDeadline = Number.isFinite(deadline) && Number.isFinite(observedAt) &&
-    deadline > observedAt && deadline <= observedAt + 30_000;
-  const fresh = boundedDeadline && deadline > Date.now();
-  const expired = observed && boundedDeadline && !fresh;
-  const countsValid = connection && Number.isInteger(connection.active_streams) &&
-    connection.active_streams! >= 0 && Number.isInteger(connection.inbox_subscriptions) &&
-    connection.inbox_subscriptions! >= 0;
-  const knownSource = connection?.source === "embedded_bus" && connection.scope === "this_server_process";
-  const connected = !stale && fresh && observed && countsValid && knownSource && connection?.state === "connected" &&
-    connection.active_streams! > 0;
-  const notObserved = !stale && fresh && observed && countsValid && knownSource && connection?.state === "not_observed" &&
-    connection.active_streams === 0;
-  return (
-    <div className="hub-connection-row">
-      <strong>{names[agent.id] ?? "Unknown agent"}</strong>
-      <span>{stale ? "Hub connection snapshot unverified" : !connection ? "Hub connection unknown" : expired ? "Hub connection snapshot expired" : connected ? "Connected to Hub" :
-        notObserved ? "No active push stream observed" : "Hub connection unavailable"}</span>
-      {!stale && fresh && observed && countsValid && knownSource && connection?.state !== "unavailable" && (
-        <small>{connection!.active_streams} active stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)</small>
-      )}
-      {connected && (
-        <small>{connection!.inbox_subscriptions! > 0 ? "Inbox subscription observed: new messages can be pushed to this agent."
-          : "No active inbox subscription observed. Delivery may still happen another way; this alone does not show the agent is ready."}</small>
-      )}
-      {observed && <small>Snapshot observed: {observed}</small>}
-      {!stale && fresh && observed && knownSource && connection?.state !== "unavailable" && observationTime(connection?.last_stream_write_at) && (
-        <small>Last stream write: {observationTime(connection?.last_stream_write_at)}</small>
-      )}
-    </div>
-  );
-}
 const topicDenied = (error: unknown) =>
   error instanceof HubApiError && error.status === 403 &&
   ["topic_read_forbidden", "ingress_forbidden"].includes(error.code);
@@ -106,107 +46,6 @@ const errorText = (error: unknown) =>
             : "The request could not be completed. Your changes were not confirmed."
     : "The connection could not be verified. No result is being assumed.";
 
-function Icon({
-  kind,
-}: {
-  kind: "grid" | "folder" | "agents" | "arrow" | "plus" | "refresh";
-}) {
-  const paths = {
-    grid: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
-    folder: "M3 7V4h6l3 3h9v13H3z",
-    agents:
-      "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-3a5 5 0 0 1 10 0v3 M17 5a3 3 0 0 1 0 6 M16 15a5 5 0 0 1 6 5",
-    arrow: "M5 12h14 M13 6l6 6-6 6",
-    plus: "M12 4v16 M4 12h16",
-    refresh: "M20 9a8 8 0 1 0 0 6 M20 3v6h-6",
-  };
-  return (
-    <svg
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.6"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d={paths[kind]} />
-    </svg>
-  );
-}
-
-function Badge({
-  children,
-  tone = "neutral",
-}: {
-  children: ReactNode;
-  tone?: string;
-}) {
-  return (
-    <span className={`badge ${tone}`}>
-      <span className="dot" />
-      {children}
-    </span>
-  );
-}
-function PanelTitle({
-  number,
-  title,
-  count,
-  children,
-}: {
-  number: string;
-  title: string;
-  count?: number;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="panel-title">
-      <span className="panel-number">{number}</span>
-      <h2>{title}</h2>
-      {count !== undefined && <span className="count">{count}</span>}
-      <span className="panel-action">{children}</span>
-    </div>
-  );
-}
-function Modal({
-  title,
-  onClose,
-  children,
-}: {
-  title: string;
-  onClose: () => void;
-  children: ReactNode;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const headingId = useId();
-  useEffect(() => {
-    ref.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      aria-labelledby={headingId}
-      onClose={onClose}
-      onCancel={onClose}
-    >
-      <div className="modal-head">
-        <h2 id={headingId}>{title}</h2>
-        <button
-          className="icon-button"
-          aria-label="Close dialog"
-          onClick={() => ref.current?.close()}
-        >
-          ×
-        </button>
-      </div>
-      {children}
-    </dialog>
-  );
-}
-
 export function HubApp() {
   const demo = new URLSearchParams(location.search).get("demo") === "1";
   const client = useMemo(
@@ -223,7 +62,6 @@ export function HubApp() {
   const [events, setEvents] = useState<EventsStatus | null>(null);
   const [topic, setTopic] = useState("auto-wake-v1-test");
   const [topicDraft, setTopicDraft] = useState(topic);
-  const [project, setProject] = useState<string>("all");
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [notice, setNotice] = useState("");
@@ -268,7 +106,6 @@ export function HubApp() {
     setPauseChoice(null);
     setDecisionChoices({});
     setProtectedChoice(null);
-    setProject("all");
     // Clear the editable draft without changing the applied topic: changing it
     // would trigger another refresh and could immediately undo fail-closed UI.
     setTopicDraft("");
@@ -558,24 +395,6 @@ export function HubApp() {
         : null;
     });
   }, [stale, data]);
-  const openDecisions =
-    data?.decisions.filter(
-      (item) =>
-        item.status === "open" &&
-        (project === "all" || item.project === project),
-    ) ?? [];
-  // Answered decisions are history, not waiting work. Shown separately so an
-  // answer's limits stay visible without becoming a new approval request.
-  const recentAnswers = (data?.decisions.filter(
-    (item) => item.status === "answered" && (project === "all" || item.project === project),
-  ) ?? []).sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 3);
-  const tasks =
-    data?.tasks.filter(
-      (item) => project === "all" || item.project === project,
-    ) ?? [];
-  const projects =
-    data?.projects.filter((item) => project === "all" || item.id === project) ??
-    [];
   const projectName = (id: string) =>
     data?.projects.find((item) => item.id === id)?.name ?? pretty(id);
   const peerState = (peer: PublicReachability) =>
@@ -585,7 +404,7 @@ export function HubApp() {
       ? "unknown_stale"
       : peer.status;
 
-  function checkTopic(event: React.FormEvent) {
+  function checkTopic(event: FormEvent) {
     event.preventDefault();
     if (topicDraft !== topic) {
       topicReads.current++;
@@ -600,7 +419,7 @@ export function HubApp() {
     }
   }
 
-  async function saveTask(event: React.FormEvent) {
+  async function saveTask(event: FormEvent) {
     event.preventDefault();
     const payload = JSON.stringify([taskProject, taskTitle.trim()]);
     if (!taskRequest.current || taskRequest.current.payload !== payload)
@@ -622,7 +441,7 @@ export function HubApp() {
     }
   }
   async function recordDecision(
-    event: React.FormEvent<HTMLFormElement>,
+    event: FormEvent<HTMLFormElement>,
     decision: Decision,
   ) {
     event.preventDefault();
@@ -663,8 +482,54 @@ export function HubApp() {
     );
   }
 
+  const route = useRoute();
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => setMenuOpen(false), [route]);
+  const hub: Hub | null = data ? {
+    demo, session, data, stale, loading, writable, connection, projectName, decisionChoices,
+    chooseAnswer: (decision: Decision, answer: string) =>
+      setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
+    recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
+    requestPause: (paused: boolean) => setPauseChoice(paused),
+    clearPrivateWorkspace, peers, topicDraft, setTopicDraft, checkTopic, topicError, topicStale, peerState,
+  } : null;
+  const waitingCount = hub ? openDecisions(hub).length : 0;
+  const activeWork = data ? data.tasks.filter((task) => task.status !== "verified").length : 0;
+  const nav: { route: Route; label: string; icon: IconKind; count?: number; attention?: boolean }[] = [
+    { route: { page: "home" }, label: "Home", icon: "grid" },
+    { route: { page: "inbox" }, label: "Needs you", icon: "inbox", count: data ? waitingCount : undefined, attention: waitingCount > 0 },
+    { route: { page: "work" }, label: "Work", icon: "work", count: data ? activeWork : undefined },
+    { route: { page: "projects" }, label: "Projects", icon: "folder" },
+    { route: { page: "notes" }, label: "Notes", icon: "notes" },
+    { route: { page: "agents" }, label: "Agents", icon: "agents" },
+    { route: { page: "staging" }, label: "Staging", icon: "staging" },
+  ];
+  const isCurrent = (target: Route) => target.page === route.page
+    || (target.page === "projects" && route.page === "project");
+  const pageTitle = route.page === "project"
+    ? projectName(route.id)
+    : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
+  const actions = (
+    <>
+      <button className="secondary" onClick={() => void refresh()} disabled={loading} aria-label="Refresh workspace">
+        <Icon kind="refresh" />
+        <span>{loading ? "Refreshing" : "Refresh"}</span>
+      </button>
+      <button className="primary" disabled={!writable} onClick={() => setNewTask(true)}>
+        <Icon kind="plus" />
+        New task
+      </button>
+    </>
+  );
+  const notesProps = {
+    mode: (demo ? "demo" : "live") as "demo" | "live",
+    knownProjects: data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? [],
+    csrf: session?.csrf_token ?? null, writable: !!session?.authenticated,
+    viewerActor: session?.actor ?? null, onUnauthorized: clearPrivateWorkspace,
+  };
+
   return (
-    <div className="shell">
+    <div className={`shell ${menuOpen ? "menu-open" : ""}`}>
       <aside className="sidebar">
         <a className="brand" href={demo ? "/?demo=1" : "/"}>
           <span className="brand-mark">H</span>
@@ -674,79 +539,54 @@ export function HubApp() {
             <strong>Hub</strong>
           </span>
         </a>
-        <div className="workspace-label">
-          WORKSPACE <span>PRIVATE</span>
+        <button className="menu-toggle" aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}>
+          <Icon kind="menu" />
+        </button>
+        <div className="sidebar-scroll">
+          <div className="workspace-label">
+            WORKSPACE <span>PRIVATE</span>
+          </div>
+          <nav aria-label="Workspace navigation">
+            {nav.map((item) => (
+              <a key={item.label} className={isCurrent(item.route) ? "nav-item selected" : "nav-item"}
+                href={href(item.route)} aria-current={isCurrent(item.route) ? "page" : undefined}>
+                <Icon kind={item.icon} /> {item.label}
+                {item.count !== undefined && item.count > 0 && (
+                  <span className={`nav-count ${item.attention ? "attention" : ""}`}>{item.count}</span>
+                )}
+              </a>
+            ))}
+          </nav>
+          <div className="sidebar-section">
+            PROJECTS <span>{data?.projects.length ?? "—"}</span>
+          </div>
+          <nav aria-label="Projects" className="project-nav">
+            {data?.projects.map((item) => (
+              <a key={item.id} href={`#/projects/${item.id}`}
+                className={route.page === "project" && route.id === item.id ? "project-link current" : "project-link"}>
+                <span className="project-square" />
+                {item.name}
+              </a>
+            )) ?? <span className="sidebar-help">Sign in to load projects.</span>}
+          </nav>
         </div>
-        <nav aria-label="Workspace navigation">
-          <button
-            className={project === "all" ? "nav-item selected" : "nav-item"}
-            onClick={() => setProject("all")}
-          >
-            <Icon kind="grid" /> Overview{" "}
-            <span className="nav-arrow" aria-hidden="true">
-              ↗
-            </span>
-          </button>
-          <a className="nav-item" href="#decisions">
-            <Icon kind="folder" /> Needs Beau
-          </a>
-          <a className="nav-item" href="#work">
-            <Icon kind="folder" /> Work in motion
-          </a>
-          <a className="nav-item" href="#notes">
-            <Icon kind="folder" /> Shared notes
-          </a>
-          <a className="nav-item" href="#agents">
-            <Icon kind="agents" /> Agents
-          </a>
-        </nav>
-        <div className="sidebar-section">
-          PROJECTS <span>{data?.projects.length ?? "—"}</span>
-        </div>
-        <nav aria-label="Project filters" className="project-nav">
-          {data?.projects.map((item) => (
-            <button
-              key={item.id}
-              className={
-                project === item.id ? "project-link current" : "project-link"
-              }
-              onClick={() => setProject(item.id)}
-            >
-              <span className="project-square" />
-              {item.name}
-            </button>
-          )) ?? <span className="sidebar-help">Sign in to load projects.</span>}
-        </nav>
         <div className="sidebar-bottom">
           <div className="environment-note">
             <span className="dot" /> Staging, not production
             <p>Processing workloads stay separate.</p>
           </div>
-          <div
-            className="profile"
-            title={
-              session?.authenticated
-                ? session.email ?? `${session.actor ?? "Authorized operator"}`
-                : "Sign-in required"
-            }
-          >
+          <div className="profile" title={session?.authenticated
+            ? session.email ?? `${session.actor ?? "Authorized operator"}` : "Sign-in required"}>
             <span className="avatar" aria-hidden="true">
               {demo ? "D" : session?.authenticated ? initials(session.email ?? session.actor) : "—"}
             </span>
             <div>
-              <strong>
-                {demo
-                  ? "Demo workspace"
-                  : session?.authenticated
-                    ? session.email ?? session.actor
-                    : "Private workspace"}
-              </strong>
+              <strong>{demo ? "Demo workspace" : session?.authenticated ? session.email ?? session.actor : "Private workspace"}</strong>
               <small>
-                {demo
-                  ? "Sample data only"
-                  : session?.authenticated
-                    ? session.auth_provider === "cloudflare_access" ? "Cloudflare Access" : `GitHub ID ${session.github_id ?? "unknown"}`
-                    : "Sign-in required"}
+                {demo ? "Sample data only" : session?.authenticated
+                  ? session.auth_provider === "cloudflare_access" ? "Cloudflare Access" : `GitHub ID ${session.github_id ?? "unknown"}`
+                  : "Sign-in required"}
               </small>
             </div>
           </div>
@@ -755,30 +595,18 @@ export function HubApp() {
       <main className="main">
         <header className="topbar">
           <div className="breadcrumb">
-            Workspace <span>/</span> Overview
+            Workspace <span>/</span> {data ? pageTitle : "Overview"}
           </div>
           <div className="topbar-right">
-            <span className="date">
-              {new Intl.DateTimeFormat("en-US", {
-                month: "short",
-                day: "numeric",
-                year: "numeric",
-                timeZone: "America/Chicago",
-              }).format(new Date())}
+            <span className={`feed-pill ${stale && !demo ? "stale" : connection === "live" ? "live" : ""}`}>
+              {demo ? "Sample data" : stale ? "Snapshot unverified" : connection === "live" ? "Event feed connected" : "Manual refresh"}
             </span>
-            <Badge tone={demo ? "amber" : "forest"}>
-              {demo ? "DEMO" : "PRIVATE"}
-            </Badge>
+            <span className="date">
+              {new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/Chicago" }).format(new Date())}
+            </span>
+            <Badge tone={demo ? "amber" : "forest"}>{demo ? "DEMO" : "PRIVATE"}</Badge>
             {session?.authenticated && !demo && (
-              <button
-                className="text-button"
-                onClick={() =>
-                  void mutate(
-                    () => client.logout(session.csrf_token!),
-                    "Signed out.",
-                  )
-                }
-              >
+              <button className="text-button" onClick={() => void mutate(() => client.logout(session.csrf_token!), "Signed out.")}>
                 Sign out
               </button>
             )}
@@ -787,574 +615,77 @@ export function HubApp() {
         {demo && (
           <div className="demo-banner">
             <span>
-              <strong>Demo workspace.</strong> Sample records and local-only
-              actions. Not your live infrastructure.
+              <strong>Demo workspace.</strong> Sample records and local-only actions. Not your live infrastructure.
             </span>
-            <a href="/">
-              Open live view <span>↗</span>
-            </a>
+            <a href="/">Open live view <span>↗</span></a>
           </div>
         )}
-        <section className="page-heading">
-          <div>
-            <p className="eyebrow">DEVELOPMENT / STAGING</p>
-            <h1>
-              Engineering, in view<span>.</span>
-            </h1>
-            <p className="subtitle">
-              Your projects, your agents, and a clear next step.
-            </p>
-          </div>
-          <div className="heading-actions">
-            <button
-              className="secondary"
-              onClick={() => void refresh()}
-              disabled={loading}
-              aria-label="Refresh workspace"
-            >
-              <Icon kind="refresh" />
-              <span>{loading ? "Refreshing" : "Refresh"}</span>
-            </button>
-            <button
-              className="primary"
-              disabled={!writable}
-              onClick={() => setNewTask(true)}
-            >
-              <Icon kind="plus" />
-              New task
-            </button>
-          </div>
-        </section>
         {notice && (
-          <div
-            role={noticeError ? "alert" : "status"}
-            className={`notice ${noticeError ? "error" : "success"}`}
-          >
+          <div role={noticeError ? "alert" : "status"} className={`notice ${noticeError ? "error" : "success"}`}>
             {notice}
           </div>
         )}
-        {!data ? (
-          <section className="login-panel">
-            <span className="login-symbol">H</span>
-            <p className="eyebrow">YOUR PRIVATE CONTROL PLANE</p>
-            <h2>
-              {loading
-                ? "Opening your workspace…"
-                : "Sign in to Engineering Hub."}
-            </h2>
-            <p>
-              Use your authorized account to see assigned work and record
-              decisions. Agent credentials never belong in this browser.
-            </p>
-            {!loading && (
+        {!hub ? (
+          <>
+            <PageHeader eyebrow="DEVELOPMENT / STAGING" title="Engineering, in view"
+              subtitle="Your projects, your agents, and a clear next step.">{actions}</PageHeader>
+            <section className="login-panel">
+              <span className="login-symbol">H</span>
+              <p className="eyebrow">YOUR PRIVATE CONTROL PLANE</p>
+              <h2>{loading ? "Opening your workspace…" : "Sign in to Engineering Hub."}</h2>
+              <p>
+                Use your authorized account to see assigned work and record decisions. Agent credentials never
+                belong in this browser.
+              </p>
+              {!loading && (
+                <>
+                  <a className="primary" href="/api/hub/v1/auth/login">Sign in securely <Icon kind="arrow" /></a>
+                  <p className="small-text">
+                    {session?.auth_provider === "cloudflare_access"
+                      ? "Cloudflare Access protects this workspace. If you signed out, continue to open a new Hub session."
+                      : "Sign-in is available only after the approved identity provider is configured. Agent tokens cannot be used here."}
+                  </p>
+                  <a className="text-link" href="/?demo=1">Explore a clearly labelled demo instead →</a>
+                </>
+              )}
+            </section>
+          </>
+        ) : (
+          <div className="page" key={route.page === "project" ? `project-${route.id}` : route.page}>
+            {route.page === "home" && <HomePage hub={hub} actions={actions} />}
+            {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
+            {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
+            {route.page === "projects" && <ProjectsPage hub={hub} actions={actions} />}
+            {route.page === "project" && <ProjectPage hub={hub} id={route.id} actions={actions} notesProps={notesProps} />}
+            {route.page === "notes" && (
               <>
-                <a className="primary" href="/api/hub/v1/auth/login">
-                  Sign in securely <Icon kind="arrow" />
-                </a>
-                <p className="small-text">
-                  {session?.auth_provider === "cloudflare_access"
-                    ? "Cloudflare Access protects this workspace. If you signed out, continue to open a new Hub session."
-                    : "Sign-in is available only after the approved identity provider is configured. Agent tokens cannot be used here."}
-                </p>
-                <a className="text-link" href="/?demo=1">
-                  Explore a clearly labelled demo instead →
-                </a>
+                <PageHeader eyebrow="NOTES" title="Shared notes"
+                  subtitle="Durable notes shared with the agents. Context only, never approvals.">{actions}</PageHeader>
+                <NotesPanel {...notesProps} selectedProject="all" />
               </>
             )}
-          </section>
-        ) : (
-          <>
-            <div className="summary-strip">
-              <div>
-                <span className="stat-label">NEEDS YOUR INPUT</span>
-                <strong>
-                  {openDecisions.length}
-                  <span className="stat-note">{openDecisions.length === 1 ? "decision" : "decisions"}</span>
-                </strong>
-              </div>
-              <div>
-                <span className="stat-label">WORK IN MOTION</span>
-                <strong>
-                  {tasks.length}
-                  <span className="stat-note">{tasks.length === 1 ? "task" : "tasks"}</span>
-                </strong>
-              </div>
-              <div>
-                <span className="stat-label">STAGING TARGETS SET UP</span>
-                <strong>
-                  {projects.filter((item) => item.executor_enabled).length}
-                  <span className="stat-note">of {projects.length} projects</span>
-                </strong>
-              </div>
-              <div className="feed-summary">
-                <Badge
-                  tone={
-                    stale
-                      ? "amber"
-                      : connection === "live"
-                        ? "forest"
-                        : "neutral"
-                  }
-                >
-                  {demo
-                    ? "Sample data"
-                    : stale
-                      ? "Snapshot unverified"
-                      : connection === "live"
-                        ? "Event feed connected"
-                        : "Manual refresh"}
-                </Badge>
-                <p>
-                  {demo
-                    ? "No network writes"
-                    : stale
-                      ? "Refresh before making decisions"
-                      : "No scheduled status polling"}
-                </p>
-              </div>
-            </div>
-            <div className="dashboard-grid">
-              <section className="panel decisions" id="decisions">
-                <PanelTitle
-                  number="01"
-                  title="Needs Beau"
-                  count={openDecisions.length}
-                />
-                <p className="panel-description">
-                  The questions that need a human, kept in one place.
-                </p>
-                {openDecisions.length === 0 ? (
-                  <div className="empty-state">
-                    <span>✓</span>
-                    <h3>Nothing waiting on you.</h3>
-                    <p>New decision requests will appear here.</p>
-                  </div>
-                ) : (
-                  openDecisions.map((decision) => (
-                    <form
-                      className="decision"
-                      key={decision.id}
-                      onSubmit={(event) => void recordDecision(event, decision)}
-                    >
-                      <div className="item-overline">
-                        {projectName(decision.project)}
-                        <span>REV {decision.revision}</span>
-                      </div>
-                      <h3>{decision.title}</h3>
-                      <fieldset disabled={!writable}>
-                        <legend className="sr-only">
-                          Answer for {decision.title}
-                        </legend>
-                        {decision.options.map((option) => (
-                          <label className="radio-option" key={option}>
-                            <input
-                              type="radio"
-                              name="answer"
-                              value={option}
-                              required
-                              checked={
-                                decisionChoices[decision.id]?.revision ===
-                                  decision.revision &&
-                                decisionChoices[decision.id]?.answer === option
-                              }
-                              onChange={() =>
-                                setDecisionChoices((previous) => ({
-                                  ...previous,
-                                  [decision.id]: {
-                                    revision: decision.revision,
-                                    answer: option,
-                                  },
-                                }))
-                              }
-                            />
-                            <span>{option}</span>
-                          </label>
-                        ))}
-                        <div className="decision-footer">
-                          <span>
-                            {decision.protected
-                              ? "Protected request · not an execution grant"
-                              : "Records a decision. Does not deploy."}
-                          </span>
-                          <button
-                            type="submit"
-                            className="dark-button"
-                            disabled={
-                              !writable ||
-                              decisionChoices[decision.id]?.revision !==
-                                decision.revision
-                            }
-                          >
-                            Record decision <Icon kind="arrow" />
-                          </button>
-                        </div>
-                      </fieldset>
-                    </form>
-                  ))
-                )}
-                {recentAnswers.length > 0 && (
-                  <div className="recent-answers" aria-label="Recent answers">
-                    <h3>Recent answers</h3>
-                    {recentAnswers.map((decision) => (
-                      <div className="recent-answer" key={decision.id}>
-                        <strong>{decision.title}</strong>
-                        <small>
-                          {projectName(decision.project)} · Answered{" "}
-                          {answeredBy(decision.answered_by, session?.actor)}{" "}
-                          {observationTime(decision.updated_at) ?? ""}
-                        </small>
-                        <p>Answer: {decision.answer}</p>
-                        {decision.protected && (
-                          <small>
-                            This answer did not by itself authorize running
-                            anything. Run approval and run status are tracked
-                            separately.
-                          </small>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <p className="panel-footnote">
-                  Only your signed-in session can answer. Agents can request,
-                  not approve.
-                </p>
-              </section>
-              <section className="panel" id="staging">
-                <PanelTitle number="02" title="Staging overview">
-                  <Badge tone="neutral">SOFTWARE ONLY</Badge>
-                </PanelTitle>
-                <p className="panel-description">
-                  Independent projects. Explicit activation. No production
-                  shortcuts.
-                </p>
-                <div className="project-list">
-                  {projects.map((item) => (
-                    <div className="project-row" key={item.id}>
-                      <span className="project-icon">
-                        <Icon kind="folder" />
-                      </span>
-                      <div>
-                        <strong>{item.name}</strong>
-                        <small>
-                          {item.executor_enabled
-                            ? "Staging target enabled"
-                            : "No staging target yet. Setting one up needs an inventory of the target and your acceptance."}
-                        </small>
-                      </div>
-                      <Badge
-                        tone={item.health === "healthy" ? "forest" : "neutral"}
-                      >
-                        {!item.executor_enabled && item.health === "unknown"
-                          ? "Not set up yet"
-                          : item.health === "unknown"
-                            ? "Health unknown"
-                            : pretty(item.health)}
-                      </Badge>
-                    </div>
-                  ))}
-                </div>
-                <div className="staging-control">
-                  <div>
-                    <span
-                      className={`status-orb ${data.paused ? "paused" : ""}`}
-                    />
-                    <span>
-                      <strong>
-                        {data.paused
-                          ? "Emergency pause on: new staging work is blocked"
-                          : "Emergency pause off"}
-                      </strong>
-                      <small>
-                        {!data.autonomy.configured
-                          ? "Automatic runner not set up. Agents only act on the tasks shown here."
-                          : `Automatic runner: ${pretty(data.autonomy.state)}`}
-                      </small>
-                    </span>
-                  </div>
-                  <button
-                    className="secondary small"
-                    disabled={!writable}
-                    onClick={() => setPauseChoice(!data.paused)}
-                  >
-                    {data.paused ? "Resume" : "Pause new work"}
-                  </button>
-                </div>
-                {data.runs.length > 0 && (
-                  <div className="run-list">
-                    <h3>Execution evidence</h3>
-                    {data.runs.map((run) => (
-                      <details key={run.id}>
-                        <summary>
-                          {projectName(run.project)}{" "}
-                          <Badge
-                            tone={
-                              run.status === "held" || run.status === "failed"
-                                ? "amber"
-                                : "neutral"
-                            }
-                          >
-                            {pretty(run.status)}
-                          </Badge>
-                        </summary>
-                        <p className="small-text">Target: {run.target}</p>
-                        {run.status === "held" && run.events.at(-1)?.reason && (
-                          <p className="small-text">Needs attention: {pretty(run.events.at(-1)!.reason!)}</p>
-                        )}
-                        <code>{run.artifact_digest}</code>
-                        <p className="small-text">
-                          Fence {run.fencing_generation} · {run.events.length}{" "}
-                          recorded events
-                        </p>
-                      </details>
-                    ))}
-                  </div>
-                )}
-                <p className="panel-footnote">
-                  Production, GitHub merge and real processing capabilities are
-                  not enabled.
-                </p>
-              </section>
-              <WorkQueuePanel mode={demo ? "demo" : "live"} refreshToken={data}
-                stale={stale} onUnauthorized={clearPrivateWorkspace} />
-              <section className="panel work" id="work">
-                <PanelTitle
-                  number="03"
-                  title="Work in motion"
-                  count={tasks.length}
-                />
-                <p className="panel-description">
-                  An owner, an exact candidate, and a separate reviewer.
-                </p>
-                <div className="task-table">
-                  <div className="table-header">
-                    <span>TASK / PROJECT</span>
-                    <span>OWNER</span>
-                    <span>STATE</span>
-                  </div>
-                  {tasks.length === 0 && (
-                    <div className="empty-inline">
-                      No assigned work for this project.
-                    </div>
-                  )}
-                  {tasks.map((task) => (
-                    <details className="task-row" key={task.id}>
-                      <summary>
-                        <span>
-                          <strong>{task.title}</strong>
-                          <small>{projectName(task.project)}</small>
-                          {task.scope === "staging" && task.proposed_by && (
-                            <small>Staging proposal · {names[task.proposed_by]}</small>
-                          )}
-                          <small className="task-waiting">{waitingOn(task, (id) => names[id] ?? id)}</small>
-                          <small title={task.state_since ?? undefined}>{stateAge(task)}</small>
-                        </span>
-                        <span className="owner">
-                          <span className="mini-avatar">
-                            {task.owner?.charAt(0).toUpperCase() ?? "–"}
-                          </span>
-                          {task.owner ? names[task.owner] : "Unclaimed"}
-                        </span>
-                        <Badge
-                          tone={
-                            task.status === "verified"
-                              ? "forest"
-                              : task.status === "in_review"
-                                ? "amber"
-                                : "neutral"
-                          }
-                        >
-                          {task.status === "verified"
-                            ? "Review passed"
-                            : pretty(task.status)}
-                        </Badge>
-                      </summary>
-                      <div className="task-detail">
-                        <p>
-                          Candidate:{" "}
-                          <code>
-                            {task.candidate_commit ?? "Not submitted"}
-                          </code>
-                        </p>
-                        <p>
-                          Independent reviewer:{" "}
-                          <strong>
-                            {task.review ? names[task.review.actor]
-                              : task.status === "in_review" ? "None assigned yet" : "Not requested yet"}
-                          </strong>{" "}
-                          · Repairs used: {task.repair_count}/3
-                        </p>
-                        <p>
-                          Review is bound to the exact commit, not permission to
-                          deploy to production.
-                        </p>
-                      </div>
-                    </details>
-                  ))}
-                </div>
-              </section>
-              <section className="panel agents-panel" id="agents">
-                <PanelTitle number="04" title="Agents" />
-                <p className="panel-description">
-                  Whether each agent's app is connected to the Hub, and whether it can be
-                  reached on a specific conversation topic. These are checked separately.
-                </p>
-                <div className="agents-columns">
-                <div>
-                <h3 className="agent-section-title">Connected to the Hub</h3>
-                <div className="hub-connection-list">
-                  {data.agents.map((agent) => (
-                    <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />
-                  ))}
-                </div>
-                <p className="panel-footnote">
-                  Connected means the agent's app is linked to the Hub. It doesn't prove the agent
-                  is working on anything right now, and not connected doesn't mean it's offline.
-                </p>
-                </div>
-                <div>
-                <h3 className="agent-section-title">Topic readiness</h3>
-                <form className="topic-form" onSubmit={checkTopic}>
-                  <label htmlFor="topic-root">TOPIC ROOT</label>
-                  <div>
-                    <input
-                      id="topic-root"
-                      value={topicDraft}
-                      onChange={(event) => setTopicDraft(event.target.value)}
-                      pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
-                      maxLength={128}
-                      required
-                      spellCheck={false}
-                    />
-                    <button className="secondary small" disabled={loading}>
-                      Check
-                    </button>
-                  </div>
-                </form>
-                {topicError && (
-                  <p role="alert" className="notice error">
-                    {topicError}
-                  </p>
-                )}
-                {peers?.tracking === "not_configured" && !topicError && (
-                  <p className="topic-tracking">{!demo && (stale || topicStale)
-                    ? "Topic readiness: Snapshot unverified" : "Topic readiness: Not tracked yet"}</p>
-                )}
-                <div className="peer-list">
-                  {peers?.tracking !== "not_configured" && peers?.items.map((peer) => {
-                    const state = peerState(peer);
-                    return (
-                      <div className="peer-row" key={peer.agent}>
-                        <span className={`agent-avatar ${peer.agent}`}>
-                          {names[peer.agent].charAt(0)}
-                        </span>
-                        <div>
-                          <strong>{names[peer.agent]}</strong>
-                          <small>
-                            {state === "unknown_stale"
-                              ? "Can't confirm it's reachable right now"
-                              : state === "busy_queued"
-                                ? "Bound session can queue work"
-                                : state === "reachable"
-                                  ? "Exact-topic route verified"
-                                  : pretty(state)}
-                          </small>
-                          <small>
-                            {pretty(peer.reason)}
-                            {state !== peer.status
-                              ? !demo && (stale || topicStale)
-                                ? " · Snapshot unverified"
-                                : " · Evidence expired"
-                              : ""}
-                          </small>
-                        </div>
-                        <Badge
-                          tone={
-                            state === "reachable"
-                              ? "forest"
-                              : state === "busy_queued"
-                                ? "amber"
-                                : "neutral"
-                          }
-                        >
-                          {state === "unknown_stale"
-                            ? "Unknown"
-                            : state === "linked_unverified"
-                              ? "Unverified"
-                              : state === "busy_queued"
-                                ? "Busy"
-                                : state === "reachable"
-                                  ? "Online · verified"
-                                  : pretty(state)}
-                        </Badge>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="advisory">
-                  <span>↳</span>
-                  <p>
-                    This is a best guess. Messages are kept even when an agent
-                    is offline, and being reachable doesn't mean a message was
-                    read or acted on.
-                  </p>
-                </div>
-                <p className="panel-footnote">
-                  {demo
-                    ? "All agent states above are illustrative fixtures."
-                    : "An agent shows as unknown until the Hub can confirm its live session for this topic."}
-                </p>
-                </div>
-                </div>
-              </section>
-              <NotesPanel mode={demo ? "demo" : "live"} selectedProject={project}
-                knownProjects={data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? []}
-                csrf={session?.csrf_token ?? null} writable={!!session?.authenticated}
-                viewerActor={session?.actor ?? null}
-                onUnauthorized={clearPrivateWorkspace} />
-            </div>
-            <footer className="page-footer">
-              <span>
-                ENGINEERING HUB <span className="footer-separator">/</span>{" "}
-                PRIVATE CONTROL PLANE
-              </span>
-              <span>Code, staging & production stay separate.</span>
-            </footer>
-          </>
+            {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
+            {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
+          </div>
         )}
+        <footer className="page-footer">
+          <span>
+            ENGINEERING HUB <span className="footer-separator">/</span> PRIVATE CONTROL PLANE
+          </span>
+          <span>Code, staging & production stay separate.</span>
+        </footer>
       </main>
       {protectedChoice && (
-        <Modal
-          title="Confirm protected decision"
-          onClose={() => setProtectedChoice(null)}
-        >
-          <p className="modal-copy">
-            This records your decision only. It does not grant permission to
-            execute or deploy.
-          </p>
+        <Modal title="Confirm protected decision" onClose={() => setProtectedChoice(null)}>
+          <p className="modal-copy">This records your decision only. It does not grant permission to execute or deploy.</p>
           <h3>{protectedChoice.title}</h3>
-          <p className="modal-copy">
-            Selected answer: <strong>{protectedChoice.answer}</strong>
-          </p>
+          <p className="modal-copy">Selected answer: <strong>{protectedChoice.answer}</strong></p>
           <div className="modal-actions">
-            <button
-              className="secondary"
-              onClick={() => setProtectedChoice(null)}
-            >
-              Cancel
-            </button>
-            <button
-              className="primary"
-              disabled={!writable}
-              onClick={async () => {
-                const ok = await submitDecision(
-                  protectedChoice.id,
-                  protectedChoice.revision,
-                  protectedChoice.answer,
-                );
-                if (ok) setProtectedChoice(null);
-              }}
-            >
+            <button className="secondary" onClick={() => setProtectedChoice(null)}>Cancel</button>
+            <button className="primary" disabled={!writable} onClick={async () => {
+              const ok = await submitDecision(protectedChoice.id, protectedChoice.revision, protectedChoice.answer);
+              if (ok) setProtectedChoice(null);
+            }}>
               Confirm decision
             </button>
           </div>
@@ -1364,83 +695,39 @@ export function HubApp() {
         <Modal title="Assign a task" onClose={() => setNewTask(false)}>
           <form onSubmit={(event) => void saveTask(event)}>
             <p className="modal-copy">
-              Define the goal. An agent can claim it and request independent
-              review. This does not activate a deployment.
+              Define the goal. An agent can claim it and request independent review. This does not activate a deployment.
             </p>
             <label className="field">
               Project
-              <select
-                value={taskProject}
-                onChange={(event) =>
-                  setTaskProject(event.target.value as ProjectId)
-                }
-              >
-                {data?.projects.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
+              <select value={taskProject} onChange={(event) => setTaskProject(event.target.value as ProjectId)}>
+                {data?.projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
             </label>
             <label className="field">
               What needs to happen?
-              <textarea
-                autoFocus
-                value={taskTitle}
-                onChange={(event) => setTaskTitle(event.target.value)}
-                maxLength={200}
-                required
-                rows={3}
-                placeholder="A concrete, testable outcome…"
-              />
+              <textarea autoFocus value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)}
+                maxLength={200} required rows={3} placeholder="A concrete, testable outcome…" />
             </label>
             <div className="modal-actions">
-              <button
-                className="secondary"
-                type="button"
-                onClick={() => setNewTask(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="primary"
-                disabled={!writable || !taskTitle.trim()}
-              >
-                Assign task
-              </button>
+              <button className="secondary" type="button" onClick={() => setNewTask(false)}>Cancel</button>
+              <button className="primary" disabled={!writable || !taskTitle.trim()}>Assign task</button>
             </div>
           </form>
         </Modal>
       )}
       {pauseChoice !== null && (
-        <Modal
-          title={
-            pauseChoice ? "Pause new staging work?" : "Resume new staging work?"
-          }
-          onClose={() => setPauseChoice(null)}
-        >
+        <Modal title={pauseChoice ? "Pause new staging work?" : "Resume new staging work?"} onClose={() => setPauseChoice(null)}>
           <p className="modal-copy">
-            This changes admission of new staging work. Active actions reach a
-            safe boundary; the MCP and production are not stopped. It does not
-            enable an unconfigured executor.
+            This changes admission of new staging work. Active actions reach a safe boundary; the MCP and production
+            are not stopped. It does not enable an unconfigured executor.
           </p>
           <div className="modal-actions">
-            <button className="secondary" onClick={() => setPauseChoice(null)}>
-              Cancel
-            </button>
-            <button
-              className="primary"
-              disabled={!writable}
-              onClick={async () => {
-                const ok = await mutate(
-                  () => client.setPause(pauseChoice, session!.csrf_token!),
-                  pauseChoice
-                    ? "New staging work paused."
-                    : "New staging work resumed.",
-                );
-                if (ok) setPauseChoice(null);
-              }}
-            >
+            <button className="secondary" onClick={() => setPauseChoice(null)}>Cancel</button>
+            <button className="primary" disabled={!writable} onClick={async () => {
+              const ok = await mutate(() => client.setPause(pauseChoice, session!.csrf_token!),
+                pauseChoice ? "New staging work paused." : "New staging work resumed.");
+              if (ok) setPauseChoice(null);
+            }}>
               {pauseChoice ? "Pause new work" : "Resume new work"}
             </button>
           </div>

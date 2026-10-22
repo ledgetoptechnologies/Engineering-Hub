@@ -6,6 +6,10 @@ import type { AgentSummary, TopicSnapshot } from "../src/types";
 const NOW = new Date("2026-10-17T18:00:00.000Z");
 const ORIGIN = "http://127.0.0.1:5174";
 const CSRF = "fixture-human-only-csrf";
+/** Same-document page change (no reload), as when clicking the sidebar. */
+async function go(page: Page, route: string) {
+  await page.evaluate((hash) => { location.hash = hash; }, route);
+}
 
 const hubConnection = (state: "connected" | "not_observed" = "connected"): NonNullable<AgentSummary["connection"]> => ({
   state, source: "embedded_bus", scope: "this_server_process", observed_at: NOW.toISOString(),
@@ -18,7 +22,7 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   const mock = await mockLive(page, { tracking: "not_configured" });
   mock.overview.agents[0].connection = hubConnection();
   mock.overview.agents[1].connection = hubConnection("not_observed");
-  await page.goto("/");
+  await page.goto("/#/agents");
   const rows = page.locator(".hub-connection-row");
   await expect(rows.filter({ hasText: "Codex" })).toContainText("Connected to Hub");
   await expect(rows.filter({ hasText: "Codex" })).toContainText("0 inbox subscription(s)");
@@ -34,7 +38,7 @@ test("Hub connection observations expire locally without polling", async ({ page
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page, { tracking: "not_configured" });
   mock.overview.agents[0].connection = hubConnection();
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
   const reads = mock.reads();
   await page.clock.runFor(30_100);
@@ -48,7 +52,7 @@ test("loss of overview event feed invalidates connection and not-configured topi
   await controllableEvents(page);
   const mock = await mockLive(page, { events: true, tracking: "not_configured" });
   mock.overview.agents[0].connection = hubConnection();
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
   await emit(page, "invalidate");
   await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
@@ -69,7 +73,7 @@ test("configured-but-unknown topic remains unverified while Hub transport is con
     snapshot.items = snapshot.items.map((item) => ({ ...item, status: "unknown_stale", reason: "observer_unavailable" }));
     return route.fulfill({ json: snapshot });
   });
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row").getByText("Unknown", { exact: true })).toHaveCount(3);
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
@@ -80,7 +84,7 @@ test("topic errors do not erase independent Hub connection snapshots", async ({ 
   const mock = await mockLive(page);
   mock.overview.agents[0].connection = hubConnection();
   await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
   await expect(page.getByText("Topic status unavailable.", { exact: false })).toBeVisible();
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
@@ -96,7 +100,7 @@ test("invalid or future connection timestamps never render current connection ev
   mock.overview.agents[0].connection = { ...hubConnection(), observed_at: "<img src=x onerror=alert(1)>" };
   mock.overview.agents[1].connection = { ...hubConnection(), observed_at: new Date(NOW.getTime() + 60_000).toISOString() };
   mock.overview.agents[2].connection = { ...hubConnection(), valid_until: "not-a-date", last_stream_write_at: "<script>alert(1)</script>" };
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection unavailable", { exact: true })).toHaveCount(3);
   await expect(page.locator(".hub-connection-row img, .hub-connection-row script")).toHaveCount(0);
@@ -108,7 +112,7 @@ test("agent staging proposals show proposer and scope without implying ownership
   mock.overview.tasks[0].proposed_by = "hermes";
   mock.overview.tasks[0].owner = null;
   mock.overview.tasks[0].status = "assigned";
-  await page.goto("/");
+  await page.goto("/#/work");
   const row = page.locator("details.task-row").filter({ hasText: mock.overview.tasks[0].title });
   await expect(row.getByText("Staging proposal · Hermes", { exact: true })).toBeVisible();
   await expect(row.locator(".owner")).toContainText("Unclaimed");
@@ -150,7 +154,7 @@ test("held rollback reports why it needs attention without claiming rollback suc
     events: [{ event: "held", actor: "executor:hub-pilot-v1", command_id: "fixture-phase",
       fencing_generation: 1, reason: "rollback_outcome_uncertain" }],
   });
-  await page.goto("/");
+  await page.goto("/#/staging");
   const held = page.locator("details").filter({ hasText: "Needs attention: Rollback outcome uncertain" });
   await expect(held).toHaveCount(1);
   await held.locator("summary").click();
@@ -353,31 +357,37 @@ test("colon topic passes strict ingress without discarding task or decision reco
       return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) });
     return route.fallback();
   });
-  await page.goto("/");
+  await page.goto("/#/inbox");
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await go(page, "#/agents");
   await page.getByLabel("TOPIC ROOT").fill("ops:alerts");
   const peers = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/hub/v1/topics/ops:alerts/peers");
   await page.getByRole("button", { name: "Check", exact: true }).click();
   expect((await peers).status()).toBe(200);
   await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
+  await go(page, "#/inbox");
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
   await expect(page.getByText(mock.overview.decisions[0].title, { exact: true })).toBeVisible();
+  await go(page, "#/work");
   await expect(page.getByText(mock.overview.tasks[0].title, { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  await go(page, "#/agents");
   await expect(page.locator("#agents").getByRole("alert")).toHaveCount(0);
 });
 
 test("topic ingress rejection remains panel-local but overview ingress rejection clears private records", async ({ page }) => {
   await mockLive(page);
-  await page.goto("/");
+  await page.goto("/#/inbox");
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
+  await go(page, "#/agents");
   await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
   await page.getByLabel("TOPIC ROOT").fill("ops:alerts");
   await page.getByRole("button", { name: "Check", exact: true }).click();
   await expect(page.locator("#agents").getByRole("alert")).toContainText("rejected by ingress");
+  await expect(page.locator(".peer-row")).toHaveCount(0);
+  await go(page, "#/inbox");
   await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
-  await expect(page.locator(".peer-row")).toHaveCount(0);
   await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "ingress_forbidden" } }) }));
   await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Sign in to Engineering Hub." })).toBeVisible();
@@ -393,16 +403,17 @@ for (const typed of [false, true]) {
     await page.route(`**/api/hub/v1/topics/${deniedTopic}/peers`, (route) => route.fulfill({
       status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "topic_read_forbidden" } }),
     }));
-    await page.goto("/");
+    await page.goto("/#/agents");
     if (typed) {
       await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
       await page.getByLabel("TOPIC ROOT").fill(deniedTopic);
       await page.getByRole("button", { name: "Check", exact: true }).click();
     }
     await expect(page.getByText("This session cannot read the selected topic.", { exact: false })).toBeVisible();
+    await expect(page.locator(".peer-row")).toHaveCount(0);
+    await go(page, "#/inbox");
     await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
-    await expect(page.locator(".peer-row")).toHaveCount(0);
     await expect(page.getByRole("link", { name: "Sign in with GitHub" })).toHaveCount(0);
   });
 }
@@ -412,7 +423,7 @@ test(`canonical topic ACL denial stays local and same-topic ${eventSource} recov
   await page.clock.install({ time: NOW });
   await controllableEvents(page);
   await mockLive(page, { canonical: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
   await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({
@@ -435,7 +446,7 @@ test("canonical topic invalidation refreshes only topic and source loss leaves w
   await page.clock.install({ time: NOW });
   await controllableEvents(page);
   const mock = await mockLive(page, { canonical: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
   await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
   const overviewReads = mock.reads();
@@ -459,7 +470,7 @@ test("canonical terminal recovery takes fresh snapshot and resumes with explicit
   await page.clock.install({ time: NOW });
   await controllableEvents(page);
   await mockLive(page, { canonical: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(page.locator(".peer-row").filter({ hasText: "Codex" }).getByText("Online · verified", { exact: true })).toBeVisible();
   await emitRegistry(page, "registry.snapshot_required");
   await expect.poll(() => page.evaluate(() => (window as any).__hubStreams.filter((entry: any) => entry.url.includes("/topics/")).length)).toBe(2);
@@ -476,7 +487,7 @@ for (const status of [503, 403]) {
     await page.clock.install({ time: NOW });
     await controllableEvents(page);
     await mockLive(page, { canonical: true });
-    await page.goto("/");
+    await page.goto("/#/agents");
     const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
     await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
     let release!: () => void;
@@ -503,6 +514,7 @@ for (const status of [503, 403]) {
       await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
       await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+      await go(page, "#/inbox");
       await expect(page.getByRole("heading", { name: "Needs Beau", exact: true })).toBeVisible();
       await expect(page.getByText("Topic status unavailable.", { exact: false })).toHaveCount(0);
     } finally { release(); }
@@ -516,7 +528,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   page.on("request", (request) => {
     if (request.url().includes("/api/")) writes.push(request.url());
   });
-  await page.goto("/?demo=1");
+  await page.goto("/?demo=1#/inbox");
   await expect(
     page.getByText("Demo workspace.", { exact: true }),
   ).toBeVisible();
@@ -541,12 +553,14 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
     .getByLabel("What needs to happen?")
     .fill("Fixture demo acceptance task");
   await page.getByRole("button", { name: "Assign task", exact: true }).click();
+  await go(page, "#/work");
   await expect(
     page.getByText("Fixture demo acceptance task", { exact: true }),
   ).toBeVisible();
   await expect(page.locator('.notice[role="status"]')).toContainText(
     "Demo only; no server changed.",
   );
+  await go(page, "#/inbox");
   await expect(page.getByRole("radio", { checked: true })).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Record decision", exact: true }),
@@ -563,6 +577,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
   await expect(
     page.getByRole("heading", { name: "Nothing waiting on you." }),
   ).toBeVisible();
+  await go(page, "#/staging");
   await page
     .getByRole("button", { name: "Pause new work", exact: true })
     .click();
@@ -631,7 +646,7 @@ test("live task creation uses browser session, same-origin request and CSRF with
       body: JSON.stringify({ detail: { code: "work_queue_not_configured" } }) });
   });
   try {
-    await page.goto("/");
+    await page.goto("/#/staging");
     await expect
       .poll(() =>
         mock.requests.map(
@@ -644,11 +659,12 @@ test("live task creation uses browser session, same-origin request and CSRF with
       .getByLabel("What needs to happen?")
       .fill("Live fixture human assignment");
     await page.getByRole("button", { name: "Assign task", exact: true }).click();
+    await expect(page.getByRole("status").filter({ hasText: /^Reading queue status…$/ })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: /^Task assigned\.$/ })).toHaveText("Task assigned.");
+    await go(page, "#/work");
     await expect(
       page.getByText("Live fixture human assignment", { exact: true }),
     ).toBeVisible();
-    await expect(page.getByRole("status").filter({ hasText: /^Reading queue status…$/ })).toBeVisible();
-    await expect(page.getByRole("status").filter({ hasText: /^Task assigned\.$/ })).toHaveText("Task assigned.");
     await expect(page.getByText("Demo workspace.", { exact: true })).toHaveCount(
       0,
     );
@@ -663,7 +679,7 @@ test("SSE invalidation refetches, loss marks routes stale and disables mutations
   await page.clock.install({ time: NOW });
   await controllableEvents(page);
   const mock = await mockLive(page, { events: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(
     page.getByText("Snapshot unverified", { exact: true }),
   ).toBeVisible();
@@ -715,7 +731,7 @@ test("each peer expires locally at its own deadline without HTTP refresh", async
 }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page, { expires: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   const codex = page.locator(".peer-row").filter({ hasText: "Codex" });
   const hermes = page.locator(".peer-row").filter({ hasText: "Hermes" });
   await expect(codex.getByText("Online · verified", { exact: true })).toBeVisible();
@@ -758,7 +774,7 @@ test("changing topic clears previous peers before the next snapshot arrives", as
       });
     },
   );
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(
     page
       .locator(".peer-row")
@@ -789,7 +805,7 @@ for (const lost of ["error", "source_unavailable"] as const) {
     await page.clock.install({ time: NOW });
     await controllableEvents(page);
     const mock = await mockLive(page, { events: true });
-    await page.goto("/");
+    await page.goto("/#/agents");
     await expect(
       page.getByText("Snapshot unverified", { exact: true }),
     ).toBeVisible();
@@ -846,7 +862,7 @@ test("a burst of invalidations coalesces to one in-flight refresh and one catchu
   await page.clock.install({ time: NOW });
   await controllableEvents(page);
   const mock = await mockLive(page, { events: true });
-  await page.goto("/");
+  await page.goto("/#/agents");
   await expect(
     page.getByText("Snapshot unverified", { exact: true }),
   ).toBeVisible();
@@ -913,7 +929,7 @@ test("conflicting decision disables writes until explicit refresh without echoin
       }),
     }),
   );
-  await page.goto("/");
+  await page.goto("/#/inbox");
   await page
     .getByRole("radio", { name: "NAS-backed small fixture", exact: true })
     .check();
@@ -947,7 +963,7 @@ test("expired human session removes loaded private records and cannot fall back 
       body: JSON.stringify({ detail: { code: "sign_in_required" } }),
     }),
   );
-  await page.goto("/");
+  await page.goto("/#/inbox");
   await page
     .getByRole("radio", { name: "NAS-backed small fixture", exact: true })
     .check();
@@ -1003,7 +1019,7 @@ test("protected decision requires explicit choice and separate confirmation; can
   decision.protected = true;
   decision.revision = 17;
   decision.title = "Choose the protected fixture review outcome";
-  await page.goto("/");
+  await page.goto("/#/inbox");
   const record = page.getByRole("button", {
     name: "Record decision",
     exact: true,
@@ -1072,7 +1088,7 @@ for (const status of [422, 503]) {
           }),
         }),
     );
-    await page.goto("/");
+    await page.goto("/#/agents");
     await expect(
       page
         .locator(".peer-row")
@@ -1096,6 +1112,7 @@ for (const status of [422, 503]) {
     await page
       .getByRole("button", { name: "Assign task", exact: true })
       .click();
+    await go(page, "#/work");
     await expect(
       page.getByText(`Workspace survives topic ${status}`, { exact: true }),
     ).toBeVisible();
@@ -1116,10 +1133,11 @@ for (const status of [401, 403]) {
           body: JSON.stringify({ detail: { code: "forbidden" } }),
         }),
     );
-    await page.goto("/");
+    await page.goto("/#/inbox");
     await expect(
       page.getByRole("heading", { name: "Needs Beau", exact: true }),
     ).toBeVisible();
+    await go(page, "#/agents");
     await page.getByLabel("TOPIC ROOT").fill("denied-fixture-topic");
     await page.getByRole("button", { name: "Check", exact: true }).click();
     await expect(
@@ -1185,11 +1203,12 @@ test("a pending topic request does not hold fresh workspace records or human act
     });
   });
   try {
-    await page.goto("/");
+    await page.goto("/#/inbox");
     await pending;
     await expect(
       page.getByRole("heading", { name: "Needs Beau", exact: true }),
     ).toBeVisible();
+    await go(page, "#/work");
     await expect(
       page.getByText("Verify the isolated Viewer staging candidate", {
         exact: true,
