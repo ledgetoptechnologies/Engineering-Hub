@@ -46,6 +46,9 @@ export function ModuleFrame({ src, title, capabilities, host, confirmSubmit }: {
     setState({ kind: "loading" });
     const nonce = crypto.randomUUID();
     const instance = { nonce, generation };
+    // Authority is fixed for this instance: a later placement's host or confirm
+    // callback can never complete a request this instance started.
+    const instanceHost = hostRef.current, instanceConfirm = confirmRef.current;
     const channel = new MessageChannel();
     const allowed = rateLimiter();
     let alive = true, ready = false;
@@ -60,16 +63,23 @@ export function ModuleFrame({ src, title, capabilities, host, confirmSubmit }: {
       if (alive) channel.port1.postMessage({ v: PROTOCOL_VERSION, nonce, generation, id, type: "reply", payload: body });
     };
     const handle = async (message: ModuleMessage) => {
+      if (!alive) return;
       if (message.type === "ready") { ready = true; setState({ kind: "running" }); return; }
       if (!ready) return;
       if (message.type === "resize") setHeight(clampHeight(message.height));
       else if (message.type === "notice") setNotice({ level: message.level, text: message.text });
       else if (message.type === "data.get") {
-        try { reply(message.id, { ok: true, data: await hostRef.current.getData(message.capability, message.key) }); }
-        catch { reply(message.id, { ok: false, error: "unavailable" }); }
+        try {
+          const data = await instanceHost.getData(message.capability, message.key);
+          reply(message.id, { ok: true, data });
+        } catch { reply(message.id, { ok: false, error: "unavailable" }); }
       } else if (message.type === "submit") {
-        if (!(await confirmRef.current(message.payload))) { reply(message.id, { ok: false, error: "declined" }); return; }
-        try { reply(message.id, { ok: true, ...(await hostRef.current.submit(message.item_key, message.payload, message.expected_revision)) }); }
+        const confirmed = await instanceConfirm(message.payload);
+        // Stopped, restarted, unmounted or replaced while the person was deciding:
+        // the confirmation is void and nothing is saved.
+        if (!alive) return;
+        if (!confirmed) { reply(message.id, { ok: false, error: "declined" }); return; }
+        try { reply(message.id, { ok: true, ...(await instanceHost.submit(message.item_key, message.payload, message.expected_revision)) }); }
         catch { reply(message.id, { ok: false, error: "not_saved" }); }
       }
     };

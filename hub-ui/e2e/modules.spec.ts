@@ -36,6 +36,9 @@ const CASES: Record<string, string> = {
   forged: `function main() { send("ready"); port.postMessage({ v: 1, nonce: "guessed", generation, type: "notice", payload: { level: "info", text: "x" } }); }`,
   oversize: `function main() { send("ready"); send("notice", { level: "info", text: "x".repeat(70000) }); }`,
   silent: `function main() {}`,
+  submitonly: `function main() { send("ready"); call("submit", { item_key: "A1", payload: { choice: "late" }, expected_revision: 1 }); }`,
+  submitflood: `function main() { send("ready"); call("submit", { item_key: "A1", payload: { choice: "late" }, expected_revision: 1 });
+    setTimeout(() => { for (let i = 0; i < 200; i++) send("notice", { level: "info", text: "spam" }); }, 300); }`,
 };
 
 async function serveModules(page: Page) {
@@ -55,8 +58,8 @@ test("a well-behaved module reads a granted dataset and saves only after the Hub
   await serveModules(page);
   await page.goto("/e2e/fixtures/module-lab.html?case=good");
   await expect(page.getByText("rows 3, saved revision 4")).toBeVisible();
-  expect(await lab(page)).toEqual([{ getData: ["read:dataset/crowns", "plot-a1"] }, { confirm: { choice: "conifer" } },
-    { submit: ["A1", { choice: "conifer" }, 3] }]);
+  expect(await lab(page)).toEqual([{ getData: ["good", "read:dataset/crowns", "plot-a1"] }, { confirm: { choice: "conifer" } },
+    { submit: ["good", "A1", { choice: "conifer" }, 3] }]);
   await expect(page.getByTitle("Test module")).toHaveAttribute("sandbox", "allow-scripts");
   await expect.poll(() => page.getByTitle("Test module").evaluate((el) => (el as HTMLIFrameElement).style.height)).toBe("640px");
 });
@@ -91,4 +94,59 @@ test("a module that never says ready is stopped after 10 seconds", async ({ page
   await serveModules(page);
   await page.goto("/e2e/fixtures/module-lab.html?case=silent");
   await expect(page.getByRole("alert")).toContainText("didn't start within 10 seconds", { timeout: 15000 });
+});
+
+// A confirmation that is still open when its frame stops, restarts, unmounts or is
+// replaced must never save. Positive control first: resolving normally does save.
+const submits = async (page: Page) => (await lab(page)).filter((entry) => typeof entry === "object" && entry !== null && "submit" in entry);
+const confirmOpen = (page: Page) => expect.poll(async () => (await lab(page)).some((e) => typeof e === "object" && e !== null && "confirm" in e)).toBe(true);
+const resolve = (page: Page, index = 0) => page.evaluate((i) => (window as unknown as { __resolvers: ((ok: boolean) => void)[] }).__resolvers[i](true), index);
+
+test("control: a deferred confirmation that is approved saves once", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitonly&defer=1");
+  await confirmOpen(page);
+  await resolve(page);
+  await expect.poll(async () => (await submits(page)).length).toBe(1);
+});
+
+test("a frame stopped while the confirmation is open saves nothing when it is approved", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitflood&defer=1");
+  await confirmOpen(page);
+  await expect(page.getByRole("alert")).toContainText("too many messages");
+  await resolve(page);
+  await page.waitForTimeout(400);
+  expect(await submits(page)).toEqual([]);
+});
+
+test("a restart while the old confirmation is open voids the old confirmation", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitflood&defer=1");
+  await confirmOpen(page);
+  await expect(page.getByRole("alert")).toContainText("too many messages");
+  await page.getByRole("button", { name: "Restart module" }).click();
+  await resolve(page, 0);
+  await page.waitForTimeout(400);
+  expect(await submits(page)).toEqual([]);
+});
+
+test("unmounting while the confirmation is open saves nothing", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitonly&defer=1");
+  await confirmOpen(page);
+  await page.evaluate(() => (window as unknown as { __unmount: () => void }).__unmount());
+  await resolve(page);
+  await page.waitForTimeout(400);
+  expect(await submits(page)).toEqual([]);
+});
+
+test("switching to another module while the confirmation is open never saves through the new placement", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitonly&defer=1");
+  await confirmOpen(page);
+  await page.evaluate(() => (window as unknown as { __switch: (n: string) => void }).__switch("silent"));
+  await resolve(page);
+  await page.waitForTimeout(400);
+  expect(await submits(page)).toEqual([]);
 });

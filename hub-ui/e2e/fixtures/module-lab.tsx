@@ -1,18 +1,33 @@
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ModuleFrame } from "../../src/modules/ModuleFrame";
 import "../../src/styles.css";
 
 const params = new URLSearchParams(location.search);
-const name = params.get("case") ?? "good";
 const log: unknown[] = [];
-(window as unknown as { __lab: unknown[] }).__lab = log;
+const lab = window as unknown as { __lab: unknown[]; __resolvers: ((ok: boolean) => void)[]; __switch?: (name: string) => void; __unmount?: () => void };
+lab.__lab = log;
+lab.__resolvers = [];
 
-createRoot(document.getElementById("root")!).render(
-  <ModuleFrame title="Test module" src={`http://modules.test/m/${name}/index.html`}
-    capabilities={["read:dataset/crowns", "submit:response"]}
-    host={{
-      getData: async (capability, key) => { log.push({ getData: [capability, key] }); return { rows: [1, 2, 3] }; },
-      submit: async (item, payload, revision) => { log.push({ submit: [item, payload, revision] }); return { revision: revision + 1 }; },
-    }}
-    confirmSubmit={async (payload) => { log.push({ confirm: payload }); return params.get("decline") !== "1"; }} />,
-);
+function Lab() {
+  const [name, setName] = useState(params.get("case") ?? "good");
+  const [mounted, setMounted] = useState(true);
+  lab.__switch = setName;
+  lab.__unmount = () => setMounted(false);
+  if (!mounted) return <p>unmounted</p>;
+  return (
+    <ModuleFrame title="Test module" src={`http://modules.test/m/${name}/index.html`}
+      capabilities={["read:dataset/crowns", "submit:response"]}
+      host={{
+        getData: async (capability, key) => { log.push({ getData: [name, capability, key] }); return { rows: [1, 2, 3] }; },
+        submit: async (item, payload, revision) => { log.push({ submit: [name, item, payload, revision] }); return { revision: revision + 1 }; },
+      }}
+      confirmSubmit={(payload) => {
+        log.push({ confirm: payload });
+        // ?defer=1 leaves the confirmation open until the test resolves it.
+        if (params.get("defer") === "1") return new Promise<boolean>((resolve) => { lab.__resolvers.push(resolve); });
+        return Promise.resolve(params.get("decline") !== "1");
+      }} />
+  );
+}
+createRoot(document.getElementById("root")!).render(<Lab />);
