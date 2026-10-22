@@ -466,3 +466,179 @@ def test_unbounded_kernel_values_never_admit_source_tests(kernel_scope, name, va
     with pytest.raises(runner.CIError):
         runner.verify_kernel_limits(42)
     assert len(os.listdir('/proc/self/fd')) == before
+
+
+@pytest.mark.parametrize('expected,guard,observer',[(None,lambda:None,lambda value:None),
+    ('A'*40,lambda:None,lambda value:None),('c'*40,None,lambda value:None),
+    ('c'*40,lambda:None,None),('c'*40,False,lambda value:None)])
+def test_private_hooks_require_exact_commit_and_complete_callable_pair(expected,guard,observer):
+    with pytest.raises(runner.CIError,match='private integration'):
+        runner.run(SimpleNamespace(),expected_commit=expected,admission_guard=guard,terminal_observer=observer)
+
+
+@pytest.fixture
+def hooked_controller(tmp_path,monkeypatch,kernel_scope):
+    """Real local flock/socket/cgroup fixture, fake Docker and committed source."""
+    engine,output=tmp_path/'engine',tmp_path/'output'
+    engine.mkdir(mode=0o700)
+    output.mkdir(mode=0o700)
+    sock=socket.socket(socket.AF_UNIX)
+    sock.bind(str(engine/'engine.sock'))
+    args=SimpleNamespace(image=IMAGE,ref='refs/heads/codex/example',timeout=10,
+        checkout=str(tmp_path),output_root=str(output),engine='unix://'+str(engine/'engine.sock'),
+        engine_id='expected',profile='python')
+    raw=b'synthetic lockfile'
+    labels={'io.engineering-hub.ci.'+name+'-sha256':hashlib.sha256(raw).hexdigest() for name in runner.FILES.values()}
+    events=[]
+    state=SimpleNamespace(status='created',name=None,intent=None,inputs=None,unknown=False,
+                          bad_profile=False,log_failure=False,pin=None,closed=False)
+    monkeypatch.setattr(runner.shutil,'disk_usage',lambda _path:SimpleNamespace(free=4*1024**3))
+    pin_kernel=runner.verify_kernel_limits
+    def pin(pid):
+        state.pin=pin_kernel(pid)
+        close=state.pin.close
+        def mark_closed():
+            state.closed=True
+            close()
+        state.pin.close=mark_closed
+        return state.pin
+    monkeypatch.setattr(runner,'verify_kernel_limits',pin)
+    def command(argv,**options):
+        if argv[0].endswith('/git'):
+            if argv[1]=='rev-parse': return b'c'*40+b'\n'
+            if argv[1]=='show': return raw
+            if argv[1]=='ls-tree': return b'100644 blob fake 1\tfile\0'
+        if 'info' in argv:
+            return json.dumps(dict(ID='expected',OSType='linux',CgroupVersion='2',CgroupDriver='systemd',SecurityOptions=['name=rootless'])).encode()
+        if 'image' in argv: return json.dumps([dict(Id=IMAGE,Config={'Labels':labels})]).encode()
+        if 'create' in argv:
+            events.append('create')
+            state.name=argv[argv.index('--name')+1]
+            state.intent=state.name.removeprefix('eh-local-ci-')
+            state.inputs=Path(argv[argv.index('--mount')+1].split('source=',1)[1].split(',')[0])
+            if state.unknown: raise subprocess.TimeoutExpired(argv,1)
+            return b'd'*64
+        if 'inspect' in argv:
+            if state.unknown: raise runner.CIError('Unknown create')
+            row=inspected(state.inputs)
+            row['Id']='d'*64
+            row['Name']='/'+state.name
+            row['Config']['Cmd']=['/opt/eh-ci/bootstrap.py','python',state.intent]
+            row['State']={'Status':state.status,'Pid':42 if state.status=='running' else 0,
+                'Running':state.status=='running','Paused':False,'Restarting':False,'ExitCode':0}
+            if state.bad_profile: row['HostConfig']['Memory']=0
+            return json.dumps([row]).encode()
+        if 'start' in argv:
+            events.append('start')
+            state.status='running'
+            return b''
+        if 'wait' in argv:
+            events.append('wait')
+            assert (state.inputs/'admit.json').exists()
+            state.status='exited'
+            (kernel_scope[1]/'cgroup.events').write_text('populated 0\n')
+            return b'0'
+        if 'stop' in argv:
+            events.append('stop')
+            state.status='exited'
+            (kernel_scope[1]/'cgroup.events').write_text('populated 0\n')
+            return b''
+        if 'logs' in argv:
+            if state.log_failure: raise runner.CIError('Fixture log retention failed')
+            return b'bounded synthetic test output'
+        raise AssertionError('Unexpected fake command')
+    monkeypatch.setattr(runner,'checked_output',command)
+    def archive(argv,**_options): Path(argv[argv.index('--output')+1]).write_bytes(b'synthetic archive')
+    monkeypatch.setattr(runner.subprocess,'run',archive)
+    try: yield SimpleNamespace(args=args,engine=engine,output=output,state=state,events=events)
+    finally: sock.close()
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_exact_source_mismatch_precedes_snapshot_or_container_effect(hooked_controller):
+    rig=hooked_controller
+    observed=[]
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args,expected_commit='e'*40,admission_guard=lambda:rig.events.append('guard'),terminal_observer=observed.append)
+    assert rig.events==[] and observed==[]
+    assert not (rig.engine/'HELD.json').exists()
+    assert not list(rig.output.glob('run-*/input/source.tar'))
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_private_guard_phases_and_detached_observer_precede_fd_close(hooked_controller):
+    rig=hooked_controller
+    observed=[]
+    def guard(): rig.events.append('guard')
+    def observer(value):
+        assert not rig.state.closed and rig.state.pin.fd is not None
+        assert (rig.engine/'HELD.json').exists() and (rig.output/'HELD.json').exists()
+        observed.append(json.loads(json.dumps(value)))
+        value['kernel_limits']['path']='mutated private observer copy'
+    result=runner.run(rig.args,expected_commit='c'*40,admission_guard=guard,terminal_observer=observer)
+    assert rig.events==['guard','create','guard','start','guard','wait']
+    assert len(observed)==1 and observed[0]['container_id']=='d'*64
+    assert observed[0]['source_commit']=='c'*40 and observed[0]['image_id']==IMAGE
+    assert observed[0]['engine_id']=='expected' and observed[0]['terminal_verified'] is True
+    assert observed[0]['cgroup_terminal']['descendants_empty'] is True
+    assert observed[0]['timed_out'] is False and observed[0]['exit_code']==0
+    assert observed[0]['failed'] is False and Path(observed[0]['input_directory']).name=='input'
+    assert result['kernel_limits']['path']!='mutated private observer copy'
+    assert rig.state.closed and rig.state.pin.fd is None
+    assert not (rig.engine/'HELD.json').exists() and not (rig.output/'HELD.json').exists()
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+@pytest.mark.parametrize('phase',[1,2,3])
+def test_guard_loss_vetoes_new_effects_but_keeps_cleanup_permitted(hooked_controller,phase):
+    rig=hooked_controller
+    guards=[]
+    observations=[]
+    def guard():
+        guards.append(None)
+        if len(guards)==phase: raise RuntimeError('private admission lost')
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args,expected_commit='c'*40,admission_guard=guard,terminal_observer=observations.append)
+    assert len(guards)==phase
+    assert 'wait' not in rig.events and not list(rig.output.glob('run-*/input/admit.json'))
+    if phase==1: assert 'create' not in rig.events
+    if phase<=2: assert 'start' not in rig.events and observations==[]
+    if phase==3:
+        assert 'stop' in rig.events and len(observations)==1
+        assert observations[0]['cgroup_terminal']['descendants_empty'] is True
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_private_observer_failure_retains_both_intents_and_closes_pin(hooked_controller):
+    rig=hooked_controller
+    def observer(_value): raise OSError('synthetic receipt persistence unavailable')
+    with pytest.raises(runner.CIError,match='Private terminal observation unavailable'):
+        runner.run(rig.args,expected_commit='c'*40,admission_guard=lambda:None,terminal_observer=observer)
+    assert rig.state.closed
+    assert (rig.engine/'HELD.json').exists() and (rig.output/'HELD.json').exists()
+    result=json.loads(next(rig.output.glob('run-*/result.json')).read_text())
+    assert result['state']=='held' and result['terminal_verified'] is False
+    assert result['failure_code']=='private_observer_failed'
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+@pytest.mark.parametrize('mutation',['unknown','bad_profile'])
+def test_ambiguous_create_or_unverified_profile_never_calls_terminal_observer(hooked_controller,mutation):
+    rig=hooked_controller
+    setattr(rig.state,mutation,True)
+    observed=[]
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args,expected_commit='c'*40,admission_guard=lambda:None,terminal_observer=observed.append)
+    assert observed==[] and rig.state.pin is None
+
+
+@pytest.mark.skipif(sys.platform!='linux',reason='Real Linux controller lock and kernel FD fixture')
+def test_failure_cleanup_observes_only_original_pinned_terminal_scope(hooked_controller):
+    rig=hooked_controller
+    rig.state.log_failure=True
+    observed=[]
+    with pytest.raises(runner.CIError):
+        runner.run(rig.args,expected_commit='c'*40,admission_guard=lambda:None,terminal_observer=observed.append)
+    assert len(observed)==1 and observed[0]['container_id']=='d'*64
+    assert observed[0]['cgroup_terminal']['descendants_empty'] is True and rig.state.closed
+    assert observed[0]['failed'] is True
