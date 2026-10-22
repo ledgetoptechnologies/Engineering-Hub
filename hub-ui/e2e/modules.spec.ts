@@ -36,6 +36,11 @@ const CASES: Record<string, string> = {
   forged: `function main() { send("ready"); port.postMessage({ v: 1, nonce: "guessed", generation, type: "notice", payload: { level: "info", text: "x" } }); }`,
   oversize: `function main() { send("ready"); send("notice", { level: "info", text: "x".repeat(70000) }); }`,
   silent: `function main() {}`,
+  binary: `function main() { send("ready"); send("submit", { item_key: "A1", payload: { blob: new ArrayBuffer(4 * 1024 * 1024) }, expected_revision: 1 }, 9); }`,
+  manyreads: `function main() { send("ready"); for (let i = 1; i <= 5; i++) send("data.get", { capability: "read:dataset/crowns", key: "k" + i }, i); }`,
+  dupreads: `function main() { send("ready"); send("data.get", { capability: "read:dataset/crowns", key: "a" }, 7); send("data.get", { capability: "read:dataset/crowns", key: "b" }, 7); }`,
+  savethenflood: `async function main() { send("ready"); await call("submit", { item_key: "A1", payload: { choice: "kept" }, expected_revision: 1 });
+    for (let i = 0; i < 200; i++) send("notice", { level: "info", text: "spam" }); }`,
   submitonly: `function main() { send("ready"); call("submit", { item_key: "A1", payload: { choice: "late" }, expected_revision: 1 }); }`,
   submitflood: `function main() { send("ready"); call("submit", { item_key: "A1", payload: { choice: "late" }, expected_revision: 1 });
     setTimeout(() => { for (let i = 0; i < 200; i++) send("notice", { level: "info", text: "spam" }); }, 300); }`,
@@ -149,4 +154,47 @@ test("switching to another module while the confirmation is open never saves thr
   await resolve(page);
   await page.waitForTimeout(400);
   expect(await submits(page)).toEqual([]);
+});
+
+test("binary payloads are refused before any size check can be fooled", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=binary");
+  await expect(page.getByRole("alert")).toContainText("malformed message");
+  expect(await submits(page)).toEqual([]);
+});
+
+test("too many waiting requests stop the module", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=manyreads&slowdata=1");
+  await expect(page.getByRole("alert")).toContainText("too many requests waiting");
+});
+
+test("a request number reused while still pending stops the module", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=dupreads&slowdata=1");
+  await expect(page.getByRole("alert")).toContainText("reused a request number");
+});
+
+test("after a stop, earlier completed saves are reported as saved, not denied", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=savethenflood");
+  await expect(page.getByRole("alert")).toContainText("1 earlier save was completed and stay saved.");
+  expect(await submits(page)).toHaveLength(1);
+});
+
+test("an open confirmation is reported as cancelled when the module stops", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitflood&defer=1");
+  await expect(page.getByRole("alert")).toContainText("1 open request to save was cancelled and not saved.");
+});
+
+test("a failing confirmation dialog declines without an unhandled error", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitonly&confirmreject=1");
+  await expect.poll(async () => (await lab(page)).length).toBe(1);
+  await page.waitForTimeout(300);
+  expect(await submits(page)).toEqual([]);
+  expect(errors).toEqual([]);
 });

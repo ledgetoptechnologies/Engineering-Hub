@@ -27,12 +27,59 @@ export type Rejection = "too_large" | "bad_envelope" | "wrong_instance" | "unkno
 
 const byteLength = (value: string) => new TextEncoder().encode(value).length;
 
+export const MAX_DEPTH = 16;
+export const MAX_NODES = 5000;
+export const MAX_KEYS = 200;
+export const MAX_PENDING = 4;
+export const REQUEST_DEADLINE_MS = 30_000;
+
+/**
+ * Copies a structured-clone value into plain JSON (null, boolean, finite number,
+ * string, array, plain object) within depth, node and key budgets, or returns
+ * undefined. ArrayBuffers, typed arrays, Blobs, Maps, Dates, cycles and the like
+ * are refused, so a JSON size check is real. Only the copy is ever forwarded.
+ * The browser has already received the structured clone; this is not memory isolation.
+ */
+export function toPlainJson(value: unknown): unknown {
+  let nodes = 0;
+  const seen = new Set<object>();
+  const copy = (item: unknown, depth: number): unknown => {
+    if (++nodes > MAX_NODES || depth > MAX_DEPTH) throw new Error("budget");
+    if (item === null || typeof item === "boolean" || typeof item === "string") return item;
+    if (typeof item === "number") { if (!Number.isFinite(item)) throw new Error("number"); return item; }
+    if (typeof item !== "object") throw new Error("type");
+    if (seen.has(item)) throw new Error("cycle");
+    seen.add(item);
+    try {
+      if (Array.isArray(item)) {
+        if (Object.getPrototypeOf(item) !== Array.prototype || item.length > MAX_NODES) throw new Error("array");
+        return item.map((entry) => copy(entry, depth + 1));
+      }
+      const proto = Object.getPrototypeOf(item);
+      if (proto !== Object.prototype && proto !== null) throw new Error("object");
+      const keys = Object.keys(item);
+      if (keys.length > MAX_KEYS) throw new Error("keys");
+      const out: Record<string, unknown> = {};
+      for (const key of keys) {
+        const entry = (item as Record<string, unknown>)[key];
+        // Like JSON: an undefined property is simply absent.
+        if (entry !== undefined) out[key] = copy(entry, depth + 1);
+      }
+      return out;
+    } finally { seen.delete(item); }
+  };
+  try { return copy(value, 0); } catch { return undefined; }
+}
+
 /**
  * Validates one message from the module port. `instance` is this frame's nonce and
  * generation; anything from an older generation or another instance is rejected.
  */
 export function parseModuleMessage(raw: unknown, instance: { nonce: string; generation: number }, granted: readonly string[]):
   { ok: true; message: ModuleMessage } | { ok: false; reason: Rejection } {
+  const plain = toPlainJson(raw);
+  if (plain === undefined) return { ok: false, reason: "bad_envelope" };
+  raw = plain;
   let size: number;
   try { size = byteLength(JSON.stringify(raw) ?? ""); } catch { return { ok: false, reason: "bad_envelope" }; }
   if (size > MAX_MESSAGE_BYTES) return { ok: false, reason: "too_large" };

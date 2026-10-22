@@ -46,3 +46,24 @@ describe("module protocol", () => {
     expect(isCapability("read:dataset/../x")).toBe(false);
   });
 });
+
+describe("plain JSON only", async () => {
+  const { toPlainJson, MAX_DEPTH } = await import("./protocol");
+  it("copies plain data and refuses binary, exotic, cyclic, deep or non-finite values", () => {
+    expect(toPlainJson({ a: [1, "x", null, true, { b: 2 }] })).toEqual({ a: [1, "x", null, true, { b: 2 }] });
+    expect(toPlainJson({ a: 1, gone: undefined })).toEqual({ a: 1 });
+    expect(toPlainJson([undefined])).toBeUndefined();
+    for (const bad of [new ArrayBuffer(8), new Uint8Array(4), new Map(), new Date(), NaN, Infinity, () => 1, Symbol("s"), 10n])
+      expect(toPlainJson({ v: bad })).toBeUndefined();
+    const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
+    expect(toPlainJson(cyclic)).toBeUndefined();
+    let deep: unknown = 1; for (let i = 0; i < MAX_DEPTH + 2; i++) deep = [deep];
+    expect(toPlainJson(deep)).toBeUndefined();
+    expect(toPlainJson(Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`k${i}`, i])))).toBeUndefined();
+  });
+  it("judges size on the plain copy, so a 4 MiB buffer can't hide behind a small JSON string", () => {
+    const raw = { v: 1, nonce: "n1", generation: 2, type: "submit", id: 1,
+      payload: { item_key: null, payload: { blob: new ArrayBuffer(4 * 1024 * 1024) }, expected_revision: 0 } };
+    expect(parseModuleMessage(raw, instance, granted)).toEqual({ ok: false, reason: "bad_envelope" });
+  });
+});
