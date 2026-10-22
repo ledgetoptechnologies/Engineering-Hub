@@ -1,0 +1,32 @@
+# Explicit reviewed local test image, never a deployment/release image.
+ARG REVIEWED_VALIDATION_IMAGE
+FROM node:24-bookworm-slim AS node
+FROM ${REVIEWED_VALIDATION_IMAGE}
+USER root
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
+WORKDIR /opt/eh-ci
+COPY pyproject.toml uv.lock ./
+COPY hub-ui/package.json hub-ui/package-lock.json ./hub-ui/
+# Python dependencies come from the independently reviewed validation base.
+# Confirm lock compatibility during image preparation; no branch dependency
+# installation or network access is granted during a development job.
+RUN cmp /validation/pyproject.toml /opt/eh-ci/pyproject.toml \
+    && cmp /validation/uv.lock /opt/eh-ci/uv.lock \
+    && uv sync --locked --offline --group test --no-editable --project /validation
+RUN cd hub-ui && npm ci --ignore-scripts && mv node_modules /opt/eh-ci/node_modules
+RUN python -c "import hashlib,json,pathlib; r=pathlib.Path('/opt/eh-ci'); names=('pyproject.toml','uv.lock','hub-ui/package.json','hub-ui/package-lock.json'); (r/'dependencies.json').write_text(json.dumps({n:hashlib.sha256((r/n).read_bytes()).hexdigest() for n in names}))"
+COPY scripts/local_ci_container.py /opt/eh-ci/bootstrap.py
+ARG PYPROJECT_SHA256
+ARG UV_LOCK_SHA256
+ARG PACKAGE_SHA256
+ARG NPM_LOCK_SHA256
+RUN python -c "import json,os; d=json.load(open('/opt/eh-ci/dependencies.json')); names={'pyproject.toml':'PYPROJECT_SHA256','uv.lock':'UV_LOCK_SHA256','hub-ui/package.json':'PACKAGE_SHA256','hub-ui/package-lock.json':'NPM_LOCK_SHA256'}; assert all(d[k]==os.environ[v] for k,v in names.items())"
+LABEL io.engineering-hub.ci.pyproject-sha256=${PYPROJECT_SHA256} \
+      io.engineering-hub.ci.uv-lock-sha256=${UV_LOCK_SHA256} \
+      io.engineering-hub.ci.package-sha256=${PACKAGE_SHA256} \
+      io.engineering-hub.ci.npm-lock-sha256=${NPM_LOCK_SHA256}
+USER 10001:10001
+WORKDIR /tmp
+ENTRYPOINT ["/opt/validation-venv/bin/python", "/opt/eh-ci/bootstrap.py"]
