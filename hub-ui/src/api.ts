@@ -4,6 +4,7 @@ import type {
   Decision,
   EventsStatus,
   Overview,
+  ImageVersionsSummary,
   ProjectId,
   Session,
   Task,
@@ -109,6 +110,7 @@ export class HubClient {
     path: string,
     body?: unknown,
     csrf?: string,
+    signal?: AbortSignal,
   ): Promise<T> {
     // Bootstrap has no local CSRF secret yet. Its dedicated server boundary
     // requires the browser's exact Origin and a verified Access assertion.
@@ -121,6 +123,7 @@ export class HubClient {
         method: body === undefined ? "GET" : "POST",
         credentials: "same-origin",
         redirect: "error",
+        ...(signal ? { signal } : {}),
         headers: {
           Accept: "application/json",
           ...(body === undefined
@@ -179,6 +182,10 @@ export class HubClient {
     if (this.mode === "live") return this.request("/overview");
     this.demoHuman();
     return structuredClone(this.demo);
+  }
+  async getImageVersions(): Promise<ImageVersionsSummary | null> {
+    if (this.mode === "demo") return null;
+    return this.request("/image-versions", undefined, undefined, AbortSignal.timeout(10_000));
   }
   async getTopic(topic: string): Promise<TopicSnapshot> {
     const path = topicPath(topic);

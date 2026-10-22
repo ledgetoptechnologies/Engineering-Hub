@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from importlib.metadata import version
@@ -251,7 +251,7 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
 
     async def health(request: Request):
         try:
-            with repository.connect() as conn:
+            with closing(repository.connect()) as conn, conn:
                 conn.execute("SELECT 1").fetchone()
             db_status = "ok"
         except Exception:

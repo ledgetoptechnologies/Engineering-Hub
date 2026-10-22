@@ -119,6 +119,35 @@ export interface Overview {
   agents: AgentSummary[];
   autonomy: AutonomyStatus;
   capabilities: Capabilities;
+  /** Optional on older servers; advisory image observations, not deployment authority. */
+  image_versions?: ImageVersionsSummary | null;
+}
+export type ImageVersionState = "up_to_date" | "update_available" | "unknown";
+export interface ImageVersionStatus {
+  project: string;
+  host: string;
+  service: string;
+  environment: "production" | "staging";
+  repository: string;
+  reference: string;
+  state: ImageVersionState;
+  reason: string;
+  checked_at: string;
+  running_observed_at: string | null;
+  published_observed_at: string | null;
+  valid_until: string | null;
+  digest_kind: "config" | "manifest" | "index" | null;
+  current_digest: string | null;
+  available_digest: string | null;
+}
+export interface ImageVersionsSummary {
+  configured: boolean;
+  source: "agent_observation_report";
+  reason: "available" | "not_configured" | "invalid_report" | "source_unavailable";
+  reported_by: string | null;
+  report_updated_at: string | null;
+  advisory_only: true;
+  items: ImageVersionStatus[];
 }
 export type ReadinessState =
   | "unlinked"

@@ -28,7 +28,7 @@ _GET = frozenset({
     '/', '/index.html', '/hub.svg', '/favicon.ico',
     '/api/hub/v1/auth/login', '/api/hub/v1/auth/me',
     *('/api/hub/v1/' + name for name in (
-        'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs',
+        'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
