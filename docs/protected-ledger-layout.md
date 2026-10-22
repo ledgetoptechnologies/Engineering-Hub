@@ -127,6 +127,12 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 
 ## Operator sequence still to prepare and review
 
+The phased [offline cutover runbook](offline-ledger-cutover-runbook.md) makes
+the inspect/apply, parity and abort checkpoints explicit. It is preparation for
+one later operator handoff, not permission to apply the mappings now. In
+particular, the retained old ledger cannot be used as a lossless rollback after
+the private authority accepts new mutations.
+
 1. Publish and verify the exact source/image, including owned-inactive support.
    GitHub Actions currently has an account billing/spending restriction; local
    tests do not replace a published image or authorize bypassing release gates.
@@ -228,6 +234,12 @@ disabled autonomy, rejected unauthenticated browser access, unchanged original
 ledger/settings bytes, resource limits and owned-fixture cleanup. No host ports
 are published. Ambient `DOCKER_HOST` is refused; the verified local context is
 pinned through cleanup. Missing probe-contract anchors fail closed.
+Enrollment uses the actual installed CLI with its complete canonical plan
+document. The fixture verifies wrong-digest refusal before lock creation,
+successful explicit application, retained non-owner logical fingerprints and
+refused re-application with unchanged enrolled ledger/lock bytes. These are
+disposable abort checks, not proof of a real NAS rollback or post-mutation
+reconciliation.
 
 The main-only image workflow requires this profile before upload and again on
 the registry digest before promoting `latest`. This is container acceptance,
