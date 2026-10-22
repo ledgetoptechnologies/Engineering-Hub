@@ -28,6 +28,8 @@ export interface Task extends Versioned {
   candidate_commit: string | null;
   review: Review | null;
   repair_count: number;
+  /** Optional agent context (summary, links, images); parsed defensively by details.ts. */
+  details?: unknown;
   scope?: "staging" | null;
   proposed_by?: Agent | null;
   /** Audited time the task entered its current status; null when not recorded. */
@@ -41,6 +43,10 @@ export interface Decision extends Versioned {
   status: "open" | "answered";
   answer: string | null;
   answered_by?: string;
+  /** True only when the server accepts a typed answer instead of one of the options. */
+  allow_free_text?: boolean;
+  asked_by?: Agent | null;
+  details?: unknown;
   execution_authorization: false;
 }
 export interface Run extends Versioned {

@@ -11,7 +11,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
-import { openDecisions } from "./pages/decisions";
+import { acceptsAnswer, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
 import type {
   Decision,
@@ -495,7 +495,7 @@ export function HubApp() {
       !writable ||
       !choice ||
       choice.revision !== decision.revision ||
-      !decision.options.includes(choice.answer)
+      !acceptsAnswer(decision, choice.answer)
     )
       return;
     if (decision.protected) {
@@ -517,7 +517,7 @@ export function HubApp() {
           item.id === id &&
           item.revision === revision &&
           item.status === "open" &&
-          item.options.includes(answer),
+          acceptsAnswer(item, answer),
       )
     )
       return false;

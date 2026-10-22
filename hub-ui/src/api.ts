@@ -221,7 +221,9 @@ export class HubClient {
     if (!decision) throw new HubApiError(404, "not_found");
     if (decision.revision !== revision)
       throw new HubApiError(409, "revision_conflict");
-    if (decision.status !== "open" || !decision.options.includes(answer))
+    const typed = decision.allow_free_text === true && !decision.protected
+      && answer.trim() !== "" && answer.length <= 2000;
+    if (decision.status !== "open" || !(decision.options.includes(answer) || typed))
       throw new HubApiError(409, "invalid_answer");
     Object.assign(decision, {
       answer,

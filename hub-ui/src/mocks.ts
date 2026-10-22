@@ -73,6 +73,12 @@ export function createDemoOverview(now = new Date()): Overview {
         protected: false,
         status: "open",
         answer: null,
+        allow_free_text: true,
+        asked_by: "codex",
+        details: {
+          summary: "Both options use the **same** benchmark script. The NAS fixture is ready now; local disk inspection needs a maintenance window.",
+          links: [{ label: "Benchmark plan", url: "/notes" }],
+        },
         execution_authorization: false,
       },
     ],

@@ -3,6 +3,7 @@ import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, names, pretty } from "../ui";
+import { DetailsBlock } from "../DetailsBlock";
 
 export function stateAge(task: Task): string {
   const age = relativeAge(task.state_since);
@@ -32,6 +33,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
         <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
       </summary>
       <div className="task-detail">
+        <DetailsBlock value={task.details} />
         <p>Candidate: <code>{task.candidate_commit ?? "Not submitted"}</code></p>
         <p>
           Independent reviewer:{" "}
