@@ -110,7 +110,7 @@ publish. Registry publication is not operator deployment or executor enrollment.
 The separate legacy bus workflow below retains its own release-tag policy;
 its absence of `latest` does not apply to the Hub package.
 
-`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.6.0` runs the same gates and publishes:
+`.github/workflows/container.yml` runs tests, Compose validation, and a container build for ready (non-draft) pull requests into `main` and pushes to `main` (drafts and other branches are tested on staging). A SemVer tag such as `v0.6.0` runs the same gates and publishes:
 
 - `ghcr.io/ledgetoptechnologies/internal-mcp:0.6.0`
 - `ghcr.io/ledgetoptechnologies/internal-mcp:sha-<full-commit-sha>`
