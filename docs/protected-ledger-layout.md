@@ -216,6 +216,30 @@ overlap guard or silently switch to another ledger to get past that refusal.
 
 ## Explicit disposable test selection
 
+### Installed-image release gate
+
+`scripts/hub_protected_container_smoke.py` exercises the installed release image,
+not a source-mounted replacement. With an explicitly selected local Docker
+context, it creates a labelled synthetic volume, cold-copies and explicitly
+enrolls a disposable ledger, and starts the inactive owned entrypoint using
+only the three selective mappings above. It verifies three-agent MCP access,
+preserved tasks, decisions, messages and notes across two container recreations,
+disabled autonomy, rejected unauthenticated browser access, unchanged original
+ledger/settings bytes, resource limits and owned-fixture cleanup. No host ports
+are published. Ambient `DOCKER_HOST` is refused; the verified local context is
+pinned through cleanup. Missing probe-contract anchors fail closed.
+
+The main-only image workflow requires this profile before upload and again on
+the registry digest before promoting `latest`. This is container acceptance,
+not proof of NAS permissions, human Access sign-in, agent wake, workflow
+execution, backup restoration or reboot recovery.
+
+The existing live Compose remains unchanged until the operator cutover is
+ready. Consolidate the protected-storage and entrypoint changes into one reviewed
+handoff rather than requiring incremental Compose replacements. Routine image
+updates afterward use pull/redeploy; new infrastructure requirements still need
+an explicit reviewed change.
+
 The positive runtime test deliberately skips under ordinary pytest. It must run
 in its own disposable Linux container with an **empty** dedicated tmpfs, never
 against a NAS mount or real credentials. Add these arguments to the existing
