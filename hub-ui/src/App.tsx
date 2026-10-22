@@ -11,7 +11,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
-import { acceptsAnswer, openDecisions } from "./pages/decisions";
+import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
 import type {
   Decision,
@@ -413,7 +413,7 @@ export function HubApp() {
               item.id === id &&
               item.status === "open" &&
               item.revision === choice.revision &&
-              item.options.includes(choice.answer),
+              retainsAnswerDraft(item, choice.answer),
           ),
         ),
       );

@@ -97,6 +97,50 @@ test("a typed answer is sent as the answer with CSRF and the current revision", 
     answer: "Run the NAS fixture first, then inspect the disk on Friday." } });
 });
 
+test("closing an attached image never records a selected decision", async ({ page }) => {
+  const { state } = await fixture(page, withDetails);
+  state.attachments[DECISION_IDS[0]] = [IMAGE];
+  await page.goto("/#/inbox");
+  const card = page.locator("form.decision").first();
+  await card.getByRole("radio").first().check();
+  await expect(card.getByRole("button", { name: /Record decision/ })).toBeEnabled();
+  await card.getByRole("list", { name: "Attached images" }).getByRole("button").click();
+  const dialog = page.getByRole("dialog", { name: "Plot A1 canopy map" });
+  await dialog.getByRole("button", { name: "Close dialog" }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(state.answers).toHaveLength(0);
+  await expect(card.getByRole("button", { name: /Record decision/ })).toBeEnabled();
+  await card.getByRole("button", { name: /Record decision/ }).click();
+  await expect.poll(() => state.answers.length).toBe(1);
+});
+
+test("custom answer typing survives matching a preset and same-revision refresh", async ({ page }) => {
+  const { overview, state } = await fixture(page, (data) => {
+    Object.assign(data.decisions[0], { allow_text: true, options: ["No", "Yes"] });
+  });
+  await page.goto("/#/inbox");
+  const card = page.locator("form.decision").first();
+  await card.getByRole("radio", { name: "Type my own answer" }).check();
+  const input = card.getByRole("textbox", { name: "Your answer" });
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(input).toHaveValue("");
+  await expect(card.getByRole("radio", { name: "Type my own answer" })).toBeChecked();
+  await expect(card.getByRole("button", { name: /Record decision/ })).toBeDisabled();
+  await input.pressSequentially("Not until Friday");
+  await expect(input).toHaveValue("Not until Friday");
+  await expect(card.getByRole("radio", { name: "No", exact: true })).not.toBeChecked();
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(input).toHaveValue("Not until Friday");
+  await expect(card.getByRole("radio", { name: "Type my own answer" })).toBeChecked();
+  await expect(card.getByRole("button", { name: /Record decision/ })).toBeEnabled();
+  expect(state.answers).toHaveLength(0);
+  overview.decisions[0].revision++;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(card.getByRole("button", { name: /Record decision/ })).toBeDisabled();
+  await expect(input).toHaveCount(0);
+  expect(state.answers).toHaveLength(0);
+});
+
 test("typed answers are offered only when the server allows them and never on protected requests", async ({ page }) => {
   await fixture(page, (overview) => {
     const base = overview.decisions[0];

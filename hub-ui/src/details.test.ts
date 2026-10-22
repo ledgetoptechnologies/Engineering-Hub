@@ -28,6 +28,11 @@ describe("entity context", () => {
 });
 
 describe("attachments", () => {
+  it("matches the backend raster and byte limits", () => {
+    expect(parseAttachments({ items: [{ ...image, bytes: 256 * 1024 }] }, entityId)).toHaveLength(1);
+    expect(parseAttachments({ items: [{ ...image, bytes: 256 * 1024 + 1 },
+      { ...image, media_type: "image/webp" }] }, entityId)).toEqual([]);
+  });
   it("accepts only raster images for this entity and builds URLs from the id, never the server url", () => {
     const parsed = parseAttachments({ items: [image, { ...image, id: "not-a-uuid" }, { ...image, media_type: "image/svg+xml" },
       { ...image, entity_id: "99999999-2222-4333-8444-555555555555" }, { ...image, bytes: 50 * 1024 * 1024 }] }, entityId);
