@@ -182,6 +182,13 @@ test("archived history authentication loss clears the workspace", async ({ page 
   await expect(page.getByText("operator@example.test", { exact: true })).toHaveCount(0);
 });
 
+test("a missing demo project never reads live project history", async ({ page }) => {
+  const { state } = await fixture(page);
+  await page.goto("/?demo=1#/projects/missing-client");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Project not found.");
+  expect(state.reads).toEqual([]);
+});
+
 test("a server without project routes says it needs an update and does not sign out", async ({ page }) => {
   await fixture(page, { gateway: true });
   await page.goto("/#/projects");

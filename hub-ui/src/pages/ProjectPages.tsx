@@ -271,6 +271,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   const [historyProject, setHistoryProject] = useState<{ id: string; value: Project | null; loading: boolean; error: string } | null>(null);
   useEffect(() => {
     if (listedProject) { setHistoryProject(null); return; }
+    if (hub.demo) { setHistoryProject({ id, value: null, loading: false, error: "" }); return; }
     let live = true;
     setHistoryProject({ id, value: null, loading: true, error: "" });
     readProject(id).then((value) => {
@@ -282,7 +283,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
         error: reason instanceof HubApiError && reason.status === 404 ? "" : "Project history couldn't be loaded. Refresh to retry." });
     });
     return () => { live = false; };
-  }, [id, listedProject, hub.data.projects, hub.clearPrivateWorkspace]);
+  }, [id, listedProject, hub.data.projects, hub.clearPrivateWorkspace, hub.demo]);
   const currentHistory = historyProject?.id === id ? historyProject : null;
   const project = listedProject ?? currentHistory?.value;
   if (!project) {
