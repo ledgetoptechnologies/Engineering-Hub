@@ -135,7 +135,7 @@ class AgentConnectionDTO(ResponseDTO):
     inbox_subscriptions: int | None = Field(ge=0)
     subscribed: bool | None
     last_stream_write_at: str | None
-    stale_streams: int | None
+    stale_streams: int | None = Field(ge=0)
     native_push_available: bool | None
 
 
