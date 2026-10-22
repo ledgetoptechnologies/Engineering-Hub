@@ -20,10 +20,25 @@ class DeploymentConfig:
     auth_config: AuthConfig
     allowed_hosts: tuple[str, ...]
     allowed_ips: frozenset[str]
+    protected_ledger: bool = False
+
+    def __post_init__(self):
+        if type(self.protected_ledger) is not bool:
+            raise ValueError(_ERROR)
 
     @property
     def hub_database(self) -> Path:
+        if self.protected_ledger:
+            from .protected_layout import database_path
+            return database_path()
         return self.state_root / "hub.sqlite3"
+
+    def validate_ledger_boundary(self):
+        """Opt-in metadata gate only; never opens, creates or migrates a DB."""
+        if self.protected_ledger:
+            from .protected_layout import validate_existing_boundary
+            validate_existing_boundary(self.hub_database, shared_root=self.state_root,
+                                       shared_paths=tuple(self.bus_paths.values()))
 
     @property
     def bus_paths(self) -> dict[str, Path]:
@@ -61,7 +76,9 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
     """Read without writes, environment mutation, migration, or fallback defaults.
 
     Configuration cannot contain credentials, executable flags or arbitrary paths.
-    The configuration's parent is the single operator-selected state root.
+    The configuration's parent retains settings and bus state. Version two
+    explicitly selects the fixed, separately mounted existing private ledger;
+    neither version creates or migrates that ledger.
     """
     try:
         if not isinstance(path, (str, Path)):
@@ -75,9 +92,23 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
             raise ValueError(_ERROR)
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=_object,
                               parse_constant=_constant)
-        _keys(document, ("schema_version", "base_url", "cloudflare_access",
-                         "agent_allowed_hosts", "agent_allowed_ips"))
-        if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        if type(document) is not dict or type(document.get('schema_version')) is not int:
+            raise ValueError(_ERROR)
+        version = document['schema_version']
+        common = ('schema_version', 'base_url', 'cloudflare_access',
+                  'agent_allowed_hosts', 'agent_allowed_ips')
+        if version == 1:
+            _keys(document, common)
+        elif version == 2:
+            _keys(document, (*common, 'storage'))
+            _keys(document['storage'], ('layout',))
+            if document['storage']['layout'] != 'protected-ledger-v1':
+                raise ValueError(_ERROR)
+            from .protected_layout import database_path
+            private_root = database_path().parent
+            if selected.parent == private_root or private_root in selected.parent.parents:
+                raise ValueError(_ERROR)
+        else:
             raise ValueError(_ERROR)
         access = document["cloudflare_access"]
         _keys(access, ("issuer", "audience", "allowed_emails"))
@@ -99,7 +130,7 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
                 raise ValueError(_ERROR)
         if len(set(ips)) != len(ips):
             raise ValueError(_ERROR)
-        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips))
+        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips), version == 2)
     except (OSError, ValueError, TypeError, RecursionError):
         # Do not echo paths, parser fragments, rejected keys, or file contents.
         raise ValueError(_ERROR) from None

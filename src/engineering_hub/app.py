@@ -64,8 +64,15 @@ class Settings:
     registry_enabled: bool = False
     registry_origin: str | None = None
     registry_events_enabled: bool = False
+    require_owned_ledger: bool = False
 
     def __post_init__(self):
+        if type(self.require_owned_ledger) is not bool:
+            raise ValueError('Explicit owned-ledger flag required')
+        if self.require_owned_ledger:
+            from .protected_layout import database_path
+            if self.database != database_path():
+                raise ValueError('Protected layout requires its fixed ledger path')
         if type(self.work_queue_enabled) is not bool:
             raise ValueError("Explicit work queue enable flag required")
         if type(self.registry_enabled) is not bool or type(self.registry_events_enabled) is not bool:
@@ -132,7 +139,8 @@ class Settings:
                    staging_machine_id=os.environ.get("HUB_STAGING_MACHINE_ID", "staging-pc"),
                    registry_enabled=registry_flag == '1',
                    registry_origin=os.environ.get('HUB_REGISTRY_ORIGIN'),
-                   registry_events_enabled=registry_events_flag == '1')
+                   registry_events_enabled=registry_events_flag == '1',
+                   require_owned_ledger=deployment.protected_ledger if deployment is not None else False)
 
 
 class Input(BaseModel):
@@ -204,6 +212,20 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                owned_pilot_service=None, work_queue=None, archive_reader=None,
                queued_pilot_runtime=None, bus_app=None):
     settings = settings or Settings.from_env()
+    if settings.require_owned_ledger:
+        # Refuse before any bus/notes/auth/feed/schema construction. In
+        # particular, a missing private mount must not create an empty ledger.
+        from .protected_layout import validate_existing_boundary
+        from .pilot_ownership import PilotOwner
+        if (type(repository) is not HubRepository
+                or type(repository.pilot_owner) is not PilotOwner
+                or Path(repository.path) != settings.database):
+            raise ValueError('Protected ledger requires an explicit existing owner')
+        bus_service = getattr(getattr(bus_app, 'state', None), 'service', None)
+        shared_paths = () if bus_service is None else (
+            bus_service.repository.path, bus_service.audit.path, bus_service.files.root)
+        validate_existing_boundary(settings.database, shared_paths=shared_paths)
+        repository.pilot_owner.assert_active(settings.database)
     bus_mcp = None
     bus_health = None
     notes_repository = None

@@ -56,6 +56,9 @@ async def serve_owned_inactive_hub(settings, *, bus_paths,
         if constructed:
             raise OwnedInactiveHubError()
         constructed = True
+        if settings.require_owned_ledger:
+            from .protected_layout import validate_existing_boundary
+            validate_existing_boundary(settings.database, shared_paths=tuple(bus_paths.values()))
         # Full ancestor walk before ownership, without creating or repairing it.
         parent_fd, _ = _private_parent(Path(settings.database))
         os.close(parent_fd)
@@ -101,6 +104,7 @@ async def serve_owned_inactive_hub(settings, *, bus_paths,
 
 async def serve_configuration(config_path):
     deployment = load_deployment_config(config_path)
+    deployment.validate_ledger_boundary()
     settings = Settings.from_env(deployment)
     await serve_owned_inactive_hub(settings, bus_paths=deployment.bus_paths)
 
