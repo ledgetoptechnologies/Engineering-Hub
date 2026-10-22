@@ -190,6 +190,7 @@ class LabelSetRepository:
                 'instructions': instructions, 'choices': normalized_choices}
         fingerprint = hashlib.sha256(_json({'set': data, 'items': normalized_items}).encode()).hexdigest()
         with self.repo._transaction() as db:
+            self.repo._project(project, db)
             existing = db.execute('SELECT fingerprint FROM hub_label_sets WHERE id=?', (set_id,)).fetchone()
             if existing is not None:
                 if existing[0] != fingerprint:
@@ -213,7 +214,7 @@ class LabelSetRepository:
             return self._get(db, set_id)
 
     def list(self, project):
-        self.repo._project(project)
+        self.repo._project(project, require_active=False)
         with self._read() as db:
             items = []
             for row in db.execute('SELECT * FROM hub_label_sets WHERE project=? ORDER BY updated_at DESC,id', (project,)):
@@ -233,7 +234,8 @@ class LabelSetRepository:
         clean = _image(content, content_type)
         digest = hashlib.sha256(content).hexdigest()
         with self.repo._transaction() as db:
-            self._set(db, set_id)
+            scope = self._set(db, set_id)
+            self.repo._project(scope['project'], db)
             self._item(db, set_id, item_id)
             old = db.execute('SELECT source_sha256,media_type FROM hub_label_images WHERE set_id=? AND item_id=?',
                              (set_id, item_id)).fetchone()
@@ -270,6 +272,7 @@ class LabelSetRepository:
         self.repo._actor(actor, human=True)
         with self.repo._transaction() as db:
             row = self._set(db, set_id)
+            self.repo._project(row['project'], db)
             item = self._item(db, set_id, item_id)
             if type(expected_revision) is not int or expected_revision != item['revision']:
                 raise HubError('label_conflict', 409)

@@ -433,7 +433,8 @@ async def test_private_receiver_body_timeout_is_408_before_core(monkeypatch):
     assert calls == []
 
 
-async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monkeypatch):
+@pytest.mark.parametrize('sign_in', ['login', 'bootstrap'])
+async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monkeypatch, sign_in):
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
     jwk.update(kid='fixture-key', alg='RS256', use='sig')
@@ -458,7 +459,17 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway),
                                         base_url=config.origin, follow_redirects=False) as browser:
                 browser.headers['Cf-Access-Jwt-Assertion'] = assertion
-                assert (await browser.get(BASE + '/auth/login')).status_code == 303
+                if sign_in == 'bootstrap':
+                    # No initial Hub cookie or CSRF token exists. The receiver
+                    # must still verify Access and exact first-party Origin.
+                    assert (await browser.post(BASE + '/auth/bootstrap')).status_code == 403
+                    assert (await browser.post(BASE + '/auth/bootstrap',
+                        headers={'Origin': 'https://other.example'})).status_code == 403
+                    boot = await browser.post(BASE + '/auth/bootstrap', headers={'Origin': config.origin})
+                    assert boot.status_code == 200, boot.text
+                    assert boot.json()['authenticated']
+                else:
+                    assert (await browser.get(BASE + '/auth/login')).status_code == 303
                 me = (await browser.get(BASE + '/auth/me')).json()
                 assert me['authenticated'] and me['actor'].startswith('human:cf:')
                 payload = {'project': 'engineering-hub', 'title': 'Gateway task', 'client_request_id': 'gateway-task'}

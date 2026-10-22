@@ -5,10 +5,12 @@ import base64
 import binascii
 import json
 from typing import Any
+from pathlib import Path
 from urllib.parse import parse_qsl
 
 from mcp import types
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.lowlevel import Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.transport_security import TransportSecuritySettings
@@ -18,7 +20,7 @@ from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, SendConflict, SendReplayUnavailable, message_dict
 from .files import file_dict
 from .feedback import FeedbackError, feedback_dict, feedback_page_dict, feedback_revision_dict
-from .knowledge import KnowledgeRepository, entry_dict, search_result_dict
+from .knowledge import KnowledgeProjectArchived, KnowledgeRepository, entry_dict, search_result_dict
 from .push import BASE_RESOURCE_URI, PushPublisher
 
 
@@ -184,7 +186,13 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         request = ctx.request_context.request
         return service.auth.agent(request)
 
-    knowledge = KnowledgeRepository(service.repository.path)
+    knowledge = getattr(service, 'knowledge', None)
+    if knowledge is None:
+        knowledge = KnowledgeRepository(service.repository.path)
+        service.knowledge = knowledge
+    elif (type(knowledge) is not KnowledgeRepository
+          or knowledge.db_path.resolve() != Path(service.repository.path).resolve()):
+        raise ValueError('Existing knowledge repository identity must be preserved')
 
     @mcp.tool()
     def send_message(recipient: str, message_type: str, body: Any, priority: str = "normal",
@@ -308,8 +316,11 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         """
         if ctx is None: raise ValueError("request context required")
         identity = authenticated(ctx)
-        entry = knowledge.put(project=project, path=path, title=title, content=content,
-                              author=identity, expected_version=expected_version)
+        try:
+            entry = knowledge.put(project=project, path=path, title=title, content=content,
+                                  author=identity, expected_version=expected_version)
+        except KnowledgeProjectArchived:
+            raise ToolError('project_archived') from None
         request = ctx.request_context.request
         service.audit.append(operation="knowledge_put", agent=identity, result="ok",
                              correlation_id=getattr(request.state, "correlation_id", None),

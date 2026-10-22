@@ -6,12 +6,46 @@ from agent_message_bus.knowledge import KnowledgeRepository
 from engineering_hub.app import create_app
 from engineering_hub.private_gateway import browser_route_allowed
 from tests.test_hub_api import hub, agent_headers, human_headers
-from tests.test_hub_unified_mcp import composed, initialize, content, AUTH, BASE
+from tests.test_hub_unified_mcp import composed, initialize, content, call, AUTH, BASE
 from tests.test_hub_cloudflare_auth import hub as cf_hub, sign_in
 
 API = '/api/hub/v1/notes'
 DOCUMENT = {'project': 'engineering-hub', 'path': 'notes/planning.md', 'title': 'Planning',
             'content': 'Track blockers and next steps, not approval authority.', 'expected_version': 0}
+
+
+def test_archive_blocks_all_wired_knowledge_writers_without_hiding_history(composed):
+    core, bus, _ = composed
+    projects = core.state.project_registry
+    projects.create_project('human:123', 'landscript', 'LandScript', 'landscript')
+    document = DOCUMENT | {'project': 'landscript'}
+    plan = {'scope': 'topic', 'project': 'landscript', 'topic': 'ownership',
+            'kind': 'idea', 'item_id': 'data-handoff', 'title': 'Data handoff',
+            'content': 'Discuss ownership explicitly', 'expected_version': 0}
+    auth = {'Authorization': 'Bearer ' + AUTH.codex_token}
+    with TestClient(core, base_url=BASE) as client:
+        session = initialize(client)
+        saved = content(client, session, 'knowledge_put', document)
+        saved_plan = content(client, session, 'hub_planning_put', {'payload': plan})
+        projects.archive_project('human:123', 'landscript', 1)
+        for name, arguments in (
+            ('knowledge_put', document | {'expected_version': 1, 'content': 'Late note'}),
+            ('hub_planning_put', {'payload': plan | {'expected_version': 1, 'content': 'Late plan'}}),
+        ):
+            rejected = call(client, session, name, arguments)
+            assert rejected.get('isError') and 'project_archived' in str(rejected)
+        for route, payload in ((API, document), ('/api/hub/v1/planning', plan)):
+            rejected = client.post(route, headers=auth, json=payload | {'expected_version': 1})
+            assert rejected.status_code == 409, rejected.text
+            assert rejected.json()['detail']['code'] == 'project_archived'
+        assert content(client, session, 'knowledge_get', {
+            'project': 'landscript', 'path': document['path']}) == saved
+        read_plan = content(client, session, 'hub_planning_get', {
+            key: plan[key] for key in ('scope', 'project', 'topic', 'kind', 'item_id')})
+        assert read_plan == saved_plan
+        historical = content(client, session, 'knowledge_put', document | {'project': 'vaultbridge'})
+        assert historical['project'] == 'vaultbridge'
+        assert len(projects.list_projects(True)) == 6
 
 
 def test_unavailable_store_is_not_an_empty_or_parallel_store(hub):

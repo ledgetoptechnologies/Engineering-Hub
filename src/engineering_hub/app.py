@@ -44,13 +44,6 @@ from .dto import (
     TaskDTO, TaskListDTO,
 )
 
-PROJECTS = (
-    ("engineering-hub", "Engineering Hub"), ("3d-viewer", "3D Viewer"),
-    ("project-alpha", "Project Alpha"), ("ledge-top-ops", "LedgeTop Ops"),
-    ("treedar", "TreeDar"),
-)
-
-
 @dataclass(frozen=True)
 class Settings:
     database: Path
@@ -258,7 +251,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if not callable(bus_health):
             raise ValueError('Unified bus health source required')
         from agent_message_bus.knowledge import KnowledgeRepository
-        notes_repository = KnowledgeRepository(service.repository.path)
+        notes_repository = getattr(service, 'knowledge', None)
+        if (type(notes_repository) is not KnowledgeRepository
+                or notes_repository.db_path.resolve() != Path(service.repository.path).resolve()):
+            raise ValueError('Unified bus requires its exact shared knowledge writer')
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -403,6 +399,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     from .label_sets import LabelSetRepository
     from .attachments import EntityImageRepository
+    from .projects import ProjectRepository
+    project_registry = ProjectRepository(repo)
+    if notes_repository is not None:
+        # Configure the one writer captured by the original MCP tools as well
+        # as notes/planning. No per-request or remotely supplied guard exists.
+        notes_repository.configure_write_admission(project_registry.knowledge_write_admission)
     label_sets = LabelSetRepository(repo)
     entity_images = EntityImageRepository(repo)
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
@@ -412,6 +414,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           planning_repository=notes_repository,
                           label_sets=label_sets,
                           entity_images=entity_images,
+                          project_registry=project_registry,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
     origin = urlsplit(settings.auth_config.origin)
@@ -562,6 +565,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_image_routes(app, repository=entity_images, actor=actor)
     from .activity_api import attach_activity_routes
     attach_activity_routes(app, repository=repo, actor=actor)
+    from .projects_api import attach_project_routes
+    attach_project_routes(app, repository=project_registry, actor=actor, human=human)
+    app.state.project_registry = project_registry
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes
@@ -682,9 +688,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                  headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
 
     def projects():
-        return [{"id": key, "name": name, "environment": "staging",
-                 "executor_enabled": False, "health": "unknown",
-                 "reason": "inventory_and_acceptance_required"} for key, name in PROJECTS]
+        from .projects_api import project_view
+        return [project_view(item) for item in project_registry.list_projects()]
 
     @app.head("/health", include_in_schema=False)
     @app.get("/health", response_model=HealthDTO if bus_app is None else None)
@@ -867,8 +872,15 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     if settings.ui_directory and settings.ui_directory.is_dir():
         from .browser_pages import attach_browser_page_routes
+        # Combined mode historically exposes the fixed application shell, not
+        # private data. Its API middleware verifies Access on bootstrap. Split
+        # ingress additionally gates the shell with its verified Access proof.
+        split_access_shell = (settings.auth_config.human_auth_mode == 'cloudflare_access'
+                              and settings.ingress_mode != 'combined')
         attach_browser_page_routes(app, ui_directory=settings.ui_directory, human=human,
-                                   anonymous_shell=settings.auth_config.human_auth_mode != 'cloudflare_access')
+                                   anonymous_shell=not split_access_shell,
+                                   verified_access_config=settings.auth_config.cloudflare_config
+                                   if split_access_shell else None)
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
     if settings.ingress_mode != "combined":
         from .ingress import HubIngressMiddleware

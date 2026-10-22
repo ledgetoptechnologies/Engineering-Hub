@@ -61,9 +61,9 @@ class EntityImageRepository:
                 'entity_revision': row['entity_revision'],
                 'url': '/api/hub/v1/attachments/' + row['id'] + '/image'}
 
-    def _target(self, db, kind, entity_id):
+    def _target(self, db, kind, entity_id, *, require_active=False):
         item = self.repo._get(db, _uuid(entity_id), _kind(kind))
-        self.repo._project(item['project'])
+        self.repo._project(item['project'], db, require_active=require_active)
         return item
 
     def put(self, *, image_id, kind, entity_id, expected_revision, content,
@@ -79,7 +79,7 @@ class EntityImageRepository:
         clean = _image(content, media_type)
         source_hash = hashlib.sha256(content).hexdigest()
         with self.repo._transaction() as db:
-            target = self._target(db, kind, entity_id)
+            target = self._target(db, kind, entity_id, require_active=True)
             previous = db.execute('SELECT * FROM hub_entity_images WHERE id=?', (image_id,)).fetchone()
             if previous is not None:
                 if (previous['entity_kind'] != kind or previous['entity_id'] != entity_id

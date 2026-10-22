@@ -4,7 +4,7 @@ import hashlib
 import re
 import sqlite3
 import threading
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -28,6 +28,11 @@ class KnowledgeError(ValueError):
 
 class KnowledgeNotFound(KnowledgeError):
     pass
+
+
+class KnowledgeProjectArchived(KnowledgeError):
+    def __init__(self):
+        super().__init__('project_archived')
 
 
 class KnowledgeConflict(KnowledgeError):
@@ -61,7 +66,27 @@ class KnowledgeRepository:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._admission_config_lock = threading.Lock()
+        self._write_admission_factory = None
+        self._write_admission_configured = False
+        self._put_started = False
         self._initialize()
+
+    def configure_write_admission(self, context_factory):
+        """Bind trusted application admission once, before this instance's first put.
+
+        The factory receives a validated project namespace and returns a context
+        manager held through the knowledge commit/read-back. This is an
+        application entrypoint boundary, not protection against arbitrary direct
+        SQLite writers or other independently constructed repository instances.
+        """
+        if not callable(context_factory):
+            raise ValueError('Knowledge write admission must be callable')
+        with self._admission_config_lock:
+            if self._write_admission_configured or self._put_started:
+                raise ValueError('Knowledge write admission is already fixed')
+            self._write_admission_factory = context_factory
+            self._write_admission_configured = True
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
@@ -154,13 +179,19 @@ class KnowledgeRepository:
 
     def put(self, *, project: str, path: str, title: str, content: str,
             author: str, expected_version: int) -> KnowledgeEntry:
+        with self._admission_config_lock:
+            self._put_started = True
+            admission_factory = self._write_admission_factory
         project = self.validate_project(project)
         path = self.validate_path(path)
         self._validate_document(title, content, author, expected_version)
         timestamp = _now()
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        with self._lock, self._connection() as conn:
+        # Admission must precede both this instance's lock and the bus writer
+        # transaction: a composed Hub guard may hold its own writer gate.
+        admission = nullcontext() if admission_factory is None else admission_factory(project)
+        with admission, self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT version, created_by, created_at FROM knowledge WHERE project=? AND path=?",

@@ -7,7 +7,7 @@ from starlette.responses import JSONResponse
 from pydantic import ValidationError
 from pydantic import StrictInt
 from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
-    KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository)
+    KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository, KnowledgeProjectArchived)
 from .planning_api import PlanningWrite, Scope, Kind, Status
 from . import planning
 
@@ -40,7 +40,7 @@ class HubMCPAuthMiddleware:
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
-                  planning_repository=None, label_sets=None, entity_images=None) -> FastMCP:
+                  planning_repository=None, label_sets=None, entity_images=None, project_registry=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -75,6 +75,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('planning_unavailable')
         try:
             return operation(planning_repository)
+        except KnowledgeProjectArchived:
+            raise ToolError('project_archived') from None
         except KnowledgeConflict as error:
             raise ToolError('planning_version_conflict: current_version=' + str(error.current_version)) from None
         except KnowledgeNotFound:
@@ -288,5 +290,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     if entity_images is not None:
         from .attachments_api import register_image_tools
         register_image_tools(mcp, repository=entity_images, identity=identity, invoke=invoke)
+    if project_registry is not None:
+        from .projects_api import register_project_tools
+        register_project_tools(mcp, repository=project_registry, identity=identity, invoke=invoke)
 
     return mcp

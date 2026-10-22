@@ -12,7 +12,7 @@ from .image_version_reports import ImageVersionsSummary
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
-ProjectId = Literal['engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar']
+ProjectId = Annotated[str, Field(pattern=r'^[a-z0-9][a-z0-9-]{0,63}$')]
 Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
@@ -129,10 +129,19 @@ class RecoveryDTO(ResponseDTO):
 class ProjectDTO(ResponseDTO):
     id: ProjectId
     name: str
-    environment: Literal['staging']
+    environment: Literal['staging', 'notes_only']
     executor_enabled: bool
     health: str
     reason: str
+    description: str = ''
+    repository_url: str | None = None
+    lead_agent: AgentId | None = None
+    status: Literal['on_track', 'at_risk', 'off_track', 'paused'] = 'on_track'
+    parent_project: ProjectId | None = None
+    archived: bool = False
+    revision: int = Field(default=1, ge=1)
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class AgentConnectionDTO(ResponseDTO):

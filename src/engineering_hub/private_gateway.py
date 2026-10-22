@@ -26,6 +26,7 @@ PRIVATE_ORIGIN = 'http://hub-private.invalid'
 _UUID = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
 _TOPIC = r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}'
 _LABEL_ID = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
+_PROJECT_ID = r'[a-z0-9][a-z0-9-]{0,63}'
 _GET = frozenset({
     '/', '/index.html', '/hub.svg', '/favicon.ico',
     '/api/hub/v1/auth/login', '/api/hub/v1/auth/me',
@@ -35,7 +36,7 @@ _GET = frozenset({
         'planning', 'planning/document', 'activity', 'label-sets')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
-    'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning'))
+    'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning'))
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',
@@ -55,15 +56,20 @@ def browser_route_allowed(method, path):
         return (path in _GET or client_page_allowed(method, path)
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/attachments', path) is not None
                 or re.fullmatch(r'/api/hub/v1/attachments/' + _UUID + '/image', path) is not None
                 or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + r'(?:/results|/items/' + _LABEL_ID + '/image)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/topics/' + _TOPIC + r'/(?:peers|preflight|events)', path) is not None)
     if method == 'PUT':
         return re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
+    if method == 'PATCH':
+        return re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
     return method == 'POST' and (path in _POST or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
-        or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/context', path) is not None)
+        or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/context', path) is not None
+        or path == '/api/hub/v1/projects'
+        or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/archive', path) is not None)
 
 
 def _is_events(path):

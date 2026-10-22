@@ -5,7 +5,7 @@ from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from agent_message_bus.knowledge import (KnowledgeRepository, KnowledgeConflict,
-    KnowledgeError, KnowledgeIntegrityError, KnowledgeNotFound)
+    KnowledgeError, KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeProjectArchived)
 from .planning import get_item, list_items, put_item
 
 
@@ -36,6 +36,8 @@ def attach_planning_routes(app, *, repository, actor):
             raise HTTPException(503, detail={'code': 'planning_unavailable'})
         try:
             return operation(repository)
+        except KnowledgeProjectArchived:
+            raise HTTPException(409, detail={'code': 'project_archived'}) from None
         except KnowledgeConflict as error:
             raise HTTPException(409, detail={'code': 'planning_version_conflict',
                                              'current_version': error.current_version}) from None

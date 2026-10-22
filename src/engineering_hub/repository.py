@@ -194,10 +194,22 @@ class HubRepository:
             raise HubError('invalid_input')
         return value.strip()
 
-    @staticmethod
-    def _project(project):
-        if project not in PROJECTS:
+    def _project(self, project, db=None, *, require_active=True):
+        """Validate metadata scope, never an execution target or permission grant."""
+        if type(project) is not str or re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project) is None:
             raise HubError('invalid_project')
+        if db is None:
+            with self._connection() as connection:
+                return self._project(project, connection, require_active=require_active)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_projects'").fetchone():
+            if project not in PROJECTS:
+                raise HubError('invalid_project')
+            return
+        row = db.execute('SELECT data FROM hub_projects WHERE id=?', (project,)).fetchone()
+        if row is None:
+            raise HubError('invalid_project')
+        if require_active and json.loads(row['data']).get('archived', False):
+            raise HubError('project_archived', 409)
 
     @staticmethod
     def _get(db, identity, kind):
@@ -248,6 +260,7 @@ class HubRepository:
         payload = [project, title] + ([context] if context else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
+            self._project(project, db)
             prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
             if prior:
                 if prior['fingerprint'] != fingerprint:
@@ -301,6 +314,7 @@ class HubRepository:
         payload = ['staging_task_proposal', project, title] + ([context] if context else [])
         fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
+            self._project(project, db)
             prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
             if prior:
                 if prior['fingerprint'] != fingerprint:
@@ -326,6 +340,10 @@ class HubRepository:
         if row is None:
             return True
         task = json.loads(row['data'])
+        try:
+            self._project(task.get('project'), db)
+        except HubError:
+            return False
         if 'scope' not in task and 'proposed_by' not in task:
             return True
         return (task.get('scope') == 'staging' and type(task.get('proposed_by')) is str
@@ -339,6 +357,7 @@ class HubRepository:
         self._actor(actor, agent=True)
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['status'] != 'assigned':
                 raise HubError('already_claimed', 409)
@@ -358,6 +377,7 @@ class HubRepository:
             raise HubError('invalid_commit')
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['owner'] != actor:
                 raise HubError('forbidden', 403)
@@ -371,6 +391,7 @@ class HubRepository:
             raise HubError('invalid_verdict')
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['owner'] == actor:
                 raise HubError('independent_review_required', 403)
@@ -395,6 +416,7 @@ class HubRepository:
         if allow_text:
             context['allow_text'] = True
         with self._transaction() as db:
+            self._project(project, db)
             return self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
                 title=title, options=options, protected=protected, status='open', answer=None,
                 execution_authorization=False, **context), new=True)
@@ -407,6 +429,7 @@ class HubRepository:
         context = self._context(details, links)
         with self._transaction() as db:
             item = self._get(db, identity, kind)
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             action = kind + '.context_updated'
             if kind == 'decision':
@@ -434,6 +457,7 @@ class HubRepository:
         self._actor(actor, human=True)
         with self._transaction() as db:
             item = self._get(db, identity, 'decision')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item.get('allow_text') is True:
                 try:
@@ -469,6 +493,7 @@ class HubRepository:
                         raise HubError('idempotency_conflict', 409)
                     return self._get(db, prior['run_id'], 'run')
             task = self._get(db, task_id, 'task')
+            self._project(task['project'], db)
             self._cas(task, expected_revision)
             if self._paused(db):
                 raise HubError('paused', 409)

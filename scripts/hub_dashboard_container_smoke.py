@@ -76,7 +76,8 @@ expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_ca
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',
                   'hub_label_set_create', 'hub_label_set_put_image', 'hub_label_set_results',
-                  'hub_label_set_list', 'hub_entity_put_image', 'hub_entity_images'}
+                  'hub_label_set_list', 'hub_entity_put_image', 'hub_entity_images',
+                  'hub_project_list', 'hub_project_get'}
 def rpc(method, params, token):
     headers = {'Host': expected_host, 'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
                'MCP-Protocol-Version': '2025-06-18'}

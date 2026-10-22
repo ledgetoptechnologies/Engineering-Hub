@@ -5,7 +5,6 @@ import re
 from fastapi import HTTPException, Request
 from starlette.responses import FileResponse
 
-from .repository import PROJECTS
 
 _SEGMENT = r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}'
 _TABS = frozenset({'overview', 'work', 'decisions', 'notes', 'labeling', 'activity', 'plans'})
@@ -24,7 +23,7 @@ def client_page_allowed(method, path):
         return False
     if path in _PAGES:
         return True
-    if len(parts) >= 2 and parts[0] == 'projects' and parts[1] in PROJECTS:
+    if len(parts) >= 2 and parts[0] == 'projects' and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', parts[1]):
         return (len(parts) == 2 or len(parts) == 3 and parts[2] in _TABS
                 or len(parts) == 4 and parts[2] == 'labels'
                 and re.fullmatch(_SEGMENT, parts[3]) is not None)
@@ -35,7 +34,8 @@ def client_page_allowed(method, path):
     return False
 
 
-def attach_browser_page_routes(app, *, ui_directory, human, anonymous_shell=False):
+def attach_browser_page_routes(app, *, ui_directory, human, anonymous_shell=False,
+                               verified_access_config=None):
     """Attach before StaticFiles. Existing middleware supplies CSP/no-store.
 
     Authenticate through the caller's existing human session boundary. A path
@@ -49,7 +49,14 @@ def attach_browser_page_routes(app, *, ui_directory, human, anonymous_shell=Fals
         if (not client_page_allowed(request.method, request.url.path)
                 or raw_path != request.url.path.encode('utf-8') or not index.is_file()):
             raise HTTPException(404, detail={'code': 'page_not_found'})
-        if not (anonymous_shell and request.url.path in {'/', '/index.html'}):
+        bootstrap_shell = anonymous_shell and request.url.path in {'/', '/index.html'}
+        if verified_access_config is not None and request.url.path in {'/', '/index.html'}:
+            from .cloudflare_access import _verified_access
+            # Only ingress's in-process verification proof can admit the shell
+            # before its bootstrap request creates the Hub session. A header or
+            # caller-supplied state value alone never grants this exception.
+            bootstrap_shell = _verified_access(request.scope, verified_access_config) is not None
+        if not bootstrap_shell:
             human(request)
         return FileResponse(index, media_type='text/html', headers={'Cache-Control': 'no-store'})
 

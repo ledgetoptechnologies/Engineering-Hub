@@ -3,14 +3,18 @@ import re
 
 from fastapi import HTTPException, Query, Request
 
-from .repository import HubError, HubRepository, PROJECTS
+from .repository import HubError, HubRepository
 
 
 def project_activity(repository, *, project, limit=50, before=None):
     if type(repository) is not HubRepository:
         raise ValueError('Explicit Hub repository required')
-    if project not in PROJECTS:
-        raise HubError('unknown_project', 404)
+    try:
+        repository._project(project, require_active=False)
+    except HubError as error:
+        if error.code == 'invalid_project':
+            raise HubError('unknown_project', 404) from None
+        raise
     if type(limit) is not int or not 1 <= limit <= 100:
         raise HubError('invalid_limit', 422)
     if before is not None and (type(before) is not int or not 1 <= before <= 9223372036854775807):

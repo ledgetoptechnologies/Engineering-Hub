@@ -43,6 +43,7 @@ HUB_TOOLS = {
     "hub_planning_list", "hub_planning_get", "hub_planning_put",
     "hub_label_set_create", "hub_label_set_put_image", "hub_label_set_results", "hub_label_set_list",
     "hub_entity_put_image", "hub_entity_images",
+    "hub_project_list", "hub_project_get",
 }
 
 
