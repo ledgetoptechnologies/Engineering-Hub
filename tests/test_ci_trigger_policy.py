@@ -78,3 +78,25 @@ def test_manual_package_verification_also_requires_main():
     assert set(config['on']) == {'workflow_dispatch'}
     assert config['jobs']['verify-package']['if'] == (
         "${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}")
+
+
+def test_protected_image_profile_runs_before_upload_and_latest_promotion():
+    jobs = workflow('hub-control.yml')['jobs']
+    helper = 'python scripts/hub_protected_container_smoke.py'
+    verify = [step['run'] for step in jobs['verify']['steps'] if helper in step.get('run', '')]
+    assert len(verify) == 1
+    assert '--image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-' in verify[0]
+    assert '--commit "$GITHUB_SHA"' in verify[0]
+    steps = jobs['publish']['steps']
+    local = next(i for i, step in enumerate(steps)
+                 if helper + ' --image "$BUILD_IMAGE"' in step.get('run', ''))
+    upload = next(i for i, step in enumerate(steps)
+                  if 'docker push "$BUILD_IMAGE"' in step.get('run', ''))
+    registry = next(i for i, step in enumerate(steps)
+                    if helper + ' --image "$PACKAGE@$DIGEST"' in step.get('run', ''))
+    promote = next(i for i, step in enumerate(steps)
+                   if 'imagetools create' in step.get('run', ''))
+    assert local < upload == registry < promote
+    assert '--commit "$GITHUB_SHA" > hub-local-protected-startup.json' in steps[local]['run']
+    assert '--commit "$GITHUB_SHA" > hub-registry-protected-startup.json' in steps[registry]['run']
+    assert any('hub-*-startup.json' in step.get('with', {}).get('path', '') for step in steps)

@@ -28,6 +28,8 @@ def main():
             deployment = load_deployment_config(args.config)
         except ValueError:
             parser.error('Invalid or unavailable Hub settings file; configure it before startup')
+        if deployment.protected_ledger:
+            parser.error('Protected ledger requires an explicit owned entrypoint; no runtime started')
         if args.agent_alias_port is not None:
             parser.error('--config does not support an agent alias port')
         args.split_ingress = args.unified_mcp = True

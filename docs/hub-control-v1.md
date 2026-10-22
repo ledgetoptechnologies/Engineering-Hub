@@ -68,6 +68,12 @@ not connected. Topic tracking is independently labelled `not_configured` only
 when no topic observer is configured; a configured observer failure remains
 unavailable/unverified. A bus connection never upgrades topic readiness.
 
+After explicit owner enrollment, the ordinary unowned factory deliberately
+cannot reopen the ledger. See [owned, inactive Hub](owned-inactive-hub.md) for
+the explicit continuation entrypoint that serves normal records and the bus
+without selecting an executor. It does not provision private storage, enroll
+state, enable staging, or provide reboot/restore acceptance.
+
 The REST contract is `contracts/hub-v1.openapi.json`; the running service exposes
 `/openapi.json`. `/api/hub/v1/overview` supplies tasks, decisions, runs, configured
 projects and explicit capability flags. Unknown host/agent state is not online.
