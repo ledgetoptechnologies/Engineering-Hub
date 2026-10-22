@@ -1,3 +1,8 @@
+import { useEffect, useState } from "react";
+import { HubApiError } from "../api";
+import { relativeAge } from "../dashboardText";
+import { listTopics, rememberedTopics, rememberTopic, type TopicEntry } from "../topicsApi";
+import { link } from "../router";
 import { connectionView, observationTime } from "../agentStatus";
 import type { Hub } from "../hub";
 import type { AgentSummary } from "../types";
@@ -33,27 +38,42 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
 
 export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const { peers, demo, stale, topicStale } = hub;
+  const [serverTopics, setServerTopics] = useState<TopicEntry[] | null>(null);
+  const [remembered, setRemembered] = useState<string[]>(rememberedTopics);
+  useEffect(() => {
+    if (demo) return;
+    const controller = new AbortController();
+    listTopics(controller.signal).then((value) => { if (!controller.signal.aborted) setServerTopics(value); })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
+        else setServerTopics(null);
+      });
+    return () => controller.abort();
+  }, [demo, hub.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setRemembered(rememberTopic(hub.topic)); }, [hub.topic]);
+  const topics: TopicEntry[] = serverTopics ?? remembered.map((topic) => ({ topic, last_activity_at: null, peer_count: null, source: "device" }));
+  if (!topics.some((entry) => entry.topic === hub.topic))
+    topics.unshift({ topic: hub.topic, last_activity_at: null, peer_count: null, source: "device" });
+  const connected = hub.data.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
   return (
     <>
       <PageHeader eyebrow="AGENTS" title="Agents"
-        subtitle="Whether each agent's app is connected to the Hub, and whether it can be reached on a specific conversation topic. These are checked separately.">
+        subtitle="Which agents are connected to the Hub, and whether each one can be reached on a conversation topic. These are checked separately.">
         {actions}
       </PageHeader>
-      <section className="panel agents-panel" id="agents">
-        <PanelTitle title="Agents" />
-        <div className="agents-columns">
-          <div>
-            <h3 className="agent-section-title">Connected to the Hub</h3>
-            <div className="hub-connection-list">
-              {hub.data.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
-            </div>
-            <p className="panel-footnote">
-              Connected means the agent's app is linked to the Hub. It doesn't prove the agent
-              is working on anything right now, and not connected doesn't mean it's offline.
-            </p>
-          </div>
-          <div>
-            <h3 className="agent-section-title">Topic readiness</h3>
+      <div id="agents" className="agents-page">
+      <section className="agent-cards" aria-label="Hub connections">
+        {hub.data.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
+      </section>
+      <p className="panel-footnote">
+        {connected} of {hub.data.agents.length} connected. Connected means the agent's app is linked to the Hub. It doesn't prove
+        the agent is working on anything right now, and not connected doesn't mean it's offline.
+      </p>
+      <section className="panel agents-panel" id="topics">
+        <PanelTitle title="Topics" count={topics.length} />
+        <div className="topics-layout">
+          <div className="topic-directory">
             <form className="topic-form" onSubmit={hub.checkTopic}>
               <label htmlFor="topic-root">TOPIC ROOT</label>
               <div>
@@ -62,6 +82,27 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
                 <button className="secondary small" disabled={hub.loading}>Check</button>
               </div>
             </form>
+            <ul className="topic-list" aria-label="Topics">
+              {topics.map((entry) => (
+                <li key={entry.topic}>
+                  <button type="button" className={entry.topic === hub.topic ? "topic-item current" : "topic-item"}
+                    aria-current={entry.topic === hub.topic ? "true" : undefined} onClick={() => hub.selectTopic(entry.topic)}>
+                    <span className="topic-name">{entry.topic}</span>
+                    <span className="topic-meta">
+                      {entry.peer_count !== null ? `${entry.peer_count} agents` : ""}
+                      {entry.last_activity_at ? ` · ${relativeAge(entry.last_activity_at)}` : ""}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <p className="panel-footnote">
+              {serverTopics ? "All topics the Hub knows about."
+                : "Topics checked on this device. A full list of every topic needs a server update."}
+            </p>
+          </div>
+          <div className="topic-detail" aria-label={`Readiness for ${hub.topic}`}>
+            <h3 className="agent-section-title">Readiness on <code>{hub.topic}</code></h3>
             {hub.topicError && <p role="alert" className="notice error">{hub.topicError}</p>}
             {peers?.tracking === "not_configured" && !hub.topicError && (
               <p className="topic-tracking">{!demo && (stale || topicStale)
@@ -107,6 +148,7 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
           </div>
         </div>
       </section>
+      </div>
     </>
   );
 }
@@ -140,7 +182,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
           </div>
           <div className="project-list">
             {data.projects.map((item) => (
-              <a className="project-row" key={item.id} href={`#/projects/${item.id}`}>
+              <a className="project-row" key={item.id} href={link(`/projects/${item.id}`)}>
                 <span className="project-icon"><Icon kind="folder" /></span>
                 <div>
                   <strong>{item.name}</strong>

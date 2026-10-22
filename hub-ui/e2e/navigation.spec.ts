@@ -59,14 +59,26 @@ test("a project page shows only that project's questions, work and notes", async
   await fixture(page);
   await page.goto("/");
   await page.getByRole("navigation", { name: "Projects" }).getByRole("link", { name: "TreeDar" }).click();
-  await expect(page).toHaveURL(/#\/projects\/treedar$/);
+  // Real page addresses (no #) when the server serves the app on every path.
+  await expect(page).toHaveURL(/\/projects\/treedar$/);
+  expect(page.url()).not.toContain("#");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("TreeDar");
+  const tabs = page.getByRole("navigation", { name: "TreeDar sections" });
+  await tabs.getByRole("link", { name: /Needs you/ }).click();
+  await expect(page).toHaveURL(/\/projects\/treedar\/decisions$/);
   await expect(page.locator("form.decision")).toHaveCount(1);
+  await tabs.getByRole("link", { name: /Work/ }).click();
+  await expect(page.locator(".board-card")).toHaveCount(1);
+  await page.getByRole("button", { name: "List" }).click();
   await expect(page.locator("details.task-row")).toHaveCount(1);
   await expect(page.getByText("Count tree crowns in audit plot A1", { exact: true })).toBeVisible();
+  await tabs.getByRole("link", { name: "Notes" }).click();
   await expect(page.getByLabel("Project", { exact: true })).toHaveValue("treedar");
+  // Browser Back returns to the previous tab.
+  await page.goBack();
+  await expect(page).toHaveURL(/\/projects\/treedar\/work$/);
   await page.getByRole("navigation", { name: "Breadcrumb" }).getByRole("link", { name: "Projects" }).click();
-  await expect(page.locator("a.project-card")).toHaveCount(5);
+  await expect(page.locator("table.data-table tbody tr")).toHaveCount(5);
 });
 
 test("work filters narrow by state and search without touching the server", async ({ page }) => {

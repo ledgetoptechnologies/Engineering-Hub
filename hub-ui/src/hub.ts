@@ -23,6 +23,9 @@ export interface Hub {
   topicDraft: string;
   setTopicDraft: (value: string) => void;
   checkTopic: (event: FormEvent) => void;
+  /** The topic whose readiness is currently shown. */
+  topic: string;
+  selectTopic: (topic: string) => void;
   topicError: string;
   topicStale: boolean;
   peerState: (peer: PublicReachability) => string;

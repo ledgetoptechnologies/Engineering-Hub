@@ -81,6 +81,10 @@ test("notes render as inert text with metadata, counts and truncation", async ({
   await expect(panel.getByText("Showing the first 50.", { exact: false })).toBeVisible();
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
+  // Formatted by default: raw HTML in a note is text, never markup.
+  await expect(view.locator(".note-content.formatted")).toContainText("<img src=x onerror=");
+  await expect(view.locator("img")).toHaveCount(0);
+  await view.getByRole("button", { name: "Plain text" }).click();
   await expect(view.locator("pre")).toHaveText("<img src=x onerror=\"window.__pwned=1\">\nStep one\n  indented step");
   await expect(view.locator("img")).toHaveCount(0);
   expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
@@ -281,13 +285,13 @@ test("Refresh and re-opening the open note both re-read its current version", as
   await expect(view.locator(".item-overline")).toContainText("v1");
   bump(state, "runbooks/shared-notes.md", "Saved by an agent as v2");
   await panel.getByRole("button", { name: "Refresh" }).click();
-  await expect(view.locator("pre")).toHaveText("Saved by an agent as v2");
+  await expect(view.locator(".note-content")).toHaveText("Saved by an agent as v2");
   await expect(view.locator(".item-overline")).toContainText("v2");
   await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toContainText("v2");
   bump(state, "runbooks/shared-notes.md", "Saved again as v3");
   const reads = state.docReads;
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
-  await expect(view.locator("pre")).toHaveText("Saved again as v3");
+  await expect(view.locator(".note-content")).toHaveText("Saved again as v3");
   expect(state.docReads).toBe(reads + 1);
   expect(state.posts).toHaveLength(0);
 });
@@ -324,7 +328,7 @@ test("a slow re-read of the previous note never replaces the newly opened note",
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.releaseDoc !== null).toBe(true);
   await panel.getByRole("button", { name: /Second note/ }).click();
-  await expect(panel.getByRole("article", { name: "Second note" }).locator("pre")).toHaveText("B body");
+  await expect(panel.getByRole("article", { name: "Second note" }).locator(".note-content")).toHaveText("B body");
   state.releaseDoc!();
   await page.waitForTimeout(300);
   await expect(panel.getByRole("article", { name: "Second note" })).toBeVisible();
@@ -358,7 +362,7 @@ test("a successful re-read clears only the out-of-date warning", async ({ page }
   state.docStatus = 200;
   bump(state, "runbooks/shared-notes.md", "Recovered v2");
   await panel.getByRole("button", { name: "Refresh" }).click();
-  await expect(view.locator("pre")).toHaveText("Recovered v2");
+  await expect(view.locator(".note-content")).toHaveText("Recovered v2");
   await expect(warning).toHaveCount(0);
   // A save notice is not a read warning and survives a later re-read.
   await view.getByRole("button", { name: "Edit" }).click();

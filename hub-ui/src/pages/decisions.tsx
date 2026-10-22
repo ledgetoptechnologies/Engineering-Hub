@@ -1,3 +1,4 @@
+import { link } from "../router";
 import { answeredBy } from "../dashboardText";
 import { observationTime } from "../agentStatus";
 import type { Hub } from "../hub";
@@ -9,7 +10,7 @@ export function DecisionCard({ hub, decision }: { hub: Hub; decision: Decision }
   return (
     <form className="decision" onSubmit={(event) => hub.recordDecision(event, decision)}>
       <div className="item-overline">
-        <a className="project-chip" href={`#/projects/${decision.project}`}>{hub.projectName(decision.project)}</a>
+        <a className="project-chip" href={link(`/projects/${decision.project}`)}>{hub.projectName(decision.project)}</a>
         <span>REV {decision.revision}</span>
       </div>
       <h3>{decision.title}</h3>

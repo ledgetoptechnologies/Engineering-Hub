@@ -1,11 +1,10 @@
+import { link } from "../router";
 import { useState } from "react";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
-import { NotesPanel } from "../NotesPanel";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { TaskTable } from "./tasks";
-import { LabelSetsPanel } from "./LabelSets";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -82,35 +81,6 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   );
 }
 
-export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
-  return (
-    <>
-      <PageHeader eyebrow="PROJECTS" title="Projects" subtitle="Each project's open questions, work and staging status.">{actions}</PageHeader>
-      <div className="project-cards">
-        {hub.data.projects.map((item) => {
-          const open = openDecisions(hub, item.id).length;
-          const tasks = hub.data.tasks.filter((task) => task.project === item.id);
-          const active = tasks.filter((task) => task.status !== "verified").length;
-          return (
-            <a className="project-card" key={item.id} href={`#/projects/${item.id}`}>
-              <div className="project-card-head">
-                <span className="project-square" />
-                <h2>{item.name}</h2>
-                <StagingBadge hub={hub} id={item.id} />
-              </div>
-              <dl>
-                <div><dt>Waiting on you</dt><dd className={open ? "attention" : ""}>{open}</dd></div>
-                <div><dt>Open tasks</dt><dd>{active}</dd></div>
-                <div><dt>Review passed</dt><dd>{tasks.length - active}</dd></div>
-              </dl>
-            </a>
-          );
-        })}
-      </div>
-    </>
-  );
-}
-
 export function StagingBadge({ hub, id }: { hub: Hub; id: string }) {
   const item = hub.data.projects.find((project) => project.id === id);
   if (!item) return null;
@@ -119,46 +89,5 @@ export function StagingBadge({ hub, id }: { hub: Hub; id: string }) {
       {!item.executor_enabled && item.health === "unknown" ? "Not set up yet"
         : item.health === "unknown" ? "Health unknown" : pretty(item.health)}
     </Badge>
-  );
-}
-
-export function ProjectPage({ hub, id, actions, notesProps }: {
-  hub: Hub; id: string; actions: React.ReactNode;
-  notesProps: Omit<React.ComponentProps<typeof NotesPanel>, "selectedProject">;
-}) {
-  const item = hub.data.projects.find((project) => project.id === id);
-  if (!item) {
-    return (
-      <>
-        <PageHeader eyebrow="PROJECTS" title="Project not found">{actions}</PageHeader>
-        <section className="panel"><p>This project isn't in the workspace. <a className="text-link" href="#/projects">Back to projects</a></p></section>
-      </>
-    );
-  }
-  const waiting = openDecisions(hub, id);
-  const tasks = hub.data.tasks.filter((task) => task.project === id);
-  return (
-    <>
-      <nav className="crumbs" aria-label="Breadcrumb"><a href="#/projects">Projects</a> <span>/</span> {item.name}</nav>
-      <PageHeader eyebrow="PROJECT" title={item.name}
-        subtitle={item.executor_enabled ? "Staging target enabled."
-          : "No staging target yet. Setting one up needs an inventory of the target and your acceptance."}>
-        <StagingBadge hub={hub} id={id} />
-        {actions}
-      </PageHeader>
-      <div className="project-layout">
-        <section className="panel decisions" aria-label={`${item.name} decisions`}>
-          <PanelTitle title="Needs you" count={waiting.length} />
-          <DecisionList hub={hub} decisions={waiting} emptyNote="No open questions for this project." />
-          <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id)} />
-        </section>
-        <section className="panel work" aria-label={`${item.name} work`}>
-          <PanelTitle title="Work" count={tasks.length} />
-          <TaskTable hub={hub} tasks={tasks} empty="No tasks for this project yet." />
-        </section>
-      </div>
-      <LabelSetsPanel hub={hub} project={id} />
-      <NotesPanel {...notesProps} selectedProject={id} />
-    </>
   );
 }

@@ -4,10 +4,11 @@ import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { NotesPanel } from "./NotesPanel";
 import type { Hub } from "./hub";
-import { href, useRoute, type Route } from "./router";
+import { href, link, useRoute, type Route } from "./router";
 import { Badge, Icon, Modal, PageHeader, pretty, type IconKind } from "./ui";
 import { HomePage } from "./pages/HomePage";
-import { InboxPage, ProjectPage, ProjectsPage, WorkPage } from "./pages/WorkPages";
+import { InboxPage, WorkPage } from "./pages/WorkPages";
+import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
@@ -48,7 +49,8 @@ const errorText = (error: unknown) =>
     : "The connection could not be verified. No result is being assumed.";
 
 export function HubApp() {
-  const demo = new URLSearchParams(location.search).get("demo") === "1";
+  // Read once: the mode must not change if the address is rewritten later.
+  const [demo] = useState(() => new URLSearchParams(location.search).get("demo") === "1");
   const client = useMemo(
     () => new HubClient({ mode: demo ? "demo" : "live" }),
     [demo],
@@ -407,13 +409,17 @@ export function HubApp() {
 
   function checkTopic(event: FormEvent) {
     event.preventDefault();
-    if (topicDraft !== topic) {
+    selectTopic(topicDraft);
+  }
+  function selectTopic(next: string) {
+    setTopicDraft(next);
+    if (next !== topic) {
       topicReads.current++;
       setPeers(null);
       setRegistryEpoch(null);
       setTopicStale(false);
       setTopicError("");
-      setTopic(topicDraft);
+      setTopic(next);
     } else {
       setRegistryRetry((value) => value + 1);
       void refresh();
@@ -492,7 +498,7 @@ export function HubApp() {
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
     requestPause: (paused: boolean) => setPauseChoice(paused),
-    clearPrivateWorkspace, peers, topicDraft, setTopicDraft, checkTopic, topicError, topicStale, peerState,
+    clearPrivateWorkspace, peers, topic, topicDraft, setTopicDraft, checkTopic, selectTopic, topicError, topicStale, peerState,
   } : null;
   const waitingCount = hub ? openDecisions(hub).length : 0;
   const activeWork = data ? data.tasks.filter((task) => task.status !== "verified").length : 0;
@@ -533,7 +539,7 @@ export function HubApp() {
     <div className={`shell ${menuOpen ? "menu-open" : ""}`}>
       <aside className="sidebar">
         <a className="brand" href={demo ? "/?demo=1" : "/"}>
-          <span className="brand-mark">H</span>
+          <img className="brand-mark" src="/hub.svg" alt="" width="44" height="44" />
           <span>
             Engineering
             <br />
@@ -564,7 +570,7 @@ export function HubApp() {
           </div>
           <nav aria-label="Projects" className="project-nav">
             {data?.projects.map((item) => (
-              <a key={item.id} href={`#/projects/${item.id}`}
+              <a key={item.id} href={link(`/projects/${item.id}`)}
                 className={(route.page === "project" && route.id === item.id) || (route.page === "labels" && route.project === item.id)
                   ? "project-link current" : "project-link"}>
                 <span className="project-square" />
@@ -659,7 +665,7 @@ export function HubApp() {
             {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
             {route.page === "projects" && <ProjectsPage hub={hub} actions={actions} />}
-            {route.page === "project" && <ProjectPage hub={hub} id={route.id} actions={actions} notesProps={notesProps} />}
+            {route.page === "project" && <ProjectPage hub={hub} id={route.id} tab={route.tab} actions={actions} notesProps={notesProps} />}
             {route.page === "notes" && (
               <>
                 <PageHeader eyebrow="NOTES" title="Shared notes"
