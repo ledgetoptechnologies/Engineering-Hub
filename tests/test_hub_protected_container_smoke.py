@@ -48,7 +48,10 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
                 'Host':'tcp://remote:2375' if failure in {'network','ambient_local_remote_context'}
                 else 'unix:///var/run/docker.sock'}}})
         assert os.environ['DOCKER_CONTEXT']=='verified-local'
-        if args[1:3]==('image','inspect'): return IMAGE_ID
+        if args[1:3]==('image','inspect'):
+            if args[args.index('--format')+1]=='{{json .Config.Entrypoint}}':
+                return json.dumps(['python','-m','engineering_hub','--host','0.0.0.0','--port','8770'])
+            return IMAGE_ID
         if args[1:3]==('volume','inspect'):
             volume=args[-1]
             owner=volume.removeprefix('hub-protected-state-')
@@ -59,6 +62,8 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
             return json.dumps({'protected_seed':'passed','enrollment_cli':'passed',
                                'abort_before_enrollment':'unchanged','reenrollment':'refused'})
         if args[1]=='run' and args[-1]==module.VERIFY: return json.dumps({'preservation':'passed'})
+        if args[1]=='run' and module.REJECT_UNMOUNTED in args:
+            return json.dumps({'unmounted_default_and_v1':'refused','phantom_ledger':False})
         if args[1:3]==('container','inspect'):
             prior=next(c for c in calls if c[1]=='run' and c[c.index('--name')+1]==args[-1])
             owner=prior[prior.index('--label')+1].split('=',1)[1]
@@ -103,7 +108,9 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
         assert args[args.index('--memory')+1]==args[args.index('--memory-swap')+1]=='512m'
         assert args[args.index('--cpus')+1]=='1' and args[args.index('--pids-limit')+1]=='128'
         assert args[args.index('--user')+1]=='568:568'
-        assert '--read-only' in args and args[args.index('--cap-drop')+1]=='ALL'
+        negative=module.REJECT_UNMOUNTED in args
+        assert ('--read-only' not in args if negative else '--read-only' in args)
+        assert args[args.index('--cap-drop')+1]=='ALL'
         assert not {'--privileged','--publish','-p','--device','--env-file'} & set(args)
         assert not any('live-sentinel' in value for value in args)
         if '-d' in args:
@@ -124,7 +131,9 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
 
 def test_embedded_scripts_compile_and_keep_real_guards(monkeypatch):
     module=load(monkeypatch)
-    for script in (module.SEED,module.PROBE,module.VERIFY): ast.parse(script)
+    for script in (module.SEED,module.PROBE,module.VERIFY,module.REJECT_UNMOUNTED): ast.parse(script)
+    assert 'hub_image_state_mount_required' in module.REJECT_UNMOUNTED
+    assert 'not ledger.exists()' in module.REJECT_UNMOUNTED
     assert 'allow_ephemeral' not in module.SEED
     assert 'INSERT INTO hub_pilot_owner' not in module.SEED
     assert "'engineering_hub.pilot_enrollment',*args]" in module.SEED
