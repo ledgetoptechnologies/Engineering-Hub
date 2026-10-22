@@ -72,6 +72,105 @@ async function fixture(page: Page) {
 }
 const panelOf = (page: Page) => page.getByRole("region", { name: "Shared notes" });
 
+test("dirty note navigation can be cancelled or explicitly discarded", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("unsaved route draft");
+  for (const link of [
+    page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Home", exact: true }),
+    page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "TreeDar", exact: true }),
+  ]) {
+    page.once("dialog", dialog => { void dialog.dismiss(); });
+    await link.click();
+    await expect(page).toHaveURL(/#\/notes$/);
+    await expect(panel.getByLabel("Content")).toHaveValue("unsaved route draft");
+  }
+  page.once("dialog", dialog => { void dialog.accept(); });
+  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Home", exact: true }).click();
+  await expect(page).toHaveURL(/#\/$/);
+  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
+  await expect(panel.getByLabel("Content")).toHaveCount(0);
+  expect(state.posts).toHaveLength(0);
+});
+
+test("cancelled browser Back and Forward preserve both the dirty draft and history", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/");
+  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("back history draft");
+  page.once("dialog", dialog => { void dialog.dismiss(); });
+  await page.goBack();
+  await expect(page).toHaveURL(/#\/notes$/);
+  await expect(panel.getByLabel("Content")).toHaveValue("back history draft");
+  page.once("dialog", dialog => { void dialog.accept(); });
+  await page.goBack();
+  await expect(page).toHaveURL(/#\/$/);
+  await page.goForward();
+  await expect(page).toHaveURL(/#\/notes$/);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("forward history draft");
+  // Add a following page, then return without leaving a dirty editor behind.
+  page.once("dialog", dialog => { void dialog.accept(); });
+  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Home", exact: true }).click();
+  await page.goBack();
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("forward preserved draft");
+  page.once("dialog", dialog => { void dialog.dismiss(); });
+  await page.goForward();
+  await expect(page).toHaveURL(/#\/notes$/);
+  await expect(panel.getByLabel("Content")).toHaveValue("forward preserved draft");
+  page.once("dialog", dialog => { void dialog.accept(); });
+  await page.goForward();
+  await expect(page).toHaveURL(/#\/$/);
+  expect(state.posts).toHaveLength(0);
+});
+
+test("authorization loss clears a dirty note without a discard prompt", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("private revoked draft");
+  const dialogs: string[] = [];
+  page.on("dialog", dialog => { dialogs.push(dialog.type()); void dialog.dismiss(); });
+  state.listStatus = 401;
+  await panel.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(page.getByRole("link", { name: /Sign in securely/ })).toBeVisible();
+  await expect(page.getByText("private revoked draft", { exact: true })).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
+  expect(dialogs).toEqual([]);
+  expect(state.posts).toHaveLength(0);
+});
+
+test("project-to-project navigation protects the project's note draft", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/projects/engineering-hub");
+  const panel = panelOf(page);
+  await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
+  await panel.getByRole("button", { name: "Edit", exact: true }).click();
+  await panel.getByLabel("Content").fill("project scoped unsaved draft");
+  const nextProject = page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "TreeDar", exact: true });
+  page.once("dialog", dialog => { void dialog.dismiss(); });
+  await nextProject.click();
+  await expect(page).toHaveURL(/#\/projects\/engineering-hub$/);
+  await expect(panel.getByLabel("Content")).toHaveValue("project scoped unsaved draft");
+  page.once("dialog", dialog => { void dialog.accept(); });
+  await nextProject.click();
+  await expect(page).toHaveURL(/#\/projects\/treedar$/);
+  await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
+  await expect(panel.getByLabel("Content")).toHaveCount(0);
+  expect(state.posts).toHaveLength(0);
+});
+
 test("notes render as inert text with metadata, counts and truncation", async ({ page }) => {
   const state = await fixture(page);
   state.truncated = true;

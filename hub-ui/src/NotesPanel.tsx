@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { HubApiError, type HubMode } from "./api";
+import { registerRouteLeaveGuard } from "./router";
 import {
   isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
   NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
@@ -92,6 +93,7 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   function confirmDiscard(): boolean {
     return !dirtyRef.current || window.confirm(dirtyPrompt);
   }
+  useEffect(() => registerRouteLeaveGuard(() => !dirtyRef.current || window.confirm(dirtyPrompt)), []);
   function closeEditor() {
     saveGeneration.current++; setDraft(null); setConflict(null); setSaving(false);
   }
