@@ -43,7 +43,11 @@ activate a transport. The provider's `invoke(attempt, admission_guard)` and
 `verify_terminal(attempt, receipt_id)` are asynchronous operator-trusted methods.
 The invocation must check the synchronous admission guard before each new host
 effect. Verification must inspect the original attempt rather than accept
-user-supplied JSON. This source API does not supply a concrete host provider.
+user-supplied JSON.
+
+An optional concrete same-host provider is documented in
+[development-ci-local-provider.md](development-ci-local-provider.md). It does
+not supply the remote TrueNAS-to-staging transport or activate a live worker.
 
 Tests can exercise this API with simulated providers, but that is not proof the
 actual staging controller or private NAS connection has been enrolled for CI.
@@ -82,7 +86,7 @@ The local controller's existing advisory JSON is not an authenticated remote
 receipt merely because it says `terminal_verified`.
 
 A future host provider must prove the real binding and writer exclusion. No
-such provider, transport endpoint, credential, machine service, automatic
+remote provider, transport endpoint, credential, machine service, automatic
 reconciliation or restart/restore authority is created by a source-only adapter.
 
 ## Verification and deployment reporting

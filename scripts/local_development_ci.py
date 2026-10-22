@@ -7,6 +7,7 @@ only after host-side kernel resource checks and never gets a Docker socket.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import ExitStack
 import errno
 import hashlib
@@ -261,7 +262,17 @@ def verify_created(row, image, name, input_directory, profile, intent):
         raise CIError('Actual container profile mismatch')
 
 
-def run(args):
+def run(args, *, expected_commit=None, admission_guard=None, terminal_observer=None):
+    """Standalone by default; optional hooks belong only to trusted composition.
+
+    A terminal observer receives detached observations while the original kernel
+    FD and admission locks are still held. It is not a public receipt endpoint.
+    """
+    hooks=admission_guard is not None or terminal_observer is not None
+    if (expected_commit is not None and
+            (not isinstance(expected_commit,str) or not re.fullmatch('[a-f0-9]{40}',expected_commit))
+        or hooks and (expected_commit is None or not callable(admission_guard) or not callable(terminal_observer))):
+        raise CIError('Complete private integration hooks and exact source commit required')
     validate_timeout(args.timeout)
     if sys.platform != 'linux' or not IMAGE.fullmatch(args.image):
         raise CIError('Linux bounded immutable-image CI required')
@@ -278,10 +289,14 @@ def run(args):
             raise CIError('Engine is stopping or has retained CI intent; admission denied')
         lock = private_lock(output / 'runner.lock')
         stack.callback(os.close, lock)
-        return _run_admitted(args, checkout, output, engine_directory)
+        if expected_commit is None and not hooks:
+            return _run_admitted(args, checkout, output, engine_directory)
+        return _run_admitted(args, checkout, output, engine_directory,
+            expected_commit=expected_commit, admission_guard=admission_guard, terminal_observer=terminal_observer)
 
 
-def _run_admitted(args, checkout, output, engine_directory):
+def _run_admitted(args, checkout, output, engine_directory, *, expected_commit=None,
+                  admission_guard=None, terminal_observer=None):
     held = output / 'HELD.json'
     engine_held = engine_directory / 'HELD.json'
     container = None
@@ -289,6 +304,7 @@ def _run_admitted(args, checkout, output, engine_directory):
     terminal = False
     started = False
     kernel = None
+    profile_verified = False
     result = {'schema': 'engineering-hub.local-ci.v1', 'state': 'preflight',
               'advisory': True, 'execution_authorization': False, 'profile': args.profile,
               'phase': 'preflight'}
@@ -313,6 +329,8 @@ def _run_admitted(args, checkout, output, engine_directory):
                                 cwd=checkout, environment=environment).decode().strip()
         if not re.fullmatch('[a-f0-9]{40}', commit):
             raise CIError('Exact committed source unavailable')
+        if expected_commit is not None and commit != expected_commit:
+            raise CIError('Candidate branch no longer selects the reviewed commit')
         result.update(source_commit=commit, source_ref=args.ref, image_id=args.image, engine_id=args.engine_id)
         result['phase'] = 'image_verification'
         image = json.loads(docker('image', 'inspect', args.image))[0]
@@ -350,12 +368,18 @@ def _run_admitted(args, checkout, output, engine_directory):
         write_intent(held, marker)
         container = name
         result['phase'] = 'container_creation'
+        if admission_guard is not None:
+            admission_guard()
         cid = docker(*create_arguments(args.image, name, inputs, args.profile, intent)).decode().strip()
         if not CID.fullmatch(cid):
             raise CIError('Created container identity unavailable')
         container = cid
         result['phase'] = 'container_profile_verification'
         verify_created(inspect(), args.image, name, inputs, args.profile, intent)
+        profile_verified = True
+        result.update(container_id=cid, intent=intent, container_name=name)
+        if admission_guard is not None:
+            admission_guard()
         started = True
         result['phase'] = 'container_start'
         docker('container', 'start', cid)
@@ -363,6 +387,8 @@ def _run_admitted(args, checkout, output, engine_directory):
         kernel = verify_kernel_limits(inspect()['State']['Pid'])
         result['kernel_limits'] = kernel.evidence
         result['phase'] = 'source_admission'
+        if admission_guard is not None:
+            admission_guard()
         (inputs / 'admit.json').write_text(json.dumps({'intent': intent}))
         (inputs / 'admit.json').chmod(0o444)
         result['phase'] = 'source_execution'
@@ -403,13 +429,42 @@ def _run_admitted(args, checkout, output, engine_directory):
                 elif exited and kernel is not None:
                     result['cgroup_terminal'] = kernel.verify_empty()
                     terminal = True
+                if terminal and profile_verified and kernel is not None:
+                    result['exit_code'] = state['ExitCode']
             except Exception:
                 result['cleanup_failure_code'] = 'terminal_or_cgroup_unverified'
         if terminal:
             result['state'] = 'failed'
         raise CIError('Local CI unavailable; retained evidence requires inspection') from None
     finally:
+        observer_failed = False
         try:
+            if terminal and terminal_observer is not None and profile_verified and kernel is not None:
+                try:
+                    # The retained CID is immutable, but recheck its exact
+                    # profile/state and the original pinned scope, not a later
+                    # empty pathname or an arbitrary caller result.json.
+                    row=inspect()
+                    verify_created(row,args.image,name,inputs,args.profile,intent)
+                    state=row['State']
+                    if (row.get('Id')!=cid or state.get('Status')!='exited' or state.get('Pid')!=0
+                        or type(state.get('ExitCode')) is not int or not 0<=state['ExitCode']<=255
+                        or any(state.get(key) for key in ('Running','Paused','Restarting'))):
+                        raise CIError('Terminal observation unavailable')
+                    cgroup=kernel.verify_empty()
+                    observation={key:result[key] for key in
+                        ('source_commit','image_id','engine_id','container_id','intent','container_name','profile')}
+                    observation.update(exit_code=state['ExitCode'],timed_out=result.get('timed_out',False),
+                        failed=result['state']!='passed',input_directory=str(inputs),
+                        terminal_verified=True,cgroup_terminal=cgroup,kernel_limits=kernel.evidence)
+                    terminal_observer(copy.deepcopy(observation))
+                except Exception:
+                    # A failed observer may have lost its durable receipt. Keep
+                    # both HELD markers even though local cleanup looked empty.
+                    observer_failed=True
+                    terminal=False
+                    result.update(state='held',failure_phase='terminal_observation',
+                                  failure_code='private_observer_failed')
             result['terminal_verified'] = terminal
             (root / 'result.json').write_text(json.dumps(result, sort_keys=True) + '\n')
             if terminal:
@@ -418,6 +473,8 @@ def _run_admitted(args, checkout, output, engine_directory):
         finally:
             if kernel is not None:
                 kernel.close()
+        if observer_failed:
+            raise CIError('Private terminal observation unavailable; preserve ownership') from None
 
 
 def main():
