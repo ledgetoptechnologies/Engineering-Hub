@@ -65,6 +65,12 @@ accepted host effect or release ownership while it remains active. Unknown or
 nonterminal outcomes retain the machine for explicit reconciliation. Expiry,
 process exit, a disappeared agent, a report file or a terminal-looking dict is
 not capacity-release evidence.
+If write ownership has already been lost, the adapter cannot safely mark the
+job held itself. Read-only inspection may still show the retained `claimed`
+record until the queue processes expiry; the physical reservation remains
+bound. Neither that readable status nor an unexpired lease proves the old
+executor is still authorized. A later owned process may observe the hold, but
+this adapter supplies no takeover or reconciliation authority.
 
 ## Completion is a separate trust boundary
 

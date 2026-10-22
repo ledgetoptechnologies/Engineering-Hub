@@ -230,7 +230,12 @@ async def test_duplicate_submission_is_one_durable_attempt(rig):
 async def test_owner_loss_never_releases_reservation(rig):
     _,job=submit(rig)
     rig.provider.change=rig.owner.close
-    with pytest.raises(HubError): await rig.bridge.run_once()
+    result=await rig.bridge.run_once()
+    # Lost ownership forbids even the attempted held-state write. A read-only
+    # projection may still report the original claimed record; it is neither
+    # completed nor evidence that the physical reservation became available.
+    assert result['id']==job['id'] and result['state']=='claimed'
+    assert reservation(rig)==job['id']
     # Inspect only through a newly acquired owned process; the old bridge cannot
     # mutate a new epoch or pretend its external attempt was stopped.
     owner=PilotOwner(rig.repo.path,allow_ephemeral_test_storage=True,require_existing=True)
@@ -250,13 +255,20 @@ async def test_owner_loss_never_releases_reservation(rig):
 
 
 @pytest.mark.asyncio
-async def test_renewal_keeps_accepted_job_live_beyond_original_lease(rig):
+async def test_renewal_keeps_accepted_job_live_beyond_original_lease(rig,monkeypatch):
     _,job=submit(rig)
+    renewed=asyncio.Event()
+    actual=rig.queue.renew
+    def observe(**kwargs):
+        result=actual(**kwargs)
+        renewed.set()
+        return result
+    monkeypatch.setattr(rig.queue,'renew',observe)
     rig.provider.release=asyncio.Event()
     running=asyncio.create_task(rig.bridge.run_once())
     await rig.provider.started.wait()
     rig.clock[0]+=500
-    await asyncio.sleep(.035)
+    await asyncio.wait_for(renewed.wait(),timeout=2)
     assert rig.queue.get_job(job['id'])['lease_until']==2100
     rig.clock[0]+=200
     rig.provider.release.set()
@@ -264,13 +276,20 @@ async def test_renewal_keeps_accepted_job_live_beyond_original_lease(rig):
 
 
 @pytest.mark.asyncio
-async def test_renewal_supervises_separate_terminal_inspection(rig):
+async def test_renewal_supervises_separate_terminal_inspection(rig,monkeypatch):
     _,job=submit(rig)
+    renewed=asyncio.Event()
+    actual=rig.queue.renew
+    def observe(**kwargs):
+        result=actual(**kwargs)
+        renewed.set()
+        return result
+    monkeypatch.setattr(rig.queue,'renew',observe)
     rig.provider.inspect_release=asyncio.Event()
     running=asyncio.create_task(rig.bridge.run_once())
     await rig.provider.inspect_started.wait()
     rig.clock[0]+=500
-    await asyncio.sleep(.035)
+    await asyncio.wait_for(renewed.wait(),timeout=2)
     assert rig.queue.get_job(job['id'])['lease_until']==2100
     rig.clock[0]+=200
     rig.provider.inspect_release.set()
@@ -278,17 +297,30 @@ async def test_renewal_supervises_separate_terminal_inspection(rig):
 
 
 @pytest.mark.asyncio
-async def test_lease_expiry_preserves_machine_after_provider_drains(rig):
+async def test_lease_expiry_preserves_machine_after_provider_drains(rig,monkeypatch):
     _,job=submit(rig)
+    inspected=asyncio.Event()
+    actual=rig.queue.live_claim
+    def observe(**kwargs):
+        try:
+            return actual(**kwargs)
+        finally:
+            if rig.clock[0]>1600:
+                inspected.set()
+    monkeypatch.setattr(rig.queue,'live_claim',observe)
     rig.provider.release=asyncio.Event()
     running=asyncio.create_task(rig.bridge.run_once())
     await rig.provider.started.wait()
     rig.clock[0]+=601
-    await asyncio.sleep(.035)
+    await asyncio.wait_for(inspected.wait(),timeout=2)
     rig.provider.release.set()
-    await running
-    rig.queue.status()
+    retained=await running
+    assert retained['state']=='claimed' and retained['requires_reconciliation'] is True
+    # Read-only status cannot convert expiry into a write. A later admission
+    # performs the queue's normal expiry-to-held transition without replay.
+    assert await rig.bridge.run_once() is None
     assert rig.queue.get_job(job['id'])['state']=='held' and reservation(rig)==job['id']
+    assert len(rig.provider.calls)==1
 
 
 @pytest.mark.asyncio
@@ -298,10 +330,10 @@ async def test_repeated_cancellation_drains_before_propagation_and_serializes(ri
     running=asyncio.create_task(rig.bridge.run_once())
     await rig.provider.started.wait()
     running.cancel()
-    await asyncio.sleep(.005)
+    await asyncio.sleep(0)
     running.cancel()
     second=asyncio.create_task(rig.bridge.run_once())
-    await asyncio.sleep(.02)
+    await asyncio.sleep(0)
     assert not running.done() and not second.done() and reservation(rig)==job['id']
     rig.provider.release.set()
     with pytest.raises(asyncio.CancelledError): await running
