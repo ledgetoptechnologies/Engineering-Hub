@@ -10,6 +10,7 @@ describe("hash routes", () => {
     ["#/projects", { page: "projects" }],
     ["#/projects/treedar", { page: "project", id: "treedar" }],
     ["#/notes", { page: "notes" }],
+    ["#/planning", { page: "planning" }],
     ["#/agents", { page: "agents" }],
     ["#/staging", { page: "staging" }],
   ])("parses %s", (hash, route) => {

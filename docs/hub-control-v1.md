@@ -52,6 +52,16 @@ completion. No observed stream does not mean the agent is offline. Standalone
 Hub instances without the embedded bus leave this observation absent/unknown.
 
 Connection snapshots include `observed_at` and a maximum 30-second `valid_until`.
+Positive transport evidence expires at most 45 seconds after a stream opens or
+its last successful server write, using a monotonic clock. The first write has
+the same bounded startup grace. Snapshot refreshes cannot extend that deadline;
+`valid_until` can be shorter than 30 seconds. Retained streams without recent
+activity contribute to `stale_streams`, not `active_streams` or subscriptions,
+and the connection state is `stale` when no fresh stream remains. Blocked body
+sends on authenticated persistent MCP GET streams time out after 15 seconds.
+These are server-side observations: an intermediary may still accept writes
+after its downstream client disappeared. Neither stream freshness nor a stored
+subscription proves client receipt, agent readiness, or correct-session wake.
 The dashboard expires them locally; it does not poll or start a listener.
 Use Refresh for a new snapshot. Malformed or failed observations are unavailable,
 not connected. Topic tracking is independently labelled `not_configured` only

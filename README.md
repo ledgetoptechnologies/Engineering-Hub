@@ -104,18 +104,28 @@ The live smoke test discovers the server's tools and exercises message delivery,
 
 The current Hub image is built by `.github/workflows/hub-control.yml`. Tested
 `main` publication promotes the verified registry digest to
-`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`. PR checks do not
-publish. Registry publication is not operator deployment or executor enrollment.
+`ghcr.io/ledgetoptechnologies/engineering-hub-control:latest`. Hosted checks run
+only for pushes to `main`, or a manual Hub dispatch selecting `main`. A manual
+dispatch selecting a development branch is refused by the job condition. Pull
+requests, development-branch pushes and tag pushes do not run hosted CI; use
+local staging validation for those changes before merging. Registry publication
+is not operator deployment or executor enrollment.
 
-The separate legacy bus workflow below retains its own release-tag policy;
-its absence of `latest` does not apply to the Hub package.
+The separate legacy bus workflow retains main-only tests, Compose validation and
+a container build. Its historical tag-publication job is explicitly disabled;
+removing tag triggers must not accidentally republish the retired standalone
+`internal-mcp:stable` from a main push. This does not change or delete previously
+published images, tokens or live clients.
 
-`.github/workflows/container.yml` runs tests, Compose validation, and a container build for pull requests and `main`. A SemVer tag such as `v0.6.0` runs the same gates and publishes:
+Historical standalone bus release tags included:
 
 - `ghcr.io/ledgetoptechnologies/internal-mcp:0.6.0`
 - `ghcr.io/ledgetoptechnologies/internal-mcp:sha-<full-commit-sha>`
 
-Stable releases also publish the moving `stable` tag; there is intentionally no mutable `latest` tag. Protect `v*` Git refs and do not move/rebuild a release tag; pin a digest for a deployment that needs content-addressed immutability. The workflow uses the repository-scoped `GITHUB_TOKEN` with `packages: write` and publishes OCI source, version, and revision labels. GitHub leaves a first-published package private by default; this project keeps that visibility.
+Historical stable releases also used the moving `stable` tag, not `latest`.
+Those retained steps are not an active publisher under the main-only policy.
+Do not move/rebuild an old release tag; pin a digest when consuming historical
+images. GHCR package visibility remains unchanged and private.
 
 ## TrueNAS SCALE: current versus legacy
 

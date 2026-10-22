@@ -47,7 +47,9 @@ REST equivalent: authenticated `GET /api/presence`. All three agent identities m
 
 The snapshot includes observation time, `scope: this_server_process`, `native_push_available`, and rows for Hermes, Codex and Claude:
 
-- `active_streams`: authorized persistent GET `/mcp` SSE responses currently observed as open. One-shot tool calls and initialization do not establish a listener.
+- `active_streams`: authorized persistent GET `/mcp` SSE responses with recent server activity. One-shot tool calls and initialization do not establish a listener.
+- `stale_streams`: retained streams whose initial grace or last completed write is at least 45 seconds old; excluded from active stream/subscription counts.
+- `valid_for_seconds`: remaining monotonic transport-evidence lifetime (at most 30 seconds), used by Hub's snapshot deadline. Status reads do not renew old activity. Initial streams have a 45-second first-write grace; existing SSE heartbeats normally write every 15 seconds. A blocked authenticated GET body send is bounded to 15 seconds.
 - `inbox_subscriptions`: registered inbox subscriptions intersecting active streams, gated by healthy native push.
 - `subscribed`: whether that intersection is nonempty.
 - `connected_since`, `subscribed_since`, `last_stream_write_at`: server-observed UTC transport times, or null when unavailable. Successful ASGI writes are not client receipt acknowledgments.
@@ -55,6 +57,10 @@ The snapshot includes observation time, `scope: this_server_process`, `native_pu
 A stored subscription without an active stream is **not** subscribed presence. Disconnect, cancellation, session deletion, unsubscribe and source failure update the relevant state. Multiple streams/sessions are counted without leaking their IDs. Reconnect generations prevent an old stream's cleanup from clearing a replacement stream.
 
 **Subscribed is not online/ready/awake/delivered/read/authorized.** The server cannot infer which desktop chat will act. Network failure detection is subject to the transport's disconnect/write detection; a successful keepalive write is not a client acknowledgment. Counts are local to this server process, not a fleet-wide presence service.
+An intermediary can keep accepting upstream writes after the real client has
+gone away. Such streams can still appear fresh; positive client-response and
+session-binding evidence remains a separate, unverified capability. Do not
+interpret the transport-expiry mitigation as an end-to-end wake fix.
 
 No client heartbeat writes, inbox/database polling, scheduler, model calls, extra network probes or new storage mounts are used. The observer follows stream lifecycle and existing outgoing SSE writes/keepalive comments.
 

@@ -29,10 +29,11 @@ _GET = frozenset({
     '/api/hub/v1/auth/login', '/api/hub/v1/auth/me',
     *('/api/hub/v1/' + name for name in (
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
-        'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document')),
+        'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
+        'planning', 'planning/document')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
-    'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes'))
+    'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning'))
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',
