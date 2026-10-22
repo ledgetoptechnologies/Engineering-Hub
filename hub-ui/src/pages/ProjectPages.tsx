@@ -394,7 +394,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <div><dt>Repository</dt><dd>{repository
                 ? <a className="text-link" href={repository} target="_blank" rel="noopener noreferrer">{new URL(repository).pathname.replace(/^\//, "") || new URL(repository).host}</a>
                 : "None (notes-only)"}</dd></div>
-              <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "Not set up yet"}</dd></div>
+              <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "No staging target"}</dd></div>
               <div><dt>Health</dt><dd>{project.health === "unknown" ? "Not reported" : pretty(project.health)}</dd></div>
               <div><dt>Agents</dt><dd><AgentStack agents={stats.agents} /></dd></div>
               <div><dt>Open tasks</dt><dd>{stats.active}</dd></div>

@@ -625,7 +625,7 @@ test("demo is explicitly labelled and task/decision/pause actions never contact 
     .getByRole("button", { name: "Resume new work", exact: true })
     .click();
   await expect(
-    page.getByText("Emergency pause off", { exact: true }),
+    page.getByText("Running normally: nothing is paused", { exact: true }),
   ).toBeVisible();
   expect(writes).toEqual([]);
 });

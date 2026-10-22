@@ -84,10 +84,11 @@ test("unconfigured projects and runner read as not set up, not as faults", async
   await fixture(page);
   await page.goto("/#/staging");
   const staging = page.locator("#staging");
-  await expect(staging.getByText("Not set up yet", { exact: true })).toHaveCount(5);
+  await expect(staging.getByText("No staging target", { exact: true })).toHaveCount(5);
+  await expect(staging.getByText(/^No projects are connected to the staging PC yet\./)).toBeVisible();
   await expect(staging.getByText("Unknown", { exact: true })).toHaveCount(0);
-  await expect(staging.getByText("Emergency pause off", { exact: true })).toBeVisible();
-  await expect(staging.getByText("Automatic runner not set up. Agents only act on the tasks shown here.", { exact: true })).toBeVisible();
+  await expect(staging.getByText("Running normally: nothing is paused", { exact: true })).toBeVisible();
+  await expect(staging.getByText("No automatic runner is set up, so nothing runs on its own. Agents only act on the tasks shown here.", { exact: true })).toBeVisible();
   await expect(staging.getByRole("button", { name: "Pause new work" })).toBeEnabled();
 });
 

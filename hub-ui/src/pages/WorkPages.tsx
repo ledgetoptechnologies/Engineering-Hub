@@ -86,7 +86,7 @@ export function StagingBadge({ hub, id }: { hub: Hub; id: string }) {
   if (!item) return null;
   return (
     <Badge tone={item.health === "healthy" ? "forest" : "neutral"}>
-      {!item.executor_enabled && item.health === "unknown" ? "Not set up yet"
+      {!item.executor_enabled && item.health === "unknown" ? "No staging target"
         : item.health === "unknown" ? "Health unknown" : pretty(item.health)}
     </Badge>
   );
