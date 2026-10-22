@@ -3679,3 +3679,6 @@ dialog .field-label small {
 dialog .modal-head {
   margin-bottom: 14px;
 }
+/* Notes / Plans & ideas switch inside a project's "Notes & plans" tab */
+.subview-switch { margin: 0 0 14px; }
+.subview-switch a { text-decoration: none; }

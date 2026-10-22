@@ -52,13 +52,16 @@ test("sidebar pages switch without reloading or extra reads, and mark the curren
   await expect(page.getByRole("heading", { level: 1 })).toContainText(/Good (morning|afternoon|evening)/);
   const reads = state.reads;
   for (const [label, heading] of [["Needs you", "Needs you"], ["Work", "Work in motion"], ["Projects", "Projects"],
-    ["Notes", "Shared notes"], ["Agents", "Agents"], ["Staging", "Staging"], ["Home", /Good/]] as const) {
+    ["Agents", "Agents"], ["Staging", "Staging"], ["Home", /Good/]] as const) {
     await nav(page).getByRole("link", { name: new RegExp("^" + label) }).click();
     await expect(page.getByRole("heading", { level: 1 })).toContainText(heading);
     await expect(nav(page).getByRole("link", { name: new RegExp("^" + label) })).toHaveAttribute("aria-current", "page");
   }
   expect(state.reads).toBe(reads);
   expect(state.writes).toBe(0);
+  // Notes and plans live inside each project now, not in the sidebar.
+  await expect(nav(page).getByRole("link", { name: /^Notes/ })).toHaveCount(0);
+  await expect(nav(page).getByRole("link", { name: /^Plans/ })).toHaveCount(0);
 });
 
 test("the inbox count and project filter show only open questions", async ({ page }) => {
@@ -88,7 +91,7 @@ test("a project page shows only that project's questions, work and notes", async
   await page.getByRole("button", { name: "List" }).click();
   await expect(page.locator("details.task-row")).toHaveCount(1);
   await expect(page.getByText("Count tree crowns in audit plot A1", { exact: true })).toBeVisible();
-  await tabs.getByRole("link", { name: "Notes" }).click();
+  await tabs.getByRole("link", { name: "Notes & plans" }).click();
   await expect(page.getByLabel("Project", { exact: true })).toHaveValue("treedar");
   // Browser Back returns to the previous tab.
   await page.goBack();

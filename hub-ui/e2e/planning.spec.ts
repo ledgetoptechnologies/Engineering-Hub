@@ -129,7 +129,8 @@ test("a changed kind on a blank new draft is protected on navigation", async ({ 
 test("a project's Plans tab shows that project's topic plans, not the Hub backlog", async ({ page }) => {
   await fixture(page);
   await page.goto("/#/projects/engineering-hub");
-  await page.getByRole("navigation", { name: "Engineering Hub sections" }).getByRole("link", { name: "Plans" }).click();
+  await page.getByRole("navigation", { name: "Engineering Hub sections" }).getByRole("link", { name: "Notes & plans" }).click();
+  await page.getByRole("group", { name: "Notes and plans" }).getByRole("link", { name: "Plans & ideas" }).click();
   await expect(page).toHaveURL(/\/(#\/)?projects\/engineering-hub\/plans$/);
   const panel = panelOf(page);
   await expect(panel.getByRole("button", { name: /Topic feature idea/ })).toBeVisible();
