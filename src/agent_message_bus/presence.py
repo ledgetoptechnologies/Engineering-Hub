@@ -6,6 +6,9 @@ from typing import Any
 from .push import PushPublisher
 
 
+PRESENCE_SEND_TIMEOUT_SECONDS = 15
+
+
 class MCPStreamPresenceMiddleware:
     """Observe only authorized, successful, persistent MCP SSE GET responses."""
 
@@ -36,7 +39,14 @@ class MCPStreamPresenceMiddleware:
                     stream_token = await self.publisher.open_presence_stream(session_id, agent)
                 return
 
-            await send(message)
+            # A blocked ASGI send otherwise retains an apparently open stream
+            # forever. Only bound the authenticated persistent GET transport;
+            # do not change tool calls, unauthenticated responses or POSTs.
+            if stream_token is not None and message["type"] == "http.response.body":
+                async with asyncio.timeout(PRESENCE_SEND_TIMEOUT_SECONDS):
+                    await send(message)
+            else:
+                await send(message)
             if (stream_token is not None and message["type"] == "http.response.body"
                     and message.get("body")):
                 await self.publisher.record_presence_stream_write(stream_token)

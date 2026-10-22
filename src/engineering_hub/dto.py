@@ -126,7 +126,7 @@ class ProjectDTO(ResponseDTO):
 
 
 class AgentConnectionDTO(ResponseDTO):
-    state: Literal['connected', 'not_observed', 'unavailable']
+    state: Literal['connected', 'stale', 'not_observed', 'unavailable']
     source: Literal['embedded_bus']
     scope: Literal['this_server_process']
     observed_at: str | None
@@ -135,6 +135,7 @@ class AgentConnectionDTO(ResponseDTO):
     inbox_subscriptions: int | None = Field(ge=0)
     subscribed: bool | None
     last_stream_write_at: str | None
+    stale_streams: int | None = Field(ge=0)
     native_push_available: bool | None
 
 
