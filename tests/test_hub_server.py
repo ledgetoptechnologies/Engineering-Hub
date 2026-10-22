@@ -186,3 +186,4 @@ def test_listener_configuration_has_no_independent_owner_or_proxy_trust(monkeypa
     assert listener.config.proxy_headers is False
     assert listener.config.access_log is False
     assert listener.config.workers == 1 and listener.config.reload is False
+    assert listener.config.timeout_graceful_shutdown == 30

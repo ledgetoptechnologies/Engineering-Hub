@@ -15,6 +15,7 @@ import threading
 import uvicorn
 
 from .lifecycle import finish_owned
+from .stream_shutdown import StreamDisconnect
 
 
 class _Listener(uvicorn.Server):
@@ -115,7 +116,9 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
                 raise ValueError("Non-loopback browser bind requires authenticated HubFrontends")
         async with pair.lifespan():
             # Configuration failure must unwind the core owner too.
-            servers = [_listener(pair.agents), _listener(pair.browser)]
+            stopping = asyncio.Event()
+            servers = [_listener(StreamDisconnect(app, stopping))
+                       for app in (pair.agents, pair.browser)]
             workers = [asyncio.create_task(server.serve(sockets=sockets))
                        for server, sockets in zip(servers, (agent_sockets, [browser_socket]))]
             stopped = asyncio.create_task(stop.wait())
@@ -138,10 +141,20 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
                 if stopped not in done:
                     raise RuntimeError("Hub listener stopped unexpectedly")
             finally:
-                for server in servers:
-                    server.should_exit = True
-                stopped.cancel()
-                readiness.cancel()
+                # Sticky admission veto and read-only disconnect precede the
+                # first cleanup await. Keep the core alive for accepted work.
+                admission_error = None
+                try:
+                    if callable(getattr(pair, 'close_admission', None)):
+                        pair.close_admission()
+                except BaseException as error:
+                    admission_error = error
+                finally:
+                    stopping.set()
+                    for server in servers:
+                        server.should_exit = True
+                    stopped.cancel()
+                    readiness.cancel()
 
                 async def drain():
                     await asyncio.gather(stopped, readiness, return_exceptions=True)
@@ -151,4 +164,11 @@ async def serve_frontends(pair_factory, *, agent_host="0.0.0.0", agent_port=8770
 
                 # Keep the shared owner alive until both frontends drain, even
                 # if the supervisor cancels the runner again during cleanup.
-                await finish_owned(drain())
+                try:
+                    await finish_owned(drain())
+                except BaseException as cleanup_error:
+                    if admission_error is not None:
+                        raise admission_error from cleanup_error
+                    raise
+                if admission_error is not None:
+                    raise admission_error
