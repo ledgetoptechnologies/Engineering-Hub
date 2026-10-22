@@ -1,3 +1,4 @@
+import { link } from "../router";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
@@ -19,7 +20,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
       <summary>
         <span>
           <strong>{task.title}</strong>
-          <small><a className="project-chip" href={`#/projects/${task.project}`}>{hub.projectName(task.project)}</a></small>
+          <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a></small>
           {task.scope === "staging" && task.proposed_by && <small>Staging proposal · {names[task.proposed_by]}</small>}
           <small className="task-waiting">{waitingOn(task, (id) => names[id] ?? id)}</small>
           <small title={task.state_since ?? undefined}>{stateAge(task)}</small>

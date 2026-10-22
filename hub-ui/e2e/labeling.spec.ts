@@ -17,7 +17,7 @@ function crownSet() {
     items, updated_at: new Date().toISOString() };
 }
 
-async function fixture(page: Page, { supported = true, sets = [crownSet()] } = {}) {
+async function fixture(page: Page, { supported = true, gateway = false, sets = [crownSet()] } = {}) {
   const state = { puts: [] as { url: string; body: Record<string, unknown>; csrf?: string }[], conflictNext: false, sets };
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
@@ -31,6 +31,8 @@ async function fixture(page: Page, { supported = true, sets = [crownSet()] } = {
     if (path.endsWith("/notes")) return respond({ items: [], truncated: false });
     if (path.startsWith("/api/hub/v1/label-sets")) {
       if (!supported) return respond({ detail: "Not Found" }, 404);
+      // The private gateway refuses routes it does not know with 403, not 404.
+      if (gateway) return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
       const parts = path.split("/").slice(5);
       if (parts.length === 0) {
         const project = url.searchParams.get("project");
@@ -63,11 +65,11 @@ async function fixture(page: Page, { supported = true, sets = [crownSet()] } = {
 
 test("a project lists its labeling sets and opens one with dynamic filters", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/projects/treedar");
+  await page.goto("/#/projects/treedar/labeling");
   const panel = page.getByRole("region", { name: "Labeling" });
   await expect(panel.getByText("1 of 7 labeled", { exact: false })).toBeVisible();
   await panel.getByRole("link", { name: /Crown types, October flight/ }).click();
-  await expect(page).toHaveURL(/#\/projects\/treedar\/labels\/crowns-oct$/);
+  await expect(page).toHaveURL(/\/projects\/treedar\/labels\/crowns-oct$/);
   await expect(page.getByRole("heading", { level: 1 })).toContainText("Crown types, October flight");
   const cards = page.locator("article.label-card");
   await expect(cards).toHaveCount(7);
@@ -119,8 +121,9 @@ test("any agent-defined choices work, not just tree types", async ({ page }) => 
 
 test("servers without labeling sets show no panel and no error", async ({ page }) => {
   await fixture(page, { supported: false });
-  await page.goto("/#/projects/treedar");
+  await page.goto("/#/projects/treedar/labeling");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("TreeDar");
+  await expect(page.getByText("Labeling sets appear here", { exact: false })).toBeVisible();
   await expect(page.getByRole("region", { name: "Labeling" })).toHaveCount(0);
   await page.goto("/#/projects/treedar/labels/crowns-oct");
   await expect(page.getByText("This labeling set isn't available for this project.", { exact: true })).toBeVisible();
@@ -131,4 +134,15 @@ test("a set belonging to another project is never shown under this one", async (
   await page.goto("/#/projects/3d-viewer/labels/crowns-oct");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("Labeling set not found");
   await expect(page.locator("article.label-card")).toHaveCount(0);
+});
+
+test("a gateway that does not know the labeling route is not treated as a sign-out", async ({ page }) => {
+  await fixture(page, { gateway: true });
+  await page.goto("/#/projects/treedar/labeling");
+  await expect(page.getByText("Labeling sets appear here", { exact: false })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Labeling" })).toHaveCount(0);
+  // Still signed in, and the private workspace is still loaded.
+  await expect(page.getByText("operator@example.test", { exact: true })).toBeVisible();
+  await page.getByRole("navigation", { name: "TreeDar sections" }).getByRole("link", { name: /Work/ }).click();
+  await expect(page.getByRole("list", { name: "Work board" })).toBeVisible();
 });

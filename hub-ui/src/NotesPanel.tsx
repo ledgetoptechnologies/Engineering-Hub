@@ -5,6 +5,7 @@ import {
   isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
   NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
 } from "./notesApi";
+import { Markdown } from "./markdown";
 
 export interface NotesPanelProps {
   mode: HubMode;
@@ -24,14 +25,28 @@ interface Draft { base: NoteDocument | null; path: string; title: string; conten
 interface Conflict { project: string; path: string; current: number; latest: NoteDocument | null; latestState: "loading" | "loaded" | "missing" | "failed" }
 type Search = { kind: "query" | "prefix"; text: string };
 
+/** Group list items by folder ("" is the project root), folders sorted, root first. */
+export function groupByFolder<T extends { path: string }>(items: T[]): { folder: string; items: T[] }[] {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const cut = item.path.lastIndexOf("/");
+    const folder = cut < 0 ? "" : item.path.slice(0, cut);
+    groups.set(folder, [...(groups.get(folder) ?? []), item]);
+  }
+  return [...groups].sort(([a], [b]) => a === "" ? -1 : b === "" ? 1 : a.localeCompare(b))
+    .map(([folder, rows]) => ({ folder, items: rows }));
+}
+
 export const DEFAULT_NOTES_PROJECT = "engineering-hub";
 const dirtyPrompt = "You have unsaved note edits. Discard them?";
 
-function when(value: string): string {
-  const date = new Date(value), minutes = Math.round((Date.now() - date.getTime()) / 60000);
-  const age = minutes < 1 ? "just now" : minutes < 60 ? `${minutes}m ago`
+function age(value: string): string {
+  const minutes = Math.round((Date.now() - new Date(value).getTime()) / 60000);
+  return minutes < 1 ? "just now" : minutes < 60 ? `${minutes}m ago`
     : minutes < 2880 ? `${Math.round(minutes / 60)}h ago` : `${Math.round(minutes / 1440)}d ago`;
-  return `${date.toLocaleString()} (${age})`;
+}
+function when(value: string): string {
+  return `${new Date(value).toLocaleString()} (${age(value)})`;
 }
 /** Cloudflare humans are "human:cf:<64 hex>"; show a short, stable label and keep the full id in a tooltip. */
 export function actorLabel(actor: string, viewer?: string | null): string {
@@ -70,6 +85,7 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   const [draft, setDraft] = useState<Draft | null>(null);
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [saving, setSaving] = useState(false);
+  const [plain, setPlain] = useState(false);
   // stale_read marks the warning from a failed re-read, so only a later
   // successful read clears it; other notices are left alone.
   const [notice, setNotice] = useState<{ kind: "status" | "alert"; text: string; stale_read?: true } | null>(null);
@@ -312,13 +328,17 @@ ${latest.path}`;
             ? search.text ? "No notes match this search." : `No notes in ${project} yet.`
             : `${list.items.length} note${list.items.length === 1 ? "" : "s"}${search.text ? " matching" : ""} in ${project}.`}
             {list.truncated && ` Showing the first ${NOTE_LIST_LIMIT}. Narrow the search or path prefix to see the rest.`}</p>
-          <ul>{list.items.map(item => <li key={item.path}>
-            <button type="button" className={item.path === selected ? "note-link current" : "note-link"}
-              aria-current={item.path === selected ? "true" : undefined} onClick={() => open(item.path)}>
-              <strong>{item.title}</strong>
-              <span>{item.path}</span>
-              <span>v{item.version} · <Actor id={item.updated_by} viewer={viewerActor} /> · {when(item.updated_at)}</span>
-            </button></li>)}</ul>
+          {groupByFolder(list.items).map(group => <details key={group.folder} className="note-folder" open>
+            <summary><span className="folder-icon" aria-hidden="true" />{group.folder || project}
+              <span className="tab-count">{group.items.length}</span></summary>
+            <ul>{group.items.map(item => <li key={item.path}>
+              <button type="button" className={item.path === selected ? "note-link current" : "note-link"}
+                aria-current={item.path === selected ? "true" : undefined} onClick={() => open(item.path)}>
+                <strong>{item.title}</strong>
+                <span>{item.path}</span>
+                <span>v{item.version} · <Actor id={item.updated_by} viewer={viewerActor} /> · <time dateTime={item.updated_at} title={new Date(item.updated_at).toLocaleString()}>{age(item.updated_at)}</time></span>
+              </button></li>)}</ul>
+          </details>)}
         </>}
       </div>
       <div className="notes-detail" ref={detailRef}>
@@ -373,9 +393,13 @@ ${latest.path}`;
         : docState === "loading" ? <p role="status">Reading note…</p>
         : doc ? <article className="note-view" aria-label={doc.title}>
           <div className="item-overline">{doc.project}<span>v{doc.version}</span></div>
-          <h3>{doc.title}</h3>
+          <div className="note-view-head"><h3>{doc.title}</h3>
+            <div className="segmented" role="group" aria-label="Note view">
+              <button type="button" aria-pressed={!plain} onClick={() => setPlain(false)}>Formatted</button>
+              <button type="button" aria-pressed={plain} onClick={() => setPlain(true)}>Plain text</button>
+            </div></div>
           <p className="panel-footnote">{doc.path} · Updated by <Actor id={doc.updated_by} viewer={viewerActor} />, {when(doc.updated_at)} · Created by <Actor id={doc.created_by} viewer={viewerActor} />, {when(doc.created_at)}</p>
-          <pre className="note-content">{doc.content}</pre>
+          {plain ? <pre className="note-content">{doc.content}</pre> : <div className="note-content formatted"><Markdown source={doc.content} /></div>}
           {canWrite && <div className="note-actions"><button className="secondary" type="button" onClick={startEdit}>Edit</button></div>}
         </article>
         : <p className="panel-footnote">This note could not be shown.</p>}

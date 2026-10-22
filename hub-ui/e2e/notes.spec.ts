@@ -71,9 +71,20 @@ async function fixture(page: Page) {
   return state;
 }
 const panelOf = (page: Page) => page.getByRole("region", { name: "Shared notes" });
+// Today's gateway has no client-route fallback (#/ addresses); the dev server has one (real paths).
+const MODES = ["path", "hash"] as const;
+async function addressMode(page: Page, mode: (typeof MODES)[number]) {
+  if (mode === "hash") await page.route(/\/projects$/, route => route.fulfill({ status: 403, contentType: "application/json",
+    body: JSON.stringify({ detail: { code: "gateway_route_forbidden" } }) }));
+}
+async function expectMode(page: Page, mode: (typeof MODES)[number]) {
+  if (mode === "hash") expect(page.url()).toContain("#/");
+  else expect(page.url()).not.toContain("#");
+}
 
-test("dirty note navigation can be cancelled or explicitly discarded", async ({ page }) => {
+for (const mode of MODES) test(`dirty note navigation can be cancelled or explicitly discarded (${mode} addresses)`, async ({ page }) => {
   const state = await fixture(page);
+  await addressMode(page, mode);
   await page.goto("/#/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
@@ -85,19 +96,21 @@ test("dirty note navigation can be cancelled or explicitly discarded", async ({ 
   ]) {
     page.once("dialog", dialog => { void dialog.dismiss(); });
     await link.click();
-    await expect(page).toHaveURL(/#\/notes$/);
+    await expect(page).toHaveURL(/\/(#\/)?notes$/);
     await expect(panel.getByLabel("Content")).toHaveValue("unsaved route draft");
   }
   page.once("dialog", dialog => { void dialog.accept(); });
   await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Home", exact: true }).click();
-  await expect(page).toHaveURL(/#\/$/);
+  await expect(page).toHaveURL(/:\d+\/(#\/)?$/);
   await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
   await expect(panel.getByLabel("Content")).toHaveCount(0);
+  await expectMode(page, mode);
   expect(state.posts).toHaveLength(0);
 });
 
-test("cancelled browser Back and Forward preserve both the dirty draft and history", async ({ page }) => {
+for (const mode of MODES) test(`cancelled browser Back and Forward preserve both the dirty draft and history (${mode} addresses)`, async ({ page }) => {
   const state = await fixture(page);
+  await addressMode(page, mode);
   await page.goto("/#/");
   await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
   const panel = panelOf(page);
@@ -106,13 +119,13 @@ test("cancelled browser Back and Forward preserve both the dirty draft and histo
   await panel.getByLabel("Content").fill("back history draft");
   page.once("dialog", dialog => { void dialog.dismiss(); });
   await page.goBack();
-  await expect(page).toHaveURL(/#\/notes$/);
+  await expect(page).toHaveURL(/\/(#\/)?notes$/);
   await expect(panel.getByLabel("Content")).toHaveValue("back history draft");
   page.once("dialog", dialog => { void dialog.accept(); });
   await page.goBack();
-  await expect(page).toHaveURL(/#\/$/);
+  await expect(page).toHaveURL(/:\d+\/(#\/)?$/);
   await page.goForward();
-  await expect(page).toHaveURL(/#\/notes$/);
+  await expect(page).toHaveURL(/\/(#\/)?notes$/);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await panel.getByRole("button", { name: "Edit", exact: true }).click();
   await panel.getByLabel("Content").fill("forward history draft");
@@ -125,11 +138,12 @@ test("cancelled browser Back and Forward preserve both the dirty draft and histo
   await panel.getByLabel("Content").fill("forward preserved draft");
   page.once("dialog", dialog => { void dialog.dismiss(); });
   await page.goForward();
-  await expect(page).toHaveURL(/#\/notes$/);
+  await expect(page).toHaveURL(/\/(#\/)?notes$/);
   await expect(panel.getByLabel("Content")).toHaveValue("forward preserved draft");
   page.once("dialog", dialog => { void dialog.accept(); });
   await page.goForward();
-  await expect(page).toHaveURL(/#\/$/);
+  await expect(page).toHaveURL(/:\d+\/(#\/)?$/);
+  await expectMode(page, mode);
   expect(state.posts).toHaveLength(0);
 });
 
@@ -151,9 +165,10 @@ test("authorization loss clears a dirty note without a discard prompt", async ({
   expect(state.posts).toHaveLength(0);
 });
 
-test("project-to-project navigation protects the project's note draft", async ({ page }) => {
+for (const mode of MODES) test(`project-to-project navigation protects the project's note draft (${mode} addresses)`, async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/projects/engineering-hub");
+  await addressMode(page, mode);
+  await page.goto("/#/projects/engineering-hub/notes");
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await panel.getByRole("button", { name: "Edit", exact: true }).click();
@@ -161,13 +176,15 @@ test("project-to-project navigation protects the project's note draft", async ({
   const nextProject = page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "TreeDar", exact: true });
   page.once("dialog", dialog => { void dialog.dismiss(); });
   await nextProject.click();
-  await expect(page).toHaveURL(/#\/projects\/engineering-hub$/);
+  await expect(page).toHaveURL(/\/(#\/)?projects\/engineering-hub\/notes$/);
   await expect(panel.getByLabel("Content")).toHaveValue("project scoped unsaved draft");
   page.once("dialog", dialog => { void dialog.accept(); });
   await nextProject.click();
-  await expect(page).toHaveURL(/#\/projects\/treedar$/);
+  await expect(page).toHaveURL(/\/(#\/)?projects\/treedar$/);
+  await page.getByRole("navigation", { name: "TreeDar sections" }).getByRole("link", { name: "Notes" }).click();
   await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
   await expect(panel.getByLabel("Content")).toHaveCount(0);
+  await expectMode(page, mode);
   expect(state.posts).toHaveLength(0);
 });
 
@@ -180,6 +197,10 @@ test("notes render as inert text with metadata, counts and truncation", async ({
   await expect(panel.getByText("Showing the first 50.", { exact: false })).toBeVisible();
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
+  // Formatted by default: raw HTML in a note is text, never markup.
+  await expect(view.locator(".note-content.formatted")).toContainText("<img src=x onerror=");
+  await expect(view.locator("img")).toHaveCount(0);
+  await view.getByRole("button", { name: "Plain text" }).click();
   await expect(view.locator("pre")).toHaveText("<img src=x onerror=\"window.__pwned=1\">\nStep one\n  indented step");
   await expect(view.locator("img")).toHaveCount(0);
   expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();
@@ -380,13 +401,13 @@ test("Refresh and re-opening the open note both re-read its current version", as
   await expect(view.locator(".item-overline")).toContainText("v1");
   bump(state, "runbooks/shared-notes.md", "Saved by an agent as v2");
   await panel.getByRole("button", { name: "Refresh" }).click();
-  await expect(view.locator("pre")).toHaveText("Saved by an agent as v2");
+  await expect(view.locator(".note-content")).toHaveText("Saved by an agent as v2");
   await expect(view.locator(".item-overline")).toContainText("v2");
   await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toContainText("v2");
   bump(state, "runbooks/shared-notes.md", "Saved again as v3");
   const reads = state.docReads;
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
-  await expect(view.locator("pre")).toHaveText("Saved again as v3");
+  await expect(view.locator(".note-content")).toHaveText("Saved again as v3");
   expect(state.docReads).toBe(reads + 1);
   expect(state.posts).toHaveLength(0);
 });
@@ -423,7 +444,7 @@ test("a slow re-read of the previous note never replaces the newly opened note",
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.releaseDoc !== null).toBe(true);
   await panel.getByRole("button", { name: /Second note/ }).click();
-  await expect(panel.getByRole("article", { name: "Second note" }).locator("pre")).toHaveText("B body");
+  await expect(panel.getByRole("article", { name: "Second note" }).locator(".note-content")).toHaveText("B body");
   state.releaseDoc!();
   await page.waitForTimeout(300);
   await expect(panel.getByRole("article", { name: "Second note" })).toBeVisible();
@@ -457,7 +478,7 @@ test("a successful re-read clears only the out-of-date warning", async ({ page }
   state.docStatus = 200;
   bump(state, "runbooks/shared-notes.md", "Recovered v2");
   await panel.getByRole("button", { name: "Refresh" }).click();
-  await expect(view.locator("pre")).toHaveText("Recovered v2");
+  await expect(view.locator(".note-content")).toHaveText("Recovered v2");
   await expect(warning).toHaveCount(0);
   // A save notice is not a read warning and survives a later re-read.
   await view.getByRole("button", { name: "Edit" }).click();

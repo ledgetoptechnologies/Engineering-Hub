@@ -1,1 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="10" fill="#cfef5b"/><path d="M11 10v20m18-20v20M11 20h18" fill="none" stroke="#172017" stroke-width="5"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0a1a4a"/><stop offset="1" stop-color="#050d2b"/></linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset=".5" stop-color="#1d4ed8"/><stop offset="1" stop-color="#3b82f6"/></linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7dd3fc"/><stop offset=".55" stop-color="#3b82f6"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient>
+    <linearGradient id="cross" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset=".6" stop-color="#3b82f6"/><stop offset="1" stop-color="#1e40af"/></linearGradient>
+    <pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M8 0H0V8" fill="none" stroke="#3b82f6" stroke-opacity=".16" stroke-width=".5"/></pattern>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#tile)"/>
+  <rect x="10" y="10" width="108" height="108" rx="23" fill="url(#grid)"/>
+  <g fill="none" stroke="#3b82f6" stroke-opacity=".45" stroke-width=".8">
+    <path d="M64 10v108M10 64h108"/>
+    <circle cx="64" cy="64" r="38" stroke-dasharray="2 3"/>
+    <path d="M22 30h10l6 6M106 30H96l-6 6M22 98h10l6-6M106 98H96l-6-6"/>
+  </g>
+  <g fill="#0a1a4a" stroke="#60a5fa" stroke-width=".9">
+    <rect x="61.5" y="17.5" width="5" height="5"/><rect x="61.5" y="105.5" width="5" height="5"/>
+    <rect x="17.5" y="61.5" width="5" height="5"/><rect x="105.5" y="61.5" width="5" height="5"/>
+  </g>
+  <g filter="url(#glow)">
+    <rect x="30" y="28" width="18" height="72" rx="9" fill="url(#bar)"/>
+    <rect x="80" y="28" width="18" height="72" rx="9" fill="url(#bar)"/>
+    <path d="M30 40c2 12 9 20 20 22h22c12 2 19 12 26 26v-24c-4-7-10-12-18-13H54c-10-1-18-7-24-17z" fill="url(#cross)"/>
+  </g>
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="none" stroke="url(#rim)" stroke-width="4" filter="url(#glow)"/>
+</svg>
