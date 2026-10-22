@@ -22,6 +22,8 @@ from starlette.applications import Starlette
 from agent_message_bus.auth import AuthSettings
 from .auth import AuthConfig, SessionStore, build_auth_router, require_human
 from .build_info import read_build_commit
+from .image_version_reports import image_versions_for
+from .image_version_reports import ImageVersionsSummary
 from .repository import HubError, HubRepository
 from .mcp import HubMCPAuthMiddleware, build_hub_mcp
 from .reachability import PublicReachability, project_topic_snapshot
@@ -370,7 +372,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
                           work_queue=work_queue, mcp=bus_mcp,
-                          agent_status=agents_for if bus_app is not None else None)
+                          agent_status=agents_for if bus_app is not None else None,
+                          image_versions=lambda: ImageVersionsSummary.model_validate(
+                              image_versions_for(notes_repository)).model_dump(mode='json'))
     origin = urlsplit(settings.auth_config.origin)
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -669,6 +673,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
+                "image_versions": image_versions_for(notes_repository),
                 "capabilities": {"production": False, "host_dispatch": False,
                                  "github_merge": False, "processing": False,
                                  "fixture_dispatch": fixture_workflow is not None,
@@ -679,6 +684,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def list_projects(request: Request):
         actor(request)
         return {"items": projects()}
+
+    @app.get("/api/hub/v1/image-versions", response_model=ImageVersionsSummary)
+    def image_versions(request: Request):
+        actor(request)
+        return image_versions_for(notes_repository)
 
     @app.get("/api/hub/v1/agents", response_model=AgentListDTO, response_model_exclude_unset=True)
     async def list_agents(request: Request):

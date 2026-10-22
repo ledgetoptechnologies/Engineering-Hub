@@ -34,7 +34,7 @@ class HubMCPAuthMiddleware:
 
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
-                  work_queue=None, mcp=None, agent_status=None) -> FastMCP:
+                  work_queue=None, mcp=None, agent_status=None, image_versions=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -85,6 +85,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             result['autonomy'] = invoke(autonomy_status)
         if agent_status is not None:
             result['agents'] = await agent_status()
+        if image_versions is not None:
+            result['image_versions'] = invoke(image_versions)
         return result
 
     @mcp.tool()

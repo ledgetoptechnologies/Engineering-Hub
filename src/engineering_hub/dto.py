@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from .image_version_reports import ImageVersionsSummary
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
@@ -221,6 +222,7 @@ class OverviewDTO(ResponseDTO):
     agents: list[AgentDTO]
     autonomy: AutonomyDTO
     capabilities: CapabilitiesDTO
+    image_versions: ImageVersionsSummary | None = None
 
 
 class TaskListDTO(ResponseDTO):
