@@ -24,6 +24,19 @@ contract test, **not another reproduction of the complete old REST server** and
 not a recovery artifact. A legacy `schema` number or a healthy endpoint alone
 does not establish record-format downgrade compatibility.
 
+`tests/test_hub_full_state_recovery.py` additionally rehearses an ordinary,
+unenrolled cold recovery with the actual Hub and bus repositories. It compares
+complete database schemas/rows and file hashes, then verifies archived projects,
+context/answers/images, notes, message claims/receipts, immutable file revisions,
+sessions and idempotent replays. Source state remains unchanged; a held synthetic
+run is never dispatched. This is not protected ownership transfer or NAS proof.
+
+An ordinary same-Compose UI update and future protected executor enrollment are
+separate operator changes. Do not require protected mounts or reenrollment merely
+to update the ordinary UI. Neither may bypass its applicable recovery checks;
+the protected identity-continuity requirements below apply only where enrolled
+state is actually involved.
+
 ## Recovery choices and mutation boundary
 
 Before upgrade, identify the exact candidate digest, current authority, existing
