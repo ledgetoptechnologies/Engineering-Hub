@@ -8,6 +8,7 @@ export type Route =
   | { page: "projects" }
   | { page: "project"; id: string }
   | { page: "notes" }
+  | { page: "planning" }
   | { page: "agents" }
   | { page: "staging" };
 
@@ -17,6 +18,7 @@ const legacy: Record<string, Route> = {
   decisions: { page: "inbox" },
   work: { page: "work" },
   notes: { page: "notes" },
+  planning: { page: "planning" },
   agents: { page: "agents" },
   staging: { page: "staging" },
   "software-queue": { page: "staging" },
@@ -57,6 +59,7 @@ export function parseRoute(hash: string): Route {
     case "inbox": return { page: "inbox" };
     case "work": return { page: "work" };
     case "notes": return { page: "notes" };
+    case "planning": return { page: "planning" };
     case "agents": return { page: "agents" };
     case "staging": return { page: "staging" };
     case "projects":
