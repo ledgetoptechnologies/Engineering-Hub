@@ -32,6 +32,23 @@ selection in settings. The selected config remains
 `/var/lib/hub/settings.json`; version two selects the fixed private ledger.
 The image already provides the `/var/lib/hub` directory; it is not a host bind.
 Do not add another copy of the authoritative Hub ledger there.
+The ordinary/default or version-one entrypoint is not valid for this selective
+layout. Repository construction refuses `hub_image_state_mount_required` before
+mkdir/SQLite access when a ledger under `/var/lib/hub` lacks the exact parent
+mount; nested settings/bus mounts do not satisfy that check. This also applies
+when the container root is writable, so safety does not depend on `read_only`.
+An explicit mount is not itself proof of durable media, backup or host ACLs.
+
+The future inactive protected startup must use this exact process argument list:
+
+```text
+python -I -B -m engineering_hub.owned_inactive_hub --config /var/lib/hub/settings.json
+```
+
+That replaces the image's ordinary entrypoint; it must not be appended as extra
+arguments to `python -m engineering_hub`. This is a future handoff requirement,
+not instructions to change the current Compose now. Autonomous pilot startup
+has further enrollment/transport prerequisites and is not implied by this command.
 Preserve the original cold state separately for reviewed rollback, never as a
 second running authority. Plan backup/snapshot coverage for existing shared
 state **and the private child**

@@ -9,6 +9,7 @@ import sqlite3
 import uuid
 
 from .pilot_ownership import PilotOwner
+from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
@@ -42,6 +43,10 @@ class HubRepository:
         self.path = str(path)
         if self.path == ':memory:':
             raise HubError('durable_path_required')
+        try:
+            require_image_state_mount(self.path)
+        except ImageStateBoundaryError:
+            raise HubError('hub_image_state_mount_required',409) from None
         self._assert_pilot_owner(None)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._write_connection() as db:

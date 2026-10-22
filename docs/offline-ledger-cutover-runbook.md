@@ -21,6 +21,13 @@ private child through the shared tree. Settings and bus sources need not move.
 Only the authoritative ledger is a candidate for reviewed cold relocation.
 This document supplies no complete replacement Compose or automatic mover.
 Beau applies any accepted NAS configuration in one later coordinated handoff.
+The selective layout requires an explicit replacement entrypoint:
+`python -I -B -m engineering_hub.owned_inactive_hub --config /var/lib/hub/settings.json`
+for the initial inactive startup. The image's default/ordinary entrypoint and
+version-one settings are not a protected-ledger fallback. They must refuse an
+unmounted `/var/lib/hub` ledger rather than create an empty image-layer database.
+The release rehearsal tests that refusal with writable container root and then
+tests the correct protected startup separately. Do not apply this command now.
 
 ## 1. Establish the gates before a real maintenance window
 

@@ -17,6 +17,7 @@ from hub_unified_container_smoke import stop_owned, remove_owned_volume
 
 SEED = SETTINGS_SEED + r'''
 import hashlib, shutil, sqlite3, subprocess, sys
+(root / 'legacy-settings.json').write_text(json.dumps(settings))
 repo = HubRepository(root / 'hub.sqlite3')
 decision = repo.create_decision('human:123','treedar','Synthetic preserved decision',['yes','no'])
 with sqlite3.connect(root / 'hub.sqlite3') as db:
@@ -125,6 +126,23 @@ print(json.dumps({'preservation':'passed'}))
 '''
 
 
+REJECT_UNMOUNTED = r'''
+import json,subprocess,sys
+from pathlib import Path
+command=json.loads(sys.argv[1])
+assert command==['python','-m','engineering_hub','--host','0.0.0.0','--port','8770']
+ledger=Path('/var/lib/hub/hub.sqlite3')
+assert not ledger.exists()
+for args in (command,command+['--config','/var/lib/hub/settings.json']):
+    result=subprocess.run(args,capture_output=True,text=True,timeout=30)
+    assert result.returncode!=0
+    assert 'hub_image_state_mount_required' in result.stderr
+    assert not ledger.exists()
+    assert not list(ledger.parent.glob('hub.sqlite3*'))
+print(json.dumps({'unmounted_default_and_v1':'refused','phantom_ledger':False}))
+'''
+
+
 def _artifact(image, commit):
     if not isinstance(image,str) or not re.fullmatch(
         r'ghcr\.io/ledgetoptechnologies/engineering-hub-control:(?:build-)[a-z0-9-]+|'
@@ -198,6 +216,24 @@ def _smoke(image, commit):
         expected = {'/var/lib/hub/settings.json':(mountpoint+'/settings.json',False),
                     '/var/lib/hub/agent-message-bus':(mountpoint+'/agent-message-bus',True),
                     '/var/lib/hub-private':(mountpoint+'/private',True)}
+        # Deliberately writable root: refusal must come from source admission,
+        # not accidentally from the operator's usual read_only Compose setting.
+        negative_name='hub-protected-'+owner+'-unmounted'
+        names.append(negative_name)
+        negative_args=command(negative_name)
+        negative_args.remove('--read-only')
+        for destination,(source,writable) in expected.items():
+            if destination=='/var/lib/hub/settings.json':
+                source=mountpoint+'/legacy-settings.json'
+            negative_args.extend(['--mount','type=bind,source='+source+',target='+destination+('' if writable else ',readonly')])
+        for agent in ('HERMES','CODEX','CLAUDE','ADMIN'):
+            negative_args.extend(['-e',agent+'_TOKEN=synthetic-protected-'+agent.lower()+'-only'])
+        entrypoint=json.loads(run('docker','image','inspect','--format','{{json .Config.Entrypoint}}',image_id))
+        negative_report=json.loads(run(*negative_args,'--entrypoint','python',image_id,'-I','-B','-c',
+                                       REJECT_UNMOUNTED,json.dumps(entrypoint),timeout=75))
+        assert negative_report=={'unmounted_default_and_v1':'refused','phantom_ledger':False}
+        stop_owned(negative_name,owner)
+        names.remove(negative_name)
         for iteration in range(3):
             name = 'hub-protected-'+owner+'-'+str(iteration)
             names.append(name)
@@ -232,6 +268,7 @@ def _smoke(image, commit):
         return {'protected_profile':'passed','source_commit':commit,'resolved_image_id':image_id,
             'stages':reports,'recreations':2,'selective_maps':3,'runtime':'inactive',
             'enrollment_cli':seed,
+            'wrong_startup':negative_report,
             'network':'none','truenas':'not_deployed','human_sign_in':'not_tested','agent_wake':'not_tested'}
     finally:
         for name in names:
