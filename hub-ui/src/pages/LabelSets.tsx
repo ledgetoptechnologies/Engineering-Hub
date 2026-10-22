@@ -1,3 +1,4 @@
+import { link } from "../router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { HubApiError } from "../api";
@@ -39,7 +40,7 @@ export function LabelSetsPanel({ hub, project }: { hub: Hub; project: string }) 
         {sets?.map((set) => {
           const percent = set.item_count ? Math.round((set.labeled_count / set.item_count) * 100) : 0;
           return (
-            <a key={set.id} className="label-set-card" href={`#/projects/${project}/labels/${set.id}`}>
+            <a key={set.id} className="label-set-card" href={link(`/projects/${project}/labels/${set.id}`)}>
               <strong>{set.title}</strong>
               <span className="progress" aria-hidden="true"><span style={{ width: `${percent}%` }} /></span>
               <small>{set.labeled_count} of {set.item_count} labeled · updated {relativeAge(set.updated_at) ?? "—"}</small>
@@ -105,8 +106,8 @@ export function LabelSetPage({ hub, project, setId, actions }: {
   if (state !== "loaded" || !set) {
     return (
       <>
-        <nav className="crumbs" aria-label="Breadcrumb"><a href="#/projects">Projects</a> <span>/</span>{" "}
-          <a href={`#/projects/${project}`}>{hub.projectName(project)}</a></nav>
+        <nav className="crumbs" aria-label="Breadcrumb"><a href={link("/projects")}>Projects</a> <span>/</span>{" "}
+          <a href={link(`/projects/${project}`)}>{hub.projectName(project)}</a></nav>
         <PageHeader eyebrow="LABELING" title={state === "missing" ? "Labeling set not found" : "Labeling"}>{actions}</PageHeader>
         <section className="panel">
           <p role={state === "failed" ? "alert" : "status"}>
@@ -159,8 +160,8 @@ export function LabelSetPage({ hub, project, setId, actions }: {
 
   return (
     <>
-      <nav className="crumbs" aria-label="Breadcrumb"><a href="#/projects">Projects</a> <span>/</span>{" "}
-        <a href={`#/projects/${project}`}>{hub.projectName(project)}</a> <span>/</span> {set.title}</nav>
+      <nav className="crumbs" aria-label="Breadcrumb"><a href={link("/projects")}>Projects</a> <span>/</span>{" "}
+        <a href={link(`/projects/${project}`)}>{hub.projectName(project)}</a> <span>/</span> {set.title}</nav>
       <PageHeader eyebrow="LABELING" title={set.title} subtitle={set.instructions || undefined}>{actions}</PageHeader>
       <div className="label-toolbar">
         <div className="label-tally" aria-label="Progress">

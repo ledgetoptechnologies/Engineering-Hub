@@ -1,3 +1,4 @@
+import { link } from "../router";
 import { connectionView } from "../agentStatus";
 import { ImageVersionsPanel } from "../ImageVersionsPanel";
 import type { Hub } from "../hub";
@@ -21,22 +22,22 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
       <PageHeader eyebrow="DEVELOPMENT / STAGING" title={greeting()}
         subtitle="What needs you, what's moving, and who's around.">{actions}</PageHeader>
       <div className="kpi-grid">
-        <a className={`kpi ${waiting.length ? "attention" : ""}`} href="#/inbox">
+        <a className={`kpi ${waiting.length ? "attention" : ""}`} href={link("/inbox")}>
           <span className="kpi-label"><Icon kind="inbox" size={16} /> Needs you</span>
           <strong>{waiting.length}</strong>
           <span className="kpi-note">{waiting.length === 0 ? "Nothing waiting" : waiting.length === 1 ? "decision" : "decisions"}</span>
         </a>
-        <a className="kpi" href="#/work">
+        <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
           <strong>{active.length}</strong>
           <span className="kpi-note">{tasks.length - active.length} review passed</span>
         </a>
-        <a className="kpi" href="#/agents">
+        <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
           <strong>{connected.length}<span className="kpi-of">/{hub.data.agents.length}</span></strong>
           <span className="kpi-note">{hub.stale && !hub.demo ? "Not verified right now" : "Transport only · not listening proof"}</span>
         </a>
-        <a className="kpi" href="#/staging">
+        <a className="kpi" href={link("/staging")}>
           <span className="kpi-label"><Icon kind="staging" size={16} /> Staging</span>
           <strong>{targets}<span className="kpi-of">/{hub.data.projects.length}</span></strong>
           <span className="kpi-note">{hub.data.paused ? "Emergency pause on" : "targets set up"}</span>
@@ -48,7 +49,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <div className="panel-title">
             <h2>Needs you</h2>
             <span className="count">{waiting.length}</span>
-            <span className="panel-action"><a className="text-link" href="#/inbox">Open inbox →</a></span>
+            <span className="panel-action"><a className="text-link" href={link("/inbox")}>Open inbox →</a></span>
           </div>
           {waiting.length === 0 ? (
             <p className="panel-description">Nothing is waiting on you right now.</p>
@@ -56,7 +57,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <ul className="preview-list">
               {waiting.slice(0, 6).map((decision) => (
                 <li key={decision.id}>
-                  <a href="#/inbox">
+                  <a href={link("/inbox")}>
                     <span className="preview-title">{decision.title}</span>
                     <span className="preview-meta">
                       {hub.projectName(decision.project)}{decision.protected ? " · Protected" : ""}
@@ -64,7 +65,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                   </a>
                 </li>
               ))}
-              {waiting.length > 6 && <li className="preview-more"><a href="#/inbox">+{waiting.length - 6} more</a></li>}
+              {waiting.length > 6 && <li className="preview-more"><a href={link("/inbox")}>+{waiting.length - 6} more</a></li>}
             </ul>
           )}
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, undefined, 2)} />
@@ -73,7 +74,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <div className="panel-title">
             <h2>Work in motion</h2>
             <span className="count">{active.length}</span>
-            <span className="panel-action"><a className="text-link" href="#/work">All work →</a></span>
+            <span className="panel-action"><a className="text-link" href={link("/work")}>All work →</a></span>
           </div>
           {active.length === 0 ? (
             <p className="panel-description">No open tasks.</p>
@@ -81,7 +82,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <ul className="preview-list">
               {active.slice(0, 6).map((task) => (
                 <li key={task.id}>
-                  <a href="#/work">
+                  <a href={link("/work")}>
                     <span className="preview-title">{task.title}</span>
                     <span className="preview-meta">
                       {hub.projectName(task.project)} · {task.owner ? names[task.owner] : "Unclaimed"}
@@ -96,7 +97,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <section className="panel" aria-label="Agents summary">
           <div className="panel-title">
             <h2>Agents</h2>
-            <span className="panel-action"><a className="text-link" href="#/agents">Details →</a></span>
+            <span className="panel-action"><a className="text-link" href={link("/agents")}>Details →</a></span>
           </div>
           <ul className="agent-mini">
             {hub.data.agents.map((agent) => {
@@ -117,7 +118,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <section className="panel" aria-label="Projects summary">
           <div className="panel-title">
             <h2>Projects</h2>
-            <span className="panel-action"><a className="text-link" href="#/projects">All projects →</a></span>
+            <span className="panel-action"><a className="text-link" href={link("/projects")}>All projects →</a></span>
           </div>
           <ul className="project-mini">
             {hub.data.projects.map((project) => {
@@ -125,7 +126,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
               const work = hub.data.tasks.filter((task) => task.project === project.id && task.status !== "verified").length;
               return (
                 <li key={project.id}>
-                  <a href={`#/projects/${project.id}`}>
+                  <a href={link(`/projects/${project.id}`)}>
                     <span className="project-square" />
                     <strong>{project.name}</strong>
                     <span className="preview-meta">
