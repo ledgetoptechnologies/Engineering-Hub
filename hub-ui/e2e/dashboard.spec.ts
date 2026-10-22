@@ -24,14 +24,14 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   mock.overview.agents[1].connection = hubConnection("not_observed");
   await page.goto("/#/agents");
   const rows = page.locator(".hub-connection-row");
-  await expect(rows.filter({ hasText: "Codex" })).toContainText("Connected to Hub");
+  await expect(rows.filter({ hasText: "Codex" })).toContainText("Hub stream observed");
   await expect(rows.filter({ hasText: "Codex" })).toContainText("0 inbox subscription(s)");
   await expect(rows.filter({ hasText: "Hermes" })).toContainText("No active push stream observed");
   await expect(rows.filter({ hasText: "Claude" })).toContainText("Hub connection unknown");
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row")).toHaveCount(0);
   await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("not connected doesn't mean it's offline.", { exact: false })).toBeVisible();
+  await expect(page.getByText("may still accept writes after the agent stops listening.", { exact: false })).toBeVisible();
 });
 
 test("Hub connection observations expire locally without polling", async ({ page }) => {
@@ -39,12 +39,35 @@ test("Hub connection observations expire locally without polling", async ({ page
   const mock = await mockLive(page, { tracking: "not_configured" });
   mock.overview.agents[0].connection = hubConnection();
   await page.goto("/#/agents");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.getByText("Hub stream observed", { exact: true })).toBeVisible();
   const reads = mock.reads();
   await page.clock.runFor(30_100);
-  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub stream observed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection snapshot expired", { exact: true })).toBeVisible();
   expect(mock.reads()).toBe(reads);
+});
+
+test("refreshed stale stream snapshots stay neutral and do not imply topic readiness", async ({ page }) => {
+  await page.clock.install({ time: NOW });
+  const mock = await mockLive(page, { tracking: "not_configured" });
+  const connection: NonNullable<AgentSummary["connection"]> = {
+    ...hubConnection("not_observed"), state: "stale", stale_streams: 3,
+  };
+  mock.overview.agents[0].connection = connection;
+  await page.goto("/#/agents");
+  const row = page.locator(".hub-connection-row").filter({ hasText: "Codex" });
+  for (let refresh = 0; refresh < 3; refresh++) {
+    const observed = NOW.getTime() + refresh * 10_000;
+    connection.observed_at = new Date(observed).toISOString();
+    connection.valid_until = new Date(observed + 30_000).toISOString();
+    await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
+    await expect(row).toContainText("Connection stale — heartbeat not recently observed");
+    await expect(row).toContainText("0 fresh stream(s)");
+    await expect(row).toContainText("3 stale stream(s)");
+    await expect(row.locator(".presence.on")).toHaveCount(0);
+    await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
+    await page.clock.runFor(10_000);
+  }
 });
 
 test("loss of overview event feed invalidates connection and not-configured topic snapshots", async ({ page }) => {
@@ -55,9 +78,9 @@ test("loss of overview event feed invalidates connection and not-configured topi
   await page.goto("/#/agents");
   await expect(page.getByText("Snapshot unverified", { exact: true })).toBeVisible();
   await emit(page, "invalidate");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.getByText("Hub stream observed", { exact: true })).toBeVisible();
   await emit(page, "error");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub stream observed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection snapshot unverified", { exact: true })).toHaveCount(3);
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Topic readiness: Snapshot unverified", { exact: true })).toBeVisible();
@@ -74,7 +97,7 @@ test("configured-but-unknown topic remains unverified while Hub transport is con
     return route.fulfill({ json: snapshot });
   });
   await page.goto("/#/agents");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.getByText("Hub stream observed", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row").getByText("Unknown", { exact: true })).toHaveCount(3);
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
 });
@@ -85,12 +108,12 @@ test("topic errors do not erase independent Hub connection snapshots", async ({ 
   mock.overview.agents[0].connection = hubConnection();
   await page.route("**/api/hub/v1/topics/*/peers", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
   await page.goto("/#/agents");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toBeVisible();
+  await expect(page.getByText("Hub stream observed", { exact: true })).toBeVisible();
   await expect(page.getByText("Topic status unavailable.", { exact: false })).toBeVisible();
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toHaveCount(0);
   await page.route("**/api/hub/v1/overview", (route) => route.fulfill({ status: 503, json: { detail: "unavailable" } }));
   await page.getByRole("button", { name: "Refresh workspace", exact: true }).click();
-  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub stream observed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection snapshot unverified", { exact: true })).toHaveCount(3);
 });
 
@@ -101,7 +124,7 @@ test("invalid or future connection timestamps never render current connection ev
   mock.overview.agents[1].connection = { ...hubConnection(), observed_at: new Date(NOW.getTime() + 60_000).toISOString() };
   mock.overview.agents[2].connection = { ...hubConnection(), valid_until: "not-a-date", last_stream_write_at: "<script>alert(1)</script>" };
   await page.goto("/#/agents");
-  await expect(page.getByText("Connected to Hub", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Hub stream observed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Hub connection unavailable", { exact: true })).toHaveCount(3);
   await expect(page.locator(".hub-connection-row img, .hub-connection-row script")).toHaveCount(0);
 });

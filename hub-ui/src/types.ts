@@ -82,12 +82,13 @@ export interface AgentSummary {
   chat_readiness: string;
   reason: string;
   connection?: {
-    state: "connected" | "not_observed" | "unavailable";
+    state: "connected" | "stale" | "not_observed" | "unavailable";
     source: "embedded_bus";
     scope: "this_server_process";
     observed_at: string | null;
     valid_until: string | null;
     active_streams: number | null;
+    stale_streams?: number | null;
     inbox_subscriptions: number | null;
     subscribed: boolean | null;
     last_stream_write_at: string | null;

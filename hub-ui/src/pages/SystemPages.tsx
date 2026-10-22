@@ -20,10 +20,12 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
         <strong>{names[agent.id] ?? "Unknown agent"}</strong>
         <span>{view.label}</span>
         {view.trusted && connection?.state !== "unavailable" && (
-          <small>{connection!.active_streams} active stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)</small>
+          <small>{connection!.active_streams} fresh stream(s) · {connection!.inbox_subscriptions} inbox subscription(s)
+            {connection!.stale_streams !== undefined && connection!.stale_streams !== null &&
+              ` · ${connection!.stale_streams} stale stream(s)`}</small>
         )}
         {view.connected && (
-          <small>{connection!.inbox_subscriptions! > 0 ? "Inbox subscription observed: new messages can be pushed to this agent."
+          <small>{connection!.inbox_subscriptions! > 0 ? "Inbox subscription observed. A server stream write does not prove client receipt or chat readiness."
             : "No active inbox subscription observed. Delivery may still happen another way; this alone does not show the agent is ready."}</small>
         )}
         {view.observed && <small>Snapshot observed: {view.observed}</small>}
@@ -59,16 +61,19 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
   return (
     <>
       <PageHeader eyebrow="AGENTS" title="Agents"
-        subtitle="Which agents are connected to the Hub, and whether each one can be reached on a conversation topic. These are checked separately.">
+        subtitle="Recent Hub stream observations and reachability on a specific conversation topic. These are checked separately.">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
-      <section className="agent-cards" aria-label="Hub connections">
+      <h2 className="agent-section-title">Hub stream observations</h2>
+      <section className="agent-cards" aria-label="Hub stream observations">
         {hub.data.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
       </section>
       <p className="panel-footnote">
-        {connected} of {hub.data.agents.length} connected. Connected means the agent's app is linked to the Hub. It doesn't prove
-        the agent is working on anything right now, and not connected doesn't mean it's offline.
+        {connected} of {hub.data.agents.length} with a Hub stream observed. Stream observed means the Hub recently wrote to a
+        retained stream. An upstream connection may still accept writes after the agent stops listening. This does not prove
+        client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
+        offline. Topic readiness is checked separately.
       </p>
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />

@@ -1545,6 +1545,7 @@
             "type": "string",
             "enum": [
               "connected",
+              "stale",
               "not_observed",
               "unavailable"
             ],
@@ -1628,6 +1629,18 @@
             ],
             "title": "Last Stream Write At"
           },
+          "stale_streams": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stale Streams"
+          },
           "native_push_available": {
             "anyOf": [
               {
@@ -1652,6 +1665,7 @@
           "inbox_subscriptions",
           "subscribed",
           "last_stream_write_at",
+          "stale_streams",
           "native_push_available"
         ],
         "title": "AgentConnectionDTO"
