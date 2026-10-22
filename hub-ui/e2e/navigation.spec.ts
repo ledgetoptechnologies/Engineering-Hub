@@ -30,6 +30,22 @@ async function fixture(page: Page) {
 }
 const nav = (page: Page) => page.getByRole("navigation", { name: "Workspace navigation" });
 
+for (const width of [1440, 390]) test(`project decision timeline dot stays within its column (${width}px)`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 1100 });
+  await fixture(page);
+  await page.goto("/#/projects/engineering-hub");
+  const dot = page.locator(".timeline-dot.kind-decision").first();
+  await expect(dot).toBeVisible();
+  const box = await dot.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.width).toBeLessThanOrEqual(14);
+  expect(box!.height).toBeLessThanOrEqual(14);
+  expect(await dot.evaluate(element => getComputedStyle(element).padding)).toBe("0px");
+  const title = await dot.locator("..").locator("strong").boundingBox();
+  expect(title).not.toBeNull();
+  expect(box!.x + box!.width).toBeLessThanOrEqual(title!.x);
+});
+
 test("sidebar pages switch without reloading or extra reads, and mark the current page", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/");

@@ -3080,7 +3080,7 @@ code {
   background: var(--blue-2);
   box-shadow: 0 0 0 3px var(--blue-soft);
 }
-.timeline-dot.decision {
+.timeline-dot.kind-decision {
   background: var(--orange);
   box-shadow: 0 0 0 3px #ffedd5;
 }

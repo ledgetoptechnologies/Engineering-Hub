@@ -159,7 +159,7 @@ function Timeline({ changes }: { changes: Change[] }) {
     <ol className="timeline">
       {changes.map((change, index) => (
         <li key={index}>
-          <span className={`timeline-dot ${change.kind}`} aria-hidden="true" />
+          <span className={`timeline-dot kind-${change.kind}`} aria-hidden="true" />
           <div>
             <strong>{change.title}</strong>
             <span className="timeline-meta">
