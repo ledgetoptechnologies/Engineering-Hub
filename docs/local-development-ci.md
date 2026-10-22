@@ -84,6 +84,13 @@ or claim that this helper preempts/reserves that job's machine. Headroom and
 coordination still matter. An uncertain/nonterminal container outcome remains
 held, not silently retried or treated as a free machine.
 
+The test wait defaults to a validated maximum of900 seconds (15 minutes), with
+fail-fast Python tests. `--timeout` may select1–900 integer seconds; it cannot
+disable the deadline. Setup and terminal-inspection/stop budgets remain separate.
+Expiry is not quiescence: HELD remains until the original container and pinned
+kernel cgroup are authoritatively terminal. CPU, RAM, swap, PID and scratch limits
+do not increase for this longer full-suite wait.
+
 After accepted work is terminal, stop only the CI engine using the helper's
 pinned engine/invocation arguments. Never stop another generation just because
 its service name or socket path resembles this one. No global prune/cleanup.

@@ -24,6 +24,7 @@ from uuid import uuid4
 
 MEMORY = 2 * 1024**3
 TMPFS = 1024**3
+MAX_TIMEOUT_SECONDS = 900
 FILES = {'pyproject.toml': 'pyproject', 'uv.lock': 'uv-lock',
          'hub-ui/package.json': 'package', 'hub-ui/package-lock.json': 'npm-lock'}
 IMAGE = re.compile(r'^sha256:[a-f0-9]{64}$')
@@ -35,6 +36,12 @@ FD_ROOT = Path('/proc/self/fd')
 
 class CIError(RuntimeError):
     pass
+
+
+def validate_timeout(value):
+    if type(value) is not int or not 1 <= value <= MAX_TIMEOUT_SECONDS:
+        raise CIError('Bounded local CI wait required')
+    return value
 
 
 def checked_output(argv, *, timeout=30, environment=None, cwd=None, merge_stderr=False):
@@ -255,7 +262,8 @@ def verify_created(row, image, name, input_directory, profile, intent):
 
 
 def run(args):
-    if sys.platform != 'linux' or not IMAGE.fullmatch(args.image) or not 1 <= args.timeout <= 300:
+    validate_timeout(args.timeout)
+    if sys.platform != 'linux' or not IMAGE.fullmatch(args.image):
         raise CIError('Linux bounded immutable-image CI required')
     if not re.fullmatch(r'refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}', args.ref) or args.ref == 'refs/heads/main':
         raise CIError('Explicit committed development branch required')
@@ -417,7 +425,7 @@ def main():
     for name in ('checkout', 'ref', 'image', 'engine', 'engine-id', 'output-root'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--profile', choices=('python', 'ui', 'all'), default='all')
-    parser.add_argument('--timeout', type=int, default=300)
+    parser.add_argument('--timeout', type=int, default=MAX_TIMEOUT_SECONDS)
     args = parser.parse_args()
     try:
         result = run(args)

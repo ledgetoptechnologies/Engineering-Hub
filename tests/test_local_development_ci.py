@@ -27,6 +27,29 @@ bootstrap = module('local_ci_container')
 IMAGE = 'sha256:' + 'a' * 64
 
 
+@pytest.mark.parametrize('value', [1, 300, 900])
+def test_ci_wait_accepts_only_positive_bounded_seconds(value):
+    assert runner.validate_timeout(value) == value
+
+
+@pytest.mark.parametrize('value', [0, -1, 901, True, '900', 900.0, None])
+def test_ci_wait_refuses_unbounded_or_coerced_values(value):
+    with pytest.raises(runner.CIError):
+        runner.validate_timeout(value)
+
+
+def test_cli_default_wait_is_the_same_validated_fifteen_minute_bound(monkeypatch):
+    observed = []
+    monkeypatch.setattr(runner.sys, 'argv', ['local_development_ci',
+        '--checkout', '/synthetic', '--ref', 'refs/heads/codex/example', '--image', IMAGE,
+        '--engine', 'unix:///synthetic/engine.sock', '--engine-id', 'synthetic', '--output-root', '/synthetic/results'])
+    monkeypatch.setattr(runner, 'run', lambda args: observed.append(args.timeout) or {'state': 'passed'})
+    with pytest.raises(SystemExit) as result:
+        runner.main()
+    assert result.value.code == 0
+    assert observed == [runner.MAX_TIMEOUT_SECONDS] == [900]
+
+
 def test_engine_requires_pinned_rootless_cgroup_v2_systemd():
     row = dict(ID='expected', OSType='linux', CgroupVersion='2', CgroupDriver='systemd',
                SecurityOptions=['name=seccomp', 'name=rootless'])
