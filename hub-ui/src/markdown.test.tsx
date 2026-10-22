@@ -63,6 +63,8 @@ describe("gateway responses are not sign-outs", () => {
     expect(await listTopics(signal, async () => forbidden())).toBeNull();
     await expect(listLabelSets("treedar", signal, async () => forbidden())).rejects.toMatchObject({ status: 404, code: "label_sets_unavailable" });
     await expect(listTopics(signal, async () => json({ detail: { code: "access_denied" } }, 403))).rejects.toMatchObject({ status: 403 });
+    expect(await listTopics(signal, async () => json({ detail: { code: "topic_catalog_unavailable" } }, 503))).toBeNull();
+    await expect(listTopics(signal, async () => json({ detail: { code: "other" } }, 503))).rejects.toMatchObject({ status: 503 });
   });
 });
 
