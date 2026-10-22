@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -234,19 +235,22 @@ def test_archived_project_blocks_existing_work_mutations_and_dispatch(state):
 
 
 @pytest.mark.parametrize('operation', ['create_task', 'propose_staging_task', 'create_decision'])
-def test_archive_between_initial_validation_and_write_is_rechecked(state, monkeypatch, operation):
+def test_archive_before_write_transaction_is_rechecked(state, monkeypatch, operation):
     repo, projects = state
     create(projects)
-    original = repo._project
+    original = repo._transaction
     armed = True
-    def project(value, db=None, *, require_active=True):
+    @contextmanager
+    def transaction():
         nonlocal armed
-        result = original(value, db, require_active=require_active)
-        if db is None and armed:
+        # Another writer archives before this operation obtains its write
+        # transaction. Admission must inspect the current project inside it.
+        if armed:
             armed = False
-            projects.archive_project('human:123', value, 1)
-        return result
-    monkeypatch.setattr(repo, '_project', project)
+            projects.archive_project('human:123', 'client-notes', 1)
+        with original() as db:
+            yield db
+    monkeypatch.setattr(repo, '_transaction', transaction)
     with pytest.raises(HubError, match='project_archived'):
         if operation == 'create_decision':
             repo.create_decision('codex', 'client-notes', 'Which?', ['one', 'two'])
