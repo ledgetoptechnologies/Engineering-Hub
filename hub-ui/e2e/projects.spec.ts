@@ -182,6 +182,21 @@ test("archived history authentication loss clears the workspace", async ({ page 
   await expect(page.getByText("operator@example.test", { exact: true })).toHaveCount(0);
 });
 
+test("refreshing archived history keeps the same project's readable page until the read finishes", async ({ page }) => {
+  const { overview, state } = await fixture(page);
+  overview.projects.find((item) => item.id === "treedar")!.archived = true;
+  await page.goto("/#/projects/treedar");
+  await expect(page.getByText("This project is archived.", { exact: false })).toBeVisible();
+  let release!: () => void;
+  state.delayReads.treedar = new Promise<void>((resolve) => { release = resolve; });
+  const pending = page.waitForRequest((request) => request.url().endsWith("/projects/treedar"));
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await pending;
+  await expect(page.getByText("This project is archived.", { exact: false })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1 })).not.toContainText("Loading project");
+  release();
+});
+
 test("a missing demo project never reads live project history", async ({ page }) => {
   const { state } = await fixture(page);
   await page.goto("/?demo=1#/projects/missing-client");

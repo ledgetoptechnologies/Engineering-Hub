@@ -273,7 +273,8 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
     if (listedProject) { setHistoryProject(null); return; }
     if (hub.demo) { setHistoryProject({ id, value: null, loading: false, error: "" }); return; }
     let live = true;
-    setHistoryProject({ id, value: null, loading: true, error: "" });
+    setHistoryProject((current) => ({ id,
+      value: current?.id === id ? current.value : null, loading: true, error: "" }));
     readProject(id).then((value) => {
       if (live) setHistoryProject({ id, value, loading: false, error: "" });
     }).catch((reason) => {
