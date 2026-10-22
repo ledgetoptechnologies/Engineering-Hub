@@ -31,6 +31,7 @@ async def test_registered_subscription_is_not_reported_as_live_presence():
         assert set(agent) == {
             "agent", "active_streams", "inbox_subscriptions", "subscribed",
             "connected_since", "subscribed_since", "last_stream_write_at",
+            "stale_streams", "valid_for_seconds",
         }
         assert agent["active_streams"] == 0
         assert agent["inbox_subscriptions"] == 0

@@ -6,6 +6,7 @@ import threading
 import uuid
 from concurrent.futures import Future
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from mcp.server.session import ServerSession
@@ -16,6 +17,9 @@ from .database import AGENTS
 
 BASE_RESOURCE_URI = "agentbus://inbox/{}"
 MAX_ACTIVE_SUBSCRIPTIONS = 32
+# MCP SSE emits idle heartbeats every 15 seconds. Allow missed/slow beats, but
+# never renew positive presence indefinitely just because a stream is retained.
+PRESENCE_FRESHNESS_SECONDS = 45
 
 
 class SubscriptionLimit(RuntimeError):
@@ -192,6 +196,7 @@ class PushPublisher:
                 "session_id": session_id,
                 "agent": agent,
                 "connected_since": _utc_now(),
+                "last_activity_monotonic": monotonic(),
                 "last_stream_write_at": None,
             }
         return token
@@ -201,6 +206,7 @@ class PushPublisher:
             stream = self._presence_streams.get(token)
             if stream is not None:
                 stream["last_stream_write_at"] = _utc_now()
+                stream["last_activity_monotonic"] = monotonic()
 
     async def close_presence_stream(self, token: str) -> None:
         async with self._lock:
@@ -210,10 +216,16 @@ class PushPublisher:
         """Return transport-only presence observed by this server process."""
         async with self._lock:
             observed_at = _utc_now()
+            observed_monotonic = monotonic()
             streams = tuple(self._presence_streams.values())
             streams_by_agent: dict[str, list[dict[str, Any]]] = {agent: [] for agent in AGENTS}
+            stale_counts = {agent: 0 for agent in AGENTS}
             active_session_agents: dict[str, str] = {}
             for stream in streams:
+                age = observed_monotonic - stream["last_activity_monotonic"]
+                if not 0 <= age < PRESENCE_FRESHNESS_SECONDS:
+                    stale_counts[stream["agent"]] += 1
+                    continue
                 streams_by_agent[stream["agent"]].append(stream)
                 active_session_agents[stream["session_id"]] = stream["agent"]
             subscriptions: dict[str, list[datetime]] = {agent: [] for agent in AGENTS}
@@ -231,6 +243,12 @@ class PushPublisher:
                 agents.append({
                     "agent": agent,
                     "active_streams": len(agent_streams),
+                    "stale_streams": stale_counts[agent],
+                    # Carry the remaining monotonic evidence lifetime to the
+                    # projector. Refreshing a snapshot must not reset this age.
+                    "valid_for_seconds": min(30, max(
+                        (PRESENCE_FRESHNESS_SECONDS - observed_monotonic + stream["last_activity_monotonic"]
+                         for stream in agent_streams), default=30)),
                     "inbox_subscriptions": len(subscription_times),
                     "subscribed": bool(subscription_times),
                     "connected_since": _utc_text(min(

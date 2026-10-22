@@ -32,9 +32,9 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <span className="kpi-note">{tasks.length - active.length} review passed</span>
         </a>
         <a className="kpi" href="#/agents">
-          <span className="kpi-label"><Icon kind="agents" size={16} /> Agents connected</span>
+          <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
           <strong>{connected.length}<span className="kpi-of">/{hub.data.agents.length}</span></strong>
-          <span className="kpi-note">{hub.stale && !hub.demo ? "Not verified right now" : "Hub connection"}</span>
+          <span className="kpi-note">{hub.stale && !hub.demo ? "Not verified right now" : "Transport only · not listening proof"}</span>
         </a>
         <a className="kpi" href="#/staging">
           <span className="kpi-label"><Icon kind="staging" size={16} /> Staging</span>

@@ -2,6 +2,8 @@ name: Container CI and GHCR release
 
 on:
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
     tags: ["v*"]
@@ -12,6 +14,8 @@ permissions:
 jobs:
   verify:
     name: Test and build container
+    # Drafts and branches other than main are tested on staging, not on GitHub minutes.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
