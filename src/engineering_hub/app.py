@@ -568,6 +568,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .projects_api import attach_project_routes
     attach_project_routes(app, repository=project_registry, actor=actor, human=human)
     app.state.project_registry = project_registry
+    from .topic_catalog_api import attach_topic_catalog_route
+    attach_topic_catalog_route(app, bridge=registry_bridge, human=human)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes

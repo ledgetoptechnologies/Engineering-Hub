@@ -446,7 +446,16 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
     monkeypatch.setattr(access, 'CloudflareAccessVerifier', lambda _: verifier)
     monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: verifier)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude')
-    core = create_app(Settings(tmp_path / 'hub.sqlite', auth, config))
+    from engineering_hub.registry_bridge import CanonicalRegistryBridge, HumanRegistryAccess
+    from engineering_hub.registry_client import RegistryClient
+    def no_registry_io(_):
+        raise AssertionError('Listing authorized topics must not fetch remote snapshots')
+    registry = CanonicalRegistryBridge(
+        RegistryClient('https://fixture-registry.invalid', transport=httpx.MockTransport(no_registry_io)),
+        human_topics=lambda principal: frozenset({'engineering-hub'}),
+        human_reader=lambda principal, topic: HumanRegistryAccess(
+            'synthetic-reader-never-returned', frozenset({'engineering-hub'})))
+    core = create_app(Settings(tmp_path / 'hub.sqlite', auth, config), registry_bridge=registry)
     now = int(time.time())
     assertion = jwt.encode(dict(iss=config.cloudflare_issuer, aud=['fixture-hub'],
         sub='synthetic-human', email='beau@example.com', type='app', iat=now - 1, exp=now + 300),
@@ -472,6 +481,12 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
                     assert (await browser.get(BASE + '/auth/login')).status_code == 303
                 me = (await browser.get(BASE + '/auth/me')).json()
                 assert me['authenticated'] and me['actor'].startswith('human:cf:')
+                topics = await browser.get(BASE + '/topics')
+                assert topics.status_code == 200, topics.text
+                assert topics.json() == {'items': [{'topic': 'engineering-hub',
+                    'last_activity_at': None, 'peer_count': None}]}
+                assert topics.headers['cache-control'] == 'no-store'
+                assert (await browser.post(BASE + '/topics', json={})).status_code == 403
                 payload = {'project': 'engineering-hub', 'title': 'Gateway task', 'client_request_id': 'gateway-task'}
                 assert (await browser.post(BASE + '/tasks', json=payload)).status_code == 403
                 browser.headers.update({'Origin': config.origin, 'X-Hub-CSRF': me['csrf_token']})

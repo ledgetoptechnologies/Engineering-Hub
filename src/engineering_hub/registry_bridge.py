@@ -71,10 +71,39 @@ def project_registry_snapshot(snapshot, *, topic, now=None, stream_configured=Fa
 class CanonicalRegistryBridge:
     """Explicit injected clients only; no environment activation or background I/O."""
 
-    def __init__(self, client, *, stream=None, human_reader=None):
+    def __init__(self, client, *, stream=None, human_reader=None, human_topics=None):
         if stream is not None and client.source_identity != stream.source_identity:
             raise ValueError('registry_source_identity_mismatch')
         self.client, self.stream, self.human_reader = client, stream, human_reader
+        # Trusted integration seam, not environment/RPC input. The resolver
+        # must enumerate this human's scope using the same membership authority
+        # as human_reader; message labels are not grants or bindings.
+        self.human_topics = human_topics
+
+    def topics_for_human(self, principal):
+        if (not isinstance(principal, str) or re.fullmatch(
+                r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', principal) is None):
+            raise RegistryAccessDenied(403)
+        if self.human_reader is None or self.human_topics is None:
+            raise RegistrySourceUnavailable()
+        try:
+            topics = self.human_topics(principal)
+        except RegistryAccessDenied:
+            raise
+        except Exception:
+            raise RegistrySourceUnavailable() from None
+        if (type(topics) is not frozenset or len(topics) > 500
+                or any(type(topic) is not str or re.fullmatch(
+                    r'[a-z0-9][a-z0-9_-]{0,127}', topic) is None for topic in topics)):
+            raise RegistrySourceUnavailable()
+        try:
+            for topic in topics:
+                self.access(principal, topic)
+        except RegistryAccessDenied:
+            raise
+        except Exception:
+            raise RegistrySourceUnavailable() from None
+        return tuple(sorted(topics))
 
     def access(self, principal, topic, agent_bearer=None):
         if principal in {'codex', 'hermes', 'claude'}:

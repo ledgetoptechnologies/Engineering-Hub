@@ -3,7 +3,9 @@
 This is a procedure to review and rehearse with disposable data, **not permission
 to apply it to TrueNAS or the live Hub now**. Current Compose, mounts, settings,
 tokens and services remain unchanged. Publication is still a separate gate;
-local tests do not bypass GitHub billing or prove a published image is available.
+local tests do not prove the exact published image is available. Earlier billing
+restrictions must not be assumed current after the repository became public;
+verify the candidate's actual workflow and registry results instead.
 
 ## Scope
 

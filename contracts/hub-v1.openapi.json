@@ -1079,6 +1079,24 @@
         }
       }
     },
+    "/api/hub/v1/topics": {
+      "get": {
+        "summary": "Topics",
+        "operationId": "topics_api_hub_v1_topics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicCatalogDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/staging/tasks": {
       "post": {
         "tags": [
@@ -5136,6 +5154,47 @@
           "items"
         ],
         "title": "TaskListDTO"
+      },
+      "TopicCatalogDTO": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TopicCatalogItem"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "TopicCatalogDTO"
+      },
+      "TopicCatalogItem": {
+        "properties": {
+          "topic": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+            "title": "Topic"
+          },
+          "last_activity_at": {
+            "type": "null",
+            "title": "Last Activity At"
+          },
+          "peer_count": {
+            "type": "null",
+            "title": "Peer Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic"
+        ],
+        "title": "TopicCatalogItem"
       },
       "TopicPreflight": {
         "properties": {
