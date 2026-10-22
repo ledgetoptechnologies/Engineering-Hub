@@ -3,7 +3,7 @@ name: Container CI and GHCR release
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
     branches: [main]
     tags: ["v*"]
@@ -15,7 +15,8 @@ jobs:
   verify:
     name: Test and build container
     # Drafts and branches other than main are tested on staging, not on GitHub minutes.
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    # An edit only counts when it moves the pull request onto main (retargeted from a stacked base).
+    if: ${{ github.event_name != 'pull_request' || (!github.event.pull_request.draft && (github.event.action != 'edited' || github.event.changes.base != null)) }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
