@@ -1,5 +1,11 @@
 # Safe integration / cutover checklist
 
+**Historical standalone bus packaging checklist.** Its UID10001, watcher and
+legacy port assumptions are not the current unified NAS Hub/pilot procedure.
+Use [current readiness](release-readiness-2026-10-22.md), the
+[protected layout](protected-ledger-layout.md) and the
+[offline cutover runbook](offline-ledger-cutover-runbook.md) for that work.
+
 No publish, deployment, watcher change, or client configuration change is part of the packaging task. An operator must explicitly approve any live cutover.
 
 - [ ] `uv run pytest -q` passes and both Compose files validate.

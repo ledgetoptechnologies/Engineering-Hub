@@ -2,6 +2,8 @@
 
 Status: independently reviewed source integration, not an activated NAS workflow.
 Normal `--config` startup remains unchanged and does not select this service.
+See [the current release checkpoint](release-readiness-2026-10-22.md) before any
+operator handoff; older evidence below is scoped, not proof of installed readiness.
 
 Isolated non-root Linux validation passed 96 focused tests, including 19 new
 composition cases. A separate root-agent rerun of the 19 cases and API contract
@@ -83,14 +85,20 @@ acceptance and machine reboot acceptance remain separate checks.
 The separate entrypoint is intentionally not selected by ordinary Hub startup:
 
 ```text
-python -m engineering_hub.unified_pilot_startup validate --config /var/lib/hub/settings.json --pilot-config /var/lib/hub/private/pilot.json
-python -m engineering_hub.unified_pilot_startup serve --config /var/lib/hub/settings.json --pilot-config /var/lib/hub/private/pilot.json
+python -I -B -m engineering_hub.unified_pilot_startup validate --config /var/lib/hub/settings.json --pilot-config /var/lib/hub-private/pilot.json
+python -I -B -m engineering_hub.unified_pilot_startup serve --config /var/lib/hub/settings.json --pilot-config /var/lib/hub-private/pilot.json
 ```
 
 `validate` reads the existing non-secret deployment settings and protected pilot
 profile. It does not read agent environment tokens, the executor credential or
 CA file, acquire an owner, bind a socket, contact an executor or modify a database.
 Its result means configuration shape is valid, not installed readiness.
+For version-two protected storage, the selector enforces that the profile is
+exactly `/var/lib/hub-private/pilot.json`. The former shared-tree private path is
+not the selective protected-layout recipe. Validation also checks the existing
+ledger boundary's metadata; it does not open/enroll the database. These command
+forms are references, not instructions to run `serve` now. Initial protected
+cutover instead starts the separately documented owned-inactive service.
 
 `serve` is the explicit activation operation. It retains the current process UID
 (including the NAS app's UID568), existing three agent tokens, deployment-selected
