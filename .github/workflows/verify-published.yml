@@ -12,6 +12,7 @@ permissions:
   packages: read
 jobs:
   verify-package:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

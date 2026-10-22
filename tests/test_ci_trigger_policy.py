@@ -71,3 +71,10 @@ def test_only_current_hub_can_publish_from_main():
     assert current['env']['PACKAGE'] == 'ghcr.io/ledgetoptechnologies/engineering-hub-control'
     assert current['needs'] == 'verify'
     assert workflow('container.yml')['jobs']['publish']['if'] == '${{ false }}'
+
+
+def test_manual_package_verification_also_requires_main():
+    config = workflow('verify-published.yml')
+    assert set(config['on']) == {'workflow_dispatch'}
+    assert config['jobs']['verify-package']['if'] == (
+        "${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}")
