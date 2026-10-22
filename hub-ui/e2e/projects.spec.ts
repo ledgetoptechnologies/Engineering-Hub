@@ -68,13 +68,17 @@ test("editing reads the latest revision, sends it with CAS, and shows the human 
   await page.getByRole("button", { name: "Edit project" }).click();
   const form = page.getByRole("form", { name: "Edit project" });
   await expect(form.getByLabel("Project ID")).toHaveAttribute("readonly", "");
+  await form.getByLabel("Name", { exact: true }).fill("TreeDar Survey");
+  await expect(form.getByLabel("Project ID")).toHaveValue("treedar");
   await form.getByLabel("Status").selectOption("Off track");
   await form.getByLabel("Lead agent").selectOption("Codex");
   await form.getByLabel("Repository (optional)").fill("https://github.com/ledgetop/treedar");
   await form.getByRole("button", { name: "Save changes" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(state.writes[0]).toMatchObject({ method: "PATCH", path: "/api/hub/v1/projects/treedar",
-    body: { expected_revision: 1, status: "off_track", lead_agent: "codex", repository_url: "https://github.com/ledgetop/treedar" } });
+    body: { expected_revision: 1, name: "TreeDar Survey", status: "off_track", lead_agent: "codex", repository_url: "https://github.com/ledgetop/treedar" } });
+  await expect(page.getByRole("heading", { level: 1 })).toContainText("TreeDar Survey");
+  await expect(page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "TreeDar Survey" })).toBeVisible();
   await expect(page.locator(".project-meta .status-pill")).toHaveText("Off track");
   await expect(page.getByRole("link", { name: "ledgetop/treedar" })).toHaveAttribute("rel", "noopener noreferrer");
 });
@@ -96,7 +100,7 @@ test("a conflict keeps the draft and never overwrites; archive asks first and hi
   await page.getByRole("button", { name: "Archive" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Archive project" }).click();
   await expect(page.getByText("This project is archived.", { exact: false })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "TreeDar" })).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: /TreeDar/ })).toHaveCount(0);
   expect(state.writes.at(-1)).toMatchObject({ method: "POST", path: "/api/hub/v1/projects/treedar/archive", body: { expected_revision: 1 } });
 });
 
