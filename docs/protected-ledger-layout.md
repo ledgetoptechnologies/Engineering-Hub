@@ -6,33 +6,50 @@ document is a design and acceptance checklist, **not a command to migrate or
 restart the live Hub**. The current image must not receive this configuration
 until the source and its dependencies are merged, published and verified.
 
-## Selected preparation: sibling children inside the existing root
+## Preferred preparation: selective mounts inside the existing root
 
 Beau clarified that `/mnt/Plugins/App_Data/Engineering-Hub/` is the intended
 root for all EH state. No separate top-level dataset is required by this design.
-Prepare these **sibling children** inside it:
+Minimize existing-data movement by keeping the settings and bus sources where
+they already are, mounting only the following individual sources:
 
 | Host child source | Container target | Contents |
 | --- | --- | --- |
-| `Engineering-Hub/shared/` | `/var/lib/hub` | Existing settings and complete message-bus database, audit, knowledge/files state |
+| `Engineering-Hub/settings.json` | `/var/lib/hub/settings.json` (read-only file) | Existing non-secret settings; reviewed version-two storage selection |
+| `Engineering-Hub/agent-message-bus/` | `/var/lib/hub/agent-message-bus` | Existing complete bus database, audit, knowledge/files state, unchanged host location |
 | `Engineering-Hub/private/` | `/var/lib/hub-private` | Existing Hub ledger after reviewed cold relocation/enrollment; private staging profile and executor credentials |
 
 These are future mount mappings, **not instructions to apply now**. The current
 whole-root mapping stays installed until a reviewed offline preservation and
-rollback plan is ready. Do not mount the parent into the same app alongside its
-private child. Keep the same container paths, ports, tokens and human Access
+rollback plan is ready. Replace it with the selective mappings together, not
+by leaving it alongside the private child. Keep container paths, ports, tokens and human Access
 policy. The sources must already exist; no automatic directory creation,
 empty-ledger fallback, data move or permission repair is allowed at startup.
 
-This changes the host locations of settings/bus state to the `shared` child,
-not the container paths. Preserve their contents except the explicitly reviewed
-version-two storage selection in the settings file. The selected config remains
+This leaves the existing settings and bus host/container paths unchanged.
+Preserve their contents except the explicitly reviewed version-two storage
+selection in settings. The selected config remains
 `/var/lib/hub/settings.json`; version two selects the fixed private ledger.
-The shared child does not need another copy of the authoritative Hub ledger.
+The image already provides the `/var/lib/hub` directory; it is not a host bind.
+Do not add another copy of the authoritative Hub ledger there.
 Preserve the original cold state separately for reviewed rollback, never as a
-second running authority. Plan backup/snapshot coverage for **both children**
+second running authority. Plan backup/snapshot coverage for existing shared
+state **and the private child**
 and any child datasets, rather than assuming the current parent-only policy
 includes newly created datasets.
+
+The settings file is read-only inside the app, not immutable on the NAS. It is
+loaded at startup. A file bind pins an inode: replacing the host file atomically
+can leave the old version visible in a running container. Apply reviewed edits
+before recreating the app, then verify the selected configuration. This is not
+a newly implemented runtime settings editor. The Compose fragment must use
+long bind syntax with `create_host_path: false` so a missing settings file is
+not silently created as a directory. No new Compose recursion feature is needed.
+
+The separately tested alternative is `Engineering-Hub/shared/` to
+`/var/lib/hub`, plus `Engineering-Hub/private/` to `/var/lib/hub-private`.
+It also avoids aliases, but needs an otherwise unnecessary offline move of all
+settings/bus state into `shared`. Retain it as an alternative, not a prerequisite.
 
 Beau and the agents are the current SMB users, not arbitrary outside users.
 The intended benefit is predictable process access, preventing accidental edits
@@ -55,7 +72,7 @@ source replacement or rename by accounts with parent rights. Container mode
 bits do not prove that host-side boundary. A child dataset may constrain rename
 behavior, but still needs effective ACL and alias-exclusion acceptance.
 
-The new sibling-child preparation avoids that alias without moving outside
+The selective-mount preparation avoids that alias without moving outside
 Engineering-Hub. A protected private child dataset with effective permissions
 may be appropriate where a plain folder's parent rights allow replacement.
 The exact host arrangement still needs operator acceptance; container tests do
@@ -113,14 +130,17 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 1. Publish and verify the exact source/image, including owned-inactive support.
    GitHub Actions currently has an account billing/spending restriction; local
    tests do not replace a published image or authorize bypassing release gates.
-2. Prepare the sibling-child layout above and review the cold preservation/move
+2. Prepare the selective mappings above and review the cold ledger relocation
    and rollback procedure. Establish effective private ACL/source-parent
    protection without recursive changes to existing shared data. Verify the
-   actual host/container mappings and backup coverage of both children.
-3. Arrange a maintenance window and stop **all writers to relocated state**:
-   Hub ledger, message-bus databases, audit/files/knowledge state, settings,
-   background services and independently running scripts. Stopping only the
-   Hub ledger writer is insufficient if any bus/file writer remains. Confirm coherent
+   actual host/container mappings and backup coverage of all existing and new state.
+3. Arrange a maintenance window and stop **all writers to relocated or edited
+   state**, including Hub, background services and independently running scripts.
+   The preferred layout relocates only the ledger and edits settings; the bus
+   sources remain in place. If using the shared-child alternative, additionally
+   stop every writer to bus databases, audit/files/knowledge and settings before
+   their cold copy. Stopping only the Hub ledger writer is insufficient for that
+   alternative. Confirm coherent
    recovery coverage. Existing automatic online ZFS snapshots are acknowledged;
    online capture itself does not require stopping Hub. Restore acceptance is a
    separate check. Never copy only a live SQLite main file or discard WAL/SHM.
@@ -172,11 +192,16 @@ $env:EH_ALIAS_TEST_IMAGE = 'sha256:<reviewed-local-image-digest>'
 python -m pytest -q tests/test_hub_protected_alias_docker.py
 ```
 
-The four real Docker cases prove separate same-filesystem sibling sources and
+The five real Docker cases prove separate same-filesystem sibling sources and
 two sibling subdirectories of one common source are accepted, a
 shared-parent/private-child double mount is rejected, and an equal
 private source mounted outside shared paths is rejected without `shared_root`.
 Alias cases verify actual matching device/inode identities before admission.
+The selective-path case uses real bind mounts of a settings file (read-only),
+the existing bus directory and private child from the same owned synthetic
+source. It checks real config loading and metadata admission without moving
+those sources or opening synthetic database contents. It does not start a Hub
+service or prove live data/credentials work on the NAS.
 These tests require Docker's `volume-subpath` support; the subdirectory is
 created before use. Every command uses the explicitly selected local Unix-socket
 or Windows-pipe context; TCP/SSH remote endpoints are refused. Verify that the

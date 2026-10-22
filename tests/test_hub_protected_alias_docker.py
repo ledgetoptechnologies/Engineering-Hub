@@ -69,7 +69,7 @@ def fixture():
         private, shared = volume('private'), volume('shared')
         run([f'type=volume,source={private},target=/seed',
              f'type=volume,source={shared},target=/shared'], '''
-import os
+import os, json
 from pathlib import Path
 p = Path('/seed/private')
 p.mkdir(mode=0o700)
@@ -82,6 +82,26 @@ p.chmod(0o700)
 os.chown(p, 568, 568)
 Path('/seed/shared').mkdir(mode=0o700)
 os.chown('/seed/shared', 568, 568)
+settings = Path('/seed/settings.json')
+settings.write_text(json.dumps({
+    'schema_version': 2, 'storage': {'layout': 'protected-ledger-v1'},
+    'base_url': 'https://hub.example',
+    'cloudflare_access': {'issuer': 'https://fixture.cloudflareaccess.com',
+        'audience': 'fixture-audience', 'allowed_emails': ['operator@example.test']},
+    'agent_allowed_hosts': ['hub.example', '127.0.0.1'],
+    'agent_allowed_ips': ['127.0.0.1']}))
+settings.chmod(0o600)
+os.chown(settings, 568, 568)
+bus = Path('/seed/agent-message-bus')
+bus.mkdir(mode=0o700)
+for name in ('messages.sqlite3', 'audit.jsonl'):
+    f = bus / name
+    f.write_bytes(b'synthetic-shared-state')
+    f.chmod(0o600)
+    os.chown(f, 568, 568)
+(bus / 'files').mkdir(mode=0o700)
+os.chown(bus / 'files', 568, 568)
+os.chown(bus, 568, 568)
 Path('/shared').chmod(0o700)
 os.chown('/shared', 568, 568)
 ''', root=True)
@@ -139,3 +159,35 @@ assert (root / 'hub.sqlite3.pilot-owner.lock').read_bytes() == b''
 print(case + ': PASS')
 '''.replace('CASE', repr(case))
     assert run(mounts, script) == f'{case}: PASS'
+
+
+def test_selective_existing_paths_accept_without_parent_or_shared_state_move(fixture):
+    private, _, run = fixture
+    obj = json.loads(docker('volume', 'inspect', private))[0]
+    source = obj['Mountpoint']
+    assert obj['Name'] == private and obj['Labels'].get(LABEL)
+    assert source.startswith('/') and '..' not in Path(source).parts
+    mounts = [
+        f'type=bind,source={source}/private,target=/var/lib/hub-private',
+        f'type=bind,source={source}/settings.json,target=/var/lib/hub/settings.json,readonly',
+        f'type=bind,source={source}/agent-message-bus,target=/var/lib/hub/agent-message-bus',
+    ]
+    assert run(mounts, '''
+from pathlib import Path
+from engineering_hub.deployment_config import load_deployment_config
+settings = Path('/var/lib/hub/settings.json')
+before = settings.read_bytes()
+deployment = load_deployment_config(settings)
+assert str(deployment.hub_database) == '/var/lib/hub-private/hub.sqlite3'
+assert str(deployment.bus_paths['AGENT_BUS_DB']) == '/var/lib/hub/agent-message-bus/messages.sqlite3'
+deployment.validate_ledger_boundary()  # metadata only; synthetic DB is never opened
+assert not Path('/var/lib/hub/private').exists()
+assert not Path('/var/lib/hub/hub.sqlite3').exists()
+rows = [row.split() for row in Path('/proc/self/mountinfo').read_text().splitlines()]
+assert not any(row[4] == '/var/lib/hub' for row in rows), 'whole parent was mounted'
+assert any(row[4] == str(settings) and 'ro' in row[5].split(',') for row in rows)
+assert settings.read_bytes() == before
+for name in ('messages.sqlite3', 'audit.jsonl'):
+    assert (Path('/var/lib/hub/agent-message-bus') / name).read_bytes() == b'synthetic-shared-state'
+print('selective-existing-paths: PASS')
+''') == 'selective-existing-paths: PASS'
