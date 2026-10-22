@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,13 +108,27 @@ class MessageRepository:
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 10000")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
+    @contextmanager
+    def _connection(self):
+        """Close repository-owned handles after SQLite's transaction context exits.
+
+        ``Connection.__exit__`` commits/rolls back but does not close the handle.
+        Keep public ``connect()`` caller-owned and preserve its existing contract.
+        """
+        with closing(self.connect()) as conn, conn:
+            yield conn
+
     def initialize(self) -> None:
-        with self.connect() as conn:
+        with self._connection() as conn:
             self._migrate_messages(conn)
             conn.executescript(Path(__file__).with_name("schema.sql").read_text())
             self._migrate_delivery_sequence(conn)
@@ -268,7 +283,7 @@ class MessageRepository:
 
         message_id = str(uuid.uuid4())
         created = iso(now_utc())
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 if client_request_id is not None:
@@ -348,7 +363,7 @@ class MessageRepository:
     def get_send_receipt(self, sender: str, client_request_id: str) -> dict[str, Any]:
         self._validate_agent(sender)
         _validate_client_request_id(client_request_id)
-        with self.connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("""SELECT r.message_id, r.sender, r.recipient, r.created_at, r.seq,
                     m.status
                 FROM send_idempotency AS r
@@ -383,7 +398,7 @@ class MessageRepository:
         self._validate_agent(recipient)
         if status not in STATUSES: raise MessageError("invalid status")
         limit = min(max(1, int(limit)), 100)
-        with self.connect() as conn:
+        with self._connection() as conn:
             sql = "SELECT * FROM messages WHERE recipient=? AND status=?"
             params: list[Any] = [recipient, status]
             if actionable_only:
@@ -409,17 +424,17 @@ class MessageRepository:
         return head
 
     def delivery_head(self) -> int:
-        with self.connect() as conn:
+        with self._connection() as conn:
             return self._delivery_head(conn)
 
     def oldest_available_seq(self) -> int | None:
-        with self.connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("""SELECT MIN(d.seq) FROM message_delivery_sequence AS d
                 INNER JOIN messages AS m ON m.id=d.message_id""").fetchone()
             return int(row[0]) if row is not None and row[0] is not None else None
 
     def sequence_for(self, message_id: str) -> int:
-        with self.connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT seq FROM message_delivery_sequence WHERE message_id=?", (message_id,)
             ).fetchone()
@@ -434,7 +449,7 @@ class MessageRepository:
             raise MessageError("after must be a non-negative integer")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise MessageError("limit must be between 1 and 100")
-        with self.connect() as conn:
+        with self._connection() as conn:
             # Validate against the durable global head, not recipient MAX(seq).
             # One read transaction keeps validation and paging on one snapshot.
             conn.execute("BEGIN")
@@ -449,7 +464,7 @@ class MessageRepository:
 
     def claim(self, message_id: str, agent: str) -> Message:
         self._validate_agent(agent); expires = iso(now_utc() + timedelta(seconds=self.lease_seconds))
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
             if row is None: conn.rollback(); raise NotFound("message not found")
@@ -468,7 +483,7 @@ class MessageRepository:
 
     def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> Message:
         self._validate_agent(agent); timestamp = iso(now_utc())
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
             if row is None: conn.rollback(); raise NotFound("message not found")
@@ -483,14 +498,14 @@ class MessageRepository:
     def cleanup(self, *, acknowledged_days: int = 30, rejected_days: int = 90) -> dict[str, int]:
         acknowledged_days = max(1, int(acknowledged_days)); rejected_days = max(1, int(rejected_days)); current = now_utc()
         a_cutoff = iso(current - timedelta(days=acknowledged_days)); r_cutoff = iso(current - timedelta(days=rejected_days))
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             a = conn.execute("DELETE FROM messages WHERE status='acknowledged' AND acknowledged_at < ?", (a_cutoff,)).rowcount
             r = conn.execute("DELETE FROM messages WHERE status='rejected' AND rejected_at < ?", (r_cutoff,)).rowcount
             conn.commit(); return {"acknowledged_deleted": a, "rejected_deleted": r}
 
     def expire_claims(self) -> int:
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             return conn.execute("UPDATE messages SET status='pending',claimed_by=NULL,claim_expires_at=NULL WHERE status='claimed' AND claim_expires_at <= ?", (iso(now_utc()),)).rowcount
 
 

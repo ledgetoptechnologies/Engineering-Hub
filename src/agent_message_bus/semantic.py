@@ -8,6 +8,7 @@ import re
 import sqlite3
 import struct
 import threading
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -138,7 +139,7 @@ class SemanticIndex:
         self._files = FileRepository(self.db_path, self.file_root)
 
     def _initialize_index(self) -> None:
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS documents (
                     source TEXT NOT NULL,
@@ -173,15 +174,23 @@ class SemanticIndex:
 
     def _connect_index(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.index_path, timeout=15, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=15000")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _connect_source(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _probe_model(self) -> tuple[str | None, str | None, list[tuple[Path, str]]]:
@@ -287,7 +296,7 @@ class SemanticIndex:
                     else:
                         state, error, ready = "available", None, True
             try:
-                with self._connect_index() as conn:
+                with closing(self._connect_index()) as conn, conn:
                     documents = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
                     chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
                     metadata = {row["key"]: row["value"] for row in conn.execute(
@@ -346,11 +355,11 @@ class SemanticIndex:
             if self._model_dim is not None and self._model_dim != len(query_vector):
                 raise SemanticIndexError("query and document embedding dimensions do not match")
             self._model_dim = len(query_vector)
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 conn.execute("INSERT INTO index_meta(key,value) VALUES('model_dimension',?) "
                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(self._model_dim),))
             results: dict[tuple[str, str, str], tuple[float, sqlite3.Row, str]] = {}
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 cursor = conn.execute(
                     """SELECT c.source,c.project,c.path,c.text,c.vector,c.dimensions,
                               d.title,d.digest,d.version_json,d.truncated,d.content_indexed,d.metadata_only
@@ -399,7 +408,7 @@ class SemanticIndex:
                 seen.add(key)
                 if self._index_document(document, embedder, model_hash):
                     updated += 1
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 existing = conn.execute("SELECT source,project,path FROM documents").fetchall()
                 stale = [(row["source"], row["project"], row["path"])
                          for row in existing if (row["source"], row["project"], row["path"]) not in seen]
@@ -411,7 +420,7 @@ class SemanticIndex:
                     except Exception:
                         conn.rollback()
                         raise
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 indexed_docs = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
                 indexed_chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
                 conn.execute("BEGIN IMMEDIATE")
@@ -437,7 +446,7 @@ class SemanticIndex:
     def _knowledge_documents(self) -> Iterator[_Document]:
         cursor: tuple[str, str] | None = None
         while True:
-            with self._connect_source() as conn:
+            with closing(self._connect_source()) as conn, conn:
                 try:
                     if cursor is None:
                         rows = conn.execute(
@@ -462,7 +471,7 @@ class SemanticIndex:
                 path = str(row["path"])
                 fingerprint = _fingerprint("knowledge", row["sha256"], title, path)
                 if not self._needs_refresh("knowledge", str(row["project"]), path, fingerprint):
-                    with self._connect_index() as conn:
+                    with closing(self._connect_index()) as conn, conn:
                         indexed = conn.execute(
                             "SELECT truncated FROM documents WHERE source='knowledge' AND project=? AND path=?",
                             (row["project"], path),
@@ -471,7 +480,7 @@ class SemanticIndex:
                                     str(row["sha256"]), fingerprint, int(row["version"]), "",
                                     bool(indexed["truncated"]) if indexed else False, True, False)
                     continue
-                with self._connect_source() as conn:
+                with closing(self._connect_source()) as conn, conn:
                     content_row = conn.execute(
                         "SELECT content FROM knowledge WHERE project=? AND path=? AND version=? AND sha256=?",
                         (row["project"], path, row["version"], row["sha256"]),
@@ -572,7 +581,7 @@ class SemanticIndex:
 
     def _needs_refresh(self, source: str, project: str, path: str,
                        fingerprint: str) -> bool:
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             row = conn.execute(
                 "SELECT fingerprint FROM documents WHERE source=? AND project=? AND path=?",
                 (source, project, path),
@@ -580,7 +589,7 @@ class SemanticIndex:
         return row is None or row["fingerprint"] != fingerprint or self._stored_model_hash() != self._model_hash
 
     def _indexed_file_flags(self, project: str, path: str) -> tuple[bool, bool, bool] | None:
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             row = conn.execute(
                 "SELECT truncated,content_indexed,metadata_only FROM documents "
                 "WHERE source='file' AND project=? AND path=?",
@@ -593,7 +602,7 @@ class SemanticIndex:
     def _stored_model_hash(self) -> str | None:
         if self._stored_model_hash_cache is not _UNSET:
             return self._stored_model_hash_cache  # type: ignore[return-value]
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             row = conn.execute("SELECT value FROM index_meta WHERE key='model_hash'").fetchone()
         self._stored_model_hash_cache = str(row["value"]) if row is not None else None
         return self._stored_model_hash_cache
@@ -602,7 +611,7 @@ class SemanticIndex:
         if not document.text and document.content_indexed:
             # An unchanged source document may only carry metadata fields. Preserve its
             # current vectors and refresh authoritative version/title/digest fields.
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 conn.execute(
                     "UPDATE documents SET title=?,digest=?,version_json=?,truncated=?,content_indexed=?,metadata_only=? "
                     "WHERE source=? AND project=? AND path=?",
@@ -611,14 +620,14 @@ class SemanticIndex:
                      document.project, document.path),
                 )
             return False
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             current = conn.execute(
                 "SELECT fingerprint FROM documents WHERE source=? AND project=? AND path=?",
                 (document.source, document.project, document.path),
             ).fetchone()
         if current is not None and current["fingerprint"] == document.fingerprint \
                 and self._stored_model_hash() == model_hash:
-            with self._connect_index() as conn:
+            with closing(self._connect_index()) as conn, conn:
                 conn.execute(
                     "UPDATE documents SET title=?,digest=?,version_json=?,truncated=?,content_indexed=?,metadata_only=? "
                     "WHERE source=? AND project=? AND path=?",
@@ -640,7 +649,7 @@ class SemanticIndex:
             if self._model_dim is not None and self._model_dim != dimension:
                 raise SemanticIndexError("embedding model changed vector dimensions")
             self._model_dim = dimension
-        with self._connect_index() as conn:
+        with closing(self._connect_index()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute("DELETE FROM documents WHERE source=? AND project=? AND path=?",
