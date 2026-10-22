@@ -23,12 +23,21 @@ export function parseTopicList(value: unknown): TopicEntry[] {
   });
 }
 
+async function unavailableCatalog(response: Response): Promise<boolean> {
+  try {
+    const body: unknown = await response.clone().json();
+    return (body as { detail?: { code?: unknown } })?.detail?.code === "topic_catalog_unavailable";
+  } catch { return false; }
+}
+
 /** null means the server has no topic list yet (404); errors other than that are thrown. */
 export async function listTopics(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<TopicEntry[] | null> {
   const response = await fetchImpl.call(globalThis, "/api/hub/v1/topics", {
     method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal,
   });
   if (await isMissingRoute(response)) return null;
+  // No trusted resolver for this account: fall back explicitly, never an empty "authoritative" list.
+  if (response.status === 503 && await unavailableCatalog(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "topic_list_failed");
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) throw new HubApiError(502, "invalid_topic_list");
   return parseTopicList(await response.json());
