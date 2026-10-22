@@ -482,6 +482,42 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
                     json={'expected_revision': decision['revision'], 'answer': 'A'})
                 assert answer.status_code == 200, answer.text
                 assert answer.json()['answered_by'] == me['actor']
+                # Exercise mutation methods through both gateways and the real
+                # authenticated owner, not merely the route-table predicate.
+                created = await browser.post(BASE + '/projects', json={
+                    'project_id': 'client-notes', 'name': 'Client notes',
+                    'client_request_id': 'gateway-project'})
+                assert created.status_code == 201, created.text
+                project_path = BASE + '/projects/client-notes'
+                edit = {'expected_revision': 1, 'description': 'Notes without a repository'}
+                denied = await browser.patch(project_path, json=edit,
+                    headers={'X-Hub-CSRF': 'incorrect'})
+                assert denied.status_code == 403
+                edited = await browser.patch(project_path, json=edit)
+                assert edited.status_code == 200, edited.text
+                assert edited.json()['revision'] == 2
+                assert edited.json()['repository_url'] is None
+                assert (await browser.patch(project_path, json=edit)).status_code == 409
+
+                from engineering_hub.label_sets import LabelSetRepository
+                labels = LabelSetRepository(core.state.repository)
+                labels.create(set_id='gateway-labels', project='client-notes', title='Review',
+                    choices=[{'key': 'yes', 'label': 'Yes'}, {'key': 'no', 'label': 'No'}],
+                    items=[{'id': 'item-1'}], actor='codex')
+                label_path = BASE + '/label-sets/gateway-labels/items/item-1/label'
+                # Clearing a label needs no image; classification still does.
+                clear = {'expected_revision': 0, 'choice': None}
+                assert (await browser.put(label_path, json=clear,
+                    headers={'X-Hub-CSRF': 'incorrect'})).status_code == 403
+                labeled = await browser.put(label_path, json=clear)
+                assert labeled.status_code == 200, labeled.text
+                assert labeled.json()['revision'] == 1
+                assert (await browser.put(label_path, json=clear)).status_code == 409
+                archived = await browser.post(project_path + '/archive',
+                    json={'expected_revision': 2})
+                assert archived.status_code == 200, archived.text
+                assert archived.json()['archived'] is True
+                assert (await browser.get(project_path)).json()['archived'] is True
                 browser.headers.pop('Cf-Access-Jwt-Assertion')
                 assert (await browser.get(BASE + '/tasks')).status_code == 401
                 duplicate = await exchange(gateway, BASE + '/tasks', headers=[

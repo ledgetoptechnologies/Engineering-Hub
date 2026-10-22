@@ -4,6 +4,7 @@ from typing import Literal
 from fastapi import Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from .dto import NullableAgentId
 from .repository import PROJECTS
 
 
@@ -14,7 +15,7 @@ class ProjectInput(BaseModel):
     client_request_id: str = Field(min_length=1, max_length=128)
     description: str = Field(default='', max_length=4096)
     repository_url: str | None = Field(default=None, max_length=2048)
-    lead_agent: Literal['codex', 'hermes', 'claude'] | None = None
+    lead_agent: NullableAgentId = None
     status: Literal['on_track', 'at_risk', 'off_track', 'paused'] = 'on_track'
     parent_project: str | None = Field(default=None, max_length=64)
 
@@ -25,7 +26,7 @@ class ProjectEdit(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=4096)
     repository_url: str | None = Field(default=None, max_length=2048)
-    lead_agent: Literal['codex', 'hermes', 'claude'] | None = None
+    lead_agent: NullableAgentId = None
     status: Literal['on_track', 'at_risk', 'off_track', 'paused'] | None = None
     parent_project: str | None = Field(default=None, max_length=64)
 

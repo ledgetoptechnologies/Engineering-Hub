@@ -254,7 +254,6 @@ class HubRepository:
 
     def create_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         self._actor(actor, human=True)
-        self._project(project)
         title, key = self._text(title), self._text(client_request_id)
         context = self._context(details, links)
         payload = [project, title] + ([context] if context else [])
@@ -308,7 +307,6 @@ class HubRepository:
     def propose_staging_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         """An agent may propose work, never grant execution or production authority."""
         self._actor(actor, agent=True)
-        self._project(project)
         title, key = self._text(title), self._text(client_request_id, 128)
         context = self._context(details, links)
         payload = ['staging_task_proposal', project, title] + ([context] if context else [])
@@ -403,7 +401,6 @@ class HubRepository:
 
     def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
         self._actor(actor)
-        self._project(project)
         title = self._text(title)
         if type(protected) is not bool or not isinstance(options, list) or not 2 <= len(options) <= 5:
             raise HubError('invalid_options')
