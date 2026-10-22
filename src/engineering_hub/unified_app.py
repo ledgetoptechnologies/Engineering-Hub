@@ -18,6 +18,8 @@ def create_unified_app(settings=None, *, bus_paths=None):
     listener, job, watcher fallback or second bus is discovered here.
     """
     settings = settings or Settings.from_env()
+    if settings.require_owned_ledger:
+        raise ValueError('Protected ledger requires an explicit owned entrypoint')
     return create_app(settings, bus_app=_create_unified_bus(settings, bus_paths=bus_paths))
 
 

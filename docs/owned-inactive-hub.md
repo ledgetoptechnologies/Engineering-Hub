@@ -7,8 +7,9 @@ or its credentials running. It does not change the default Hub entrypoint.
 ## Scope and prerequisites
 
 The operator must select the existing non-secret deployment configuration and
-the same authoritative Hub database. The configuration loader still determines
-the database from its state root; this change adds no alternate storage layout.
+the same authoritative Hub database. Version1 configuration determines the
+database from its state root. The separately opted-in version2 layout is
+described in [protected-ledger-layout.md](protected-ledger-layout.md).
 In particular, it does **not** make a group-writable SMB directory private, move
 the ledger, configure a new mount, or make a live NAS installation eligible.
 
@@ -36,7 +37,8 @@ python -m engineering_hub.owned_inactive_hub --config /operator/selected/setting
 ```
 
 The example path is not an instruction to move settings. Use the established
-configuration location; its parent currently selects the database and bus paths.
+configuration location; version1 selects database and bus paths from its parent,
+while version2 preserves bus paths and requires the separate fixed private mount.
 There is no default configuration, executor-profile argument or automatic mode
 fallback. Work-queue enablement and bus startup-retention cleanup must both be
 disabled; enabled or invalid values are rejected before binding or opening state.
@@ -78,8 +80,8 @@ live deployment or restarts.
 
 This is source/disposable-test acceptance only: it is not acceptance of a new
 container image, NAS deployment, private host mapping, reboot recovery or snapshot
-restoration. Selecting or provisioning a protected layout remains a separate
-operator decision and implementation.
+restoration. Applying a protected layout remains a separate operator-reviewed
+maintenance action; source support does not authorize migration or provisioning.
 
 ## Acceptance evidence
 

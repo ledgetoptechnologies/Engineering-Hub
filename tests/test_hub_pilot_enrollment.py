@@ -1,19 +1,25 @@
 """Disposable Linux cold-ledger enrollment, never NAS or host activation."""
+import asyncio
+from contextlib import closing
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import subprocess
 import sys
+import uuid
 
 import pytest
 
 from engineering_hub import pilot_enrollment as enrollment
-from engineering_hub.auth import SessionStore
+from engineering_hub.auth import AuthConfig, SessionStore
+from engineering_hub.cloudflare_access import CloudflareIdentity
+from engineering_hub.outbox import HubOutboxPublisher
 from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError, _local_filesystem
 from engineering_hub.repository import HubError, HubRepository
-from engineering_hub.work_queue import WorkAction, WorkQueue
+from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker
 
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Linux offline ownership enrollment')
@@ -42,7 +48,7 @@ def ledger(tmp_path, monkeypatch):
 
 
 def snapshot(path):
-    with sqlite3.connect(Path(path).as_uri() + '?mode=ro&immutable=1', uri=True) as db:
+    with closing(sqlite3.connect(Path(path).as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
         return enrollment._snapshot(db)
 
 
@@ -73,6 +79,104 @@ def test_plan_is_read_only_fingerprints_no_secrets_and_apply_preserves_every_exi
         assert owned.create_task('human:42', 'engineering-hub', 'Preserve task', 'preserved-request')['title'] == 'Preserve task'
     with pytest.raises(enrollment.EnrollmentError):
         enrollment.apply_plan(plan, enrollment.plan_digest(plan), writers_stopped=True, backup_verified=True)
+
+
+def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_owned_reopen(ledger):
+    # All constructors and traffic below are local disposable fixtures. This
+    # exercises enrollment compatibility, not live Access verification, bus
+    # delivery, job execution, or a production state-migration procedure.
+    source, repo, _, github_session = ledger
+    task = repo.list_tasks()[0]
+    config = AuthConfig(
+        base_url='https://hub.example.com', human_auth_mode='cloudflare_access',
+        cloudflare_issuer='https://disposable-test.cloudflareaccess.com',
+        cloudflare_audience='disposable-test-audience',
+        cloudflare_allowed_emails=('beau@example.com',))
+    identity = CloudflareIdentity('test-subject', 'beau@example.com', 'human:42', 99999)
+    sessions = SessionStore(source, repository=repo, clock=lambda: 1000)
+    access_session = sessions.create_cloudflare_session(config, identity)
+    expected_access = sessions.cloudflare_session_for(access_session['cookie_token'], config, identity)
+    assert expected_access['actor'] == identity.actor
+    assert expected_access['csrf_token'] == access_session['csrf_token']
+    actions = {'validate': WorkAction('disposable-machine', project='engineering-hub',
+                                    requires_execution_proof=False)}
+    queue = WorkQueue(repo, actions, clock=lambda: 1000, target_verifier=lambda *args: True)
+    worker = WorkWorker('codex', str(uuid.uuid4()))
+    target = WorkTarget(task['id'], 'a' * 40, 'sha256:' + 'b' * 64)
+    terminal_jobs = []
+    for outcome in ('succeeded', 'failed'):
+        submitted = queue.submit(actor='codex', request_id='history-' + outcome,
+                                 action_key='validate', environment='staging', target=target)
+        claimed = queue.claim(worker=worker)
+        assert claimed['id'] == submitted['id']
+        terminal_jobs.append(queue.complete(job_id=claimed['id'], worker=worker,
+                                            fence=claimed['fence'], outcome=outcome))
+    expected_queue = queue.status()
+
+    class DisposableBus:
+        def __init__(self):
+            self.sent = []
+
+        async def bus_info(self, **kwargs):
+            return {'native_push': {'inbox_uri': 'agentbus://inbox/codex'}}
+
+        async def send_message(self, **payload):
+            self.sent.append(payload)
+            return {'id': str(uuid.uuid4())}
+
+    bus = DisposableBus()
+    publisher = HubOutboxPublisher(repo, bus, recipients=('hermes',))
+    delivered = asyncio.run(publisher.drain_batch())
+    assert delivered == {'accepted': len(bus.sent), 'failed': 0, 'pending': 0, 'held_reason': None}
+    assert delivered['accepted'] > 0
+    before = snapshot(source)
+    source_bytes = source.read_bytes()
+    assert not any(source.with_name(source.name + suffix).exists()
+                   for suffix in ('-wal', '-shm', '-journal'))
+    copied_root = source.parent.parent / 'cold-copy-private'
+    copied_root.mkdir(mode=0o700)
+    copied = copied_root / 'hub.sqlite3'
+    shutil.copyfile(source, copied)
+    copied.chmod(0o600)
+    assert copied.read_bytes() == source_bytes
+    plan = enrollment.inspect_plan(copied)
+    assert plan['snapshot'] == before
+    result = enrollment.apply_plan(plan, enrollment.plan_digest(plan),
+                                   writers_stopped=True, backup_verified=True)
+    with PilotOwner(copied, require_existing=True, allow_ephemeral_test_storage=True) as owner:
+        owned = HubRepository(copied, pilot_owner=owner)
+        owned_sessions = SessionStore(copied, repository=owned, clock=lambda: 1000)
+        owned_queue = WorkQueue(owned, actions, clock=lambda: 1000,
+                                target_verifier=lambda *args: True)
+        owned_publisher = HubOutboxPublisher(owned, bus, recipients=('hermes',))
+        assert owner.previous_epoch == result['epoch']
+        assert owned.list_tasks() == repo.list_tasks()
+        assert owned.list_decisions() == repo.list_decisions()
+        assert owned.create_task('human:42', 'engineering-hub', 'Preserve task',
+                                 'preserved-request') == task
+        assert owned_sessions.session_for(github_session['cookie_token'])['github_id'] == 42
+        assert owned_sessions.cloudflare_session_for(
+            access_session['cookie_token'], config, identity) == expected_access
+        changed_identity = CloudflareIdentity('different-subject', identity.email, identity.actor, 99999)
+        assert owned_sessions.cloudflare_session_for(
+            access_session['cookie_token'], config, changed_identity) is None
+        assert owned_queue.status() == expected_queue
+        for job in terminal_jobs:
+            assert owned_queue.get_job(job['id'])['state'] == job['state']
+            assert owned_queue.submit(actor='codex', request_id='history-' + job['state'],
+                                      action_key='validate', environment='staging', target=target) == job
+        sent_before = len(bus.sent)
+        assert asyncio.run(owned_publisher.drain_batch()) == {
+            'accepted': 0, 'failed': 0, 'pending': 0, 'held_reason': None}
+        assert len(bus.sent) == sent_before
+        with owned._connection() as db:
+            assert db.execute('SELECT generation FROM hub_target_fences').fetchone()[0] == 51
+            assert db.execute('SELECT generation,job_id FROM hub_work_machines').fetchone()[:] == (2, None)
+            assert db.execute('SELECT COUNT(*) FROM auth_access_identities').fetchone()[0] == 1
+        with closing(sqlite3.connect(copied)) as db:
+            assert enrollment._snapshot(db, enrolled=True) == before
+    assert source.read_bytes() == source_bytes
+    assert snapshot(source) == before
 
 
 @pytest.mark.parametrize('changed', ['no-attestations', 'bad-digest', 'extra-key', 'content', 'replacement'])

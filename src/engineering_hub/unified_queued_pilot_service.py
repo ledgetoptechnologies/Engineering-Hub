@@ -76,6 +76,9 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
     Default unified startup never selects this source-only composition.
     """
     try:
+        if type(settings) is Settings and settings.require_owned_ledger:
+            from .protected_layout import validate_existing_boundary
+            validate_existing_boundary(settings.database, shared_paths=tuple(bus_paths.values()))
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
                 or settings.auth_config.human_auth_mode != 'cloudflare_access'
