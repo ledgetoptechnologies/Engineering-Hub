@@ -5,6 +5,11 @@ from mcp.server.fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from pydantic import ValidationError
+from pydantic import StrictInt
+from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
+    KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository)
+from .planning_api import PlanningWrite, Scope, Kind, Status
+from . import planning
 
 from .repository import HubError
 from .work_queue import WorkWorker
@@ -34,13 +39,16 @@ class HubMCPAuthMiddleware:
 
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
-                  work_queue=None, mcp=None, agent_status=None, image_versions=None) -> FastMCP:
+                  work_queue=None, mcp=None, agent_status=None, image_versions=None,
+                  planning_repository=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
     elif type(mcp) is not FastMCP or getattr(mcp, '_hub_tools_registered', False):
         raise ValueError('Fresh explicit MCP registration owner required')
     mcp._hub_tools_registered = True
+    if planning_repository is not None and type(planning_repository) is not KnowledgeRepository:
+        raise ValueError('Explicit shared knowledge repository required')
 
     def identity(ctx):
         request = ctx.request_context.request
@@ -61,6 +69,57 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise
         except Exception:
             raise ToolError("internal_error") from None
+
+    def planning_invoke(operation):
+        if planning_repository is None:
+            raise ToolError('planning_unavailable')
+        try:
+            return operation(planning_repository)
+        except KnowledgeConflict as error:
+            raise ToolError('planning_version_conflict: current_version=' + str(error.current_version)) from None
+        except KnowledgeNotFound:
+            raise ToolError('planning_item_not_found') from None
+        except KnowledgeIntegrityError:
+            raise ToolError('planning_integrity_failure') from None
+        except (KnowledgeError, ValidationError):
+            raise ToolError('invalid_planning_item') from None
+        except Exception:
+            raise ToolError('planning_unavailable') from None
+
+    @mcp.tool()
+    def hub_planning_list(scope: Scope, project: str, ctx: Context,
+                          topic: str | None = None, kind: Kind | None = None,
+                          limit: StrictInt = 50) -> dict:
+        """List advisory topic plans/ideas or the separate EH improvements backlog.
+
+        hub_improvements requires project engineering-hub and no topic. Records
+        are shared context, not task assignment, approval or execution rights.
+        A truncated list requires a narrower topic/kind; it is not a full backlog.
+        """
+        identity(ctx)
+        return planning_invoke(lambda store: planning.list_items(store, scope=scope,
+            project=project, topic=topic, kind=kind, limit=limit))
+
+    @mcp.tool()
+    def hub_planning_get(scope: Scope, project: str, kind: Kind, item_id: str,
+                         ctx: Context, topic: str | None = None) -> dict:
+        """Read one complete advisory plan/idea, including its CAS version."""
+        identity(ctx)
+        return planning_invoke(lambda store: planning.get_item(store, scope=scope,
+            project=project, topic=topic, kind=kind, item_id=item_id))
+
+    @mcp.tool()
+    def hub_planning_put(payload: PlanningWrite, ctx: Context) -> dict:
+        """Create/update an advisory plan, feature, idea or EH improvement.
+
+        New item expected_version=0; edits require a fresh read and reconcile on
+        conflict. Stable item_id deduplicates the same record. Status is advisory:
+        planned/done never approve, schedule, deploy or prove work completed.
+        Agent author is authenticated. Keep credentials/private data out.
+        """
+        author = identity(ctx)
+        return planning_invoke(lambda store: planning.put_item(store, author=author,
+            **PlanningWrite.model_validate(payload).model_dump()))
 
     async def invoke_topic(operation, ctx, *args):
         principal = identity(ctx)
