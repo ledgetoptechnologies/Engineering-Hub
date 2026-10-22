@@ -97,7 +97,7 @@ async def test_actual_primary_alias_browser_share_one_core_and_feed(tmp_path, mo
         assert len(captured) == 3 and len({address for _, address in captured}) == 3
         alias = next(address for _, address in captured if address not in (primary, browser))
         assert len(listeners) == 2
-        assert listeners[0].config.app is pair.agents and listeners[1].config.app is pair.browser
+        assert listeners[0].config.app.app is pair.agents and listeners[1].config.app.app is pair.browser
         task_record = core.state.repository.create_task('human:123', 'engineering-hub', 'Alias task', 'alias-task')
         async with httpx.AsyncClient(headers={'Host': 'hub.test'}, trust_env=False) as client:
             for address in (primary, alias):

@@ -18,8 +18,9 @@ import httpx
 
 from .lifecycle import finish_owned
 from .private_browser_socket import private_browser_socket
-from .private_gateway import PrivateBrowserGateway, PublicBrowserGateway, _is_events
+from .private_gateway import PrivateBrowserGateway, PublicBrowserGateway
 from .server import _bind, _listener, _signal_stop
+from .stream_shutdown import StreamDisconnect as _StreamDisconnect
 
 
 class SplitServerError(RuntimeError):
@@ -40,43 +41,6 @@ def _options(factory, ports, stop_event, on_ready, install_signals):
         raise ValueError('Hub readiness callback must be callable')
     if type(install_signals) is not bool:
         raise ValueError('Hub signal option must be boolean')
-
-
-class _StreamDisconnect:
-    """End read-only event subscriptions when listener admission is stopping.
-
-    Only an idle receive observer is cancelled. Ordinary requests, including
-    every POST, retain their original receive and must drain to completion.
-    """
-
-    def __init__(self, app, stopping):
-        self.app, self.stopping = app, stopping
-
-    async def __call__(self, scope, receive, send):
-        path = scope.get('path', '')
-        streaming = (scope.get('type') == 'http' and scope.get('method') == 'GET'
-                     and (_is_events(path) or path in {'/mcp', '/mcp/'}))
-        if not streaming:
-            return await self.app(scope, receive, send)
-
-        async def disconnectable_receive():
-            if self.stopping.is_set():
-                return {'type': 'http.disconnect'}
-            incoming = asyncio.create_task(receive())
-            stopped = asyncio.create_task(self.stopping.wait())
-            try:
-                done, _ = await asyncio.wait((incoming, stopped),
-                                             return_when=asyncio.FIRST_COMPLETED)
-                if stopped in done:
-                    return {'type': 'http.disconnect'}
-                return incoming.result()
-            finally:
-                for observer in (incoming, stopped):
-                    if not observer.done():
-                        observer.cancel()
-                await finish_owned(asyncio.gather(incoming, stopped, return_exceptions=True))
-
-        return await self.app(scope, disconnectable_receive, send)
 
 
 def _task(coroutine):
