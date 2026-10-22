@@ -181,7 +181,7 @@ def smoke(image, commit):
             names.remove(name)
         maintenance = standby_pid1_acceptance(image, owner, volume, names)
         return {"source_commit": commit, "image_smoke": "passed", "canonical_host": "hub.ledgetoptechnologies.com",
-                "authenticated_agents": 3, "mcp_tools": 13, "human_sign_in": "disabled",
+                "authenticated_agents": 3, "mcp_tools": 21, "human_sign_in": "disabled",
                 "named_volume_recreation": "passed", "network": "none", "truenas": "not_deployed",
                 "maintenance_standby": maintenance}
     finally:

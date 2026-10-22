@@ -11,7 +11,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
-import { openDecisions } from "./pages/decisions";
+import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
 import type {
   Decision,
@@ -413,7 +413,7 @@ export function HubApp() {
               item.id === id &&
               item.status === "open" &&
               item.revision === choice.revision &&
-              item.options.includes(choice.answer),
+              retainsAnswerDraft(item, choice.answer),
           ),
         ),
       );
@@ -495,7 +495,7 @@ export function HubApp() {
       !writable ||
       !choice ||
       choice.revision !== decision.revision ||
-      !decision.options.includes(choice.answer)
+      !acceptsAnswer(decision, choice.answer)
     )
       return;
     if (decision.protected) {
@@ -517,7 +517,7 @@ export function HubApp() {
           item.id === id &&
           item.revision === revision &&
           item.status === "open" &&
-          item.options.includes(answer),
+          acceptsAnswer(item, answer),
       )
     )
       return false;
@@ -536,7 +536,7 @@ export function HubApp() {
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
     requestPause: (paused: boolean) => setPauseChoice(paused),
-    clearPrivateWorkspace, peers, topic, topicDraft, setTopicDraft, checkTopic, selectTopic, topicError, topicStale, peerState,
+    clearPrivateWorkspace, refresh: async () => { await refresh(); }, peers, topic, topicDraft, setTopicDraft, checkTopic, selectTopic, topicError, topicStale, peerState,
   } : null;
   const waitingCount = hub ? openDecisions(hub).length : 0;
   const activeWork = data ? data.tasks.filter((task) => task.status !== "verified").length : 0;
@@ -569,7 +569,7 @@ export function HubApp() {
   );
   const notesProps = {
     mode: (demo ? "demo" : "live") as "demo" | "live",
-    knownProjects: data?.projects.map((item) => ({ id: item.id, name: item.name })) ?? [],
+    knownProjects: data?.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name })) ?? [],
     csrf: session?.csrf_token ?? null, writable: !!session?.authenticated,
     viewerActor: session?.actor ?? null, onUnauthorized: clearPrivateWorkspace,
   };
@@ -605,10 +605,10 @@ export function HubApp() {
             ))}
           </nav>
           <div className="sidebar-section">
-            PROJECTS <span>{data?.projects.length ?? "—"}</span>
+            PROJECTS <span>{data?.projects.filter((item) => !item.archived).length ?? "—"}</span>
           </div>
           <nav aria-label="Projects" className="project-nav">
-            {data?.projects.map((item) => (
+            {data?.projects.filter((item) => !item.archived).map((item) => (
               <a key={item.id} href={link(`/projects/${item.id}`)}
                 className={(route.page === "project" && route.id === item.id) || (route.page === "labels" && route.project === item.id)
                   ? "project-link current" : "project-link"}>
@@ -756,7 +756,7 @@ export function HubApp() {
             <label className="field">
               Project
               <select value={taskProject} onChange={(event) => setTaskProject(event.target.value as ProjectId)}>
-                {data?.projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                {data?.projects.filter((item) => !item.archived).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
             </label>
             <label className="field">

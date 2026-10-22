@@ -5,6 +5,7 @@ import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
 import { statusLabel, statusTone } from "./tasks";
+import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
 
 function greeting(now = new Date()) {
   const hour = now.getHours();
@@ -13,10 +14,11 @@ function greeting(now = new Date()) {
 
 export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const waiting = openDecisions(hub);
+  const projects = hub.data.projects.filter((item) => !item.archived);
   const tasks = hub.data.tasks;
   const active = tasks.filter((task) => task.status !== "verified");
   const connected = hub.data.agents.filter((agent) => connectionView(agent, !hub.demo && hub.stale).connected);
-  const targets = hub.data.projects.filter((item) => item.executor_enabled).length;
+  const targets = projects.filter((item) => item.executor_enabled).length;
   return (
     <>
       <PageHeader eyebrow="DEVELOPMENT / STAGING" title={greeting()}
@@ -39,12 +41,11 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         </a>
         <a className="kpi" href={link("/staging")}>
           <span className="kpi-label"><Icon kind="staging" size={16} /> Staging</span>
-          <strong>{targets}<span className="kpi-of">/{hub.data.projects.length}</span></strong>
+          <strong>{targets}<span className="kpi-of">/{projects.length}</span></strong>
           <span className="kpi-note">{hub.data.paused ? "Emergency pause on" : "targets set up"}</span>
         </a>
       </div>
       <div className="home-grid">
-        <ImageVersionsPanel summary={hub.data.image_versions} stale={!hub.demo && hub.stale} />
         <section className="panel" aria-label="Needs you">
           <div className="panel-title">
             <h2>Needs you</h2>
@@ -70,19 +71,31 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           )}
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, undefined, 2)} />
         </section>
-        <section className="panel" aria-label="Work in motion summary">
+        <section className="panel" aria-label="Work pipeline">
           <div className="panel-title">
-            <h2>Work in motion</h2>
-            <span className="count">{active.length}</span>
+            <h2>Work pipeline</h2>
+            <span className="count">{tasks.length}</span>
             <span className="panel-action"><a className="text-link" href={link("/work")}>All work →</a></span>
           </div>
-          {active.length === 0 ? (
-            <p className="panel-description">No open tasks.</p>
-          ) : (
-            <ul className="preview-list">
-              {active.slice(0, 6).map((task) => (
+          <StageBar tasks={tasks} label="All tasks by stage" height={18} />
+          <StageLegend tasks={tasks} />
+          <ul className="pipeline-rows" aria-label="Tasks by project">
+            {projects.map((project) => {
+              const rows = tasks.filter((task) => task.project === project.id);
+              return (
+                <li key={project.id}>
+                  <a href={link(`/projects/${project.id}/work`)}>{project.name}</a>
+                  <StageBar tasks={rows} label={`${project.name} tasks by stage`} height={10} />
+                  <span className="pipeline-count">{rows.length}</span>
+                </li>
+              );
+            })}
+          </ul>
+          {active.length > 0 && (
+            <ul className="preview-list compact">
+              {active.slice(0, 3).map((task) => (
                 <li key={task.id}>
-                  <a href={link("/work")}>
+                  <a href={link(`/projects/${task.project}/work`)}>
                     <span className="preview-title">{task.title}</span>
                     <span className="preview-meta">
                       {hub.projectName(task.project)} · {task.owner ? names[task.owner] : "Unclaimed"}
@@ -93,6 +106,15 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
               ))}
             </ul>
           )}
+        </section>
+        <section className="panel" aria-label="Recent activity chart">
+          <div className="panel-title">
+            <h2>Last 14 days</h2>
+            <span className="panel-action"><a className="text-link" href={link("/projects")}>Projects →</a></span>
+          </div>
+          <DayBars label="Tasks and questions last changed per day"
+            series={dailyCounts([...tasks.map((task) => task.updated_at), ...hub.data.decisions.map((item) => item.updated_at)])} />
+          <p className="panel-footnote">Tasks and questions by the day they last changed. Each record counts once, on its latest change.</p>
         </section>
         <section className="panel" aria-label="Agents summary">
           <div className="panel-title">
@@ -121,7 +143,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <span className="panel-action"><a className="text-link" href={link("/projects")}>All projects →</a></span>
           </div>
           <ul className="project-mini">
-            {hub.data.projects.map((project) => {
+            {projects.map((project) => {
               const open = openDecisions(hub, project.id).length;
               const work = hub.data.tasks.filter((task) => task.project === project.id && task.status !== "verified").length;
               return (
@@ -132,12 +154,14 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                     <span className="preview-meta">
                       {open ? `${open} waiting · ` : ""}{work} open {work === 1 ? "task" : "tasks"}
                     </span>
+                    <StageBar tasks={hub.data.tasks.filter((task) => task.project === project.id)} label={`${project.name} progress`} height={6} />
                   </a>
                 </li>
               );
             })}
           </ul>
         </section>
+        <ImageVersionsPanel summary={hub.data.image_versions} stale={!hub.demo && hub.stale} />
       </div>
     </>
   );

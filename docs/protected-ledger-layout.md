@@ -151,8 +151,10 @@ particular, the retained old ledger cannot be used as a lossless rollback after
 the private authority accepts new mutations.
 
 1. Publish and verify the exact source/image, including owned-inactive support.
-   GitHub Actions currently has an account billing/spending restriction; local
-   tests do not replace a published image or authorize bypassing release gates.
+   Earlier account billing restrictions are historical, not a current verified
+   blocker: Beau subsequently made the repository public and main publication
+   succeeded. Check the exact candidate's current workflow and registry result;
+   local tests still do not replace a published image or bypass release gates.
 2. Prepare the selective mappings above and review the cold ledger relocation
    and rollback procedure. Establish effective private ACL/source-parent
    protection without recursive changes to existing shared data. Verify the

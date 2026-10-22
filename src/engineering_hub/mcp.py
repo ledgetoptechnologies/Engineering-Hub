@@ -7,7 +7,7 @@ from starlette.responses import JSONResponse
 from pydantic import ValidationError
 from pydantic import StrictInt
 from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
-    KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository)
+    KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository, KnowledgeProjectArchived)
 from .planning_api import PlanningWrite, Scope, Kind, Status
 from . import planning
 
@@ -40,7 +40,7 @@ class HubMCPAuthMiddleware:
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
-                  planning_repository=None) -> FastMCP:
+                  planning_repository=None, label_sets=None, entity_images=None, project_registry=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -75,6 +75,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('planning_unavailable')
         try:
             return operation(planning_repository)
+        except KnowledgeProjectArchived:
+            raise ToolError('project_archived') from None
         except KnowledgeConflict as error:
             raise ToolError('planning_version_conflict: current_version=' + str(error.current_version)) from None
         except KnowledgeNotFound:
@@ -149,13 +151,16 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return result
 
     @mcp.tool()
-    def hub_staging_task_propose(project: str, title: str, client_request_id: str, ctx: Context) -> dict:
+    def hub_staging_task_propose(project: str, title: str, client_request_id: str, ctx: Context,
+                                 details: str | None = None, links: list[dict[str, str]] | None = None) -> dict:
         """Create an unclaimed staging-only task, not approval or execution.
 
         Reuse a request ID only for the same payload. An independent agent must
         review an exact candidate; registered execution admission is separate.
         """
-        return invoke(repo.propose_staging_task, identity(ctx), project, title, client_request_id)
+        principal = identity(ctx)
+        return invoke(lambda: repo.propose_staging_task(principal, project, title, client_request_id,
+                                                       details=details, links=links))
 
     @mcp.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:
@@ -179,9 +184,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(repo.review_task, identity(ctx), task_id, expected_revision, commit, verdict)
 
     @mcp.tool()
-    def hub_decision_request(project: str, title: str, options: list[str], ctx: Context, protected: bool = False) -> dict:
+    def hub_decision_request(project: str, title: str, options: list[str], ctx: Context, protected: bool = False,
+                              details: str | None = None, links: list[dict[str, str]] | None = None,
+                              allow_text: bool = False) -> dict:
         """Request a human decision; this tool cannot answer or grant approval."""
-        return invoke(repo.create_decision, identity(ctx), project, title, options, protected)
+        principal = identity(ctx)
+        return invoke(lambda: repo.create_decision(principal, project, title, options, protected,
+                                                  details=details, links=links, allow_text=allow_text))
 
     @mcp.tool()
     def hub_run_list(ctx: Context) -> dict:
@@ -274,5 +283,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         for operation in (hub_work_status, hub_work_jobs, hub_work_get, hub_work_submit,
                           hub_work_claim, hub_work_renew, hub_work_complete):
             mcp.add_tool(operation)
+
+    if label_sets is not None:
+        from .label_sets_api import register_label_set_tools
+        register_label_set_tools(mcp, repository=label_sets, identity=identity, invoke=invoke)
+    if entity_images is not None:
+        from .attachments_api import register_image_tools
+        register_image_tools(mcp, repository=entity_images, identity=identity, invoke=invoke)
+    if project_registry is not None:
+        from .projects_api import register_project_tools
+        register_project_tools(mcp, repository=project_registry, identity=identity, invoke=invoke)
 
     return mcp

@@ -28,6 +28,9 @@ export interface Task extends Versioned {
   candidate_commit: string | null;
   review: Review | null;
   repair_count: number;
+  /** Optional agent context; parsed defensively by details.ts. */
+  details?: string | null;
+  links?: { label: string; url: string }[] | null;
   scope?: "staging" | null;
   proposed_by?: Agent | null;
   /** Audited time the task entered its current status; null when not recorded. */
@@ -41,6 +44,10 @@ export interface Decision extends Versioned {
   status: "open" | "answered";
   answer: string | null;
   answered_by?: string;
+  /** True only when the server accepts a typed answer instead of one of the options. */
+  allow_text?: boolean;
+  details?: string | null;
+  links?: { label: string; url: string }[] | null;
   execution_authorization: false;
 }
 export interface Run extends Versioned {
@@ -75,6 +82,14 @@ export interface Project {
   executor_enabled: boolean;
   health: string;
   reason: string;
+  /** Human-managed metadata (newer servers). None of it grants access or execution. */
+  description?: string;
+  repository_url?: string | null;
+  lead_agent?: Agent | null;
+  status?: "on_track" | "at_risk" | "off_track" | "paused";
+  parent_project?: string | null;
+  archived?: boolean;
+  revision?: number;
 }
 export interface AgentSummary {
   id: Agent;

@@ -4,9 +4,27 @@ import { observationTime } from "../agentStatus";
 import type { Hub } from "../hub";
 import type { Decision } from "../types";
 import { EmptyState, Icon } from "../ui";
+import { DetailsBlock } from "../DetailsBlock";
+import { useState } from "react";
+
+export const MAX_FREE_TEXT = 4096;
+/** Typed answers only when the server says so, and never on protected requests. */
+export const allowsFreeText = (decision: Decision) => decision.allow_text === true && !decision.protected;
+export const acceptsAnswer = (decision: Decision, answer: string) =>
+  decision.options.includes(answer)
+  || (allowsFreeText(decision) && answer.trim() !== "" && answer.length <= MAX_FREE_TEXT);
+/** An empty custom draft is retainable, but is never a submittable answer. */
+export const retainsAnswerDraft = (decision: Decision, answer: string) =>
+  decision.options.includes(answer) || (allowsFreeText(decision) && answer.length <= MAX_FREE_TEXT);
 
 export function DecisionCard({ hub, decision }: { hub: Hub; decision: Decision }) {
   const choice = hub.decisionChoices[decision.id];
+  const current = choice?.revision === decision.revision ? choice.answer : null;
+  const [draft, setDraft] = useState(() => ({ revision: decision.revision,
+    text: current !== null && !decision.options.includes(current) ? current : "",
+    selected: current !== null && !decision.options.includes(current) }));
+  const other = draft.revision === decision.revision ? draft.text : "";
+  const typing = allowsFreeText(decision) && draft.revision === decision.revision && draft.selected;
   return (
     <form className="decision" onSubmit={(event) => hub.recordDecision(event, decision)}>
       <div className="item-overline">
@@ -14,22 +32,44 @@ export function DecisionCard({ hub, decision }: { hub: Hub; decision: Decision }
         <span>REV {decision.revision}</span>
       </div>
       <h3>{decision.title}</h3>
+      <DetailsBlock entity={decision} kind="decision" load={!hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />
       <fieldset disabled={!hub.writable}>
         <legend className="sr-only">Answer for {decision.title}</legend>
         {decision.options.map((option) => (
           <label className="radio-option" key={option}>
             <input type="radio" name="answer" value={option} required
-              checked={choice?.revision === decision.revision && choice?.answer === option}
-              onChange={() => hub.chooseAnswer(decision, option)} />
+              checked={!typing && current === option}
+              onChange={() => { setDraft({ revision: decision.revision, text: other, selected: false });
+                hub.chooseAnswer(decision, option); }} />
             <span>{option}</span>
           </label>
         ))}
+        {allowsFreeText(decision) && (
+          <div className="free-answer">
+            <label className="radio-option">
+              <input type="radio" name="answer" value="__other" checked={typing}
+                onChange={() => { setDraft({ revision: decision.revision, text: other, selected: true });
+                  hub.chooseAnswer(decision, other); }} />
+              <span>Type my own answer</span>
+            </label>
+            {typing && (
+              <label className="field">
+                <span className="sr-only">Your answer</span>
+                <textarea value={other} rows={3} maxLength={MAX_FREE_TEXT} required autoFocus
+                  placeholder="Write your answer for the agents"
+                  onChange={(event) => { setDraft({ revision: decision.revision, text: event.target.value, selected: true });
+                    hub.chooseAnswer(decision, event.target.value); }} />
+                <small>{other.length} / {MAX_FREE_TEXT}</small>
+              </label>
+            )}
+          </div>
+        )}
         <div className="decision-footer">
           <span>
             {decision.protected ? "Protected request · not an execution grant" : "Records a decision. Does not deploy."}
           </span>
           <button type="submit" className="dark-button"
-            disabled={!hub.writable || choice?.revision !== decision.revision}>
+            disabled={!hub.writable || current === null || !acceptsAnswer(decision, current)}>
             Record decision <Icon kind="arrow" />
           </button>
         </div>

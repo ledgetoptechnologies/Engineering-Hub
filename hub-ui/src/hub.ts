@@ -18,6 +18,8 @@ export interface Hub {
   recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void;
   requestPause: (paused: boolean) => void;
   clearPrivateWorkspace: () => void;
+  /** Re-read the workspace snapshot (after a successful human change). */
+  refresh: () => Promise<void>;
   // Topic readiness (Agents page).
   peers: TopicSnapshot | null;
   topicDraft: string;

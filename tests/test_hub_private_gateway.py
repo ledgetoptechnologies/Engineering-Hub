@@ -433,7 +433,8 @@ async def test_private_receiver_body_timeout_is_408_before_core(monkeypatch):
     assert calls == []
 
 
-async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monkeypatch):
+@pytest.mark.parametrize('sign_in', ['login', 'bootstrap'])
+async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monkeypatch, sign_in):
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
     jwk.update(kid='fixture-key', alg='RS256', use='sig')
@@ -445,7 +446,16 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
     monkeypatch.setattr(access, 'CloudflareAccessVerifier', lambda _: verifier)
     monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: verifier)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude')
-    core = create_app(Settings(tmp_path / 'hub.sqlite', auth, config))
+    from engineering_hub.registry_bridge import CanonicalRegistryBridge, HumanRegistryAccess
+    from engineering_hub.registry_client import RegistryClient
+    def no_registry_io(_):
+        raise AssertionError('Listing authorized topics must not fetch remote snapshots')
+    registry = CanonicalRegistryBridge(
+        RegistryClient('https://fixture-registry.invalid', transport=httpx.MockTransport(no_registry_io)),
+        human_topics=lambda principal: frozenset({'engineering-hub'}),
+        human_reader=lambda principal, topic: HumanRegistryAccess(
+            'synthetic-reader-never-returned', frozenset({'engineering-hub'})))
+    core = create_app(Settings(tmp_path / 'hub.sqlite', auth, config), registry_bridge=registry)
     now = int(time.time())
     assertion = jwt.encode(dict(iss=config.cloudflare_issuer, aud=['fixture-hub'],
         sub='synthetic-human', email='beau@example.com', type='app', iat=now - 1, exp=now + 300),
@@ -458,9 +468,25 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway),
                                         base_url=config.origin, follow_redirects=False) as browser:
                 browser.headers['Cf-Access-Jwt-Assertion'] = assertion
-                assert (await browser.get(BASE + '/auth/login')).status_code == 303
+                if sign_in == 'bootstrap':
+                    # No initial Hub cookie or CSRF token exists. The receiver
+                    # must still verify Access and exact first-party Origin.
+                    assert (await browser.post(BASE + '/auth/bootstrap')).status_code == 403
+                    assert (await browser.post(BASE + '/auth/bootstrap',
+                        headers={'Origin': 'https://other.example'})).status_code == 403
+                    boot = await browser.post(BASE + '/auth/bootstrap', headers={'Origin': config.origin})
+                    assert boot.status_code == 200, boot.text
+                    assert boot.json()['authenticated']
+                else:
+                    assert (await browser.get(BASE + '/auth/login')).status_code == 303
                 me = (await browser.get(BASE + '/auth/me')).json()
                 assert me['authenticated'] and me['actor'].startswith('human:cf:')
+                topics = await browser.get(BASE + '/topics')
+                assert topics.status_code == 200, topics.text
+                assert topics.json() == {'items': [{'topic': 'engineering-hub',
+                    'last_activity_at': None, 'peer_count': None}]}
+                assert topics.headers['cache-control'] == 'no-store'
+                assert (await browser.post(BASE + '/topics', json={})).status_code == 403
                 payload = {'project': 'engineering-hub', 'title': 'Gateway task', 'client_request_id': 'gateway-task'}
                 assert (await browser.post(BASE + '/tasks', json=payload)).status_code == 403
                 browser.headers.update({'Origin': config.origin, 'X-Hub-CSRF': me['csrf_token']})
@@ -471,6 +497,42 @@ async def test_real_owner_human_session_tasks_decisions_and_csrf(tmp_path, monke
                     json={'expected_revision': decision['revision'], 'answer': 'A'})
                 assert answer.status_code == 200, answer.text
                 assert answer.json()['answered_by'] == me['actor']
+                # Exercise mutation methods through both gateways and the real
+                # authenticated owner, not merely the route-table predicate.
+                created = await browser.post(BASE + '/projects', json={
+                    'project_id': 'client-notes', 'name': 'Client notes',
+                    'client_request_id': 'gateway-project'})
+                assert created.status_code == 201, created.text
+                project_path = BASE + '/projects/client-notes'
+                edit = {'expected_revision': 1, 'description': 'Notes without a repository'}
+                denied = await browser.patch(project_path, json=edit,
+                    headers={'X-Hub-CSRF': 'incorrect'})
+                assert denied.status_code == 403
+                edited = await browser.patch(project_path, json=edit)
+                assert edited.status_code == 200, edited.text
+                assert edited.json()['revision'] == 2
+                assert edited.json()['repository_url'] is None
+                assert (await browser.patch(project_path, json=edit)).status_code == 409
+
+                from engineering_hub.label_sets import LabelSetRepository
+                labels = LabelSetRepository(core.state.repository)
+                labels.create(set_id='gateway-labels', project='client-notes', title='Review',
+                    choices=[{'key': 'yes', 'label': 'Yes'}, {'key': 'no', 'label': 'No'}],
+                    items=[{'id': 'item-1'}], actor='codex')
+                label_path = BASE + '/label-sets/gateway-labels/items/item-1/label'
+                # Clearing a label needs no image; classification still does.
+                clear = {'expected_revision': 0, 'choice': None}
+                assert (await browser.put(label_path, json=clear,
+                    headers={'X-Hub-CSRF': 'incorrect'})).status_code == 403
+                labeled = await browser.put(label_path, json=clear)
+                assert labeled.status_code == 200, labeled.text
+                assert labeled.json()['revision'] == 1
+                assert (await browser.put(label_path, json=clear)).status_code == 409
+                archived = await browser.post(project_path + '/archive',
+                    json={'expected_revision': 2})
+                assert archived.status_code == 200, archived.text
+                assert archived.json()['archived'] is True
+                assert (await browser.get(project_path)).json()['archived'] is True
                 browser.headers.pop('Cf-Access-Jwt-Assertion')
                 assert (await browser.get(BASE + '/tasks')).status_code == 401
                 duplicate = await exchange(gateway, BASE + '/tasks', headers=[

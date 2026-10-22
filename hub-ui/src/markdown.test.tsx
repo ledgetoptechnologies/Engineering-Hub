@@ -63,6 +63,8 @@ describe("gateway responses are not sign-outs", () => {
     expect(await listTopics(signal, async () => forbidden())).toBeNull();
     await expect(listLabelSets("treedar", signal, async () => forbidden())).rejects.toMatchObject({ status: 404, code: "label_sets_unavailable" });
     await expect(listTopics(signal, async () => json({ detail: { code: "access_denied" } }, 403))).rejects.toMatchObject({ status: 403 });
+    expect(await listTopics(signal, async () => json({ detail: { code: "topic_catalog_unavailable" } }, 503))).toBeNull();
+    await expect(listTopics(signal, async () => json({ detail: { code: "other" } }, 503))).rejects.toMatchObject({ status: 503 });
   });
 });
 
@@ -72,5 +74,17 @@ describe("topic list", () => {
       .toEqual([{ topic: "eh-1", last_activity_at: "2026-10-21T00:00:00Z", peer_count: 2, source: "server" }]);
     expect(() => parseTopicList({ items: [{ topic: "bad topic" }] })).toThrow();
     expect(() => parseTopicList({ items: [{ topic: "a" }, { topic: "a" }] })).toThrow();
+  });
+});
+
+describe("new-note placement", async () => {
+  const { slugify, placePath } = await import("./NotesPanel");
+  it("files a title as a safe name inside a chosen or new folder", () => {
+    expect(slugify("Café Staging Checklist!")).toBe("cafe-staging-checklist");
+    expect(slugify("../../etc/passwd")).toBe("etcpasswd");
+    expect(placePath({ folder: "", newFolder: "", name: "Plan", nameTouched: false })).toBe("plan.md");
+    expect(placePath({ folder: "runbooks", newFolder: "", name: "notes.md", nameTouched: true })).toBe("runbooks/notes.md");
+    expect(placePath({ folder: "__new_folder__", newFolder: "Field Work/2026 ", name: "Day 1", nameTouched: true })).toBe("field-work/2026/day-1.md");
+    expect(placePath({ folder: "", newFolder: "", name: "", nameTouched: false })).toBe("");
   });
 });

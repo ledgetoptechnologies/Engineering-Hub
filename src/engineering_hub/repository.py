@@ -10,13 +10,15 @@ import uuid
 
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
+from .entity_context import bounded_text, validated_context
 
 
 PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar'})
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
 # Audit actions that set a task's status. Run bookkeeping saves the task without
 # changing it, so those actions must not reset how long a task has been waiting.
-TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed')
+TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed',
+                       'task.context_invalidated')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                          'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
 
@@ -192,10 +194,22 @@ class HubRepository:
             raise HubError('invalid_input')
         return value.strip()
 
-    @staticmethod
-    def _project(project):
-        if project not in PROJECTS:
+    def _project(self, project, db=None, *, require_active=True):
+        """Validate metadata scope, never an execution target or permission grant."""
+        if type(project) is not str or re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project) is None:
             raise HubError('invalid_project')
+        if db is None:
+            with self._connection() as connection:
+                return self._project(project, connection, require_active=require_active)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_projects'").fetchone():
+            if project not in PROJECTS:
+                raise HubError('invalid_project')
+            return
+        row = db.execute('SELECT data FROM hub_projects WHERE id=?', (project,)).fetchone()
+        if row is None:
+            raise HubError('invalid_project')
+        if require_active and json.loads(row['data']).get('archived', False):
+            raise HubError('project_archived', 409)
 
     @staticmethod
     def _get(db, identity, kind):
@@ -231,19 +245,29 @@ class HubRepository:
         with self._connection() as db:
             return self._get(db, identity, kind)
 
-    def create_task(self, actor, project, title, client_request_id):
+    @staticmethod
+    def _context(details, links):
+        try:
+            return validated_context(details, links)
+        except ValueError:
+            raise HubError('invalid_context') from None
+
+    def create_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         self._actor(actor, human=True)
-        self._project(project)
         title, key = self._text(title), self._text(client_request_id)
-        fingerprint = hashlib.sha256(_json([project, title]).encode()).hexdigest()
+        context = self._context(details, links)
+        payload = [project, title] + ([context] if context else [])
+        fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
+            self._project(project, db)
             prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
             if prior:
                 if prior['fingerprint'] != fingerprint:
                     raise HubError('idempotency_conflict', 409)
                 return self._get(db, prior['entity_id'], 'task')
             item = self._save(db, actor, 'task.created', 'task', dict(id=str(uuid.uuid4()), project=project,
-                title=title, status='assigned', owner=None, candidate_commit=None, review=None, repair_count=0), new=True)
+                title=title, status='assigned', owner=None, candidate_commit=None, review=None, repair_count=0,
+                **context), new=True)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 
@@ -280,13 +304,15 @@ class HubRepository:
                 best[row['entity_id']] = (row['revision'], row['created_at'])
         return [dict(task, state_since=best[task['id']][1] if task['id'] in best else None) for task in tasks]
 
-    def propose_staging_task(self, actor, project, title, client_request_id):
+    def propose_staging_task(self, actor, project, title, client_request_id, *, details=None, links=None):
         """An agent may propose work, never grant execution or production authority."""
         self._actor(actor, agent=True)
-        self._project(project)
         title, key = self._text(title), self._text(client_request_id, 128)
-        fingerprint = hashlib.sha256(_json(['staging_task_proposal', project, title]).encode()).hexdigest()
+        context = self._context(details, links)
+        payload = ['staging_task_proposal', project, title] + ([context] if context else [])
+        fingerprint = hashlib.sha256(_json(payload).encode()).hexdigest()
         with self._transaction() as db:
+            self._project(project, db)
             prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
             if prior:
                 if prior['fingerprint'] != fingerprint:
@@ -295,7 +321,7 @@ class HubRepository:
             item = self._save(db, actor, 'task.proposed', 'task', dict(
                 id=str(uuid.uuid4()), project=project, title=title, status='assigned',
                 owner=None, candidate_commit=None, review=None, repair_count=0,
-                scope='staging', proposed_by=actor), new=True)
+                scope='staging', proposed_by=actor, **context), new=True)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 
@@ -312,6 +338,10 @@ class HubRepository:
         if row is None:
             return True
         task = json.loads(row['data'])
+        try:
+            self._project(task.get('project'), db)
+        except HubError:
+            return False
         if 'scope' not in task and 'proposed_by' not in task:
             return True
         return (task.get('scope') == 'staging' and type(task.get('proposed_by')) is str
@@ -325,6 +355,7 @@ class HubRepository:
         self._actor(actor, agent=True)
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['status'] != 'assigned':
                 raise HubError('already_claimed', 409)
@@ -344,6 +375,7 @@ class HubRepository:
             raise HubError('invalid_commit')
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['owner'] != actor:
                 raise HubError('forbidden', 403)
@@ -357,6 +389,7 @@ class HubRepository:
             raise HubError('invalid_verdict')
         with self._transaction() as db:
             item = self._get(db, identity, 'task')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
             if item['owner'] == actor:
                 raise HubError('independent_review_required', 403)
@@ -366,19 +399,53 @@ class HubRepository:
                         review=dict(actor=actor, commit=commit, verdict=verdict) if verdict == 'approve' else None)
             return self._save(db, actor, 'task.reviewed', 'task', item)
 
-    def create_decision(self, actor, project, title, options, protected=False):
+    def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
         self._actor(actor)
-        self._project(project)
         title = self._text(title)
         if type(protected) is not bool or not isinstance(options, list) or not 2 <= len(options) <= 5:
             raise HubError('invalid_options')
         options = [self._text(option) for option in options]
         if len(set(options)) != len(options):
             raise HubError('invalid_options')
+        if type(allow_text) is not bool or (protected and allow_text):
+            raise HubError('invalid_options')
+        context = self._context(details, links)
+        if allow_text:
+            context['allow_text'] = True
         with self._transaction() as db:
+            self._project(project, db)
             return self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
                 title=title, options=options, protected=protected, status='open', answer=None,
-                execution_authorization=False), new=True)
+                execution_authorization=False, **context), new=True)
+
+    def update_context(self, actor, kind, identity, expected_revision, details, links):
+        """Human-only CAS edit; task review never survives changed instructions."""
+        self._actor(actor, human=True)
+        if kind not in {'task', 'decision'}:
+            raise HubError('invalid_kind')
+        context = self._context(details, links)
+        with self._transaction() as db:
+            item = self._get(db, identity, kind)
+            self._project(item['project'], db)
+            self._cas(item, expected_revision)
+            action = kind + '.context_updated'
+            if kind == 'decision':
+                if item['status'] != 'open':
+                    raise HubError('decision_closed', 409)
+            else:
+                # A queued manifest/review may already bind the task revision.
+                # Do not mutate that admission surface through this new API.
+                if self.queued_pilot_enrolled(db):
+                    raise HubError('queued_pilot_admission_required', 409)
+                self._no_active_run(db, identity)
+                if item.get('candidate_commit') is not None or item.get('review') is not None:
+                    item.update(candidate_commit=None, review=None,
+                                status='claimed' if item.get('owner') else 'assigned')
+                    action = 'task.context_invalidated'
+            for field in ('details', 'links'):
+                item.pop(field, None)
+            item.update(context)
+            return self._save(db, actor, action, kind, item)
 
     def list_decisions(self):
         return self._list('decision')
@@ -387,8 +454,17 @@ class HubRepository:
         self._actor(actor, human=True)
         with self._transaction() as db:
             item = self._get(db, identity, 'decision')
+            self._project(item['project'], db)
             self._cas(item, expected_revision)
-            if item['status'] != 'open' or answer not in item['options']:
+            # Recheck persisted records too: older releases could save conflicting
+            # flags. Only an explicitly unprotected decision permits free text.
+            free_text = item.get('allow_text') is True and item.get('protected') is False
+            if free_text:
+                try:
+                    answer = bounded_text(answer, 4096)
+                except ValueError:
+                    raise HubError('invalid_answer', 409) from None
+            if item['status'] != 'open' or (not free_text and answer not in item['options']):
                 raise HubError('invalid_answer', 409)
             item.update(answer=answer, answered_by=actor, status='answered')
             return self._save(db, actor, 'decision.answered', 'decision', item)
@@ -417,6 +493,7 @@ class HubRepository:
                         raise HubError('idempotency_conflict', 409)
                     return self._get(db, prior['run_id'], 'run')
             task = self._get(db, task_id, 'task')
+            self._project(task['project'], db)
             self._cas(task, expected_revision)
             if self._paused(db):
                 raise HubError('paused', 409)

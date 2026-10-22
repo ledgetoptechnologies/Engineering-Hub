@@ -41,6 +41,9 @@ HUB_TOOLS = {
     "hub_overview", "hub_task_get", "hub_task_claim", "hub_task_candidate", "hub_task_review",
     "hub_decision_request", "hub_run_list", "hub_topic_peers", "hub_topic_preflight", "hub_staging_task_propose",
     "hub_planning_list", "hub_planning_get", "hub_planning_put",
+    "hub_label_set_create", "hub_label_set_put_image", "hub_label_set_results", "hub_label_set_list",
+    "hub_entity_put_image", "hub_entity_images",
+    "hub_project_list", "hub_project_get",
 }
 
 

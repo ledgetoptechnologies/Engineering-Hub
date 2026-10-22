@@ -4,7 +4,12 @@ import { createDemoOverview, createDemoTopic } from "../src/mocks";
 import type { AgentSummary, TopicSnapshot } from "../src/types";
 
 const NOW = new Date("2026-10-17T18:00:00.000Z");
-const ORIGIN = "http://127.0.0.1:5174";
+let ORIGIN: string;
+test.beforeEach(({}, testInfo) => {
+  const baseURL = testInfo.project.use.baseURL;
+  if (!baseURL) throw new Error("Browser tests require an explicit baseURL");
+  ORIGIN = new URL(baseURL).origin;
+});
 const CSRF = "fixture-human-only-csrf";
 /** Same-document page change (no reload), as when clicking the sidebar. */
 async function go(page: Page, route: string) {

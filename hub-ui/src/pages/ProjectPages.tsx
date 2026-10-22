@@ -1,4 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { HubApiError } from "../api";
+import { describeVerb, readActivity, type ActivityItem } from "../activityApi";
+import { actorLabel } from "../NotesPanel";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import { NotesPanel } from "../NotesPanel";
@@ -9,6 +12,10 @@ import { Badge, EmptyState, Icon, names, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { LabelSetsPanel } from "./LabelSets";
 import { stateAge, statusLabel, statusTone, TaskTable } from "./tasks";
+import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } from "./ProjectEditor";
+import { safeHref } from "../markdown";
+import type { Project } from "../types";
+import { readProject } from "../projectsApi";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -47,8 +54,17 @@ function AgentStack({ agents }: { agents: string[] }) {
   );
 }
 
+/** A person's status for the project wins; otherwise one derived from its open work. */
+function shownStatus(project: Project, stats: ProjectStats): { label: string; tone: string } {
+  return project.status ? { label: STATUS_LABEL[project.status], tone: STATUS_TONE[project.status] } : derivedStatus(stats);
+}
+const canManage = (hub: Hub) => !hub.demo && hub.writable && !!hub.session?.csrf_token;
+
 export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
-  const rows = hub.data.projects.map((project) => ({ project, stats: projectStats(hub, project.id) }));
+  const [creating, setCreating] = useState(false);
+  const archived = hub.data.projects.filter((project) => project.archived).length;
+  const rows = hub.data.projects.filter((project) => !project.archived)
+    .map((project) => ({ project, stats: projectStats(hub, project.id) }));
   return (
     <>
       <header className="list-header">
@@ -56,8 +72,13 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
           <p className="eyebrow">PROJECTS</p>
           <h1>Projects<span>.</span></h1>
         </div>
-        <div className="heading-actions">{actions}</div>
+        <div className="heading-actions">
+          {canManage(hub) && <button type="button" className="secondary" onClick={() => setCreating(true)}>
+            <Icon kind="plus" size={16} /> New project</button>}
+          {actions}
+        </div>
       </header>
+      {creating && <ProjectEditorDialog hub={hub} project={null} onClose={() => setCreating(false)} />}
       <section className="panel table-panel" aria-label="All projects">
         <table className="data-table">
           <thead>
@@ -75,7 +96,7 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
           </thead>
           <tbody>
             {rows.map(({ project, stats }) => {
-              const status = derivedStatus(stats);
+              const status = shownStatus(project, stats);
               return (
                 <tr key={project.id}>
                   <th scope="row">
@@ -173,23 +194,114 @@ function Timeline({ changes }: { changes: Change[] }) {
   );
 }
 
+const KIND_LABEL = { task: "Task", decision: "Question", run: "Staging run" } as const;
+
+/** The Hub's audit history when the server has it; otherwise the latest change per item, labelled as such. */
+function ActivityFeed({ hub, project, fallback }: { hub: Hub; project: string; fallback: Change[] }) {
+  const [items, setItems] = useState<ActivityItem[]>([]);
+  const [next, setNext] = useState<number | null>(null);
+  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "failed">(hub.demo ? "unsupported" : "loading");
+  const [more, setMore] = useState(false);
+  const generation = useRef(0);
+  const load = (before: number | null) => {
+    const current = ++generation.current, controller = new AbortController();
+    if (before === null) setState("loading"); else setMore(true);
+    readActivity(project, before, controller.signal).then((page) => {
+      if (current !== generation.current) return;
+      if (!page) { setState("unsupported"); return; }
+      setItems((previous) => before === null ? page.items : [...previous, ...page.items]);
+      setNext(page.nextBefore);
+      setState("loaded");
+    }).catch((error) => {
+      if (current !== generation.current) return;
+      if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
+      else setState("failed");
+    }).finally(() => { if (current === generation.current) setMore(false); });
+    return controller;
+  };
+  // Re-read when the workspace snapshot changes (event-feed driven, never polled).
+  useEffect(() => {
+    if (hub.demo) return;
+    const controller = load(null);
+    return () => { generation.current++; controller.abort(); };
+  }, [project, hub.demo, hub.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (state === "unsupported") return <>
+    <p className="panel-description">The latest change to each task and question, newest first. This server doesn't keep a full history yet.</p>
+    <Timeline changes={fallback} />
+  </>;
+  if (state === "loading") return <p role="status">Reading activity…</p>;
+  if (state === "failed") return <p role="alert" className="notice error">Activity could not be read. It will retry when the workspace refreshes.</p>;
+  if (!items.length) return <EmptyState title="No activity yet." />;
+  return (
+    <>
+      <p className="panel-description">Every recorded change, newest first. Titles are shown as they are now.</p>
+      <ol className="timeline" aria-label="Activity history">
+        {items.map((item) => (
+          <li key={item.sequence}>
+            <span className={`timeline-dot kind-${item.kind === "decision" ? "decision" : "task"}`} aria-hidden="true" />
+            <div>
+              <strong>{item.title ?? `${KIND_LABEL[item.kind]} ${item.entityId.slice(0, 8)}`}</strong>
+              <span className="timeline-meta">
+                {KIND_LABEL[item.kind]} · {actorName(item.actor, hub.session?.actor)} {describeVerb(item.verb)} it · revision {item.revision}
+              </span>
+            </div>
+            <time dateTime={item.at} title={new Date(item.at).toLocaleString()}>{relativeAge(item.at)}</time>
+          </li>
+        ))}
+      </ol>
+      {next !== null && (
+        <button type="button" className="secondary" disabled={more} onClick={() => load(next)}>
+          {more ? "Loading…" : "Show older"}
+        </button>
+      )}
+    </>
+  );
+}
+
+const actorName = (actor: string, viewer?: string | null) =>
+  viewer && actor === viewer ? "You" : (names as Record<string, string>)[actor] ?? actorLabel(actor);
+
 export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   hub: Hub; id: string; tab: ProjectTab; actions: React.ReactNode;
   notesProps: Omit<React.ComponentProps<typeof NotesPanel>, "selectedProject">;
 }) {
   const [view, setView] = useState<"board" | "list">("board");
-  const project = hub.data.projects.find((item) => item.id === id);
+  const [dialog, setDialog] = useState<"edit" | "archive" | null>(null);
+  const listedProject = hub.data.projects.find((item) => item.id === id);
+  const [historyProject, setHistoryProject] = useState<{ id: string; value: Project | null; loading: boolean; error: string } | null>(null);
+  useEffect(() => {
+    if (listedProject) { setHistoryProject(null); return; }
+    if (hub.demo) { setHistoryProject({ id, value: null, loading: false, error: "" }); return; }
+    let live = true;
+    setHistoryProject((current) => ({ id,
+      value: current?.id === id ? current.value : null, loading: true, error: "" }));
+    readProject(id).then((value) => {
+      if (live) setHistoryProject({ id, value, loading: false, error: "" });
+    }).catch((reason) => {
+      if (!live) return;
+      if (reason instanceof HubApiError && reason.status === 401) { hub.clearPrivateWorkspace(); return; }
+      setHistoryProject({ id, value: null, loading: false,
+        error: reason instanceof HubApiError && reason.status === 404 ? "" : "Project history couldn't be loaded. Refresh to retry." });
+    });
+    return () => { live = false; };
+  }, [id, listedProject, hub.data.projects, hub.clearPrivateWorkspace, hub.demo]);
+  const currentHistory = historyProject?.id === id ? historyProject : null;
+  const project = listedProject ?? currentHistory?.value;
   if (!project) {
+    const loading = !listedProject && (!currentHistory || currentHistory.loading);
     return (
       <>
         <nav className="crumbs" aria-label="Breadcrumb"><a href={link("/projects")}>Projects</a></nav>
-        <header className="list-header"><div><p className="eyebrow">PROJECTS</p><h1>Project not found<span>.</span></h1></div></header>
-        <section className="panel"><p>This project isn't in the workspace. <a className="text-link" href={link("/projects")}>Back to projects</a></p></section>
+        <header className="list-header"><div><p className="eyebrow">PROJECTS</p><h1>{loading ? "Loading project" : currentHistory?.error ? "Project unavailable" : "Project not found"}<span>.</span></h1></div></header>
+        <section className="panel"><p role={loading ? "status" : undefined}>{loading ? "Reading project history…" : currentHistory?.error || "This project isn't in the workspace."} <a className="text-link" href={link("/projects")}>Back to projects</a></p></section>
       </>
     );
   }
+  const projectHub = project.archived ? { ...hub, writable: false } : hub;
   const stats = projectStats(hub, id);
-  const status = derivedStatus(stats);
+  const status = shownStatus(project, stats);
+  const repository = project.repository_url ? safeHref(project.repository_url) : null;
+  const parent = project.parent_project ? hub.data.projects.find((item) => item.id === project.parent_project) : null;
   const changes = latestChanges(hub, id);
   const tabs: { key: ProjectTab; label: string; count?: number }[] = [
     { key: "overview", label: "Overview" },
@@ -217,8 +329,17 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
             </div>
           </div>
         </div>
-        <div className="heading-actions">{actions}</div>
+        <div className="heading-actions">
+          {canManage(hub) && !project.archived && <button type="button" className="secondary" onClick={() => setDialog("edit")}>Edit project</button>}
+          {canManage(hub) && !project.archived && project.id !== "engineering-hub" && project.revision &&
+            <button type="button" className="secondary" onClick={() => setDialog("archive")}>Archive</button>}
+          {actions}
+        </div>
       </header>
+      {project.archived && <p className="notice">This project is archived. Its history is kept for reference.</p>}
+      {project.description && <p className="project-description">{project.description}</p>}
+      {dialog === "edit" && <ProjectEditorDialog hub={hub} project={project} onClose={() => setDialog(null)} />}
+      {dialog === "archive" && <ArchiveProjectDialog hub={hub} project={project} onClose={() => setDialog(null)} />}
       <nav className="tabs" aria-label={`${project.name} sections`}>
         {tabs.map((item) => (
           <a key={item.key} href={tabHref(item.key)} className={tab === item.key ? "tab current" : "tab"}
@@ -267,6 +388,11 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
             <dl className="properties">
               <div><dt>Status</dt><dd><span className={`status-pill ${status.tone}`}>{status.label}</span></dd></div>
               <div><dt>Project id</dt><dd><code>{project.id}</code></dd></div>
+              {project.lead_agent && <div><dt>Lead</dt><dd>{names[project.lead_agent]}</dd></div>}
+              {parent && <div><dt>Part of</dt><dd><a className="text-link" href={link(`/projects/${parent.id}`)}>{parent.name}</a></dd></div>}
+              <div><dt>Repository</dt><dd>{repository
+                ? <a className="text-link" href={repository} target="_blank" rel="noopener noreferrer">{new URL(repository).pathname.replace(/^\//, "") || new URL(repository).host}</a>
+                : "None (notes-only)"}</dd></div>
               <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "Not set up yet"}</dd></div>
               <div><dt>Health</dt><dd>{project.health === "unknown" ? "Not reported" : pretty(project.health)}</dd></div>
               <div><dt>Agents</dt><dd><AgentStack agents={stats.agents} /></dd></div>
@@ -280,7 +406,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 
       {tab === "decisions" && (
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
-          <DecisionList hub={hub} decisions={stats.waiting} emptyNote="No open questions for this project." />
+          <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />
           <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
         </section>
@@ -294,22 +420,22 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <button type="button" aria-pressed={view === "list"} className={view === "list" ? "chip selected" : "chip"} onClick={() => setView("list")}><Icon kind="menu" size={14} /> List</button>
             </div>
           </div>
-          {view === "board" ? <WorkBoard hub={hub} tasks={stats.tasks} /> : (
+          {view === "board" ? <WorkBoard hub={projectHub} tasks={stats.tasks} /> : (
             <section className="panel work" aria-label={`${project.name} work`}>
-              <TaskTable hub={hub} tasks={stats.tasks} empty="No tasks for this project yet." />
+              <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
         </>
       )}
 
-      {tab === "notes" && <NotesPanel {...notesProps} selectedProject={id} />}
+      {tab === "notes" && <NotesPanel {...notesProps} writable={notesProps.writable && !project.archived} selectedProject={id} />}
 
       {/* Topic proposals scoped to this project; never execution approval. */}
-      {tab === "plans" && <PlanningPanel {...notesProps} selectedProject={id} topic={hub.topic} />}
+      {tab === "plans" && <PlanningPanel {...notesProps} writable={notesProps.writable && !project.archived} selectedProject={id} topic={hub.topic} />}
 
       {tab === "labeling" && (
         <>
-          <LabelSetsPanel hub={hub} project={id} />
+          <LabelSetsPanel hub={projectHub} project={id} />
           <p className="panel-footnote">Labeling sets appear here when an agent prepares one for this project.</p>
         </>
       )}
@@ -317,8 +443,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
       {tab === "activity" && (
         <section className="panel" aria-label="Activity">
           <div className="panel-title"><h2>Activity</h2></div>
-          <p className="panel-description">The latest change to each task and question, newest first. A full history of every change needs a server update.</p>
-          <Timeline changes={changes} />
+          <ActivityFeed hub={hub} project={id} fallback={changes} />
         </section>
       )}
     </>

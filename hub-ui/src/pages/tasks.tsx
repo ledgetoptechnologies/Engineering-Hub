@@ -1,8 +1,10 @@
+import { useState } from "react";
 import { link } from "../router";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, names, pretty } from "../ui";
+import { DetailsBlock } from "../DetailsBlock";
 
 export function stateAge(task: Task): string {
   const age = relativeAge(task.state_since);
@@ -15,8 +17,9 @@ export const statusTone = (task: Task) =>
   task.status === "verified" ? "forest" : task.status === "in_review" ? "amber" : "neutral";
 
 export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
+  const [expanded, setExpanded] = useState(false);
   return (
-    <details className="task-row">
+    <details className="task-row" onToggle={(event) => setExpanded((event.currentTarget as HTMLDetailsElement).open)}>
       <summary>
         <span>
           <strong>{task.title}</strong>
@@ -32,6 +35,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
         <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
       </summary>
       <div className="task-detail">
+        <DetailsBlock entity={task} kind="task" load={expanded && !hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />
         <p>Candidate: <code>{task.candidate_commit ?? "Not submitted"}</code></p>
         <p>
           Independent reviewer:{" "}

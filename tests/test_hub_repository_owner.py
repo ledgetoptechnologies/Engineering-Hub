@@ -122,9 +122,15 @@ def test_unenrolled_legacy_repository_remains_compatible(tmp_path):
     assert HubRepository(path).get_task(task['id']) == task
 
 
-def test_missing_enrolled_database_is_not_recreated(enrolled):
+@pytest.mark.parametrize('operation', ['task', 'proposal', 'decision'])
+def test_missing_enrolled_database_is_not_recreated(enrolled, operation):
     path, owner = enrolled
     repo = HubRepository(path, pilot_owner=owner)
     path.rename(path.with_name('preserved.sqlite'))
-    assert_denied(lambda: repo.create_task('human:123', 'engineering-hub', 'Denied', 'missing'))
+    actions = {
+        'task': lambda: repo.create_task('human:123', 'engineering-hub', 'Denied', 'missing'),
+        'proposal': lambda: repo.propose_staging_task('codex', 'engineering-hub', 'Denied', 'missing'),
+        'decision': lambda: repo.create_decision('codex', 'engineering-hub', 'Denied', ['A', 'B']),
+    }
+    assert_denied(actions[operation])
     assert not path.exists()

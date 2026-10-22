@@ -102,8 +102,8 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
               ))}
             </ul>
             <p className="panel-footnote">
-              {serverTopics ? "All topics the Hub knows about."
-                : "Topics checked on this device. A full list of every topic needs a server update."}
+              {serverTopics ? "Topics available to your account."
+                : "Topics checked on this device only. The Hub can't list the topics available to your account yet."}
             </p>
           </div>
           <div className="topic-detail" aria-label={`Readiness for ${hub.topic}`}>
@@ -186,7 +186,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
             </button>
           </div>
           <div className="project-list">
-            {data.projects.map((item) => (
+            {data.projects.filter((item) => !item.archived).map((item) => (
               <a className="project-row" key={item.id} href={link(`/projects/${item.id}`)}>
                 <span className="project-icon"><Icon kind="folder" /></span>
                 <div>

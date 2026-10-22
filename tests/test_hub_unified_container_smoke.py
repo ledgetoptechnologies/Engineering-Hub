@@ -67,7 +67,7 @@ def test_synthetic_three_stage_plan_profile_graceful_cleanup_and_no_live_environ
         elif args[1] == 'exec':
             assert kwargs['timeout'] == 55
             stage = args[-2]
-            return json.dumps({'stage': stage, 'preservation': 'passed', 'tools': 24 if stage == 'seed' else 37,
+            return json.dumps({'stage': stage, 'preservation': 'passed', 'tools': 24 if stage == 'seed' else 45,
                                'agent_ports': [8770] if stage == 'seed' else [8770,8765],
                                'shared_session_across_agent_ports': 'not_applicable' if stage == 'seed' else 'passed',
                                'native_notification_route': 'not_applicable' if stage == 'seed' else 'alias_to_primary'})

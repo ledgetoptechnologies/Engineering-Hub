@@ -37,7 +37,10 @@ BUS = {'send_message','get_send_receipt','presence_status','receive_messages','w
  'file_list','file_history','feedback_submit','feedback_get','feedback_list','feedback_update','bus_info'}
 HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_task_review',
  'hub_decision_request','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose',
- 'hub_planning_list','hub_planning_get','hub_planning_put'}
+ 'hub_planning_list','hub_planning_get','hub_planning_put',
+ 'hub_label_set_create','hub_label_set_put_image','hub_label_set_results',
+ 'hub_label_set_list','hub_entity_put_image','hub_entity_images',
+ 'hub_project_list','hub_project_get'}
 
 def snapshot():
     def normalized(value):
@@ -189,7 +192,7 @@ async def main():
     # host-side graceful stop. Save a new baseline for recreation checks.
     saved['snapshot'] = snapshot()
     manifest.write_text(json.dumps(saved,sort_keys=True))
-    print(json.dumps({'stage':stage,'preservation':'passed','tools':24 if stage=='seed' else 37,
+    print(json.dumps({'stage':stage,'preservation':'passed','tools':24 if stage=='seed' else 45,
                       'agent_ports':[8770] if stage=='seed' else [8770,8765],
                       'shared_session_across_agent_ports':'not_applicable' if stage=='seed' else 'passed',
                       'native_notification_route':'not_applicable' if stage=='seed' else 'alias_to_primary',

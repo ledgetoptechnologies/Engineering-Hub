@@ -12,7 +12,8 @@ from .image_version_reports import ImageVersionsSummary
 
 
 AgentId = Literal['hermes', 'codex', 'claude']
-ProjectId = Literal['engineering-hub', '3d-viewer', 'project-alpha', 'ledge-top-ops', 'treedar']
+NullableAgentId = AgentId | None
+ProjectId = Annotated[str, Field(pattern=r'^[a-z0-9][a-z0-9-]{0,63}$')]
 Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
@@ -37,18 +38,25 @@ class ReviewDTO(ResponseDTO):
     verdict: Literal['approve']
 
 
+class ContextLinkDTO(ResponseDTO):
+    label: str
+    url: str
+
+
 class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
     status: Literal['assigned', 'claimed', 'in_review', 'verified']
-    owner: AgentId | None
+    owner: NullableAgentId
     candidate_commit: Commit | None
     review: ReviewDTO | None
     repair_count: int = Field(ge=0, le=3)
     scope: Literal['staging'] | None = None
-    proposed_by: AgentId | None = None
+    proposed_by: NullableAgentId = None
     # Audited time the task entered its current status; derived, never stored.
     state_since: str | None = None
+    details: str | None = None
+    links: list[ContextLinkDTO] | None = None
 
 
 class DecisionDTO(EntityDTO):
@@ -60,6 +68,9 @@ class DecisionDTO(EntityDTO):
     answer: str | None
     execution_authorization: Literal[False]
     answered_by: HumanId | None = None
+    details: str | None = None
+    links: list[ContextLinkDTO] | None = None
+    allow_text: bool = False
 
 
 class RunEventDTO(ResponseDTO):
@@ -119,10 +130,19 @@ class RecoveryDTO(ResponseDTO):
 class ProjectDTO(ResponseDTO):
     id: ProjectId
     name: str
-    environment: Literal['staging']
+    environment: Literal['staging', 'notes_only']
     executor_enabled: bool
     health: str
     reason: str
+    description: str = ''
+    repository_url: str | None = None
+    lead_agent: NullableAgentId = None
+    status: Literal['on_track', 'at_risk', 'off_track', 'paused'] = 'on_track'
+    parent_project: ProjectId | None = None
+    archived: bool = False
+    revision: int = Field(default=1, ge=1)
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class AgentConnectionDTO(ResponseDTO):

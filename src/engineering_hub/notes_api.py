@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from agent_message_bus.knowledge import (
     KnowledgeRepository, KnowledgeConflict, KnowledgeError, KnowledgeIntegrityError,
-    KnowledgeNotFound, entry_dict,
+    KnowledgeNotFound, KnowledgeProjectArchived, entry_dict,
 )
 
 
@@ -30,6 +30,8 @@ def attach_notes_routes(app, *, repository, actor):
             raise HTTPException(503, detail={'code': 'notes_unavailable'})
         try:
             return operation(repository)
+        except KnowledgeProjectArchived:
+            raise HTTPException(409, detail={'code': 'project_archived'}) from None
         except KnowledgeConflict as error:
             raise HTTPException(409, detail={'code': 'notes_version_conflict',
                                              'current_version': error.current_version}) from None
