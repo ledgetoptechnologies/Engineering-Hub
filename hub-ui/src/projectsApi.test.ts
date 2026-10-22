@@ -9,6 +9,18 @@ const input: CreateProjectInput = { project_id: "client-notes", name: "Client no
 const response = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 
 describe("human project API", () => {
+  it("matches the server's name and description bounds for requests and responses", async () => {
+    const maximum = fixture({ name: "n".repeat(100), description: "d".repeat(4096) });
+    expect(parseProject(maximum)).toMatchObject({ name: maximum.name, description: maximum.description });
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response(maximum));
+    await createProject({ ...input, name: maximum.name, description: maximum.description }, "csrf", fetchImpl);
+    expect(JSON.parse(fetchImpl.mock.calls[0][1]!.body as string).description).toHaveLength(4096);
+    await expect(createProject({ ...input, name: "n".repeat(101) }, "csrf", fetchImpl)).rejects.toThrow("invalid_project_metadata");
+    await expect(updateProject("client-notes", { expected_revision: 1, description: "d".repeat(4097) }, "csrf", fetchImpl)).rejects.toThrow("invalid_project_metadata");
+    expect(() => parseProject(fixture({ name: "n".repeat(101) }))).toThrow("invalid_project_response");
+    expect(() => parseProject(fixture({ description: "d".repeat(4097) }))).toThrow("invalid_project_response");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
   it("accepts stable project identifiers only", () => {
     for (const id of ["client-notes", "treedar", "a0"]) expect(isProjectId(id)).toBe(true);
     for (const id of ["Client", "client_notes", "../escape", "a\n", "a".repeat(65), ""]) expect(isProjectId(id)).toBe(false);

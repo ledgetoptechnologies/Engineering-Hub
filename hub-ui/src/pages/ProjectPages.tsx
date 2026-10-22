@@ -15,6 +15,7 @@ import { stateAge, statusLabel, statusTone, TaskTable } from "./tasks";
 import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } from "./ProjectEditor";
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
+import { readProject } from "../projectsApi";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -266,16 +267,35 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 }) {
   const [view, setView] = useState<"board" | "list">("board");
   const [dialog, setDialog] = useState<"edit" | "archive" | null>(null);
-  const project = hub.data.projects.find((item) => item.id === id);
+  const listedProject = hub.data.projects.find((item) => item.id === id);
+  const [historyProject, setHistoryProject] = useState<{ id: string; value: Project | null; loading: boolean; error: string } | null>(null);
+  useEffect(() => {
+    if (listedProject) { setHistoryProject(null); return; }
+    let live = true;
+    setHistoryProject({ id, value: null, loading: true, error: "" });
+    readProject(id).then((value) => {
+      if (live) setHistoryProject({ id, value, loading: false, error: "" });
+    }).catch((reason) => {
+      if (!live) return;
+      if (reason instanceof HubApiError && reason.status === 401) { hub.clearPrivateWorkspace(); return; }
+      setHistoryProject({ id, value: null, loading: false,
+        error: reason instanceof HubApiError && reason.status === 404 ? "" : "Project history couldn't be loaded. Refresh to retry." });
+    });
+    return () => { live = false; };
+  }, [id, listedProject, hub.data.projects, hub.clearPrivateWorkspace]);
+  const currentHistory = historyProject?.id === id ? historyProject : null;
+  const project = listedProject ?? currentHistory?.value;
   if (!project) {
+    const loading = !listedProject && (!currentHistory || currentHistory.loading);
     return (
       <>
         <nav className="crumbs" aria-label="Breadcrumb"><a href={link("/projects")}>Projects</a></nav>
-        <header className="list-header"><div><p className="eyebrow">PROJECTS</p><h1>Project not found<span>.</span></h1></div></header>
-        <section className="panel"><p>This project isn't in the workspace. <a className="text-link" href={link("/projects")}>Back to projects</a></p></section>
+        <header className="list-header"><div><p className="eyebrow">PROJECTS</p><h1>{loading ? "Loading project" : currentHistory?.error ? "Project unavailable" : "Project not found"}<span>.</span></h1></div></header>
+        <section className="panel"><p role={loading ? "status" : undefined}>{loading ? "Reading project history…" : currentHistory?.error || "This project isn't in the workspace."} <a className="text-link" href={link("/projects")}>Back to projects</a></p></section>
       </>
     );
   }
+  const projectHub = project.archived ? { ...hub, writable: false } : hub;
   const stats = projectStats(hub, id);
   const status = shownStatus(project, stats);
   const repository = project.repository_url ? safeHref(project.repository_url) : null;
@@ -384,7 +404,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
 
       {tab === "decisions" && (
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
-          <DecisionList hub={hub} decisions={stats.waiting} emptyNote="No open questions for this project." />
+          <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />
           <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
         </section>
@@ -398,22 +418,22 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <button type="button" aria-pressed={view === "list"} className={view === "list" ? "chip selected" : "chip"} onClick={() => setView("list")}><Icon kind="menu" size={14} /> List</button>
             </div>
           </div>
-          {view === "board" ? <WorkBoard hub={hub} tasks={stats.tasks} /> : (
+          {view === "board" ? <WorkBoard hub={projectHub} tasks={stats.tasks} /> : (
             <section className="panel work" aria-label={`${project.name} work`}>
-              <TaskTable hub={hub} tasks={stats.tasks} empty="No tasks for this project yet." />
+              <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
         </>
       )}
 
-      {tab === "notes" && <NotesPanel {...notesProps} selectedProject={id} />}
+      {tab === "notes" && <NotesPanel {...notesProps} writable={notesProps.writable && !project.archived} selectedProject={id} />}
 
       {/* Topic proposals scoped to this project; never execution approval. */}
-      {tab === "plans" && <PlanningPanel {...notesProps} selectedProject={id} topic={hub.topic} />}
+      {tab === "plans" && <PlanningPanel {...notesProps} writable={notesProps.writable && !project.archived} selectedProject={id} topic={hub.topic} />}
 
       {tab === "labeling" && (
         <>
-          <LabelSetsPanel hub={hub} project={id} />
+          <LabelSetsPanel hub={projectHub} project={id} />
           <p className="panel-footnote">Labeling sets appear here when an agent prepares one for this project.</p>
         </>
       )}

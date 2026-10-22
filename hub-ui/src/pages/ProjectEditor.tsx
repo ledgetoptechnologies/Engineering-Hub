@@ -44,13 +44,20 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
   const dirty = JSON.stringify(draft.value) !== JSON.stringify(project ? fromProject(draft.base ?? project) : blank()) || (!project && draft.id !== "");
   const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
   useEffect(() => registerRouteLeaveGuard(() => !dirtyRef.current || window.confirm("Discard unsaved project changes?")), []);
+  const projectId = project?.id ?? null;
   // Edit always starts from the server's latest revision, never a stale list copy.
+  // Overview refreshes replace object identities, not the person's draft. Only
+  // opening a different project establishes a new editing session.
   useEffect(() => {
-    if (!project) return;
+    setError(""); setConflict(false);
+    setDraft({ id: projectId ?? "", idTouched: false, base: project,
+      value: project ? fromProject(project) : blank(), requestId: crypto.randomUUID() });
+    if (!projectId) { setState("ready"); return; }
+    setState("loading");
     let live = true;
-    readProject(project.id).then((latest) => {
+    readProject(projectId).then((latest) => {
       if (!live) return;
-      setDraft((current) => ({ ...current, base: latest, value: fromProject(latest) }));
+      setDraft((current) => ({ ...current, id: latest.id, base: latest, value: fromProject(latest) }));
       setState("ready");
     }).catch((reason) => {
       if (!live) return;
@@ -58,7 +65,7 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
       setError(failureText(reason)); setState("ready");
     });
     return () => { live = false; };
-  }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
   const set = <K extends keyof ProjectMetadata>(key: K, value: ProjectMetadata[K]) =>
     setDraft((current) => ({ ...current, value: { ...current.value, [key]: value },
       // The ID follows the name until the person types their own.
@@ -90,7 +97,7 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
         {state === "loading" ? <p role="status">Reading the latest version…</p> : (
           <fieldset disabled={state !== "ready"}>
             <label className="field">Name
-              <input required maxLength={200} value={draft.value.name} autoFocus onChange={(event) => set("name", event.target.value)} />
+              <input required maxLength={100} value={draft.value.name} autoFocus onChange={(event) => set("name", event.target.value)} />
             </label>
             <label className="field">Project ID
               <input required maxLength={64} pattern="[a-z0-9][a-z0-9-]{0,63}" value={draft.id} readOnly={!!draft.base}
@@ -99,7 +106,7 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
             </label>
             <small className="field-help" id="project-id-help">{draft.base ? "The ID can't change, so links and history keep working." : "Filled in from the name. Lowercase letters, numbers and dashes; it can't be changed later."}</small>
             <label className="field">Description
-              <textarea rows={3} maxLength={4000} value={draft.value.description}
+              <textarea rows={3} maxLength={4096} value={draft.value.description}
                 placeholder="What is this project for?" onChange={(event) => set("description", event.target.value)} />
             </label>
             <div className="editor-row">

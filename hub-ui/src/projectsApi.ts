@@ -36,11 +36,11 @@ function validRepository(value: unknown): boolean {
 function metadata(value: UpdateProjectInput | CreateProjectInput): Partial<ProjectMetadata> {
   const result: Partial<ProjectMetadata> = {};
   if (value.name !== undefined) {
-    if (!safeText(value.name, 200) || !value.name.trim()) throw new HubApiError(422, "invalid_project_metadata");
+    if (!safeText(value.name, 100) || !value.name.trim()) throw new HubApiError(422, "invalid_project_metadata");
     result.name = value.name;
   }
   if (value.description !== undefined) {
-    if (!safeText(value.description, 4000)) throw new HubApiError(422, "invalid_project_metadata");
+    if (!safeText(value.description, 4096)) throw new HubApiError(422, "invalid_project_metadata");
     result.description = value.description;
   }
   if (value.repository_url !== undefined) {
@@ -65,7 +65,7 @@ export function parseProject(value: unknown, expectedId?: string): ProjectManage
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new HubApiError(502, "invalid_project_response");
   const row = value as Record<string, unknown>;
   if (typeof row.id !== "string" || !isProjectId(row.id) || (expectedId !== undefined && row.id !== expectedId)
-      || !safeText(row.name, 200) || !(row.name as string).trim() || !Number.isSafeInteger(row.revision) || (row.revision as number) < 1
+      || !safeText(row.name, 100) || !(row.name as string).trim() || !Number.isSafeInteger(row.revision) || (row.revision as number) < 1
       || typeof row.archived !== "boolean" || !safeText(row.environment, 128) || typeof row.executor_enabled !== "boolean"
       || !safeText(row.health, 128) || !safeText(row.reason, 256)) throw new HubApiError(502, "invalid_project_response");
   try { metadata(row as unknown as UpdateProjectInput); } catch { throw new HubApiError(502, "invalid_project_response"); }
