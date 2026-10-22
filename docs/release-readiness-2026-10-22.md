@@ -1,5 +1,34 @@
 # Release readiness — 2026-10-22 checkpoint
 
+## Superseding PR52 recovery gate
+
+The dated checkpoint below is retained as historical evidence, **not current
+release readiness or an operator instruction**. In particular, its main478,
+publication/billing and dormant-label statements are not current PR52 status.
+
+PR52 head `76224e513f1d501875ed22e6f01972cecb77291d` passed 5,518 Linux tests
+(68 skipped), 229 UI unit tests, 115 fixture browser tests and five exact-head
+image checks. Those checks omitted two subsequently reproduced counterexamples:
+protected decisions accepted off-menu free text through the API, and the old
+`a333704dcf8c14ef071d4af434928e657e5baed0` reader returned500 for task,
+decision and overview routes after candidate-format writes (clean control200).
+These are revision-before-merge findings, not evidence that the live deployment
+crashed for either reason. Later fixes require their own exact-source evidence;
+the counts above must not be transferred to a changed head.
+
+An image-only downgrade to a333 is **not an accepted post-write rollback**.
+See [Hub record-format recovery](Hub-record-format-recovery.md) for the explicit
+hold/forward-recovery gate, required preserved state, and acceptance criteria.
+No compatible immutable recovery artifact has yet been accepted. Current-source
+reopen tests prove neither old-image compatibility nor NAS restore/reboot safety.
+
+The first protected, owned-inactive NAS upgrade is still a separate operator
+gate. This document does not authorize automatic moves, legacy downgrade,
+TrueNAS management, activation or changing the existing Compose. Beau applies
+any eventual accepted NAS handoff. Subsequent historical text is retained below.
+
+---
+
 **Not a completed live staging rollout. No operator change is requested now.**
 Current Compose, agent tokens, data, ports and Cloudflare policy stay unchanged.
 This checkpoint separates source/container evidence from the outstanding live

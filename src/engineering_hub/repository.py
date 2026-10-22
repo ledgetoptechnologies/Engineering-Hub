@@ -407,7 +407,7 @@ class HubRepository:
         options = [self._text(option) for option in options]
         if len(set(options)) != len(options):
             raise HubError('invalid_options')
-        if type(allow_text) is not bool:
+        if type(allow_text) is not bool or (protected and allow_text):
             raise HubError('invalid_options')
         context = self._context(details, links)
         if allow_text:
@@ -456,12 +456,15 @@ class HubRepository:
             item = self._get(db, identity, 'decision')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
-            if item.get('allow_text') is True:
+            # Recheck persisted records too: older releases could save conflicting
+            # flags. Only an explicitly unprotected decision permits free text.
+            free_text = item.get('allow_text') is True and item.get('protected') is False
+            if free_text:
                 try:
                     answer = bounded_text(answer, 4096)
                 except ValueError:
                     raise HubError('invalid_answer', 409) from None
-            if item['status'] != 'open' or (item.get('allow_text') is not True and answer not in item['options']):
+            if item['status'] != 'open' or (not free_text and answer not in item['options']):
                 raise HubError('invalid_answer', 409)
             item.update(answer=answer, answered_by=actor, status='answered')
             return self._save(db, actor, 'decision.answered', 'decision', item)

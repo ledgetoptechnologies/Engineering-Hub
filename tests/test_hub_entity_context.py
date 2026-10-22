@@ -101,6 +101,33 @@ def test_allow_text_is_explicit_bounded_and_never_execution_authority(repo):
     assert repo.list_decisions()[0]['answer'] == answer
 
 
+def test_protected_free_text_creation_rejected_without_writes(repo):
+    with pytest.raises(HubError, match='invalid_options'):
+        decision(repo, protected=True, allow_text=True)
+    assert repo.list_decisions() == []
+    assert repo.list_audit() == []
+    assert repo.list_outbox() == []
+
+
+@pytest.mark.parametrize('protected', [True, None, 'false', 0])
+def test_persisted_free_text_requires_explicit_unprotected_record(repo, protected):
+    item = decision(repo, protected=True)
+    # Simulate contradictory/corrupt state written by an older release.
+    item.update(allow_text=True, protected=protected)
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?',
+                   (json.dumps(item), item['id']))
+    audit, outbox = repo.list_audit(), repo.list_outbox()
+    with pytest.raises(HubError, match='invalid_answer'):
+        repo.answer_decision('human:1', item['id'], item['revision'], 'Off-menu')
+    assert repo.list_decisions() == [item]
+    assert repo.list_audit() == audit
+    assert repo.list_outbox() == outbox
+    saved = repo.answer_decision('human:1', item['id'], item['revision'], 'Yes')
+    assert saved['answer'] == 'Yes'
+    assert saved['execution_authorization'] is False
+
+
 @pytest.mark.parametrize('answer', [True, [], {}, '', ' ', 'x' * 4097, 'x\x00', '\ud800'])
 def test_invalid_free_text_answer(repo, answer):
     item = decision(repo, allow_text=True)

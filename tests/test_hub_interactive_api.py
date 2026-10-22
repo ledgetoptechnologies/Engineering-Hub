@@ -172,6 +172,46 @@ def test_decision_context_free_answer_and_inert_agent_attachment(hub):
     assert closed_upload['isError'] is True and 'decision_closed' in str(closed_upload)
 
 
+def test_protected_free_text_rejected_through_rest_and_mcp(hub):
+    client, app, settings = hub
+    payload = {'project': 'treedar', 'title': 'Choose?', 'options': ['Yes', 'No'],
+               'protected': True, 'allow_text': True}
+    human = human_headers(client, app, settings)
+    response = client.post(BASE + '/decisions', headers=human, json=payload)
+    assert response.status_code == 400, response.text
+    assert 'invalid_options' in response.text
+    result = call(client, 'hub_decision_request', payload)
+    assert result['isError'] is True and 'invalid_options' in str(result)
+    assert app.state.repository.list_decisions() == []
+    assert app.state.repository.list_audit() == []
+    assert app.state.repository.list_outbox() == []
+
+
+def test_human_api_protected_legacy_record_remains_preset_only(hub):
+    client, app, settings = hub
+    repo = app.state.repository
+    item = repo.create_decision('claude', 'treedar', 'Choose?', ['Yes', 'No'], protected=True)
+    item['allow_text'] = True
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(item), item['id']))
+    path = BASE + '/decisions/' + item['id'] + '/answer'
+    payload = {'expected_revision': item['revision'], 'answer': 'Off-menu'}
+    assert client.post(path, headers=agent_headers(), json=payload).status_code == 403
+    human = human_headers(client, app, settings)
+    assert client.post(path, json=payload).status_code == 403
+    audit, outbox = repo.list_audit(), repo.list_outbox()
+    assert client.post(path, headers=human | {'Origin': 'https://evil.test'}, json=payload).status_code == 403
+    assert client.post(path, headers=human, json=payload | {'expected_revision': 99}).status_code == 409
+    assert client.post(path, headers=human, json=payload).status_code == 409
+    assert repo.list_decisions() == [item]
+    assert repo.list_audit() == audit and repo.list_outbox() == outbox
+    payload['answer'] = 'Yes'
+    saved = client.post(path, headers=human, json=payload)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()['execution_authorization'] is False
+    assert client.post(path, headers=human, json=payload).status_code == 409
+
+
 @pytest.mark.parametrize('url', ['javascript:alert(1)', 'data:text/html,hello', 'http://example.com'])
 def test_agent_context_rejects_executable_and_non_https_links(hub, url):
     client, app, _ = hub
