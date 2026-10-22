@@ -15,6 +15,9 @@ describe("routes", () => {
     ["/projects/treedar/activity", { page: "project", id: "treedar", tab: "activity" }],
     ["/projects/treedar/labels/crowns-oct", { page: "labels", project: "treedar", set: "crowns-oct" }],
     ["/notes", { page: "notes" }],
+    ["/planning", { page: "planning" }],
+    ["#/planning", { page: "planning" }],
+    ["/projects/treedar/plans", { page: "project", id: "treedar", tab: "plans" }],
     ["/agents", { page: "agents" }],
     ["/staging", { page: "staging" }],
   ])("parses %s", (value, route) => {

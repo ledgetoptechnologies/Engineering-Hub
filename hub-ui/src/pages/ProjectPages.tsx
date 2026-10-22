@@ -2,6 +2,7 @@ import { useState } from "react";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import { NotesPanel } from "../NotesPanel";
+import { PlanningPanel } from "../PlanningPanel";
 import { link, type ProjectTab } from "../router";
 import type { Decision, Task } from "../types";
 import { Badge, EmptyState, Icon, names, pretty } from "../ui";
@@ -195,6 +196,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
     { key: "decisions", label: "Needs you", count: stats.waiting.length },
     { key: "work", label: "Work", count: stats.active },
     { key: "notes", label: "Notes" },
+    { key: "plans", label: "Plans" },
     { key: "labeling", label: "Labeling" },
     { key: "activity", label: "Activity" },
   ];
@@ -301,6 +303,9 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
       )}
 
       {tab === "notes" && <NotesPanel {...notesProps} selectedProject={id} />}
+
+      {/* Topic proposals scoped to this project; never execution approval. */}
+      {tab === "plans" && <PlanningPanel {...notesProps} selectedProject={id} topic={hub.topic} />}
 
       {tab === "labeling" && (
         <>

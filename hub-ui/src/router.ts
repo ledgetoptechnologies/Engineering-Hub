@@ -4,7 +4,7 @@
  */
 import { useEffect, useState } from "react";
 
-export const PROJECT_TABS = ["overview", "work", "decisions", "notes", "labeling", "activity"] as const;
+export const PROJECT_TABS = ["overview", "work", "decisions", "notes", "plans", "labeling", "activity"] as const;
 export type ProjectTab = (typeof PROJECT_TABS)[number];
 
 export type Route =
@@ -15,6 +15,7 @@ export type Route =
   | { page: "project"; id: string; tab: ProjectTab }
   | { page: "labels"; project: string; set: string }
   | { page: "notes" }
+  | { page: "planning" }
   | { page: "agents" }
   | { page: "staging" };
 
@@ -25,6 +26,7 @@ const legacy: Record<string, Route> = {
   decisions: { page: "inbox" },
   work: { page: "work" },
   notes: { page: "notes" },
+  planning: { page: "planning" },
   agents: { page: "agents" },
   staging: { page: "staging" },
   "software-queue": { page: "staging" },
@@ -66,6 +68,7 @@ export function parseRoute(value: string): Route {
     case "inbox": return parts.length === 1 ? { page: "inbox" } : { page: "home" };
     case "work": return { page: "work" };
     case "notes": return { page: "notes" };
+    case "planning": return { page: "planning" };
     case "agents": return { page: "agents" };
     case "staging": return { page: "staging" };
     case "projects": {

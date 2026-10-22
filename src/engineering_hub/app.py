@@ -373,6 +373,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
                           work_queue=work_queue, mcp=bus_mcp,
                           agent_status=agents_for if bus_app is not None else None,
+                          planning_repository=notes_repository,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
     origin = urlsplit(settings.auth_config.origin)
@@ -514,6 +515,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     from .notes_api import attach_notes_routes
     attach_notes_routes(app, repository=notes_repository, actor=actor)
+    from .planning_api import attach_planning_routes
+    attach_planning_routes(app, repository=notes_repository, actor=actor)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes

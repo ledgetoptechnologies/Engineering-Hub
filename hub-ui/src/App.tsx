@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { HubApiError, HubClient } from "./api";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { NotesPanel } from "./NotesPanel";
+import { PlanningPanel } from "./PlanningPanel";
 import type { Hub } from "./hub";
 import { href, link, useRoute, type Route } from "./router";
 import { Badge, Icon, Modal, PageHeader, pretty, type IconKind } from "./ui";
@@ -545,6 +546,7 @@ export function HubApp() {
     { route: { page: "work" }, label: "Work", icon: "work", count: data ? activeWork : undefined },
     { route: { page: "projects" }, label: "Projects", icon: "folder" },
     { route: { page: "notes" }, label: "Notes", icon: "notes" },
+    { route: { page: "planning" }, label: "Plans & ideas", icon: "notes" },
     { route: { page: "agents" }, label: "Agents", icon: "agents" },
     { route: { page: "staging" }, label: "Staging", icon: "staging" },
   ];
@@ -712,6 +714,13 @@ export function HubApp() {
             )}
             {route.page === "labels" && <LabelSetPage hub={hub} project={route.project} setId={route.set} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
+            {route.page === "planning" && (
+              <>
+                <PageHeader eyebrow="PLANNING" title="Plans & ideas"
+                  subtitle="Topic proposals and a separate Engineering Hub improvement backlog. Never execution approval.">{actions}</PageHeader>
+                <PlanningPanel {...notesProps} selectedProject="engineering-hub" topic={topic} />
+              </>
+            )}
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
           </div>
         )}
