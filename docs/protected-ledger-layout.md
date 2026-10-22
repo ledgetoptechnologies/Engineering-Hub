@@ -1,12 +1,46 @@
 # Protected ledger layout — preparation, not a live cutover
 
-Beau approved preparing and testing one extra protected mapping under the
-existing Engineering-Hub storage tree. Beau applies TrueNAS changes. This
+Beau approved preparing and testing storage under the existing Engineering-Hub
+root, with as many child folders/datasets as needed. Beau applies TrueNAS changes. This
 document is a design and acceptance checklist, **not a command to migrate or
 restart the live Hub**. The current image must not receive this configuration
 until the source and its dependencies are merged, published and verified.
 
-## Storage choice is not ready to apply
+## Selected preparation: sibling children inside the existing root
+
+Beau clarified that `/mnt/Plugins/App_Data/Engineering-Hub/` is the intended
+root for all EH state. No separate top-level dataset is required by this design.
+Prepare these **sibling children** inside it:
+
+| Host child source | Container target | Contents |
+| --- | --- | --- |
+| `Engineering-Hub/shared/` | `/var/lib/hub` | Existing settings and complete message-bus database, audit, knowledge/files state |
+| `Engineering-Hub/private/` | `/var/lib/hub-private` | Existing Hub ledger after reviewed cold relocation/enrollment; private staging profile and executor credentials |
+
+These are future mount mappings, **not instructions to apply now**. The current
+whole-root mapping stays installed until a reviewed offline preservation and
+rollback plan is ready. Do not mount the parent into the same app alongside its
+private child. Keep the same container paths, ports, tokens and human Access
+policy. The sources must already exist; no automatic directory creation,
+empty-ledger fallback, data move or permission repair is allowed at startup.
+
+This changes the host locations of settings/bus state to the `shared` child,
+not the container paths. Preserve their contents except the explicitly reviewed
+version-two storage selection in the settings file. The selected config remains
+`/var/lib/hub/settings.json`; version two selects the fixed private ledger.
+The shared child does not need another copy of the authoritative Hub ledger.
+Preserve the original cold state separately for reviewed rollback, never as a
+second running authority. Plan backup/snapshot coverage for **both children**
+and any child datasets, rather than assuming the current parent-only policy
+includes newly created datasets.
+
+Beau and the agents are the current SMB users, not arbitrary outside users.
+The intended benefit is predictable process access, preventing accidental edits
+to execution state and keeping executor credentials out of ordinary shared
+files. These filesystem checks do not isolate Beau's administrator account,
+root or another process deliberately running with the same privileged identity.
+
+## Why not keep the whole-parent bind too?
 
 The existing whole-tree mapping is
 `/mnt/Plugins/App_Data/Engineering-Hub/` to `/var/lib/hub`. Adding a second bind
@@ -21,14 +55,13 @@ source replacement or rename by accounts with parent rights. Container mode
 bits do not prove that host-side boundary. A child dataset may constrain rename
 behavior, but still needs effective ACL and alias-exclusion acceptance.
 
-The simplest candidate is an independently protected source **outside both the
-SMB export and the shared bind source**, while leaving existing shared settings
-and bus paths unchanged. This is a proposal, not an approved host path: Beau's
-current approval covers preparation/testing under Engineering-Hub only. Do not
-provision a sibling dataset or change the existing shared mapping without the
-corresponding direct approval. An alternative retaining that parent would need
-a separately reviewed export/mount arrangement that excludes every private
-alias; this patch does not claim such an arrangement exists.
+The new sibling-child preparation avoids that alias without moving outside
+Engineering-Hub. A protected private child dataset with effective permissions
+may be appropriate where a plain folder's parent rights allow replacement.
+The exact host arrangement still needs operator acceptance; container tests do
+not prove NAS ACLs or mountpoint/source-parent protection. Do not change SMB
+exports, recursively change permissions or provision anything on NAS from this
+document. This is source/layout preparation, not live cutover authority.
 
 Once a layout is chosen, the extra source must already exist and be protected;
 Compose must not create it with permissive defaults. Settings and message-bus
@@ -80,9 +113,14 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 1. Publish and verify the exact source/image, including owned-inactive support.
    GitHub Actions currently has an account billing/spending restriction; local
    tests do not replace a published image or authorize bypassing release gates.
-2. Obtain the layout decision above, then establish private source ACL/rename protection without changing existing SMB
-   settings/bus behavior. Verify host/container metadata and the extra mount.
-3. Arrange a maintenance window and stop **all ledger writers**. Confirm coherent
+2. Prepare the sibling-child layout above and review the cold preservation/move
+   and rollback procedure. Establish effective private ACL/source-parent
+   protection without recursive changes to existing shared data. Verify the
+   actual host/container mappings and backup coverage of both children.
+3. Arrange a maintenance window and stop **all writers to relocated state**:
+   Hub ledger, message-bus databases, audit/files/knowledge state, settings,
+   background services and independently running scripts. Stopping only the
+   Hub ledger writer is insufficient if any bus/file writer remains. Confirm coherent
    recovery coverage. Existing automatic online ZFS snapshots are acknowledged;
    online capture itself does not require stopping Hub. Restore acceptance is a
    separate check. Never copy only a live SQLite main file or discard WAL/SHM.
@@ -101,6 +139,14 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 No live migration tool, NAS changes, real workflow activation, reboot recovery
 or source-parent protection is claimed by this patch. Do not apply the fragment
 or mapping to the live app yet.
+
+The disposable cold-copy regression in `test_hub_pilot_enrollment.py` creates
+real local auth/queue/delivery tables through their normal constructors, copies
+a quiescent synthetic ledger, explicitly enrolls the copy and reopens it with
+the live ownership capability. It checks session/identity binding, task and job
+idempotency, terminal history/fences and no replay of accepted bus deliveries;
+the original source bytes remain unchanged. Its in-process fake bus and test
+identities do not verify live Access, NAS backup/restore or a real migration.
 
 ## Mount-alias acceptance
 
@@ -126,8 +172,9 @@ $env:EH_ALIAS_TEST_IMAGE = 'sha256:<reviewed-local-image-digest>'
 python -m pytest -q tests/test_hub_protected_alias_docker.py
 ```
 
-The three real Docker cases prove separate same-filesystem sibling sources are
-accepted, a shared-parent/private-child double mount is rejected, and an equal
+The four real Docker cases prove separate same-filesystem sibling sources and
+two sibling subdirectories of one common source are accepted, a
+shared-parent/private-child double mount is rejected, and an equal
 private source mounted outside shared paths is rejected without `shared_root`.
 Alias cases verify actual matching device/inode identities before admission.
 These tests require Docker's `volume-subpath` support; the subdirectory is
@@ -136,6 +183,11 @@ or Windows-pipe context; TCP/SSH remote endpoints are refused. Verify that the
 selected local engine is disposable-test appropriate before running. These
 checks do not test TrueNAS ACLs, dataset rename protection,
 NAS mount topology, restored state or reboot recovery.
+
+An unrelated mount whose source root overlaps the private source on the same
+filesystem can also cause safe refusal (for example a host file bind). Inspect
+the intended mount topology during operator acceptance; do not weaken the
+overlap guard or silently switch to another ledger to get past that refusal.
 
 ## Explicit disposable test selection
 

@@ -80,6 +80,8 @@ for name, content in [('hub.sqlite3', b'synthetic-not-a-database'), ('hub.sqlite
     os.chown(f, 568, 568)
 p.chmod(0o700)
 os.chown(p, 568, 568)
+Path('/seed/shared').mkdir(mode=0o700)
+os.chown('/seed/shared', 568, 568)
 Path('/shared').chmod(0o700)
 os.chown('/shared', 568, 568)
 ''', root=True)
@@ -100,12 +102,15 @@ os.chown('/shared', 568, 568)
             docker('volume', 'rm', name)
 
 
-@pytest.mark.parametrize('case', ['sibling', 'parent-alias', 'external-alias'])
+@pytest.mark.parametrize('case', ['sibling', 'same-parent-siblings', 'parent-alias', 'external-alias'])
 def test_real_volume_mount_alias_admission(fixture, case):
     private, shared, run = fixture
     sub = f'type=volume,source={private},volume-subpath=private'
     mounts = [f'{sub},target=/var/lib/hub-private']
-    mounts.append(f'type=volume,source={private if case == "parent-alias" else shared},target=/var/lib/hub')
+    if case == 'same-parent-siblings':
+        mounts.append(f'type=volume,source={private},volume-subpath=shared,target=/var/lib/hub')
+    else:
+        mounts.append(f'type=volume,source={private if case == "parent-alias" else shared},target=/var/lib/hub')
     if case == 'external-alias':
         mounts.append(f'{sub},target=/outside-private-alias')
     script = '''
@@ -115,7 +120,8 @@ root = Path('/var/lib/hub-private')
 db = root / 'hub.sqlite3'
 before = db.read_bytes()
 case = CASE
-if case != 'sibling':
+accepted = case in {'sibling', 'same-parent-siblings'}
+if not accepted:
     alias = Path('/var/lib/hub/private' if case == 'parent-alias' else '/outside-private-alias')
     assert alias.stat().st_dev == root.stat().st_dev
     assert alias.stat().st_ino == root.stat().st_ino
@@ -125,9 +131,9 @@ else:
 try:
     validate_existing_boundary(db, shared_root=None if case == 'external-alias' else Path('/var/lib/hub'))
 except ProtectedLayoutError:
-    assert case != 'sibling', 'separate sibling mounts must be accepted'
+    assert not accepted, 'separate sibling mounts must be accepted'
 else:
-    assert case == 'sibling', 'real overlapping mount alias was incorrectly admitted'
+    assert accepted, 'real overlapping mount alias was incorrectly admitted'
 assert db.read_bytes() == before
 assert (root / 'hub.sqlite3.pilot-owner.lock').read_bytes() == b''
 print(case + ': PASS')
