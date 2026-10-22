@@ -1,11 +1,7 @@
 /** Backend DTOs. Advisory readiness is never a delivery or deployment grant. */
 export type Agent = "codex" | "hermes" | "claude";
-export type ProjectId =
-  | "engineering-hub"
-  | "3d-viewer"
-  | "project-alpha"
-  | "ledge-top-ops"
-  | "treedar";
+/** Projects come from the server's list; the UI never assumes a fixed set. */
+export type ProjectId = string;
 export interface Session {
   authenticated: boolean;
   actor: string | null;
