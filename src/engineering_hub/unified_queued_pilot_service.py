@@ -23,7 +23,7 @@ from .pilot_ownership import PilotOwner
 from .pilot_service import (REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS,
                             _TRANSFER_LOCK, _TRANSFERRED_OWNERS)
 from .queued_pilot import QueuedContainerPilot
-from .queued_pilot_runtime import QueuedPilotRuntime
+from .queued_pilot_runtime import QueuedPilotRuntime, _canonical_uuid
 from .queued_pilot_service import QueuedPilotServiceError, _synchronous
 from .repository import HubRepository
 from .server import _bind, _signal_stop
@@ -38,7 +38,8 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                                          agent_host='0.0.0.0', agent_port=8770,
                                          browser_host='0.0.0.0', browser_port=8771,
                                          stop_event=None, on_ready=None,
-                                         install_signals=True):
+                                         install_signals=True, generation_id=None,
+                                         on_generation_ready=None):
     """Bind first, then transfer one pre-enrolled owner and dedicated client.
 
     Failed listener binding leaves the caller's owner untouched. Once the pair
@@ -62,7 +63,10 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
                 or stop_event is not None and type(stop_event) is not asyncio.Event
                 or type(install_signals) is not bool
-                or on_ready is not None and not callable(on_ready)):
+                or on_ready is not None and not callable(on_ready)
+                or (generation_id is None) != (on_generation_ready is None)
+                or generation_id is not None and not _canonical_uuid(generation_id)
+                or on_generation_ready is not None and not _synchronous(on_generation_ready)):
             raise ValueError()
         owner.assert_active(settings.database)
         _key(action_key)
@@ -75,6 +79,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         raise ValueError('Explicit pre-enrolled unified queued pilot configuration required') from None
 
     client = None
+    generation_drain = None
     transferred = constructed = False
     stop = stop_event if stop_event is not None else asyncio.Event()
 
@@ -88,7 +93,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         return result is True
 
     def pair_factory():
-        nonlocal client, transferred, constructed
+        nonlocal client, transferred, constructed, generation_drain
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -109,6 +114,8 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         bridge = QueuedContainerPilot(queue, workflow, action_key=action_key, machine_id=machine_id)
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
+        if generation_id is not None:
+            generation_drain = runtime.bind_generation_drain(owner, generation_id)
         bus = _create_unified_bus(settings, bus_paths=bus_paths)
         core = create_app(settings, repository=repo, event_feed=feed,
                           work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus)
@@ -117,6 +124,11 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
     async def cleanup():
         failed = False
         try:
+            if generation_drain is not None:
+                try:
+                    await generation_drain.revoke()
+                except BaseException:
+                    failed = True
             if client is not None:
                 try:
                     await client.aclose()
@@ -156,8 +168,17 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                             pair.core.state.queued_pilot_runtime.close_admission()
                         finally:
                             pair.close_admission()
+                    def generation_ready(*addresses):
+                        if generation_drain is not None:
+                            result = on_generation_ready(generation_drain)
+                            if inspect.isawaitable(result):
+                                if inspect.iscoroutine(result):
+                                    result.close()
+                                raise QueuedPilotServiceError()
+                        if on_ready is not None:
+                            return on_ready(*addresses)
                     await _serve_listeners((pair.agents, pair.browser),
-                        (agent_socket, browser_socket), stop, on_ready,
+                        (agent_socket, browser_socket), stop, generation_ready,
                         (agent_socket.getsockname(), browser_socket.getsockname()),
                         on_stopping=close_admission)
         finally:
