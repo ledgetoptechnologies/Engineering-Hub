@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import errno
 import hashlib
 import json
 import os
@@ -29,6 +30,7 @@ IMAGE = re.compile(r'^sha256:[a-f0-9]{64}$')
 CID = re.compile(r'^[a-f0-9]{64}$')
 PROC_ROOT = Path('/proc')
 CGROUP_ROOT = Path('/sys/fs/cgroup')
+FD_ROOT = Path('/proc/self/fd')
 
 
 class CIError(RuntimeError):
@@ -162,12 +164,23 @@ class KernelCgroup:
             raise CIError('Pinned CI cgroup identity changed')
         try:
             events = _cgroup_read(self.fd, 'cgroup.events')
-        except FileNotFoundError:
-            # A deleted pinned cgroup cannot contain tasks. A missing or renamed
-            # pathname alone is not enough: inspect the pinned inode itself.
-            if os.fstat(self.fd).st_nlink != 0:
+        except OSError as error:
+            # kernfs/cgroupfs preserves st_nlink=2 after deletion, so link count
+            # is not a removal test. Require the kernel's deleted-dentry marker
+            # on this exact still-pinned FD, its original device/inode, an ENOENT
+            # member lookup and the absence of the original pathname. A renamed
+            # scope, temporary missing file or replacement scope is not proof.
+            expected = self.evidence['path'] + ' (deleted)'
+            current = os.fstat(self.fd)
+            if (error.errno != errno.ENOENT
+                    or (current.st_dev, current.st_ino) != (self.evidence['device'], self.evidence['inode'])
+                    or os.path.lexists(self.evidence['path'])
+                    or os.readlink(FD_ROOT / str(self.fd)) != expected
+                    or os.readlink(FD_ROOT / str(self.fd)) != expected
+                    or os.path.lexists(self.evidence['path'])):
                 raise CIError('Pinned CI cgroup quiescence unavailable') from None
-            return {'state': 'removed', 'descendants_empty': True}
+            return {'state': 'removed', 'descendants_empty': True,
+                    'removal_proof': 'kernel_deleted_fd'}
         values = [line.split() for line in events.splitlines()]
         populated = [value[1] for value in values if len(value) == 2 and value[0] == 'populated']
         if populated != ['0']:
@@ -269,7 +282,8 @@ def _run_admitted(args, checkout, output, engine_directory):
     started = False
     kernel = None
     result = {'schema': 'engineering-hub.local-ci.v1', 'state': 'preflight',
-              'advisory': True, 'execution_authorization': False, 'profile': args.profile}
+              'advisory': True, 'execution_authorization': False, 'profile': args.profile,
+              'phase': 'preflight'}
     root = Path(tempfile.mkdtemp(prefix='run-', dir=output))
     result['evidence_directory'] = str(root)
     os.chmod(root, 0o700)
@@ -284,12 +298,15 @@ def _run_admitted(args, checkout, output, engine_directory):
             raise CIError('Uncertain prior CI operation retained; explicit reconciliation required')
         if shutil.disk_usage(output).free < 3 * 1024**3:
             raise CIError('At least 3 GiB free workspace capacity required')
+        result['phase'] = 'engine_verification'
         validate_engine(json.loads(docker('info', '--format', '{{json .}}')), args.engine_id)
+        result['phase'] = 'source_verification'
         commit = checked_output(['/usr/bin/git', 'rev-parse', '--verify', args.ref + '^{commit}'],
                                 cwd=checkout, environment=environment).decode().strip()
         if not re.fullmatch('[a-f0-9]{40}', commit):
             raise CIError('Exact committed source unavailable')
         result.update(source_commit=commit, source_ref=args.ref, image_id=args.image, engine_id=args.engine_id)
+        result['phase'] = 'image_verification'
         image = json.loads(docker('image', 'inspect', args.image))[0]
         if image.get('Id') != args.image:
             raise CIError('Immutable cached image unavailable')
@@ -302,6 +319,7 @@ def _run_admitted(args, checkout, output, engine_directory):
         sizes = [int(row.split(b'\t', 1)[0].split()[-1]) for row in tree.split(b'\0') if row]
         if sum(sizes) > 64 * 1024**2:
             raise CIError('Committed snapshot exceeds 64 MiB bound')
+        result['phase'] = 'snapshot_creation'
         inputs = root / 'input'
         inputs.mkdir(mode=0o755)
         archive = inputs / 'source.tar'
@@ -319,36 +337,51 @@ def _run_admitted(args, checkout, output, engine_directory):
         # a subsequent invocation may not silently abandon it or start new work.
         marker = {'intent': intent, 'container_name': name, 'engine_id': args.engine_id,
                   'evidence_directory': str(root), 'output_root': str(output)}
+        result['phase'] = 'intent_recording'
         write_intent(engine_held, marker)
         write_intent(held, marker)
         container = name
+        result['phase'] = 'container_creation'
         cid = docker(*create_arguments(args.image, name, inputs, args.profile, intent)).decode().strip()
         if not CID.fullmatch(cid):
             raise CIError('Created container identity unavailable')
         container = cid
+        result['phase'] = 'container_profile_verification'
         verify_created(inspect(), args.image, name, inputs, args.profile, intent)
         started = True
+        result['phase'] = 'container_start'
         docker('container', 'start', cid)
+        result['phase'] = 'kernel_limits_verification'
         kernel = verify_kernel_limits(inspect()['State']['Pid'])
         result['kernel_limits'] = kernel.evidence
+        result['phase'] = 'source_admission'
         (inputs / 'admit.json').write_text(json.dumps({'intent': intent}))
         (inputs / 'admit.json').chmod(0o444)
+        result['phase'] = 'source_execution'
         try:
             docker('container', 'wait', cid, timeout=args.timeout)
         except subprocess.TimeoutExpired:
             result['timed_out'] = True
             docker('container', 'stop', '--time', '10', cid, timeout=20)
+        result['phase'] = 'container_terminal_verification'
         state = inspect()['State']
         exited = state.get('Status') == 'exited' and not any(state.get(k) for k in ('Running', 'Paused', 'Restarting'))
         if not exited:
             raise CIError('CI quiescence unverified; preserve ownership')
+        result['phase'] = 'kernel_quiescence_verification'
         result['cgroup_terminal'] = kernel.verify_empty()
         terminal = True
         result.update(state='passed' if state['ExitCode'] == 0 and not result.get('timed_out') else 'failed',
                       exit_code=state['ExitCode'], container_id=cid, terminal_verified=True)
+        result['phase'] = 'log_retention'
         (root / 'test.log').write_bytes(docker('container', 'logs', '--tail', '5000', cid, merge_stderr=True))
+        result['phase'] = 'complete'
         return result
-    except Exception:
+    except Exception as error:
+        result['failure_phase'] = result['phase']
+        result['failure_code'] = ('cli_timeout' if isinstance(error, subprocess.TimeoutExpired)
+            else 'filesystem_unavailable' if isinstance(error, OSError)
+            else 'admission_or_verification_failed')
         result['state'] = 'held' if container else 'preflight_failed'
         if container and not terminal:
             try:
@@ -363,7 +396,7 @@ def _run_admitted(args, checkout, output, engine_directory):
                     result['cgroup_terminal'] = kernel.verify_empty()
                     terminal = True
             except Exception:
-                pass
+                result['cleanup_failure_code'] = 'terminal_or_cgroup_unverified'
         if terminal:
             result['state'] = 'failed'
         raise CIError('Local CI unavailable; retained evidence requires inspection') from None

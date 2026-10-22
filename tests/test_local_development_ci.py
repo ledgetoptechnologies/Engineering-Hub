@@ -319,6 +319,8 @@ def test_unknown_create_retains_engine_and_output_intent_before_effect(tmp_path,
     evidence = list(output.glob('run-*/result.json'))
     assert len(evidence) == 1
     assert json.loads(evidence[0].read_text())['state'] == 'held'
+    assert json.loads(evidence[0].read_text())['failure_phase'] == 'container_creation'
+    assert json.loads(evidence[0].read_text())['failure_code'] == 'cli_timeout'
     assert not any('start' in command for command in calls)
 
 
@@ -388,7 +390,44 @@ def test_only_deleted_pinned_scope_counts_as_removed(kernel_scope):
         for entry in scope.iterdir():
             entry.unlink()
         scope.rmdir()
-        assert pin.verify_empty() == {'state': 'removed', 'descendants_empty': True}
+        assert pin.verify_empty() == {'state': 'removed', 'descendants_empty': True,
+                                      'removal_proof': 'kernel_deleted_fd'}
+    finally:
+        pin.close()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Pinned Linux cgroup deletion')
+def test_deleted_pin_with_replacement_path_still_retains_ownership(kernel_scope):
+    process, scope = kernel_scope
+    pin = runner.verify_kernel_limits(42)
+    try:
+        for entry in scope.iterdir():
+            entry.unlink()
+        scope.rmdir()
+        scope.mkdir()
+        (scope / 'cgroup.events').write_text('populated 0\n')
+        with pytest.raises(runner.CIError, match='quiescence unavailable'):
+            pin.verify_empty()
+    finally:
+        pin.close()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Kernel deleted-FD marker')
+def test_deleted_fd_proof_does_not_depend_on_cgroupfs_link_count(kernel_scope, monkeypatch):
+    process, scope = kernel_scope
+    pin = runner.verify_kernel_limits(42)
+    original = os.fstat
+    try:
+        for entry in scope.iterdir():
+            entry.unlink()
+        scope.rmdir()
+        info = original(pin.fd)
+        def cgroupfs_stat(fd):
+            if fd == pin.fd:
+                return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=2)
+            return original(fd)
+        monkeypatch.setattr(runner.os, 'fstat', cgroupfs_stat)
+        assert pin.verify_empty()['removal_proof'] == 'kernel_deleted_fd'
     finally:
         pin.close()
 
