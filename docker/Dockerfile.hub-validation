@@ -19,6 +19,7 @@ COPY hub_validation_worker ./hub_validation_worker
 COPY scripts ./scripts
 COPY contracts ./contracts
 COPY compose.yaml compose.truenas.yaml compose.hub-control.yaml compose.hub-test.yaml ./
+COPY compose.hub-unified.yaml hub-settings.example.json ./
 COPY docker ./docker
 COPY deployment ./deployment
 COPY packaging ./packaging

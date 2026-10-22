@@ -100,3 +100,31 @@ and unified-service regression suites and raw-ASGI duplicate-Authorization tests
 It ran in a network-disabled, non-root, read-only test container with disposable
 tmpfs test data. Executor responses in these tests remain synthetic; this result
 does not establish a live NAS connection, native executor drain or reboot safety.
+
+## Repeatable isolated Linux validation
+
+From the repository root, build the test-only image with
+`docker build -f docker/Dockerfile.hub-validation -t eh-drain-validation .`.
+Use the resulting immutable local image ID when recording release evidence.
+The validation image includes the public unified Compose and settings example;
+neither contains a live credential.
+
+A full-suite run needs disposable writable test-data directories even when the
+image filesystem is read-only. Its temporary directory must allow executing
+synthetic test scripts used by the worker protocol tests. These are test-only
+mounts, not a proposal to change production container mounts or hardening:
+
+```sh
+docker run --rm --network none --cpus 1 --memory 1g --memory-swap 1g \
+  --pids-limit 128 --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m \
+  --tmpfs /validation/data:rw,nosuid,nodev,noexec,size=128m,uid=10001,gid=10001,mode=0700 \
+  --tmpfs /validation/tests/.test-data:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 \
+  eh-drain-validation python -m pytest -q -W default \
+  --basetemp /tmp/hub-validation -p no:cacheprovider
+```
+
+No host filesystem, Docker socket, live credentials, NAS or production endpoint
+is mounted. Network-disabled tests may use only their own container loopback.
+Full-suite skips and warnings must be reported separately from passing tests.
