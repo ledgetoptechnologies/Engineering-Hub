@@ -76,6 +76,27 @@ def test_overview_requires_identity_and_has_explicit_unknown_readiness(hub):
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
 
 
+def test_image_versions_are_authenticated_advisory_reads(hub, monkeypatch):
+    client, _, _ = hub
+    calls = []
+    from engineering_hub import app as application
+    from engineering_hub.image_version_reports import ImageVersionsSummary
+    def source(_):
+        calls.append(True)
+        return ImageVersionsSummary(configured=False, reason='not_configured').model_dump(mode='json')
+    monkeypatch.setattr(application, 'image_versions_for', source)
+    assert client.get(BASE + '/image-versions').status_code == 401
+    assert calls == []
+    response = client.get(BASE + '/image-versions', headers=agent_headers())
+    assert response.status_code == 200 and response.json()['advisory_only'] is True
+    assert response.json()['reason'] == 'not_configured'
+    overview = client.get(BASE + '/overview', headers=agent_headers()).json()
+    assert overview['image_versions'] == response.json()
+    assert overview['capabilities']['production'] is False
+    assert overview['runs'] == [] and len(calls) == 2
+    assert response.headers['cache-control'] == 'no-store'
+
+
 @pytest.mark.parametrize("name", ["hermes", "codex", "claude"])
 @pytest.mark.parametrize("path", ["overview", "projects", "agents", "tasks", "decisions", "runs"])
 def test_existing_bus_agent_identities_can_read(hub, name, path):

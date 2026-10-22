@@ -183,13 +183,17 @@ async def test_real_streamable_http_push_is_recipient_scoped_and_idle_without_se
                     sender="hermes", recipient="codex", message_type="external-event",
                     body={"private": "external postcommit payload"},
                 )
-                assert await publisher.publish_committed(externally_committed.recipient) == 1
+                # The running native source must deliver this external commit.
+                # A second manual publish races that source and may correctly
+                # produce two invalidations through the bounded dirty bit.
                 external_invalidation = await asyncio.wait_for(codex_events.get(), 2)
+                assert str(external_invalidation.root.params.uri) == BASE_URI.format("codex")
                 assert set(external_invalidation.root.params.model_dump(by_alias=True, exclude_none=True)) == {"uri"}
                 next_page = resource_json(await codex.read_resource(AnyUrl(
                     BASE_URI.format("codex") + f"?after={page['next_cursor']}&limit=1"
                 )))
                 assert [item["id"] for item in next_page["messages"]] == [externally_committed.id]
+                assert await no_notification(hermes_events)
                 with pytest.raises(McpError):
                     await hermes.read_resource(AnyUrl(BASE_URI.format("codex") + "?after=0"))
                 with pytest.raises(McpError):

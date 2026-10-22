@@ -71,6 +71,24 @@ async def test_public_closed_route_table_never_calls_owner(method, path):
     await run()
 
 
+async def test_image_version_status_is_read_only_through_closed_gateway():
+    calls = []
+    async def upstream(request):
+        calls.append(request)
+        assert request.method == 'GET'
+        assert request.url.path == BASE + '/image-versions'
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, json={'configured': False, 'items': []})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = PublicBrowserGateway(client)
+        response = await exchange(gateway, BASE + '/image-versions')
+        assert status(response) == 200 and len(calls) == 1
+        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            denied = await exchange(gateway, BASE + '/image-versions', method=method)
+            assert status(denied) == 403
+        assert len(calls) == 1
+
+
 async def test_constructor_inert_and_original_credentials_forward_without_client_defaults():
     async def run():
         calls = []
