@@ -56,7 +56,7 @@ def run_profile(profile, intent):
                       HF_HUB_OFFLINE='1', PYTHONDONTWRITEBYTECODE='1')
     home.mkdir(mode=0o700)
     if profile in {'python', 'all'}:
-        subprocess.run(['/opt/validation-venv/bin/python', '-m', 'pytest', '-q',
+        subprocess.run(['/opt/validation-venv/bin/python', '-m', 'pytest', '-q', '-x',
                         '--basetemp', '/tmp/pytest', '-o', 'cache_dir=/tmp/pytest-cache'], cwd=root, check=True)
     if profile in {'ui', 'all'}:
         # This cache belongs to the reviewed image, not the source archive.

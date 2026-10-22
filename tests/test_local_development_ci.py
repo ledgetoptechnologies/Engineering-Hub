@@ -163,6 +163,7 @@ def test_image_owned_cached_profiles_are_fixed_and_preserve_npm_links(cached_pro
         assert linked.is_symlink() and linked.read_text() == 'synthetic tool'
     if profile in {'python', 'all'}:
         assert commands[0][0][:3] == ['/opt/validation-venv/bin/python', '-m', 'pytest']
+        assert '-x' in commands[0][0]
 
 
 def test_changed_dependency_locks_reject_before_source_execution(cached_profile):
