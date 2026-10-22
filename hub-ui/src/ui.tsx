@@ -89,8 +89,10 @@ export function EmptyState({ title, children }: { title: string; children?: Reac
   );
 }
 
-export function Modal({ title, onClose, children }: {
+export function Modal({ title, onClose, children, size = "default" }: {
   title: string; onClose: () => void; children: ReactNode;
+  /** "wide" for viewers (images, maps); forms use the default width. */
+  size?: "default" | "wide";
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const headingId = useId();
@@ -98,7 +100,7 @@ export function Modal({ title, onClose, children }: {
     ref.current?.showModal();
   }, []);
   return (
-    <dialog ref={ref} aria-labelledby={headingId} onClose={onClose} onCancel={onClose}>
+    <dialog ref={ref} className={size === "wide" ? "modal-wide" : undefined} aria-labelledby={headingId} onClose={onClose} onCancel={onClose}>
       <div className="modal-head">
         <h2 id={headingId}>{title}</h2>
         <button type="button" className="icon-button" aria-label="Close dialog" onClick={() => ref.current?.close()}>

@@ -41,6 +41,7 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
   const [state, setState] = useState<"ready" | "loading" | "saving">(project ? "loading" : "ready");
   const [error, setError] = useState("");
   const [conflict, setConflict] = useState(false);
+  const [editingId, setEditingId] = useState(false);
   const dirty = JSON.stringify(draft.value) !== JSON.stringify(project ? fromProject(draft.base ?? project) : blank()) || (!project && draft.id !== "");
   const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
   useEffect(() => registerRouteLeaveGuard(() => !dirtyRef.current || window.confirm("Discard unsaved project changes?")), []);
@@ -96,51 +97,75 @@ export function ProjectEditorDialog({ hub, project, onClose }: { hub: Hub; proje
       <form className="project-editor" onSubmit={(event) => void save(event)} aria-label={project ? "Edit project" : "New project"}>
         {state === "loading" ? <p role="status">Reading the latest version…</p> : (
           <fieldset disabled={state !== "ready"}>
-            <label className="field">Name
-              <input required maxLength={100} value={draft.value.name} autoFocus onChange={(event) => set("name", event.target.value)} />
+            <label className="field">
+              <span className="field-label">Name</span>
+              <input required maxLength={100} value={draft.value.name} autoFocus placeholder="e.g. Mlsna LandScript"
+                onChange={(event) => set("name", event.target.value)} />
             </label>
-            <label className="field">Project ID
-              <input required maxLength={64} pattern="[a-z0-9][a-z0-9-]{0,63}" value={draft.id} readOnly={!!draft.base}
-                aria-describedby="project-id-help"
-                onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value, idTouched: true }))} />
-            </label>
-            <small className="field-help" id="project-id-help">{draft.base ? "The ID can't change, so links and history keep working." : "Filled in from the name. Lowercase letters, numbers and dashes; it can't be changed later."}</small>
-            <label className="field">Description
+            {/* The ID is the project's permanent address; most people never need to touch it. */}
+            <div className="project-address">
+              {editingId && !draft.base ? (
+                <label className="field compact">
+                  <span className="field-label">Project ID</span>
+                  <input required maxLength={64} pattern="[a-z0-9][a-z0-9-]{0,63}" value={draft.id} autoFocus
+                    onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value, idTouched: true }))} />
+                  <small>Lowercase letters, numbers and dashes. It can't be changed after the project is created.</small>
+                </label>
+              ) : (
+                <p>
+                  <span className="field-label">Address</span>{" "}
+                  <code>/projects/{draft.id || "…"}</code>{" "}
+                  {draft.base ? <small>· can't be changed</small>
+                    : <button type="button" className="link-button" onClick={() => setEditingId(true)}>Change</button>}
+                </p>
+              )}
+            </div>
+            <label className="field">
+              <span className="field-label">Description <small>optional</small></span>
               <textarea rows={3} maxLength={4096} value={draft.value.description}
                 placeholder="What is this project for?" onChange={(event) => set("description", event.target.value)} />
             </label>
             <div className="editor-row">
-              <label className="field">Status
+              <label className="field">
+                <span className="field-label">Status</span>
                 <select value={draft.value.status} onChange={(event) => set("status", event.target.value as ProjectStatus)}>
                   {PROJECT_STATUSES.map((status) => <option key={status} value={status}>{STATUS_LABEL[status]}</option>)}
                 </select>
               </label>
-              <label className="field">Lead agent
+              <label className="field">
+                <span className="field-label">Lead agent</span>
                 <select value={draft.value.lead_agent ?? ""} onChange={(event) => set("lead_agent", (event.target.value || null) as ProjectMetadata["lead_agent"])}>
                   <option value="">No lead</option>
                   {(["codex", "hermes", "claude"] as const).map((agent) => <option key={agent} value={agent}>{names[agent]}</option>)}
                 </select>
               </label>
             </div>
-            <label className="field">Repository (optional)
-              <input type="url" maxLength={2048} placeholder="https://github.com/owner/repository" value={draft.value.repository_url ?? ""}
-                aria-describedby="project-repo-help" onChange={(event) => set("repository_url", event.target.value || null)} />
-            </label>
-            <small className="field-help" id="project-repo-help">Leave blank for a notes-only or client project. A link doesn't give agents repository access.</small>
-            <label className="field">Part of (optional)
-              <select value={draft.value.parent_project ?? ""} onChange={(event) => set("parent_project", event.target.value || null)}>
-                <option value="">Independent project</option>
-                {others.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-              </select>
-            </label>
+            <details className="more-options" open={!!(draft.value.repository_url || draft.value.parent_project) || undefined}>
+              <summary>More options</summary>
+              <label className="field">
+                <span className="field-label">Repository <small>optional</small></span>
+                <input type="url" maxLength={2048} placeholder="https://github.com/owner/repository" value={draft.value.repository_url ?? ""}
+                  onChange={(event) => set("repository_url", event.target.value || null)} />
+                <small>Leave blank for client or notes-only projects. A link doesn't give agents access to the repository.</small>
+              </label>
+              <label className="field">
+                <span className="field-label">Part of <small>optional</small></span>
+                <select value={draft.value.parent_project ?? ""} onChange={(event) => set("parent_project", event.target.value || null)}>
+                  <option value="">Independent project</option>
+                  {others.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+              </label>
+            </details>
           </fieldset>
         )}
         {error && <p role="alert" className="notice error">{error}</p>}
-        <div className="note-actions">
-          <button type="submit" className="primary" disabled={!canSave}>{state === "saving" ? "Saving…" : project ? "Save changes" : "Create project"}</button>
-          <button type="button" className="secondary" onClick={close}>Cancel</button>
-        </div>
-        <p className="panel-footnote">Projects organize notes, tasks and decisions. Creating one doesn't enable staging, give access to anyone, or start any work.</p>
+        <footer className="dialog-footer">
+          <p>Organizes notes, tasks and decisions. Doesn't turn on staging, give anyone access or start work.</p>
+          <div className="dialog-actions">
+            <button type="button" className="secondary" onClick={close}>Cancel</button>
+            <button type="submit" className="primary" disabled={!canSave}>{state === "saving" ? "Saving…" : project ? "Save changes" : "Create project"}</button>
+          </div>
+        </footer>
       </form>
     </Modal>
   );
