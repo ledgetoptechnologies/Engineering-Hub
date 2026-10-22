@@ -1,4 +1,5 @@
 import { connectionView } from "../agentStatus";
+import { ImageVersionsPanel } from "../ImageVersionsPanel";
 import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
@@ -42,6 +43,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         </a>
       </div>
       <div className="home-grid">
+        <ImageVersionsPanel summary={hub.data.image_versions} stale={!hub.demo && hub.stale} />
         <section className="panel" aria-label="Needs you">
           <div className="panel-title">
             <h2>Needs you</h2>
