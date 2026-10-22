@@ -18,7 +18,7 @@ function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => vo
     if (next === 1) setOffset({ x: 0, y: 0 });
   };
   return (
-    <Modal title={image.title} onClose={onClose}>
+    <Modal title={image.title} onClose={onClose} size="wide">
       <div className="image-viewer-tools" role="group" aria-label="Zoom">
         <button type="button" className="secondary small" onClick={() => setScale(zoom / 1.5)} disabled={zoom <= 1}>−</button>
         <span aria-live="polite">{Math.round(zoom * 100)}%</span>

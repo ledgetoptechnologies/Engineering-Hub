@@ -545,8 +545,6 @@ export function HubApp() {
     { route: { page: "inbox" }, label: "Needs you", icon: "inbox", count: data ? waitingCount : undefined, attention: waitingCount > 0 },
     { route: { page: "work" }, label: "Work", icon: "work", count: data ? activeWork : undefined },
     { route: { page: "projects" }, label: "Projects", icon: "folder" },
-    { route: { page: "notes" }, label: "Notes", icon: "notes" },
-    { route: { page: "planning" }, label: "Plans & ideas", icon: "notes" },
     { route: { page: "agents" }, label: "Agents", icon: "agents" },
     { route: { page: "staging" }, label: "Staging", icon: "staging" },
   ];

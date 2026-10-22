@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import { audit, blocking } from "./audit";
 
 const human = "human:cf:" + "e".repeat(64);
 // 1x1 transparent PNG.
@@ -183,3 +184,34 @@ test("the Activity tab shows the Hub's recorded history with paging, newest firs
   await expect(history.getByRole("listitem")).toHaveCount(3);
   await expect(page.getByRole("button", { name: "Show older" })).toHaveCount(0);
 });
+
+for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone", { width: 390, height: 844 }]] as const) {
+  test(`a wide map opens fitted inside the viewer with no sideways scrolling (${name})`, async ({ page }) => {
+    // Draw a 1600x900 "map" so the viewer has a realistic wide image to fit.
+    await page.goto("about:blank");
+    const wide = await page.evaluate(() => {
+      const canvas = document.createElement("canvas"); canvas.width = 1600; canvas.height = 900;
+      const g = canvas.getContext("2d")!; g.fillStyle = "#e8f5e9"; g.fillRect(0, 0, 1600, 900);
+      g.strokeStyle = "#c62828"; g.lineWidth = 8; g.strokeRect(300, 200, 700, 400); g.fillStyle = "#1b5e20"; g.font = "64px sans-serif"; g.fillText("A1", 600, 420);
+      return canvas.toDataURL("image/png").split(",")[1];
+    });
+    const { state } = await fixture(page, withDetails);
+    await page.route(/\/api\/hub\/v1\/attachments\/[0-9a-f-]+\/image$/, (route) =>
+      route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from(wide, "base64") }));
+    state.attachments[DECISION_IDS[0]] = [{ ...IMAGE, title: "Area map: this question is about area A1 (red outline, labelled A1)" }];
+    await page.setViewportSize(size);
+    await page.goto("/#/inbox");
+    await page.locator("form.decision").first().getByRole("list", { name: "Attached images" }).getByRole("button").click();
+    const dialog = page.getByRole("dialog");
+    const img = dialog.getByRole("img", { name: /Area map/ });
+    await expect(img).toBeVisible();
+    await expect.poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth)).toBe(1600);
+    const box = await dialog.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right }));
+    expect(box.scroll).toBeLessThanOrEqual(box.client);
+    expect(box.right).toBeLessThanOrEqual(size.width);
+    const fit = await img.evaluate((el) => { const i = el.getBoundingClientRect(), v = el.parentElement!.getBoundingClientRect();
+      return { inside: i.left >= v.left - 1 && i.right <= v.right + 1 && i.top >= v.top - 1 && i.bottom <= v.bottom + 1 }; });
+    expect(fit.inside).toBe(true);
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
+  });
+}

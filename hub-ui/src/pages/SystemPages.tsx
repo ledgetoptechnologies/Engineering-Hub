@@ -158,6 +158,13 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
   );
 }
 
+/** One line saying how many projects have a staging target configured (configuration only, not verified readiness), so a row of "no target" badges doesn't read as a fault. */
+export function stagingSummary(projects: { executor_enabled: boolean }[]): string {
+  const ready = projects.filter((item) => item.executor_enabled).length;
+  if (ready === 0) return "No projects are connected to the staging PC yet. Connecting one needs an inventory of the target and your acceptance.";
+  return `${ready} of ${projects.length} project${projects.length === 1 ? " has" : "s have"} a staging target enabled.`;
+}
+
 export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const { data } = hub;
   return (
@@ -174,17 +181,19 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
             <div>
               <span className={`status-orb ${data.paused ? "paused" : ""}`} />
               <span>
-                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Emergency pause off"}</strong>
+                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Running normally: the emergency pause is off"}</strong>
                 <small>
-                  {!data.autonomy.configured ? "Automatic runner not set up. Agents only act on the tasks shown here."
+                  {!data.autonomy.configured ? "No automatic runner is set up, so nothing runs on its own. Agents only act on the tasks shown here."
                     : `Automatic runner: ${pretty(data.autonomy.state)}`}
                 </small>
+                <small>The pause is an emergency stop: it blocks new automated staging work until you resume.</small>
               </span>
             </div>
             <button className="secondary small" disabled={!hub.writable} onClick={() => hub.requestPause(!data.paused)}>
               <Icon kind="pause" size={14} /> {data.paused ? "Resume" : "Pause new work"}
             </button>
           </div>
+          <p className="staging-summary" role="status">{stagingSummary(data.projects.filter((item) => !item.archived))}</p>
           <div className="project-list">
             {data.projects.filter((item) => !item.archived).map((item) => (
               <a className="project-row" key={item.id} href={link(`/projects/${item.id}`)}>
@@ -192,8 +201,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
                 <div>
                   <strong>{item.name}</strong>
                   <small>
-                    {item.executor_enabled ? "Staging target enabled"
-                      : "No staging target yet. Setting one up needs an inventory of the target and your acceptance."}
+                    {item.executor_enabled ? "Staging target enabled" : "Not connected to the staging PC yet"}
                   </small>
                 </div>
                 <StagingBadge hub={hub} id={item.id} />
