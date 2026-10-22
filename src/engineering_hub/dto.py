@@ -37,6 +37,11 @@ class ReviewDTO(ResponseDTO):
     verdict: Literal['approve']
 
 
+class ContextLinkDTO(ResponseDTO):
+    label: str
+    url: str
+
+
 class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
@@ -49,6 +54,8 @@ class TaskDTO(EntityDTO):
     proposed_by: AgentId | None = None
     # Audited time the task entered its current status; derived, never stored.
     state_since: str | None = None
+    details: str | None = None
+    links: list[ContextLinkDTO] | None = None
 
 
 class DecisionDTO(EntityDTO):
@@ -60,6 +67,9 @@ class DecisionDTO(EntityDTO):
     answer: str | None
     execution_authorization: Literal[False]
     answered_by: HumanId | None = None
+    details: str | None = None
+    links: list[ContextLinkDTO] | None = None
+    allow_text: bool = False
 
 
 class RunEventDTO(ResponseDTO):

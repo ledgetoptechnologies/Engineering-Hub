@@ -151,6 +151,8 @@ class NewTask(Input):
     project: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=200)
     client_request_id: str = Field(min_length=1, max_length=128)
+    details: str | None = Field(default=None, max_length=4096)
+    links: list[dict[str, str]] | None = Field(default=None, max_length=8)
 
 
 class Revision(Input):
@@ -170,10 +172,18 @@ class NewDecision(Input):
     title: str = Field(min_length=1, max_length=200)
     options: list[str] = Field(min_length=2, max_length=5)
     protected: bool = False
+    details: str | None = Field(default=None, max_length=4096)
+    links: list[dict[str, str]] | None = Field(default=None, max_length=8)
+    allow_text: bool = False
 
 
 class Answer(Revision):
-    answer: str = Field(min_length=1, max_length=200)
+    answer: str = Field(min_length=1, max_length=4096)
+
+
+class EntityContext(Revision):
+    details: str | None = Field(default=None, max_length=4096)
+    links: list[dict[str, str]] | None = Field(default=None, max_length=8)
 
 
 class Pause(Input):
@@ -391,11 +401,17 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 'guidance': topic_delivery_guidance(
                     PublicReachability.model_validate_json(json.dumps(peer))).model_dump()}
 
+    from .label_sets import LabelSetRepository
+    from .attachments import EntityImageRepository
+    label_sets = LabelSetRepository(repo)
+    entity_images = EntityImageRepository(repo)
     hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
                           work_queue=work_queue, mcp=bus_mcp,
                           agent_status=agents_for if bus_app is not None else None,
                           planning_repository=notes_repository,
+                          label_sets=label_sets,
+                          entity_images=entity_images,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
     origin = urlsplit(settings.auth_config.origin)
@@ -509,10 +525,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
-        )
+        if "Content-Security-Policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
+            )
         return response
 
     @app.exception_handler(HubError)
@@ -539,6 +556,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_notes_routes(app, repository=notes_repository, actor=actor)
     from .planning_api import attach_planning_routes
     attach_planning_routes(app, repository=notes_repository, actor=actor)
+    from .label_sets_api import attach_label_set_routes
+    attach_label_set_routes(app, repository=label_sets, actor=actor, human=human)
+    from .attachments_api import attach_image_routes
+    attach_image_routes(app, repository=entity_images, actor=actor)
+    from .activity_api import attach_activity_routes
+    attach_activity_routes(app, repository=repo, actor=actor)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes
@@ -728,7 +751,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/tasks", status_code=201, response_model=TaskDTO, response_model_exclude_unset=True)
     def create_task(payload: NewTask, request: Request):
         return repo.create_task(human(request, mutation=True), payload.project,
-                                payload.title, payload.client_request_id)
+                                payload.title, payload.client_request_id,
+                                details=payload.details, links=payload.links)
+
+    @app.post('/api/hub/v1/tasks/{task_id}/context', response_model=TaskDTO, response_model_exclude_unset=True)
+    def update_task_context(task_id: str, payload: EntityContext, request: Request):
+        return repo.update_context(human(request, mutation=True), 'task', task_id,
+                                   payload.expected_revision, payload.details, payload.links)
 
     @app.get("/api/hub/v1/tasks/{task_id}", response_model=TaskDTO, response_model_exclude_unset=True)
     def get_task(task_id: str, request: Request):
@@ -756,7 +785,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.post("/api/hub/v1/decisions", status_code=201, response_model=DecisionDTO, response_model_exclude_unset=True)
     def create_decision(payload: NewDecision, request: Request):
         return repo.create_decision(actor(request, mutation=True), payload.project,
-                                    payload.title, payload.options, payload.protected)
+                                    payload.title, payload.options, payload.protected,
+                                    details=payload.details, links=payload.links, allow_text=payload.allow_text)
+
+    @app.post('/api/hub/v1/decisions/{decision_id}/context', response_model=DecisionDTO, response_model_exclude_unset=True)
+    def update_decision_context(decision_id: str, payload: EntityContext, request: Request):
+        return repo.update_context(human(request, mutation=True), 'decision', decision_id,
+                                   payload.expected_revision, payload.details, payload.links)
 
     @app.post("/api/hub/v1/decisions/{decision_id}/answer", response_model=DecisionDTO, response_model_exclude_unset=True)
     def answer(decision_id: str, payload: Answer, request: Request):
@@ -831,6 +866,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.work_queue = work_queue
 
     if settings.ui_directory and settings.ui_directory.is_dir():
+        from .browser_pages import attach_browser_page_routes
+        attach_browser_page_routes(app, ui_directory=settings.ui_directory, human=human,
+                                   anonymous_shell=settings.auth_config.human_auth_mode != 'cloudflare_access')
         app.mount("/", StaticFiles(directory=settings.ui_directory, html=True), name="dashboard")
     if settings.ingress_mode != "combined":
         from .ingress import HubIngressMiddleware
