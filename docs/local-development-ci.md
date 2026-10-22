@@ -17,6 +17,13 @@ MCP, or automatic production deployment. Browser/container-release acceptance
 and staged deployment/health/rollback are separate checks; a source-test report
 must not be relabeled full CI/CD acceptance.
 
+The explicitly composed [development CI queue adapter](development-ci-queue-adapter.md)
+supplies source-level binding to the existing owned machine queue, with durable
+attempts, lease renewal and private terminal verification. It does not wire this
+CLI into the live Hub or supply the enrolled host provider/transport. Do not
+claim task/note proposals automatically schedule this controller. Existing
+manual/on-demand CI and the inactive Hub retain their current behavior.
+
 Only committed source is included. The selected development ref resolves to an
 exact commit before creating an archive; dirty/untracked edits, `.git`, host
 SSH credentials and live environment settings are not provided to test code.
