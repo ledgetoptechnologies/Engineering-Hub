@@ -8,7 +8,7 @@ The caller must still acquire PilotOwner(require_existing=True).
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
@@ -66,9 +66,25 @@ def _unescape(value):
     return _ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
 
 
+def _mount_path(raw):
+    value = _unescape(raw)
+    if (not value.startswith('/') or value.startswith('//') or '\x00' in value
+            or str(PurePosixPath(value)) != value
+            or any(part in {'.', '..'} for part in value.split('/'))):
+        raise ProtectedLayoutError()
+    return PurePosixPath(value)
+
+
+def _overlapping_sources(left, right):
+    # Path components, not string prefixes: /private-other is not /private.
+    return left == right or left in right.parents or right in left.parents
+
+
 def _mount_snapshot(fd):
-    root = str(ROOT)
+    root = PurePosixPath(str(ROOT))
     selected = []
+    mounts = []
+    identifiers = set()
     for line in _read_mountinfo().splitlines():
         fields = line.split()
         if len(fields) < 10 or '-' not in fields:
@@ -76,20 +92,41 @@ def _mount_snapshot(fd):
         separator = fields.index('-')
         if separator < 6 or len(fields) != separator + 4:
             raise ProtectedLayoutError()
-        point = _unescape(fields[4])
+        numbers = (*fields[:2], *fields[2].split(':'))
+        if (len(fields[2].split(':')) != 2
+                or any(re.fullmatch('[0-9]+', number) is None
+                       or str(int(number)) != number for number in numbers)
+                or fields[0] in identifiers):
+            raise ProtectedLayoutError()
+        identifiers.add(fields[0])
+        source = _mount_path(fields[3])
+        point = _mount_path(fields[4])
+        mounts.append((tuple(fields), source, point))
         if point == root:
-            selected.append(tuple(fields))
-        elif point.startswith(root + '/'):
+            selected.append((tuple(fields), source))
+        elif root in point.parents:
             # A nested mount could substitute just the ledger or owner lock.
             raise ProtectedLayoutError()
     if len(selected) != 1:
         raise ProtectedLayoutError()
-    row = selected[0]
+    row, source = selected[0]
     value = os.fstat(fd)
     if (not row[0].isdigit() or int(row[0]) != _mount_id(fd)
             or row[2] != f'{os.major(value.st_dev)}:{os.minor(value.st_dev)}'):
         raise ProtectedLayoutError()
-    return row
+    relevant = []
+    for other, other_source, other_point in mounts:
+        if other[2] != row[2]:
+            continue
+        if other[0] != row[0] and _overlapping_sources(source, other_source):
+            # A parent bind, recursive dataset bind, equal bind or file bind
+            # elsewhere can expose private state despite different root inodes.
+            # No supplied shared_root is needed to identify that alias.
+            raise ProtectedLayoutError()
+        relevant.append((other[0], other[1], other[2], str(other_source), str(other_point)))
+    # Recheck the selected mount and the complete same-device source/point
+    # snapshot; additions or changes cannot silently expand alias exposure.
+    return row, tuple(sorted(relevant))
 
 
 def _identity(value):
@@ -169,8 +206,9 @@ def _shared_identities(paths, required_root=None):
 def validate_existing_boundary(database, shared_root=None, shared_paths=None):
     """Check existing private metadata without opening either ledger or lock.
 
-    A distinct mount ID at the exact root is required. Same-device nested binds
-    are valid; device+inode aliases to the supplied shared root/DB, conventional
+    A distinct mount ID at the exact root is required. Same-device sibling binds
+    are valid, but another mount of an overlapping source tree is not. Also,
+    device+inode aliases to the supplied shared root/DB, conventional
     bus roles, or explicit shared_paths (a dict of paths or list/tuple) are not.
     Pinned directory/file signatures and the mount identity are rechecked before
     returning. This snapshot is not a transferable ownership capability.

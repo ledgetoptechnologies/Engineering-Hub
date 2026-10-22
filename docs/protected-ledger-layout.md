@@ -6,23 +6,38 @@ document is a design and acceptance checklist, **not a command to migrate or
 restart the live Hub**. The current image must not receive this configuration
 until the source and its dependencies are merged, published and verified.
 
-## Proposed storage
+## Storage choice is not ready to apply
 
-Existing mapping remains unchanged:
+The existing whole-tree mapping is
+`/mnt/Plugins/App_Data/Engineering-Hub/` to `/var/lib/hub`. Adding a second bind
+from its `private` child to `/var/lib/hub-private` is **not a valid protected
+layout**: the same private data remains reachable at `/var/lib/hub/private`.
+A child dataset alone does not remove that alias; Docker's recursive bind can
+expose the child mount through the shared tree too. The earlier nested-source
+Compose example has therefore been withdrawn. Do not apply it.
 
-```yaml
-volumes:
-  - /mnt/Plugins/App_Data/Engineering-Hub/:/var/lib/hub
-  - /mnt/Plugins/App_Data/Engineering-Hub/private:/var/lib/hub-private
-```
+A plain private directory under a group/SMB-writable parent is also subject to
+source replacement or rename by accounts with parent rights. Container mode
+bits do not prove that host-side boundary. A child dataset may constrain rename
+behavior, but still needs effective ACL and alias-exclusion acceptance.
 
-The second source must already exist and be independently protected. Do not
-let Compose create it with permissive defaults. Settings and message-bus
-database/audit/files stay under `/var/lib/hub`; the authoritative **existing**
-Hub ledger moves offline to `/var/lib/hub-private/hub.sqlite3`. No automatic
-copy, empty-ledger fallback, permission repair or enrollment occurs at startup.
+The simplest candidate is an independently protected source **outside both the
+SMB export and the shared bind source**, while leaving existing shared settings
+and bus paths unchanged. This is a proposal, not an approved host path: Beau's
+current approval covers preparation/testing under Engineering-Hub only. Do not
+provision a sibling dataset or change the existing shared mapping without the
+corresponding direct approval. An alternative retaining that parent would need
+a separately reviewed export/mount arrangement that excludes every private
+alias; this patch does not claim such an arrangement exists.
 
-Container UID568 must own the private root0700 and ledger/ownerlock0600,
+Once a layout is chosen, the extra source must already exist and be protected;
+Compose must not create it with permissive defaults. Settings and message-bus
+database/audit/files stay under `/var/lib/hub`; any authoritative **existing**
+Hub ledger relocation is a later offline, reviewed migration to
+`/var/lib/hub-private/hub.sqlite3`. No automatic copy, empty-ledger fallback,
+permission repair or enrollment occurs at startup.
+
+Container UID 568 must own the private root 0700 and ledger/owner lock 0600,
 single-link regular files on supported local storage. A separately protected
 child dataset may help establish host ACLs; a container mount alone does not.
 The host source parent currently participates in SMB access: verify effective
@@ -48,7 +63,9 @@ Never put executor credentials in shared settings, bus files, Git or chat.
 
 The exact private mount ID/device, trusted ancestors, existing ledger and lock
 metadata and shared-role aliases are checked before selecting an owned service.
-Same-filesystem bind mounts are valid; identical inode aliases are not.
+Distinct same-filesystem sibling bind sources may be valid; overlapping source
+trees and private aliases through other mounts are not. This is not permission
+to weaken the guard merely to make the withdrawn nested layout start.
 These checks are a current container-namespace snapshot, not a host ACL audit,
 reboot admission mechanism or lock against equally privileged administrators.
 
@@ -63,7 +80,7 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 1. Publish and verify the exact source/image, including owned-inactive support.
    GitHub Actions currently has an account billing/spending restriction; local
    tests do not replace a published image or authorize bypassing release gates.
-2. Establish private source ACL/rename protection without changing existing SMB
+2. Obtain the layout decision above, then establish private source ACL/rename protection without changing existing SMB
    settings/bus behavior. Verify host/container metadata and the extra mount.
 3. Arrange a maintenance window and stop **all ledger writers**. Confirm coherent
    recovery coverage. Existing automatic online ZFS snapshots are acknowledged;
@@ -84,6 +101,41 @@ and browser8771; no alias, tunnel, Ops or Cloudflare policy changes are included
 No live migration tool, NAS changes, real workflow activation, reboot recovery
 or source-parent protection is claimed by this patch. Do not apply the fragment
 or mapping to the live app yet.
+
+## Mount-alias acceptance
+
+The admission check examines canonical mount source roots across the whole
+current mount namespace, even when no shared root was supplied. Any other
+same-device mount exposing an ancestor, equal root or descendant of the private
+source is refused, including file aliases outside the conventional shared
+paths. Component comparisons preserve distinct sibling sources. The relevant
+mount snapshot is rechecked before returning. This remains a snapshot, not a
+guarantee against a host administrator changing mounts afterward.
+
+`tests/test_hub_protected_alias_docker.py` is a separate, opt-in **trusted host**
+test. Do not expose a Docker socket to branch CI. It creates only UUID-labelled
+synthetic named volumes/containers, mounts current source read-only, uses no
+network or application, and removes its exact owned fixtures afterward. Select
+an already reviewed, locally cached immutable validation image with Python at
+`/opt/validation-venv/bin/python`, then run on the trusted host:
+
+```powershell
+$env:EH_DISPOSABLE_DOCKER_ALIAS_TEST = '1'
+$env:EH_ALIAS_TEST_CONTEXT = '<verified-local-test-context>'
+$env:EH_ALIAS_TEST_IMAGE = 'sha256:<reviewed-local-image-digest>'
+python -m pytest -q tests/test_hub_protected_alias_docker.py
+```
+
+The three real Docker cases prove separate same-filesystem sibling sources are
+accepted, a shared-parent/private-child double mount is rejected, and an equal
+private source mounted outside shared paths is rejected without `shared_root`.
+Alias cases verify actual matching device/inode identities before admission.
+These tests require Docker's `volume-subpath` support; the subdirectory is
+created before use. Every command uses the explicitly selected local Unix-socket
+or Windows-pipe context; TCP/SSH remote endpoints are refused. Verify that the
+selected local engine is disposable-test appropriate before running. These
+checks do not test TrueNAS ACLs, dataset rename protection,
+NAS mount topology, restored state or reboot recovery.
 
 ## Explicit disposable test selection
 

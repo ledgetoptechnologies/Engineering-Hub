@@ -312,3 +312,101 @@ def test_actual_dedicated_container_mount_accepts_metadata_only():
     lock.chmod(0o600)
     layout.validate_existing_boundary(database)
     assert database.read_bytes() == b'synthetic-not-a-database'
+
+
+def _encode_mount_path(path):
+    return str(path).replace('\\', r'\134').replace(' ', r'\040').replace('\t', r'\011').replace('\n', r'\012')
+
+
+def _source_mount(row, *, source, point=None, offset=0, device=None):
+    fields = row.split()
+    fields[0] = str(int(fields[0]) + offset)
+    fields[3] = _encode_mount_path(source)
+    if point is not None:
+        fields[4] = _encode_mount_path(point)
+    if device is not None:
+        fields[2] = device
+    return ' '.join(fields) + '\n'
+
+
+@pytest.mark.parametrize('private_source,other_source,other_point', [
+    ('/datasets/private', '/datasets', '/var/lib/hub'),
+    ('/datasets/private', '/', '/unrelated/source-parent'),
+    ('/', '/', '/var/lib/hub/private-dataset'),
+    ('/datasets/private', '/datasets/private', '/outside-shared-root'),
+    ('/datasets/private', '/datasets/private/hub.sqlite3', '/files/exposed-ledger'),
+    ('/datasets/private', '/datasets/private/pilot.json', '/files/exposed-profile'),
+    ('/datasets/private', '/datasets/private/child', '/outside/nested-alias'),
+    ('/datasets/private files', '/datasets/private files/executor.token', '/outside/escaped alias'),
+    ('/datasets/private\\files', '/datasets/private\\files', '/outside/escaped-backslash'),
+])
+def test_overlapping_bind_sources_are_rejected_even_without_shared_root(
+        boundary, monkeypatch, private_source, other_source, other_point):
+    _, database, _, row = boundary
+    selected = _source_mount(row, source=private_source)
+    alias = _source_mount(row, source=other_source, point=other_point, offset=100)
+    monkeypatch.setattr(layout, '_read_mountinfo', lambda: selected + alias)
+    with pytest.raises(layout.ProtectedLayoutError):
+        layout.validate_existing_boundary(database)
+
+
+@pytest.mark.parametrize('private_source,other_source', [
+    ('/datasets/private', '/datasets/shared'),
+    ('/datasets/private', '/datasets/private-other'),
+    ('/datasets/private files', '/datasets/private files-other'),
+    ('/datasets/private\\files', '/datasets/private\\files-other'),
+    ('/datasets/private', '/datasets/Private'),
+])
+def test_distinct_same_device_sibling_sources_remain_valid(boundary, monkeypatch, private_source, other_source):
+    _, database, _, row = boundary
+    selected = _source_mount(row, source=private_source)
+    sibling = _source_mount(row, source=other_source, point='/outside/sibling', offset=100)
+    monkeypatch.setattr(layout, '_read_mountinfo', lambda: selected + sibling)
+    layout.validate_existing_boundary(database)
+
+
+def test_overlapping_root_on_different_device_is_not_an_alias(boundary, monkeypatch):
+    _, database, _, row = boundary
+    selected = _source_mount(row, source='/datasets/private')
+    unrelated = _source_mount(row, source='/', point='/unrelated/filesystem', offset=100, device='0:999999')
+    monkeypatch.setattr(layout, '_read_mountinfo', lambda: selected + unrelated)
+    layout.validate_existing_boundary(database)
+
+
+@pytest.mark.parametrize('field,value', [
+    (3, 'relative/source'), (3, '//datasets/private'), (3, '/datasets//private'),
+    (3, '/datasets/../private'), (3, '/datasets/./private'), (3, '/datasets/private/'),
+    (3, r'/datasets/private\999'), (4, '/outside//alias'), (4, 'relative/point'),
+    (2, '00:123'), (2, '0:00123'), (0, '001'), (1, '001'),
+])
+def test_noncanonical_mount_source_point_or_identity_fails_closed(boundary, monkeypatch, field, value):
+    _, database, _, row = boundary
+    selected = _source_mount(row, source='/datasets/private')
+    other = _source_mount(row, source='/datasets/sibling', point='/outside/sibling', offset=100).split()
+    other[field] = value
+    monkeypatch.setattr(layout, '_read_mountinfo', lambda: selected + ' '.join(other) + '\n')
+    with pytest.raises(layout.ProtectedLayoutError):
+        layout.validate_existing_boundary(database)
+
+
+@pytest.mark.parametrize('new_source', ['/datasets', '/datasets/private/hub.sqlite3', '/datasets/sibling'])
+def test_alias_relevant_mount_snapshot_is_rechecked_before_return(boundary, monkeypatch, new_source):
+    _, database, _, row = boundary
+    selected = _source_mount(row, source='/datasets/private')
+    added = _source_mount(row, source=new_source, point='/outside/new-mount', offset=100)
+    reads = 0
+    def changing():
+        nonlocal reads
+        reads += 1
+        return selected if reads == 1 else selected + added
+    monkeypatch.setattr(layout, '_read_mountinfo', changing)
+    with pytest.raises(layout.ProtectedLayoutError):
+        layout.validate_existing_boundary(database)
+    assert reads >= 2
+
+
+def test_canonical_mount_component_comparison_handles_kernel_escapes():
+    assert layout._mount_path(r'/data/private\040files') == Path('/data/private files')
+    assert layout._mount_path(r'/data/private\134files') == Path('/data/private\\files')
+    assert layout._overlapping_sources(Path('/data/private'), Path('/data/private/child'))
+    assert not layout._overlapping_sources(Path('/data/private'), Path('/data/private-other'))
