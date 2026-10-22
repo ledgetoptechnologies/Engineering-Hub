@@ -7,12 +7,14 @@ export type Route =
   | { page: "work" }
   | { page: "projects" }
   | { page: "project"; id: string }
+  | { page: "labels"; project: string; set: string }
   | { page: "notes" }
   | { page: "planning" }
   | { page: "agents" }
   | { page: "staging" };
 
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
   decisions: { page: "inbox" },
@@ -65,13 +67,18 @@ export function parseRoute(hash: string): Route {
     case "projects":
       if (parts.length === 1) return { page: "projects" };
       if (parts.length === 2 && projectId.test(parts[1])) return { page: "project", id: parts[1] };
+      if (parts.length === 4 && projectId.test(parts[1]) && parts[2] === "labels" && setId.test(parts[3]) && parts[3] !== "..")
+        return { page: "labels", project: parts[1], set: parts[3] };
       return { page: "projects" };
     default: return { page: "home" };
   }
 }
 
 export function href(route: Route): string {
-  return route.page === "home" ? "#/" : route.page === "project" ? `#/projects/${route.id}` : `#/${route.page}`;
+  if (route.page === "home") return "#/";
+  if (route.page === "project") return `#/projects/${route.id}`;
+  if (route.page === "labels") return `#/projects/${route.project}/labels/${route.set}`;
+  return `#/${route.page}`;
 }
 
 export function useRoute(): Route {

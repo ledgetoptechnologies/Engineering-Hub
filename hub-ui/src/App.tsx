@@ -11,6 +11,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, ProjectPage, ProjectsPage, WorkPage } from "./pages/WorkPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { openDecisions } from "./pages/decisions";
+import { LabelSetPage } from "./pages/LabelSets";
 import type {
   Decision,
   EventsStatus,
@@ -544,9 +545,9 @@ export function HubApp() {
     { route: { page: "staging" }, label: "Staging", icon: "staging" },
   ];
   const isCurrent = (target: Route) => target.page === route.page
-    || (target.page === "projects" && route.page === "project");
-  const pageTitle = route.page === "project"
-    ? projectName(route.id)
+    || (target.page === "projects" && (route.page === "project" || route.page === "labels"));
+  const pageTitle = route.page === "project" ? projectName(route.id)
+    : route.page === "labels" ? `${projectName(route.project)} labeling`
     : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
   const actions = (
     <>
@@ -603,7 +604,8 @@ export function HubApp() {
           <nav aria-label="Projects" className="project-nav">
             {data?.projects.map((item) => (
               <a key={item.id} href={`#/projects/${item.id}`}
-                className={route.page === "project" && route.id === item.id ? "project-link current" : "project-link"}>
+                className={(route.page === "project" && route.id === item.id) || (route.page === "labels" && route.project === item.id)
+                  ? "project-link current" : "project-link"}>
                 <span className="project-square" />
                 {item.name}
               </a>
@@ -690,7 +692,8 @@ export function HubApp() {
             </section>
           </>
         ) : (
-          <div className="page" key={route.page === "project" ? `project-${route.id}` : route.page}>
+          <div className="page" key={route.page === "project" ? `project-${route.id}`
+            : route.page === "labels" ? `labels-${route.project}-${route.set}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
@@ -703,6 +706,7 @@ export function HubApp() {
                 <NotesPanel {...notesProps} selectedProject="all" />
               </>
             )}
+            {route.page === "labels" && <LabelSetPage hub={hub} project={route.project} setId={route.set} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
             {route.page === "planning" && (
               <>

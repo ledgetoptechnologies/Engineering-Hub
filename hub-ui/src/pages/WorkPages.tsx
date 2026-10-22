@@ -5,6 +5,7 @@ import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
 import { NotesPanel } from "../NotesPanel";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { TaskTable } from "./tasks";
+import { LabelSetsPanel } from "./LabelSets";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -156,6 +157,7 @@ export function ProjectPage({ hub, id, actions, notesProps }: {
           <TaskTable hub={hub} tasks={tasks} empty="No tasks for this project yet." />
         </section>
       </div>
+      <LabelSetsPanel hub={hub} project={id} />
       <NotesPanel {...notesProps} selectedProject={id} />
     </>
   );
