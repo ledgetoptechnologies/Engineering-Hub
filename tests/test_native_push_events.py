@@ -32,6 +32,11 @@ from agent_message_bus.sqlite_events import (
 
 
 BASE_URI = "agentbus://inbox/{}"
+# Spawn imports this integration module (HTTP/MCP/app dependencies) independently
+# in each child. Four imports on the one-CPU local CI worker can exceed 10s even
+# when event delivery is prompt. This shared bound covers process startup/join,
+# not the unchanged 3s notification-delivery assertions below.
+PROCESS_STARTUP_JOIN_SECONDS = 60
 
 
 @pytest.mark.asyncio
@@ -231,7 +236,7 @@ def assert_recipient_only_notification(notification, recipient: str, *, secret: 
 def _independent_writer(db_path: str, sender: str, recipient: str, message_id: str,
                        marker: str, barrier=None) -> None:
     if barrier is not None:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=PROCESS_STARTUP_JOIN_SECONDS)
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
     try:
         conn.execute("PRAGMA busy_timeout=10000")
@@ -244,6 +249,30 @@ def _independent_writer(db_path: str, sender: str, recipient: str, message_id: s
         conn.commit()
     finally:
         conn.close()
+
+
+async def _cleanup_owned_writers(processes):
+    """Bounded cleanup of this fixture's children, including on assertions.
+
+    Never enumerate/stop unrelated multiprocessing children. Joining/closing a
+    child only after its exit also prevents deferred test-runner shutdown from
+    waiting on a writer still stuck at the failed startup barrier.
+    """
+    started = [process for process in processes if process.pid is not None]
+    try:
+        for process in started:
+            if process.is_alive():
+                process.terminate()
+        await asyncio.gather(*(asyncio.to_thread(process.join, 5) for process in started))
+        for process in started:
+            if process.is_alive():
+                process.kill()
+        await asyncio.gather(*(asyncio.to_thread(process.join, 5) for process in started))
+        assert not any(process.is_alive() for process in started), 'Owned writer cleanup did not finish'
+    finally:
+        for process in processes:
+            if process.pid is None or not process.is_alive():
+                process.close()
 
 
 @pytest.mark.asyncio
@@ -334,9 +363,12 @@ async def test_native_eventsource_delivers_mcp_rest_and_independent_process_comm
                         target=_independent_writer,
                         args=(str(db_path), "claude", "hermes", process_id, process_secret),
                     )
-                    process.start()
-                    await asyncio.to_thread(process.join, 10)
-                    assert process.exitcode == 0
+                    try:
+                        process.start()
+                        await asyncio.to_thread(process.join, PROCESS_STARTUP_JOIN_SECONDS)
+                        assert process.exitcode == 0
+                    finally:
+                        await _cleanup_owned_writers([process])
                     process_notice = await asyncio.wait_for(hermes_events.get(), 3)
                     assert_recipient_only_notification(process_notice, "hermes", secret=process_secret,
                                                        message_id=process_id)
@@ -352,17 +384,21 @@ async def test_native_eventsource_delivers_mcp_rest_and_independent_process_comm
                     ]
                     processes = []
                     concurrent_ids: dict[str, set[str]] = {name: set() for name in sessions}
-                    for index, (sender, recipient) in enumerate(concurrent):
-                        message_id = str(uuid.uuid4())
-                        marker = f"concurrent-private-{index}"
-                        concurrent_ids[recipient].add(message_id)
-                        secrets[message_id] = marker
-                        child = mp.Process(target=_independent_writer,
-                            args=(str(db_path), sender, recipient, message_id, marker, barrier))
-                        child.start()
-                        processes.append(child)
-                    await asyncio.gather(*(asyncio.to_thread(child.join, 10) for child in processes))
-                    assert [child.exitcode for child in processes] == [0, 0, 0, 0]
+                    try:
+                        for index, (sender, recipient) in enumerate(concurrent):
+                            message_id = str(uuid.uuid4())
+                            marker = f"concurrent-private-{index}"
+                            concurrent_ids[recipient].add(message_id)
+                            secrets[message_id] = marker
+                            child = mp.Process(target=_independent_writer,
+                                args=(str(db_path), sender, recipient, message_id, marker, barrier))
+                            processes.append(child)
+                            child.start()
+                        await asyncio.gather(*(asyncio.to_thread(child.join, PROCESS_STARTUP_JOIN_SECONDS)
+                                               for child in processes))
+                        assert [child.exitcode for child in processes] == [0, 0, 0, 0]
+                    finally:
+                        await _cleanup_owned_writers(processes)
                     latest_head = await asyncio.to_thread(repository.delivery_head)
                     assert source.wait_for_cursor(latest_head, timeout=5)
 

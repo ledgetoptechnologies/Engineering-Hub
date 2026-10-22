@@ -109,8 +109,9 @@ test("connected agents state whether an inbox subscription was observed without 
   await fixture(page);
   await page.goto("/#/agents");
   const agents = page.locator("#agents");
-  await expect(agents.getByText("Inbox subscription observed: new messages can be pushed to this agent.", { exact: true })).toHaveCount(1);
+  await expect(agents.getByText("Inbox subscription observed. A server stream write does not prove client receipt or chat readiness.", { exact: true })).toHaveCount(1);
+  await expect(agents.getByText("Inbox subscription observed: new messages can be pushed to this agent.", { exact: true })).toHaveCount(0);
   await expect(agents.getByText("No active inbox subscription observed.", { exact: false })).toHaveCount(2);
-  await expect(agents.getByText("17 active stream(s)", { exact: false })).toBeVisible();
+  await expect(agents.getByText("17 fresh stream(s)", { exact: false })).toBeVisible();
   await expect(agents.getByText(/leak/i)).toHaveCount(0);
 });
