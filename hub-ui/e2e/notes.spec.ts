@@ -265,8 +265,7 @@ test("unsaved edits are not dropped by opening another note or switching project
   await panel.getByRole("button", { name: /Second note/ }).click();
   await expect(panel.getByLabel("Content")).toHaveValue("draft text");
   page.once("dialog", dialog => { prompts.push(dialog.message()); void dialog.dismiss(); });
-  await panel.getByLabel("Project").fill("treedar");
-  await panel.getByRole("button", { name: "Open" }).click();
+  await panel.getByLabel("Project").selectOption("treedar");
   await expect(panel.getByLabel("Project")).toHaveValue("engineering-hub");
   await expect(panel.getByLabel("Content")).toHaveValue("draft text");
   expect(prompts).toEqual(["You have unsaved note edits. Discard them?", "You have unsaved note edits. Discard them?"]);
@@ -284,8 +283,7 @@ test("a slow list for the previous project never replaces the current project's 
   state.slowProject = "engineering-hub";
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect(panel.getByText("Reading notes…", { exact: true })).toBeVisible();
-  await panel.getByLabel("Project").fill("treedar");
-  await panel.getByRole("button", { name: "Open" }).click();
+  await panel.getByLabel("Project").selectOption("treedar");
   await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
   state.release?.();
   await page.waitForTimeout(300);

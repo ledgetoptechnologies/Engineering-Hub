@@ -70,7 +70,6 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   // A project page opens on that project's notes; elsewhere the default.
   const initialProject = selectedProject !== "all" && isNoteProject(selectedProject) ? selectedProject : DEFAULT_NOTES_PROJECT;
   const [project, setProject] = useState(initialProject);
-  const [projectDraft, setProjectDraft] = useState(initialProject);
   const [searchDraft, setSearchDraft] = useState<Search>({ kind: "query", text: "" });
   const [search, setSearch] = useState<Search>({ kind: "query", text: "" });
   const [list, setList] = useState<NoteList | null>(null);
@@ -114,10 +113,10 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
     saveGeneration.current++; setDraft(null); setConflict(null); setSaving(false);
   }
   function switchProject(next: string) {
-    if (next === project || !confirmDiscard()) { setProjectDraft(project); return; }
+    if (next === project || !confirmDiscard()) return;
     closeEditor(); setSelected(null); setDoc(null); setDocState("idle"); setNotice(null);
     setSearch({ kind: "query", text: "" }); setSearchDraft({ kind: "query", text: "" });
-    setProject(next); setProjectDraft(next);
+    setProject(next);
   }
 
   // Follow the sidebar filter, but never silently drop unsaved edits.
@@ -297,14 +296,14 @@ ${latest.path}`;
     <p className="panel-description">Durable project notes shared with the agents. Notes are context only. They do not approve
       tasks, answer decisions or authorize runs.</p>
     <div className="notes-controls">
-      <form className="notes-project" onSubmit={event => { event.preventDefault();
-        if (isNoteProject(projectDraft)) switchProject(projectDraft); }}>
+      <div className="notes-project">
         <label htmlFor="notes-project">Project</label>
-        <input id="notes-project" list="notes-projects" value={projectDraft} spellCheck={false} maxLength={64}
-          pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" required onChange={event => setProjectDraft(event.target.value)} />
-        <datalist id="notes-projects">{knownProjects.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</datalist>
-        <button className="secondary small" type="submit" disabled={projectDraft === project}>Open</button>
-      </form>
+        {/* A real dropdown: a type-to-filter list hid the other projects until the box was cleared. */}
+        <select id="notes-project" value={project} onChange={event => switchProject(event.target.value)}>
+          {(knownProjects.some(item => item.id === project) ? knownProjects : [{ id: project, name: project }, ...knownProjects])
+            .map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select>
+      </div>
       <form className="notes-search" role="search" onSubmit={event => { event.preventDefault(); setSearch({ ...searchDraft }); }}>
         <label htmlFor="notes-search-kind" className="sr-only">Search by</label>
         <select id="notes-search-kind" value={searchDraft.kind}
