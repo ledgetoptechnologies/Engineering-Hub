@@ -7,6 +7,7 @@ import pytest
 from fastapi import Request
 from starlette.responses import JSONResponse
 from mcp.server.transport_security import TransportSecuritySettings
+from sse_starlette.sse import _shutdown_watcher
 
 from engineering_hub import server as runner
 from engineering_hub.app import create_app
@@ -111,6 +112,7 @@ async def pair_request(pair):
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != 'linux', reason='Real native bus event source')
 async def test_ordinary_idle_native_mcp_get_stops_and_clears_presence(config, tmp_path):
+    previous_tasks = set(asyncio.all_tasks())
     from agent_message_bus.app import create_app as create_bus
     bus = create_bus(db_path=tmp_path / 'bus.sqlite3', audit_path=tmp_path / 'audit.jsonl',
         file_root=tmp_path / 'files', auth=config.agent_auth, push_events_operational=True,
@@ -141,4 +143,17 @@ async def test_ordinary_idle_native_mcp_get_stops_and_clears_presence(config, tm
         assert pair.state == 'closed' and feed.stops == 1
     finally:
         stop.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        try:
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        finally:
+            # The SDK's process-exit notifier outlives its server on a fixture
+            # loop. Retire only this test's newly created SDK notifier tasks,
+            # never arbitrary application work or an earlier test's watcher.
+            watchers = [pending for pending in asyncio.all_tasks()
+                        if pending not in previous_tasks and not pending.done()
+                        and getattr(pending.get_coro(), 'cr_code', None) is _shutdown_watcher.__code__]
+            for pending in watchers:
+                pending.cancel()
+            if watchers:
+                await asyncio.gather(*watchers, return_exceptions=True)
+            assert all(pending.done() for pending in watchers)
