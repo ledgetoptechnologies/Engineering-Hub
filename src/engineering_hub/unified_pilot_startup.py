@@ -194,7 +194,14 @@ def load_profile(path):
 
 def _validated_configuration(config_path, profile_path):
     deployment = load_deployment_config(config_path)
+    deployment.validate_ledger_boundary()
+    if deployment.protected_ledger:
+        _require(Path(profile_path) == deployment.hub_database.parent / 'pilot.json')
     profile = load_profile(profile_path)
+    if deployment.protected_ledger:
+        root = deployment.hub_database.parent
+        _require(profile.credential_file == root / 'executor.token'
+                 and profile.ca_file == root / 'staging-ca.pem')
     # A private secret child of the existing EH mount is permitted, but never
     # downloadable bus content or an alias/collision with other state/config.
     # Actual reading still rejects symlinks/hardlinks and requires UID0600/0700.
