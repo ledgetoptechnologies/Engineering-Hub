@@ -7,9 +7,9 @@ import { EmptyState, Icon } from "../ui";
 import { DetailsBlock } from "../DetailsBlock";
 import { useState } from "react";
 
-export const MAX_FREE_TEXT = 2000;
+export const MAX_FREE_TEXT = 4096;
 /** Typed answers only when the server says so, and never on protected requests. */
-export const allowsFreeText = (decision: Decision) => decision.allow_free_text === true && !decision.protected;
+export const allowsFreeText = (decision: Decision) => decision.allow_text === true && !decision.protected;
 export const acceptsAnswer = (decision: Decision, answer: string) =>
   decision.options.includes(answer)
   || (allowsFreeText(decision) && answer.trim() !== "" && answer.length <= MAX_FREE_TEXT);
@@ -26,7 +26,7 @@ export function DecisionCard({ hub, decision }: { hub: Hub; decision: Decision }
         <span>REV {decision.revision}</span>
       </div>
       <h3>{decision.title}</h3>
-      <DetailsBlock value={decision.details} />
+      <DetailsBlock entity={decision} kind="decision" load={!hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />
       <fieldset disabled={!hub.writable}>
         <legend className="sr-only">Answer for {decision.title}</legend>
         {decision.options.map((option) => (

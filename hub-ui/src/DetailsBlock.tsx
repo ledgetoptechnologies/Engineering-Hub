@@ -1,6 +1,7 @@
-/** Summary, links and image attachments for a decision or task. Data only. */
-import { useRef, useState, type PointerEvent, type WheelEvent } from "react";
-import { attachmentUrl, parseDetails, type DetailImage } from "./details";
+/** Context text, links and image attachments for a decision or task. Data only. */
+import { useEffect, useRef, useState, type PointerEvent, type WheelEvent } from "react";
+import { HubApiError } from "./api";
+import { attachmentUrl, listAttachments, parseContext, type DetailImage } from "./details";
 import { Markdown } from "./markdown";
 import { link } from "./router";
 import { Modal } from "./ui";
@@ -11,9 +12,8 @@ function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => vo
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const drag = useRef<{ x: number; y: number } | null>(null);
-  const clamp = (value: number) => Math.min(8, Math.max(1, value));
   const setScale = (value: number) => {
-    const next = clamp(value);
+    const next = Math.min(8, Math.max(1, value));
     setZoom(next);
     if (next === 1) setOffset({ x: 0, y: 0 });
   };
@@ -40,37 +40,61 @@ function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => vo
         <img src={attachmentUrl(image.id)} alt={image.title} draggable={false}
           style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})` }} />
       </div>
-      <p className="panel-footnote">{image.width} × {image.height} px · {(image.bytes / 1024 / 1024).toFixed(1)} MB.
-        Scroll or use + and − to zoom; drag to move.</p>
+      <p className="panel-footnote">{(image.bytes / 1024).toFixed(0)} KB · Scroll or use + and − to zoom; drag to move.</p>
     </Modal>
   );
 }
 
-export function DetailsBlock({ value }: { value: unknown }) {
-  const details = parseDetails(value);
+/**
+ * `load` gates the attachments read (decision cards load at once; task rows when
+ * expanded). Demo mode never reads. Only a real 401/403 clears the workspace.
+ */
+export function DetailsBlock({ entity, kind, load, onUnauthorized }: {
+  entity: { id: string; revision: number }; kind: "task" | "decision"; load: boolean; onUnauthorized: () => void;
+}) {
+  const context = parseContext(entity);
+  const [images, setImages] = useState<DetailImage[]>([]);
+  const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState<DetailImage | null>(null);
-  if (!details) return null;
+  const unauthorized = useRef(onUnauthorized);
+  unauthorized.current = onUnauthorized;
+  useEffect(() => {
+    if (!load) return;
+    const controller = new AbortController();
+    setFailed(false);
+    listAttachments(kind, entity.id, controller.signal).then((value) => {
+      if (!controller.signal.aborted) setImages(value ?? []);
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      if (error instanceof HubApiError && [401, 403].includes(error.status)) unauthorized.current();
+      else setFailed(true);
+    });
+    return () => controller.abort();
+  }, [load, kind, entity.id, entity.revision]);
+  if (!context && images.length === 0 && !failed) return null;
   return (
     <div className="item-details">
-      {details.summary.trim() && <div className="item-summary"><Markdown source={details.summary} /></div>}
-      {details.images.length > 0 && (
+      {context?.summary.trim() && <div className="item-summary"><Markdown source={context.summary} /></div>}
+      {images.length > 0 && (
         <ul className="attachment-grid" aria-label="Attached images">
-          {details.images.map((image) => (
+          {images.map((image) => (
             <li key={image.id}>
               <button type="button" className="attachment-thumb" onClick={() => setOpen(image)}
                 aria-label={`View ${image.title}`}>
-                <img src={attachmentUrl(image.id)} alt="" loading="lazy" width={image.width} height={image.height} />
+                <img src={attachmentUrl(image.id)} alt="" loading="lazy" />
                 <span>{image.title}</span>
               </button>
             </li>
           ))}
         </ul>
       )}
-      {details.links.length > 0 && (
+      {failed && <p className="panel-footnote">Attached images could not be loaded right now.</p>}
+      {context && context.links.length > 0 && (
         <ul className="detail-links" aria-label="Links">
-          {details.links.map((item) => (
+          {context.links.map((item) => (
             <li key={item.href + item.label}>
-              <a href={external(item.href) ? item.href : link(item.href)} {...(external(item.href) ? { target: "_blank", rel: "noopener noreferrer" } : {})}>
+              <a href={external(item.href) ? item.href : link(item.href)}
+                {...(external(item.href) ? { target: "_blank", rel: "noopener noreferrer" } : {})}>
                 {item.label}
               </a>
               {external(item.href) && <small>{new URL(item.href).hostname}</small>}

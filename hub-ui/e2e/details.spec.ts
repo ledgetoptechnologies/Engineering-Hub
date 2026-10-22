@@ -6,11 +6,19 @@ const human = "human:cf:" + "e".repeat(64);
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 
 type Overview = ReturnType<typeof createDemoOverview>;
+const DECISION_IDS = ["11111111-2222-4333-8444-000000000001", "11111111-2222-4333-8444-000000000002"];
+const TASK_IDS = ["22222222-2222-4333-8444-000000000001", "22222222-2222-4333-8444-000000000002", "22222222-2222-4333-8444-000000000003", "22222222-2222-4333-8444-000000000004"];
+const IMAGE = { id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", kind: "decision", project: "engineering-hub", title: "Plot A1 canopy map",
+  media_type: "image/png", bytes: 210000, sha256: "c".repeat(64), by: "codex", created_at: "2026-10-22T12:00:00Z", entity_revision: 1 };
 
 async function fixture(page: Page, edit: (overview: Overview) => void = () => {}) {
   const overview = createDemoOverview(new Date());
   edit(overview);
-  const state = { answers: [] as { body: Record<string, unknown>; csrf?: string }[], imageReads: 0 };
+  // Attachments are addressed by UUID entity ids, as the server issues them.
+  overview.decisions.forEach((decision, index) => { decision.id = DECISION_IDS[index]; });
+  overview.tasks.forEach((task, index) => { task.id = TASK_IDS[index]; });
+  const state = { answers: [] as { body: Record<string, unknown>; csrf?: string }[], imageReads: 0,
+    attachments: {} as Record<string, Record<string, unknown>[]> };
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const respond = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
@@ -20,7 +28,10 @@ async function fixture(page: Page, edit: (overview: Overview) => void = () => {}
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
-    if (path.startsWith("/api/hub/v1/attachments/")) {
+    const list = /^\/api\/hub\/v1\/(tasks|decisions)\/([^/]+)\/attachments$/.exec(path);
+    if (list) return respond({ project: "engineering-hub", entity_revision: 1,
+      items: (state.attachments[list[2]] ?? []).map((item) => ({ ...item, entity_id: list[2] })) });
+    if (/^\/api\/hub\/v1\/attachments\/[0-9a-f-]+\/image$/.test(path)) {
       state.imageReads++;
       return route.fulfill({ status: 200, contentType: "image/png", body: PNG });
     }
@@ -38,18 +49,15 @@ async function fixture(page: Page, edit: (overview: Overview) => void = () => {}
 
 const withDetails = (overview: Overview) => {
   Object.assign(overview.decisions[0], {
-    details: {
-      summary: "Compare the two **crown counts**.\n\n<img src=x onerror=\"window.__pwned=1\">",
-      links: [{ label: "Survey notes", url: "/notes" }, { label: "Vendor page", url: "https://example.com/spec" },
-        { label: "Bad", url: "javascript:alert(1)" }],
-      attachments: [{ kind: "image", id: "plot-a1-map", title: "Plot A1 canopy map", width: 1600, height: 1200, bytes: 420000 },
-        { kind: "svg", id: "vector-map", title: "Vector", width: 10, height: 10, bytes: 10 }],
-    },
+    details: "Compare the two **crown counts**.\n\n<img src=x onerror=\"window.__pwned=1\">",
+    links: [{ label: "Survey notes", url: "/notes" }, { label: "Vendor page", url: "https://example.com/spec" },
+      { label: "Bad", url: "javascript:alert(1)" }],
   });
 };
 
 test("decision details show a formatted summary, safe links and a zoomable map image", async ({ page }) => {
   const { state } = await fixture(page, withDetails);
+  state.attachments[DECISION_IDS[0]] = [IMAGE, { ...IMAGE, id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", media_type: "image/svg+xml", title: "Vector" }];
   await page.goto("/#/inbox");
   const card = page.locator("form.decision").first();
   await expect(card.locator(".item-summary strong")).toHaveText("crown counts");
@@ -75,7 +83,7 @@ test("decision details show a formatted summary, safe links and a zoomable map i
 });
 
 test("a typed answer is sent as the answer with CSRF and the current revision", async ({ page }) => {
-  const { state } = await fixture(page, (overview) => { overview.decisions[0].allow_free_text = true; });
+  const { state } = await fixture(page, (overview) => { overview.decisions[0].allow_text = true; });
   await page.goto("/#/inbox");
   const card = page.locator("form.decision").first();
   const record = card.getByRole("button", { name: /Record decision/ });
@@ -92,8 +100,8 @@ test("a typed answer is sent as the answer with CSRF and the current revision", 
 test("typed answers are offered only when the server allows them and never on protected requests", async ({ page }) => {
   await fixture(page, (overview) => {
     const base = overview.decisions[0];
-    delete (base as { allow_free_text?: boolean }).allow_free_text;
-    overview.decisions.push({ ...base, id: "protected-one", title: "Protected request", protected: true, allow_free_text: true });
+    delete (base as { allow_text?: boolean }).allow_text;
+    overview.decisions.push({ ...base, id: DECISION_IDS[1], title: "Protected request", protected: true, allow_text: true });
   });
   await page.goto("/#/inbox");
   await expect(page.locator("form.decision")).toHaveCount(2);
@@ -102,12 +110,32 @@ test("typed answers are offered only when the server allows them and never on pr
 
 test("task rows show their details when expanded", async ({ page }) => {
   await fixture(page, (overview) => {
-    Object.assign(overview.tasks[0], { details: { summary: "Counts differ by **3** crowns in plot A1.",
-      links: [{ label: "Run log", url: "https://example.com/log" }] } });
+    Object.assign(overview.tasks[0], { details: "Counts differ by **3** crowns in plot A1.",
+      links: [{ label: "Run log", url: "https://example.com/log" }] });
   });
   await page.goto("/#/work");
   const row = page.locator("details.task-row").first();
   await row.locator("summary").click();
   await expect(row.locator(".item-summary strong")).toHaveText("3");
   await expect(row.getByRole("link", { name: "Run log" })).toBeVisible();
+});
+
+test("the Activity tab shows the Hub's recorded history with paging, newest first", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.tasks[0].project;
+  const event = (sequence: number, action: string, title: string) => ({ sequence, action, entity_id: TASK_IDS[0], revision: sequence,
+    created_at: new Date(Date.now() - sequence * 60000).toISOString(), kind: action.split(".")[0], actor: "codex", current_title: title });
+  await page.route("**/api/hub/v1/activity?*", (route) => {
+    const before = new URL(route.request().url()).searchParams.get("before");
+    const body = before ? { project, items: [event(1, "task.created", "Older item")], next_before: null }
+      : { project, items: [event(3, "task.claimed", "Newest item"), event(2, "decision.answered", "Middle item")], next_before: 2 };
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.goto(`/#/projects/${project}/activity`);
+  const history = page.getByRole("list", { name: "Activity history" });
+  await expect(history.getByRole("listitem")).toHaveCount(2);
+  await expect(history.getByRole("listitem").first()).toContainText("Codex claimed it");
+  await page.getByRole("button", { name: "Show older" }).click();
+  await expect(history.getByRole("listitem")).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "Show older" })).toHaveCount(0);
 });
