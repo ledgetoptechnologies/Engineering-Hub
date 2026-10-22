@@ -3728,7 +3728,7 @@ dialog .modal-head h2 { font-size: 20px; line-height: 1.3; overflow-wrap: anywhe
 }
 a.project-chip, .detail-links a { display: inline-flex; align-items: center; min-height: 24px; }
 
-/* Staging page: readable status text, and a one-line summary of which projects can run staging work. */
+/* Staging page: readable status text, and a one-line summary of which projects have a staging target enabled. */
 .staging-control > div > span:not(.status-orb) { display: flex; flex-direction: column; gap: 3px; }
 .staging-control strong { font-size: 14px; }
 .staging-control small { font-size: 12.5px; color: var(--muted); margin-top: 0; }

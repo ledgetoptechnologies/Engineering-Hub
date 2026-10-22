@@ -158,11 +158,11 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
   );
 }
 
-/** One line saying how many projects can actually run staging work, so a row of "no target" badges doesn't read as a fault. */
+/** One line saying how many projects have a staging target configured (configuration only, not verified readiness), so a row of "no target" badges doesn't read as a fault. */
 export function stagingSummary(projects: { executor_enabled: boolean }[]): string {
   const ready = projects.filter((item) => item.executor_enabled).length;
-  if (ready === 0) return "No projects are connected to the staging PC yet. Connecting one needs an inventory of the target and your acceptance; until then nothing runs in staging.";
-  return `${ready} of ${projects.length} project${projects.length === 1 ? "" : "s"} can run staging work.`;
+  if (ready === 0) return "No projects are connected to the staging PC yet. Connecting one needs an inventory of the target and your acceptance.";
+  return `${ready} of ${projects.length} project${projects.length === 1 ? " has" : "s have"} a staging target enabled.`;
 }
 
 export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
@@ -181,7 +181,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
             <div>
               <span className={`status-orb ${data.paused ? "paused" : ""}`} />
               <span>
-                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Running normally: nothing is paused"}</strong>
+                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Running normally: the emergency pause is off"}</strong>
                 <small>
                   {!data.autonomy.configured ? "No automatic runner is set up, so nothing runs on its own. Agents only act on the tasks shown here."
                     : `Automatic runner: ${pretty(data.autonomy.state)}`}
