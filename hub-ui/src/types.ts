@@ -82,6 +82,14 @@ export interface Project {
   executor_enabled: boolean;
   health: string;
   reason: string;
+  /** Human-managed metadata (newer servers). None of it grants access or execution. */
+  description?: string;
+  repository_url?: string | null;
+  lead_agent?: Agent | null;
+  status?: "on_track" | "at_risk" | "off_track" | "paused";
+  parent_project?: string | null;
+  archived?: boolean;
+  revision?: number;
 }
 export interface AgentSummary {
   id: Agent;

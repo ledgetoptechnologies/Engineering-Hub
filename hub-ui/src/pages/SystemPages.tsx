@@ -186,7 +186,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
             </button>
           </div>
           <div className="project-list">
-            {data.projects.map((item) => (
+            {data.projects.filter((item) => !item.archived).map((item) => (
               <a className="project-row" key={item.id} href={link(`/projects/${item.id}`)}>
                 <span className="project-icon"><Icon kind="folder" /></span>
                 <div>

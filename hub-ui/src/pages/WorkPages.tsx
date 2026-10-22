@@ -59,7 +59,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <span className="sr-only">Project</span>
           <select value={project} onChange={(event) => setProject(event.target.value)}>
             <option value="all">All projects</option>
-            {hub.data.projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            {hub.data.projects.filter((item) => !item.archived).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
         </label>
         <div className="chip-row" role="group" aria-label="Filter by state">
