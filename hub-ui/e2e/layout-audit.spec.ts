@@ -24,7 +24,7 @@ for (const size of sizes) {
       await page.waitForTimeout(150);
       const findings = await audit(page, "page", size.width);
       report[`page ${path}`] = findings;
-      await page.screenshot({ path: test.info().outputPath(`${size.name}${path.replace(/\//g, "_") || "_home"}.png`), fullPage: true });
+      if (blocking(findings).length) await page.screenshot({ path: test.info().outputPath(`${size.name}${path.replace(/\//g, "_") || "_home"}.png`), fullPage: true });
       expect.soft(blocking(findings), JSON.stringify(blocking(findings), null, 1)).toEqual([]);
     });
 
@@ -40,7 +40,7 @@ for (const size of sizes) {
       for (const more of await page.locator("dialog[open] details:not([open]) > summary").all()) await more.click();
       const findings = await audit(page, "dialog", size.width);
       report[`dialog ${dialog.label}`] = findings;
-      await page.screenshot({ path: test.info().outputPath(`${size.name}_dialog_${dialog.label.replace(/ /g, "-")}.png`) });
+      if (blocking(findings).length) await page.screenshot({ path: test.info().outputPath(`${size.name}_dialog_${dialog.label.replace(/ /g, "-")}.png`) });
       expect.soft(blocking(findings), JSON.stringify(blocking(findings), null, 1)).toEqual([]);
     });
   });
