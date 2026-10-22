@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { imageUrl, parseLabelSet, parseLabelSetList, saveLabel } from "./labelSetsApi";
+import { imageUrl, listLabelSets, parseLabelSet, parseLabelSetList, saveLabel } from "./labelSetsApi";
 
 const choices = [{ key: "conifer", label: "Conifer" }, { key: "broadleaf", label: "Broadleaf" }, { key: "unsure", label: "Not sure" }];
 function set(extra: Record<string, unknown> = {}) {
@@ -62,5 +62,15 @@ describe("labelling sets client", () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ id: "91", meta: {}, label: null, revision: 5 }));
     await expect(saveLabel(parsed.id, parsed.items[0], "conifer", "csrf", parsed.choices, fetchImpl))
       .rejects.toMatchObject({ code: "invalid_label_set" });
+  });
+});
+
+describe("gateway refusals", () => {
+  it("reports a gateway route refusal as unavailable, not as a lost sign-in", async () => {
+    const signal = new AbortController().signal;
+    const refused = async () => response({ detail: { code: "gateway_route_forbidden" } }, 403);
+    await expect(listLabelSets("treedar", signal, refused)).rejects.toMatchObject({ status: 404, code: "label_sets_unavailable" });
+    const denied = async () => response({ detail: { code: "access_denied" } }, 403);
+    await expect(listLabelSets("treedar", signal, denied)).rejects.toMatchObject({ status: 403 });
   });
 });

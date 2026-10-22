@@ -12,6 +12,25 @@ import type {
 } from "./types";
 
 export type HubMode = "live" | "demo";
+
+/**
+ * The private gateway answers routes it does not know (a feature this server
+ * doesn't have yet) with 403 gateway_route_forbidden or 400 gateway_invalid_*.
+ * That is "not available", never a lost sign-in, so callers must not clear the
+ * workspace for it.
+ */
+export async function isMissingRoute(response: Response): Promise<boolean> {
+  if (response.status === 404) return true;
+  if (![400, 403].includes(response.status)) return false;
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return false;
+  try {
+    const body: unknown = await response.clone().json();
+    const code = (body as { detail?: { code?: unknown } })?.detail?.code;
+    return typeof code === "string" && (code === "gateway_route_forbidden" || code.startsWith("gateway_invalid_"));
+  } catch {
+    return false;
+  }
+}
 export class HubApiError extends Error {
   constructor(
     public readonly status: number,

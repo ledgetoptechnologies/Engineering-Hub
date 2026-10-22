@@ -1,5 +1,5 @@
 /** Agent-defined labelling sets: images plus human choices. Data only, no agent code. */
-import { HubApiError } from "./api";
+import { HubApiError, isMissingRoute } from "./api";
 
 export interface LabelChoice { key: string; label: string }
 export interface ItemLabel { choice: string; by: string; at: string }
@@ -93,6 +93,7 @@ const getInit = (signal: AbortSignal): RequestInit => ({
   headers: { Accept: "application/json" }, signal,
 });
 async function json(response: Response): Promise<unknown> {
+  if (!response.ok && await isMissingRoute(response)) throw new HubApiError(404, "label_sets_unavailable");
   if (!response.ok) {
     let code = response.status === 404 ? "label_sets_unavailable" : response.status === 409 ? "label_conflict" : "label_request_failed";
     if (response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
