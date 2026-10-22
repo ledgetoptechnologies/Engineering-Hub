@@ -16,8 +16,7 @@ from hub_unified_container_smoke import stop_owned, remove_owned_volume
 
 
 SEED = SETTINGS_SEED + r'''
-import hashlib, shutil, sqlite3
-from engineering_hub.pilot_enrollment import inspect_plan, apply_plan, plan_digest
+import hashlib, shutil, sqlite3, subprocess, sys
 repo = HubRepository(root / 'hub.sqlite3')
 decision = repo.create_decision('human:123','treedar','Synthetic preserved decision',['yes','no'])
 with sqlite3.connect(root / 'hub.sqlite3') as db:
@@ -33,9 +32,40 @@ original = source.read_bytes()
 assert target.read_bytes() == original
 # All synthetic writers above have exited their transactions. This untouched
 # source is the fixture's verified backup, not an attestation about any live NAS.
-plan = inspect_plan(target)
-enrolled = apply_plan(plan,plan_digest(plan),writers_stopped=True,backup_verified=True)
+def enrollment_cli(*args):
+    return subprocess.run([sys.executable,'-I','-B','-m',
+        'engineering_hub.pilot_enrollment',*args],capture_output=True,
+        text=True,timeout=30,check=False)
+before_inspection = target.read_bytes()
+inspected = enrollment_cli('inspect','--database',str(target))
+assert inspected.returncode == 0 and not inspected.stderr
+document = json.loads(inspected.stdout)
+assert target.read_bytes() == before_inspection
+plan_file = private / 'enrollment-plan.json'
+with plan_file.open('x',encoding='utf-8') as stream:
+    stream.write(inspected.stdout)
+plan_file.chmod(0o600)
+lock = target.with_name(target.name+'.pilot-owner.lock')
+# Operator abort checkpoint: a rejected digest must not enroll or change the
+# copy, and the original remains available. This does NOT restore a stale
+# source after the new private ledger has accepted authoritative mutations.
+wrong_digest = ('0' if document['digest'][0] != '0' else '1')+document['digest'][1:]
+aborted = enrollment_cli('apply','--plan',str(plan_file),
+    '--expected-digest',wrong_digest,'--writers-stopped','--backup-verified')
+assert aborted.returncode == 1 and not aborted.stdout and not lock.exists()
+assert target.read_bytes() == before_inspection and source.read_bytes() == original
+applied = enrollment_cli('apply','--plan',str(plan_file),
+    '--expected-digest',document['digest'],'--writers-stopped','--backup-verified')
+assert applied.returncode == 0 and not applied.stderr
+enrolled = json.loads(applied.stdout)
 assert enrolled['runtime_activated'] is False and source.read_bytes() == original
+assert enrolled['prior_snapshot'] == document['plan']['snapshot']
+enrolled_bytes, lock_bytes = target.read_bytes(), lock.read_bytes()
+retry = enrollment_cli('apply','--plan',str(plan_file),
+    '--expected-digest',document['digest'],'--writers-stopped','--backup-verified')
+assert retry.returncode == 1 and not retry.stdout
+assert target.read_bytes() == enrolled_bytes and lock.read_bytes() == lock_bytes
+assert source.read_bytes() == original
 settings['schema_version'] = 2
 settings['storage'] = {'layout':'protected-ledger-v1'}
 (root / 'settings.json').write_text(json.dumps(settings))
@@ -44,7 +74,8 @@ saved.update(decision=decision,source_sha256=hashlib.sha256(original).hexdigest(
     settings_sha256=hashlib.sha256((root/'settings.json').read_bytes()).hexdigest(),
     database_device=enrolled['database_device'],database_inode=enrolled['database_inode'])
 (private / 'fixture.json').write_text(json.dumps(saved))
-print(json.dumps({'protected_seed':'passed'}))
+print(json.dumps({'protected_seed':'passed','enrollment_cli':'passed',
+    'abort_before_enrollment':'unchanged','reenrollment':'refused'}))
 '''
 
 # Reuse the existing complete three-identity HTTP/MCP and ingress assertions,
@@ -161,7 +192,9 @@ def _smoke(image, commit):
             or mountpoint != '/var/lib/docker/volumes/'+volume+'/_data'
             or str(PurePosixPath(mountpoint)) != mountpoint):
             raise RuntimeError('Disposable volume identity mismatch')
-        assert fixture(SEED,'seed')['protected_seed'] == 'passed'
+        seed = fixture(SEED,'seed')
+        assert seed == {'protected_seed':'passed','enrollment_cli':'passed',
+                        'abort_before_enrollment':'unchanged','reenrollment':'refused'}
         expected = {'/var/lib/hub/settings.json':(mountpoint+'/settings.json',False),
                     '/var/lib/hub/agent-message-bus':(mountpoint+'/agent-message-bus',True),
                     '/var/lib/hub-private':(mountpoint+'/private',True)}
@@ -198,6 +231,7 @@ def _smoke(image, commit):
             assert fixture(VERIFY,'verify-'+str(iteration))['preservation']=='passed'
         return {'protected_profile':'passed','source_commit':commit,'resolved_image_id':image_id,
             'stages':reports,'recreations':2,'selective_maps':3,'runtime':'inactive',
+            'enrollment_cli':seed,
             'network':'none','truenas':'not_deployed','human_sign_in':'not_tested','agent_wake':'not_tested'}
     finally:
         for name in names:

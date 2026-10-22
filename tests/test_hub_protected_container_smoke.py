@@ -55,7 +55,9 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
             return json.dumps({'Name':volume,'Labels':{'hub.release-owner':owner if failure!='label' else 'foreign'},
                 'Driver':'local','Options':None,
                 'Mountpoint':'/var/lib/docker/volumes/'+volume+'/_data' if failure!='mountpoint' else '/live/state'})
-        if args[1]=='run' and args[-1]==module.SEED: return json.dumps({'protected_seed':'passed'})
+        if args[1]=='run' and args[-1]==module.SEED:
+            return json.dumps({'protected_seed':'passed','enrollment_cli':'passed',
+                               'abort_before_enrollment':'unchanged','reenrollment':'refused'})
         if args[1]=='run' and args[-1]==module.VERIFY: return json.dumps({'preservation':'passed'})
         if args[1:3]==('container','inspect'):
             prior=next(c for c in calls if c[1]=='run' and c[c.index('--name')+1]==args[-1])
@@ -92,6 +94,8 @@ def test_owned_selective_plan_and_cleanup(monkeypatch,failure):
         result=module.smoke(IMAGE,COMMIT)
         assert result['recreations']==2 and len(result['stages'])==3
         assert result['runtime']=='inactive' and result['selective_maps']==3
+        assert result['enrollment_cli']['abort_before_enrollment']=='unchanged'
+        assert result['enrollment_cli']['reenrollment']=='refused'
     runs=[c for c in calls if c[1]=='run']
     for args in runs:
         assert args[args.index('--pull')+1]=='never'
@@ -123,7 +127,11 @@ def test_embedded_scripts_compile_and_keep_real_guards(monkeypatch):
     for script in (module.SEED,module.PROBE,module.VERIFY): ast.parse(script)
     assert 'allow_ephemeral' not in module.SEED
     assert 'INSERT INTO hub_pilot_owner' not in module.SEED
-    assert 'inspect_plan(target)' in module.SEED and 'apply_plan(plan' in module.SEED
+    assert "'engineering_hub.pilot_enrollment',*args]" in module.SEED
+    assert "enrollment_cli('inspect'" in module.SEED
+    assert 'document[\'plan\'][\'snapshot\']' in module.SEED
+    assert 'aborted.returncode == 1' in module.SEED and 'not lock.exists()' in module.SEED
+    assert 'retry.returncode == 1' in module.SEED and 'lock.read_bytes() == lock_bytes' in module.SEED
     assert "overview['autonomy'] ==" in module.PROBE
     assert "assert 8765 not in listeners" in module.PROBE
 
