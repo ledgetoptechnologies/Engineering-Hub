@@ -65,16 +65,21 @@ boundary; this is not automatic onboarding for outside agents.
 
 Use the reviewed `scripts/staging_ci_engine.py` helper on the staging host:
 
+Install the reviewed host helper/controller into a separate private, versioned
+operator directory. Never execute host scripts from the development checkout
+being tested: that checkout may change those scripts. The controller accepts
+the candidate checkout as data; it must remain independent of that source.
+
 ```text
-python3 scripts/staging_ci_engine.py inspect
-python3 scripts/staging_ci_engine.py start
+python3 /path/to/reviewed/scripts/staging_ci_engine.py inspect
+python3 /path/to/reviewed/scripts/staging_ci_engine.py start
 ```
 
 Retain its actual engine ID and service invocation ID. Do not substitute the
 shared/default Docker context. The local test controller is:
 
 ```text
-python3 scripts/local_development_ci.py --checkout <local-checkout> --ref refs/heads/<development-branch> --image sha256:<reviewed-ci-image-id> --engine unix://<private-ci-socket> --engine-id <observed-ci-engine-id> --output-root <private-ci-results> --profile all
+python3 /path/to/reviewed/scripts/local_development_ci.py --checkout <local-checkout> --ref refs/heads/<development-branch> --image sha256:<reviewed-ci-image-id> --engine unix://<private-ci-socket> --engine-id <observed-ci-engine-id> --output-root <private-ci-results> --profile all
 ```
 
 The runner serializes its own jobs and retains reports/logs bound to the commit,
