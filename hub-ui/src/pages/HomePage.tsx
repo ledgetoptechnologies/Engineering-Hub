@@ -14,10 +14,11 @@ function greeting(now = new Date()) {
 
 export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const waiting = openDecisions(hub);
+  const projects = hub.data.projects.filter((item) => !item.archived);
   const tasks = hub.data.tasks;
   const active = tasks.filter((task) => task.status !== "verified");
   const connected = hub.data.agents.filter((agent) => connectionView(agent, !hub.demo && hub.stale).connected);
-  const targets = hub.data.projects.filter((item) => item.executor_enabled).length;
+  const targets = projects.filter((item) => item.executor_enabled).length;
   return (
     <>
       <PageHeader eyebrow="DEVELOPMENT / STAGING" title={greeting()}
@@ -40,7 +41,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         </a>
         <a className="kpi" href={link("/staging")}>
           <span className="kpi-label"><Icon kind="staging" size={16} /> Staging</span>
-          <strong>{targets}<span className="kpi-of">/{hub.data.projects.length}</span></strong>
+          <strong>{targets}<span className="kpi-of">/{projects.length}</span></strong>
           <span className="kpi-note">{hub.data.paused ? "Emergency pause on" : "targets set up"}</span>
         </a>
       </div>
@@ -79,7 +80,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           <StageBar tasks={tasks} label="All tasks by stage" height={18} />
           <StageLegend tasks={tasks} />
           <ul className="pipeline-rows" aria-label="Tasks by project">
-            {hub.data.projects.map((project) => {
+            {projects.map((project) => {
               const rows = tasks.filter((task) => task.project === project.id);
               return (
                 <li key={project.id}>
@@ -142,7 +143,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <span className="panel-action"><a className="text-link" href={link("/projects")}>All projects →</a></span>
           </div>
           <ul className="project-mini">
-            {hub.data.projects.map((project) => {
+            {projects.map((project) => {
               const open = openDecisions(hub, project.id).length;
               const work = hub.data.tasks.filter((task) => task.project === project.id && task.status !== "verified").length;
               return (

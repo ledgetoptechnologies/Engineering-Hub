@@ -12,6 +12,9 @@ import { Badge, EmptyState, Icon, names, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { LabelSetsPanel } from "./LabelSets";
 import { stateAge, statusLabel, statusTone, TaskTable } from "./tasks";
+import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } from "./ProjectEditor";
+import { safeHref } from "../markdown";
+import type { Project } from "../types";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -50,8 +53,17 @@ function AgentStack({ agents }: { agents: string[] }) {
   );
 }
 
+/** A person's status for the project wins; otherwise one derived from its open work. */
+function shownStatus(project: Project, stats: ProjectStats): { label: string; tone: string } {
+  return project.status ? { label: STATUS_LABEL[project.status], tone: STATUS_TONE[project.status] } : derivedStatus(stats);
+}
+const canManage = (hub: Hub) => !hub.demo && hub.writable && !!hub.session?.csrf_token;
+
 export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
-  const rows = hub.data.projects.map((project) => ({ project, stats: projectStats(hub, project.id) }));
+  const [creating, setCreating] = useState(false);
+  const archived = hub.data.projects.filter((project) => project.archived).length;
+  const rows = hub.data.projects.filter((project) => !project.archived)
+    .map((project) => ({ project, stats: projectStats(hub, project.id) }));
   return (
     <>
       <header className="list-header">
@@ -59,8 +71,13 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
           <p className="eyebrow">PROJECTS</p>
           <h1>Projects<span>.</span></h1>
         </div>
-        <div className="heading-actions">{actions}</div>
+        <div className="heading-actions">
+          {canManage(hub) && <button type="button" className="secondary" onClick={() => setCreating(true)}>
+            <Icon kind="plus" size={16} /> New project</button>}
+          {actions}
+        </div>
       </header>
+      {creating && <ProjectEditorDialog hub={hub} project={null} onClose={() => setCreating(false)} />}
       <section className="panel table-panel" aria-label="All projects">
         <table className="data-table">
           <thead>
@@ -78,7 +95,7 @@ export function ProjectsPage({ hub, actions }: { hub: Hub; actions: React.ReactN
           </thead>
           <tbody>
             {rows.map(({ project, stats }) => {
-              const status = derivedStatus(stats);
+              const status = shownStatus(project, stats);
               return (
                 <tr key={project.id}>
                   <th scope="row">
@@ -248,6 +265,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   notesProps: Omit<React.ComponentProps<typeof NotesPanel>, "selectedProject">;
 }) {
   const [view, setView] = useState<"board" | "list">("board");
+  const [dialog, setDialog] = useState<"edit" | "archive" | null>(null);
   const project = hub.data.projects.find((item) => item.id === id);
   if (!project) {
     return (
@@ -259,7 +277,9 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
     );
   }
   const stats = projectStats(hub, id);
-  const status = derivedStatus(stats);
+  const status = shownStatus(project, stats);
+  const repository = project.repository_url ? safeHref(project.repository_url) : null;
+  const parent = project.parent_project ? hub.data.projects.find((item) => item.id === project.parent_project) : null;
   const changes = latestChanges(hub, id);
   const tabs: { key: ProjectTab; label: string; count?: number }[] = [
     { key: "overview", label: "Overview" },
@@ -287,8 +307,17 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
             </div>
           </div>
         </div>
-        <div className="heading-actions">{actions}</div>
+        <div className="heading-actions">
+          {canManage(hub) && !project.archived && <button type="button" className="secondary" onClick={() => setDialog("edit")}>Edit project</button>}
+          {canManage(hub) && !project.archived && project.id !== "engineering-hub" && project.revision &&
+            <button type="button" className="secondary" onClick={() => setDialog("archive")}>Archive</button>}
+          {actions}
+        </div>
       </header>
+      {project.archived && <p className="notice">This project is archived. Its history is kept for reference.</p>}
+      {project.description && <p className="project-description">{project.description}</p>}
+      {dialog === "edit" && <ProjectEditorDialog hub={hub} project={project} onClose={() => setDialog(null)} />}
+      {dialog === "archive" && <ArchiveProjectDialog hub={hub} project={project} onClose={() => setDialog(null)} />}
       <nav className="tabs" aria-label={`${project.name} sections`}>
         {tabs.map((item) => (
           <a key={item.key} href={tabHref(item.key)} className={tab === item.key ? "tab current" : "tab"}
@@ -337,6 +366,11 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
             <dl className="properties">
               <div><dt>Status</dt><dd><span className={`status-pill ${status.tone}`}>{status.label}</span></dd></div>
               <div><dt>Project id</dt><dd><code>{project.id}</code></dd></div>
+              {project.lead_agent && <div><dt>Lead</dt><dd>{names[project.lead_agent]}</dd></div>}
+              {parent && <div><dt>Part of</dt><dd><a className="text-link" href={link(`/projects/${parent.id}`)}>{parent.name}</a></dd></div>}
+              <div><dt>Repository</dt><dd>{repository
+                ? <a className="text-link" href={repository} target="_blank" rel="noopener noreferrer">{new URL(repository).pathname.replace(/^\//, "") || new URL(repository).host}</a>
+                : "None (notes-only)"}</dd></div>
               <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "Not set up yet"}</dd></div>
               <div><dt>Health</dt><dd>{project.health === "unknown" ? "Not reported" : pretty(project.health)}</dd></div>
               <div><dt>Agents</dt><dd><AgentStack agents={stats.agents} /></dd></div>
