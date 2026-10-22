@@ -25,6 +25,12 @@ request. The cached dependency image is pinned by immutable ID and lockfile
 hashes; changed dependencies require deliberate reviewed cache rebuilding, not
 network installation during the job.
 
+Prepare that image from a clean `git archive`, not a Windows working-tree copy:
+Git may store LF while the checkout uses CRLF. The branch/image lock hashes must
+match the exact committed bytes. Base-cache compatibility permits only CRLF/LF
+line-ending equivalence, not changed dependency declarations; the new image's
+labels and bootstrap retain exact snapshot hashes.
+
 ## Existing-machine separation
 
 Inventory found a live rootless pilot/recovery engine on the staging PC, with

@@ -12,8 +12,7 @@ COPY hub-ui/package.json hub-ui/package-lock.json ./hub-ui/
 # Python dependencies come from the independently reviewed validation base.
 # Confirm lock compatibility during image preparation; no branch dependency
 # installation or network access is granted during a development job.
-RUN cmp /validation/pyproject.toml /opt/eh-ci/pyproject.toml \
-    && cmp /validation/uv.lock /opt/eh-ci/uv.lock \
+RUN python -c "from pathlib import Path; names=('pyproject.toml','uv.lock'); assert all((Path('/validation')/n).read_bytes().replace(b'\r\n',b'\n') == (Path('/opt/eh-ci')/n).read_bytes().replace(b'\r\n',b'\n') for n in names)" \
     && uv sync --locked --offline --group test --no-editable --project /validation
 RUN cd hub-ui && npm ci --ignore-scripts && mv node_modules /opt/eh-ci/node_modules
 RUN python -c "import hashlib,json,pathlib; r=pathlib.Path('/opt/eh-ci'); names=('pyproject.toml','uv.lock','hub-ui/package.json','hub-ui/package-lock.json'); (r/'dependencies.json').write_text(json.dumps({n:hashlib.sha256((r/n).read_bytes()).hexdigest() for n in names}))"
