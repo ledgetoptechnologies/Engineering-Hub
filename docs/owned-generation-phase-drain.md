@@ -19,6 +19,16 @@ local callback receive the capability. Existing callers supplying neither option
 retain their behavior. Service teardown awaits a pending owned drain, then revokes
 the capability before client/owner cleanup. No public HTTP/MCP route is added.
 
+The generation callback must return synchronously, not return background work.
+An accidental newly-created native coroutine is closed without running it. An
+explicitly returned same-loop asyncio Task/Future is cancelled and gathered
+before startup failure can exit the core lifespan or release its owner; repeated
+caller cancellation cannot skip that cleanup. Cancellation is cooperative, with
+no unsafe timeout that releases ownership while returned work still runs.
+Foreign-loop Futures, already-started bare coroutines and custom awaitables are
+rejected without attempting to execute or take ownership of foreign work. This
+does not police arbitrary tasks a trusted callback starts but does not return.
+
 The integrator can retain that in-process capability and later call:
 
 ```python
@@ -94,12 +104,19 @@ Windows runs skip the Linux cases; a skip is not installed acceptance. The
 mocked tests and Linux suites must pass in an explicitly isolated source-test
 runtime before treating this integration as reviewed lifecycle evidence.
 
-The final focused Linux validation run passed 62 tests with ResourceWarning and
+The initial focused Linux validation run passed 62 tests with ResourceWarning and
 PytestUnraisableExceptionWarning treated as errors, including the existing runtime
 and unified-service regression suites and raw-ASGI duplicate-Authorization tests.
 It ran in a network-disabled, non-root, read-only test container with disposable
 tmpfs test data. Executor responses in these tests remain synthetic; this result
 does not establish a live NAS connection, native executor drain or reboot safety.
+
+The callback-cleanup follow-up passed 74 focused Linux tests in 9.24 seconds
+with both warning classes treated as errors, using the same isolated container
+constraints. These include returned-task cleanup, current-task rejection without
+self-await, and existing asynchronous readiness compatibility. Independent source
+review accepted the follow-up; Python 3.14 SQLite warning attribution remains a
+separate pending review and is not dismissed by the Python 3.12 test result.
 
 ## Repeatable isolated Linux validation
 

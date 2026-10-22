@@ -32,6 +32,30 @@ from .unified_app import _create_unified_bus
 from .work_queue import WorkAction, WorkQueue, _key
 
 
+async def _reject_async_generation_result(result):
+    """Reject the sync callback's result without leaking returned local work.
+
+    A returned local Future/Task transfers cleanup of that object, not authority
+    over arbitrary work on another loop. Never schedule custom awaitables or
+    close a coroutine that somebody else has already started. Cancellation of a
+    local Task is cooperative: retain the lifecycle until its cleanup finishes.
+    """
+    if not inspect.isawaitable(result):
+        return
+    if (inspect.iscoroutine(result)
+            and inspect.getcoroutinestate(result) == inspect.CORO_CREATED):
+        result.close()
+    elif (asyncio.isfuture(result)
+          and result.get_loop() is asyncio.get_running_loop()):
+        if result is asyncio.current_task():
+            # The readiness observer is already lifecycle-owned. Cancelling and
+            # gathering ourselves would deadlock its startup-failure cleanup.
+            raise QueuedPilotServiceError()
+        result.cancel()
+        await finish_owned(asyncio.gather(result, return_exceptions=True))
+    raise QueuedPilotServiceError()
+
+
 async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *,
                                          owner, bus_paths, action_key, machine_id,
                                          target_verifier, supervisor_stop_grace_seconds,
@@ -168,15 +192,14 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                             pair.core.state.queued_pilot_runtime.close_admission()
                         finally:
                             pair.close_admission()
-                    def generation_ready(*addresses):
+                    async def generation_ready(*addresses):
                         if generation_drain is not None:
                             result = on_generation_ready(generation_drain)
-                            if inspect.isawaitable(result):
-                                if inspect.iscoroutine(result):
-                                    result.close()
-                                raise QueuedPilotServiceError()
+                            await _reject_async_generation_result(result)
                         if on_ready is not None:
-                            return on_ready(*addresses)
+                            result = on_ready(*addresses)
+                            if inspect.isawaitable(result):
+                                await result
                     await _serve_listeners((pair.agents, pair.browser),
                         (agent_socket, browser_socket), stop, generation_ready,
                         (agent_socket.getsockname(), browser_socket.getsockname()),

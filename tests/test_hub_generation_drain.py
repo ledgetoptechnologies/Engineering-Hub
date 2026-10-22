@@ -1,10 +1,12 @@
 """Mock providers; real drafted runtime task, accepted phase and observer cleanup."""
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
 from engineering_hub import queued_pilot_runtime as draft
+from engineering_hub import unified_queued_pilot_service as service
 
 GEN = '38d7cd63-08c5-4213-95f9-f4999ce85c75'
 REQ = 'cf90a001-ab26-4406-b858-9611d7c26769'
@@ -179,3 +181,83 @@ async def test_binding_rejects_wrong_owner_and_second_binding(monkeypatch):
     with pytest.raises(draft.HubError): await cap.drain(generation_id=GEN, request_id='not-a-uuid')
     assert runtime.admission_allowed() and cap._task is None
     bridge.release.set(); source.close_release.set(); await runtime.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_rejection', [False, True])
+async def test_invalid_generation_callback_task_drains_despite_repeated_cancellation(cancel_rejection):
+    entered, cleanup_entered, release, finished = (asyncio.Event() for _ in range(4))
+    async def work():
+        try:
+            entered.set()
+            await asyncio.Future()
+        finally:
+            cleanup_entered.set()
+            await release.wait()
+            finished.set()
+    returned = asyncio.create_task(work())
+    await entered.wait()
+    rejected = asyncio.create_task(service._reject_async_generation_result(returned))
+    await cleanup_entered.wait()
+    if cancel_rejection:
+        rejected.cancel(); await asyncio.sleep(0); rejected.cancel(); await asyncio.sleep(0)
+    assert not rejected.done() and not returned.done() and not finished.is_set()
+    release.set()
+    with pytest.raises(asyncio.CancelledError if cancel_rejection else service.QueuedPilotServiceError):
+        await rejected
+    assert returned.cancelled() and finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('done', [False, True])
+async def test_invalid_generation_callback_future_is_retrieved(done):
+    future = asyncio.get_running_loop().create_future()
+    if done:
+        future.set_exception(RuntimeError('synthetic callback failure'))
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service._reject_async_generation_result(future)
+    assert future.done() and (done or future.cancelled())
+
+
+@pytest.mark.asyncio
+async def test_invalid_generation_callback_current_task_rejected_without_self_cancel():
+    current = asyncio.current_task()
+    cancelling = current.cancelling()
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service._reject_async_generation_result(current)
+    assert not current.cancelled() and current.cancelling() == cancelling
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_invalid_generation_callback_foreign_future_is_not_cancelled():
+    loop = asyncio.new_event_loop()
+    try:
+        foreign = loop.create_future()
+        with pytest.raises(service.QueuedPilotServiceError):
+            await service._reject_async_generation_result(foreign)
+        assert not foreign.done()
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_generation_callback_coroutine_closed_without_start():
+    started = False
+    async def work():
+        nonlocal started
+        started = True
+    returned = work()
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service._reject_async_generation_result(returned)
+    assert not started and inspect.getcoroutinestate(returned) == inspect.CORO_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_invalid_generation_callback_custom_awaitable_is_not_scheduled():
+    class Custom:
+        def __await__(self):
+            raise AssertionError('custom awaitable must not run')
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service._reject_async_generation_result(Custom())
+    assert await service._reject_async_generation_result(None) is None

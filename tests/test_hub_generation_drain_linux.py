@@ -120,6 +120,78 @@ async def test_generation_ready_callback_failure_drains_and_revokes(unified_rig)
 
 
 @pytest.mark.asyncio
+async def test_generation_ready_returning_current_task_rejected_without_deadlock(unified_rig):
+    rig = unified_rig
+    with pytest.raises(service.QueuedPilotServiceError):
+        await asyncio.wait_for(service.serve_owned_unified_queued_pilot(
+            rig.settings, rig.manifest, rig.client_factory,
+            **options(rig, generation_id=GEN,
+                      on_generation_ready=lambda _: asyncio.current_task())), 8)
+    closed(rig)
+
+
+@pytest.mark.asyncio
+async def test_generation_ready_returned_task_finishes_before_owner_cleanup(unified_rig):
+    rig = unified_rig
+    entered, cleanup_entered, release, finished = (asyncio.Event() for _ in range(4))
+    async def callback_work():
+        try:
+            entered.set()
+            await asyncio.Future()
+        finally:
+            cleanup_entered.set()
+            await release.wait()
+            rig.owner.assert_active(rig.settings.database)
+            assert rig.owner.close_count == rig.clients[0].close_count == 0
+            finished.set()
+    returned = asyncio.create_task(callback_work())
+    await entered.wait()
+    serving = asyncio.create_task(service.serve_owned_unified_queued_pilot(
+        rig.settings, rig.manifest, rig.client_factory,
+        **options(rig, generation_id=GEN, on_generation_ready=lambda _: returned)))
+    try:
+        await asyncio.wait_for(cleanup_entered.wait(), 8)
+        assert not serving.done() and rig.owner.close_count == 0
+    finally:
+        release.set()
+        with pytest.raises(service.QueuedPilotServiceError):
+            await asyncio.wait_for(serving, 8)
+        if not returned.done():
+            returned.cancel()
+            await asyncio.gather(returned, return_exceptions=True)
+    assert returned.cancelled() and finished.is_set()
+    closed(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('generation_enabled', [False, True])
+async def test_existing_async_on_ready_is_awaited(unified_rig, generation_enabled):
+    rig = unified_rig
+    entered, release, finished, stop = (asyncio.Event() for _ in range(4))
+    caps = []
+    async def ready(*addresses):
+        assert len(addresses) == 2
+        entered.set()
+        await release.wait()
+        finished.set()
+        stop.set()
+    changes = ({'generation_id': GEN, 'on_generation_ready': caps.append}
+               if generation_enabled else {})
+    serving = asyncio.create_task(service.serve_owned_unified_queued_pilot(
+        rig.settings, rig.manifest, rig.client_factory,
+        **options(rig, stop_event=stop, on_ready=ready, **changes)))
+    try:
+        await asyncio.wait_for(entered.wait(), 8)
+        assert not serving.done() and not finished.is_set()
+        assert len(caps) == int(generation_enabled)
+    finally:
+        release.set()
+        await asyncio.wait_for(serving, 8)
+    assert finished.is_set()
+    closed(rig)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('changes', [
     {'generation_id': GEN}, {'on_generation_ready': lambda _: None},
     {'generation_id': 'invalid', 'on_generation_ready': lambda _: None},
