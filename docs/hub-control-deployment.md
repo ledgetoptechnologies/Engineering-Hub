@@ -1,5 +1,12 @@
 # Private Hub control deployment — operator-gated
 
+> Historical standalone proposal, superseded. Do not apply the steps below to
+> the current NAS. The later verified setup uses a bridged tunnel to port8771,
+> unified MCP on8770, no8765 alias and Engineering-Hub storage. The earlier
+> host-network tunnel premise below was corrected by Beau. Use
+> [small deployment](simple-hub-deployment.md) and the
+> [ordinary49d update handoff](hub-release-49dcbcd-operator-handoff.md).
+
 This standalone Compose profile is deployment configuration, **not evidence of a
 running service or release acceptance**. It does not activate anything by being
 committed. The working message bus, its images, volumes, port 8765, MCP endpoint

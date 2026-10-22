@@ -1,4 +1,12 @@
-# Standalone TrueNAS Hub control, main-built moving image. Never merge with bus Compose.
+# HISTORICAL PROFILE — DO NOT INSTALL OR USE FOR THE CURRENT NAS UPDATE.
+# Superseded by compose.hub-unified.yaml and docs/simple-hub-deployment.md.
+# The comments and service below preserve an obsolete standalone topology:
+# retired Agent_MCP storage/8765 bus and an incorrect host-network tunnel premise.
+# Current operation uses Engineering-Hub storage and a bridged tunnel to 8771.
+# Keep the existing installed Compose for the ordinary49d update; see
+# docs/hub-release-49dcbcd-operator-handoff.md. No staging activation here.
+#
+# Historical standalone TrueNAS Hub control. Remaining text is NOT current guidance.
 # Replace ONLY the three agent-token placeholders before installation.
 # Private GHCR pulls may require your existing GitHub registry credential in
 # TrueNAS. Never paste credentials into chat or make the package public.

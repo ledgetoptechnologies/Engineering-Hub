@@ -1,6 +1,9 @@
 # Hub record-format recovery gate
 
-Status: source-only recovery contract; **no live recovery or upgrade authorized**.
+Status: record-format recovery contract; this document does not authorize live
+recovery or a NAS change. The ordinary PR52 release is now published; see the
+[49dcbcd operator handoff](hub-release-49dcbcd-operator-handoff.md) for its exact
+artifact and the separate, still-required live acceptance checks.
 This covers PR52's persisted-record changes separately from private-ledger
 enrollment and application deployment rollback.
 
@@ -99,7 +102,11 @@ does not downgrade the Hub control-plane ledger and is separate evidence.
    not establish these host properties. Beau performs the reviewed NAS change;
    no automatic state mover or configuration mutation is authorized here.
 
-Until these gates pass, PR52's old-image rollback claim is rejected and live
-upgrade readiness remains unproven. See the [offline cutover runbook](offline-ledger-cutover-runbook.md)
+PR52's old-image rollback claim remains rejected. Publication and disposable
+current-reader recovery tests do not establish live NAS recovery, protected
+ownership transfer or reboot acceptance. They do establish the narrower ordinary
+release evidence recorded in the operator handoff; do not treat this document's
+historical pre-publication status as a new source blocker. See the
+[offline cutover runbook](offline-ledger-cutover-runbook.md)
 for additional owner-enrollment constraints; its pre-mutation abort is not a
 post-write compatible recovery artifact.

@@ -171,9 +171,9 @@ This section records the original standalone profile and deferred OAuth setup.
 It is not the current installation path; use the unified deployment guide linked
 above for persisted settings, agent tokens and Cloudflare Access verification.
 
-The opt-in, standalone `compose.hub-control.yaml` profile and
-[`hub-control-deployment.md`](hub-control-deployment.md) provide the private
-operator deployment path. They have not been activated and do not modify the bus.
+The old `compose.hub-control.yaml` profile and
+[`hub-control-deployment.md`](hub-control-deployment.md) are historical only;
+they are not the current operator deployment path. Do not install them.
 
 Use the existing approved secret/environment mechanism, not command arguments,
 repository files, chat, or browser storage. Required variables:
