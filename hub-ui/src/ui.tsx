@@ -101,7 +101,7 @@ export function Modal({ title, onClose, children }: {
     <dialog ref={ref} aria-labelledby={headingId} onClose={onClose} onCancel={onClose}>
       <div className="modal-head">
         <h2 id={headingId}>{title}</h2>
-        <button className="icon-button" aria-label="Close dialog" onClick={() => ref.current?.close()}>
+        <button type="button" className="icon-button" aria-label="Close dialog" onClick={() => ref.current?.close()}>
           ×
         </button>
       </div>

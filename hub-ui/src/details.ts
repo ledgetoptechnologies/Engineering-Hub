@@ -11,8 +11,8 @@ export interface DetailImage { id: string; title: string; bytes: number; mediaTy
 export interface EntityContext { summary: string; links: DetailLink[] }
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-const MEDIA = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_IMAGE_BYTES = 256 * 1024;
+const MEDIA = new Set(["image/png", "image/jpeg"]);
 
 const text = (value: unknown, max: number): string | null =>
   typeof value === "string" && value.length <= max ? value : null;
@@ -46,7 +46,7 @@ export function parseContext(entity: unknown): EntityContext | null {
 export function parseAttachments(value: unknown, entityId: string): DetailImage[] {
   if (!value || typeof value !== "object" || !Array.isArray((value as { items?: unknown }).items)) return [];
   const images: DetailImage[] = [];
-  for (const raw of (value as { items: unknown[] }).items.slice(0, 12)) {
+  for (const raw of (value as { items: unknown[] }).items.slice(0, 8)) {
     const item = raw as Record<string, unknown> | null;
     if (!item || typeof item.id !== "string" || !uuid.test(item.id) || item.entity_id !== entityId) continue;
     if (typeof item.media_type !== "string" || !MEDIA.has(item.media_type)) continue;

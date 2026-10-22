@@ -59,11 +59,13 @@ export function StageLegend({ tasks }: { tasks: Task[] }) {
 export function dailyCounts(times: string[], days = 14, now = new Date()): { day: Date; count: number }[] {
   const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1));
   const buckets = Array.from({ length: days }, (_, i) => ({ day: new Date(start.getFullYear(), start.getMonth(), start.getDate() + i), count: 0 }));
+  const key = (day: Date) => `${day.getFullYear()}-${day.getMonth()}-${day.getDate()}`;
+  const byDay = new Map(buckets.map((bucket) => [key(bucket.day), bucket]));
   for (const value of times) {
-    const at = Date.parse(value);
-    if (!Number.isFinite(at)) continue;
-    const index = Math.floor((at - start.getTime()) / 86_400_000);
-    if (index >= 0 && index < days) buckets[index].count++;
+    const at = new Date(value);
+    if (!Number.isFinite(at.getTime())) continue;
+    const bucket = byDay.get(key(at));
+    if (bucket) bucket.count++;
   }
   return buckets;
 }
