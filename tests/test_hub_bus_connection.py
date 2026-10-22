@@ -100,6 +100,31 @@ def test_native_source_failure_does_not_erase_observed_stream(tmp_path):
         client.portal.call(publisher.close_presence_stream, stream)
 
 
+def test_api_refresh_cannot_revive_stale_transport_or_claim_chat_readiness(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr('agent_message_bus.push.monotonic', lambda: clock[0])
+    app, bus = setup_app(tmp_path)
+    publisher = bus.state.push_publisher
+    with TestClient(app, base_url=ORIGIN) as client:
+        client.portal.call(publisher.activate)
+        stream = client.portal.call(publisher.open_presence_stream, 'private-session', 'codex')
+        client.portal.call(publisher.subscribe, 'private-session', 'codex', object())
+        client.portal.call(publisher.record_presence_stream_write, stream)
+        assert codex(client.get(BASE + '/agents', headers=HEADERS).json()['items'])['connection']['state'] == 'connected'
+        clock[0] += 45
+        for path, field in [('/agents', 'items'), ('/overview', 'agents'), ('/agents', 'items')]:
+            response = client.get(BASE + path, headers=HEADERS)
+            assert response.status_code == 200
+            item = codex(response.json()[field])
+            assert item['connection']['state'] == 'stale'
+            assert item['connection']['stale_streams'] == 1
+            assert item['connection']['active_streams'] == item['connection']['inbox_subscriptions'] == 0
+            assert item['connection']['subscribed'] is False
+            assert item['chat_readiness'] == 'unverified'
+            assert 'private-session' not in response.text
+        client.portal.call(publisher.close_presence_stream, stream)
+
+
 @pytest.mark.parametrize('mode', ['error', 'malformed', 'missing'])
 def test_unavailable_publisher_is_unknown_and_does_not_leak_errors(tmp_path, monkeypatch, mode):
     app, bus = setup_app(tmp_path)
@@ -136,7 +161,9 @@ def test_malformed_or_stale_snapshot_never_becomes_connected(tmp_path, change):
     now = datetime.now(timezone.utc)
     snapshot = {'observed_at': now.isoformat(), 'scope': 'this_server_process', 'native_push_available': True,
         'agents': [dict(agent=agent, active_streams=1, inbox_subscriptions=0, subscribed=False,
-                        last_stream_write_at=None) for agent in ('codex', 'hermes', 'claude')]}
+                        last_stream_write_at=None, stale_streams=0, valid_for_seconds=30)
+                   for agent in ('codex', 'hermes', 'claude')]}
+    assert {item['state'] for item in project_bus_connections(snapshot, now=now).values()} == {'connected'}
     if change == 'stale':
         snapshot['observed_at'] = (now - timedelta(seconds=30)).isoformat()
     elif change == 'future':
