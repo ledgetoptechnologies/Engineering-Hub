@@ -3534,3 +3534,21 @@ img.brand-mark {
   grid-column: 2;
   margin-top: 6px;
 }
+
+/* One scroll area for the whole note list: folder lists must not be nested scroll
+   containers, or the wheel stops over a note (overscroll is contained). */
+.notes-list .note-folder ul {
+  max-height: none;
+  overflow: visible;
+}
+
+/* New note: folder + file name instead of a typed path. */
+.note-place {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 12px;
+}
+.note-place .note-location {
+  grid-column: 1 / -1;
+  margin-top: -4px;
+}

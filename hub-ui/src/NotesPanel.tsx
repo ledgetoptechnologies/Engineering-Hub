@@ -20,7 +20,24 @@ export interface NotesPanelProps {
 }
 /** expected > 0 on a new note is an accepted overwrite of exactly accepted.project/path. */
 interface Draft { base: NoteDocument | null; path: string; title: string; content: string; expected: number;
-  accepted: { project: string; path: string } | null }
+  accepted: { project: string; path: string } | null; place?: Place }
+/** How a new note is filed: a folder and a file name, never a typed path. */
+interface Place { folder: string; newFolder: string; name: string; nameTouched: boolean }
+const NEW_FOLDER = "__new_folder__";
+
+/** Lowercase words joined by dashes; only characters a path part may hold. */
+export function slugify(value: string): string {
+  // Strip accents (combining marks) after NFKD so "café" files as "cafe".
+  return value.toLowerCase().normalize("NFKD").replace(/\p{M}/gu, "")
+    .replace(/[^a-z0-9._ -]+/g, "").trim().replace(/[\s_]+/g, "-").replace(/-+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "").slice(0, 80);
+}
+export function placePath(place: Place): string {
+  const folder = place.folder === NEW_FOLDER
+    ? place.newFolder.split("/").map(slugify).filter(Boolean).join("/") : place.folder;
+  const base = slugify(place.name.replace(/\.md$/i, ""));
+  return base ? (folder ? `${folder}/` : "") + `${base}.md` : "";
+}
 /** Bound to the exact project and path that conflicted; never applied to another note. */
 interface Conflict { project: string; path: string; current: number; latest: NoteDocument | null; latestState: "loading" | "loaded" | "missing" | "failed" }
 type Search = { kind: "query" | "prefix"; text: string };
@@ -195,7 +212,8 @@ ${selected}`;
   function startNew() {
     if (!confirmDiscard()) return;
     closeEditor(); setNotice(null);
-    setDraft({ base: null, path: "", title: "", content: "", expected: 0, accepted: null });
+    setDraft({ base: null, path: "", title: "", content: "", expected: 0, accepted: null,
+      place: { folder: "", newFolder: "", name: "", nameTouched: false } });
   }
   function startEdit() {
     if (!doc) return;
@@ -273,6 +291,7 @@ ${latest.path}`;
   }
 
   const pathValid = draft ? isNotePath(draft.path) : true;
+  const folders = list ? groupByFolder(list.items).map(group => group.folder).filter(Boolean) : [];
   const bytes = draft ? noteRequestBytes({ project, path: draft.path, title: draft.title, content: draft.content,
     expected_version: draft.expected }) : 0;
   const draftValid = !!draft && pathValid && draft.title.trim() !== "" && bytes <= MAX_NOTE_REQUEST_BYTES;
@@ -346,16 +365,43 @@ ${latest.path}`;
           {draft.base && <p className="panel-footnote">Based on version {draft.base.version}. If someone saves first, you will
             be asked before anything is replaced.</p>}
           <fieldset disabled={saving}>
-            <label className="field">Path
-              <input value={draft.path} readOnly={pathLocked} maxLength={512} spellCheck={false} required
-                placeholder="runbooks/staging-checklist.md" aria-invalid={!pathValid}
-                onChange={event => { if (!pathLocked) setDraft({ ...draft, path: event.target.value, expected: 0, accepted: null }); }} />
-            </label>
-            {draft.path !== "" && !pathValid && <p className="notice error">Use a relative path like
-              folder/name.md with no leading slash, backslashes, empty parts, "." or "..".</p>}
+            {draft.place && !pathLocked ? <div className="note-place">
+              <label className="field">Folder
+                <select value={draft.place.folder} onChange={event => {
+                  const place = { ...draft.place!, folder: event.target.value };
+                  setDraft({ ...draft, place, path: placePath(place), expected: 0, accepted: null });
+                }}>
+                  <option value="">Top level (no folder)</option>
+                  {folders.map(folder => <option key={folder} value={folder}>{folder}</option>)}
+                  <option value={NEW_FOLDER}>New folder…</option>
+                </select>
+              </label>
+              {draft.place.folder === NEW_FOLDER && <label className="field">New folder name
+                <input value={draft.place.newFolder} maxLength={120} placeholder="for example: runbooks" onChange={event => {
+                  const place = { ...draft.place!, newFolder: event.target.value };
+                  setDraft({ ...draft, place, path: placePath(place), expected: 0, accepted: null });
+                }} />
+              </label>}
+              <label className="field">File name
+                <input value={draft.place.name} maxLength={84} placeholder="Filled in from the title" onChange={event => {
+                  const place = { ...draft.place!, name: event.target.value, nameTouched: event.target.value !== "" };
+                  setDraft({ ...draft, place, path: placePath(place), expected: 0, accepted: null });
+                }} />
+              </label>
+              <p className="panel-footnote note-location">Saved as <code>{draft.path || "…"}</code></p>
+            </div> : <label className="field">Location
+              <input value={draft.path} readOnly spellCheck={false} />
+            </label>}
             <label className="field">Title
               <input value={draft.title} maxLength={MAX_NOTE_TITLE_CHARS} required
-                onChange={event => setDraft({ ...draft, title: event.target.value })} />
+                onChange={event => {
+                  const title = event.target.value;
+                  // The file name follows the title until the user types their own.
+                  if (draft.place && !pathLocked && !draft.place.nameTouched) {
+                    const place = { ...draft.place, name: slugify(title) };
+                    setDraft({ ...draft, title, place, path: placePath(place), expected: 0, accepted: null });
+                  } else setDraft({ ...draft, title });
+                }} />
             </label>
             <label className="field">Content
               <textarea value={draft.content} rows={14} spellCheck
