@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import { audit, blocking } from "./audit";
 
 const human = "human:cf:" + "e".repeat(64);
 type Overview = ReturnType<typeof createDemoOverview>;
@@ -231,7 +232,7 @@ for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone",
     const overflow = await dialog.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right }));
     expect(overflow.scroll).toBeLessThanOrEqual(overflow.client);
     expect(overflow.right).toBeLessThanOrEqual(size.width);
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
     await page.screenshot({ path: test.info().outputPath(`new-project-${name}.png`) });
-    await page.screenshot({ path: `C:/Users/fstor/AppData/Local/Temp/claude/C--Projects-Engineering-Hub/5f63d63c-e920-43cb-8a68-f6801e2c50be/scratchpad/shots/new-project-${name}.png` });
   });
 }

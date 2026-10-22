@@ -136,3 +136,16 @@ test("a project's Plans tab shows that project's topic plans, not the Hub backlo
   await expect(panel.getByRole("button", { name: /Topic feature idea/ })).toBeVisible();
   await expect(panel.getByRole("button", { name: /Improve Hub search/ })).toHaveCount(0);
 });
+
+test("shipped improvements move to a Done group with a check, below open work", async ({ page }) => {
+  const state = await fixture(page);
+  state.items.push({ ...saved(hub, "Dynamic projects", "dynamic-projects"), status: "done" },
+    { ...saved(hub, "Custom modules", "custom-modules"), status: "in_progress" });
+  await page.goto("/#/planning");
+  const panel = panelOf(page);
+  await panel.getByLabel("Backlog").selectOption("hub_improvements");
+  const open = panel.getByRole("region", { name: "Open" }), done = panel.getByRole("region", { name: "Done" });
+  await expect(open.getByRole("button")).toHaveText([/Custom modules/, /Improve Hub search/]);
+  await expect(done.getByRole("button")).toHaveText([/✓ Dynamic projects/]);
+  await expect(panel.getByRole("region", { name: "Declined" })).toHaveCount(0);
+});

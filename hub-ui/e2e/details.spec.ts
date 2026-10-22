@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import { audit, blocking } from "./audit";
 
 const human = "human:cf:" + "e".repeat(64);
 // 1x1 transparent PNG.
@@ -211,6 +212,6 @@ for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone",
     const fit = await img.evaluate((el) => { const i = el.getBoundingClientRect(), v = el.parentElement!.getBoundingClientRect();
       return { inside: i.left >= v.left - 1 && i.right <= v.right + 1 && i.top >= v.top - 1 && i.bottom <= v.bottom + 1 }; });
     expect(fit.inside).toBe(true);
-    await page.screenshot({ path: `C:/Users/fstor/AppData/Local/Temp/claude/C--Projects-Engineering-Hub/5f63d63c-e920-43cb-8a68-f6801e2c50be/scratchpad/shots/viewer-${name}.png` });
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
   });
 }

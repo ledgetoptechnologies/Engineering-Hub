@@ -3711,3 +3711,19 @@ dialog.modal-wide .image-viewer img {
 }
 dialog .modal-head h2 { font-size: 20px; line-height: 1.3; overflow-wrap: anywhere; }
 @media (max-width: 560px) { dialog .modal-head h2 { font-size: 17px; } }
+
+.plan-group + .plan-group { margin-top: 14px; }
+.plan-group-title { margin: 6px 0 4px; font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.plan-group-title span { font-weight: 400; }
+.plan-done-mark { color: var(--ok, #1f7a4d); }
+.plan-status-done { color: var(--ok, #1f7a4d); font-weight: 600; }
+.plan-status-in_progress { font-weight: 600; }
+.plan-group[aria-label="Done"] .note-link strong, .plan-group[aria-label="Declined"] .note-link strong { font-weight: 500; }
+
+/* Layout audit 2026-10-22: project tabs wrap on phones instead of hiding later tabs off-screen;
+   small chips and link pills get a 24px tap target. */
+@media (max-width: 640px) {
+  .tabs { flex-wrap: wrap; overflow-x: visible; row-gap: 0; }
+  .tab { padding: 9px 10px; }
+}
+a.project-chip, .detail-links a { display: inline-flex; align-items: center; min-height: 24px; }
