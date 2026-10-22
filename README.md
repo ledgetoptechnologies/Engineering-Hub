@@ -8,6 +8,10 @@ live acceptance are separate states; this README does not certify the NAS state.
 
 ## Start here: current unified deployment
 
+For the staging rollout's current evidence and remaining gates, start with the
+[2026-10-22 release-readiness checkpoint](docs/release-readiness-2026-10-22.md).
+It is not an instruction to replace the currently installed Compose.
+
 Use [the small deployment guide](docs/simple-hub-deployment.md) and
 [`compose.hub-unified.yaml`](compose.hub-unified.yaml), not the legacy standalone
 bus/control examples below.
