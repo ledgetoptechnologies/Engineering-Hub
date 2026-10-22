@@ -39,7 +39,13 @@ function outcomeText({ saved, unknown, voided }: Outcome): string {
   return parts.join(" ");
 }
 
-export function ModuleFrame({ src, title, capabilities, host, confirmSubmit }: {
+export function ModuleFrame({ placementKey, src, title, capabilities, host, confirmSubmit }: {
+  /**
+   * Trusted identity of this placement: project + placement id + module version +
+   * authority generation, from the server. Any change starts a new instance and voids
+   * open confirmations, even when the address and grants are identical.
+   */
+  placementKey: string;
   src: string; title: string; capabilities: readonly string[]; host: ModuleHost;
   /** Native confirmation shown by the Hub before any submission is saved. */
   confirmSubmit: (payload: unknown) => Promise<boolean>;
@@ -137,7 +143,7 @@ export function ModuleFrame({ src, title, capabilities, host, confirmSubmit }: {
     element.src = url;
     const timer = window.setTimeout(() => { if (!ready) stop("timeout"); }, READY_TIMEOUT_MS);
     return () => { window.clearTimeout(timer); element.removeEventListener("load", onLoad); alive = false; channel.port1.close(); };
-  }, [url, generation, capabilities.join(" ")]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [placementKey, url, generation, capabilities.join(" ")]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (state.kind === "blocked") return <p role="alert" className="notice error">This module's address isn't allowed, so it wasn't loaded.</p>;
   return (

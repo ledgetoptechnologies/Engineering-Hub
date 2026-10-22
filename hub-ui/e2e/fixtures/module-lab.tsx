@@ -5,18 +5,20 @@ import "../../src/styles.css";
 
 const params = new URLSearchParams(location.search);
 const log: unknown[] = [];
-const lab = window as unknown as { __lab: unknown[]; __resolvers: ((ok: boolean) => void)[]; __switch?: (name: string) => void; __unmount?: () => void };
+const lab = window as unknown as { __lab: unknown[]; __resolvers: ((ok: boolean) => void)[]; __switch?: (name: string) => void; __unmount?: () => void; __placement?: (key: string) => void };
 lab.__lab = log;
 lab.__resolvers = [];
 
 function Lab() {
   const [name, setName] = useState(params.get("case") ?? "good");
   const [mounted, setMounted] = useState(true);
+  const [placement, setPlacement] = useState("project-a/placement-1/v1/g1");
+  lab.__placement = setPlacement;
   lab.__switch = setName;
   lab.__unmount = () => setMounted(false);
   if (!mounted) return <p>unmounted</p>;
   return (
-    <ModuleFrame title="Test module" src={`http://modules.test/m/${name}/index.html`}
+    <ModuleFrame placementKey={placement} title="Test module" src={`http://modules.test/m/${name}/index.html`}
       capabilities={["read:dataset/crowns", "submit:response"]}
       host={{
         getData: async (capability, key) => {
@@ -25,7 +27,7 @@ function Lab() {
           if (params.get("slowdata") === "1") await new Promise(() => {});
           return { rows: [1, 2, 3] };
         },
-        submit: async (item, payload, revision) => { log.push({ submit: [name, item, payload, revision] }); return { revision: revision + 1 }; },
+        submit: async (item, payload, revision) => { log.push({ submit: [name, item, payload, revision], placement }); return { revision: revision + 1 }; },
       }}
       confirmSubmit={(payload) => {
         log.push({ confirm: payload });

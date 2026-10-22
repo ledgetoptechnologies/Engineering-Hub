@@ -64,7 +64,7 @@ test("a well-behaved module reads a granted dataset and saves only after the Hub
   await page.goto("/e2e/fixtures/module-lab.html?case=good");
   await expect(page.getByText("rows 3, saved revision 4")).toBeVisible();
   expect(await lab(page)).toEqual([{ getData: ["good", "read:dataset/crowns", "plot-a1"] }, { confirm: { choice: "conifer" } },
-    { submit: ["good", "A1", { choice: "conifer" }, 3] }]);
+    { submit: ["good", "A1", { choice: "conifer" }, 3], placement: "project-a/placement-1/v1/g1" }]);
   await expect(page.getByTitle("Test module")).toHaveAttribute("sandbox", "allow-scripts");
   await expect.poll(() => page.getByTitle("Test module").evaluate((el) => (el as HTMLIFrameElement).style.height)).toBe("640px");
 });
@@ -197,4 +197,15 @@ test("a failing confirmation dialog declines without an unhandled error", async 
   await page.waitForTimeout(300);
   expect(await submits(page)).toEqual([]);
   expect(errors).toEqual([]);
+});
+
+test("replacing the placement with the same module, address and grants voids the open confirmation", async ({ page }) => {
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=submitonly&defer=1");
+  await confirmOpen(page);
+  // Same module URL and capabilities, different project placement (e.g. navigating from project A to B).
+  await page.evaluate(() => (window as unknown as { __placement: (k: string) => void }).__placement("project-b/placement-7/v1/g1"));
+  await resolve(page, 0);
+  await page.waitForTimeout(400);
+  expect(await submits(page)).toEqual([]);
 });
