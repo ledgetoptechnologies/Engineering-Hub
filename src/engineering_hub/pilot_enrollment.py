@@ -46,6 +46,18 @@ _DDL = {
     'hub_delivery_namespace': 'CREATE TABLE hub_delivery_namespace (id INTEGER PRIMARY KEY CHECK(id=1), namespace TEXT NOT NULL)',
     'hub_delivery_receipts': 'CREATE TABLE hub_delivery_receipts (sequence INTEGER NOT NULL, recipient TEXT NOT NULL, request_json TEXT NOT NULL, message_id TEXT, PRIMARY KEY(sequence, recipient))',
     'hub_delivery_sender': 'CREATE TABLE hub_delivery_sender (id INTEGER PRIMARY KEY CHECK(id=1), principal TEXT NOT NULL)',
+    'hub_projects': 'CREATE TABLE hub_projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)',
+    'hub_project_registry_meta': 'CREATE TABLE hub_project_registry_meta (key TEXT PRIMARY KEY)',
+    'hub_project_requests': 'CREATE TABLE hub_project_requests (actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, project_id TEXT NOT NULL, PRIMARY KEY(actor,key))',
+    'hub_label_sets': 'CREATE TABLE hub_label_sets (id TEXT PRIMARY KEY, project TEXT NOT NULL, data TEXT NOT NULL, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL)',
+    'hub_label_items': 'CREATE TABLE hub_label_items (set_id TEXT NOT NULL, id TEXT NOT NULL, position INTEGER NOT NULL, meta TEXT NOT NULL, label TEXT, revision INTEGER NOT NULL, PRIMARY KEY(set_id,id))',
+    'hub_label_images': 'CREATE TABLE hub_label_images (set_id TEXT NOT NULL, item_id TEXT NOT NULL, media_type TEXT NOT NULL, data BLOB NOT NULL, source_sha256 TEXT NOT NULL, PRIMARY KEY(set_id,item_id))',
+    'hub_entity_images': 'CREATE TABLE hub_entity_images (id TEXT PRIMARY KEY, entity_kind TEXT NOT NULL, entity_id TEXT NOT NULL, data BLOB NOT NULL, media_type TEXT NOT NULL, source_sha256 TEXT NOT NULL, title TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, entity_revision INTEGER NOT NULL)',
+}
+# Exact current native-module indexes only; this is not generic index admission.
+_INDEX_DDL = {
+    'hub_label_sets_project': ('hub_label_sets', 'CREATE INDEX hub_label_sets_project ON hub_label_sets(project)'),
+    'hub_entity_images_entity': ('hub_entity_images', 'CREATE INDEX hub_entity_images_entity ON hub_entity_images(entity_kind,entity_id)'),
 }
 _CORE = frozenset(list(_DDL)[:9])
 _GROUPS = (
@@ -53,6 +65,8 @@ _GROUPS = (
     frozenset({'auth_access_sessions', 'auth_access_identities'}),
     frozenset({'hub_work_jobs', 'hub_work_machines', 'hub_work_policy'}),
     frozenset({'hub_delivery_namespace', 'hub_delivery_receipts', 'hub_delivery_sender'}),
+    frozenset({'hub_projects', 'hub_project_registry_meta', 'hub_project_requests'}),
+    frozenset({'hub_label_sets', 'hub_label_items', 'hub_label_images'}),
 )
 _OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
 _MAX_DB_BYTES = 256 * 1024 * 1024
@@ -194,11 +208,21 @@ def _snapshot(db, *, enrolled=False):
     for group in _GROUPS:
         if tables & group and not group <= tables:
             raise EnrollmentError()
+    expected_indexes = {name for name, (table, _) in _INDEX_DDL.items() if table in tables}
+    if {name for kind, name, _, sql in objects if kind == 'index' and sql is not None} != expected_indexes:
+        raise EnrollmentError()
     for kind, name, table, sql in objects:
         if kind == 'table':
             if _normal(sql) != _normal(_DDL[name]):
                 raise EnrollmentError()
-        elif kind != 'index' or sql is not None or not name.startswith('sqlite_autoindex_') or table not in tables:
+        elif kind == 'index':
+            if sql is None:
+                if not name.startswith('sqlite_autoindex_') or table not in tables:
+                    raise EnrollmentError()
+            elif (name not in _INDEX_DDL or table != _INDEX_DDL[name][0]
+                  or _normal(sql) != _normal(_INDEX_DDL[name][1])):
+                raise EnrollmentError()
+        else:
             raise EnrollmentError()
     # No controller ownership or incomplete external effects may be adopted.
     for (raw,) in db.execute("SELECT data FROM hub_entities WHERE kind='run'"):
