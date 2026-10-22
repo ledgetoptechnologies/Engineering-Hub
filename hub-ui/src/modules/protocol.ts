@@ -32,6 +32,16 @@ export const MAX_NODES = 5000;
 export const MAX_KEYS = 200;
 export const MAX_PENDING = 4;
 export const REQUEST_DEADLINE_MS = 30_000;
+/** Largest reply the host sends back into a module. */
+export const MAX_REPLY_BYTES = 256 * 1024;
+
+/** Host → module replies get the same plain-JSON domain and a size cap. */
+export function boundedReply(body: Record<string, unknown>): Record<string, unknown> {
+  const plain = toPlainJson(body);
+  if (plain === undefined) return { ok: false, error: "reply_not_plain" };
+  return new TextEncoder().encode(JSON.stringify(plain)).length > MAX_REPLY_BYTES
+    ? { ok: false, error: "reply_too_large" } : plain as Record<string, unknown>;
+}
 
 /**
  * Copies a structured-clone value into plain JSON (null, boolean, finite number,
@@ -59,7 +69,10 @@ export function toPlainJson(value: unknown): unknown {
       if (proto !== Object.prototype && proto !== null) throw new Error("object");
       const keys = Object.keys(item);
       if (keys.length > MAX_KEYS) throw new Error("keys");
-      const out: Record<string, unknown> = {};
+      // An own "__proto__" key would re-prototype a normal object on assignment and
+      // hide fields from JSON sizing; refuse it and copy into a null-prototype object.
+      if (keys.includes("__proto__")) throw new Error("proto");
+      const out: Record<string, unknown> = Object.create(null);
       for (const key of keys) {
         const entry = (item as Record<string, unknown>)[key];
         // Like JSON: an undefined property is simply absent.

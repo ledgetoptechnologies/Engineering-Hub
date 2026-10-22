@@ -37,6 +37,7 @@ const CASES: Record<string, string> = {
   oversize: `function main() { send("ready"); send("notice", { level: "info", text: "x".repeat(70000) }); }`,
   silent: `function main() {}`,
   binary: `function main() { send("ready"); send("submit", { item_key: "A1", payload: { blob: new ArrayBuffer(4 * 1024 * 1024) }, expected_revision: 1 }, 9); }`,
+  oneread: `function main() { send("ready"); send("data.get", { capability: "read:dataset/crowns", key: "slow" }, 1); }`,
   manyreads: `function main() { send("ready"); for (let i = 1; i <= 5; i++) send("data.get", { capability: "read:dataset/crowns", key: "k" + i }, i); }`,
   dupreads: `function main() { send("ready"); send("data.get", { capability: "read:dataset/crowns", key: "a" }, 7); send("data.get", { capability: "read:dataset/crowns", key: "b" }, 7); }`,
   savethenflood: `async function main() { send("ready"); await call("submit", { item_key: "A1", payload: { choice: "kept" }, expected_revision: 1 });
@@ -208,4 +209,13 @@ test("replacing the placement with the same module, address and grants voids the
   await resolve(page, 0);
   await page.waitForTimeout(400);
   expect(await submits(page)).toEqual([]);
+});
+
+test("a host call that never finishes stops the module at the 30-second deadline", async ({ page }) => {
+  await page.clock.install();
+  await serveModules(page);
+  await page.goto("/e2e/fixtures/module-lab.html?case=oneread&slowdata=1");
+  await expect.poll(async () => (await lab(page)).length).toBe(1);
+  await page.clock.runFor(31_000);
+  await expect(page.getByRole("alert")).toContainText("took longer than 30 seconds");
 });

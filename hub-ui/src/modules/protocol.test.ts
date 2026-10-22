@@ -67,3 +67,17 @@ describe("plain JSON only", async () => {
     expect(parseModuleMessage(raw, instance, granted)).toEqual({ ok: false, reason: "bad_envelope" });
   });
 });
+
+describe("prototype keys and replies", async () => {
+  const { toPlainJson, boundedReply } = await import("./protocol");
+  it("refuses an own __proto__ key instead of re-prototyping the copy", () => {
+    const hostile = JSON.parse(`{"payload":{"__proto__":{"hidden":"${"x".repeat(100000)}"}}}`);
+    expect(toPlainJson(hostile)).toBeUndefined();
+    expect(Object.getPrototypeOf(toPlainJson({ a: 1 }))).toBeNull();
+  });
+  it("bounds and normalizes replies to the module", () => {
+    expect(boundedReply({ ok: true, data: { rows: [1, 2] } })).toEqual({ ok: true, data: { rows: [1, 2] } });
+    expect(boundedReply({ ok: true, data: "x".repeat(300 * 1024) })).toEqual({ ok: false, error: "reply_too_large" });
+    expect(boundedReply({ ok: true, data: new Map() })).toEqual({ ok: false, error: "reply_not_plain" });
+  });
+});

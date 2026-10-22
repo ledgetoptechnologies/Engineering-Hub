@@ -4,7 +4,7 @@
  * MessagePort, within message, size and time budgets. A broken budget ends the frame.
  */
 import { useEffect, useRef, useState } from "react";
-import { clampHeight, MAX_PENDING, MIN_HEIGHT, moduleAssetUrl, parseModuleMessage, PROTOCOL_VERSION, rateLimiter, READY_TIMEOUT_MS,
+import { boundedReply, clampHeight, MAX_PENDING, MIN_HEIGHT, moduleAssetUrl, parseModuleMessage, PROTOCOL_VERSION, rateLimiter, READY_TIMEOUT_MS,
   REQUEST_DEADLINE_MS, type ModuleMessage } from "./protocol";
 
 export interface ModuleHost {
@@ -28,6 +28,7 @@ const STOP_TEXT: Record<string, string> = {
   capability_denied: "The module asked for data it wasn't granted.",
   busy: "The module had too many requests waiting.",
   duplicate: "The module reused a request number that was still in progress.",
+  deadline: "A request it made took longer than 30 seconds.",
 };
 
 function outcomeText({ saved, unknown, voided }: Outcome): string {
@@ -83,10 +84,12 @@ export function ModuleFrame({ placementKey, src, title, capabilities, host, conf
       setState({ kind: "stopped", reason, outcome: { ...outcome, voided: outcome.voided + awaitingConfirm, unknown: outcome.unknown + dispatched } });
     };
     const reply = (id: number, body: Record<string, unknown>) => {
-      if (alive) channel.port1.postMessage({ v: PROTOCOL_VERSION, nonce, generation, id, type: "reply", payload: body });
+      if (alive) channel.port1.postMessage({ v: PROTOCOL_VERSION, nonce, generation, id, type: "reply", payload: boundedReply(body) });
     };
+    // A host call that outlives its deadline stops the whole instance: the slot is never
+    // freed while the underlying work may still be running, and the bridge can't cancel it.
     const withDeadline = <T,>(work: Promise<T>) => new Promise<T>((resolve, reject) => {
-      const timer = window.setTimeout(() => reject(new Error("deadline")), REQUEST_DEADLINE_MS);
+      const timer = window.setTimeout(() => { stop("deadline"); reject(new Error("deadline")); }, REQUEST_DEADLINE_MS);
       work.then((value) => { window.clearTimeout(timer); resolve(value); }, (error) => { window.clearTimeout(timer); reject(error); });
     });
     const handle = async (message: ModuleMessage) => {
