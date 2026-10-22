@@ -237,8 +237,7 @@ def _execution(value):
         raise EngineError() from None
 
 
-def _cgroup(value, state):
-    group = state['ControlGroup']
+def _cgroup_path(value, group):
     expected = f'/user.slice/user-{value.uid}.slice/user@{value.uid}.service/'
     if (not group.startswith(expected) or not group.endswith('/' + UNIT)
             or any(part in {'', '.', '..'} for part in group.split('/')[1:])):
@@ -247,6 +246,11 @@ def _cgroup(value, state):
     selected = root / group.lstrip('/')
     if selected.resolve() != selected:
         raise EngineError()
+    return selected
+
+
+def _cgroup(value, state):
+    selected = _cgroup_path(value, state['ControlGroup'])
     if (selected.joinpath('memory.max').read_text().strip() != str(MEMORY)
             or selected.joinpath('memory.swap.max').read_text().strip() != '0'
             or selected.joinpath('pids.max').read_text().strip() != '384'):
@@ -371,12 +375,48 @@ def _pid_start(pid):
     return fields[19]
 
 
-def _terminal(value, pid, started, invocation_id):
+def _cgroup_empty(path):
+    """Prove the pinned service path absent or its kernel population is zero."""
+    directory = events = None
+    try:
+        try:
+            directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return True
+        events = os.open('cgroup.events', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=directory)
+        raw = os.read(events, 4097)
+        if len(raw) > 4096:
+            raise EngineError()
+        try:
+            rows = [line.split() for line in raw.decode('ascii').splitlines()]
+        except UnicodeDecodeError:
+            raise EngineError() from None
+        population = [row[1] for row in rows if len(row) == 2 and row[0] == 'populated']
+        if population != ['0']:
+            return False
+        pinned = os.fstat(directory)
+        try:
+            named = path.lstat()
+        except FileNotFoundError:
+            return True
+        if (pinned.st_dev, pinned.st_ino) != (named.st_dev, named.st_ino):
+            raise EngineError()
+        return True
+    finally:
+        if events is not None:
+            os.close(events)
+        if directory is not None:
+            os.close(directory)
+
+
+def _terminal(value, pid, started, invocation_id, control_group):
     state = unit_state(value)
     return (state['LoadState'] in {'not-found', 'loaded'} and state['ActiveState'] == 'inactive'
         and state['MainPID'] in {'', '0'}
         and state['InvocationID'] in {'', invocation_id}
-        and _pid_start(pid) != started and not _present(value.socket))
+        and _pid_start(pid) != started and not _present(value.socket)
+        and _cgroup_empty(control_group))
 
 
 def _stop_locked(value, parent, *, engine_id, invocation_id):
@@ -394,6 +434,7 @@ def _stop_locked(value, parent, *, engine_id, invocation_id):
     selected = unit_state(value)
     if selected['InvocationID'] != invocation_id:
         raise EngineError()
+    control_group = _cgroup_path(value, selected['ControlGroup'])
     pid = int(selected['MainPID'])
     started = _pid_start(pid)
     if started is None:
@@ -404,7 +445,8 @@ def _stop_locked(value, parent, *, engine_id, invocation_id):
     previous = _DEADLINE
     try:
         os.write(marker, json.dumps({'unit': UNIT, 'engine_id': engine_id,
-            'invocation_id': invocation_id, 'pid': pid, 'pid_start': started}).encode())
+            'invocation_id': invocation_id, 'pid': pid, 'pid_start': started,
+            'control_group': str(control_group)}).encode())
         os.fsync(marker)
         os.fsync(parent)
         run(value, ['/usr/bin/systemctl', '--user', 'stop', '--no-block', UNIT])
@@ -412,7 +454,7 @@ def _stop_locked(value, parent, *, engine_id, invocation_id):
         _DEADLINE = deadline
         while time.monotonic() < deadline:
             try:
-                if _terminal(value, pid, started, invocation_id):
+                if _terminal(value, pid, started, invocation_id, control_group):
                     original = os.fstat(marker)
                     named = os.stat('STOPPING.json', dir_fd=parent, follow_symlinks=False)
                     current, pinned = value.runtime.lstat(), os.fstat(parent)

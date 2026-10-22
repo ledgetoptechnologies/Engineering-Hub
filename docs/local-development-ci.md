@@ -25,7 +25,8 @@ request. The cached dependency image is pinned by immutable ID and lockfile
 hashes; changed dependencies require deliberate reviewed cache rebuilding, not
 network installation during the job.
 
-Prepare that image from a clean `git archive`, not a Windows working-tree copy:
+Prepare that image with `git -c core.autocrlf=false -c core.eol=lf archive`,
+not a Windows working-tree copy or an archive using implicit Git settings:
 Git may store LF while the checkout uses CRLF. The branch/image lock hashes must
 match the exact committed bytes. Base-cache compatibility permits only CRLF/LF
 line-ending equivalence, not changed dependency declarations; the new image's
@@ -42,7 +43,12 @@ hosts Viewer/Project Alpha and is likewise not the development CI endpoint.
 The separate CI engine is owned by the existing non-root staging user, with
 private state under `~/engineering-hub-ci` and a Unix socket under
 `/run/user/<uid>/engineering-hub-ci`. The on-demand transient user service must
-have effective aggregate CPU, RAM, swap and task caps. No root service, new
+have effective CPU, RAM, swap and task caps. The daemon is capped at one CPU,
+2 GiB RAM, no swap and 384 tasks; the single serialized job independently has
+one CPU, 2 GiB RAM, no swap and 256 tasks. These are separate budgets, not a
+claim that a daemon service cgroup also contains Docker's container scopes.
+Allow headroom for their combined worst case (two CPUs and 4 GiB RAM).
+No root service, new
 account, global permission change, linger or boot autostart is installed.
 The live staging user's existing subuid/subgid ranges and CPU/memory/pids
 delegation were observed; a short capped no-op user service completed cleanly.

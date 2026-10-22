@@ -27,6 +27,8 @@ FILES = {'pyproject.toml': 'pyproject', 'uv.lock': 'uv-lock',
          'hub-ui/package.json': 'package', 'hub-ui/package-lock.json': 'npm-lock'}
 IMAGE = re.compile(r'^sha256:[a-f0-9]{64}$')
 CID = re.compile(r'^[a-f0-9]{64}$')
+PROC_ROOT = Path('/proc')
+CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 
 class CIError(RuntimeError):
@@ -131,25 +133,78 @@ def validate_engine(info, expected):
         raise CIError('Pinned rootless cgroup-v2/systemd engine required')
 
 
+def _cgroup_read(fd, name):
+    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    try:
+        raw = os.read(source, 4097)
+        if len(raw) > 4096:
+            raise CIError('Kernel cgroup metadata exceeds its bound')
+        return raw.decode('ascii').strip()
+    finally:
+        os.close(source)
+
+
+class KernelCgroup:
+    """Pinned kernel scope, retained until terminal inspection/cleanup finishes."""
+    def __init__(self, fd, evidence):
+        self.fd, self.evidence = fd, evidence
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def verify_empty(self):
+        if self.fd is None:
+            raise CIError('Pinned CI cgroup unavailable')
+        before = os.fstat(self.fd)
+        if (before.st_dev, before.st_ino) != (self.evidence['device'], self.evidence['inode']):
+            raise CIError('Pinned CI cgroup identity changed')
+        try:
+            events = _cgroup_read(self.fd, 'cgroup.events')
+        except FileNotFoundError:
+            # A deleted pinned cgroup cannot contain tasks. A missing or renamed
+            # pathname alone is not enough: inspect the pinned inode itself.
+            if os.fstat(self.fd).st_nlink != 0:
+                raise CIError('Pinned CI cgroup quiescence unavailable') from None
+            return {'state': 'removed', 'descendants_empty': True}
+        values = [line.split() for line in events.splitlines()]
+        populated = [value[1] for value in values if len(value) == 2 and value[0] == 'populated']
+        if populated != ['0']:
+            raise CIError('CI cgroup still has processes; preserve ownership')
+        return {'state': 'empty', 'descendants_empty': True}
+
+
 def verify_kernel_limits(pid):
     if type(pid) is not int or pid <= 1:
         raise CIError('Owned container PID unavailable')
-    start = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
-    rows = Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+    process = PROC_ROOT / str(pid)
+    start = (process / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+    rows = (process / 'cgroup').read_text().splitlines()
     paths = [row[3:] for row in rows if row.startswith('0::')]
     if len(paths) != 1 or '..' in Path(paths[0]).parts:
         raise CIError('Container cgroup unavailable')
-    root = Path('/sys/fs/cgroup') / paths[0].lstrip('/')
-    cpu = (root / 'cpu.max').read_text().split()
-    memory = (root / 'memory.max').read_text().strip()
-    swap = (root / 'memory.swap.max').read_text().strip()
-    pids = (root / 'pids.max').read_text().strip()
-    if (len(cpu) != 2 or cpu[0] == 'max' or int(cpu[0]) > int(cpu[1])
-            or memory == 'max' or int(memory) > MEMORY or swap != '0'
-            or pids == 'max' or int(pids) > 256):
-        raise CIError('Effective kernel CI limits unavailable')
-    if Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19] != start:
-        raise CIError('Container PID changed during verification')
+    root = CGROUP_ROOT / paths[0].lstrip('/')
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(fd)
+        cpu = _cgroup_read(fd, 'cpu.max').split()
+        memory = _cgroup_read(fd, 'memory.max')
+        swap = _cgroup_read(fd, 'memory.swap.max')
+        pids = _cgroup_read(fd, 'pids.max')
+        if (len(cpu) != 2 or cpu[0] == 'max' or not 0 < int(cpu[0]) <= int(cpu[1])
+                or memory == 'max' or not 0 < int(memory) <= MEMORY or swap != '0'
+                or pids == 'max' or not 0 < int(pids) <= 256):
+            raise CIError('Effective kernel CI limits unavailable')
+        named = os.stat(root, follow_symlinks=False)
+        if ((named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                or (process / 'stat').read_text().rsplit(')', 1)[1].split()[19] != start):
+            raise CIError('Container PID/cgroup changed during verification')
+        return KernelCgroup(fd, {'path': str(root), 'device': before.st_dev, 'inode': before.st_ino,
+            'cpu_max': ' '.join(cpu), 'memory_max': memory, 'memory_swap_max': swap, 'pids_max': pids})
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def create_arguments(image, name, input_directory, profile, intent):
@@ -211,6 +266,8 @@ def _run_admitted(args, checkout, output, engine_directory):
     container = None
     intent = None
     terminal = False
+    started = False
+    kernel = None
     result = {'schema': 'engineering-hub.local-ci.v1', 'state': 'preflight',
               'advisory': True, 'execution_authorization': False, 'profile': args.profile}
     root = Path(tempfile.mkdtemp(prefix='run-', dir=output))
@@ -248,7 +305,8 @@ def _run_admitted(args, checkout, output, engine_directory):
         inputs = root / 'input'
         inputs.mkdir(mode=0o755)
         archive = inputs / 'source.tar'
-        subprocess.run(['/usr/bin/git', 'archive', '--format=tar', '--output', str(archive), commit],
+        subprocess.run(['/usr/bin/git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
+                        'archive', '--format=tar', '--output', str(archive), commit],
                        cwd=checkout, check=True, timeout=30, env=environment,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         archive.chmod(0o444)
@@ -269,8 +327,10 @@ def _run_admitted(args, checkout, output, engine_directory):
             raise CIError('Created container identity unavailable')
         container = cid
         verify_created(inspect(), args.image, name, inputs, args.profile, intent)
+        started = True
         docker('container', 'start', cid)
-        verify_kernel_limits(inspect()['State']['Pid'])
+        kernel = verify_kernel_limits(inspect()['State']['Pid'])
+        result['kernel_limits'] = kernel.evidence
         (inputs / 'admit.json').write_text(json.dumps({'intent': intent}))
         (inputs / 'admit.json').chmod(0o444)
         try:
@@ -279,9 +339,11 @@ def _run_admitted(args, checkout, output, engine_directory):
             result['timed_out'] = True
             docker('container', 'stop', '--time', '10', cid, timeout=20)
         state = inspect()['State']
-        terminal = state.get('Status') == 'exited' and not any(state.get(k) for k in ('Running', 'Paused', 'Restarting'))
-        if not terminal:
+        exited = state.get('Status') == 'exited' and not any(state.get(k) for k in ('Running', 'Paused', 'Restarting'))
+        if not exited:
             raise CIError('CI quiescence unverified; preserve ownership')
+        result['cgroup_terminal'] = kernel.verify_empty()
+        terminal = True
         result.update(state='passed' if state['ExitCode'] == 0 and not result.get('timed_out') else 'failed',
                       exit_code=state['ExitCode'], container_id=cid, terminal_verified=True)
         (root / 'test.log').write_bytes(docker('container', 'logs', '--tail', '5000', cid, merge_stderr=True))
@@ -292,19 +354,29 @@ def _run_admitted(args, checkout, output, engine_directory):
             try:
                 docker('container', 'stop', '--time', '10', container, timeout=20)
                 state = inspect()['State']
-                terminal = (state.get('Status') in {'exited', 'created'} and not state.get('Running')
-                            and not state.get('Paused') and not state.get('Restarting'))
+                exited = (state.get('Status') in {'exited', 'created'} and not state.get('Running')
+                          and not state.get('Paused') and not state.get('Restarting'))
+                if exited and not started:
+                    result['cgroup_terminal'] = {'state': 'not_started', 'descendants_empty': True}
+                    terminal = True
+                elif exited and kernel is not None:
+                    result['cgroup_terminal'] = kernel.verify_empty()
+                    terminal = True
             except Exception:
                 pass
         if terminal:
             result['state'] = 'failed'
         raise CIError('Local CI unavailable; retained evidence requires inspection') from None
     finally:
-        result['terminal_verified'] = terminal
-        (root / 'result.json').write_text(json.dumps(result, sort_keys=True) + '\n')
-        if terminal:
-            clear_own_intent(held, intent)
-            clear_own_intent(engine_held, intent)
+        try:
+            result['terminal_verified'] = terminal
+            (root / 'result.json').write_text(json.dumps(result, sort_keys=True) + '\n')
+            if terminal:
+                clear_own_intent(held, intent)
+                clear_own_intent(engine_held, intent)
+        finally:
+            if kernel is not None:
+                kernel.close()
 
 
 def main():

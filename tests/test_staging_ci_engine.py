@@ -153,7 +153,7 @@ def test_stop_never_interrupts_a_running_container(engine, selected, monkeypatch
 
 
 def test_stop_proves_terminal_before_removing_own_marker(engine, tmp_path, monkeypatch):
-    selected = engine.Layout(568, tmp_path, tmp_path, tmp_path / 'private')
+    selected = engine.Layout(1000, tmp_path, tmp_path, tmp_path / 'private')
     monkeypatch.setattr(engine, 'inspect', lambda _: result(engine))
     monkeypatch.setattr(engine, 'unit_state', lambda _: state(engine))
     monkeypatch.setattr(engine, '_pid_start', lambda _: '1234')
@@ -172,7 +172,7 @@ def test_stop_proves_terminal_before_removing_own_marker(engine, tmp_path, monke
 
 
 def test_stop_unknown_retains_marker_without_force_kill(engine, tmp_path, monkeypatch):
-    selected = engine.Layout(568, tmp_path, tmp_path, tmp_path / 'private')
+    selected = engine.Layout(1000, tmp_path, tmp_path, tmp_path / 'private')
     monkeypatch.setattr(engine, 'inspect', lambda _: result(engine))
     monkeypatch.setattr(engine, 'unit_state', lambda _: state(engine))
     monkeypatch.setattr(engine, '_pid_start', lambda _: '1234')
@@ -189,7 +189,54 @@ def test_stop_unknown_retains_marker_without_force_kill(engine, tmp_path, monkey
         engine.os.close(parent)
     assert stopped['state'] == 'stop_requested' and stopped['terminal_verified'] is False
     assert (tmp_path / 'STOPPING.json').exists()
+    marker = json.loads((tmp_path / 'STOPPING.json').read_text())
+    assert marker['control_group'] == '/sys/fs/cgroup' + state(engine)['ControlGroup']
     assert len(calls) == 2 and all('kill' not in command for command in calls)
+
+
+@pytest.mark.parametrize('events,expected', [
+    ('populated 0\nfrozen 0\n', True),
+    ('populated 1\nfrozen 0\n', False),
+    ('frozen 0\n', False),
+    ('populated 0\npopulated 0\n', False),
+    ('populated unknown\n', False),
+])
+def test_original_cgroup_population_must_be_zero(engine, tmp_path, events, expected):
+    (tmp_path / 'cgroup.events').write_text(events)
+    assert engine._cgroup_empty(tmp_path) is expected
+
+
+def test_original_cgroup_absence_is_terminal_but_missing_events_is_not(engine, tmp_path):
+    assert engine._cgroup_empty(tmp_path / 'absent') is True
+    with pytest.raises(FileNotFoundError):
+        engine._cgroup_empty(tmp_path)
+
+
+def test_cgroup_symlink_or_invalid_event_bytes_fail_closed(engine, tmp_path):
+    target = tmp_path / 'target'
+    target.mkdir()
+    (target / 'cgroup.events').write_text('populated 0\n')
+    alias = tmp_path / 'alias'
+    alias.symlink_to(target, target_is_directory=True)
+    with pytest.raises(OSError):
+        engine._cgroup_empty(alias)
+    (target / 'cgroup.events').write_bytes(b'populated 0\n\xff')
+    with pytest.raises(engine.EngineError):
+        engine._cgroup_empty(target)
+
+
+def test_pid_and_socket_gone_do_not_prove_empty_original_cgroup(engine, selected, monkeypatch):
+    inactive = {**state(engine), 'ActiveState': 'inactive', 'MainPID': '0'}
+    monkeypatch.setattr(engine, 'unit_state', lambda _: inactive)
+    monkeypatch.setattr(engine, '_pid_start', lambda _: None)
+    monkeypatch.setattr(engine, '_present', lambda _: False)
+    original = Path('/sys/fs/cgroup') / state(engine)['ControlGroup'].lstrip('/')
+    calls = []
+    monkeypatch.setattr(engine, '_cgroup_empty', lambda path: calls.append(path) or False)
+    assert engine._terminal(selected, 2345, '1234', 'a' * 32, original) is False
+    assert calls == [original]
+    monkeypatch.setattr(engine, '_cgroup_empty', lambda path: path == original)
+    assert engine._terminal(selected, 2345, '1234', 'a' * 32, original) is True
 
 
 @pytest.mark.parametrize('marker', ['HELD.json', 'STOPPING.json'])

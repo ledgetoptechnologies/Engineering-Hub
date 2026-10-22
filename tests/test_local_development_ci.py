@@ -307,6 +307,7 @@ def test_unknown_create_retains_engine_and_output_intent_before_effect(tmp_path,
     monkeypatch.setattr(runner, 'checked_output', command)
     def archive(argv, **_options):
         assert 'archive' in argv
+        assert argv[:5] == ['/usr/bin/git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf']
         Path(argv[argv.index('--output') + 1]).write_bytes(b'synthetic archive')
     monkeypatch.setattr(runner.subprocess, 'run', archive)
     try:
@@ -319,3 +320,86 @@ def test_unknown_create_retains_engine_and_output_intent_before_effect(tmp_path,
     assert len(evidence) == 1
     assert json.loads(evidence[0].read_text())['state'] == 'held'
     assert not any('start' in command for command in calls)
+
+
+@pytest.fixture
+def kernel_scope(tmp_path, monkeypatch):
+    process = tmp_path / 'proc/42'
+    process.mkdir(parents=True)
+    state = ['S'] + ['0'] * 18 + ['123456']
+    (process / 'stat').write_text('42 (synthetic process) ' + ' '.join(state))
+    (process / 'cgroup').write_text('0::/user.slice/ci.scope\n')
+    cgroups = tmp_path / 'cgroups'
+    scope = cgroups / 'user.slice/ci.scope'
+    scope.mkdir(parents=True)
+    for name, value in {'cpu.max': '100000 100000', 'memory.max': str(runner.MEMORY),
+        'memory.swap.max': '0', 'pids.max': '256', 'cgroup.events': 'populated 1\nfrozen 0\n'}.items():
+        (scope / name).write_text(value)
+    monkeypatch.setattr(runner, 'PROC_ROOT', tmp_path / 'proc')
+    monkeypatch.setattr(runner, 'CGROUP_ROOT', cgroups)
+    return process, scope
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Pinned Linux cgroup directory FDs')
+def test_kernel_evidence_is_retained_until_all_descendants_are_empty(kernel_scope):
+    process, scope = kernel_scope
+    pin = runner.verify_kernel_limits(42)
+    try:
+        assert pin.evidence['path'] == str(scope)
+        assert pin.evidence['cpu_max'] == '100000 100000'
+        assert pin.evidence['memory_max'] == str(runner.MEMORY)
+        assert pin.evidence['memory_swap_max'] == '0'
+        assert pin.evidence['pids_max'] == '256'
+        with pytest.raises(runner.CIError, match='still has processes'):
+            pin.verify_empty()
+        (scope / 'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        assert pin.verify_empty() == {'state': 'empty', 'descendants_empty': True}
+    finally:
+        pin.close()
+    with pytest.raises(runner.CIError):
+        pin.verify_empty()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Pinned Linux cgroup directory FDs')
+def test_missing_or_replaced_path_does_not_hide_a_populated_pinned_cgroup(kernel_scope):
+    process, scope = kernel_scope
+    pin = runner.verify_kernel_limits(42)
+    retained = scope.with_name('renamed-old-ci.scope')
+    scope.rename(retained)
+    scope.mkdir()
+    (scope / 'cgroup.events').write_text('populated 0\n')
+    try:
+        with pytest.raises(runner.CIError, match='still has processes'):
+            pin.verify_empty()
+        (retained / 'cgroup.events').write_text('populated 0\n')
+        assert pin.verify_empty()['state'] == 'empty'
+    finally:
+        pin.close()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Pinned Linux cgroup deletion')
+def test_only_deleted_pinned_scope_counts_as_removed(kernel_scope):
+    process, scope = kernel_scope
+    pin = runner.verify_kernel_limits(42)
+    try:
+        (scope / 'cgroup.events').unlink()
+        with pytest.raises(runner.CIError, match='quiescence unavailable'):
+            pin.verify_empty()
+        for entry in scope.iterdir():
+            entry.unlink()
+        scope.rmdir()
+        assert pin.verify_empty() == {'state': 'removed', 'descendants_empty': True}
+    finally:
+        pin.close()
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Pinned Linux resource checks')
+@pytest.mark.parametrize('name,value', [('cpu.max', 'max 100000'), ('memory.max', 'max'),
+                                      ('memory.swap.max', '1'), ('pids.max', 'max')])
+def test_unbounded_kernel_values_never_admit_source_tests(kernel_scope, name, value):
+    process, scope = kernel_scope
+    (scope / name).write_text(value)
+    before = len(os.listdir('/proc/self/fd'))
+    with pytest.raises(runner.CIError):
+        runner.verify_kernel_limits(42)
+    assert len(os.listdir('/proc/self/fd')) == before
