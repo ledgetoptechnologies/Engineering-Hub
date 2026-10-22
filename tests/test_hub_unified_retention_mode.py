@@ -1,6 +1,7 @@
 """Explicit preservation first, original startup retention after verification."""
 from datetime import timedelta
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +17,7 @@ def test_invalid_retention_mode_fails_before_bus_construction(tmp_path, monkeypa
         # Validate the mode before any factory state is opened. Supply a valid
         # settings object without requiring any real database paths.
         with pytest.raises(ValueError, match='HUB_BUS_STARTUP_CLEANUP'):
-            create_unified_app(settings=object())
+            create_unified_app(settings=SimpleNamespace(require_owned_ledger=False))
     assert list(tmp_path.iterdir()) == []
 
 
