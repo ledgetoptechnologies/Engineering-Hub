@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { HubApiError, type HubMode } from "./api";
+import { registerRouteLeaveGuard } from "./router";
 import {
   isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
   NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
@@ -51,8 +52,10 @@ function readError(error: unknown): string {
 
 export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writable, viewerActor, onUnauthorized }: NotesPanelProps) {
   const detailRef = useRef<HTMLDivElement>(null);
-  const [project, setProject] = useState(DEFAULT_NOTES_PROJECT);
-  const [projectDraft, setProjectDraft] = useState(DEFAULT_NOTES_PROJECT);
+  // A project page opens on that project's notes; elsewhere the default.
+  const initialProject = selectedProject !== "all" && isNoteProject(selectedProject) ? selectedProject : DEFAULT_NOTES_PROJECT;
+  const [project, setProject] = useState(initialProject);
+  const [projectDraft, setProjectDraft] = useState(initialProject);
   const [searchDraft, setSearchDraft] = useState<Search>({ kind: "query", text: "" });
   const [search, setSearch] = useState<Search>({ kind: "query", text: "" });
   const [list, setList] = useState<NoteList | null>(null);
@@ -90,6 +93,7 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   function confirmDiscard(): boolean {
     return !dirtyRef.current || window.confirm(dirtyPrompt);
   }
+  useEffect(() => registerRouteLeaveGuard(() => !dirtyRef.current || window.confirm(dirtyPrompt)), []);
   function closeEditor() {
     saveGeneration.current++; setDraft(null); setConflict(null); setSaving(false);
   }
