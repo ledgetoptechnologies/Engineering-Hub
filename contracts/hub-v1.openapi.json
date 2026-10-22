@@ -584,6 +584,24 @@
         }
       }
     },
+    "/api/hub/v1/image-versions": {
+      "get": {
+        "summary": "Image Versions",
+        "operationId": "image_versions_api_hub_v1_image_versions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageVersionsSummary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/agents": {
       "get": {
         "summary": "List Agents",
@@ -2211,6 +2229,247 @@
         ],
         "title": "HealthDTO"
       },
+      "ImageVersionStatus": {
+        "properties": {
+          "project": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Project"
+          },
+          "host": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Host"
+          },
+          "service": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Service"
+          },
+          "environment": {
+            "type": "string",
+            "enum": [
+              "production",
+              "staging"
+            ],
+            "title": "Environment"
+          },
+          "repository": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 12,
+            "pattern": "^ghcr\\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._/-][a-z0-9]+)*$",
+            "title": "Repository"
+          },
+          "reference": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|sha256:[0-9a-f]{64})$",
+            "title": "Reference"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "up_to_date",
+              "update_available",
+              "unknown"
+            ],
+            "title": "State"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "same_image",
+              "different_image",
+              "running_not_observed",
+              "published_not_observed",
+              "observation_source_mismatch",
+              "reference_mismatch",
+              "repository_mismatch",
+              "platform_unverified",
+              "platform_mismatch",
+              "running_observation_in_future",
+              "published_observation_in_future",
+              "running_observation_expired",
+              "published_observation_expired",
+              "identity_unverified",
+              "identity_conflict"
+            ],
+            "title": "Reason"
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Checked At"
+          },
+          "running_observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Running Observed At"
+          },
+          "published_observed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Observed At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "digest_kind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "config",
+                  "manifest",
+                  "index"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest Kind"
+          },
+          "current_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Digest"
+          },
+          "available_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Digest"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "project",
+          "host",
+          "service",
+          "environment",
+          "repository",
+          "reference",
+          "state",
+          "reason",
+          "checked_at"
+        ],
+        "title": "ImageVersionStatus"
+      },
+      "ImageVersionsSummary": {
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "title": "Configured"
+          },
+          "source": {
+            "type": "string",
+            "const": "agent_observation_report",
+            "title": "Source",
+            "default": "agent_observation_report"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "available",
+              "not_configured",
+              "invalid_report",
+              "source_unavailable"
+            ],
+            "title": "Reason"
+          },
+          "reported_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported By"
+          },
+          "report_updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Report Updated At"
+          },
+          "advisory_only": {
+            "type": "boolean",
+            "const": true,
+            "title": "Advisory Only",
+            "default": true
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ImageVersionStatus"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "configured",
+          "reason"
+        ],
+        "title": "ImageVersionsSummary"
+      },
       "NewDecision": {
         "properties": {
           "project": {
@@ -2402,6 +2661,16 @@
           },
           "capabilities": {
             "$ref": "#/components/schemas/CapabilitiesDTO"
+          },
+          "image_versions": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ImageVersionsSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,

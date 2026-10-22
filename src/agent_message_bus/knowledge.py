@@ -4,6 +4,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -64,13 +65,23 @@ class KnowledgeRepository:
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 10000")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
+    @contextmanager
+    def _connection(self):
+        """Preserve SQLite transaction exit, then close this operation's handle."""
+        with closing(self.connect()) as conn, conn:
+            yield conn
+
     def _initialize(self) -> None:
-        with self.connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS knowledge (
                     project TEXT NOT NULL,
@@ -149,7 +160,7 @@ class KnowledgeRepository:
         timestamp = _now()
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        with self._lock, self.connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT version, created_by, created_at FROM knowledge WHERE project=? AND path=?",
@@ -177,7 +188,7 @@ class KnowledgeRepository:
     def get(self, project: str, path: str) -> KnowledgeEntry:
         project = self.validate_project(project)
         path = self.validate_path(path)
-        with self.connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT * FROM knowledge WHERE project=? AND path=?", (project, path)
             ).fetchone()
@@ -197,7 +208,7 @@ class KnowledgeRepository:
             params.extend((path_prefix, len(path_prefix) + 1, path_prefix + "/"))
         sql += " ORDER BY path LIMIT ?"
         params.append(limit)
-        with self.connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._from_row(row) for row in rows]
 
@@ -223,7 +234,7 @@ class KnowledgeRepository:
             params.append(project)
         sql += " ORDER BY project, path LIMIT ?"
         params.append(limit)
-        with self.connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._from_row(row) for row in rows]
 

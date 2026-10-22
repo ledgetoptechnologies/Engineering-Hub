@@ -202,6 +202,43 @@ export function HubApp() {
   }, [refresh]);
 
   useEffect(() => {
+    if (demo || !session?.authenticated || !data) return;
+    // Native browser metadata refresh, not an agent/LLM inbox watcher. Never
+    // upgrades topic readiness, workspace freshness or execution authority.
+    const interval = 5 * 60_000;
+    let active = true, inFlight = false, lastAttempt = Date.now();
+    async function updateImages() {
+      if (!active || inFlight || document.visibilityState !== "visible"
+          || Date.now() - lastAttempt < interval) return;
+      inFlight = true;
+      lastAttempt = Date.now();
+      const expected = requests.current;
+      try {
+        const images = await client.getImageVersions();
+        if (active && expected === requests.current)
+          setData(previous => previous ? { ...previous, image_versions: images } : null);
+      } catch (error) {
+        if (!active || expected !== requests.current) return;
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+          clearPrivateWorkspace();
+        } else {
+          // Older servers (404) and failures cannot leave a positive image
+          // comparison behind. Other workspace records remain independent.
+          setData(previous => previous ? { ...previous, image_versions: null } : null);
+        }
+      } finally { inFlight = false; }
+    }
+    const timer = window.setInterval(() => void updateImages(), interval);
+    const visible = () => { void updateImages(); };
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", visible);
+    };
+  }, [demo, session?.authenticated, session?.actor, !!data, client, clearPrivateWorkspace]);
+
+  useEffect(() => {
     if (demo || !session?.authenticated || !events?.available) return;
     let active = true;
     let connected = false;
