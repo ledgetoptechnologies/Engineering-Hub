@@ -13,6 +13,18 @@ export interface PlanningPanelProps {
 }
 interface Editor { value: PlanningDraft; base: PlanningItem | null }
 interface Conflict { current: number; latest: PlanningItem | null; failed: boolean }
+/** Says which kind of failure happened, by fixed code only (never the server's text). */
+function listFailure(error: unknown): string {
+  const code = error instanceof HubApiError ? error.code : "";
+  const status = error instanceof HubApiError ? error.status : 0;
+  if (code === "invalid_planning_response")
+    return "Plans arrived in a shape this page doesn't accept, so nothing was shown (invalid_planning_response). Tell an agent; Refresh to retry.";
+  if (status === 404 || code === "planning_item_not_found")
+    return "This server doesn't have plans yet (404). The Hub may need an update.";
+  if (status === 503 || code === "planning_unavailable" || code === "planning_integrity_failure")
+    return `The plans store is unavailable right now (${code || status}). It may be restarting; Refresh to retry.`;
+  return `Plans could not be loaded (${code || status || "network"}). Refresh to retry.`;
+}
 const discardText = "You have unsaved planning edits. Discard them?";
 const pretty = (value: string) => value.replaceAll("_", " ");
 const identity = (value: PlanningKey) => `${value.scope}/${value.project}/${value.topic}/${value.kind}/${value.item_id}`;
@@ -62,7 +74,7 @@ export function PlanningPanel({ mode, selectedProject, knownProjects, topic: ini
       setList(value); setLoading(false);
     }).catch(error => {
       if (current !== generation.current || controller.signal.aborted || deny(error)) return;
-      setLoading(false); setNotice({ error: true, text: "Plans could not be loaded. The server may need an update; use Refresh to retry." });
+      setLoading(false); setNotice({ error: true, text: listFailure(error) });
     });
     return () => { generation.current++; controller.abort(); };
   }, [mode, scope, project, topic, kindFilter, revision]);
@@ -145,9 +157,10 @@ export function PlanningPanel({ mode, selectedProject, knownProjects, topic: ini
       <label>Show kind <select aria-label="Show kind" value={kindFilter} onChange={event => setKindFilter(event.target.value as typeof kindFilter)}>
         <option value="all">All kinds</option>{PLANNING_KINDS.map(kind => <option key={kind} value={kind}>{pretty(kind)}</option>)}</select></label>
       {scope === "topic" ? <form className="notes-project" onSubmit={openTopic}>
-        <label htmlFor="planning-project">Project</label><input id="planning-project" list="planning-projects" value={projectInput} maxLength={64}
-          onChange={event => setProjectInput(event.target.value)} required />
-        <datalist id="planning-projects">{knownProjects.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</datalist>
+        <label htmlFor="planning-project">Project</label><select id="planning-project" value={projectInput} onChange={event => setProjectInput(event.target.value)} required>
+          {(knownProjects.some(item => item.id === projectInput) ? knownProjects : [{ id: projectInput, name: projectInput }, ...knownProjects])
+            .map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select>
         <label htmlFor="planning-topic">Topic</label><input id="planning-topic" value={topicInput} maxLength={128}
           onChange={event => setTopicInput(event.target.value)} required />
         <button className="secondary small" disabled={!isNoteProject(projectInput) || !isPlanningTopic(topicInput)}>Open topic</button>

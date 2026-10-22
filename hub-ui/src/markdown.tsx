@@ -4,7 +4,7 @@
  */
 import { Fragment, type ReactNode } from "react";
 
-function safeHref(url: string): string | null {
+export function safeHref(url: string): string | null {
   if (/^\/(?!\/)[A-Za-z0-9/_.#?=&%-]*$/.test(url)) return url;
   try {
     const parsed = new URL(url);

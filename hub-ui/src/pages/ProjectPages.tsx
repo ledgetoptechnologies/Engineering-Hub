@@ -1,4 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { HubApiError } from "../api";
+import { describeVerb, readActivity, type ActivityItem } from "../activityApi";
+import { actorLabel } from "../NotesPanel";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import { NotesPanel } from "../NotesPanel";
@@ -173,6 +176,73 @@ function Timeline({ changes }: { changes: Change[] }) {
   );
 }
 
+const KIND_LABEL = { task: "Task", decision: "Question", run: "Staging run" } as const;
+
+/** The Hub's audit history when the server has it; otherwise the latest change per item, labelled as such. */
+function ActivityFeed({ hub, project, fallback }: { hub: Hub; project: string; fallback: Change[] }) {
+  const [items, setItems] = useState<ActivityItem[]>([]);
+  const [next, setNext] = useState<number | null>(null);
+  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "failed">(hub.demo ? "unsupported" : "loading");
+  const [more, setMore] = useState(false);
+  const generation = useRef(0);
+  const load = (before: number | null) => {
+    const current = ++generation.current, controller = new AbortController();
+    if (before === null) setState("loading"); else setMore(true);
+    readActivity(project, before, controller.signal).then((page) => {
+      if (current !== generation.current) return;
+      if (!page) { setState("unsupported"); return; }
+      setItems((previous) => before === null ? page.items : [...previous, ...page.items]);
+      setNext(page.nextBefore);
+      setState("loaded");
+    }).catch((error) => {
+      if (current !== generation.current) return;
+      if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
+      else setState("failed");
+    }).finally(() => { if (current === generation.current) setMore(false); });
+    return controller;
+  };
+  // Re-read when the workspace snapshot changes (event-feed driven, never polled).
+  useEffect(() => {
+    if (hub.demo) return;
+    const controller = load(null);
+    return () => { generation.current++; controller.abort(); };
+  }, [project, hub.demo, hub.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (state === "unsupported") return <>
+    <p className="panel-description">The latest change to each task and question, newest first. This server doesn't keep a full history yet.</p>
+    <Timeline changes={fallback} />
+  </>;
+  if (state === "loading") return <p role="status">Reading activity…</p>;
+  if (state === "failed") return <p role="alert" className="notice error">Activity could not be read. It will retry when the workspace refreshes.</p>;
+  if (!items.length) return <EmptyState title="No activity yet." />;
+  return (
+    <>
+      <p className="panel-description">Every recorded change, newest first. Titles are shown as they are now.</p>
+      <ol className="timeline" aria-label="Activity history">
+        {items.map((item) => (
+          <li key={item.sequence}>
+            <span className={`timeline-dot kind-${item.kind === "decision" ? "decision" : "task"}`} aria-hidden="true" />
+            <div>
+              <strong>{item.title ?? `${KIND_LABEL[item.kind]} ${item.entityId.slice(0, 8)}`}</strong>
+              <span className="timeline-meta">
+                {KIND_LABEL[item.kind]} · {actorName(item.actor, hub.session?.actor)} {describeVerb(item.verb)} it · revision {item.revision}
+              </span>
+            </div>
+            <time dateTime={item.at} title={new Date(item.at).toLocaleString()}>{relativeAge(item.at)}</time>
+          </li>
+        ))}
+      </ol>
+      {next !== null && (
+        <button type="button" className="secondary" disabled={more} onClick={() => load(next)}>
+          {more ? "Loading…" : "Show older"}
+        </button>
+      )}
+    </>
+  );
+}
+
+const actorName = (actor: string, viewer?: string | null) =>
+  viewer && actor === viewer ? "You" : (names as Record<string, string>)[actor] ?? actorLabel(actor);
+
 export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   hub: Hub; id: string; tab: ProjectTab; actions: React.ReactNode;
   notesProps: Omit<React.ComponentProps<typeof NotesPanel>, "selectedProject">;
@@ -317,8 +387,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
       {tab === "activity" && (
         <section className="panel" aria-label="Activity">
           <div className="panel-title"><h2>Activity</h2></div>
-          <p className="panel-description">The latest change to each task and question, newest first. A full history of every change needs a server update.</p>
-          <Timeline changes={changes} />
+          <ActivityFeed hub={hub} project={id} fallback={changes} />
         </section>
       )}
     </>

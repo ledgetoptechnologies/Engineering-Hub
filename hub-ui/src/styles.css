@@ -3347,3 +3347,208 @@ img.brand-mark {
 .agents-page > .panel-footnote {
   margin-bottom: 18px;
 }
+
+/* ==== Decision and task details: summary, links, images, typed answers ==== */
+.item-details {
+  display: grid;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+.item-summary {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  border-left: 3px solid var(--blue-line);
+  padding: 2px 0 2px 12px;
+}
+.item-summary .md p:last-child {
+  margin-bottom: 0;
+}
+.attachment-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+.attachment-thumb {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  text-align: left;
+  cursor: zoom-in;
+}
+.attachment-thumb:hover {
+  border-color: var(--blue-2);
+}
+.attachment-thumb img {
+  width: 100%;
+  height: 100px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #eef2f8;
+}
+.attachment-thumb span {
+  font-size: 12px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.detail-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.detail-links li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f8fafc;
+  font-size: 12.5px;
+}
+.detail-links a {
+  color: var(--blue);
+  font-weight: 600;
+}
+.detail-links small {
+  font: 11px var(--mono);
+  color: var(--ink-3);
+}
+.free-answer textarea {
+  width: 100%;
+  margin-top: 6px;
+}
+.free-answer small {
+  display: block;
+  text-align: right;
+  font: 11px var(--mono);
+  color: var(--ink-3);
+}
+.image-viewer-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font: 12px var(--mono);
+}
+.image-viewer-tools .button-link {
+  margin-left: auto;
+}
+.image-viewer {
+  overflow: hidden;
+  width: min(90vw, 1100px);
+  height: min(70vh, 760px);
+  display: grid;
+  place-items: center;
+  background: var(--navy);
+  border-radius: 10px;
+  touch-action: none;
+  cursor: grab;
+}
+.image-viewer img {
+  max-width: 100%;
+  max-height: 100%;
+  transform-origin: center;
+  user-select: none;
+}
+
+/* ==== Home charts ==== */
+.stage-bar-wrap { position: relative; }
+.stage-bar {
+  display: flex;
+  gap: 2px;
+  width: 100%;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #fff;
+}
+.stage-bar.empty { background: #eef2f8; }
+.stage-seg { min-width: 4px; transition: filter 0.15s; }
+.stage-seg:hover { filter: brightness(1.12); }
+.chart-tip {
+  position: absolute;
+  right: 0;
+  top: -26px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--navy);
+  color: #fff;
+  font-size: 12px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.chart-legend {
+  list-style: none;
+  margin: 10px 0 14px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.chart-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.chart-legend strong { font: 600 12.5px var(--mono); color: var(--ink); }
+.swatch { width: 10px; height: 10px; border-radius: 3px; }
+.pipeline-rows {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.pipeline-rows li {
+  display: grid;
+  grid-template-columns: minmax(90px, 140px) 1fr 28px;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.pipeline-rows a { color: var(--ink); font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pipeline-rows a:hover { color: var(--blue); }
+.pipeline-count { font: 600 12px var(--mono); color: var(--ink-3); text-align: right; }
+.preview-list.compact { margin-top: 10px; }
+.day-bars { margin: 6px 0 0; }
+.day-bars svg { width: 100%; height: auto; display: block; }
+.day-bars .bar { fill: #2f6fd1; }
+.day-bars .bar.active { fill: #173d86; }
+.day-bars .axis { stroke: var(--line); stroke-width: 1; }
+.day-bars .tick { font: 12px var(--mono); fill: var(--ink-3); }
+.day-bars svg { max-height: 180px; }
+.chart-tip-line { font-size: 12.5px; color: var(--ink-2); margin-top: 6px; }
+.chart-tip-line strong { font-family: var(--mono); color: var(--ink); }
+.project-mini .stage-bar-wrap,
+.project-mini .stage-bar.empty {
+  grid-column: 2;
+  margin-top: 6px;
+}
+
+/* One scroll area for the whole note list: folder lists must not be nested scroll
+   containers, or the wheel stops over a note (overscroll is contained). */
+.notes-list .note-folder ul {
+  max-height: none;
+  overflow: visible;
+}
+
+/* New note: folder + file name instead of a typed path. */
+.note-place {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 12px;
+}
+.note-place .note-location {
+  grid-column: 1 / -1;
+  margin-top: -4px;
+}

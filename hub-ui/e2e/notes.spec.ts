@@ -215,11 +215,16 @@ test("create then edit; a concurrent save shows both versions and replaces only 
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
-  await editor.getByLabel("Path").fill("/bad");
-  await expect(editor.getByText("Use a relative path", { exact: false })).toBeVisible();
-  await expect(editor.getByRole("button", { name: "Save note" })).toBeDisabled();
-  await editor.getByLabel("Path").fill("handoffs/pilot.md");
+  // No typed paths: pick a folder and a file name; the name follows the title until edited.
   await editor.getByLabel("Title").fill("Pilot handoff");
+  await expect(editor.getByLabel("File name")).toHaveValue("pilot-handoff");
+  await expect(editor.getByText("pilot-handoff.md", { exact: true })).toBeVisible();
+  await editor.getByLabel("Folder").selectOption("New folder…");
+  await editor.getByLabel("New folder name").fill("Handoffs");
+  await editor.getByLabel("File name").fill("");
+  await expect(editor.getByRole("button", { name: "Save note" })).toBeDisabled();
+  await editor.getByLabel("File name").fill("pilot");
+  await expect(editor.getByText("handoffs/pilot.md", { exact: true })).toBeVisible();
   await editor.getByLabel("Content").fill("Waiting on run authorization.");
   await editor.getByRole("button", { name: "Save note" }).click();
   await expect(panel.getByText('Saved "Pilot handoff" as version 1.', { exact: true })).toBeVisible();
@@ -229,7 +234,7 @@ test("create then edit; a concurrent save shows both versions and replaces only 
 
   await panel.getByRole("article", { name: "Pilot handoff" }).getByRole("button", { name: "Edit" }).click();
   const edit = panel.getByRole("form", { name: "Edit note" });
-  await expect(edit.getByLabel("Path")).toHaveAttribute("readonly", "");
+  await expect(edit.getByLabel("Location")).toHaveAttribute("readonly", "");
   await edit.getByLabel("Content").fill("My edit");
   // An agent saves first.
   const stored = state.notes.find(note => note.path === "handoffs/pilot.md")!;
@@ -265,8 +270,7 @@ test("unsaved edits are not dropped by opening another note or switching project
   await panel.getByRole("button", { name: /Second note/ }).click();
   await expect(panel.getByLabel("Content")).toHaveValue("draft text");
   page.once("dialog", dialog => { prompts.push(dialog.message()); void dialog.dismiss(); });
-  await panel.getByLabel("Project").fill("treedar");
-  await panel.getByRole("button", { name: "Open" }).click();
+  await panel.getByLabel("Project").selectOption("treedar");
   await expect(panel.getByLabel("Project")).toHaveValue("engineering-hub");
   await expect(panel.getByLabel("Content")).toHaveValue("draft text");
   expect(prompts).toEqual(["You have unsaved note edits. Discard them?", "You have unsaved note edits. Discard them?"]);
@@ -284,8 +288,7 @@ test("a slow list for the previous project never replaces the current project's 
   state.slowProject = "engineering-hub";
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect(panel.getByText("Reading notes…", { exact: true })).toBeVisible();
-  await panel.getByLabel("Project").fill("treedar");
-  await panel.getByRole("button", { name: "Open" }).click();
+  await panel.getByLabel("Project").selectOption("treedar");
   await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
   state.release?.();
   await page.waitForTimeout(300);
@@ -320,28 +323,29 @@ test("a new-note path collision can never be applied to a different existing not
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
-  await editor.getByLabel("Path").fill("runbooks/shared-notes.md");
   await editor.getByLabel("Title").fill("Mine");
+  await editor.getByLabel("Folder").selectOption("runbooks");
+  await editor.getByLabel("File name").fill("shared-notes");
   await editor.getByLabel("Content").fill("my text");
   await editor.getByRole("button", { name: "Save note" }).click();
   const conflict = editor.getByRole("alert");
   await expect(conflict.getByText("A note already exists at this path (version 1).", { exact: false })).toBeVisible();
   // Before Replace: the path cannot be retargeted to B.
-  await expect(editor.getByLabel("Path")).toHaveAttribute("readonly", "");
+  await expect(editor.getByLabel("Location")).toHaveAttribute("readonly", "");
   await conflict.getByRole("button", { name: "Replace version 1 with mine" }).click();
   // After Replace: still locked, and the accepted version names this path only.
-  await expect(editor.getByLabel("Path")).toHaveAttribute("readonly", "");
+  await expect(editor.getByLabel("Location")).toHaveAttribute("readonly", "");
   await expect(editor.getByText("Saving replaces version 1 of", { exact: false })).toBeVisible();
-  await editor.getByLabel("Path").press("End");
-  await editor.getByLabel("Path").pressSequentially("x");
-  await expect(editor.getByLabel("Path")).toHaveValue("runbooks/shared-notes.md");
+  await editor.getByLabel("Location").press("End");
+  await editor.getByLabel("Location").pressSequentially("x");
+  await expect(editor.getByLabel("Location")).toHaveValue("runbooks/shared-notes.md");
   page.once("dialog", dialog => void dialog.accept());
   await editor.getByRole("button", { name: "Cancel" }).click();
   // A fresh new note at B starts from version 0 and conflicts instead of overwriting.
   await panel.getByRole("button", { name: "New note" }).click();
   const second = panel.getByRole("form", { name: "New note" });
-  await second.getByLabel("Path").fill("b.md");
   await second.getByLabel("Title").fill("Mine");
+  await second.getByLabel("File name").fill("b");
   await second.getByRole("button", { name: "Save note" }).click();
   await expect(second.getByRole("alert").getByText("A note already exists at this path (version 1).", { exact: false })).toBeVisible();
   expect(state.posts.map(post => [post.body.path, post.body.expected_version])).toEqual([["runbooks/shared-notes.md", 0], ["b.md", 0]]);
@@ -355,8 +359,9 @@ test("Replace then save writes only the accepted path at the accepted version", 
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
-  await editor.getByLabel("Path").fill("runbooks/shared-notes.md");
   await editor.getByLabel("Title").fill("Mine");
+  await editor.getByLabel("Folder").selectOption("runbooks");
+  await editor.getByLabel("File name").fill("shared-notes");
   await editor.getByLabel("Content").fill("my text");
   await editor.getByRole("button", { name: "Save note" }).click();
   await editor.getByRole("alert").getByRole("button", { name: "Replace version 1 with mine" }).click();
@@ -374,8 +379,8 @@ test("notes over the gateway request budget are blocked locally and a 413 keeps 
   const panel = panelOf(page);
   await panel.getByRole("button", { name: "New note" }).click();
   const editor = panel.getByRole("form", { name: "New note" });
-  await editor.getByLabel("Path").fill("big.md");
   await editor.getByLabel("Title").fill("Big");
+  await expect(editor.getByText("big.md", { exact: true })).toBeVisible();
   // 40,000 quote marks are 40 KB of content but 80 KB once JSON-escaped.
   await editor.getByLabel("Content").fill('"'.repeat(40000));
   await expect(editor.getByText("Too large to save.", { exact: false })).toBeVisible();
@@ -490,4 +495,17 @@ test("a successful re-read clears only the out-of-date warning", async ({ page }
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.docReads).toBe(reads + 1);
   await expect(saved).toBeVisible();
+});
+
+test("the note list scrolls as one area even with the pointer over a note", async ({ page }) => {
+  const state = await fixture(page);
+  for (let i = 0; i < 40; i++) state.notes.push({ project: "engineering-hub", path: `runbooks/item-${String(i).padStart(2, "0")}.md`,
+    title: `Runbook item ${i}`, content: "x", version: 1, updated_by: "codex" });
+  await page.setViewportSize({ width: 1400, height: 800 });
+  await page.goto("/#/notes");
+  const list = panelOf(page).locator(".notes-list");
+  await panelOf(page).getByRole("button", { name: /Runbook item 3 / }).hover();
+  const before = await list.evaluate(element => element.scrollTop);
+  await page.mouse.wheel(0, 600);
+  await expect.poll(() => list.evaluate(element => element.scrollTop)).toBeGreaterThan(before);
 });

@@ -74,3 +74,15 @@ describe("topic list", () => {
     expect(() => parseTopicList({ items: [{ topic: "a" }, { topic: "a" }] })).toThrow();
   });
 });
+
+describe("new-note placement", async () => {
+  const { slugify, placePath } = await import("./NotesPanel");
+  it("files a title as a safe name inside a chosen or new folder", () => {
+    expect(slugify("Café Staging Checklist!")).toBe("cafe-staging-checklist");
+    expect(slugify("../../etc/passwd")).toBe("etcpasswd");
+    expect(placePath({ folder: "", newFolder: "", name: "Plan", nameTouched: false })).toBe("plan.md");
+    expect(placePath({ folder: "runbooks", newFolder: "", name: "notes.md", nameTouched: true })).toBe("runbooks/notes.md");
+    expect(placePath({ folder: "__new_folder__", newFolder: "Field Work/2026 ", name: "Day 1", nameTouched: true })).toBe("field-work/2026/day-1.md");
+    expect(placePath({ folder: "", newFolder: "", name: "", nameTouched: false })).toBe("");
+  });
+});
