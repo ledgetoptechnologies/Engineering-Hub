@@ -18,7 +18,7 @@ async function fixture(page: Page) {
         version: 3, updated_by: "claude" },
     ] as Stored[],
     posts: [] as { body: Record<string, unknown>; csrf: string | undefined }[],
-    listStatus: 200, truncated: false, slowProject: null as string | null,
+    listStatus: 200, truncated: false, slowProject: null as string | null, pageSize: 0, afters: [] as (string | null)[],
     release: null as (() => void) | null,
     docStatus: 200, docReads: 0, slowDocPath: null as string | null,
     releaseDoc: null as (() => void) | null,
@@ -41,6 +41,14 @@ async function fixture(page: Page) {
       const query = url.searchParams.get("query")?.toLowerCase();
       const items = state.notes.filter(note => note.project === project
         && (!query || `${note.title}\n${note.content}`.toLowerCase().includes(query))).map(meta);
+      if (state.pageSize) {
+        // Real path-ordered paging, like the server: continue after the given path.
+        const after = url.searchParams.get("after"), prefix = url.searchParams.get("path_prefix");
+        state.afters.push(after);
+        const rest = items.sort((a, b) => a.path.localeCompare(b.path))
+          .filter(item => (!after || item.path > after) && (!prefix || item.path.startsWith(prefix + "/")));
+        return respond({ items: rest.slice(0, state.pageSize), truncated: rest.length > state.pageSize });
+      }
       return respond({ items, truncated: state.truncated });
     }
     if (path === "/api/hub/v1/notes/document") {
@@ -197,7 +205,8 @@ test("notes render as inert text with metadata, counts and truncation", async ({
   await page.goto("/#/notes");
   const panel = panelOf(page);
   await expect(panel.getByText("1 note in engineering-hub.", { exact: false })).toBeVisible();
-  await expect(panel.getByText("Showing the first 50.", { exact: false })).toBeVisible();
+  await expect(panel.getByText("More notes below the list.", { exact: false })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Show more notes" })).toBeVisible();
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
   // Formatted by default: raw HTML in a note is text, never markup.
@@ -511,4 +520,42 @@ test("the note list scrolls as one area even with the pointer over a note", asyn
   const before = await list.evaluate(element => element.scrollTop);
   await page.mouse.wheel(0, 600);
   await expect.poll(() => list.evaluate(element => element.scrollTop)).toBeGreaterThan(before);
+});
+
+test("Show more notes continues the list after the last path until everything is shown", async ({ page }) => {
+  const state = await fixture(page);
+  const base = state.notes[0];
+  state.notes = Array.from({ length: 5 }, (_, i) => ({ ...base, path: `plans/note-${i}.md`, title: `Plan ${i}` }));
+  state.pageSize = 2;
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  const titles = panel.locator(".notes-list .note-link strong");
+  await expect(titles).toHaveText(["Plan 0", "Plan 1"]);
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(titles).toHaveText(["Plan 0", "Plan 1", "Plan 2", "Plan 3"]);
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(titles).toHaveText(["Plan 0", "Plan 1", "Plan 2", "Plan 3", "Plan 4"]);
+  await expect(panel.getByRole("button", { name: "Show more notes" })).toHaveCount(0);
+  expect(state.afters).toEqual([null, "plans/note-1.md", "plans/note-3.md"]);
+});
+
+test("searching after Show more starts the list over from the first page", async ({ page }) => {
+  const state = await fixture(page);
+  const base = state.notes[0];
+  state.notes = [...Array.from({ length: 3 }, (_, i) => ({ ...base, path: `plans/note-${i}.md`, title: `Plan ${i}` })),
+    ...Array.from({ length: 3 }, (_, i) => ({ ...base, path: `runbooks/step-${i}.md`, title: `Step ${i}` }))];
+  state.pageSize = 2;
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  const titles = panel.locator(".notes-list .note-link strong");
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(titles).toHaveText(["Plan 0", "Plan 1", "Plan 2", "Step 0"]);
+  await panel.locator("select").filter({ hasText: "Path starts with" }).selectOption("prefix");
+  await panel.getByRole("searchbox", { name: "Search notes" }).fill("runbooks");
+  await panel.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(titles).toHaveText(["Step 0", "Step 1"]);
+  expect(state.afters.at(-1)).toBeNull();
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(titles).toHaveText(["Step 0", "Step 1", "Step 2"]);
+  expect(state.afters.at(-1)).toBe("runbooks/step-1.md");
 });

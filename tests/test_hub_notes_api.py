@@ -99,6 +99,18 @@ def test_lists_search_prefix_and_limits_do_not_dump_content(composed):
             'project': 'engineering-hub', 'path_prefix': 'notes'}).json()['items']) == 3
         assert client.get(API, headers=headers, params={
             'project': 'engineering-hub', 'query': 'x', 'path_prefix': 'notes'}).status_code == 422
+        # Path-ordered pages continue after the last path: no gaps, no repeats.
+        first = client.get(API, headers=headers, params={'project': 'engineering-hub', 'limit': 2}).json()
+        rest = client.get(API, headers=headers, params={'project': 'engineering-hub', 'limit': 2,
+                                                        'after': first['items'][-1]['path']}).json()
+        assert [item['path'] for item in first['items'] + rest['items']] == [f'notes/{i}.md' for i in range(3)]
+        assert rest['truncated'] is False
+        within = client.get(API, headers=headers, params={'project': 'engineering-hub', 'path_prefix': 'notes',
+                                                          'after': 'notes/0.md'}).json()
+        assert [item['path'] for item in within['items']] == ['notes/1.md', 'notes/2.md']
+        refused = client.get(API, headers=headers, params={'project': 'engineering-hub', 'query': 'x', 'after': 'notes/0.md'})
+        assert refused.status_code == 422 and refused.json()['detail']['code'] == 'search_has_no_next_page'
+        assert client.get(API, headers=headers, params={'project': 'engineering-hub', 'after': '../x'}).status_code == 422
 
 
 @pytest.mark.parametrize('patch', [{'author': 'claude'}, {'expected_version': True},

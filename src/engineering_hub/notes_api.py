@@ -48,14 +48,18 @@ def attach_notes_routes(app, *, repository, actor):
     def list_notes(request: Request, project: str = Query(min_length=1, max_length=64),
                    query: str | None = Query(default=None, min_length=1, max_length=200),
                    path_prefix: str | None = Query(default=None, min_length=1, max_length=512),
-                   limit: int = Query(default=50, ge=1, le=99)):
+                   limit: int = Query(default=50, ge=1, le=99),
+                   after: str | None = Query(default=None, min_length=1, max_length=512)):
         actor(request)
         if query is not None and path_prefix is not None:
             raise HTTPException(422, detail={'code': 'choose_note_search_or_prefix'})
+        if query is not None and after is not None:
+            # Search results are ranked, not path-ordered, so they can't continue from a path.
+            raise HTTPException(422, detail={'code': 'search_has_no_next_page'})
         def read(repo):
             entries = (repo.search(query=query, project=project, limit=limit + 1)
                        if query is not None else
-                       repo.list(project=project, path_prefix=path_prefix, limit=limit + 1))
+                       repo.list(project=project, path_prefix=path_prefix, limit=limit + 1, after=after))
             return {'items': [entry_dict(entry, include_content=False) for entry in entries[:limit]],
                     'truncated': len(entries) > limit}
         return invoke(read)
