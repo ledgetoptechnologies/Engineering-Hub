@@ -99,8 +99,7 @@ def test_invalid_enrollment_has_no_defaults_or_code_selection(change):
     assert str(error.value) == 'trusted manual staging session unavailable'
 
 
-@pytest.fixture
-def dependencies(monkeypatch):
+def synthetic_dependencies(monkeypatch):
     events, observers, captured = [], [], []
     def transport(origin, **kwargs):
         captured.append((origin, kwargs))
@@ -128,6 +127,11 @@ def dependencies(monkeypatch):
             events.append('observer-close')
     monkeypatch.setattr(module, 'CurrentExecutorObserver', Observer)
     return SimpleNamespace(events=events, observers=observers, captured=captured)
+
+
+@pytest.fixture
+def dependencies(monkeypatch):
+    return synthetic_dependencies(monkeypatch)
 
 
 def construct(tmp_path, data=None):
@@ -350,53 +354,17 @@ async def test_installed_selector_uses_actual_async_composition_callbacks(instal
 
 
 @pytest.mark.parametrize('action,expected_calls', [('accept', 1), ('decline', 0)])
-async def test_installed_async_acceptance_keeps_shared_loop_health_responsive(
-        tmp_path, dependencies, monkeypatch, action, expected_calls):
+def test_installed_async_acceptance_keeps_shared_loop_health_responsive(action, expected_calls):
     """Supersedes the old 1/4/2 synchronous snapshot/accept/decline counts.
 
     Metadata and decline no longer observe; one owned preflight checks accept.
     This measures only isolated ASGI health while synthetic identity I/O waits,
     not real NAS/Engine latency or responsiveness during durable audit commits.
     """
-    import threading
-    with composed(tmp_path, dependencies) as state:
-        actor = state.composition._enrollment.operator_actor
-        before = dependencies.events.count('observe')
-        snapshot = state.broker.snapshot(actor=actor)
-        assert dependencies.events.count('observe') - before == 0
-        observer_type = type(dependencies.observers[0])
-        original = observer_type.observe_verified
-        entered, release = threading.Event(), threading.Event()
-        def slow_observation(observer):
-            entered.set()
-            if not release.wait(2):
-                raise TimeoutError('Synthetic observation was not drained')
-            return original(observer)
-        monkeypatch.setattr(observer_type, 'observe_verified', slow_observation)
-        before = dependencies.events.count('observe')
-        operation = asyncio.create_task(state.broker.decide_async(actor=actor,
-            request_id=snapshot['request_id'], expected_revision=snapshot['revision'], action=action))
-        try:
-            if action == 'accept':
-                async with asyncio.timeout(1):
-                    while not entered.is_set():
-                        await asyncio.sleep(.001)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=state.core),
-                                         base_url='https://hub.example') as client:
-                latencies = []
-                for _ in range(5):
-                    started = time.monotonic()
-                    result = await asyncio.wait_for(client.get('/health'), timeout=.25)
-                    latencies.append(time.monotonic() - started)
-                    assert result.status_code == 200
-                assert max(latencies) < .25
-            if action == 'accept':
-                assert not operation.done() and state.client.submissions == []
-        finally:
-            release.set()
-            await operation
-        assert dependencies.events.count('observe') - before == expected_calls
-        assert state.client.submissions == []
+    from tests.responsiveness_probe import run_isolated_probe
+    report = run_isolated_probe('health', action=action)
+    assert report['latency_accepted'] and report['functional_verified']
+    assert report['observation_calls'] == expected_calls
 
 
 def test_verified_proof_clipped_to_original_report_deadline(tmp_path, dependencies):

@@ -8,6 +8,7 @@ import secrets
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 from uuid import uuid4
@@ -23,8 +24,8 @@ from tests.test_hub_queued_pilot import rig, submit, machine_job
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='real Linux owned SQLite')
 
 
-@pytest.fixture
-def case(rig):
+@contextmanager
+def async_pilot_case(rig):
     state = SimpleNamespace(calls=0, block_at=None, entered=threading.Event(),
                             release=threading.Event(), delay=0, threads=[], reject=False)
     target = rig.bridge.target
@@ -63,6 +64,12 @@ def case(rig):
     finally:
         state.release.set()
         broker.close()
+
+
+@pytest.fixture
+def case(rig):
+    with async_pilot_case(rig) as value:
+        yield value
 
 
 async def accept(case):
@@ -314,46 +321,19 @@ async def test_release_proof_expiry_during_local_validation_keeps_capacity_held(
     assert case.gate.admission_state == 'closed'
 
 
-async def test_real_unified_mcp_ping_and_overview_remain_responsive_during_observation(case, tmp_path, monkeypatch):
+def test_real_unified_mcp_ping_and_overview_remain_responsive_during_observation():
     """Real in-process Hub/bus routes, synthetic delayed identity; not NAS latency."""
-    import httpx
-    from agent_message_bus.app import create_app as create_bus
-    from engineering_hub.app import Settings, create_app
-    from engineering_hub.auth import AuthConfig
-    from tests.test_hub_unified_mcp import AUTH, BASE, headers, result, security
-    monkeypatch.setenv('AGENT_BUS_ALLOWED_HOSTS', '127.0.0.1:*')
-    bus = create_bus(db_path=tmp_path / 'messages.sqlite3', audit_path=tmp_path / 'audit.jsonl',
-        file_root=tmp_path / 'files', auth=AUTH, push_events_operational=False,
-        transport_security_settings=security())
-    core = create_app(Settings(Path(case.repo.path), AUTH, AuthConfig('https://hub.test',
-        human_auth_mode='cloudflare_access', cloudflare_issuer='https://fixture.cloudflareaccess.com',
-        cloudflare_audience='fixture', cloudflare_allowed_emails=('beau@example.test',)),
-        agent_allowed_hosts=('127.0.0.1:8000',)), repository=case.repo,
-        work_queue=case.queue, bus_app=bus)
-    case.observation.delay = 1.0
-    await accept(case)
-    submit(case)
-    async with core.router.lifespan_context(core):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core), base_url=BASE) as client:
-            initialized = await client.post('/mcp', headers=headers(), json={'jsonrpc': '2.0', 'id': 1,
-                'method': 'initialize', 'params': {'protocolVersion': '2025-06-18', 'capabilities': {},
-                    'clientInfo': {'name': 'isolated-latency-check', 'version': '1'}}})
-            result(initialized)
-            session = initialized.headers['Mcp-Session-Id']
-            notified = await client.post('/mcp', headers=headers(session=session), json={
-                'jsonrpc': '2.0', 'method': 'notifications/initialized'})
-            assert notified.status_code == 202
-            running = asyncio.create_task(case.bridge.run_once())
-            latencies = []
-            while not running.done():
-                started = time.monotonic()
-                response = await client.post('/mcp', headers=headers(session=session), json={
-                    'jsonrpc': '2.0', 'id': 2, 'method': 'ping'})
-                assert result(response) == {}
-                overview = await client.get('/api/hub/v1/overview', headers=headers())
-                assert overview.status_code == 200
-                latencies.append(time.monotonic() - started)
-                await asyncio.sleep(.005)
-            assert (await running)['state'] == 'succeeded'
-            assert len(latencies) >= 5 and max(latencies) < .25
-            assert (await client.delete('/mcp', headers=headers(session=session))).status_code == 200
+    from tests.responsiveness_probe import run_isolated_probe
+    report = run_isolated_probe('unified')
+    assert report['latency_accepted'] and report['functional_verified']
+
+
+def test_synchronous_observer_negative_control_rejects_latency_only():
+    from tests.responsiveness_probe import run_isolated_probe
+    report = run_isolated_probe('unified', negative_control=True)
+    assert report['workflow_state'] == 'succeeded'
+    assert report['session_deleted'] and report['lifespan_drained']
+    assert report['inline_observations'] > 0
+    assert report['inline_observation_overlaps_request'] is True
+    assert report['max_seconds'] >= .3
+    assert report['rejection'] == 'latency_limit_exceeded'
