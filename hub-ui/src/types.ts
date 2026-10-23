@@ -23,7 +23,7 @@ export interface Review {
 export interface Task extends Versioned {
   project: ProjectId;
   title: string;
-  status: "assigned" | "claimed" | "in_review" | "verified";
+  status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn";
   owner: Agent | null;
   candidate_commit: string | null;
   review: Review | null;
@@ -35,17 +35,27 @@ export interface Task extends Versioned {
   proposed_by?: Agent | null;
   /** Audited time the task entered its current status; null when not recorded. */
   state_since?: string | null;
+  /** Present on withdrawn records only: superseded work kept for history. */
+  withdrawn_reason?: string | null;
+  superseded_by?: string | null;
+  withdrawn_by?: string | null;
+  withdrawn_at?: string | null;
 }
 export interface Decision extends Versioned {
   project: ProjectId;
   title: string;
   options: string[];
   protected: boolean;
-  status: "open" | "answered";
+  status: "open" | "answered" | "withdrawn";
   answer: string | null;
   answered_by?: string;
   /** True only when the server accepts a typed answer instead of one of the options. */
   allow_text?: boolean;
+  /** Present on withdrawn records only: superseded work kept for history. */
+  withdrawn_reason?: string | null;
+  superseded_by?: string | null;
+  withdrawn_by?: string | null;
+  withdrawn_at?: string | null;
   details?: string | null;
   links?: { label: string; url: string }[] | null;
   execution_authorization: false;
@@ -137,6 +147,8 @@ export interface Overview {
   capabilities: Capabilities;
   /** Optional on older servers; advisory image observations, not deployment authority. */
   image_versions?: ImageVersionsSummary | null;
+  /** Split out by the client on load so every list and count skips them; see withdrawn.ts. */
+  withdrawn?: { tasks: Task[]; decisions: Decision[] };
 }
 export type ImageVersionState = "up_to_date" | "update_available" | "unknown";
 export interface ImageVersionStatus {

@@ -69,7 +69,7 @@ def browser_route_allowed(method, path):
         return re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
     return method == 'POST' and (path in _POST or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
-        or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/context', path) is not None
+        or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         or path == '/api/hub/v1/projects'
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/archive', path) is not None)
 

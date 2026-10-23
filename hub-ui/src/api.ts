@@ -1,4 +1,5 @@
 import { createDemoOverview, createDemoTopic, DEMO_SESSION } from "./mocks";
+import { canWithdrawDecision, canWithdrawTask, splitWithdrawn } from "./withdrawn";
 import type {
   Agent,
   Decision,
@@ -179,9 +180,9 @@ export class HubClient {
     return session;
   }
   async getOverview(): Promise<Overview> {
-    if (this.mode === "live") return this.request("/overview");
+    if (this.mode === "live") return splitWithdrawn(await this.request<Overview>("/overview"));
     this.demoHuman();
-    return structuredClone(this.demo);
+    return splitWithdrawn(structuredClone(this.demo));
   }
   async getImageVersions(): Promise<ImageVersionsSummary | null> {
     if (this.mode === "demo") return null;
@@ -233,6 +234,32 @@ export class HubClient {
       updated_at: new Date().toISOString(),
     });
     return structuredClone(decision);
+  }
+  /** Retire a superseded task or question; the server keeps it, with the reason and replacement. */
+  async withdraw(
+    kind: "task" | "decision",
+    id: string,
+    revision: number,
+    reason: string,
+    supersededBy: string | null,
+    csrf: string,
+  ): Promise<Task | Decision> {
+    const body = { expected_revision: revision, reason, ...(supersededBy ? { superseded_by: supersededBy } : {}) };
+    if (this.mode === "live")
+      return this.request(`/${kind === "task" ? "tasks" : "decisions"}/${encodeURIComponent(id)}/withdraw`, body, csrf);
+    this.demoHuman(csrf);
+    const item = kind === "task" ? this.demo.tasks.find((task) => task.id === id)
+      : this.demo.decisions.find((decision) => decision.id === id);
+    if (!item) throw new HubApiError(404, "not_found");
+    if (item.revision !== revision) throw new HubApiError(409, "revision_conflict");
+    if (kind === "task" ? !canWithdrawTask(item as Task) : !canWithdrawDecision(item as Decision))
+      throw new HubApiError(409, "withdraw_not_allowed");
+    Object.assign(item, {
+      status: "withdrawn", withdrawn_reason: reason.trim(), superseded_by: supersededBy,
+      withdrawn_by: this.demoSession.actor, withdrawn_at: new Date().toISOString(),
+      revision: item.revision + 1, updated_at: new Date().toISOString(),
+    });
+    return structuredClone(item);
   }
   async createTask(
     project: ProjectId,

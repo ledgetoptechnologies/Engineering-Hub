@@ -263,7 +263,7 @@ def test_mcp_discovery_and_topic_tools_preserve_original_identity(make_hub):
                                  "clientInfo": {"name": "fixture", "version": "1"}})
     assert response.status_code == 200, response.text
     tools = rpc("tools/list", {}).json()["result"]["tools"]
-    assert len(tools) == 21
+    assert len(tools) == 22
     for tool in ("hub_topic_peers", "hub_topic_preflight"):
         arguments = {"topic": "engineering-hub"}
         if tool.endswith("preflight"):

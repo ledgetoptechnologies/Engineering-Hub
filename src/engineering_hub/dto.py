@@ -18,6 +18,8 @@ Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
 HumanId = Annotated[str, Field(pattern=r'^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$')]
+# One pattern, not a Literal union, so the published schema is stable across typing-cache resets.
+WithdrawnBy = Annotated[str, Field(pattern=r'^(?:hermes|codex|claude|human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64}))$')]
 RunState = Literal['pending', 'running', 'succeeded', 'failed', 'rolled_back', 'held']
 RunEventState = Literal['running', 'succeeded', 'failed', 'rolled_back', 'held']
 
@@ -46,7 +48,7 @@ class ContextLinkDTO(ResponseDTO):
 class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
-    status: Literal['assigned', 'claimed', 'in_review', 'verified']
+    status: Literal['assigned', 'claimed', 'in_review', 'verified', 'withdrawn']
     owner: NullableAgentId
     candidate_commit: Commit | None
     review: ReviewDTO | None
@@ -57,6 +59,11 @@ class TaskDTO(EntityDTO):
     state_since: str | None = None
     details: str | None = None
     links: list[ContextLinkDTO] | None = None
+    # Present only on withdrawn records: why, by whom, when, and the replacement if any.
+    withdrawn_reason: str | None = None
+    superseded_by: str | None = None
+    withdrawn_by: WithdrawnBy | None = None
+    withdrawn_at: str | None = None
 
 
 class DecisionDTO(EntityDTO):
@@ -64,13 +71,18 @@ class DecisionDTO(EntityDTO):
     title: str
     options: list[str]
     protected: bool
-    status: Literal['open', 'answered']
+    status: Literal['open', 'answered', 'withdrawn']
     answer: str | None
     execution_authorization: Literal[False]
     answered_by: HumanId | None = None
     details: str | None = None
     links: list[ContextLinkDTO] | None = None
     allow_text: bool = False
+    # Present only on withdrawn records: why, by whom, when, and the replacement if any.
+    withdrawn_reason: str | None = None
+    superseded_by: str | None = None
+    withdrawn_by: WithdrawnBy | None = None
+    withdrawn_at: str | None = None
 
 
 class RunEventDTO(ResponseDTO):

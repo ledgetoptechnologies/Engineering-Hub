@@ -8,6 +8,8 @@ import { DetailLinks, DetailsBlock, ImageViewer, useAttachments } from "../Detai
 import { attachmentUrl, parseContext, type DetailImage } from "../details";
 import { Markdown } from "../markdown";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { canWithdrawDecision } from "../withdrawn";
+import { WithdrawDialog } from "./Withdraw";
 
 export const MAX_FREE_TEXT = 4096;
 /** Typed answers only when the server says so, and never on protected requests. */
@@ -29,12 +31,15 @@ export function DecisionCard({ hub, decision }: { hub: Hub; decision: Decision }
     selected: current !== null && !decision.options.includes(current) }));
   // The pop-up is a sibling of the card's form, never inside it, so its buttons can't submit the card.
   const [full, setFull] = useState<{ focus: string | null } | null>(null);
+  const [withdrawing, setWithdrawing] = useState(false);
   return (
     <>
       <DecisionForm hub={hub} decision={decision} draft={draft} setDraft={setDraft}
-        onOpenFull={(image) => setFull({ focus: image?.id ?? null })} />
+        onOpenFull={(image) => setFull({ focus: image?.id ?? null })}
+        onWithdraw={canWithdrawDecision(decision) ? () => setWithdrawing(true) : undefined} />
       {full && <QuestionView hub={hub} decision={decision} draft={draft} setDraft={setDraft} focus={full.focus}
         onClose={() => setFull(null)} />}
+      {withdrawing && <WithdrawDialog hub={hub} kind="decision" item={decision} onClose={() => setWithdrawing(false)} />}
     </>
   );
 }
@@ -87,9 +92,9 @@ function QuestionView({ hub, decision, draft, setDraft, focus, onClose }: {
 }
 
 /** The answer form, shared by the card and the full-question view so a choice or typed answer carries across. */
-function DecisionForm({ hub, decision, draft, setDraft, onOpenFull, full = false }: {
+function DecisionForm({ hub, decision, draft, setDraft, onOpenFull, onWithdraw, full = false }: {
   hub: Hub; decision: Decision; draft: Draft; setDraft: (draft: Draft) => void;
-  onOpenFull?: (image?: DetailImage) => void; full?: boolean;
+  onOpenFull?: (image?: DetailImage) => void; onWithdraw?: () => void; full?: boolean;
 }) {
   const choice = hub.decisionChoices[decision.id];
   const current = choice?.revision === decision.revision ? choice.answer : null;
@@ -141,6 +146,8 @@ function DecisionForm({ hub, decision, draft, setDraft, onOpenFull, full = false
         <div className="decision-footer">
           <span>
             {decision.protected ? "Protected request · not an execution grant" : "Records a decision. Does not deploy."}
+            {onWithdraw && !full && <> · <button type="button" className="link-button" onClick={onWithdraw}>
+              No longer needed? Withdraw</button></>}
           </span>
           <button type="submit" className="dark-button"
             disabled={!hub.writable || current === null || !acceptsAnswer(decision, current)}>

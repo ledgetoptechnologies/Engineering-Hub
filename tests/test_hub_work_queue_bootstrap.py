@@ -79,7 +79,7 @@ def test_real_app_passes_configured_queue_to_authenticated_mcp(tmp_path):
         assert response.status_code == 200
         tools = {tool['name'] for tool in response.json()['result']['tools']}
         # 21 composed Hub tools plus the 7 explicitly configured queue tools.
-        assert len(tools) == 28 and {
+        assert len(tools) == 29 and {
             'hub_work_status', 'hub_work_jobs', 'hub_work_get', 'hub_work_submit',
             'hub_work_claim', 'hub_work_renew', 'hub_work_complete',
         } <= tools
