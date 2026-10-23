@@ -3804,3 +3804,17 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
   .question-side { overflow: visible; }
   .question-gallery img { height: auto; min-height: 0; max-height: 70vh; }
 }
+.session-reconciliation-panel {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.session-reconciliation-panel code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.session-reconciliation-panel .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
