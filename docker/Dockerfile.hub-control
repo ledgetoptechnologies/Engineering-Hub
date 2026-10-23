@@ -7,7 +7,9 @@ COPY hub-ui/ ./
 RUN npm run build
 
 FROM python:3.12-slim AS builder
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv
+# NumPy initializes its BLAS pool during import, before FastEmbed's ONNX thread
+# setting applies. Default to one thread for this bounded, already-threaded app.
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv OPENBLAS_NUM_THREADS=1
 WORKDIR /build
 RUN python -m pip install --no-cache-dir uv==0.11.17
 COPY pyproject.toml uv.lock README.md ./
@@ -16,12 +18,12 @@ RUN uv sync --locked --no-default-groups --no-editable
 # Unified MCP retains offline semantic search from the existing bus. Bake the
 # same model rather than silently dropping that capability or downloading at runtime.
 RUN mkdir -p /opt/fastembed-cache \
-    && /opt/venv/bin/python -c "from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed-cache', providers=['CPUExecutionProvider'], threads=2); list(model.embed(['Engineering Hub semantic model image preparation.']))" \
+    && /opt/venv/bin/python -c "from fastembed import TextEmbedding; model=TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed-cache', providers=['CPUExecutionProvider'], threads=1); list(model.embed(['Engineering Hub semantic model image preparation.']))" \
     && chmod -R a+rX /opt/fastembed-cache
 
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/opt/venv/bin:${PATH}" \
-    HUB_UI_DIRECTORY=/app/dashboard HUB_DB=/var/lib/hub/hub.sqlite3
+    HUB_UI_DIRECTORY=/app/dashboard HUB_DB=/var/lib/hub/hub.sqlite3 OPENBLAS_NUM_THREADS=1
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Engineering Hub Control" \
       org.opencontainers.image.source="https://github.com/ledgetoptechnologies/Engineering-Hub" \
