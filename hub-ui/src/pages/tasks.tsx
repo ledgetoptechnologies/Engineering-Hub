@@ -5,6 +5,8 @@ import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, names, pretty } from "../ui";
 import { DetailsBlock } from "../DetailsBlock";
+import { canWithdrawTask } from "../withdrawn";
+import { WithdrawDialog } from "./Withdraw";
 
 export function stateAge(task: Task): string {
   const age = relativeAge(task.state_since);
@@ -18,7 +20,9 @@ export const statusTone = (task: Task) =>
 
 export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
   const [expanded, setExpanded] = useState(false);
+  const [withdrawing, setWithdrawing] = useState(false);
   return (
+    <>
     <details className="task-row" onToggle={(event) => setExpanded((event.currentTarget as HTMLDetailsElement).open)}>
       <summary>
         <span>
@@ -45,8 +49,14 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
           · Repairs used: {task.repair_count}/3
         </p>
         <p>Review is bound to the exact commit, not permission to deploy to production.</p>
+        {canWithdrawTask(task) && hub.writable && (
+          <p><button type="button" className="link-button" onClick={() => setWithdrawing(true)}>
+            No longer needed? Withdraw this task</button></p>
+        )}
       </div>
     </details>
+    {withdrawing && <WithdrawDialog hub={hub} kind="task" item={task} onClose={() => setWithdrawing(false)} />}
+    </>
   );
 }
 

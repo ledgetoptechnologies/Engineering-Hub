@@ -13,7 +13,8 @@ export const STAGES: { key: Task["status"]; label: string; color: string }[] = [
 ];
 
 export function stageCounts(tasks: Task[]): Record<Task["status"], number> {
-  const counts = { assigned: 0, claimed: 0, in_review: 0, verified: 0 };
+  // withdrawn is always 0 here: overview loading moves withdrawn tasks out of hub.data.tasks.
+  const counts = { assigned: 0, claimed: 0, in_review: 0, verified: 0, withdrawn: 0 };
   for (const task of tasks) counts[task.status]++;
   return counts;
 }

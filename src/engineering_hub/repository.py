@@ -18,7 +18,12 @@ AGENTS = frozenset({'hermes', 'codex', 'claude'})
 # Audit actions that set a task's status. Run bookkeeping saves the task without
 # changing it, so those actions must not reset how long a task has been waiting.
 TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed',
-                       'task.context_invalidated')
+                       'task.context_invalidated', 'task.withdrawn')
+# Audit actions that record who created a task or decision. Withdrawal by an agent
+# is limited to the agent named here, read from the audit log, never from the record.
+CREATION_ACTIONS = {'task': ('task.created', 'task.proposed'), 'decision': ('decision.created',)}
+WITHDRAWABLE_TASK_STATUSES = frozenset({'assigned', 'claimed'})
+_UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 HELD_REASONS = frozenset({'candidate_outcome_uncertain', 'staging_paused', 'rollback_failed',
                          'rollback_outcome_uncertain', 'rollback_smoke_failed', 'rollback_smoke_outcome_uncertain'})
 
@@ -379,6 +384,8 @@ class HubRepository:
             self._cas(item, expected_revision)
             if item['owner'] != actor:
                 raise HubError('forbidden', 403)
+            if item['status'] == 'withdrawn':
+                raise HubError('withdrawn', 409)
             self._no_active_run(db, identity)
             item.update(candidate_commit=commit, review=None, status='in_review')
             return self._save(db, actor, 'task.candidate', 'task', item)
@@ -433,6 +440,8 @@ class HubRepository:
                 if item['status'] != 'open':
                     raise HubError('decision_closed', 409)
             else:
+                if item['status'] == 'withdrawn':
+                    raise HubError('withdrawn', 409)
                 # A queued manifest/review may already bind the task revision.
                 # Do not mutate that admission surface through this new API.
                 if self.queued_pilot_enrolled(db):
@@ -449,6 +458,62 @@ class HubRepository:
 
     def list_decisions(self):
         return self._list('decision')
+
+    @staticmethod
+    def _creator(db, kind, identity):
+        marks = ','.join('?' * len(CREATION_ACTIONS[kind]))
+        row = db.execute(f'SELECT actor FROM hub_audit WHERE entity_id=? AND revision=1 AND action IN ({marks}) '
+                         'ORDER BY sequence LIMIT 1', (identity, *CREATION_ACTIONS[kind])).fetchone()
+        return row['actor'] if row else None
+
+    def withdraw(self, actor, kind, identity, expected_revision, reason, superseded_by=None):
+        """Retire an unstarted task or an unanswered, unprotected decision. Nothing is deleted.
+
+        A human may withdraw any eligible item; an agent only one it created, per the
+        audit log. Withdrawal never approves, answers or reviews anything: a task with a
+        candidate, review or active run, a protected decision and an answered decision
+        are refused. Retrying the same withdrawal returns the withdrawn item.
+        """
+        self._actor(actor)
+        if kind not in CREATION_ACTIONS:
+            raise HubError('invalid_kind')
+        try:
+            reason = bounded_text(reason, 500)
+        except ValueError:
+            raise HubError('invalid_reason') from None
+        if superseded_by is not None and (type(superseded_by) is not str or _UUID.fullmatch(superseded_by) is None
+                                          or superseded_by == identity):
+            raise HubError('invalid_replacement')
+        with self._transaction() as db:
+            item = self._get(db, identity, kind)
+            # Archived projects keep their records; retiring a stale one there is allowed.
+            self._project(item['project'], db, require_active=False)
+            if actor in AGENTS and self._creator(db, kind, identity) != actor:
+                raise HubError('forbidden', 403)
+            if item['status'] == 'withdrawn':
+                if (item.get('withdrawn_by') == actor and item.get('withdrawn_reason') == reason
+                        and item.get('superseded_by') == superseded_by):
+                    return item
+                raise HubError('withdrawn', 409)
+            self._cas(item, expected_revision)
+            if kind == 'decision':
+                if item.get('protected') is not False:
+                    raise HubError('protected_decision', 409)
+                if item['status'] != 'open':
+                    raise HubError('decision_closed', 409)
+            else:
+                if (item['status'] not in WITHDRAWABLE_TASK_STATUSES or item.get('candidate_commit') is not None
+                        or item.get('review') is not None):
+                    raise HubError('task_in_progress', 409)
+                self._no_active_run(db, identity)
+            if superseded_by is not None:
+                replacement = self._get(db, superseded_by, kind)
+                if replacement['status'] == 'withdrawn':
+                    raise HubError('invalid_replacement')
+                self._project(replacement['project'], db)
+            item.update(status='withdrawn', withdrawn_reason=reason, superseded_by=superseded_by,
+                        withdrawn_by=actor, withdrawn_at=datetime.now(timezone.utc).isoformat())
+            return self._save(db, actor, kind + '.withdrawn', kind, item)
 
     def answer_decision(self, actor, identity, expected_revision, answer):
         self._actor(actor, human=True)

@@ -1531,6 +1531,55 @@
         }
       }
     },
+    "/api/hub/v1/tasks/{task_id}/withdraw": {
+      "post": {
+        "summary": "Withdraw Task",
+        "operationId": "withdraw_task_api_hub_v1_tasks__task_id__withdraw_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Withdraw"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/tasks/{task_id}": {
       "get": {
         "summary": "Get Task",
@@ -1792,6 +1841,55 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/EntityContext"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/decisions/{decision_id}/withdraw": {
+      "post": {
+        "summary": "Withdraw Decision",
+        "operationId": "withdraw_decision_api_hub_v1_decisions__decision_id__withdraw_post",
+        "parameters": [
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Withdraw"
               }
             }
           }
@@ -2856,7 +2954,8 @@
             "type": "string",
             "enum": [
               "open",
-              "answered"
+              "answered",
+              "withdrawn"
             ],
             "title": "Status"
           },
@@ -2917,6 +3016,59 @@
             "type": "boolean",
             "title": "Allow Text",
             "default": false
+          },
+          "withdrawn_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Reason"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "withdrawn_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn By"
+          },
+          "withdrawn_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn At"
           }
         },
         "additionalProperties": false,
@@ -5013,7 +5165,8 @@
               "assigned",
               "claimed",
               "in_review",
-              "verified"
+              "verified",
+              "withdrawn"
             ],
             "title": "Status"
           },
@@ -5124,6 +5277,59 @@
               }
             ],
             "title": "Links"
+          },
+          "withdrawn_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Reason"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          },
+          "withdrawn_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn By"
+          },
+          "withdrawn_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn At"
           }
         },
         "additionalProperties": false,
@@ -5360,6 +5566,40 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "Withdraw": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Reason"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "reason"
+        ],
+        "title": "Withdraw"
       },
       "WorkClaim": {
         "properties": {

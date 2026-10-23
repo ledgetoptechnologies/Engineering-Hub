@@ -1,6 +1,6 @@
 /** The view of Hub state that pages read. All mutation still goes through HubApp. */
 import type { FormEvent } from "react";
-import type { Decision, Overview, PublicReachability, Session, TopicSnapshot } from "./types";
+import type { Decision, Overview, PublicReachability, Session, Task, TopicSnapshot } from "./types";
 
 export interface DecisionChoice { revision: number; answer: string }
 
@@ -17,6 +17,8 @@ export interface Hub {
   chooseAnswer: (decision: Decision, answer: string) => void;
   recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void;
   requestPause: (paused: boolean) => void;
+  /** Withdraw a superseded task or question (kept for history). Resolves true when the server accepted it. */
+  withdraw: (kind: "task" | "decision", item: Task | Decision, reason: string, supersededBy: string | null) => Promise<boolean>;
   clearPrivateWorkspace: () => void;
   /** Re-read the workspace snapshot (after a successful human change). */
   refresh: () => Promise<void>;
