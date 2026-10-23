@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -36,8 +37,8 @@ class DistinctContainerClient(FakeClient):
         return response
 
 
-@pytest.fixture
-def rig(tmp_path):
+@contextmanager
+def queued_pilot_rig(tmp_path):
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     path = private / "hub.sqlite3"
@@ -55,6 +56,12 @@ def rig(tmp_path):
         yield result
     finally:
         result.owner.close()
+
+
+@pytest.fixture
+def rig(tmp_path):
+    with queued_pilot_rig(tmp_path) as value:
+        yield value
 
 
 def submit(rig, key="one"):

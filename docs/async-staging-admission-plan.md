@@ -316,3 +316,42 @@ configuration change is part of this refactor.
   original-command reconciliation, rollback and lifecycle suites. Run a complete
   immutable tracked-source backend export after integration, separately report
   real-proxy tests, then complete actual host/NAS acceptance before activation.
+
+### Strict responsiveness probes and process scope
+
+The unified MCP-ping-plus-overview and trusted-composition source health probes run
+through `python -m tests.responsiveness_probe` in a fresh interpreter. Each child
+constructs the same real application/SQLite ownership boundaries and retains the
+original maximum 250 ms assertion (combined ping+overview samples, or five health
+requests with 250 ms deadlines). Normal GC remains enabled; there is no warmup,
+pre-measurement collection, percentile substitution or retry. Parent tests check
+the structured result, actual loaded source paths/hashes and successful child
+exit. Reusable ordinary context managers/factories supply synthetic test facts;
+no fixture unwrapping or nested pytest run is used.
+This is an explicitly source-tree integration probe with strict source paths,
+not an installed-package fallback; installed image/wheel acceptance is separate.
+
+This separates the stated isolated-application check from thousands of unrelated
+prior test applications' process heap. A passive exact-source full-order prefix
+measured a 167.95 ms ping containing 165.62 ms generation-two GC on its request
+thread; the handler took 0.042 ms afterward. Earlier prefix GC pauses exceeded
+250 ms. The CI 356 ms request did not have GC instrumentation, so its exact cause
+remains unproved. Process isolation is not a fix or latency guarantee for
+production GC, durable audit/fsync, host contention, long-running applications
+or the real NAS/Engine connection; those still require separately scoped tests.
+
+A separate child-only negative control intercepts only the exact observation's
+executor submission and runs that 300 ms synthetic observer synchronously. Other
+executor calls remain unchanged. The workflow, authenticated MCP operations,
+session deletion and lifespan drain must succeed before the report specifically
+rejects latency. A generic child error/skip is not an accepted negative result.
+The blocked sample is retained even if that control finishes the workflow before
+five samples; it is not averaged away. Runtime code and admission rules are not
+changed by either probe.
+
+The child explicitly treats ResourceWarning as an error and captures unraisable
+cleanup failures through scenario/runner/temporary-state cleanup. Only after all
+latency measurements and cleanup does a GC resource audit surface deferred
+destructor failures; it cannot improve measured samples. Either failure prevents
+an accepted report. Dedicated warning and unraisable controls verify this rather
+than relying on the parent pytest process's warning hooks.
