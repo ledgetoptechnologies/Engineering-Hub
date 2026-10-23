@@ -193,6 +193,17 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                                                   details=details, links=links, allow_text=allow_text))
 
     @mcp.tool()
+    def hub_entity_withdraw(kind: str, entity_id: str, expected_revision: int, reason: str, ctx: Context,
+                            superseded_by: str | None = None) -> dict:
+        """Withdraw a task or decision you created that is no longer needed; nothing is deleted.
+
+        kind is 'task' or 'decision'. Only unstarted tasks (no candidate, review or run) and
+        unanswered, unprotected decisions qualify. Give a short reason and, if it was
+        replaced, the full id of the replacement. This never answers, approves or reviews.
+        """
+        return invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
+
+    @mcp.tool()
     def hub_run_list(ctx: Context) -> dict:
         """Read execution records without dispatching work."""
         identity(ctx)

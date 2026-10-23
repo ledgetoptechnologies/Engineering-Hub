@@ -536,6 +536,9 @@ export function HubApp() {
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
     requestPause: (paused: boolean) => setPauseChoice(paused),
+    withdraw: (kind, item, reason, supersededBy) => mutate(
+      () => client.withdraw(kind, item.id, item.revision, reason, supersededBy, session!.csrf_token!),
+      kind === "task" ? "Task withdrawn. It is kept under Withdrawn with its history." : "Question withdrawn. It is kept under Withdrawn with its history."),
     clearPrivateWorkspace, refresh: async () => { await refresh(); }, peers, topic, topicDraft, setTopicDraft, checkTopic, selectTopic, topicError, topicStale, peerState,
   } : null;
   const waitingCount = hub ? openDecisions(hub).length : 0;

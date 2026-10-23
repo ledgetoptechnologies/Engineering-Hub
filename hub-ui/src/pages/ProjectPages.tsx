@@ -12,6 +12,7 @@ import { Badge, EmptyState, Icon, names, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { LabelSetsPanel } from "./LabelSets";
 import { stateAge, statusLabel, statusTone, TaskTable } from "./tasks";
+import { WithdrawnList } from "./Withdraw";
 import { ArchiveProjectDialog, ProjectEditorDialog, STATUS_LABEL, STATUS_TONE } from "./ProjectEditor";
 import { safeHref } from "../markdown";
 import type { Project } from "../types";
@@ -19,7 +20,7 @@ import { readProject } from "../projectsApi";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
-  assigned: "Assigned", claimed: "In progress", in_review: "In review", verified: "Review passed",
+  assigned: "Assigned", claimed: "In progress", in_review: "In review", verified: "Review passed", withdrawn: "Withdrawn",
 };
 
 export interface ProjectStats {
@@ -409,6 +410,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
         <section className="panel decisions" aria-label={`${project.name} decisions`}>
           <DecisionList hub={projectHub} decisions={stats.waiting} emptyNote="No open questions for this project." />
           <RecentAnswers hub={hub} decisions={answeredDecisions(hub, id, 10)} />
+          <WithdrawnList hub={hub} kind="decision" project={id} />
           <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
         </section>
       )}
@@ -426,6 +428,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <TaskTable hub={projectHub} tasks={stats.tasks} empty="No tasks for this project yet." />
             </section>
           )}
+          <WithdrawnList hub={hub} kind="task" project={id} />
         </>
       )}
 

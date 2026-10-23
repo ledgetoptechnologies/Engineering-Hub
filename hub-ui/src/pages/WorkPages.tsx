@@ -5,6 +5,7 @@ import type { Task } from "../types";
 import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { TaskTable } from "./tasks";
+import { WithdrawnList } from "./Withdraw";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -30,6 +31,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
         <p className="panel-description">Pick an answer and record it. Recording an answer never deploys anything.</p>
         <DecisionList hub={hub} decisions={waiting} />
         <RecentAnswers hub={hub} decisions={answeredDecisions(hub, project === "all" ? undefined : project)} />
+        <WithdrawnList hub={hub} kind="decision" project={project === "all" ? undefined : project} />
         <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
       </section>
     </>
@@ -76,6 +78,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <PanelTitle title="Work in motion" count={tasks.length} />
         <p className="panel-description">An owner, an exact candidate, and a separate reviewer.</p>
         <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" ? "No tasks match these filters." : "No assigned work for this project."} />
+        <WithdrawnList hub={hub} kind="task" project={project === "all" ? undefined : project} />
       </section>
     </>
   );

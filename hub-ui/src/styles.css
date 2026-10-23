@@ -3817,3 +3817,13 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
   flex-wrap: wrap;
   gap: 8px;
 }
+
+/* Withdrawn tasks and questions: collapsed history, never open work. */
+.withdrawn-list { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+.withdrawn-list > summary { cursor: pointer; font-size: 13px; color: var(--muted); min-height: 24px; display: flex; align-items: center; }
+.withdrawn-list ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 10px; }
+.withdrawn-list li { display: grid; gap: 2px; padding: 8px 10px; border-radius: 8px; background: #f6f7fa; }
+.withdrawn-list li strong { font-weight: 550; color: var(--ink-3, #475569); text-decoration: line-through; text-decoration-color: #a3abbd; }
+.withdrawn-list li small { color: var(--muted); font-size: 12px; }
+.withdrawn-list li p { margin: 2px 0 0; font-size: 13px; }
+.withdraw-subject { margin: 4px 0 8px; }

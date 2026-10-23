@@ -179,6 +179,11 @@ class EntityContext(Revision):
     links: list[dict[str, str]] | None = Field(default=None, max_length=8)
 
 
+class Withdraw(Revision):
+    reason: str = Field(min_length=1, max_length=500)
+    superseded_by: str | None = Field(default=None, pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
 class Pause(Input):
     paused: bool
 
@@ -768,6 +773,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return repo.update_context(human(request, mutation=True), 'task', task_id,
                                    payload.expected_revision, payload.details, payload.links)
 
+    @app.post('/api/hub/v1/tasks/{task_id}/withdraw', response_model=TaskDTO, response_model_exclude_unset=True)
+    def withdraw_task(task_id: str, payload: Withdraw, request: Request):
+        return repo.withdraw(human(request, mutation=True), 'task', task_id, payload.expected_revision,
+                             payload.reason, payload.superseded_by)
+
     @app.get("/api/hub/v1/tasks/{task_id}", response_model=TaskDTO, response_model_exclude_unset=True)
     def get_task(task_id: str, request: Request):
         actor(request)
@@ -801,6 +811,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def update_decision_context(decision_id: str, payload: EntityContext, request: Request):
         return repo.update_context(human(request, mutation=True), 'decision', decision_id,
                                    payload.expected_revision, payload.details, payload.links)
+
+    @app.post('/api/hub/v1/decisions/{decision_id}/withdraw', response_model=DecisionDTO, response_model_exclude_unset=True)
+    def withdraw_decision(decision_id: str, payload: Withdraw, request: Request):
+        return repo.withdraw(human(request, mutation=True), 'decision', decision_id, payload.expected_revision,
+                             payload.reason, payload.superseded_by)
 
     @app.post("/api/hub/v1/decisions/{decision_id}/answer", response_model=DecisionDTO, response_model_exclude_unset=True)
     def answer(decision_id: str, payload: Answer, request: Request):

@@ -69,7 +69,7 @@ expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_ca
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',
                   'hub_label_set_create', 'hub_label_set_put_image', 'hub_label_set_results',
-                  'hub_label_set_list', 'hub_entity_put_image', 'hub_entity_images',
+                  'hub_label_set_list', 'hub_entity_put_image', 'hub_entity_images', 'hub_entity_withdraw',
                   'hub_project_list', 'hub_project_get'}
 def rpc(method, params, token):
     headers = {'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
@@ -89,7 +89,7 @@ for agent, token in tokens.items():
     status, body = rpc('tools/list', {}, token)
     assert status == 200
     tools = json.loads(body)['result']['tools']
-    assert len(tools) == 21 and {tool['name'] for tool in tools} == expected_tools
+    assert len(tools) == 22 and {tool['name'] for tool in tools} == expected_tools
 
 for path in ('/', '/index.html', '/hub.svg', '/assets/anything.js', '/api/hub/v1/auth/login',
              '/api/hub/v1/auth/me', '/api/hub/v1/overview'):
@@ -113,7 +113,7 @@ for line in Path('/proc/net/tcp6').read_text().splitlines()[1:]:
     fields = line.split()
     assert not (fields[3] == '0A' and int(fields[1].split(':')[1], 16) in (8770, 8771)), 'Unexpected IPv6 Hub listener'
 print(json.dumps({'split_image_smoke': 'passed', 'build_commit': expected_commit,
-                  'authenticated_agents': 3, 'mcp_tools': 21,
+                  'authenticated_agents': 3, 'mcp_tools': 22,
                   'agent_bind': '0.0.0.0:8770', 'browser_bind': '127.0.0.1:8771',
                   'human_sign_in': 'not_tested', 'network': 'none'}))
 '''
@@ -260,7 +260,7 @@ def smoke(image, commit):
             _verify_profile(name, volume)
             report = json.loads(run("docker", "exec", name, "python", "-c", PROBE, commit, timeout=110))
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
-            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 21
+            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 22
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
             if iteration == 0:
                 run("docker", "exec", name, "python", "-c", SEED_RECORDS)
