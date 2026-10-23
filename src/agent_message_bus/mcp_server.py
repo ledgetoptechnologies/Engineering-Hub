@@ -17,6 +17,7 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyUrl
 from anyio import CancelScope
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, SendConflict, SendReplayUnavailable, message_dict
@@ -41,6 +42,7 @@ async def _semantic_work(operation, *args, **kwargs):
     """
     task = asyncio.create_task(asyncio.to_thread(partial(operation, *args, **kwargs)))
     cancelled = False
+    failure = None
     with CancelScope(shield=True):
         while not task.done():
             try:
@@ -51,12 +53,16 @@ async def _semantic_work(operation, *args, **kwargs):
                 break
         try:
             result = task.result()
-        except BaseException:
-            if cancelled:
-                raise asyncio.CancelledError from None
-            raise
+        except BaseException as error:
+            failure = error
+    # A cancelled AnyIO request scope cannot interrupt its shielded thread wait,
+    # but must still propagate once work ends. Returning a normal tool result to
+    # an already-cancelled MCP responder would attempt a second response.
+    await checkpoint_if_cancelled()
     if cancelled:
-        raise asyncio.CancelledError
+        raise asyncio.CancelledError from None
+    if failure is not None:
+        raise failure
     return result
 
 

@@ -237,7 +237,8 @@ async def test_semantic_work_retains_thread_after_repeated_direct_cancellation(f
 
 
 @pytest.mark.asyncio
-async def test_semantic_work_retains_thread_after_anyio_scope_cancellation():
+@pytest.mark.parametrize('fails', [False, True])
+async def test_semantic_work_retains_thread_after_anyio_scope_cancellation(fails):
     import anyio
     from agent_message_bus.mcp_server import _semantic_work
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -247,6 +248,8 @@ async def test_semantic_work_retains_thread_after_anyio_scope_cancellation():
         entered.set()
         try:
             assert release.wait(3)
+            if fails:
+                raise ValueError('synthetic worker failure after scope cancellation')
         finally:
             finished.set()
 
@@ -260,7 +263,7 @@ async def test_semantic_work_retains_thread_after_anyio_scope_cancellation():
         group.cancel_scope.cancel()
         # A separate thread releases work despite the cancelled caller scope.
         threading.Timer(.05, release.set).start()
-    assert finished.is_set() and completed == [True]
+    assert finished.is_set() and completed == []
 
 
 @pytest.mark.asyncio
@@ -307,6 +310,134 @@ async def test_semantic_admission_queues_before_allocating_threads_and_cancels_w
     assert len(calls) == 2
 
 
+async def cancellation_scenario(root, action):
+    """Actual loopback RPC interruption while a bounded synthetic thread runs."""
+    import httpx
+    from agent_message_bus.app import create_app as create_bus
+    from agent_message_bus.semantic import SemanticIndex
+    from engineering_hub.app import Settings, create_app
+    from engineering_hub.auth import AuthConfig
+    from engineering_hub.frontends import HubFrontends
+    from tests.test_hub_frontends import Feed
+    from tests.test_hub_ordinary_shutdown import start
+    from tests.test_hub_unified_mcp import AUTH, headers, result, security
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    order = []
+
+    class Embedder:
+        model_name = 'synthetic-cancellation-only'
+
+        def embed(self, texts):
+            entered.set()
+            try:
+                assert release.wait(4), 'bounded synthetic worker was not released'
+                for _ in texts:
+                    yield [1., 0., 0.]
+            finally:
+                order.append('worker_finished')
+                finished.set()
+
+    class ObservedFeed(Feed):
+        async def stop(self):
+            order.append('feed_stop')
+            await super().stop()
+
+    bus = create_bus(db_path=root/'bus.db', audit_path=root/'audit.jsonl',
+        file_root=root/'files', auth=AUTH, push_events_operational=False,
+        transport_security_settings=security())
+    bus.state.service.semantic = SemanticIndex(root/'bus.db', root/'files', embedder=Embedder())
+    tool = bus.state.mcp._tool_manager.get_tool('semantic_search')
+    original = tool.fn
+
+    async def observed_tool(**kwargs):
+        try:
+            return await original(**kwargs)
+        finally:
+            order.append('handler_finished')
+
+    tool.fn = observed_tool
+    feed, stop = ObservedFeed(), asyncio.Event()
+    core = create_app(Settings(root/'hub.db', AUTH, AuthConfig('https://hub.test',
+        human_auth_mode='cloudflare_access', cloudflare_issuer='https://synthetic.cloudflareaccess.com',
+        cloudflare_audience='test-only', cloudflare_allowed_emails=('test@example.test',)),
+        agent_allowed_hosts=('127.0.0.1:8000',)), bus_app=bus, event_feed=feed)
+    pair = HubFrontends(core)
+    owner, url = await start(pair, stop)
+    work = delete = None
+    releaser = None
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=5,
+            headers={**headers(), 'Host': '127.0.0.1:8000'}) as client:
+            initial = await client.post(url+'/mcp', json={'jsonrpc': '2.0', 'id': 1,
+                'method': 'initialize', 'params': {'protocolVersion': '2025-06-18',
+                    'capabilities': {}, 'clientInfo': {'name': 'semantic-cancellation-test', 'version': '1'}}})
+            result(initial)
+            client.headers['Mcp-Session-Id'] = initial.headers['mcp-session-id']
+            assert (await client.post(url+'/mcp', json={'jsonrpc': '2.0',
+                'method': 'notifications/initialized'})).status_code == 202
+            work = asyncio.create_task(client.post(url+'/mcp', json={'jsonrpc': '2.0', 'id': 2,
+                'method': 'tools/call', 'params': {'name': 'semantic_search',
+                    'arguments': {'query': 'synthetic'}}}))
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert not finished.is_set()
+            if action == 'cancel-rpc':
+                assert (await client.post(url+'/mcp', json={'jsonrpc': '2.0',
+                    'method': 'notifications/cancelled', 'params': {'requestId': 2,
+                    'reason': 'synthetic cancellation'}})).status_code == 202
+                work.cancel()  # Also detach the real HTTP caller.
+                await asyncio.gather(work, return_exceptions=True)
+            else:
+                delete = asyncio.create_task(client.delete(url+'/mcp'))
+            await asyncio.sleep(.03)
+            assert 'handler_finished' not in order and not finished.is_set()
+            # Bounded release is independent of the event loop and remains safe
+            # if cancellation regresses into a blocking loop implementation.
+            releaser = threading.Timer(.3, release.set)
+            releaser.start()
+            owner.cancel()
+            await asyncio.sleep(.03)
+            owner.cancel()
+            await asyncio.sleep(.03)
+            assert not owner.done() and feed.stops == 0
+            assert 'handler_finished' not in order and not finished.is_set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            order.append('owner_finished')
+            if delete is not None:
+                assert (await delete).status_code == 200
+            await asyncio.gather(work, return_exceptions=True)
+        assert order.index('worker_finished') < order.index('handler_finished') < order.index('owner_finished')
+        assert feed.stops == 1 and pair.state == 'failed'
+        return {'action': action, 'order': order, 'worker_owned': True,
+                'owner_finished_after_worker': True, 'owner_cancelled': True,
+                'feed_stopped_before_worker': order.index('feed_stop') < order.index('worker_finished')}
+    finally:
+        release.set()
+        stop.set()
+        await asyncio.gather(owner, *(task for task in (work, delete) if task), return_exceptions=True)
+        if releaser:
+            await asyncio.to_thread(releaser.join, 2)
+            assert not releaser.is_alive()
+
+
+@pytest.mark.parametrize('action', ['cancel-rpc', 'delete-session'])
+def test_active_semantic_rpc_remains_owned_until_thread_finishes(action):
+    root = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(root/'src'), str(root))),
+               PYTHONDONTWRITEBYTECODE='1')
+    child = subprocess.run([sys.executable, '-B', '-m', 'tests.test_semantic_async_mcp',
+        action, '0'], cwd=root, env=env, capture_output=True, text=True, timeout=20)
+    assert child.returncode == 0, child.stdout + child.stderr
+    records = [line.removeprefix('SEMANTIC_PROBE ') for line in child.stdout.splitlines()
+               if line.startswith('SEMANTIC_PROBE ')]
+    assert len(records) == 1
+    report = json.loads(records[0])
+    assert report['worker_owned'] and report['owner_finished_after_worker'] and report['owner_cancelled']
+    assert 'Request already responded to' not in child.stderr
+    assert 'crashed' not in child.stderr
+
+
 if __name__ == '__main__':
     import faulthandler
     from tests.responsiveness_probe import strict_resource_audit
@@ -314,7 +445,10 @@ if __name__ == '__main__':
     try:
         with strict_resource_audit():
             with tempfile.TemporaryDirectory(prefix='eh-semantic-probe-') as directory:
-                value = asyncio.run(scenario(Path(directory), sys.argv[1], bool(int(sys.argv[2]))))
+                if sys.argv[1] in {'cancel-rpc', 'delete-session'}:
+                    value = asyncio.run(cancellation_scenario(Path(directory), sys.argv[1]))
+                else:
+                    value = asyncio.run(scenario(Path(directory), sys.argv[1], bool(int(sys.argv[2]))))
         print('SEMANTIC_PROBE ' + json.dumps(value))
     finally:
         faulthandler.cancel_dump_traceback_later()
