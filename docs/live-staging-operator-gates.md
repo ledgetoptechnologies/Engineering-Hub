@@ -124,6 +124,36 @@ Before any bounded activation, independently accept one fresh generation with:
 All these are **unaccepted live gates** until actual evidence says otherwise.
 No activation commands, credentials or new service installation are supplied here.
 
+### First-release recovery model: trusted operator, not unattended replay
+
+A third continuously running monotonic-authority service is not a prerequisite
+for a bounded, manually accepted first release. The existing storage/launcher
+trust model already trusts Beau and host administrators. What remains mandatory
+is an explicit recovery boundary: all relevant writers and prior executor
+generations stopped, evidence preserved, intended authorities selected, and
+actual current Engine effects reconciled with both operation histories.
+
+Every new queued session must start admission-closed. A fresh process/owner-bound
+challenge, current immutable executor identity, complete target inventory and
+effective writer exclusion support the operator's bounded session acceptance.
+Unknown work or unresolved differences remain held; do not reset fences,
+manufacture receipts or replay commands to make histories agree. An in-memory
+accepted capability must expire or close with its process/generation, and be
+checked again before later effects. Restart/reboot requires new reconciliation.
+
+This is an implementation and acceptance requirement, not a claim that current
+startup already enforces it. No new editable approval file, settings boolean or
+allowlist callback establishes reconciliation. The launch receipt alone proves
+bounded launch identity, not complete current host state. Operator attestations
+record responsibility; they do not automatically establish the underlying facts.
+
+Restoring both histories can be handled by deliberate trusted-operator inspection
+and authority selection, but not advertised as automatically detected rollback.
+Undisclosed rollback of all trusted state by a malicious administrator is outside
+this first-release model. Restoring databases under an active writer remains
+unsupported. See the source-only reconciliation contract in the Hub; no NAS
+restore or service installation is authorized by this section.
+
 ## End-to-end acceptance after both boundaries are accepted
 
 First run the existing container-shell `executor_connection_check` with privately
