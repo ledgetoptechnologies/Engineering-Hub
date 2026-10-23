@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engineering_hub.container_pilot_manifest import Platform
+from engineering_hub import current_executor_observation as current_observation
 from .build_record import VerifiedImage
 from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
@@ -45,6 +46,7 @@ from .configuration_commitment import configuration_commitment
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
+CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
 _TARGETS = {
     'engine_socket': '/run/engineering-hub/docker.sock',
     'issuer_socket': '/run/engineering-hub/issuer.sock',
@@ -56,6 +58,10 @@ _TARGETS = {
     'baseline': '/var/lib/engineering-hub/baseline',
     'secrets': '/var/lib/engineering-hub/secrets',
 }
+
+
+class _ObservationWaitExpired(Exception):
+    """Internal control flow: the polling window, not launch authority, ended."""
 
 
 class LaunchSupervisorError(RuntimeError):
@@ -611,6 +617,8 @@ class LaunchSupervisor:
         self._launch_id = self._container_id = None
         self._closed = False
         self._issuance_open = False
+        self._receipt_served = False
+        self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
         try:
@@ -696,6 +704,10 @@ class LaunchSupervisor:
 
     def _record(self):
         return {'container_id': self._container_id, 'manifest': self.release.launch_profile_digest,
+                'approval_expires_at_ms': getattr(self, '_approval_expires_at_ms', None),
+                'engine_id': getattr(getattr(self, '_daemon_pin', None), 'daemon_id', None),
+                'engine_pid': getattr(getattr(self, '_daemon_pin', None), 'pid', None),
+                'engine_start_ticks': getattr(getattr(self, '_daemon_pin', None), 'start_ticks', None),
                 'boot_id': None if self._consumer is None else self._consumer.boot,
                 'pid': None if self._consumer is None else self._consumer.pid,
                 'start_ticks': None if self._consumer is None else self._consumer.start}
@@ -845,12 +857,17 @@ class LaunchSupervisor:
                          and tuple(defaults.get('Cmd') or ()) == self.profile.command
                          and tuple(defaults.get('Env') or ()) == self.profile.environment)
                 launch_id = str(uuid4())
+                self._origin = time.monotonic()
+                wall = time.time()
+                _require(type(self._origin) in (int, float) and math.isfinite(self._origin)
+                         and type(wall) in (int, float) and math.isfinite(wall) and wall > 0)
+                self._expires = self._origin + self._ttl
+                self._approval_expires_at_ms = int(wall * 1000) + self._ttl * 1000
                 self._journal.reserve(launch_id, {'profile_digest': self.profile.digest(),
+                    'approval_expires_at_ms': self._approval_expires_at_ms,
                     'image': self.image.runnable_reference,
                     'request_digest': 'sha256:' + hashlib.sha256(_canonical(self._create_body())).hexdigest()})
                 self._launch_id = launch_id
-                self._origin = time.monotonic()
-                self._expires = self._origin + self._ttl
                 _, created = self._engine.json('POST', '/containers/create?name=eh-executor-' + launch_id,
                     deadline, body=self._create_body(), statuses=(201,))
                 _require(type(created) is dict and set(created) <= {'Id', 'Warnings'}
@@ -1031,6 +1048,7 @@ class LaunchSupervisor:
                 peer.shutdown(socket.SHUT_WR)
                 _remaining(deadline)
                 self._journal.issuance_state(self._launch_id, 'sent', hashlib.sha256(raw).hexdigest())
+                self._receipt_served = True
                 return payload['receipt_id']
             except BaseException:
                 if reserved:
@@ -1043,6 +1061,177 @@ class LaunchSupervisor:
             finally:
                 if peer is not None:
                     peer.close()
+
+    @contextmanager
+    def _observation_mutex(self, deadline, *, wait_window=False):
+        # PID fence is required before a possibly inherited mutex.
+        _require(self._pid == os.getpid())
+        if getattr(self, '_observation_thread', None) == threading.get_ident():
+            self._hold()
+            raise LaunchSupervisorError()
+        def remaining():
+            value = deadline - time.monotonic()
+            _require(math.isfinite(value))
+            if wait_window and value <= 0:
+                raise _ObservationWaitExpired()
+            _require(value > 0)
+            return value
+        acquired = self._mutex.acquire(timeout=remaining())
+        if wait_window and not acquired:
+            raise _ObservationWaitExpired()
+        _require(acquired)
+        try:
+            remaining()
+            self._observation_thread = threading.get_ident()
+            yield
+        finally:
+            self._observation_thread = None
+            self._mutex.release()
+
+    def _observe_current_launch_locked(self, nonce, deadline):
+        """Only identity/authority failures here hold; wire input is checked outside."""
+        try:
+            self._guard()
+            _require(self._receipt_served and not self._issuance_open)
+            deadline = min(deadline, self._expires)
+            _remaining(deadline)
+            self._validate_live(deadline)
+            now = int(time.time() * 1000)
+            _require(type(self._approval_expires_at_ms) is int
+                     and 0 < now < self._approval_expires_at_ms)
+            release = current_observation.CurrentExecutorReleasePins(**{
+                name: getattr(self.release, name)
+                for name in current_observation.CurrentExecutorReleasePins.__dataclass_fields__})
+            pins = current_observation.CurrentLaunchPins(
+                self._launch_id, self._consumer.boot, self._consumer.pid, self._consumer.start,
+                self._container_id, self._daemon_pin.daemon_id, self._daemon_pin.pid,
+                self._daemon_pin.start_ticks, self._approval_expires_at_ms)
+            # Fixed original wall expiry AND retained local monotonic expiry.
+            remaining = int(_remaining(self._expires) * 1000)
+            expires = min(now + min(5000, remaining), self._approval_expires_at_ms)
+            _require(now < expires)
+            payload = {name: getattr(release, name) for name in current_observation._RELEASE_FIELDS}
+            payload['platform'] = release.platform.model_dump(mode='json')
+            payload.update({name: getattr(pins, name) for name in current_observation._LAUNCH_FIELDS})
+            payload.update(protocol=current_observation.PROTOCOL, audience=current_observation.AUDIENCE,
+                           nonce=nonce, observation_id=str(uuid4()), observed_at_ms=now, expires_at_ms=expires)
+            signature = base64.urlsafe_b64encode(self._signer.sign(
+                current_observation.SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+            raw = _canonical({'payload': payload, 'signature': signature})
+            _require(len(raw) <= current_observation.MAX_OBSERVATION_BYTES)
+            self._validate_live(deadline)
+            _require(int(time.time() * 1000) < expires)
+            _remaining(deadline)
+            return raw
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+
+    def observe_current_launch(self, *, nonce, timeout_ms):
+        """Fresh signed current identity; no create/start/stop or approval renewal.
+
+        Trusted Python entry point. Socket callers must pass the separate exact
+        init-peer authentication below; a nonce is not authority to select a PID.
+        """
+        _require(self._pid == os.getpid())
+        _require(type(nonce) is str and _HEX.fullmatch(nonce)
+                 and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + min(timeout_ms, self._request_ms) / 1000
+        with self._observation_mutex(deadline):
+            return self._observe_current_launch_locked(nonce, deadline)
+
+    def serve_one_current_observation(self, *, timeout_ms):
+        """One bounded peer; malformed/foreign input never holds a healthy launch.
+
+        False means rejected wire input/peer/transport. Actual identity failure
+        raises with held original evidence; neither outcome stops the container.
+        """
+        _require(self._pid == os.getpid())
+        _require(type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + min(timeout_ms, self._request_ms) / 1000
+        with self._observation_mutex(deadline):
+            peer = None
+            try:
+                # No framing or remote request can select the retained consumer.
+                self._listener.settimeout(_remaining(deadline))
+                peer, _ = self._listener.accept()
+                credentials = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+                _require(0 < size <= MAX_REQUEST_BYTES)
+                request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+                _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
+                         and request['protocol'] == CURRENT_REQUEST_PROTOCOL
+                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+                peer.settimeout(_remaining(deadline))
+                _require(peer.recv(1) == b'')
+            except Exception:
+                if peer is not None:
+                    peer.close()
+                return False
+            except BaseException:
+                if peer is not None:
+                    peer.close()
+                raise
+            try:
+                raw = self._observe_current_launch_locked(request['nonce'], deadline)
+                # A disconnected requester is not proof of a broken launch.
+                try:
+                    peer.settimeout(_remaining(deadline))
+                    peer.sendall(struct.pack('!I', len(raw)) + raw)
+                    peer.shutdown(socket.SHUT_WR)
+                    _remaining(deadline)
+                    return True
+                except Exception:
+                    return False
+            finally:
+                peer.close()
+
+    def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
+        """Owned bounded wait, serving fresh observations after the one receipt.
+
+        No new listener/thread/service. Approval expiry stops observation service,
+        not the container; only the caller's explicit stop signal requests stop.
+        """
+        _require(self._pid == os.getpid())
+        _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
+                 and callable(stop_requested))
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            requested = stop_requested()
+            _require(type(requested) is bool)
+            if requested:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                with self._observation_mutex(deadline, wait_window=True):
+                    try:
+                        _require(not self._closed and not self._held and self._receipt_served
+                                 and not self._issuance_open and self._consumer is not None)
+                        self._consumer.check()
+                        active = (time.monotonic() < self._expires
+                                  and int(time.time() * 1000) < self._approval_expires_at_ms)
+                        read = [self._consumer.fd]
+                        if active:
+                            read.append(self._listener)
+                        remaining = deadline - time.monotonic()
+                        _require(math.isfinite(remaining))
+                        if remaining <= 0:
+                            return False
+                        ready, _, _ = select.select(read, [], [], min(.1, remaining))
+                        _require(self._consumer.fd not in ready)
+                        pending = active and self._listener in ready
+                    except BaseException:
+                        self._hold()
+                        raise LaunchSupervisorError() from None
+            except _ObservationWaitExpired:
+                return False
+            if pending:
+                remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    return False
+                self.serve_one_current_observation(timeout_ms=min(self._request_ms, remaining_ms))
 
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""

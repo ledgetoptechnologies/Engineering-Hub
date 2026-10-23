@@ -269,7 +269,11 @@ def synthetic_issuer(short_root, root_journal):
     authority._socket_path = path
     authority._launch_id, authority._container_id = str(uuid4()), 'd' * 64
     authority._closed, authority._held, authority._issuance_open = False, False, True
+    authority._receipt_served = False
     authority._expires = time.monotonic() + 30
+    authority._approval_expires_at_ms = int(time.time() * 1000) + 30000
+    authority._daemon_pin = launch._DaemonPin('/synthetic/docker.sock', os.getpid(),
+        authority._consumer.start, 10001, 10001, 'synthetic-engine', '1.45')
     authority._request_ms = 1000
     authority._signer = Ed25519PrivateKey.generate()  # Synthetic TEST key only.
     authority.release = ExecutorReleaseEnrollment('synthetic-issuer',
@@ -301,6 +305,315 @@ def serve_fixture(authority):
     thread = threading.Thread(target=run)
     thread.start()
     return thread, result
+
+
+def current_ready(authority):
+    """Synthetic existing receipt state; not a real approved container launch."""
+    authority._issuance_open = False
+    authority._receipt_served = True
+
+
+def current_pins(authority):
+    from engineering_hub.current_executor_observation import CurrentExecutorReleasePins, CurrentLaunchPins
+    release = CurrentExecutorReleasePins(**{name: getattr(authority.release, name)
+        for name in CurrentExecutorReleasePins.__dataclass_fields__})
+    pin = authority._daemon_pin
+    launch_pin = CurrentLaunchPins(authority._launch_id, authority._consumer.boot,
+        authority._consumer.pid, authority._consumer.start, authority._container_id,
+        pin.daemon_id, pin.pid, pin.start_ticks, authority._approval_expires_at_ms)
+    return release, launch_pin
+
+
+def current_exchange(path, *, nonce, timeout_ms):
+    """Test-only actual UDS client; no installed executor relay is implemented."""
+    with socket.socket(socket.AF_UNIX) as peer:
+        peer.settimeout(timeout_ms / 1000)
+        peer.connect(str(path))
+        request = launch._canonical({'protocol': launch.CURRENT_REQUEST_PROTOCOL, 'nonce': nonce})
+        peer.sendall(struct.pack('!I', len(request)) + request)
+        peer.shutdown(socket.SHUT_WR)
+        def read(size):
+            result = b''
+            while len(result) < size:
+                part = peer.recv(size - len(result))
+                assert part
+                result += part
+            return result
+        size = struct.unpack('!I', read(4))[0]
+        assert 0 < size <= 8192
+        raw = read(size)
+        assert peer.recv(1) == b''
+        return raw
+
+
+def serve_current_fixture(authority, *, timeout_ms=1000):
+    results = []
+    def run():
+        try:
+            results.append(authority.serve_one_current_observation(timeout_ms=timeout_ms))
+        except BaseException as error:
+            results.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, results
+
+
+def test_current_observation_actual_uds_core_signature_and_no_effects(synthetic_issuer):
+    from engineering_hub.current_executor_observation import CurrentExecutorObserver
+    from engineering_hub.startup_reconciliation import ExecutorSessionIdentity
+    authority, path, checks = synthetic_issuer
+    # Complete the existing, unchanged one-shot exchange first.
+    thread, original = serve_fixture(authority)
+    with_transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                                expected_issuer_gid=os.getgid())
+    try:
+        verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=with_transport,
+            max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+        verifier.close()
+    finally:
+        with_transport.close()
+        thread.join(5)
+    assert not thread.is_alive() and isinstance(original[0], str)
+    release, pins = current_pins(authority)
+    class Transport:
+        def observe_current_launch(self, **kwargs):
+            return current_exchange(path, **kwargs)
+    observer = CurrentExecutorObserver(release=release, launch=pins, transport=Transport())
+    origin_expiry = authority._expires, authority._approval_expires_at_ms
+    for _ in range(2):
+        thread, results = serve_current_fixture(authority)
+        try:
+            assert observer() == ExecutorSessionIdentity(authority._launch_id, authority.release.image_config_id)
+        finally:
+            thread.join(5)
+        assert not thread.is_alive() and results == [True]
+    assert not authority._held and not authority._issuance_open
+    assert (authority._expires, authority._approval_expires_at_ms) == origin_expiry
+    assert len(checks) == 8  # Four old receipt + two live checks for each current response.
+    with authority._journal.transaction() as db:
+        assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+    observer.close()
+
+
+@pytest.mark.parametrize('mutation', ['protocol', 'nonce', 'selector', 'duplicate', 'oversize', 'trailing'])
+def test_invalid_current_wire_does_not_hold_next_valid_request(synthetic_issuer, mutation):
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    request = {'protocol': launch.CURRENT_REQUEST_PROTOCOL, 'nonce': 'a' * 64}
+    if mutation == 'protocol': request['protocol'] = launch.REQUEST_PROTOCOL
+    if mutation == 'nonce': request['nonce'] = '\u2603'
+    if mutation == 'selector': request['pid'] = os.getpid()
+    raw = launch._canonical(request)
+    if mutation == 'duplicate': raw = b'{"nonce":"a","nonce":"b"}'
+    frame = struct.pack('!I', 257 if mutation == 'oversize' else len(raw)) + raw
+    if mutation == 'trailing': frame += b'x'
+    thread, results = serve_current_fixture(authority)
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(2)
+            peer.connect(str(path))
+            peer.sendall(frame)
+            peer.shutdown(socket.SHUT_WR)
+            try:
+                assert peer.recv(1) == b''
+            except ConnectionResetError:
+                pass
+    finally:
+        thread.join(5)
+    assert not thread.is_alive() and results == [False] and not authority._held
+    thread, results = serve_current_fixture(authority)
+    try:
+        payload = json.loads(current_exchange(path, nonce='b' * 64, timeout_ms=1000))['payload']
+        assert payload['nonce'] == 'b' * 64
+    finally:
+        thread.join(5)
+    assert results == [True] and not authority._held
+
+
+def test_current_same_uid_fork_peer_cannot_claim_init(synthetic_issuer):
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    thread, results = serve_current_fixture(authority)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            with socket.socket(socket.AF_UNIX) as peer:
+                peer.connect(str(path))
+                request = launch._canonical({'protocol': launch.CURRENT_REQUEST_PROTOCOL, 'nonce': 'a' * 64})
+                peer.sendall(struct.pack('!I', len(request)) + request)
+                peer.shutdown(socket.SHUT_WR)
+                peer.recv(1)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        os._exit(0)
+    try:
+        assert os.waitpid(pid, 0)[1] == 0
+    finally:
+        thread.join(5)
+    assert results == [False] and not authority._held
+
+
+@pytest.mark.parametrize('failure', ['identity', 'expiry', 'wall-expiry', 'signer'])
+def test_current_identity_failure_holds_evidence_without_effect(synthetic_issuer, failure):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    if failure == 'identity':
+        def fail(deadline): raise RuntimeError('synthetic identity mismatch')
+        authority._validate_live = fail
+    elif failure == 'expiry': authority._expires = time.monotonic() - 1
+    elif failure == 'wall-expiry': authority._approval_expires_at_ms = int(time.time() * 1000) - 1
+    else:
+        class BadSigner:
+            def sign(self, raw): raise RuntimeError('synthetic signer failure')
+        authority._signer = BadSigner()
+    with pytest.raises(launch.LaunchSupervisorError):
+        authority.observe_current_launch(nonce='a' * 64, timeout_ms=1000)
+    assert authority._held
+    with authority._journal.transaction() as db:
+        assert db.execute('SELECT state FROM launch').fetchone() == ('held',)
+    assert authority._listener.fileno() >= 0  # No unlink/stop/cleanup on uncertainty.
+
+
+@pytest.mark.parametrize('nonce,timeout', [('bad', 1000), ('a' * 64, True), ('a' * 64, 0)])
+def test_public_current_invalid_input_does_not_hold(synthetic_issuer, nonce, timeout):
+    authority, _, _ = synthetic_issuer
+    with pytest.raises(launch.LaunchSupervisorError):
+        authority.observe_current_launch(nonce=nonce, timeout_ms=timeout)
+    assert not authority._held and authority._issuance_open
+
+
+def test_owned_wait_serves_current_then_explicit_signal_only(synthetic_issuer):
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    stopped = threading.Event()
+    results = []
+    def wait():
+        try:
+            results.append(authority.wait_for_stop_with_observations(
+                timeout_ms=2000, stop_requested=stopped.is_set))
+        except BaseException as error:
+            results.append(error)
+    thread = threading.Thread(target=wait)
+    thread.start()
+    try:
+        payload = json.loads(current_exchange(path, nonce='a' * 64, timeout_ms=1000))['payload']
+        assert payload['launch_id'] == authority._launch_id
+    finally:
+        stopped.set()
+        thread.join(5)
+    assert results == [True] and not authority._held
+    assert authority._consumer.fd >= 0 and authority._listener.fileno() >= 0
+
+
+def test_owned_wait_expiry_preserves_live_launch_and_original_ceiling(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    authority._expires = time.monotonic() - 1
+    before = authority._approval_expires_at_ms
+    assert authority.wait_for_stop_with_observations(timeout_ms=50, stop_requested=lambda: False) is False
+    assert authority._approval_expires_at_ms == before and not authority._held
+    assert authority._listener.fileno() >= 0 and authority._consumer.fd >= 0
+
+
+@pytest.mark.parametrize('boundary', ['mutex-entry', 'mutex-acquired', 'before-select'])
+def test_owned_wait_deadline_races_are_not_authority_failures(synthetic_issuer, monkeypatch, boundary):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    before = (authority._expires, authority._approval_expires_at_ms, authority._receipt_served)
+    real_monotonic = time.monotonic
+    calls = 0
+    # First call creates the deadline; second passes the outer check. Advance
+    # across the deadline at each formerly throwing internal boundary.
+    expire_at = {'mutex-entry': 3, 'mutex-acquired': 4, 'before-select': 6}[boundary]
+    origin = real_monotonic()
+    def clock():
+        nonlocal calls
+        calls += 1
+        return origin if calls < expire_at else origin + 1
+    with monkeypatch.context() as patch:
+        patch.setattr(launch.time, 'monotonic', clock)
+        assert authority.wait_for_stop_with_observations(
+            timeout_ms=50, stop_requested=lambda: False) is False
+    assert (authority._expires, authority._approval_expires_at_ms, authority._receipt_served) == before
+    assert not authority._held and getattr(authority, '_observation_thread', None) is None
+    assert authority.wait_for_stop_with_observations(timeout_ms=50, stop_requested=lambda: True) is True
+
+
+def test_current_missing_eof_times_out_peer_without_holding(synthetic_issuer):
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    authority._request_ms = 100
+    thread, results = serve_current_fixture(authority)
+    try:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(2)
+            peer.connect(str(path))
+            request = launch._canonical({'protocol': launch.CURRENT_REQUEST_PROTOCOL, 'nonce': 'a' * 64})
+            peer.sendall(struct.pack('!I', len(request)) + request)
+            assert peer.recv(1) == b''  # No SHUT_WR: bounded malformed request, not identity loss.
+    finally:
+        thread.join(5)
+    assert results == [False] and not authority._held
+
+
+def test_current_reentry_caught_by_signer_still_holds(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    signer = authority._signer
+    class ReentrantSigner:
+        def sign(self, raw):
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.observe_current_launch(nonce='b' * 64, timeout_ms=100)
+            return signer.sign(raw)
+    authority._signer = ReentrantSigner()
+    # The synthetic fixture's _validate_live lacks the real guard, so require it
+    # explicitly to reproduce actual _validate_live behavior after signing.
+    original = authority._validate_live
+    def validate(deadline):
+        authority._guard()
+        original(deadline)
+    authority._validate_live = validate
+    with pytest.raises(launch.LaunchSupervisorError):
+        authority.observe_current_launch(nonce='a' * 64, timeout_ms=1000)
+    assert authority._held
+
+
+def test_public_current_real_fork_denied_before_inherited_mutex(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    authority._mutex.acquire()
+    try:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                authority.observe_current_launch(nonce='a' * 64, timeout_ms=100)
+            except launch.LaunchSupervisorError:
+                os._exit(0)
+            os._exit(1)
+        assert os.waitpid(pid, 0)[1] == 0
+    finally:
+        authority._mutex.release()
+    assert not authority._held
+
+
+def test_launch_original_wall_ceiling_durable_before_create(root_journal):
+    authority, _ = synthetic_launcher(root_journal)
+    original_reserve = root_journal.reserve
+    retained = []
+    def reserve(identity, data):
+        assert data['approval_expires_at_ms'] == authority._approval_expires_at_ms
+        assert authority._expires == authority._origin + authority._ttl
+        retained.append(data['approval_expires_at_ms'])
+        original_reserve(identity, data)
+    root_journal.reserve = reserve
+    try:
+        authority.launch()
+        with root_journal.transaction() as db:
+            data = json.loads(db.execute('SELECT data FROM launch').fetchone()[0])
+        assert retained == [authority._approval_expires_at_ms]
+        assert data['approval_expires_at_ms'] == retained[0]
+    finally:
+        authority.close()
 
 
 def test_actual_direct_peer_exchange_is_consumed_by_existing_signature_verifier(synthetic_issuer):

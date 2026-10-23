@@ -59,6 +59,11 @@ def harness(module, monkeypatch, *, failure=None, stop_at='wait', close_failure=
         def serve_one_receipt(self):
             self.perform('receipt')
 
+        def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
+            assert type(timeout_ms) is int and 1000 <= timeout_ms <= 3600000
+            self.perform('observation-wait')
+            return wait(state.stop, timeout_ms // 1000)
+
         def graceful_stop(self):
             self.perform('stop')
 
@@ -139,7 +144,7 @@ def test_exact_order_one_launch_receipt_wait_explicit_stop_close_restore(module,
     assert calls == ['handlers', ('construct', {
         'enrollment_file': ARGS[1], 'signing_key_file': ARGS[3],
         'journal_file': ARGS[5], 'create_journal': True}), 'launch', 'readiness', 'receipt',
-        ('wait', 60), 'stop', 'close', ('restore', [('synthetic', 'old')])]
+        'observation-wait', ('wait', 60), 'stop', 'close', ('restore', [('synthetic', 'old')])]
     assert capsys.readouterr().out == 'receipt_served\nstopped\n'
 
 
@@ -161,12 +166,13 @@ def test_flag_only_stop_at_native_boundaries_is_once(module, monkeypatch, stop_a
     assert not any(isinstance(item, tuple) and item[0] == 'wait' for item in calls)
 
 
-@pytest.mark.parametrize('failure', ['construct', 'launch', 'readiness', 'receipt', 'stop'])
+@pytest.mark.parametrize('failure', ['construct', 'launch', 'readiness', 'receipt', 'observation-wait', 'stop'])
 def test_native_exception_no_retry_no_automatic_cleanup_and_redacted(module, monkeypatch, capsys, failure):
-    calls = harness(module, monkeypatch, failure=failure, stop_at='receipt')
+    calls = harness(module, monkeypatch, failure=failure,
+                    stop_at='wait' if failure == 'observation-wait' else 'receipt')
     assert module.main(ARGS + ['--execute', '--create-journal']) == 2
     assert calls.count('launch') <= 1 and calls.count('receipt') <= 1 and calls.count('stop') <= 1
-    if failure in ('construct', 'launch', 'readiness', 'receipt'):
+    if failure in ('construct', 'launch', 'readiness', 'receipt', 'observation-wait'):
         assert 'stop' not in calls
     assert calls.count('close') == (0 if failure == 'construct' else 1)
     assert calls[-1][0] == 'restore'

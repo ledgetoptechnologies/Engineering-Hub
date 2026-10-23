@@ -17,7 +17,8 @@ the enrolled receipt expiry. It observes the owned consumer, not an Engine poll;
 the authenticated exchange retains its original enrolled deadline. Stop signals
 during readiness cancel that wait before one explicit owned graceful stop.
 
---wait-seconds bounds ONLY waiting after the one receipt exchange. It does not
+--wait-seconds bounds ONLY waiting after the one receipt exchange, during which
+the SAME retained supervisor serves bounded current observations. It does not
 extend receipt authority and is not a total-process deadline. Native enrollment
 operation deadlines remain authoritative. Expiry or any uncertain native outcome
 closes descriptors only, returns nonzero and preserves evidence; it never grants
@@ -141,7 +142,8 @@ def _execute(options):
                         print('receipt_served', flush=True)
                     elif not stop.requested:
                         raise RuntimeError('receipt readiness unavailable')
-                requested = stop.requested or _wait_for_stop(stop, options.wait_seconds)
+                requested = stop.requested or supervisor.wait_for_stop_with_observations(
+                    timeout_ms=options.wait_seconds * 1000, stop_requested=lambda: stop.requested)
                 if requested:
                     # Explicit signal only. Caller must already have drained.
                     supervisor.graceful_stop()
