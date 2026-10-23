@@ -49,6 +49,8 @@ class Feed:
 class Bridge:
     # Explicit synthetic admission state for portable lifecycle-only tests.
     # Real mandatory owner/gate enforcement is tested in queued_manual_session.
+    async_admission_required = False
+
     def __init__(self, owner):
         self.reconciliation_state = 'accepted'
         self.owner = owner
@@ -70,7 +72,7 @@ class Bridge:
         return {'id': REQ, 'state': 'held'}
 
 
-async def rig(monkeypatch):
+async def rig(monkeypatch, *, startup_timeout=2):
     monkeypatch.setattr(draft, 'NativeHubEventFeed', Feed)
     monkeypatch.setattr(draft, 'QueuedContainerPilot', Bridge)
     owner, source = Owner(), Source()
@@ -78,8 +80,38 @@ async def rig(monkeypatch):
     runtime = draft.QueuedPilotRuntime(bridge, Feed(source))
     capability = runtime.bind_generation_drain(owner, GEN)
     await runtime.start()
-    await bridge.entered.wait()
+    try:
+        async with asyncio.timeout(startup_timeout):
+            await bridge.entered.wait()
+    except BaseException:
+        # A fixture admission failure must fail promptly, not strand the idle
+        # runtime or its deliberately blocked source-cleanup task.
+        bridge.release.set()
+        source.close_release.set()
+        await runtime.stop()
+        raise
     return owner, source, bridge, runtime, capability
+
+
+@pytest.mark.asyncio
+async def test_fixture_startup_failure_is_bounded_and_drains_cleanup(monkeypatch):
+    bridges, sources = [], []
+    original_close = Source.aclose
+
+    async def no_phase(self):
+        bridges.append(self)
+        return None
+
+    async def close(self):
+        sources.append(self)
+        await original_close(self)
+
+    monkeypatch.setattr(Bridge, 'run_once', no_phase)
+    monkeypatch.setattr(Source, 'aclose', close)
+    with pytest.raises(TimeoutError):
+        await rig(monkeypatch, startup_timeout=.02)
+    assert len(bridges) == len(sources) == 1
+    assert bridges[0].release.is_set() and sources[0].closed
 
 
 @pytest.mark.asyncio
