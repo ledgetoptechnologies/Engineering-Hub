@@ -73,6 +73,43 @@ Do not repair it merely to make `inspect` succeed. The separately reviewed cold
 copy must meet destination requirements before enrollment inspection. There is
 no generic source copier or existing-enrollment rehoming tool in this runbook.
 
+### Optional read-only preparation report
+
+For an explicitly selected, already cold Linux-local source, the optional
+`python -m engineering_hub.offline_ledger_preparation --source /explicit/source/hub.sqlite3`
+reports bounded schema/logical fingerprints and retained file/ancestor identity.
+Source modes such as the existing shared0770 are observed, not repaired or
+accepted as private. Symlinks, hardlinks, sidecars, existing ownership,
+unsupported schema and unresolved work refuse. The source is opened read-only;
+this command does not checkpoint SQLite, copy files, change permissions,
+create a destination, enroll or start anything. It emits no row contents.
+
+After a separately reviewed manual cold copy, optionally add
+`--destination /explicit/accepted-private/hub.sqlite3` to compare bytes and logical
+fingerprints. The destination must independently pass the unchanged enrollment
+inspection's private0700/0600, runtime-UID, trusted-ancestor and local-filesystem
+checks. Reports retain only metadata/fingerprints and their digest. Preserve them
+privately. A mismatch or observed identity change is a stop, not a repair/retry.
+
+Source classification deserializes bounded retained-FD bytes into in-memory
+SQLite; SQLite never reopens the shared source pathname. Destination inspection
+retains the existing strict private-ledger implementation unchanged.
+For a valid sidecar-free WAL-header source, only the ephemeral memory view's
+header bytes18/19 are changed from2/2 to1/1, following
+[SQLite's documented deserialize workaround](https://www.sqlite.org/c3ref/deserialize.html).
+The source's original raw bytes determine its fingerprint and byte parity;
+`memory_view_wal_header_normalized` reports whether that memory-only change was
+needed. DELETE-header1/1 remains unchanged; malformed pairs refuse. This is not
+a source checkpoint, journal recovery or evidence that an omitted WAL was empty.
+The operator must still establish coherent cold state and preserve full recovery
+material before inspection. Existing WAL/SHM/journal files always refuse.
+These are stable observations, not an atomic snapshot across two files or proof
+of stopped writers, ACL enforcement or backup coverage; those report fields
+remain explicitly false. Do not inspect a running database. This helper is
+optional, not another mandatory gate; reviewed manual
+classification and copy/parity remain valid. Enrollment/apply is still the
+separate operation below, using its own reviewed plan and digest.
+
 ## 3. Freeze writers and preserve the cold source
 
 Stop all Hub and independent writers to the ledger and settings being changed;
