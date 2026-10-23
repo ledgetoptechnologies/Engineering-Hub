@@ -20,6 +20,7 @@ async function fixture(page: Page) {
     posts: [] as { body: Record<string, unknown>; csrf: string | undefined }[],
     listStatus: 200, truncated: false, slowProject: null as string | null, pageSize: 0, afters: [] as (string | null)[],
     release: null as (() => void) | null,
+    holdMore: false, releaseMore: null as (() => void) | null, failMore: false,
     docStatus: 200, docReads: 0, slowDocPath: null as string | null,
     releaseDoc: null as (() => void) | null,
   };
@@ -45,6 +46,8 @@ async function fixture(page: Page) {
         // Real path-ordered paging, like the server: continue after the given path.
         const after = url.searchParams.get("after"), prefix = url.searchParams.get("path_prefix");
         state.afters.push(after);
+        if (after && state.holdMore) await new Promise<void>(resolve => { state.releaseMore = resolve; });
+        if (after && state.failMore) { state.failMore = false; return respond({ detail: { code: "fixture" } }, 503); }
         const rest = items.sort((a, b) => a.path.localeCompare(b.path))
           .filter(item => (!after || item.path > after) && (!prefix || item.path.startsWith(prefix + "/")));
         return respond({ items: rest.slice(0, state.pageSize), truncated: rest.length > state.pageSize });
@@ -558,4 +561,44 @@ test("searching after Show more starts the list over from the first page", async
   await panel.getByRole("button", { name: "Show more notes" }).click();
   await expect(titles).toHaveText(["Step 0", "Step 1", "Step 2"]);
   expect(state.afters.at(-1)).toBe("runbooks/step-1.md");
+});
+
+test("a Show more page still loading never locks the next project's list", async ({ page }) => {
+  const state = await fixture(page);
+  const base = state.notes[0];
+  state.notes = [...Array.from({ length: 4 }, (_, i) => ({ ...base, path: `plans/eh-${i}.md`, title: `EH ${i}` })),
+    ...Array.from({ length: 4 }, (_, i) => ({ ...base, project: "treedar", path: `plans/td-${i}.md`, title: `TD ${i}` }))];
+  state.pageSize = 2;
+  state.holdMore = true;
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  const titles = panel.locator(".notes-list .note-link strong");
+  await expect(titles).toHaveText(["EH 0", "EH 1"]);
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(panel.getByRole("button", { name: "Loading…" })).toBeDisabled();
+  await panel.getByLabel("Project").selectOption("treedar");
+  await expect(titles).toHaveText(["TD 0", "TD 1"]);
+  state.holdMore = false;
+  const more = panel.getByRole("button", { name: "Show more notes" });
+  await expect(more).toBeEnabled();
+  await more.click();
+  await expect(titles).toHaveText(["TD 0", "TD 1", "TD 2", "TD 3"]);
+  state.releaseMore?.();                       // the old engineering-hub page finally answers
+  await expect(titles).toHaveText(["TD 0", "TD 1", "TD 2", "TD 3"]);
+});
+
+test("a failed Show more page says so and can be retried", async ({ page }) => {
+  const state = await fixture(page);
+  const base = state.notes[0];
+  state.notes = Array.from({ length: 3 }, (_, i) => ({ ...base, path: `plans/note-${i}.md`, title: `Plan ${i}` }));
+  state.pageSize = 2;
+  state.failMore = true;
+  await page.goto("/#/notes");
+  const panel = panelOf(page);
+  const titles = panel.locator(".notes-list .note-link strong");
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(panel.getByRole("alert")).toContainText("More notes could not be loaded.");
+  await expect(titles).toHaveText(["Plan 0", "Plan 1"]);
+  await panel.getByRole("button", { name: "Show more notes" }).click();
+  await expect(titles).toHaveText(["Plan 0", "Plan 1", "Plan 2"]);
 });

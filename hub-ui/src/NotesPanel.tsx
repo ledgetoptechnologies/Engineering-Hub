@@ -154,6 +154,8 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   useEffect(() => {
     const current = ++listGeneration.current;
     const controller = new AbortController();
+    // A new list (project, search, refresh) cancels any "Show more" page still loading for the old one.
+    moreController.current?.abort();
     setList(null);
     if (mode === "demo") { setListState("demo"); return () => { listGeneration.current++; controller.abort(); }; }
     setListState("loading");
@@ -168,29 +170,35 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
       setListState(error instanceof HubApiError && error.status === 404 ? "unsupported"
         : error instanceof HubApiError && error.code === "invalid_note" ? "invalid_search" : "failed");
     });
-    return () => { listGeneration.current++; controller.abort(); };
+    return () => { listGeneration.current++; controller.abort(); moreController.current?.abort(); };
   }, [mode, project, search, listRevision]);
 
-  // Path-ordered lists continue after the last path shown; each page is appended once.
-  const [loadingMore, setLoadingMore] = useState(false);
+  // Path-ordered lists continue after the last path shown; each page is appended once. The busy
+  // state belongs to the list generation that asked, so a stale page never locks a newer list.
+  const moreController = useRef<AbortController | null>(null);
+  const [moreGeneration, setMoreGeneration] = useState<number | null>(null);
+  const loadingMore = moreGeneration !== null && moreGeneration === listGeneration.current;
   async function loadMore() {
     if (!list || list.items.length === 0 || loadingMore) return;
     const current = listGeneration.current;
     const prefix = search.text.trim() && search.kind === "prefix" ? search.text.trim() : undefined;
-    setLoadingMore(true);
+    moreController.current?.abort();
+    const controller = moreController.current = new AbortController();
+    setMoreGeneration(current);
     try {
       const next = await listNotes({ project, path_prefix: prefix, after: list.items[list.items.length - 1].path },
-        new AbortController().signal);
-      if (listGeneration.current !== current) return;
+        controller.signal);
+      if (listGeneration.current !== current || controller.signal.aborted) return;
       setList(previous => previous && {
         items: [...previous.items, ...next.items.filter(item => !previous.items.some(seen => seen.path === item.path))],
         truncated: next.truncated,
       });
     } catch (error) {
-      if (listGeneration.current !== current || deny(error)) return;
+      if (listGeneration.current !== current || controller.signal.aborted || deny(error)) return;
       setNotice({ kind: "alert", text: `More notes could not be loaded. ${readError(error)}` });
     } finally {
-      setLoadingMore(false);
+      if (moreController.current === controller) moreController.current = null;
+      setMoreGeneration(generation => generation === current ? null : generation);
     }
   }
 
