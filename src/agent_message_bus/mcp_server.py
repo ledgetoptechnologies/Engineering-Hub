@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
+from functools import partial
 from typing import Any
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -15,6 +16,8 @@ from mcp.server.lowlevel import Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyUrl
+from anyio import CancelScope
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from .api import Service, _known_auth_secrets, wait_for_message_feed
 from .database import InvalidTransition, MessageError, NotFound, SendConflict, SendReplayUnavailable, message_dict
@@ -28,6 +31,39 @@ _INBOX_TEMPLATE = "agentbus://inbox/{recipient}?after={cursor}"
 _MAX_CURSOR = (1 << 63) - 1
 _MAX_PAGE_SIZE = 100
 _DEFAULT_PAGE_SIZE = 50
+
+
+async def _semantic_work(operation, *args, **kwargs):
+    """Keep blocking model/index work off-loop and own it through cancellation.
+
+    Cancelling a thread await does not stop its SQLite/model work. Retain the
+    request until that work finishes instead of letting lifespan cleanup race
+    it. Shield AnyIO scopes as well as repeated direct asyncio cancellation.
+    """
+    task = asyncio.create_task(asyncio.to_thread(partial(operation, *args, **kwargs)))
+    cancelled = False
+    failure = None
+    with CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException:
+                break
+        try:
+            result = task.result()
+        except BaseException as error:
+            failure = error
+    # A cancelled AnyIO request scope cannot interrupt its shielded thread wait,
+    # but must still propagate once work ends. Returning a normal tool result to
+    # an already-cancelled MCP responder would attempt a second response.
+    await checkpoint_if_cancelled()
+    if cancelled:
+        raise asyncio.CancelledError from None
+    if failure is not None:
+        raise failure
+    return result
 
 
 def _install_inbox_resources(mcp: FastMCP, service: Service, publisher: PushPublisher) -> None:
@@ -161,6 +197,11 @@ def _install_inbox_resources(mcp: FastMCP, service: Service, publisher: PushPubl
 
 def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) -> FastMCP:
     import os
+
+    # Search and status share the index/model lock. Admit just one blocking
+    # operation per service before allocating a default-executor thread; queued
+    # requests must not occupy threads merely waiting on that same index lock.
+    semantic_gate = asyncio.Lock()
 
     push_publisher = push_publisher or getattr(service, "push_publisher", None) or PushPublisher()
     service.push_publisher = push_publisher
@@ -353,7 +394,7 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         return {"results": [search_result_dict(entry, query) for entry in entries]}
 
     @mcp.tool(name="semantic_search")
-    def semantic_search(query: str, project: str | None = None, limit: int = 20,
+    async def semantic_search(query: str, project: str | None = None, limit: int = 20,
                         source: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
         """Search shared knowledge and stored files by meaning using local sentence embeddings.
 
@@ -366,17 +407,20 @@ def build_mcp(service: Service, *, push_publisher: PushPublisher | None = None) 
         authenticated(ctx)
         if service.semantic is None:
             raise ValueError("semantic search is not configured; keyword search is knowledge_search")
-        results = service.semantic.search(query=query, project=project, limit=limit, source=source)
+        async with semantic_gate:
+            results = await _semantic_work(service.semantic.search, query=query, project=project,
+                                           limit=limit, source=source)
         return {"mode": "semantic", "results": results}
 
     @mcp.tool(name="semantic_status")
-    def semantic_status(ctx: Context | None = None) -> dict[str, Any]:
+    async def semantic_status(ctx: Context | None = None) -> dict[str, Any]:
         """Inspect semantic model/index readiness without starting a model download."""
         if ctx is None: raise ValueError("request context required")
         authenticated(ctx)
         if service.semantic is None:
             return {"available": False, "reason": "not configured"}
-        return service.semantic.status()
+        async with semantic_gate:
+            return await _semantic_work(service.semantic.status)
 
     def storage():
         if service.files is None:
