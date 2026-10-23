@@ -223,15 +223,22 @@ def validate_configuration(config_path, profile_path):
 
 
 async def serve_configuration(config_path, profile_path, *, reconciliation_factory=None,
-                              session_acceptance_factory=None):
+                              session_acceptance_factory=None, session_enrollment_path=None):
     """The only activation operation; no new state, credential or policy setup."""
-    owner = None
+    owner = composition = None
     try:
         from .queued_pilot_service import _synchronous
         # JSON supplies no operator authority. CLI serve has no trusted local
         # acceptance channel and therefore refuses before owner/credential I/O.
-        _require(_synchronous(reconciliation_factory))
-        _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        if session_enrollment_path is None:
+            _require(_synchronous(reconciliation_factory))
+            _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        else:
+            # Only the explicit fixed selector supplies this DATA path. No
+            # callback/module lookup or fallback is permitted in enrollment.
+            _require(reconciliation_factory is None and session_acceptance_factory is None
+                     and isinstance(session_enrollment_path, (str, Path))
+                     and Path(session_enrollment_path).is_absolute())
         deployment, profile = validate_configuration(config_path, profile_path)
         from .app import Settings
         settings = Settings.from_env(deployment)
@@ -243,6 +250,15 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         _require(settings.agent_auth.identity_for(credential.decode('ascii')) is None)
         ca = read_protected_file(profile.ca_file, maximum_bytes=1024 * 1024, private=False)
         _require('sha256:' + hashlib.sha256(ca).hexdigest() == profile.ca_sha256)
+        if session_enrollment_path is not None:
+            from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
+                                                 TrustedQueuedSessionComposition)
+            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
+            composition = TrustedQueuedSessionComposition(profile=profile, database=settings.database,
+                enrollment=enrollment, ca_pem=ca, credential=credential)
+            reconciliation_factory = composition.reconciliation_factory
+            session_acceptance_factory = composition.session_acceptance_factory
         from .container_pilot_client import ContainerPilotClient
         from .unified_queued_pilot_service import serve_owned_unified_queued_pilot
         from .work_queue import WorkTarget
@@ -265,11 +281,15 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
     finally:
         # A bind/pre-transfer failure leaves ownership with this selector.
         # After transfer the wrapper has drained and close is idempotent.
-        if owner is not None:
-            try:
-                owner.close()
-            except Exception:
-                raise UnifiedPilotStartupError() from None
+        try:
+            if composition is not None:
+                composition.close()  # Owned service has drained before returning.
+        finally:
+            if owner is not None:
+                try:
+                    owner.close()
+                except Exception:
+                    raise UnifiedPilotStartupError() from None
 
 
 def main(argv=None):
