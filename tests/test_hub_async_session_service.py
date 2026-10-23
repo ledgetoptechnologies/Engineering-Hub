@@ -28,11 +28,13 @@ async def test_pending_manual_acceptance_wakes_existing_job_without_new_work(rig
     identity = ExecutorSessionIdentity(str(uuid4()), 'sha256:' + 'e' * 64)
     def observe():
         started = time.monotonic()
+        started_wall_ms = int(time.time() * 1000)
         observations.append(threading.get_ident())
         entered.set()
         time.sleep(.15)
         return VerifiedExecutorObservation(identity, secrets.token_hex(32), str(uuid4()),
-                                           started, started + 5)
+                                           started, started + 5,
+                                           int(time.time() * 1000), started_wall_ms + 5000)
 
     def gate_factory(owner, target):
         gate = StartupReconciliation(owner=owner, database=rig.settings.database,

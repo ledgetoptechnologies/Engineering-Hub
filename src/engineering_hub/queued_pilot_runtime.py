@@ -88,6 +88,19 @@ class QueuedPilotRuntime:
         except Exception:
             return False
 
+    def claim_preflight_stopped(self):
+        """Recognize our exact not-yet-claimed task during an ordinary stop.
+
+        This is not a permission issuer or a general failure normalizer. Owner,
+        process and loop failures still propagate, and unavailable/failed native
+        sources are never turned into a successful generation drain.
+        """
+        self._identity()
+        self.bridge._guard()
+        return (self._closed and self._state == 'stopping' and not self._source_failed
+                and self.feed.available
+                and self._active is asyncio.current_task())
+
     async def start(self):
         self._identity()
         if self._state != 'not_started' or self._task is not None or self._closed:
@@ -308,7 +321,7 @@ class OwnedGenerationDrain:
         runtime = self._runtime
         await runtime.stop()
         self._guard(self._generation)
-        if (runtime._state != 'stopped' or runtime._source_failed
+        if (runtime._state != 'stopped' or runtime._source_failed or not runtime.feed.available
                 or runtime._task is None or not runtime._task.done()
                 or runtime._task.cancelled() or runtime._task.exception() is not None
                 or runtime._active is not None

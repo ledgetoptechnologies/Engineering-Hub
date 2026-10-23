@@ -116,7 +116,12 @@ Its bounded synchronous verifier runs in a retained executor Future, drained
 through cancellation; it returns verified proof rather than a cached identity.
 The composition checks original enrollment/report freshness before and after
 each observation and clips proof expiry to the original report's monotonic
-ceiling. It uses the same captured TLS/credential bytes and independently retained
+ceiling. The verified proof also retains its absolute signed expiry; the fixed
+composition clips it to the original report and launch expiry. Every consumed
+scope checks both clocks again after local ownership/proof reads, including slow
+intent/result audits and completion validation. Forward wall steps cannot outlive
+the retained absolute ceiling, and permitted issuer skew cannot extend it.
+It uses the same captured TLS/credential bytes and independently retained
 issuer/release/launch pins. It never renews the original launch or report.
 
 Snapshot and decline use local binding only and claim no fresh remote readiness.

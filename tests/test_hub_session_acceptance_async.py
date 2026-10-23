@@ -32,11 +32,14 @@ def case(tmp_path):
         state.calls += 1
         state.threads.append(threading.get_ident())
         started = time.monotonic()
+        started_wall_ms = int(time.time() * 1000)
         entered.set()
         if state.block and not release.wait(2):
             raise TimeoutError('synthetic observer failed to drain')
         return VerifiedExecutorObservation(identity, 'a' * 64, str(uuid4()),
-                                           started, time.monotonic() + state.lifetime)
+                                           started, started + state.lifetime,
+                                           int(time.time() * 1000),
+                                           started_wall_ms + int(state.lifetime * 1000))
     with PilotOwner(database, allow_ephemeral_test_storage=True) as owner:
         gate = StartupReconciliation(owner=owner, database=database, target_id=TARGET,
             manifest_digest=DIGEST, executor=identity, lifetime_seconds=60,
@@ -115,7 +118,8 @@ async def test_slow_result_audit_cannot_return_late_accepted_proof(case, monkeyp
             # Deterministic elapsed callback time, only on the gate's clock;
             # do not patch the event loop clock or depend on a 30ms CI window.
             after_proof = time.monotonic() + 2
-            monkeypatch.setattr(gate_module, 'time', SimpleNamespace(monotonic=lambda: after_proof))
+            monkeypatch.setattr(gate_module, 'time', SimpleNamespace(
+                monotonic=lambda: after_proof, time=time.time))
         return True
     case.broker._audit = audit
     with pytest.raises(SessionAcceptanceError):
@@ -124,6 +128,27 @@ async def test_slow_result_audit_cannot_return_late_accepted_proof(case, monkeyp
     assert [(item.event, item.outcome) for item in case.state.records] == [
         ('intent', 'accept'), ('result', 'accepted')]
     assert case.broker._state == 'closed'
+
+
+@pytest.mark.parametrize('jump_after', ['intent', 'result'])
+async def test_forward_wall_jump_after_local_audit_cannot_open_or_return_success(case, monkeypatch, jump_after):
+    from engineering_hub import startup_reconciliation as gate_module
+    def audit(record):
+        case.state.records.append(record)
+        if record.event == jump_after:
+            # The monotonic permission is still live; only the independently
+            # retained absolute proof deadline has expired after local work.
+            after_expiry = time.time() + 10
+            monkeypatch.setattr(gate_module, 'time', SimpleNamespace(
+                monotonic=time.monotonic, time=lambda: after_expiry))
+        return True
+    case.broker._audit = audit
+    with pytest.raises(SessionAcceptanceError):
+        await case.broker.decide_async(**answer(case))
+    assert case.gate.admission_state == 'closed' and case.broker._state == 'closed'
+    assert case.state.calls == 1
+    assert [(item.event, item.outcome) for item in case.state.records] == [
+        ('intent', 'accept'), ('result', 'failed' if jump_after == 'intent' else 'accepted')]
 
 
 async def test_blocked_observation_yields_and_concurrent_preparation_bounded(case):

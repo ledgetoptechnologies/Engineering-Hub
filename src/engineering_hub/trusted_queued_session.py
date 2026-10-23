@@ -183,7 +183,11 @@ class TrustedQueuedSessionComposition:
         # Never refresh the original operator-report ceiling when a newer
         # signed identity response arrives. Gate-owned async preparation runs
         # this bounded synchronous verifier off the shared Hub event loop.
-        return replace(value, expires_monotonic=min(value.expires_monotonic, self._deadline))
+        _require(type(value.verified_wall_ms) is int and type(value.expires_wall_ms) is int
+                 and 0 < value.verified_wall_ms < value.expires_wall_ms)
+        return replace(value, expires_monotonic=min(value.expires_monotonic, self._deadline),
+                       expires_wall_ms=min(value.expires_wall_ms, self._enrollment.expires_at_ms,
+                                           self._enrollment.launch.approval_expires_at_ms))
 
     def reconciliation_factory(self, owner, target):
         try:

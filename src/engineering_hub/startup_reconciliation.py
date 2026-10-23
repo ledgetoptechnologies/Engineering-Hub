@@ -108,6 +108,8 @@ class _PreparedAdmission:
     generation: int
     subject: AdmissionSubject
     deadline: float
+    verified_wall_ms: int
+    expires_wall_ms: int
 
 
 class StartupReconciliation:
@@ -135,6 +137,7 @@ class StartupReconciliation:
         self._async_admission = async_admission
         self._loop = None
         self._generation = 0
+        self._last_scope_wall_ms = 0
         self._preparing = self._prepared = self._active_scope = None
         self._scope_transitioned = None
         self._proof_nonces, self._proof_observations = set(), set()
@@ -271,8 +274,25 @@ class StartupReconciliation:
                  and (owner is None or owner is self._owner)
                  and (subject is None or type(subject) is AdmissionSubject and scope.subject == subject))
         self._validate_local()
-        _require(time.monotonic() < scope.deadline)
+        self._scope_time(scope)
         return scope
+
+    def _scope_time(self, scope):
+        # Sample AFTER owner/proof/local reads. A monotonic deadline alone does
+        # not retain an original absolute report/launch/signed-expiry veto when
+        # wall time jumps forward during a slow audit or local proof read.
+        try:
+            wall = time.time()
+            _require(type(wall) in (int, float) and math.isfinite(wall) and wall > 0)
+            wall_ms = int(wall * 1000)
+            _require(max(scope.verified_wall_ms, self._last_scope_wall_ms) <= wall_ms < scope.expires_wall_ms
+                     and time.monotonic() < scope.deadline)
+            self._last_scope_wall_ms = wall_ms
+        except BaseException as error:
+            self.close()
+            if isinstance(error, Exception):
+                raise StartupReconciliationError() from None
+            raise
 
     def assert_active_subject(self, *, owner, subject):
         """Check the exact consumed scope; metadata alone never satisfies this."""
@@ -314,7 +334,10 @@ class StartupReconciliation:
                          and all(type(t) in (int, float) and math.isfinite(t)
                                  for t in (proof.started_monotonic, proof.expires_monotonic))
                          and started <= proof.started_monotonic <= time.monotonic()
-                         and proof.started_monotonic < proof.expires_monotonic)
+                         and proof.started_monotonic < proof.expires_monotonic
+                         and type(proof.verified_wall_ms) is int
+                         and type(proof.expires_wall_ms) is int
+                         and 0 < proof.verified_wall_ms < proof.expires_wall_ms)
                 _require(len(self._proof_nonces) < 4096 and proof.nonce not in self._proof_nonces
                          and proof.observation_id not in self._proof_observations)
                 self._proof_nonces.add(proof.nonce)
@@ -322,7 +345,8 @@ class StartupReconciliation:
                 ceiling = min(ceiling, proof.expires_monotonic)
                 _require(time.monotonic() < ceiling and self._async_context() == (loop, task))
                 prepared = _PreparedAdmission(self, owner, self._pid, loop, task, self._epoch,
-                    generation, subject, ceiling)
+                    generation, subject, ceiling, proof.verified_wall_ms, proof.expires_wall_ms)
+                self._scope_time(prepared)
                 self._prepared = prepared
                 def unconsumed_after_yield():
                     if self._prepared is prepared:

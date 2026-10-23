@@ -17,7 +17,9 @@ def test_signed_lifetime_is_anchored_to_nonce_start_not_response_finish(setup, o
     signer.mutate = shifted
     proof = observer.observe_verified()
     assert proof.started_monotonic == 100
-    assert proof.expires_monotonic == 103
+    assert proof.expires_monotonic == (102 if offset == -1000 else 103)
+    assert proof.verified_wall_ms == int(clock.wall * 1000)
+    assert proof.expires_wall_ms == 1_800_000_003_000 + offset
     assert clock.mono == 100.5
     assert proof.expires_monotonic != clock.mono + 3
 
@@ -44,3 +46,30 @@ def test_original_approval_ceiling_clips_nonce_start_lifetime(setup):
     signer.delay = .25
     proof = observer.observe_verified()
     assert proof.expires_monotonic == observer._deadline == 101
+    assert proof.expires_wall_ms == launch.approval_expires_at_ms
+
+
+def test_negative_issuer_skew_cannot_outlive_signed_absolute_expiry(setup):
+    clock, _, _, signer, observer = setup
+    def past(payload):
+        payload['observed_at_ms'] -= 2000
+        payload['expires_at_ms'] -= 2000
+    signer.mutate = past
+    signer.delay = .25
+    proof = observer.observe_verified()
+    assert proof.started_monotonic == 100
+    assert proof.expires_monotonic == 101
+    assert proof.expires_wall_ms == 1_800_000_001_000
+    assert proof.expires_monotonic < proof.started_monotonic + 3
+
+
+def test_forward_wall_shift_during_exchange_only_shortens_monotonic_ceiling(setup):
+    clock, _, _, signer, observer = setup
+    original = signer.encode
+    def advancing(envelope):
+        clock.wall += 1
+        return original(envelope)
+    signer.encode = advancing
+    proof = observer.observe_verified()
+    assert proof.started_monotonic == 100 and proof.expires_monotonic == 102
+    assert proof.expires_wall_ms == 1_800_000_003_000

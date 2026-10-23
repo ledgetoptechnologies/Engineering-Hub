@@ -119,7 +119,8 @@ def dependencies(monkeypatch):
             events.append('observe')
             started = time.monotonic()
             return VerifiedExecutorObservation(self.identity, os.urandom(32).hex(), str(uuid4()),
-                                               started, started + 5)
+                started, started + 5, verified_wall_ms=int(time.time() * 1000),
+                expires_wall_ms=int(time.time() * 1000) + 5000)
         def __call__(self):
             pytest.fail('Installed async composition must request verified proof, not bare identity')
         def close(self):
@@ -405,5 +406,18 @@ def test_verified_proof_clipped_to_original_report_deadline(tmp_path, dependenci
         proof = composition._current_verified()
         assert proof.expires_monotonic == composition._deadline
         assert proof.started_monotonic < proof.expires_monotonic
+    finally:
+        composition.close()
+
+
+def test_verified_absolute_wall_ceiling_clipped_to_original_report(tmp_path, dependencies):
+    data = document()
+    data['report']['expires_at_ms'] = int(time.time() * 1000) + 1000
+    composition = construct(tmp_path, data)
+    try:
+        proof = composition._current_verified()
+        assert proof.expires_wall_ms == data['report']['expires_at_ms']
+        assert proof.verified_wall_ms < proof.expires_wall_ms
+        assert proof.expires_monotonic <= composition._deadline
     finally:
         composition.close()

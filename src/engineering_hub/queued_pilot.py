@@ -539,8 +539,23 @@ class QueuedContainerPilot:
                 'task': self.repo.get_task(plan.job['target']['task_id'])}, job_id=plan.job_id,
                 action=self.action_key, phase='claim')
         subject = claim_subject()
-        prepared = await self.reconciliation.prepare_admission(owner=self.owner,
-            subject=subject, deadline=self._preparation_deadline())
+        try:
+            prepared = await self.reconciliation.prepare_admission(owner=self.owner,
+                subject=subject, deadline=self._preparation_deadline())
+        except StartupReconciliationError:
+            # Only this pre-claim await may race an ordinary runtime stop. No
+            # queue ownership or command was admitted; still drain the original
+            # observation and preserve local ownership/runtime/source failures.
+            # A simultaneous observation rejection is harmless only in this
+            # abandoned pre-claim attempt: a drain ack asserts local cleanup,
+            # never fresh remote identity or permission to claim another job.
+            self._guard()
+            from .queued_pilot_runtime import QueuedPilotRuntime
+            if (type(self._runtime) is QueuedPilotRuntime
+                    and self._runtime.bridge is self
+                    and self._runtime.claim_preflight_stopped()):
+                raise HubError('queued_pilot_runtime_unavailable', 409) from None
+            raise
         job = None
         try:
             with self._consume(prepared, subject):

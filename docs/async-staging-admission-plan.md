@@ -66,19 +66,28 @@ Affected paths:
 - `src/engineering_hub/lifecycle.py` (reuse its existing owned-drain contract)
 
 Extend the observer with a private verified observation result carrying exact
-identity, validated nonce/observation ID and a conservative local monotonic expiry
-clipped to original launch approval. Do not infer a new validity window from the
+identity, validated nonce/observation ID, verified local wall-clock baseline,
+absolute signed expiry and a conservative local monotonic expiry, all clipped
+to original launch approval. Missing absolute bounds deny async admission;
+they are never inferred from proof arrival. Do not infer a new validity window from the
 time an already-old response finishes. Retain current signature, replay, PID,
 clock, original-approval and sticky-denial checks.
 
 The conservative proof ceiling is
 `min(nonce_start_monotonic + (signed_expires_ms - signed_observed_ms) / 1000,
+nonce_start_monotonic + (signed_expires_ms - local_nonce_wall_ms) / 1000,
+verification_monotonic + remaining_absolute_validity,
 original_launch_monotonic_ceiling)`, further clipped by gate/report/action/lease
 ceilings at preparation. Nonce issuance causally precedes the issuer observation;
 using that earlier local start consumes transit/verification delay rather than
 minting a new lifetime at response finish. Permitted issuer clock offsets do not
-extend this duration. Tests cover positive and negative issuer offsets, delayed
-successful responses, original-approval clipping and expiry during transit.
+extend this duration. Every consumed-scope check also samples nondecreasing local
+wall time after local ownership/proof reads and rejects the earliest retained
+signed/report/approval absolute expiry. A forward wall step during local audit
+or completion validation therefore cannot be hidden by an unchanged monotonic
+clock; a backward step cannot renew authority. Tests cover positive and negative
+issuer offsets, delayed responses, original-approval clipping, transit expiry
+and independent forward wall jumps during local admission work.
 
 The async path runs only the bounded synchronous observation exchange through a
 retained executor Future and `finish_owned`. The awaiting caller can detach only

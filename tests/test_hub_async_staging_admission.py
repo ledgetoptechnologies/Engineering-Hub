@@ -17,6 +17,7 @@ from engineering_hub.startup_reconciliation import (
     AdmissionSubject, ExecutorSessionIdentity, OperatorReconciliation,
     StartupReconciliation, StartupReconciliationError,
 )
+from tests.test_hub_current_executor_observation import setup
 
 
 @pytest.fixture
@@ -29,7 +30,8 @@ def state(tmp_path):
             started = time.monotonic()
             calls.append(threading.get_ident())
             return VerifiedExecutorObservation(identity, uuid4().hex + uuid4().hex,
-                                                str(uuid4()), started, started + 2)
+                str(uuid4()), started, started + 2, verified_wall_ms=int(time.time() * 1000),
+                expires_wall_ms=int(time.time() * 1000) + 2000)
         gate = StartupReconciliation(owner=owner, database=tmp_path / 'hub.sqlite3',
             target_id='engineering-hub:staging', manifest_digest='sha256:' + 'c' * 64,
             executor=identity, lifetime_seconds=30, current_executor_identity=observe,
@@ -222,6 +224,76 @@ async def test_accepted_metadata_does_not_authorize_scope_free_effect(state):
         state.gate.assert_current_permitted(owner=state.owner, target_id='engineering-hub:staging',
                                            manifest_digest='sha256:' + 'c' * 64)
     assert len(state.calls) == 1
+
+
+@pytest.mark.parametrize('changes', [dict(verified_wall_ms=None), dict(expires_wall_ms=None),
+    dict(verified_wall_ms=True), dict(expires_wall_ms=1.0), dict(verified_wall_ms=0),
+    dict(expires_wall_ms=1)])
+async def test_async_gate_rejects_missing_or_malformed_absolute_proof_ceilings(state, changes):
+    original = state.gate._observer
+    state.gate._observer = lambda: replace(original(), **changes)
+    with pytest.raises(StartupReconciliationError):
+        await state.gate.prepare_admission(owner=state.owner, subject=subject(state),
+                                           deadline=time.monotonic() + 2)
+    assert state.gate.admission_state == 'closed'
+
+
+@pytest.mark.parametrize('boundary', ['signed-expiry', 'original-approval', 'original-report'])
+async def test_final_scope_checks_real_signed_absolute_ceilings_after_wall_jump(state, setup, boundary):
+    clock, release, launch, _, observer = setup
+    report_expiry = int(clock.wall * 1000) + 1500
+    def observe():
+        proof = observer.observe_verified()
+        return replace(proof, expires_wall_ms=min(proof.expires_wall_ms, report_expiry)) if boundary == 'original-report' else proof
+    gate = StartupReconciliation(owner=state.owner, database=state.gate._database,
+        target_id='engineering-hub:staging', manifest_digest='sha256:' + 'c' * 64,
+        executor=ExecutorSessionIdentity(launch.launch_id, release.image_config_id),
+        lifetime_seconds=60, current_executor_identity=observe, async_admission=True)
+    item = subject(state)
+    prepared = await gate.prepare_admission(owner=state.owner, subject=item, deadline=clock.mono + 10)
+    with gate.admission_scope(prepared, owner=state.owner, subject=item):
+        clock.wall += {'signed-expiry': 4, 'original-approval': 31, 'original-report': 2}[boundary]
+        with pytest.raises(StartupReconciliationError):
+            gate.assert_active_subject(owner=state.owner, subject=item)
+        assert gate.admission_state == 'closed'
+
+
+async def test_forward_wall_jump_during_owner_read_vetoes_final_scope(state, monkeypatch):
+    item = subject(state)
+    prepared = await state.gate.prepare_admission(owner=state.owner, subject=item,
+                                                 deadline=time.monotonic() + 2)
+    wall = [time.time()]
+    with state.gate.admission_scope(prepared, owner=state.owner, subject=item):
+        original = PilotOwner.assert_active
+        def shifted(owner, path):
+            value = original(owner, path)
+            wall[0] = prepared.expires_wall_ms / 1000 + 1
+            return value
+        monkeypatch.setattr(PilotOwner, 'assert_active', shifted)
+        import engineering_hub.startup_reconciliation as module
+        monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: wall[0], monotonic=time.monotonic))
+        with pytest.raises(StartupReconciliationError):
+            state.gate.assert_active_subject(owner=state.owner, subject=item)
+        assert state.gate.admission_state == 'closed'
+
+
+async def test_observed_wall_regression_cannot_reopen_same_scope(state, monkeypatch):
+    item = subject(state)
+    prepared = await state.gate.prepare_admission(owner=state.owner, subject=item,
+                                                 deadline=time.monotonic() + 2)
+    wall = [time.time()]
+    with state.gate.admission_scope(prepared, owner=state.owner, subject=item):
+        import engineering_hub.startup_reconciliation as module
+        monkeypatch.setattr(module, 'time', SimpleNamespace(time=lambda: wall[0], monotonic=time.monotonic))
+        wall[0] += .1
+        state.gate.assert_active_subject(owner=state.owner, subject=item)
+        wall[0] -= .05  # Still after original verification, but before last check.
+        with pytest.raises(StartupReconciliationError):
+            state.gate.assert_active_subject(owner=state.owner, subject=item)
+        wall[0] += .05
+        with pytest.raises(StartupReconciliationError):
+            state.gate.assert_active_subject(owner=state.owner, subject=item)
+        assert state.gate.admission_state == 'closed'
 
 
 def test_foreign_process_scope_check_does_not_touch_inherited_mutex(state):

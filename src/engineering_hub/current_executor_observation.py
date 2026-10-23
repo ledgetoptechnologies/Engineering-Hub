@@ -164,6 +164,10 @@ class VerifiedExecutorObservation:
     observation_id: str
     started_monotonic: float
     expires_monotonic: float
+    # Required for async effect admission; None only preserves the legacy
+    # constructor shape and is rejected by the async gate, never inferred there.
+    verified_wall_ms: int | None = None
+    expires_wall_ms: int | None = None
 
 
 class CurrentExecutorObserver:
@@ -290,11 +294,15 @@ class CurrentExecutorObserver:
                 final, final_wall = self._guard()
                 _require(final < deadline and final_wall < expires)
                 self._observations.add(payload["observation_id"])
-                proof_expiry = min(self._deadline, start + (expires - observed) / 1000)
+                proof_expiry = min(self._deadline, start + (expires - observed) / 1000,
+                    start + (expires - wall_start) / 1000,
+                    final + (expires - final_wall) / 1000)
                 _require(final < proof_expiry)
                 return VerifiedExecutorObservation(
                     ExecutorSessionIdentity(self._launch.launch_id, self._release.image_config_id),
-                    nonce, payload['observation_id'], start, proof_expiry)
+                    nonce, payload['observation_id'], start, proof_expiry,
+                    verified_wall_ms=final_wall,
+                    expires_wall_ms=min(expires, self._launch.approval_expires_at_ms))
             except BaseException as error:
                 self._closed = True
                 if not isinstance(error, Exception):

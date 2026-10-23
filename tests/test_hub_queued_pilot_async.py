@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='real Linux owne
 @pytest.fixture
 def case(rig):
     state = SimpleNamespace(calls=0, block_at=None, entered=threading.Event(),
-                            release=threading.Event(), delay=0, threads=[])
+                            release=threading.Event(), delay=0, threads=[], reject=False)
     target = rig.bridge.target
     identity = ExecutorSessionIdentity(str(uuid4()), 'sha256:' + 'e' * 64)
     def observe():
@@ -39,8 +39,12 @@ def case(rig):
                 raise TimeoutError('Synthetic observer timeout')
         if state.delay:
             time.sleep(state.delay)
+        if state.reject:
+            raise RuntimeError('Synthetic observation rejected; not readiness evidence')
+        verified_wall_ms = int(time.time() * 1000)
         return VerifiedExecutorObservation(identity, secrets.token_hex(32), str(uuid4()),
-                                           started, started + 5)
+            started, started + 5, verified_wall_ms=verified_wall_ms,
+            expires_wall_ms=verified_wall_ms + 5000)
     gate = StartupReconciliation(owner=rig.owner, database=rig.repo.path,
         target_id=target.target_id, manifest_digest=target.manifest_digest, executor=identity,
         lifetime_seconds=60, current_executor_identity=observe, async_admission=True)
@@ -111,6 +115,99 @@ async def test_changed_review_during_claim_observation_cannot_claim_another_job(
     assert await running is None
     assert case.queue.get_job(original['id'])['state'] == 'queued'
     assert not case.client.submissions and machine_job(case) is None
+
+
+@pytest.mark.parametrize('mode', ['normal', 'cancel', 'observer_rejected'])
+async def test_generation_drain_during_first_claim_observation_is_clean(case, mode):
+    from engineering_hub.events import NativeHubEventFeed
+    from engineering_hub.queued_pilot_runtime import QueuedPilotRuntime
+    await accept(case)
+    _, job = submit(case)
+    case.observation.block_at = 2
+    feed = NativeHubEventFeed(case.repo.path)
+    runtime = QueuedPilotRuntime(case.bridge, feed)
+    generation, request = str(uuid4()), str(uuid4())
+    cap = runtime.bind_generation_drain(case.owner, generation)
+    try:
+        assert (await feed.start())['available']
+        await runtime.start()
+        await entered(case)
+        draining = asyncio.create_task(cap.drain(generation_id=generation, request_id=request))
+        async with asyncio.timeout(2):
+            while not runtime._closed:
+                await asyncio.sleep(0)
+        if mode == 'cancel':
+            draining.cancel()
+            await asyncio.sleep(0)
+            draining.cancel()
+        elif mode == 'observer_rejected':
+            case.observation.reject = True
+        assert not draining.done() and runtime._active is not None
+        case.observation.release.set()
+        if mode == 'cancel':
+            with pytest.raises(asyncio.CancelledError):
+                await draining
+            ack = await cap.drain(generation_id=generation, request_id=request)
+        else:
+            ack = await draining
+        assert ack.request_id == request and runtime.status['state'] == 'stopped'
+        assert not ack.remote_authenticated and not ack.whole_workflow_completed
+        assert case.gate.admission_state == 'closed'
+        assert case.queue.get_job(job['id'])['state'] == 'queued'
+        assert not case.client.submissions and machine_job(case) is None
+        assert feed.broker.subscriber_count == 0
+        case.owner.assert_active(case.repo.path)
+    finally:
+        case.observation.release.set()
+        await runtime.stop()
+        await feed.stop()
+
+
+@pytest.mark.parametrize('failure', ['owner', 'source', 'source_unobserved', 'gate_without_stop'])
+async def test_first_claim_observation_failure_is_not_masked_as_normal_drain(case, failure):
+    from engineering_hub.events import NativeHubEventFeed
+    from engineering_hub.pilot_ownership import PilotOwnershipError
+    from engineering_hub.queued_pilot_runtime import QueuedPilotRuntime
+    await accept(case)
+    _, job = submit(case)
+    case.observation.block_at = 2
+    feed = NativeHubEventFeed(case.repo.path)
+    runtime = QueuedPilotRuntime(case.bridge, feed)
+    generation, request = str(uuid4()), str(uuid4())
+    cap = runtime.bind_generation_drain(case.owner, generation)
+    draining = None
+    try:
+        assert (await feed.start())['available']
+        await runtime.start()
+        await entered(case)
+        if failure == 'gate_without_stop':
+            case.gate.close()
+        else:
+            draining = asyncio.create_task(cap.drain(generation_id=generation, request_id=request))
+            async with asyncio.timeout(2):
+                while not runtime._closed:
+                    await asyncio.sleep(0)
+            if failure == 'owner':
+                case.owner.close()
+            elif failure == 'source':
+                runtime._unavailable()
+            else:
+                # Lose the native source without delivering its invalidation
+                # yet. A normal stop cannot race that failure into a clean ack.
+                feed.broker.available = False
+        case.observation.release.set()
+        if draining is None:
+            await runtime._task
+            draining = asyncio.create_task(cap.drain(generation_id=generation, request_id=request))
+        with pytest.raises((HubError, PilotOwnershipError)):
+            await draining
+        assert cap._ack is None and runtime.status['state'] != 'stopped'
+        assert case.queue.get_job(job['id'])['state'] == 'queued'
+        assert not case.client.submissions and machine_job(case) is None
+    finally:
+        case.observation.release.set()
+        await runtime.stop()
+        await feed.stop()
 
 
 @pytest.mark.parametrize('change', ['close', 'cancel', 'review', 'lease'])
@@ -191,7 +288,8 @@ async def test_slow_valid_observations_leave_shared_event_loop_responsive(case):
     assert len(gaps) >= 10 and max(gaps) < .25
 
 
-async def test_release_proof_expiry_during_local_validation_keeps_capacity_held(case, monkeypatch):
+@pytest.mark.parametrize('expiry_clock', ['monotonic', 'wall'])
+async def test_release_proof_expiry_during_local_validation_keeps_capacity_held(case, monkeypatch, expiry_clock):
     from engineering_hub import startup_reconciliation as gate_module
     await accept(case)
     _, job = submit(case)
@@ -200,9 +298,15 @@ async def test_release_proof_expiry_during_local_validation_keeps_capacity_held(
         result = original(db, intent)
         scope = case.gate._active_scope
         if scope is not None and scope.subject.kind == 'reconcile':
-            # Simulated elapsed proof work; only the gate's clock is advanced.
-            after_proof = scope.deadline + .001
-            monkeypatch.setattr(gate_module, 'time', SimpleNamespace(monotonic=lambda: after_proof))
+            # Only one gate clock advances; the other remains live. Neither an
+            # absent clock method nor renewing the proof can explain the veto.
+            if expiry_clock == 'monotonic':
+                after_proof = scope.deadline + .001
+                clocks = SimpleNamespace(monotonic=lambda: after_proof, time=time.time)
+            else:
+                after_proof = scope.expires_wall_ms / 1000 + .001
+                clocks = SimpleNamespace(monotonic=time.monotonic, time=lambda: after_proof)
+            monkeypatch.setattr(gate_module, 'time', clocks)
         return result
     monkeypatch.setattr(case.bridge, '_proof', proof)
     assert (await case.bridge.run_once())['state'] == 'held'
