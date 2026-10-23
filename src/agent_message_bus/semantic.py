@@ -256,7 +256,10 @@ class SemanticIndex:
                 model_name=self.model_name,
                 cache_dir=str(self.model_cache_root),
                 providers=["CPUExecutionProvider"],
-                threads=2,
+                # One inference worker leaves the bounded Hub's shared request
+                # loop room to run. Import-time BLAS pools are separately
+                # limited by the image default, before NumPy is imported.
+                threads=1,
                 local_files_only=True,
             )
             self._model_hash = model_hash
