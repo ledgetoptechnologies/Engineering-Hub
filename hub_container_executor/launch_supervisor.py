@@ -1149,7 +1149,18 @@ class LaunchSupervisor:
         _require(self._pid == os.getpid())
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
         deadline = time.monotonic() + min(timeout_ms, self._request_ms) / 1000
-        with self._observation_mutex(deadline):
+        return self._serve_current_until(deadline)
+
+    def _serve_current_until(self, deadline):
+        # Carry an absolute bound across the owned wait's request handoff.
+        # Scheduling or mutex admission cannot mint a fresh relative window.
+        try:
+            return self._serve_current_peer_until(deadline)
+        except _ObservationWaitExpired:
+            return False
+
+    def _serve_current_peer_until(self, deadline):
+        with self._observation_mutex(deadline, wait_window=True):
             peer = None
             try:
                 # No framing or remote request can select the retained consumer.
@@ -1228,10 +1239,8 @@ class LaunchSupervisor:
             except _ObservationWaitExpired:
                 return False
             if pending:
-                remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
-                if remaining_ms <= 0:
-                    return False
-                self.serve_one_current_observation(timeout_ms=min(self._request_ms, remaining_ms))
+                self._serve_current_until(min(
+                    deadline, time.monotonic() + self._request_ms / 1000))
 
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""

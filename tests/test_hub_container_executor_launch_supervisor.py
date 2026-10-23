@@ -539,6 +539,35 @@ def test_owned_wait_deadline_races_are_not_authority_failures(synthetic_issuer, 
     assert authority.wait_for_stop_with_observations(timeout_ms=50, stop_requested=lambda: True) is True
 
 
+def test_owned_wait_request_handoff_keeps_absolute_deadline(synthetic_issuer, monkeypatch):
+    authority, _, _ = synthetic_issuer
+    current_ready(authority)
+    before = (authority._expires, authority._approval_expires_at_ms, authority._receipt_served)
+    origin = time.monotonic()
+    now = [origin]
+    deadlines = []
+    serve = authority._serve_current_peer_until
+    select_ready = launch.select.select
+    def delayed_ready(read, write, errors, timeout):
+        if authority._listener not in read:
+            return select_ready(read, write, errors, timeout)
+        now[0] = origin + .1  # Scheduling consumes the original 50 ms window.
+        return [authority._listener], [], []
+    def capture(deadline):
+        deadlines.append(deadline)
+        return serve(deadline)  # Must decline before socket admission.
+    with monkeypatch.context() as patch:
+        patch.setattr(launch.time, 'monotonic', lambda: now[0])
+        patch.setattr(launch.select, 'select', delayed_ready)
+        patch.setattr(authority, '_serve_current_peer_until', capture)
+        assert authority.wait_for_stop_with_observations(
+            timeout_ms=50, stop_requested=lambda: False) is False
+    assert deadlines == [origin + .05]
+    assert not authority._held and getattr(authority, '_observation_thread', None) is None
+    assert (authority._expires, authority._approval_expires_at_ms, authority._receipt_served) == before
+    assert authority.wait_for_stop_with_observations(timeout_ms=50, stop_requested=lambda: True) is True
+
+
 def test_current_missing_eof_times_out_peer_without_holding(synthetic_issuer):
     authority, path, _ = synthetic_issuer
     current_ready(authority)
