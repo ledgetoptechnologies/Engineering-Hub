@@ -315,7 +315,8 @@ def test_secret_file_guards_and_no_token_echo(installed, monkeypatch, kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('layout', ['external', 'private-hub-child'])
-async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owner(installed, monkeypatch, layout):
+@pytest.mark.parametrize('with_acceptance', [False, True])
+async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owner(installed, monkeypatch, layout, with_acceptance):
     from engineering_hub import unified_queued_pilot_service as serving
     from engineering_hub.work_queue import WorkTarget
     owner = PilotOwner(installed['database'], allow_ephemeral_test_storage=True)
@@ -335,7 +336,12 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
         opened.append(result)
         return result
     monkeypatch.setattr(startup, 'PilotOwner', open_owner)
+    def acceptance(*_):
+        pytest.fail('selector must forward, not invoke, trusted acceptance factory')
+    acceptance_factory = acceptance if with_acceptance else None
     async def fake_serve(settings, manifest, factory, **kwargs):
+        assert kwargs['session_acceptance_factory'] is acceptance_factory
+        assert kwargs['reconciliation_factory'] is synthetic_reconciliation
         assert settings.database == installed['database']
         assert settings.agent_auth.codex_token == 'synthetic-codex'
         assert kwargs['agent_port'] == 8770 and kwargs['browser_port'] == 8771
@@ -358,6 +364,29 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
         raise RuntimeError('Synthetic early bind failure')
     monkeypatch.setattr(serving, 'serve_owned_unified_queued_pilot', fake_serve)
     with pytest.raises(startup.UnifiedPilotStartupError):
-        await startup.serve_configuration(installed['config'], installed['profile'], reconciliation_factory=synthetic_reconciliation)
+        await startup.serve_configuration(installed['config'], installed['profile'],
+            reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=acceptance_factory)
     assert len(opened) == 1
     with pytest.raises(PilotOwnershipError): opened[0].assert_active(installed['database'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['bool', 'object', 'async-function', 'async-callable', 'async-generator'])
+async def test_invalid_acceptance_factory_denied_before_configuration_owner_or_credentials(monkeypatch, kind):
+    async def async_function(*_):
+        pytest.fail('async factory must not execute')
+    class AsyncCallable:
+        async def __call__(self, *_):
+            pytest.fail('async callable must not execute')
+    async def async_generator(*_):
+        yield True
+    factory = {'bool': True, 'object': object(), 'async-function': async_function,
+               'async-callable': AsyncCallable(), 'async-generator': async_generator}[kind]
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('must reject factory before protected configuration/owner/credential I/O')
+    monkeypatch.setattr(startup, 'validate_configuration', forbidden)
+    monkeypatch.setattr(startup, 'PilotOwner', forbidden)
+    monkeypatch.setattr(startup, 'read_protected_file', forbidden)
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration('/not-read/config', '/not-read/profile',
+            reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=factory)

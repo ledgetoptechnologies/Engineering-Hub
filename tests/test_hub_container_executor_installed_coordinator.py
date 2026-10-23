@@ -123,7 +123,7 @@ def test_closed_nested_shape_and_canonical_denials(kind):
         module.parse_configuration(raw)
 
 
-def install_fakes(monkeypatch, events, *, failure=False):
+def install_fakes(monkeypatch, events, *, failure=False, expected_acceptance=None):
     monkeypatch.setattr(module, '_process', lambda: events.append('process'))
 
     @contextmanager
@@ -145,6 +145,8 @@ def install_fakes(monkeypatch, events, *, failure=False):
 
     async def serve(settings, manifest, factory, **kwargs):
         events.append('serve')
+        assert kwargs['session_acceptance_factory'] is expected_acceptance
+        assert kwargs['reconciliation_factory'] is synthetic_reconciliation
         assert settings.work_queue_enabled and settings.agent_auth.admin_token is None
         assert settings.agent_auth.allowed_ips == frozenset({'127.0.0.1'})
         assert kwargs['agent_host'] == '127.0.0.1' and kwargs['agent_port'] == 18870
@@ -158,11 +160,37 @@ def install_fakes(monkeypatch, events, *, failure=False):
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', serve)
 
 
-def test_concrete_factory_and_service_lifetime(monkeypatch):
+@pytest.mark.parametrize('with_acceptance', [False, True])
+def test_concrete_factory_and_service_lifetime(monkeypatch, with_acceptance):
     events = []
-    install_fakes(monkeypatch, events)
-    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
+    def acceptance(*_):
+        pytest.fail('selector must forward, not invoke, trusted acceptance factory')
+    factory = acceptance if with_acceptance else None
+    install_fakes(monkeypatch, events, expected_acceptance=factory)
+    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation,
+                                                    session_acceptance_factory=factory))
     assert events == ['process', 'secrets-enter', 'secrets-close', 'serve', 'client', 'client', 'drained']
+
+
+@pytest.mark.parametrize('kind', ['bool', 'object', 'async-function', 'async-callable', 'async-generator'])
+def test_invalid_acceptance_factory_denied_before_secret_provider(monkeypatch, kind):
+    async def async_function(*_):
+        pytest.fail('async factory must not execute')
+    class AsyncCallable:
+        async def __call__(self, *_):
+            pytest.fail('async callable must not execute')
+    async def async_generator(*_):
+        yield True
+    factory = {'bool': True, 'object': object(), 'async-function': async_function,
+               'async-callable': AsyncCallable(), 'async-generator': async_generator}[kind]
+    monkeypatch.setattr(module, '_process', lambda: None)
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('must reject factory before TEST provider or service/owner construction')
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', forbidden)
+    monkeypatch.setattr(module, 'serve_owned_queued_pilot', forbidden)
+    with pytest.raises(module.InstalledCoordinatorError):
+        run_owned_loop(module.run_installed_coordinator(parse(),
+            reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=factory))
 
 
 def test_failed_service_is_sanitized(monkeypatch):
