@@ -1,5 +1,4 @@
 """Protected-layout selection stays explicit; no live state or secret reads."""
-import asyncio
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -93,7 +92,8 @@ def test_default_cli_refuses_v2_before_socket_or_runtime(tmp_path, monkeypatch, 
     assert 'explicit owned entrypoint' in capsys.readouterr().err
 
 
-def test_owned_selector_denies_boundary_before_settings_or_service(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_owned_selector_denies_boundary_before_settings_or_service(tmp_path, monkeypatch):
     from engineering_hub import owned_inactive_hub as service, protected_layout as layout
     path = write(tmp_path, document())
     def reject(*_a, **_k):
@@ -101,7 +101,7 @@ def test_owned_selector_denies_boundary_before_settings_or_service(tmp_path, mon
     monkeypatch.setattr(layout, 'validate_existing_boundary', reject)
     monkeypatch.setattr(service.Settings, 'from_env', lambda *_a, **_k: pytest.fail('settings read'))
     with pytest.raises(layout.ProtectedLayoutError):
-        asyncio.run(service.serve_configuration(path))
+        await service.serve_configuration(path)
 
 
 def test_pilot_selector_denies_boundary_before_profile_read(tmp_path, monkeypatch):

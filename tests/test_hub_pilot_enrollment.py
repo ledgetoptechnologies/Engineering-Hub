@@ -1,5 +1,4 @@
 """Disposable Linux cold-ledger enrollment, never NAS or host activation."""
-import asyncio
 from contextlib import closing
 import hashlib
 import json
@@ -81,7 +80,8 @@ def test_plan_is_read_only_fingerprints_no_secrets_and_apply_preserves_every_exi
         enrollment.apply_plan(plan, enrollment.plan_digest(plan), writers_stopped=True, backup_verified=True)
 
 
-def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_owned_reopen(ledger):
+@pytest.mark.asyncio
+async def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_owned_reopen(ledger):
     # All constructors and traffic below are local disposable fixtures. This
     # exercises enrollment compatibility, not live Access verification, bus
     # delivery, job execution, or a production state-migration procedure.
@@ -126,7 +126,7 @@ def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_owned_re
 
     bus = DisposableBus()
     publisher = HubOutboxPublisher(repo, bus, recipients=('hermes',))
-    delivered = asyncio.run(publisher.drain_batch())
+    delivered = await publisher.drain_batch()
     assert delivered == {'accepted': len(bus.sent), 'failed': 0, 'pending': 0, 'held_reason': None}
     assert delivered['accepted'] > 0
     before = snapshot(source)
@@ -166,7 +166,7 @@ def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_owned_re
             assert owned_queue.submit(actor='codex', request_id='history-' + job['state'],
                                       action_key='validate', environment='staging', target=target) == job
         sent_before = len(bus.sent)
-        assert asyncio.run(owned_publisher.drain_batch()) == {
+        assert await owned_publisher.drain_batch() == {
             'accepted': 0, 'failed': 0, 'pending': 0, 'held_reason': None}
         assert len(bus.sent) == sent_before
         with owned._connection() as db:

@@ -7,12 +7,35 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from tests.manual_session_fixtures import synthetic_reconciliation
 
 pytest.importorskip('fcntl', reason='Optional coordinator uses Linux providers')
 
 from hub_container_executor import installed_coordinator as module
 from engineering_hub.work_queue import WorkTarget
 from tests.test_hub_container_pilot_manifest import make_manifest_data
+
+
+def run_owned_loop(coroutine):
+    # Explicit ownership: Runner closes only its new loop, without replacing or
+    # clearing pytest-asyncio's ambient policy loop (and orphaning its sockets).
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        return runner.run(coroutine)
+
+
+def test_owned_runner_preserves_ambient_policy_loop():
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    retained = policy.new_event_loop()
+    policy.set_event_loop(retained)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        assert run_owned_loop(asyncio.sleep(0, result='done')) == 'done'
+        assert policy.get_event_loop() is retained and not retained.is_closed()
+    finally:
+        retained.close()
+        policy.set_event_loop(None)
+        asyncio.set_event_loop_policy(previous_policy)
 
 
 def canonical(value):
@@ -100,7 +123,7 @@ def test_closed_nested_shape_and_canonical_denials(kind):
         module.parse_configuration(raw)
 
 
-def install_fakes(monkeypatch, events, *, failure=False):
+def install_fakes(monkeypatch, events, *, failure=False, expected_acceptance=None):
     monkeypatch.setattr(module, '_process', lambda: events.append('process'))
 
     @contextmanager
@@ -122,6 +145,8 @@ def install_fakes(monkeypatch, events, *, failure=False):
 
     async def serve(settings, manifest, factory, **kwargs):
         events.append('serve')
+        assert kwargs['session_acceptance_factory'] is expected_acceptance
+        assert kwargs['reconciliation_factory'] is synthetic_reconciliation
         assert settings.work_queue_enabled and settings.agent_auth.admin_token is None
         assert settings.agent_auth.allowed_ips == frozenset({'127.0.0.1'})
         assert kwargs['agent_host'] == '127.0.0.1' and kwargs['agent_port'] == 18870
@@ -135,25 +160,51 @@ def install_fakes(monkeypatch, events, *, failure=False):
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', serve)
 
 
-def test_concrete_factory_and_service_lifetime(monkeypatch):
+@pytest.mark.parametrize('with_acceptance', [False, True])
+def test_concrete_factory_and_service_lifetime(monkeypatch, with_acceptance):
     events = []
-    install_fakes(monkeypatch, events)
-    asyncio.run(module.run_installed_coordinator(parse()))
+    def acceptance(*_):
+        pytest.fail('selector must forward, not invoke, trusted acceptance factory')
+    factory = acceptance if with_acceptance else None
+    install_fakes(monkeypatch, events, expected_acceptance=factory)
+    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation,
+                                                    session_acceptance_factory=factory))
     assert events == ['process', 'secrets-enter', 'secrets-close', 'serve', 'client', 'client', 'drained']
+
+
+@pytest.mark.parametrize('kind', ['bool', 'object', 'async-function', 'async-callable', 'async-generator'])
+def test_invalid_acceptance_factory_denied_before_secret_provider(monkeypatch, kind):
+    async def async_function(*_):
+        pytest.fail('async factory must not execute')
+    class AsyncCallable:
+        async def __call__(self, *_):
+            pytest.fail('async callable must not execute')
+    async def async_generator(*_):
+        yield True
+    factory = {'bool': True, 'object': object(), 'async-function': async_function,
+               'async-callable': AsyncCallable(), 'async-generator': async_generator}[kind]
+    monkeypatch.setattr(module, '_process', lambda: None)
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('must reject factory before TEST provider or service/owner construction')
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', forbidden)
+    monkeypatch.setattr(module, 'serve_owned_queued_pilot', forbidden)
+    with pytest.raises(module.InstalledCoordinatorError):
+        run_owned_loop(module.run_installed_coordinator(parse(),
+            reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=factory))
 
 
 def test_failed_service_is_sanitized(monkeypatch):
     events = []
     install_fakes(monkeypatch, events, failure=True)
     with pytest.raises(module.InstalledCoordinatorError, match='^Installed pilot coordinator unavailable$'):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
 
 
 def test_fork_denied_before_secrets(monkeypatch):
     events = []
     install_fakes(monkeypatch, events)
     with pytest.raises(module.InstalledCoordinatorError):
-        asyncio.run(module.run_installed_coordinator(replace(parse(), process_id=os.getpid() + 1)))
+        run_owned_loop(module.run_installed_coordinator(replace(parse(), process_id=os.getpid() + 1), reconciliation_factory=synthetic_reconciliation))
     assert events == ['process']
 
 
@@ -166,7 +217,7 @@ def test_old_core_without_private_unix_api_denied_before_secret_provider(monkeyp
     monkeypatch.setattr(module, 'serve_owned_queued_pilot',
         lambda *args, **kwargs: pytest.fail('must not construct owner with incompatible core'))
     with pytest.raises(module.InstalledCoordinatorError):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     assert events == ['process']
 
 
@@ -201,7 +252,7 @@ def test_cancellation_propagates_after_existing_service_drains(monkeypatch):
             events.append('existing-service-drain')
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', service)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     assert events[-1] == 'existing-service-drain'
 
 
@@ -246,7 +297,7 @@ def test_actual_mcp_transport_accepts_configured_loopback_port_without_host_over
     async def capture(settings, *args, **kwargs):
         captured.append(settings)
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', capture)
-    asyncio.run(module.run_installed_coordinator(parse()))
+    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     settings = replace(captured[0], database=tmp_path / 'hub.sqlite3')
     app = create_app(settings)
     headers = {'Authorization': 'Bearer fixture-test-codex',

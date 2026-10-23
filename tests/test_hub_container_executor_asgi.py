@@ -13,6 +13,28 @@ from hub_container_executor.asgi import create_app
 from tests.test_hub_container_pilot_manifest import make_manifest_data
 
 
+def run_owned_loop(coroutine):
+    # Own and close only this call's loop. asyncio.run() would clear a
+    # caller-owned policy loop left by pytest-asyncio, orphaning its sockets.
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        return runner.run(coroutine)
+
+
+def test_owned_runner_preserves_ambient_policy_loop():
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    retained = policy.new_event_loop()
+    policy.set_event_loop(retained)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        assert run_owned_loop(asyncio.sleep(0, result="done")) == "done"
+        assert policy.get_event_loop() is retained and not retained.is_closed()
+    finally:
+        retained.close()
+        policy.set_event_loop(None)
+        asyncio.set_event_loop_policy(previous_policy)
+
+
 def setup_app(tmp_path):
     root = tmp_path / "private"
     root.mkdir(mode=0o700)
@@ -55,7 +77,7 @@ def test_get_consumes_and_rejects_headerless_nonempty_body(tmp_path):
         "path": "/v1/container-pilot/commands/" + str(uuid4()),
         "query_string": b"", "headers": [(b"authorization", b"Bearer test-token-only")],
     }
-    asyncio.run(app(scope, receive, send))
+    run_owned_loop(app(scope, receive, send))
     assert messages[0]["status"] == 400
     assert receive_count == 1
     adapter.close()
@@ -86,7 +108,7 @@ def test_stalled_post_body_is_bounded_by_independent_request_deadline(tmp_path, 
     async def send(message):
         messages.append(message)
 
-    asyncio.run(asyncio.wait_for(app(scope, receive, send), timeout=0.5))
+    run_owned_loop(asyncio.wait_for(app(scope, receive, send), timeout=0.5))
     assert messages[0]["status"] == 408
     adapter.close()
 
@@ -112,7 +134,7 @@ def test_optional_asgi_exact_echo_get_and_bodyless_reconcile(tmp_path):
         assert replay.status_code == 200 and replay.json()["replayed"] is True
         return post, get, reconcile, replay
 
-    results = asyncio.run(flow())
+    results = run_owned_loop(flow())
     assert all("test-token-only" not in result.text for result in results)
     adapter.close()
 
@@ -151,5 +173,5 @@ def test_auth_unknown_duplicate_oversized_and_nonempty_reconcile_are_rejected(tm
                                        headers={"Authorization": "Bearer test-token-only"})
             assert missing.status_code == 404
 
-    asyncio.run(flow())
+    run_owned_loop(flow())
     adapter.close()

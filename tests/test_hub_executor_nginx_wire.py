@@ -74,7 +74,7 @@ class FixtureAdapter:
 
 
 @asynccontextmanager
-async def proxy_fixture():
+async def proxy_fixture(current_observation_transport=None):
     nginx = nginx_command()
     with tempfile.TemporaryDirectory(prefix='eh-nx-', dir='/tmp') as directory:
         root = Path(directory)
@@ -83,7 +83,7 @@ async def proxy_fixture():
         cert_path.write_bytes(ca); key_path.write_bytes(key); key_path.chmod(0o600)
         socket_path = root / 'executor.sock'
         adapter = FixtureAdapter()
-        application = PilotASGI(adapter, TOKEN)
+        application = PilotASGI(adapter, TOKEN, current_observation_transport=current_observation_transport)
         state = dict(seen=[], fail=False)
         async def observed(scope, receive, send):
             state['seen'].append((scope['method'], scope['path'], scope['headers']))

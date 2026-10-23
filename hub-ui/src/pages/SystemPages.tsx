@@ -8,6 +8,7 @@ import type { Hub } from "../hub";
 import type { AgentSummary } from "../types";
 import { Badge, Icon, PageHeader, PanelTitle, names, pretty } from "../ui";
 import { WorkQueuePanel } from "../WorkQueuePanel";
+import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { StagingBadge } from "./WorkPages";
 
 function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
@@ -181,7 +182,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
             <div>
               <span className={`status-orb ${data.paused ? "paused" : ""}`} />
               <span>
-                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Running normally: the emergency pause is off"}</strong>
+                <strong>{data.paused ? "Emergency pause on: new staging work is blocked" : "Emergency pause off"}</strong>
                 <small>
                   {!data.autonomy.configured ? "No automatic runner is set up, so nothing runs on its own. Agents only act on the tasks shown here."
                     : `Automatic runner: ${pretty(data.autonomy.state)}`}
@@ -229,6 +230,11 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
           )}
           <p className="panel-footnote">Production, GitHub merge and real processing capabilities are not enabled.</p>
         </section>
+        {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
+          <SessionReconciliationPanel csrf={hub.session.csrf_token}
+            enabled={true} writable={hub.writable} stale={hub.stale}
+            onAuthError={hub.clearPrivateWorkspace} />
+        )}
         <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
           stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
       </div>

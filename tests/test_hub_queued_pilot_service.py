@@ -14,6 +14,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from tests.manual_session_fixtures import synthetic_reconciliation
 
 pytest.importorskip('fcntl', reason='Real Linux owner and Unix socket service')
 
@@ -138,7 +139,7 @@ async def reviewed_job(agent, task, key):
 
 
 def options(state, **changes):
-    values = dict(action_key=ACTION, machine_id=MACHINE, target_verifier=lambda *_: True,
+    values = dict(action_key=ACTION, machine_id=MACHINE, reconciliation_factory=synthetic_reconciliation, target_verifier=lambda *_: True,
         socket_path=state.endpoint, supervisor_stop_grace_seconds=2000,
         agent_host='127.0.0.1', agent_port=0, install_signals=False)
     values.update(changes)

@@ -249,7 +249,8 @@ def test_invalid_wheel_inputs_fail_sanitized_without_extraction(tmp_path, kind):
 def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install():
     text = (ROOT / "docker/Dockerfile.hub-executor").read_text()
     lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
-    assert lines[0].startswith("ARG CORE_IMAGE=") and "@sha256:" in lines[0]
+    assert lines[0] == "ARG CORE_IMAGE"
+    assert "ARG CORE_IMAGE=" not in text
     assert "FROM ${CORE_IMAGE} AS core" in lines
     assert any(line.startswith("FROM python:3.12-slim@sha256:") for line in lines)
     assert "FROM scratch" in lines
@@ -259,6 +260,11 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert "RUN --network=none python -I" in text
     assert "--no-deps --no-index --no-compile --no-cache-dir --disable-pip-version-check" in text
     assert "COPY --from=core /opt/venv/ /opt/venv/" in lines
+    assert text.index("COPY --from=executor-installer") < text.index("importlib.import_module")
+    assert "RUN --network=none /opt/venv/bin/python -I -B" in text
+    assert "engineering_hub.current_executor_observation" in text
+    assert "engineering_hub.current_executor_transport" in text
+    assert "record['source_files']" in text and "is_relative_to(root)" in text
     assert "USER 10001:10001" in lines
     assert 'ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.installed_runner"]' in lines
     assert 'CMD ["--config", "/operator/runner.json"]' in lines

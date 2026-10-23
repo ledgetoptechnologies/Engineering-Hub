@@ -9,6 +9,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from tests.manual_session_fixtures import synthetic_workflow_reconciliation
 
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
 from engineering_hub.container_pilot_manifest import PilotManifest
@@ -47,7 +48,7 @@ def rig(tmp_path):
         [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
     clock = [1000.0]
     queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")}, clock=lambda: clock[0])
-    bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE)
+    bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(workflow))
     result = SimpleNamespace(repo=repo, owner=owner, client=client, workflow=workflow,
                              queue=queue, bridge=bridge, clock=clock)
     try:
@@ -180,7 +181,7 @@ def reopen(rig):
         [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=rig.owner)
     rig.queue = WorkQueue(rig.repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")},
                           clock=lambda: rig.clock[0])
-    rig.bridge = QueuedContainerPilot(rig.queue, rig.workflow, action_key=ACTION, machine_id=MACHINE)
+    rig.bridge = QueuedContainerPilot(rig.queue, rig.workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(rig.workflow))
 
 
 @pytest.mark.asyncio
@@ -282,7 +283,7 @@ async def test_objects_created_before_enrollment_cannot_bypass_late_marker(tmp_p
         workflow = ContainerPilotWorkflow(repo, client,
             [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
         queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")})
-        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE)
+        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(workflow))
         task = reviewed_task(repo)
         with pytest.raises(HubError):
             repo.create_run("codex", task["id"], task["revision"], IMAGE, "engineering-hub:staging")
@@ -305,7 +306,7 @@ def test_existing_legacy_dispatcher_refuses_bridge_enrollment(tmp_path):
         queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")})
         before = dispatcher.cursor
         with pytest.raises(HubError):
-            QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE)
+            QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(workflow))
         assert dispatcher.cursor == before and client.submissions == []
         assert getattr(repo, "_queued_pilot", None) is None
 
@@ -328,7 +329,7 @@ async def test_original_target_authorization_revocation_between_phases_stops_pos
             [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
         queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")},
                           target_verifier=lambda *args: allowed[0])
-        bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE)
+        bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(workflow))
         task = reviewed_task(repo)
         job = queue.submit(actor="codex", request_id="revoked", action_key=ACTION,
             environment="staging", target=WorkTarget(task["id"], COMMIT, IMAGE))
@@ -390,7 +391,7 @@ def test_restart_cannot_rebind_enrolled_machine_or_manifest(rig, changed):
         workflow = ContainerPilotWorkflow(repo, client, [ContainerPilotTarget.from_manifest(manifest)],
                                            pilot_owner=rig.owner)
         queue = WorkQueue(repo, {ACTION: WorkAction(machine, project="engineering-hub")})
-        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=machine)
+        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=machine, reconciliation=synthetic_workflow_reconciliation(workflow))
     assert client.submissions == []
 
 
@@ -405,7 +406,7 @@ def test_preexisting_second_repository_cannot_borrow_current_owner_to_bypass_mar
         workflow = ContainerPilotWorkflow(repo, client,
             [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
         queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project="engineering-hub")})
-        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE)
+        QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=synthetic_workflow_reconciliation(workflow))
         task = reviewed_task(repo)
         with pytest.raises(HubError):
             other.create_run("codex", task["id"], task["revision"], IMAGE, "engineering-hub:staging")

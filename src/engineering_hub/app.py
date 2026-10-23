@@ -470,7 +470,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 try:
                     if queued_pilot_runtime is not None:
                         status = await queued_pilot_runtime.start()
-                        if status['state'] != 'active':
+                        # A live observer may serve read/status routes while its
+                        # mandatory manual-session gate still denies execution.
+                        if status['state'] not in {'active', 'startup_reconciliation_required', 'manual_session_closed'}:
                             raise HubError('queued_pilot_startup_unavailable', 503)
                     if runtime is not None:
                         await runtime.start()

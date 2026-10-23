@@ -16,12 +16,12 @@ def admitted(method, uri):
     # These patterns deliberately use the common anchored PCRE/Python subset.
     # Testing the literal template avoids inventing a separate route allowlist.
     patterns = re.findall(r'"~(\^.*\$)"\s+1;', BODY)
-    assert len(patterns) == 3
+    assert len(patterns) == 4
     return any(re.fullmatch(pattern, method + ':' + uri) for pattern in patterns)
 
 
 @pytest.mark.parametrize('method,path', [('POST', ROOT), ('GET', ROOT + '/' + UUID),
-    ('POST', ROOT + '/' + UUID + '/reconcile')])
+    ('POST', ROOT + '/' + UUID + '/reconcile'), ('POST', '/v1/container-pilot/current-observation')])
 def test_only_expected_routes_admitted(method, path):
     assert admitted(method, path)
 
@@ -32,7 +32,11 @@ def test_only_expected_routes_admitted(method, path):
     ('POST', ROOT + '/'), ('POST', ROOT + '?x=1'), ('GET', ROOT + '/' + UUID + '?'),
     ('POST', '/v1/%63ontainer-pilot/commands'), ('POST', '/v1//container-pilot/commands'),
     ('POST', '/v1/other/../container-pilot/commands'), ('GET', '/health'), ('POST', '/mcp'),
-    ('GET', ROOT + '/ABCDEF00-0000-4000-8000-000000000001')])
+    ('GET', ROOT + '/ABCDEF00-0000-4000-8000-000000000001'),
+    ('GET', '/v1/container-pilot/current-observation'),
+    ('POST', '/v1/container-pilot/current-observation/'),
+    ('POST', '/v1/container-pilot/current-observation?x=1'),
+    ('POST', '/v1/container-pilot/%63urrent-observation')])
 def test_aliases_other_methods_and_query_strings_denied(method, path):
     assert not admitted(method, path)
 

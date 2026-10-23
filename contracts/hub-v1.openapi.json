@@ -2674,7 +2674,9 @@
               "active",
               "stopping",
               "stopped",
-              "failed"
+              "failed",
+              "startup_reconciliation_required",
+              "manual_session_closed"
             ],
             "title": "State"
           },
@@ -4589,7 +4591,9 @@
               "active",
               "stopping",
               "stopped",
-              "failed"
+              "failed",
+              "startup_reconciliation_required",
+              "manual_session_closed"
             ],
             "title": "State"
           },

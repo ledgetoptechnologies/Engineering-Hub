@@ -14,8 +14,10 @@ agent presence or one worker's denial is not that evidence.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import hashlib
 import inspect
 import math
+import os
 import re
 import time
 import uuid
@@ -91,6 +93,42 @@ class ClosedClaimPolicy:
         return False
 
 
+@dataclass(frozen=True)
+class WorkClaimPlan:
+    """Read-only selection snapshot, NOT a reservation or admission capability.
+
+    Even a reconstructed matching plan must pass the queue's actual claim
+    callback again. Full raw row and machine generation are rechecked inside
+    claim_exact's transaction; a plan never authorizes a different candidate.
+    """
+    queue: object = field(repr=False)
+    queue_identity: str
+    process_id: int
+    worker: WorkWorker
+    action_keys: tuple | None
+    job_snapshot: tuple
+    machine_generation: int | None
+
+    @property
+    def raw_job(self):
+        return dict(self.job_snapshot)
+
+    @property
+    def job(self):
+        return WorkQueue._public(self.raw_job)
+
+    @property
+    def job_id(self):
+        return self.raw_job['id']
+
+    @property
+    def binding_digest(self):
+        value = [self.queue_identity, self.process_id, self.worker.encoded(),
+                 self.action_keys, self.job_snapshot, self.machine_generation]
+        return 'sha256:' + hashlib.sha256(json.dumps(value, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
 class WorkQueue:
     def __init__(self, repo, actions, *, approval_verifier=None,
                  reconciliation_verifier=None, completion_verifier=None, target_verifier=None,
@@ -108,6 +146,7 @@ class WorkQueue:
         if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier, production_readiness_verifier)):
             raise HubError('invalid_work_verifier')
         self.repo, self.clock, self.max_jobs = repo, clock, max_jobs
+        self._claim_plan_identity = str(uuid.uuid4())
         self.approval_verifier = approval_verifier
         self.reconciliation_verifier = reconciliation_verifier
         self.completion_verifier = completion_verifier
@@ -304,46 +343,129 @@ class WorkQueue:
             self._expire(db, now)
             if db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0] or self.repo._paused(db):
                 return None
-            # Entire durable queue is bounded. Approval is rechecked at claim,
-            # not cached from submission. Production priority is non-preemptive.
-            rows = db.execute("SELECT j.* FROM hub_work_jobs j LEFT JOIN hub_work_machines m ON m.machine_id=j.machine_id WHERE j.state='queued' AND m.job_id IS NULL ORDER BY CASE j.environment WHEN 'production' THEN 0 ELSE 1 END,j.sequence").fetchall()
-            # Establish physical-machine precedence before applying the caller's
-            # filters or capability. A different enrolled production worker may
-            # exist; no fabricated identity or agent-presence inference is used.
-            # The SQL order visits production before any staging. Select a
-            # claimable production row immediately, without running callbacks
-            # for later jobs between its admission check and reservation.
-            # Callbacks are point-in-time observations under the SQLite job
-            # transaction, not an atomic snapshot of external policy/readiness.
-            readiness_verifier = self.production_readiness_verifier
-            production_machines = set()
-            for row in rows:
-                if row['environment'] == 'production':
-                    if not self._eligible_target(row):
-                        continue
-                    readiness = self._production_readiness(row, readiness_verifier)
-                    if readiness is not False:
-                        production_machines.add(row['machine_id'])
-                elif row['machine_id'] in production_machines:
+            row = self._select_claimable(db, worker, action_keys)
+            return None if row is None else self._reserve_claim(db, row, worker, now, lease_seconds)
+
+    def _select_claimable(self, db, worker, action_keys):
+        # Entire durable queue is bounded. Approval is rechecked at claim,
+        # not cached from submission. Production priority is non-preemptive.
+        rows = db.execute("SELECT j.* FROM hub_work_jobs j LEFT JOIN hub_work_machines m ON m.machine_id=j.machine_id WHERE j.state='queued' AND m.job_id IS NULL ORDER BY CASE j.environment WHEN 'production' THEN 0 ELSE 1 END,j.sequence").fetchall()
+        # Establish physical-machine precedence before applying the caller's
+        # filters or capability. A different enrolled production worker may
+        # exist; no fabricated identity or agent-presence inference is used.
+        # The SQL order visits production before any staging. Select a
+        # claimable production row immediately, without running callbacks
+        # for later jobs between its admission check and reservation.
+        # Callbacks are point-in-time observations under the SQLite job
+        # transaction, not an atomic snapshot of external policy/readiness.
+        readiness_verifier = self.production_readiness_verifier
+        production_machines = set()
+        for row in rows:
+            if row['environment'] == 'production':
+                if not self._eligible_target(row):
                     continue
-                if action_keys is not None and row['action_key'] not in action_keys:
+                readiness = self._production_readiness(row, readiness_verifier)
+                if readiness is not False:
+                    production_machines.add(row['machine_id'])
+            elif row['machine_id'] in production_machines:
+                continue
+            if action_keys is not None and row['action_key'] not in action_keys:
+                continue
+            if row['environment'] == 'production':
+                if readiness is False:
                     continue
-                if row['environment'] == 'production':
-                    if readiness is False:
-                        continue
-                    if readiness_verifier is not None and readiness is not True:
-                        continue
-                elif not self._eligible_target(row):
+                if readiness_verifier is not None and readiness is not True:
                     continue
-                if not self._admitted(worker, row):
-                    continue
-                db.execute('INSERT OR IGNORE INTO hub_work_machines VALUES(?,0,NULL)', (row['machine_id'],))
-                db.execute('UPDATE hub_work_machines SET generation=generation+1,job_id=? WHERE machine_id=?', (row['id'], row['machine_id']))
-                fence = db.execute('SELECT generation FROM hub_work_machines WHERE machine_id=?', (row['machine_id'],)).fetchone()[0]
-                db.execute("UPDATE hub_work_jobs SET state='claimed',worker=?,fence=?,lease_until=? WHERE id=?", (worker.encoded(), fence, now + lease_seconds, row['id']))
-                self._event(db, 'work.claimed', row['id'], worker.agent)
-                return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (row['id'],)).fetchone())
-            return None
+            elif not self._eligible_target(row):
+                continue
+            if not self._admitted(worker, row):
+                continue
+            return row
+        return None
+
+    def _reserve_claim(self, db, row, worker, now, lease_seconds):
+        db.execute('INSERT OR IGNORE INTO hub_work_machines VALUES(?,0,NULL)', (row['machine_id'],))
+        db.execute('UPDATE hub_work_machines SET generation=generation+1,job_id=? WHERE machine_id=?', (row['id'], row['machine_id']))
+        fence = db.execute('SELECT generation FROM hub_work_machines WHERE machine_id=?', (row['machine_id'],)).fetchone()[0]
+        db.execute("UPDATE hub_work_jobs SET state='claimed',worker=?,fence=?,lease_until=? WHERE id=?", (worker.encoded(), fence, now + lease_seconds, row['id']))
+        self._event(db, 'work.claimed', row['id'], worker.agent)
+        return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (row['id'],)).fetchone())
+
+    def _claim_plan_options(self, worker, action_keys):
+        if type(worker) is not WorkWorker:
+            raise HubError('invalid_work_worker')
+        if action_keys is not None:
+            if type(action_keys) is not tuple or not 1 <= len(action_keys) <= 32:
+                raise HubError('invalid_work_action_filter')
+            for key in action_keys:
+                _key(key)
+                if key not in self.actions:
+                    raise HubError('work_action_not_registered', 403)
+            if len(set(action_keys)) != len(action_keys):
+                raise HubError('invalid_work_action_filter')
+
+    @staticmethod
+    def _machine_state(db, machine_id):
+        row = db.execute('SELECT generation,job_id FROM hub_work_machines WHERE machine_id=?', (machine_id,)).fetchone()
+        if row is None:
+            return None, None
+        return row['generation'], row['job_id']
+
+    def plan_claim(self, *, worker, action_keys=None):
+        """Read exact metadata selection only: no expire, reservation or writes.
+
+        Verifiers retain their existing policy. The trusted pilot caller supplies
+        its own private metadata-preview scope; there is no queue bypass flag.
+        """
+        self._claim_plan_options(worker, action_keys)
+        with self.repo._connection() as db:
+            if db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0] or self.repo._paused(db):
+                return None
+            row = self._select_claimable(db, worker, action_keys)
+            if row is None:
+                return None
+            generation, reserved = self._machine_state(db, row['machine_id'])
+            if reserved is not None:
+                return None  # Another selector won this read-only race.
+            return WorkClaimPlan(self, self._claim_plan_identity, os.getpid(), worker, action_keys,
+                tuple(sorted(dict(row).items())), generation)
+
+    def claim_exact(self, plan, *, worker, lease_seconds=60):
+        """Revalidate the SAME selection and callbacks; mismatch claims nothing.
+
+        A plan is public metadata, not proof of a remote observation. Any
+        configured actual claim verifier must authorize this transaction again.
+        """
+        self._lease(lease_seconds)
+        if (type(plan) is not WorkClaimPlan or plan.queue is not self
+                or type(plan.queue_identity) is not str or plan.queue_identity != self._claim_plan_identity
+                or type(plan.process_id) is not int or plan.process_id != os.getpid()
+                or type(plan.worker) is not WorkWorker or type(worker) is not WorkWorker
+                or plan.worker != worker or type(plan.job_snapshot) is not tuple
+                or plan.machine_generation is not None and (
+                    type(plan.machine_generation) is not int or plan.machine_generation < 0)):
+            raise HubError('invalid_work_claim_plan', 409)
+        self._claim_plan_options(worker, plan.action_keys)
+        with self.repo._transaction() as db:
+            now = self._now()
+            self._expire(db, now)
+            if db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0] or self.repo._paused(db):
+                return None
+            row = self._select_claimable(db, worker, plan.action_keys)
+            if row is None:
+                return None
+            current = tuple(sorted(dict(row).items()))
+            if (current != plan.job_snapshot or any(type(value) is not type(saved)
+                    for (_, value), (_, saved) in zip(current, plan.job_snapshot))):
+                return None
+            generation, reserved = self._machine_state(db, row['machine_id'])
+            if reserved is not None or generation != plan.machine_generation:
+                return None
+            # Snapshot/precedence reads may consume a prepared pilot scope's
+            # deadline. Recheck its local claim veto at reservation time.
+            if not self._admitted(worker, row):
+                return None
+            return self._reserve_claim(db, row, worker, now, lease_seconds)
 
     def _owned(self, db, job_id, worker, fence, now):
         _key(job_id)

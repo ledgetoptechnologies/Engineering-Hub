@@ -61,18 +61,25 @@ the reviewed `scripts/verify_hub_executor_wheel.py` as
 `validate_executor_wheel.py`. Do not build against a mutable checkout or supply
 an unreviewed validator. The fixed wheel version is currently 0.1.0.
 
-Supply mandatory build arguments `EXECUTOR_WHEEL_SHA256` (64 lowercase hex
+Supply mandatory build arguments `CORE_IMAGE` (an independently approved full
+immutable digest reference), `EXECUTOR_WHEEL_SHA256` (64 lowercase hex
 characters) and `SOURCE_COMMIT` (the independently approved 40-character commit).
 The validator checks wheel bytes, contents and recorded source identity before
 an offline, dependency-free installation. Embedded metadata is not independent
 provenance; approval of the expected wheel hash and commit remains external.
 
-`CORE_IMAGE` defaults to the published Hub control artifact at
-`ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:f40ada02aed973b7bbb8ad47c50dc40ce0dfff39b99b9b8a42eb07955dfebcad`
-(main source `cb7b790ecc0e46b9134130c6cbb87387f80a371b`). This replaces the
-earlier `805d1f8...` default, which predates the coordinator's private Unix client.
-An explicit override must also be a full digest reference. This stage is only a
-source of `/opt/venv`, never executed during the build. Registry access may
+There is no `CORE_IMAGE` default. The former `f40ada02...` core (main
+`cb7b790...`) predates current-observation APIs and is incompatible with this
+executor, despite the unchanged 0.6.0 package version. Preparing a new optional
+wheel does not build or select a new core image. Supply a separately built,
+approved compatible core by full digest; do not substitute a mutable tag or
+guess an unpublished digest. This stage is only a source of `/opt/venv`.
+After overlaying the optional wheel, an offline inert import check runs against
+the actual installed venv, requiring core observation/transport/reconciliation
+modules and every Python module recorded in the verified optional wheel. A
+missing API fails the image build; no operator configuration or issuer/runner
+resource factory is invoked. This is compatibility, not enrolled build identity.
+Registry access may
 require authentication configured outside the context. A locally validated
 alternate core digest is a different input, not equivalent provenance or release
 enrollment. Record the exact core and Python runtime/platform identities used.

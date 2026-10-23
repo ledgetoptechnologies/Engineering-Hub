@@ -16,6 +16,49 @@ TOKEN = 'isolated-test-value-not-live'
 UUID = '01812ed4-729b-4740-8772-793c921f38c9'
 
 
+def run_owned_loop(coroutine):
+    # This synchronous test owns its new loop, not pytest-asyncio's idle policy
+    # loop. Runner's explicit factory leaves that borrowed loop untouched.
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        return runner.run(coroutine)
+
+
+@pytest.fixture
+def cli_owned_loop():
+    # main() is a standalone CLI and legitimately owns asyncio.run in production.
+    # Exercise its command contracts here without clearing the test runner's
+    # ambient policy loop; do not globally close or suppress borrowed resources.
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    asyncio.set_event_loop_policy(policy)
+    try:
+        yield
+    finally:
+        # Only this fixture's private policy may own a loop here. Do not ask
+        # get_event_loop() for one: that would allocate an unused loop.
+        try:
+            loop = getattr(policy._local, '_loop', None)
+            if loop is not None:
+                loop.close()
+        finally:
+            asyncio.set_event_loop_policy(previous_policy)
+
+
+def test_owned_runner_preserves_ambient_policy_loop():
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    retained = policy.new_event_loop()
+    policy.set_event_loop(retained)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        assert run_owned_loop(asyncio.sleep(0, result='done')) == 'done'
+        assert policy.get_event_loop() is retained and not retained.is_closed()
+    finally:
+        retained.close()
+        policy.set_event_loop(None)
+        asyncio.set_event_loop_policy(previous_policy)
+
+
 def run_probe(handler, timeout=10):
     async def operation():
         client = client_module.ContainerPilotClient('http://127.0.0.1', TOKEN,
@@ -24,7 +67,7 @@ def run_probe(handler, timeout=10):
             return await client.probe_connection(UUID)
         finally:
             await client.aclose()
-    return asyncio.run(operation())
+    return run_owned_loop(operation())
 
 
 def test_exact_two_gets_preserve_only_second_bearer():
@@ -95,7 +138,7 @@ def test_invalid_uuid_causes_no_request():
         try:
             with pytest.raises(ValueError): await client.probe_connection('not-a-uuid')
         finally: await client.aclose()
-    asyncio.run(operation())
+    run_owned_loop(operation())
     assert seen == []
 
 
@@ -120,7 +163,7 @@ def test_cli_uses_protected_reader_and_existing_https_factory(monkeypatch):
         async def aclose(self): calls.append('closed')
     monkeypatch.setattr(cli, 'read_protected_file', reader)
     monkeypatch.setattr(cli, 'ContainerPilotClient', Fake)
-    assert asyncio.run(cli.check(cli.parse(args_for()))) == {'state': 'transport_auth_verified'}
+    assert run_owned_loop(cli.check(cli.parse(args_for()))) == {'state': 'transport_auth_verified'}
     assert reads[0][1] == {'maximum_bytes': 4096}
     assert reads[1][1] == {'maximum_bytes': 1048576, 'private': False}
     assert calls[0][-1] == {'timeout_seconds': 10.0}
@@ -128,7 +171,7 @@ def test_cli_uses_protected_reader_and_existing_https_factory(monkeypatch):
 
 
 @pytest.mark.parametrize('extra', [['--token', TOKEN], ['--unknown', 'value'], ['--origin-other', 'x']])
-def test_closed_cli_sanitizes_errors(extra, capsys):
+def test_closed_cli_sanitizes_errors(extra, capsys, cli_owned_loop):
     assert cli.main(args_for() + extra) == 2
     output = capsys.readouterr()
     assert TOKEN not in output.out + output.err
@@ -136,7 +179,7 @@ def test_closed_cli_sanitizes_errors(extra, capsys):
     assert json.loads(output.out)['state'] == 'connection_check_failed'
 
 
-def test_digest_mismatch_precedes_transport(monkeypatch, capsys):
+def test_digest_mismatch_precedes_transport(monkeypatch, capsys, cli_owned_loop):
     monkeypatch.setattr(cli, 'read_protected_file', lambda *a, **k: b'wrong')
     class Forbidden:
         @classmethod
@@ -152,7 +195,7 @@ def test_digest_mismatch_precedes_transport(monkeypatch, capsys):
     'credential_read', 'ca_read', 'tls_client_setup',
     'transport_auth_probe', 'client_cleanup',
 ])
-def test_cli_fixed_phase_diagnostics_never_reflect_failures(monkeypatch, capsys, failure_phase):
+def test_cli_fixed_phase_diagnostics_never_reflect_failures(monkeypatch, capsys, failure_phase, cli_owned_loop):
     secret_error = TOKEN + ' /private/ https://sensitive.invalid/'
 
     def fail():
@@ -226,7 +269,7 @@ def test_probe_preserves_caller_cancellation_during_bounded_cleanup():
             await entered.wait(); task.cancel()
             with pytest.raises(asyncio.CancelledError): await task
         finally: await client.aclose()
-    asyncio.run(operation())
+    run_owned_loop(operation())
 
 
 def test_cli_client_close_bounded_and_failure_not_success(monkeypatch):
@@ -240,7 +283,7 @@ def test_cli_client_close_bounded_and_failure_not_success(monkeypatch):
         async def aclose(self): await asyncio.sleep(0.15)
     monkeypatch.setattr(cli, 'ContainerPilotClient', Fake)
     started = time.monotonic()
-    with pytest.raises(TimeoutError): asyncio.run(cli.check(cli.parse(args_for())))
+    with pytest.raises(TimeoutError): run_owned_loop(cli.check(cli.parse(args_for())))
     assert time.monotonic() - started < 0.12
 
 
@@ -260,7 +303,7 @@ def test_cli_preserves_caller_cancellation_even_when_close_times_out(monkeypatch
         task = asyncio.create_task(cli.check(cli.parse(args_for())))
         await entered.wait(); task.cancel()
         with pytest.raises(asyncio.CancelledError): await task
-    asyncio.run(operation())
+    run_owned_loop(operation())
 
 
 @pytest.mark.asyncio
