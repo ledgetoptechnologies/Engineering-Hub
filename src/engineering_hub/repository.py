@@ -343,6 +343,8 @@ class HubRepository:
         if row is None:
             return True
         task = json.loads(row['data'])
+        if task.get('status') == 'withdrawn':
+            return False
         try:
             self._project(task.get('project'), db)
         except HubError:
@@ -460,6 +462,14 @@ class HubRepository:
         return self._list('decision')
 
     @staticmethod
+    def _open_work_job(db, task_id):
+        """A queued, claimed or held work-queue job still owns this task; terminal ones don't."""
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_work_jobs'").fetchone():
+            return False
+        return db.execute('''SELECT 1 FROM hub_work_jobs WHERE json_extract(target,'$.task_id')=?
+            AND state NOT IN ('succeeded','failed','cancelled') LIMIT 1''', (task_id,)).fetchone() is not None
+
+    @staticmethod
     def _creator(db, kind, identity):
         marks = ','.join('?' * len(CREATION_ACTIONS[kind]))
         row = db.execute(f'SELECT actor FROM hub_audit WHERE entity_id=? AND revision=1 AND action IN ({marks}) '
@@ -506,6 +516,9 @@ class HubRepository:
                         or item.get('review') is not None):
                     raise HubError('task_in_progress', 409)
                 self._no_active_run(db, identity)
+                # Accepted queue work keeps its reservation; withdrawal never cancels or releases it.
+                if self._open_work_job(db, identity):
+                    raise HubError('task_in_progress', 409)
             if superseded_by is not None:
                 replacement = self._get(db, superseded_by, kind)
                 if replacement['status'] == 'withdrawn':

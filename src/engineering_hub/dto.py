@@ -18,6 +18,8 @@ Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
 HumanId = Annotated[str, Field(pattern=r'^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$')]
+# One pattern, not a Literal union, so the published schema is stable across typing-cache resets.
+WithdrawnBy = Annotated[str, Field(pattern=r'^(?:hermes|codex|claude|human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64}))$')]
 RunState = Literal['pending', 'running', 'succeeded', 'failed', 'rolled_back', 'held']
 RunEventState = Literal['running', 'succeeded', 'failed', 'rolled_back', 'held']
 
@@ -60,7 +62,7 @@ class TaskDTO(EntityDTO):
     # Present only on withdrawn records: why, by whom, when, and the replacement if any.
     withdrawn_reason: str | None = None
     superseded_by: str | None = None
-    withdrawn_by: AgentId | HumanId | None = None
+    withdrawn_by: WithdrawnBy | None = None
     withdrawn_at: str | None = None
 
 
@@ -79,7 +81,7 @@ class DecisionDTO(EntityDTO):
     # Present only on withdrawn records: why, by whom, when, and the replacement if any.
     withdrawn_reason: str | None = None
     superseded_by: str | None = None
-    withdrawn_by: AgentId | HumanId | None = None
+    withdrawn_by: WithdrawnBy | None = None
     withdrawn_at: str | None = None
 
 

@@ -201,3 +201,51 @@ def test_mcp_withdraw_tool_uses_the_authenticated_agent(hub):
     assert not done.get('isError'), done
     assert json.loads(done['content'][0]['text'])['status'] == 'withdrawn'
     assert app.state.repository.list_audit()[-1]['action'] == 'decision.withdrawn'
+
+
+from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker
+
+
+@pytest.fixture
+def queue(repo):
+    actions = {'validate': WorkAction('machine-one', frozenset({'staging'}), project='treedar', requires_execution_proof=False)}
+    return WorkQueue(repo, actions, target_verifier=lambda *args: True)
+
+
+def submit(queue, task, key='job'):
+    return queue.submit(actor='codex', request_id=key, action_key='validate', environment='staging',
+                        target=WorkTarget(task['id'], COMMIT, 'sha256:' + 'b' * 64))
+
+
+WORKER = WorkWorker('codex', str(uuid.uuid5(uuid.NAMESPACE_DNS, 'one')))
+
+
+@pytest.mark.parametrize('state', ['queued', 'claimed', 'held'])
+def test_task_with_open_queue_work_cannot_be_withdrawn_and_the_job_is_untouched(repo, queue, state):
+    task = proposal(repo, agent='codex')
+    job = submit(queue, task)
+    if state != 'queued':
+        job = queue.claim(worker=WORKER)
+        if state == 'held':
+            queue.complete(job_id=job['id'], worker=WORKER, fence=job['fence'], outcome='held')
+    with pytest.raises(HubError, match='task_in_progress'):
+        repo.withdraw('codex', 'task', task['id'], task['revision'], 'Moved')
+    assert repo.get_task(task['id'])['status'] == 'assigned'
+    assert queue.get_job(job['id'])['state'] == state
+
+
+def test_finished_queue_work_does_not_block_withdrawal(repo, queue):
+    task = proposal(repo, agent='codex')
+    submit(queue, task)
+    job = queue.claim(worker=WORKER)
+    queue.complete(job_id=job['id'], worker=WORKER, fence=job['fence'], outcome='succeeded')
+    assert repo.withdraw('codex', 'task', task['id'], task['revision'], 'Done elsewhere')['status'] == 'withdrawn'
+
+
+def test_withdrawn_task_is_refused_by_queue_admission(repo, queue):
+    task = proposal(repo, agent='codex')
+    repo.withdraw('codex', 'task', task['id'], task['revision'], 'Moved')
+    assert repo.task_allows_environment(task['id'], 'staging') is False
+    with pytest.raises(HubError):
+        submit(queue, task, key='after')
+    assert queue.claim(worker=WORKER) is None
