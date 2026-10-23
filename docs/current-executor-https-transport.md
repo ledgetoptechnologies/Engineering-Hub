@@ -15,6 +15,17 @@ are consulted. TLS validates both the explicit CA and the literal IP SAN.
 Scoped IPv6 addresses are rejected. This class cannot determine whether supplied
 credential bytes were reused from an agent: the enroller must prohibit that.
 
+Trusted installed compositions that have already captured protected bytes may
+instead use `CurrentExecutorHTTPSTransport.from_captured_material(origin,
+ca_pem=..., ca_sha256=..., credential=..., credential_sha256=...)`. It performs
+the same exact origin, pin and TLS checks without file/network I/O, discovery or
+reopening paths. CA and credential inputs must be immutable `bytes`, respectively
+1–1048576 and 1–4096 bytes; credentials contain printable non-space ASCII only.
+This constructor does not establish how supplied material was captured or that
+it is independent of agent tokens. That authority stays with the trusted caller.
+Both constructors share one validator; the file constructor still rejects bad
+origins/pin formats before reading protected files.
+
 Each call uses a new socket, sends exactly one request and closes it. Independent
 calls share no connection pool, retry state or locks; the identity observer owns
 its own serialization and sticky denial policy. A transport failure alone does

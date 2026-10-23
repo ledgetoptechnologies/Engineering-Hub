@@ -1,7 +1,9 @@
 # Optional consumer image only; does not install or activate the host issuer.
 # Use a prepared, trusted context containing ONLY this recipe, executor.whl and
 # validate_executor_wheel.py (the reviewed verify_hub_executor_wheel.py source).
-ARG CORE_IMAGE=ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:f40ada02aed973b7bbb8ad47c50dc40ce0dfff39b99b9b8a42eb07955dfebcad
+# No historical default: unchanged package versions do not establish API parity.
+# Explicit independently approved immutable core input is mandatory.
+ARG CORE_IMAGE
 FROM ${CORE_IMAGE} AS core
 
 FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS python-runtime
@@ -28,6 +30,10 @@ COPY --from=core /opt/venv/ /opt/venv/
 COPY --from=executor-installer /executor-site/ /opt/venv/lib/python3.12/site-packages/
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 WORKDIR /
+# Inert imports against the actual overlaid, installed venv. The wheel validator
+# only proves archive consistency; an old 0.6.0 core can still lack required APIs.
+# Never construct a runner/resource/issuer or read operator configuration here.
+RUN --network=none /opt/venv/bin/python -I -B -c "import importlib,json,pathlib; root=pathlib.Path('/opt/venv/lib/python3.12/site-packages'); record=json.loads((root/'hub_container_executor/_executor_source.json').read_bytes()); names=['engineering_hub.current_executor_observation','engineering_hub.current_executor_transport','engineering_hub.startup_reconciliation']+[name[4:-3].replace('/','.') for name in record['source_files'] if name.startswith('src/') and name.endswith('.py')]; modules=[importlib.import_module(name) for name in names]; assert all(pathlib.Path(module.__file__).is_relative_to(root) for module in modules), 'Installed executor/core compatibility unavailable'"
 USER 10001:10001
 ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.installed_runner"]
 CMD ["--config", "/operator/runner.json"]

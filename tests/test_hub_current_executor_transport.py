@@ -327,3 +327,63 @@ def test_remaining_observer_budget_accepted_without_renewal(material, monkeypatc
         client.observe_current_launch(nonce=NONCE, timeout_ms=budget)
     assert connections == [("127.0.0.1", 443)]
     assert len(timeouts) == 1 and 0 < timeouts[0] <= budget / 1000
+
+
+def captured(material, origin, **changes):
+    kwargs = dict(ca_pem=material["ca_file"].read_bytes(), ca_sha256=material["ca_sha256"],
+                  credential=TOKEN, credential_sha256=material["credential_sha256"])
+    kwargs.update(changes)
+    return wire.CurrentExecutorHTTPSTransport.from_captured_material(origin, **kwargs)
+
+
+def test_captured_material_constructor_no_file_or_network_io_and_real_exchange(material, monkeypatch):
+    ca = material["ca_file"].read_bytes()
+    with server(material, lambda conn, _: conn.sendall(response(material["body"]))) as (origin, seen):
+        with monkeypatch.context() as patch:
+            patch.setattr(wire, "read_protected_file", lambda *a, **kw: pytest.fail("file read"))
+            patch.setattr(wire.socket, "socket", lambda *a, **kw: pytest.fail("socket allocated"))
+            patch.setattr(wire.socket, "getaddrinfo", lambda *a, **kw: pytest.fail("DNS lookup"))
+            client = wire.CurrentExecutorHTTPSTransport.from_captured_material(origin,
+                ca_pem=ca, ca_sha256=material["ca_sha256"], credential=TOKEN,
+                credential_sha256=material["credential_sha256"])
+        material["ca_file"].unlink()
+        material["credential_file"].unlink()
+        assert client.observe_current_launch(nonce=NONCE, timeout_ms=1000) == material["body"]
+        assert len(seen) == 1 and b"Authorization: Bearer " + TOKEN in seen[0][0]
+        assert client._context.check_hostname and client._context.verify_mode == ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize("field,value", [
+    ("ca_pem", b""), ("ca_pem", b"x" * (1024 * 1024 + 1)),
+    ("ca_pem", bytearray(b"x")), ("ca_pem", memoryview(b"x")), ("ca_pem", "not bytes"),
+    ("ca_pem", b"not a PEM certificate"), ("ca_pem", b"\xff"),
+    ("credential", b""), ("credential", b"x" * 4097),
+    ("credential", bytearray(TOKEN)), ("credential", memoryview(TOKEN)), ("credential", "not bytes"),
+    ("credential", b"contains space"), ("credential", b"newline\n"), ("credential", b"\x7f"),
+    ("ca_sha256", "sha256:" + "0" * 64), ("credential_sha256", "sha256:" + "0" * 64),
+    ("ca_sha256", None), ("credential_sha256", "invalid"),
+])
+def test_captured_material_invalid_types_sizes_pins_and_tls_sanitized(material, monkeypatch, field, value):
+    changes = {field: value}
+    if field in {"ca_pem", "credential"} and type(value) is bytes:
+        changes["ca_sha256" if field == "ca_pem" else "credential_sha256"] = (
+            "sha256:" + hashlib.sha256(value).hexdigest())
+    monkeypatch.setattr(wire, "read_protected_file", lambda *a, **kw: pytest.fail("file read"))
+    with pytest.raises(wire.CurrentExecutorTransportError) as error:
+        captured(material, "https://127.0.0.1", **changes)
+    assert str(error.value) == "Invalid current executor HTTPS configuration"
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1", "https://localhost", "https://user@127.0.0.1",
+    "https://127.0.0.1/", "https://127.0.0.1?x", "https://127.0.0.1#x", "https://[fe80::1%eth0]",
+    "https://127.0.0.1:0", "https://127.0.0.1\\x"])
+def test_captured_material_same_origin_denials(material, origin):
+    with pytest.raises(wire.CurrentExecutorTransportError):
+        captured(material, origin)
+
+
+def test_captured_material_maximum_credential_bytes(material):
+    credential = b"x" * 4096
+    client = captured(material, "https://127.0.0.1", credential=credential,
+                      credential_sha256="sha256:" + hashlib.sha256(credential).hexdigest())
+    assert client._pid == os.getpid()

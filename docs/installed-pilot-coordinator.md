@@ -69,9 +69,12 @@ This pilot uses an ordinary private Hub core, not a second production message bu
 ## Packaging and live acceptance
 
 Use independently approved immutable core and optional wheel artifacts containing
-both this module and `ContainerPilotClient.for_private_unix`. The recipe now pins
-the verified `f40ada02...` core (main `cb7b790...`) instead of the earlier
-`805d1f8...` default that predates that client method. Current wheel/archive
+both this module and `ContainerPilotClient.for_private_unix`, plus the current
+observation/HTTPS transport/reconciliation core modules. The recipe requires an
+explicit independently approved immutable core image and has no default. Its
+former `f40ada02...` core (main `cb7b790...`) predates current observations and
+is no longer compatible. Offline installed-module imports now fail the image
+build for that mismatch, without starting a service. Current wheel/archive
 checks require both coordinator and launch-supervisor modules. The earlier
 locally tested executor wheel/image did not contain this coordinator module;
 the changed source does not update those old artifacts. Rebuild and run

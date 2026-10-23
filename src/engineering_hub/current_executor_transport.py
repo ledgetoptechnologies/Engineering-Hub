@@ -46,6 +46,23 @@ def _remaining(deadline):
     return remaining
 
 
+def _origin_and_pins(origin, ca_sha256, credential_sha256):
+    _require(type(origin) is str and origin.isascii()
+             and "\\" not in origin and all(32 < ord(c) < 127 for c in origin))
+    parsed = urlsplit(origin)
+    _require(parsed.scheme == "https" and parsed.hostname
+             and not parsed.username and not parsed.password
+             and not parsed.path and not parsed.query and not parsed.fragment
+             and origin == "https://" + parsed.netloc)
+    address = ipaddress.ip_address(parsed.hostname)
+    _require(getattr(address, "scope_id", None) is None)
+    port = parsed.port if parsed.port is not None else 443
+    _require(0 < port <= 65535)
+    _require(all(type(pin) is str and _SHA.fullmatch(pin)
+                 for pin in (ca_sha256, credential_sha256)))
+    return address, port, parsed.netloc
+
+
 class _DeadlineRaw(io.RawIOBase):
     def __init__(self, sock, deadline):
         self.sock, self.deadline = sock, deadline
@@ -109,40 +126,53 @@ class CurrentExecutorHTTPSTransport:
     def __init__(self, origin, *, ca_file, ca_sha256,
                  credential_file, credential_sha256):
         try:
-            _require(type(origin) is str and origin.isascii()
-                     and "\\" not in origin
-                     and all(32 < ord(c) < 127 for c in origin))
-            parsed = urlsplit(origin)
-            _require(parsed.scheme == "https" and parsed.hostname
-                     and not parsed.username and not parsed.password
-                     and not parsed.path and not parsed.query and not parsed.fragment
-                     and origin == "https://" + parsed.netloc)
-            address = ipaddress.ip_address(parsed.hostname)
-            _require(getattr(address, "scope_id", None) is None)
-            port = parsed.port if parsed.port is not None else 443
-            _require(0 < port <= 65535)
-            _require(all(type(pin) is str and _SHA.fullmatch(pin)
-                         for pin in (ca_sha256, credential_sha256)))
+            # Preserve validation-before-read semantics, even though the common
+            # captured-material initializer independently rechecks all inputs.
+            _origin_and_pins(origin, ca_sha256, credential_sha256)
             _require(Path(ca_file) != Path(credential_file))
             ca = read_protected_file(Path(ca_file), maximum_bytes=1024 * 1024, private=False)
             credential = read_protected_file(Path(credential_file), maximum_bytes=4096)
-            _require(hmac.compare_digest("sha256:" + hashlib.sha256(ca).hexdigest(), ca_sha256)
-                     and hmac.compare_digest("sha256:" + hashlib.sha256(credential).hexdigest(),
-                                             credential_sha256)
-                     and credential and all(33 <= c <= 126 for c in credential))
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.check_hostname = True
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-            context.load_verify_locations(cadata=ca.decode("ascii"))
-            self._family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
-            self._address, self._port = str(address), port
-            self._host_header = parsed.netloc
-            self.__credential = credential
-            self._context = context
-            self._pid = os.getpid()
+            self._configure(origin, ca_pem=ca, ca_sha256=ca_sha256,
+                            credential=credential, credential_sha256=credential_sha256)
         except Exception:
             raise CurrentExecutorTransportError("Invalid current executor HTTPS configuration") from None
+
+    @classmethod
+    def from_captured_material(cls, origin, *, ca_pem, ca_sha256,
+                               credential, credential_sha256):
+        """Inert construction from independently captured, pinned immutable bytes.
+
+        No filesystem/network I/O or environment discovery. The caller retains
+        responsibility for protected capture, dedicated credentials and pins;
+        this path does not infer enrollment from response or supplied bytes.
+        """
+        try:
+            result = cls.__new__(cls)
+            result._configure(origin, ca_pem=ca_pem, ca_sha256=ca_sha256,
+                              credential=credential, credential_sha256=credential_sha256)
+            return result
+        except Exception:
+            raise CurrentExecutorTransportError("Invalid current executor HTTPS configuration") from None
+
+    def _configure(self, origin, *, ca_pem, ca_sha256, credential, credential_sha256):
+        address, port, host_header = _origin_and_pins(origin, ca_sha256, credential_sha256)
+        _require(type(ca_pem) is bytes and 0 < len(ca_pem) <= 1024 * 1024
+                 and type(credential) is bytes and 0 < len(credential) <= 4096)
+        _require(hmac.compare_digest("sha256:" + hashlib.sha256(ca_pem).hexdigest(), ca_sha256)
+                 and hmac.compare_digest("sha256:" + hashlib.sha256(credential).hexdigest(),
+                                         credential_sha256)
+                 and all(33 <= c <= 126 for c in credential))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_verify_locations(cadata=ca_pem.decode("ascii"))
+        self._family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        self._address, self._port = str(address), port
+        self._host_header = host_header
+        self.__credential = credential
+        self._context = context
+        self._pid = os.getpid()
 
     def __repr__(self):
         return "CurrentExecutorHTTPSTransport(credential=<redacted>)"
