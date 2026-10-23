@@ -100,16 +100,18 @@ import os, signal, sys
 from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError
 with PilotOwner(sys.argv[1], allow_ephemeral_test_storage=True) as owner:
     pid = os.fork()
+    # Both processes share stdout: write each short record atomically so the
+    # reader cannot receive another process's text before this record's newline.
     if pid == 0:
         try:
             owner.assert_active(sys.argv[1])
         except PilotOwnershipError:
-            print('fork-denied', flush=True)
+            os.write(sys.stdout.fileno(), b'fork-denied\\n')
         else:
             os._exit(3)
         signal.pause()
         os._exit(0)
-    print(str(pid) + ':' + owner.epoch, flush=True)
+    os.write(sys.stdout.fileno(), (str(pid) + ':' + owner.epoch + '\\n').encode('ascii'))
     sys.stdin.read()
 ''')
     fork_pid = None
