@@ -222,10 +222,14 @@ def validate_configuration(config_path, profile_path):
         raise UnifiedPilotStartupError() from None
 
 
-async def serve_configuration(config_path, profile_path):
+async def serve_configuration(config_path, profile_path, *, reconciliation_factory=None):
     """The only activation operation; no new state, credential or policy setup."""
     owner = None
     try:
+        from .queued_pilot_service import _synchronous
+        # JSON supplies no operator authority. CLI serve has no trusted local
+        # acceptance channel and therefore refuses before owner/credential I/O.
+        _require(_synchronous(reconciliation_factory))
         deployment, profile = validate_configuration(config_path, profile_path)
         from .app import Settings
         settings = Settings.from_env(deployment)
@@ -250,6 +254,7 @@ async def serve_configuration(config_path, profile_path):
         await serve_owned_unified_queued_pilot(settings, profile.manifest, client_factory,
             owner=owner, bus_paths=deployment.bus_paths, action_key=ACTION,
             machine_id=profile.machine_id, target_verifier=target_verifier,
+            reconciliation_factory=reconciliation_factory,
             supervisor_stop_grace_seconds=profile.grace_seconds,
             agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771)
     except Exception:

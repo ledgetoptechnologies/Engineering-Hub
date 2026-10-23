@@ -212,10 +212,14 @@ def target_allowed(config, actor, action_key, environment, target):
         and target.artifact_digest == config.manifest.candidate.image_config_id)
 
 
-async def run_installed_coordinator(config):
+async def run_installed_coordinator(config, *, reconciliation_factory=None):
     try:
         _process()
         _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
+        from engineering_hub.queued_pilot_service import _synchronous
+        # Fixed JSON/CLI input cannot impersonate the missing trusted operator
+        # channel. An explicit Python composition must supply that dependency.
+        _require(_synchronous(reconciliation_factory))
         # The optional wheel can coexist with an older core having the same
         # distribution version. Deny that unsupported composition before even
         # reading TEST secrets. API presence is compatibility, not attestation
@@ -240,6 +244,7 @@ async def run_installed_coordinator(config):
 
         await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
+            reconciliation_factory=reconciliation_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
             agent_host='127.0.0.1', agent_port=config.port)
     except Exception:

@@ -229,6 +229,20 @@ def test_pending_identity_failure_is_sticky_not_normal_readiness(session):
         accept(s)
 
 
+def test_status_checks_only_local_deadline_and_expiry_is_sticky(session, monkeypatch):
+    s = session
+    accept(s)
+    def forbidden():
+        pytest.fail('status must not perform observer or owner I/O')
+    s.observed[0] = forbidden
+    monkeypatch.setattr(s.owner, 'assert_active', lambda *_: forbidden())
+    assert s.gate.admission_state == 'accepted'
+    s.clock[0] = 160
+    assert s.gate.admission_state == 'closed'
+    s.clock[0] = 100
+    assert s.gate.admission_state == 'closed'
+
+
 @pytest.mark.parametrize('seconds', [True, 1.0, 0, -1, 3601])
 def test_constructor_rejects_invalid_lifetime(session, seconds):
     with pytest.raises(StartupReconciliationError):

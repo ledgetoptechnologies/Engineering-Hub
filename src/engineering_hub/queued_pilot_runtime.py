@@ -53,7 +53,13 @@ class QueuedPilotRuntime:
 
     @property
     def status(self):
-        return dict(state=self._state,
+        state = self._state
+        if state == 'active':
+            gate = self.bridge.reconciliation_state
+            if gate != 'accepted':
+                state = ('startup_reconciliation_required' if gate == 'pending'
+                         else 'manual_session_closed')
+        return dict(state=state,
             running=self._task is not None and not self._task.done(),
             active=self._active is not None and not self._active.done(),
             last_job=None if self._last_job is None else dict(self._last_job))
@@ -70,6 +76,7 @@ class QueuedPilotRuntime:
         """A synchronous, sticky admission veto; never an authority issuer."""
         try:
             self._identity()
+            self.bridge._reconciliation_admission()
             return (self._state == 'active' and self._loop is not None
                 and self._task is not None and not self._task.done()
                 and self._task.cancelling() == 0
@@ -102,6 +109,7 @@ class QueuedPilotRuntime:
         ownership. The lifecycle owner must still await stop() afterward.
         """
         self._identity()
+        self.bridge.close_admission()
         # Never cancel a task which may be awaiting an accepted remote phase.
         # The bridge veto closes any following phase immediately; the accepted
         # phase drains before the idle observer and subscription are closed.
@@ -127,6 +135,7 @@ class QueuedPilotRuntime:
         return self.status
 
     def _unavailable(self):
+        self.bridge.close_admission()
         self._source_failed = True
         self._closed = True
         self._state = 'native_source_unavailable'
@@ -214,6 +223,7 @@ class QueuedPilotRuntime:
             self._closed = True
             self._state = 'failed'
         finally:
+            self.bridge.close_admission()
             if observer is not None:
                 observer.cancel()  # Only the idle subscription, never effects.
                 await asyncio.gather(observer, return_exceptions=True)

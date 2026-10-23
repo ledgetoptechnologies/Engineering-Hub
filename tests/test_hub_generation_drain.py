@@ -47,7 +47,10 @@ class Feed:
 
 
 class Bridge:
+    # Explicit synthetic admission state for portable lifecycle-only tests.
+    # Real mandatory owner/gate enforcement is tested in queued_manual_session.
     def __init__(self, owner):
+        self.reconciliation_state = 'accepted'
         self.owner = owner
         self.repo = SimpleNamespace(path='/test/hub.sqlite3', pilot_owner=owner)
         self.entered = asyncio.Event()
@@ -55,6 +58,10 @@ class Bridge:
         self.finished = False
         self.calls = 0
     def _guard(self): self.owner.assert_active(self.repo.path)
+    def _reconciliation_admission(self):
+        if self.reconciliation_state != 'accepted':
+            raise RuntimeError('synthetic manual session closed')
+    def close_admission(self): self.reconciliation_state = 'closed'
     async def run_once(self):
         self.calls += 1
         self.entered.set()

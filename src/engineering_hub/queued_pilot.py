@@ -14,6 +14,7 @@ from .container_pilot import ContainerPilotWorkflow
 from .container_pilot_client import ContainerPilotResponse
 from .pilot_recovery import ACTIONS, PilotRecovery
 from .repository import AGENTS, HubError
+from .startup_reconciliation import StartupReconciliation, StartupReconciliationError
 from .work_queue import ClosedClaimPolicy, WorkQueue, WorkTarget, WorkWorker
 
 
@@ -28,7 +29,7 @@ class QueuedContainerPilot:
     marker. Existing public/legacy pilot entrypoints subsequently fail closed.
     It does not start an event loop, listener, network call or background worker.
     """
-    def __init__(self, queue, workflow, *, action_key, machine_id):
+    def __init__(self, queue, workflow, *, action_key, machine_id, reconciliation):
         if (type(queue) is not WorkQueue or type(workflow) is not ContainerPilotWorkflow
                 or queue.repo is not workflow.repo or workflow.pilot_owner is None
                 or workflow.repo.execution_principal != 'executor:container-pilot'):
@@ -42,6 +43,13 @@ class QueuedContainerPilot:
                 or len(workflow.targets) != 1):
             raise HubError('queued_pilot_binding_required', 409)
         target.validated_manifest()
+        if type(reconciliation) is not StartupReconciliation:
+            raise HubError('queued_pilot_reconciliation_required', 409)
+        try:
+            reconciliation.assert_binding(owner=workflow.pilot_owner, target_id=target.target_id,
+                                          manifest_digest=target.manifest_digest)
+        except StartupReconciliationError:
+            raise HubError('queued_pilot_reconciliation_required', 409) from None
         if (any(getattr(queue, name) is not None for name in
                 ('completion_verifier', 'reconciliation_verifier'))
                 or queue.claim_verifier is not None and type(queue.claim_verifier) is not ClosedClaimPolicy
@@ -49,6 +57,7 @@ class QueuedContainerPilot:
             raise HubError('queued_pilot_policy_conflict', 409)
         self.queue, self.workflow, self.repo = queue, workflow, queue.repo
         self.owner, self.target = workflow.pilot_owner, target
+        self.reconciliation = reconciliation
         self.action_key, self.machine_id = action_key, machine_id
         self._action = action
         self._additional_target_verifier = queue.target_verifier
@@ -122,12 +131,37 @@ class QueuedContainerPilot:
     def _runtime_admission(self):
         """An attached native runtime can only veto existing authority."""
         if self._runtime is None:
+            self._reconciliation_admission()
             return
         from .queued_pilot_runtime import QueuedPilotRuntime
         if (type(self._runtime) is not QueuedPilotRuntime
                 or self._runtime.bridge is not self
                 or self._runtime.admission_allowed() is not True):
             raise HubError('queued_pilot_runtime_unavailable', 409)
+        self._reconciliation_admission()
+
+    def _reconciliation_admission(self):
+        try:
+            if type(self.reconciliation) is not StartupReconciliation:
+                raise StartupReconciliationError()
+            self.reconciliation.assert_current_permitted(owner=self.owner,
+                target_id=self.target.target_id, manifest_digest=self.target.manifest_digest)
+        except StartupReconciliationError:
+            raise HubError('queued_pilot_reconciliation_required', 409) from None
+
+    def close_admission(self):
+        """Close only this session's gate; never cancel effects or release ownership."""
+        self.reconciliation.close()
+
+    @property
+    def reconciliation_state(self):
+        """Local gate lifecycle, not an assertion of remote readiness."""
+        if type(self.reconciliation) is not StartupReconciliation:
+            return 'unavailable'
+        try:
+            return self.reconciliation.admission_state
+        except StartupReconciliationError:
+            return 'unavailable'
 
     def _review(self, db, actor, target, *, original=None):
         task = self.repo._get(db, target.task_id, 'task')
@@ -146,6 +180,7 @@ class QueuedContainerPilot:
     def target_verifier(self, actor, action_key, environment, target):
         try:
             self._guard()
+            self._reconciliation_admission()
             if action_key != self.action_key or environment != 'staging' or type(target) is not WorkTarget:
                 return False
             if (self._additional_target_verifier is not None
@@ -341,6 +376,10 @@ class QueuedContainerPilot:
         return self._verify_completion(job, evidence_id, outcome, recovery=False)
 
     def reconciliation_verifier(self, job, evidence_id, outcome):
+        try:
+            self._reconciliation_admission()
+        except HubError:
+            return False
         return self._verify_completion(job, evidence_id, outcome, recovery=True)
 
     def _hold(self, job):
@@ -405,5 +444,11 @@ class QueuedContainerPilot:
             if current['state'] == 'claimed' and current['lease_until'] > self.queue._now():
                 # Prior-epoch exclusion permits inspection, not adoption of its
                 # live queue lease. Reconciliation waits for the durable hold.
+                return current
+            # Original-command GETs may retain historical evidence while closed,
+            # but they cannot prove current-host exclusion or release capacity.
+            try:
+                self._reconciliation_admission()
+            except HubError:
                 return current
             return self.queue.reconcile(job_id=job_id, evidence_id=evidence_id, outcome=outcome)

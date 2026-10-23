@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from tests.manual_session_fixtures import synthetic_reconciliation
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -22,6 +23,28 @@ from engineering_hub.container_pilot_client import ContainerPilotClient
 from engineering_hub.pilot_ownership import PilotOwner, PilotOwnershipError
 from engineering_hub.repository import HubRepository
 from tests.test_hub_container_pilot import pilot_manifest
+
+
+def run_owned_loop(coroutine):
+    # Explicit ownership: Runner closes only its new loop, without replacing or
+    # clearing pytest-asyncio's ambient policy loop (and orphaning its sockets).
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        return runner.run(coroutine)
+
+
+def test_owned_runner_preserves_ambient_policy_loop():
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    retained = policy.new_event_loop()
+    policy.set_event_loop(retained)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        assert run_owned_loop(asyncio.sleep(0, result='done')) == 'done'
+        assert policy.get_event_loop() is retained and not retained.is_closed()
+    finally:
+        retained.close()
+        policy.set_event_loop(None)
+        asyncio.set_event_loop_policy(previous_policy)
 
 
 TASK = '00000000-0000-4000-8000-000000000001'
@@ -112,7 +135,7 @@ def test_verified_https_uses_captured_ca_and_ignores_all_environment_trust(monke
         assert captured['retries'] == 0 and captured['trust_env'] is False
         assert not keylog.exists() and 'private-test-token' not in repr(client)
     finally:
-        asyncio.run(client.aclose())
+        run_owned_loop(client.aclose())
 
 
 @pytest.mark.asyncio
@@ -286,7 +309,7 @@ def test_secret_file_guards_and_no_token_echo(installed, monkeypatch, kind):
         document['executor']['credential_sha256'] = 'sha256:' + hashlib.sha256(b'synthetic-codex').hexdigest()
     installed['profile'].write_bytes(encode(document))
     with pytest.raises(startup.UnifiedPilotStartupError) as error:
-        asyncio.run(startup.serve_configuration(installed['config'], installed['profile']))
+        run_owned_loop(startup.serve_configuration(installed['config'], installed['profile'], reconciliation_factory=synthetic_reconciliation))
     assert 'synthetic-executor-token' not in str(error.value)
 
 
@@ -335,6 +358,6 @@ async def test_selector_preserves_settings_scope_tls_and_closes_pretransfer_owne
         raise RuntimeError('Synthetic early bind failure')
     monkeypatch.setattr(serving, 'serve_owned_unified_queued_pilot', fake_serve)
     with pytest.raises(startup.UnifiedPilotStartupError):
-        await startup.serve_configuration(installed['config'], installed['profile'])
+        await startup.serve_configuration(installed['config'], installed['profile'], reconciliation_factory=synthetic_reconciliation)
     assert len(opened) == 1
     with pytest.raises(PilotOwnershipError): opened[0].assert_active(installed['database'])

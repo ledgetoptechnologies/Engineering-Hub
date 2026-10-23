@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from tests.manual_session_fixtures import synthetic_reconciliation
 
 if sys.platform != 'linux':
     pytest.skip('Real Linux private PilotOwner and native SQLite feeds', allow_module_level=True)
@@ -111,7 +112,7 @@ def rig(tmp_path, monkeypatch):
 
 
 def options(rig, **changes):
-    result = dict(owner=rig.owner, bus_paths=rig.paths, action_key=ACTION,
+    result = dict(owner=rig.owner, bus_paths=rig.paths, action_key=ACTION, reconciliation_factory=synthetic_reconciliation,
         machine_id=MACHINE, target_verifier=lambda *_: rig.allowed,
         supervisor_stop_grace_seconds=2000, agent_host='127.0.0.1', agent_port=0,
         browser_host='127.0.0.1', browser_port=0, install_signals=False)

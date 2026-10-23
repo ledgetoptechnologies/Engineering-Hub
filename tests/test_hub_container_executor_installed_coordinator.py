@@ -7,12 +7,35 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from tests.manual_session_fixtures import synthetic_reconciliation
 
 pytest.importorskip('fcntl', reason='Optional coordinator uses Linux providers')
 
 from hub_container_executor import installed_coordinator as module
 from engineering_hub.work_queue import WorkTarget
 from tests.test_hub_container_pilot_manifest import make_manifest_data
+
+
+def run_owned_loop(coroutine):
+    # Explicit ownership: Runner closes only its new loop, without replacing or
+    # clearing pytest-asyncio's ambient policy loop (and orphaning its sockets).
+    with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+        return runner.run(coroutine)
+
+
+def test_owned_runner_preserves_ambient_policy_loop():
+    previous_policy = asyncio.get_event_loop_policy()
+    policy = asyncio.DefaultEventLoopPolicy()
+    retained = policy.new_event_loop()
+    policy.set_event_loop(retained)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        assert run_owned_loop(asyncio.sleep(0, result='done')) == 'done'
+        assert policy.get_event_loop() is retained and not retained.is_closed()
+    finally:
+        retained.close()
+        policy.set_event_loop(None)
+        asyncio.set_event_loop_policy(previous_policy)
 
 
 def canonical(value):
@@ -138,7 +161,7 @@ def install_fakes(monkeypatch, events, *, failure=False):
 def test_concrete_factory_and_service_lifetime(monkeypatch):
     events = []
     install_fakes(monkeypatch, events)
-    asyncio.run(module.run_installed_coordinator(parse()))
+    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     assert events == ['process', 'secrets-enter', 'secrets-close', 'serve', 'client', 'client', 'drained']
 
 
@@ -146,14 +169,14 @@ def test_failed_service_is_sanitized(monkeypatch):
     events = []
     install_fakes(monkeypatch, events, failure=True)
     with pytest.raises(module.InstalledCoordinatorError, match='^Installed pilot coordinator unavailable$'):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
 
 
 def test_fork_denied_before_secrets(monkeypatch):
     events = []
     install_fakes(monkeypatch, events)
     with pytest.raises(module.InstalledCoordinatorError):
-        asyncio.run(module.run_installed_coordinator(replace(parse(), process_id=os.getpid() + 1)))
+        run_owned_loop(module.run_installed_coordinator(replace(parse(), process_id=os.getpid() + 1), reconciliation_factory=synthetic_reconciliation))
     assert events == ['process']
 
 
@@ -166,7 +189,7 @@ def test_old_core_without_private_unix_api_denied_before_secret_provider(monkeyp
     monkeypatch.setattr(module, 'serve_owned_queued_pilot',
         lambda *args, **kwargs: pytest.fail('must not construct owner with incompatible core'))
     with pytest.raises(module.InstalledCoordinatorError):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     assert events == ['process']
 
 
@@ -201,7 +224,7 @@ def test_cancellation_propagates_after_existing_service_drains(monkeypatch):
             events.append('existing-service-drain')
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', service)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(module.run_installed_coordinator(parse()))
+        run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     assert events[-1] == 'existing-service-drain'
 
 
@@ -246,7 +269,7 @@ def test_actual_mcp_transport_accepts_configured_loopback_port_without_host_over
     async def capture(settings, *args, **kwargs):
         captured.append(settings)
     monkeypatch.setattr(module, 'serve_owned_queued_pilot', capture)
-    asyncio.run(module.run_installed_coordinator(parse()))
+    run_owned_loop(module.run_installed_coordinator(parse(), reconciliation_factory=synthetic_reconciliation))
     settings = replace(captured[0], database=tmp_path / 'hub.sqlite3')
     app = create_app(settings)
     headers = {'Authorization': 'Bearer fixture-test-codex',

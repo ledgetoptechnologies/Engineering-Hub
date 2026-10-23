@@ -208,7 +208,8 @@ class QueuedPilotJobDTO(ResponseDTO):
 
 
 class QueuedPilotRuntimeDTO(ResponseDTO):
-    state: Literal['not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed']
+    state: Literal['not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed',
+                   'startup_reconciliation_required', 'manual_session_closed']
     running: bool
     active: bool
     last_job: QueuedPilotJobDTO | None
@@ -216,7 +217,8 @@ class QueuedPilotRuntimeDTO(ResponseDTO):
 
 class AutonomyDTO(ResponseDTO):
     configured: bool
-    state: Literal['disabled', 'not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed']
+    state: Literal['disabled', 'not_started', 'native_source_unavailable', 'active', 'stopping', 'stopped', 'failed',
+                   'startup_reconciliation_required', 'manual_session_closed']
     running: bool
     receipts: list[DispatchReceiptDTO]
     last_result: DispatchResultDTO | None = None

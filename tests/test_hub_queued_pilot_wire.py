@@ -4,6 +4,7 @@ import uuid
 
 import httpx
 import pytest
+from tests.manual_session_fixtures import synthetic_workflow_reconciliation
 
 pytest.importorskip('fcntl', reason='Linux private PilotOwner required')
 
@@ -74,7 +75,7 @@ async def test_lost_terminal_response_recovers_original_wire_commands_without_re
             queue = WorkQueue(repo, {'engineering-hub.pilot': WorkAction('staging-pc',
                 project='engineering-hub')})
             bridge = QueuedContainerPilot(queue, workflow,
-                action_key='engineering-hub.pilot', machine_id='staging-pc')
+                action_key='engineering-hub.pilot', machine_id='staging-pc', reconciliation=synthetic_workflow_reconciliation(workflow))
             task = reviewed_task(repo)
             job = queue.submit(actor='codex', request_id=str(uuid.uuid4()),
                 action_key='engineering-hub.pilot', environment='staging',

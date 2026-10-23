@@ -213,6 +213,37 @@ class StartupReconciliation:
                     raise StartupReconciliationError() from None
                 raise
 
+    def assert_binding(self, *, owner, target_id, manifest_digest):
+        """Validate a pending/accepted composition binding without opening it."""
+        self._same_process()
+        with self._lock:
+            try:
+                _require(owner is self._owner and type(target_id) is str and target_id == self._target
+                         and type(manifest_digest) is str and manifest_digest == self._manifest)
+                self._validate()
+            except BaseException as error:
+                self._closed = True
+                if isinstance(error, Exception):
+                    raise StartupReconciliationError() from None
+                raise
+
+    def assert_current_permitted(self, *, owner, target_id, manifest_digest):
+        """Recheck the independently observed executor; do not accept an echo from a caller."""
+        self.assert_permitted(owner=owner, target_id=target_id, manifest_digest=manifest_digest,
+                              executor=self._executor)
+
+    @property
+    def admission_state(self):
+        """Sanitized local lifecycle only, not readiness or current-host proof."""
+        self._same_process()
+        with self._lock:
+            if not self._closed:
+                try:
+                    self._time()  # Local monotonic deadline only; no observer/owner I/O.
+                except StartupReconciliationError:
+                    self._closed = True
+            return 'closed' if self._closed else 'accepted' if self._accepted else 'pending'
+
     def close(self):
         # Closing a child's inherited object neither unlocks nor closes its owner.
         if os.getpid() != self._pid:

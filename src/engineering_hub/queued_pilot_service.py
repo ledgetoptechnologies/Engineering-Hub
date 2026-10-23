@@ -16,6 +16,7 @@ from .auth import AuthConfig
 from .container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
 from .container_pilot_client import ContainerPilotClient
 from .events import NativeHubEventFeed
+from .owned_tasks import finish_owned
 from .frontends import HubFrontends
 from .pilot_ownership import PilotOwner
 from .pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
@@ -23,6 +24,7 @@ from .queued_pilot import QueuedContainerPilot
 from .queued_pilot_runtime import QueuedPilotRuntime
 from .repository import HubRepository
 from .split_server import _owned_service, serve_private_coordinator
+from .startup_reconciliation import StartupReconciliation
 from .work_queue import WorkAction, WorkQueue, _key
 
 
@@ -41,7 +43,7 @@ def _synchronous(value):
 
 
 async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
-                                 action_key, machine_id, target_verifier, socket_path,
+                                 action_key, machine_id, target_verifier, reconciliation_factory, socket_path,
                                  supervisor_stop_grace_seconds,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
@@ -66,6 +68,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 or settings.auth_config.cloudflare_config is None
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
+                or not _synchronous(reconciliation_factory)
                 or stop_event is not None and type(stop_event) is not asyncio.Event
                 or type(supervisor_stop_grace_seconds) is not int
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
@@ -79,7 +82,9 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     except Exception:
         raise ValueError('explicit owned queued pilot configuration required') from None
 
-    owner = client = None
+    owner = client = reconciliation = None
+    lifecycle_task = asyncio.current_task()
+    rejected_reconciliation_tasks = []
     constructed = False
     stop = stop_event if stop_event is not None else asyncio.Event()
 
@@ -95,11 +100,13 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, constructed
+        nonlocal owner, client, reconciliation, constructed
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
         owner = PilotOwner(settings.database)
+        reconciliation = _reconciliation(reconciliation_factory, owner, target,
+                                         rejected_reconciliation_tasks, lifecycle_task)
         accepted = client_factory()
         if type(accepted) is not ContainerPilotClient:
             raise QueuedPilotServiceError()
@@ -109,7 +116,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
         queue = WorkQueue(repo, {action_key: action}, target_verifier=additional_veto)
         bridge = QueuedContainerPilot(queue, workflow,
-                                      action_key=action_key, machine_id=machine_id)
+                                      action_key=action_key, machine_id=machine_id,
+                                      reconciliation=reconciliation)
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
         core = create_app(settings, repository=repo, event_feed=feed,
@@ -119,6 +127,16 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     async def cleanup():
         failed = False
         try:
+            if rejected_reconciliation_tasks:
+                try:
+                    await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
+                except BaseException:
+                    failed = True
+            if reconciliation is not None:
+                try:
+                    reconciliation.close()
+                except BaseException:
+                    failed = True
             if client is not None:
                 try:
                     await client.aclose()
@@ -150,3 +168,26 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         await _owned_service(operation, stop)
     except Exception:
         raise QueuedPilotServiceError() from None
+
+
+def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task):
+    """Trusted composition dependency, not verification of operator facts.
+
+    The factory owns invalid returns; a valid exact bound gate transfers to the
+    service. Never schedule custom awaitables. Retain a returned local Task/Future
+    for cancellation/drain before owner cleanup; unreturned work is forbidden by
+    the trusted factory contract and cannot be discovered by this component.
+    """
+    value = factory(owner, target)
+    if inspect.isawaitable(value):
+        if inspect.iscoroutine(value) and inspect.getcoroutinestate(value) == inspect.CORO_CREATED:
+            value.close()
+        elif (asyncio.isfuture(value) and value.get_loop() is asyncio.get_running_loop()
+              and value is not asyncio.current_task() and value is not lifecycle_task):
+            value.cancel()
+            rejected_local_tasks.append(value)
+        raise QueuedPilotServiceError()
+    if type(value) is not StartupReconciliation:
+        raise QueuedPilotServiceError()
+    value.assert_binding(owner=owner, target_id=target.target_id, manifest_digest=target.manifest_digest)
+    return value

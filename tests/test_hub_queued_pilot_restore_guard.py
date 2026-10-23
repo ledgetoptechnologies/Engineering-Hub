@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from tests.manual_session_fixtures import synthetic_workflow_reconciliation
 
 pytest.importorskip('fcntl', reason='Real Linux private ledgers required')
 
@@ -57,7 +58,7 @@ async def one_fresh_hub(root, host):
                 [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
             queue = WorkQueue(repo, {'engineering-hub.pilot': WorkAction('staging-pc', project='engineering-hub')})
             bridge = QueuedContainerPilot(queue, workflow,
-                action_key='engineering-hub.pilot', machine_id='staging-pc')
+                action_key='engineering-hub.pilot', machine_id='staging-pc', reconciliation=synthetic_workflow_reconciliation(workflow))
             task = reviewed_task(repo)
             job = queue.submit(actor='codex', request_id=str(uuid4()),
                 action_key='engineering-hub.pilot', environment='staging',
