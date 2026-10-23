@@ -25,6 +25,7 @@ from .queued_pilot_runtime import QueuedPilotRuntime
 from .repository import HubRepository
 from .split_server import _owned_service, serve_private_coordinator
 from .startup_reconciliation import StartupReconciliation
+from .session_acceptance import SessionAcceptanceBroker
 from .work_queue import WorkAction, WorkQueue, _key
 
 
@@ -47,7 +48,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  supervisor_stop_grace_seconds,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
-                                 install_signals=True, recover_socket=False):
+                                 install_signals=True, recover_socket=False,
+                                 session_acceptance_factory=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -69,6 +71,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
                 or not _synchronous(reconciliation_factory)
+                or session_acceptance_factory is not None and not _synchronous(session_acceptance_factory)
                 or stop_event is not None and type(stop_event) is not asyncio.Event
                 or type(supervisor_stop_grace_seconds) is not int
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
@@ -82,7 +85,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     except Exception:
         raise ValueError('explicit owned queued pilot configuration required') from None
 
-    owner = client = reconciliation = None
+    owner = client = reconciliation = acceptance_broker = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     constructed = False
@@ -100,7 +103,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, constructed
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -122,6 +125,9 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         runtime = QueuedPilotRuntime(bridge, feed)
         core = create_app(settings, repository=repo, event_feed=feed,
                           work_queue=queue, queued_pilot_runtime=runtime)
+        if session_acceptance_factory is not None:
+            acceptance_broker = _session_acceptance(session_acceptance_factory, core,
+                owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
         return HubFrontends(core)
 
     async def cleanup():
@@ -130,6 +136,11 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             if rejected_reconciliation_tasks:
                 try:
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
+                except BaseException:
+                    failed = True
+            if acceptance_broker is not None:
+                try:
+                    acceptance_broker.close()
                 except BaseException:
                     failed = True
             if reconciliation is not None:
@@ -190,4 +201,28 @@ def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task
     if type(value) is not StartupReconciliation:
         raise QueuedPilotServiceError()
     value.assert_binding(owner=owner, target_id=target.target_id, manifest_digest=target.manifest_digest)
+    return value
+
+
+def _session_acceptance(factory, core, owner, repo, target, gate, rejected_local_tasks, lifecycle_task):
+    """Optional trusted Python attachment, never operator/report discovery.
+
+    Valid attached/bound brokers transfer cleanup to this service. Invalid
+    returns/resources remain the trusted factory's obligation. Only returned
+    local Tasks/Futures are retained for cancellation/drain; no arbitrary work
+    is spawned, scheduled, adopted or cancelled by discovery.
+    """
+    value = factory(core, owner, repo, target, gate)
+    if inspect.isawaitable(value):
+        if inspect.iscoroutine(value) and inspect.getcoroutinestate(value) == inspect.CORO_CREATED:
+            value.close()
+        elif (asyncio.isfuture(value) and value.get_loop() is asyncio.get_running_loop()
+              and value is not asyncio.current_task() and value is not lifecycle_task):
+            value.cancel()
+            rejected_local_tasks.append(value)
+        raise QueuedPilotServiceError()
+    if type(value) is not SessionAcceptanceBroker or getattr(core.state, 'session_acceptance', None) is not value:
+        raise QueuedPilotServiceError()
+    value.assert_binding(gate=gate, owner=owner, target_id=target.target_id,
+                         manifest_digest=target.manifest_digest)
     return value

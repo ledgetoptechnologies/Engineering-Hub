@@ -240,6 +240,25 @@ class SessionAcceptanceBroker:
         with self._lock:
             self._seal()
 
+    def assert_binding(self, *, gate, owner, target_id, manifest_digest):
+        """Check a trusted composition's exact gate/owner without granting it.
+
+        Not caller-selected remote authority. A failed handover seals this
+        broker's retained gate, never closes another caller-supplied gate/owner.
+        """
+        self._process()
+        with self._lock:
+            try:
+                _require(not self._processing and gate is self._gate and owner is self._owner
+                         and type(target_id) is str and target_id == self._target
+                         and type(manifest_digest) is str and manifest_digest == self._manifest)
+                self._current()
+            except BaseException as error:
+                self._seal()
+                if isinstance(error, Exception):
+                    raise SessionAcceptanceError() from None
+                raise
+
 
 class _Answer(BaseModel):
     model_config = ConfigDict(strict=True, extra='forbid')

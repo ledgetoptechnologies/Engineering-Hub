@@ -24,7 +24,7 @@ from .pilot_service import (REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS,
                             _TRANSFER_LOCK, _TRANSFERRED_OWNERS)
 from .queued_pilot import QueuedContainerPilot
 from .queued_pilot_runtime import QueuedPilotRuntime, _canonical_uuid
-from .queued_pilot_service import QueuedPilotServiceError, _synchronous, _reconciliation
+from .queued_pilot_service import QueuedPilotServiceError, _synchronous, _reconciliation, _session_acceptance
 from .repository import HubRepository
 from .server import _bind, _signal_stop
 from .split_server import _options, _owned_service, _serve_listeners
@@ -63,7 +63,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                                          browser_host='0.0.0.0', browser_port=8771,
                                          stop_event=None, on_ready=None,
                                          install_signals=True, generation_id=None,
-                                         on_generation_ready=None):
+                                         on_generation_ready=None, session_acceptance_factory=None):
     """Bind first, then transfer one pre-enrolled owner and dedicated client.
 
     Failed listener binding leaves the caller's owner untouched. Once the pair
@@ -87,6 +87,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
                 or not _synchronous(reconciliation_factory)
+                or session_acceptance_factory is not None and not _synchronous(session_acceptance_factory)
                 or type(supervisor_stop_grace_seconds) is not int
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
                 or stop_event is not None and type(stop_event) is not asyncio.Event
@@ -106,7 +107,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
     except Exception:
         raise ValueError('Explicit pre-enrolled unified queued pilot configuration required') from None
 
-    client = reconciliation = None
+    client = reconciliation = acceptance_broker = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     generation_drain = None
@@ -123,7 +124,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         return result is True
 
     def pair_factory():
-        nonlocal client, reconciliation, transferred, constructed, generation_drain
+        nonlocal client, reconciliation, transferred, constructed, generation_drain, acceptance_broker
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -152,6 +153,9 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         bus = _create_unified_bus(settings, bus_paths=bus_paths)
         core = create_app(settings, repository=repo, event_feed=feed,
                           work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus)
+        if session_acceptance_factory is not None:
+            acceptance_broker = _session_acceptance(session_acceptance_factory, core,
+                owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
         return HubFrontends(core)
 
     async def cleanup():
@@ -160,6 +164,11 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
             if rejected_reconciliation_tasks:
                 try:
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
+                except BaseException:
+                    failed = True
+            if acceptance_broker is not None:
+                try:
+                    acceptance_broker.close()
                 except BaseException:
                     failed = True
             if reconciliation is not None:
