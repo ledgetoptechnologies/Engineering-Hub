@@ -82,9 +82,10 @@ def test_unsafe_paths_rejected(tools, path):
         tools["file_put"].fn(project="demo", path=path, content="no", expected_version=0, ctx=context("h"))
 
 
-def test_semantic_calls_are_authenticated_and_qualified(tools):
-    result = tools["semantic_search"].fn(query="find maintenance instructions", project="demo", ctx=context("h"))
+@pytest.mark.asyncio
+async def test_semantic_calls_are_authenticated_and_qualified(tools):
+    result = await tools["semantic_search"].fn(query="find maintenance instructions", project="demo", ctx=context("h"))
     assert result["mode"] == "semantic" and result["results"][0]["score"] == 0.8
-    assert tools["semantic_status"].fn(ctx=context("a"))["available"] is True
+    assert (await tools["semantic_status"].fn(ctx=context("a")))["available"] is True
     with pytest.raises(Exception):
-        tools["semantic_search"].fn(query="test", ctx=context("bad"))
+        await tools["semantic_search"].fn(query="test", ctx=context("bad"))
