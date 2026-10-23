@@ -7,7 +7,9 @@ export interface NoteMeta {
 }
 export interface NoteDocument extends NoteMeta { content: string }
 export interface NoteList { items: NoteMeta[]; truncated: boolean }
-export interface NoteQuery { project: string; query?: string; path_prefix?: string; limit?: number }
+export interface NoteQuery { project: string; query?: string; path_prefix?: string; limit?: number;
+  /** Continue a path-ordered list after this path (not for text search). */
+  after?: string }
 
 export const NOTE_LIST_LIMIT = 50;
 export const MAX_NOTE_CONTENT_BYTES = 64 * 1024;
@@ -110,7 +112,10 @@ export async function listNotes(request: NoteQuery, signal: AbortSignal, fetchIm
   // The backend accepts a text query or a path prefix, never both.
   const query = request.query?.trim();
   if (query) params.set("query", query);
-  else if (request.path_prefix) params.set("path_prefix", request.path_prefix);
+  else {
+    if (request.path_prefix) params.set("path_prefix", request.path_prefix);
+    if (request.after) params.set("after", request.after);
+  }
   const response = await fetchImpl.call(globalThis, `/api/hub/v1/notes?${params}`, getInit(signal));
   return parseNoteList(await json(response), request.project);
 }

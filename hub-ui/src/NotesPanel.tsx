@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { HubApiError, type HubMode } from "./api";
 import { registerRouteLeaveGuard } from "./router";
 import {
-  isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS, NOTE_LIST_LIMIT,
+  isNotePath, isNoteProject, listNotes, MAX_NOTE_REQUEST_BYTES, MAX_NOTE_TITLE_CHARS,
   NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
 } from "./notesApi";
 import { Markdown } from "./markdown";
@@ -154,6 +154,8 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
   useEffect(() => {
     const current = ++listGeneration.current;
     const controller = new AbortController();
+    // A new list (project, search, refresh) cancels any "Show more" page still loading for the old one.
+    moreController.current?.abort();
     setList(null);
     if (mode === "demo") { setListState("demo"); return () => { listGeneration.current++; controller.abort(); }; }
     setListState("loading");
@@ -168,8 +170,37 @@ export function NotesPanel({ mode, selectedProject, knownProjects, csrf, writabl
       setListState(error instanceof HubApiError && error.status === 404 ? "unsupported"
         : error instanceof HubApiError && error.code === "invalid_note" ? "invalid_search" : "failed");
     });
-    return () => { listGeneration.current++; controller.abort(); };
+    return () => { listGeneration.current++; controller.abort(); moreController.current?.abort(); };
   }, [mode, project, search, listRevision]);
+
+  // Path-ordered lists continue after the last path shown; each page is appended once. The busy
+  // state belongs to the list generation that asked, so a stale page never locks a newer list.
+  const moreController = useRef<AbortController | null>(null);
+  const [moreGeneration, setMoreGeneration] = useState<number | null>(null);
+  const loadingMore = moreGeneration !== null && moreGeneration === listGeneration.current;
+  async function loadMore() {
+    if (!list || list.items.length === 0 || loadingMore) return;
+    const current = listGeneration.current;
+    const prefix = search.text.trim() && search.kind === "prefix" ? search.text.trim() : undefined;
+    moreController.current?.abort();
+    const controller = moreController.current = new AbortController();
+    setMoreGeneration(current);
+    try {
+      const next = await listNotes({ project, path_prefix: prefix, after: list.items[list.items.length - 1].path },
+        controller.signal);
+      if (listGeneration.current !== current || controller.signal.aborted) return;
+      setList(previous => previous && {
+        items: [...previous.items, ...next.items.filter(item => !previous.items.some(seen => seen.path === item.path))],
+        truncated: next.truncated,
+      });
+    } catch (error) {
+      if (listGeneration.current !== current || controller.signal.aborted || deny(error)) return;
+      setNotice({ kind: "alert", text: `More notes could not be loaded. ${readError(error)}` });
+    } finally {
+      if (moreController.current === controller) moreController.current = null;
+      setMoreGeneration(generation => generation === current ? null : generation);
+    }
+  }
 
   const shownKey = useRef<string | null>(null);
   useEffect(() => {
@@ -345,7 +376,9 @@ ${latest.path}`;
           <p className="panel-footnote">{list.items.length === 0
             ? search.text ? "No notes match this search." : `No notes in ${project} yet.`
             : `${list.items.length} note${list.items.length === 1 ? "" : "s"}${search.text ? " matching" : ""} in ${project}.`}
-            {list.truncated && ` Showing the first ${NOTE_LIST_LIMIT}. Narrow the search or path prefix to see the rest.`}</p>
+            {list.truncated && (search.text.trim() && search.kind === "query"
+              ? ` Showing the first ${list.items.length}. Narrow the search to see the rest.`
+              : " More notes below the list.")}</p>
           {groupByFolder(list.items).map(group => <details key={group.folder} className="note-folder" open>
             <summary><span className="folder-icon" aria-hidden="true" />{group.folder || project}
               <span className="tab-count">{group.items.length}</span></summary>
@@ -357,6 +390,10 @@ ${latest.path}`;
                 <span>v{item.version} · <Actor id={item.updated_by} viewer={viewerActor} /> · <time dateTime={item.updated_at} title={new Date(item.updated_at).toLocaleString()}>{age(item.updated_at)}</time></span>
               </button></li>)}</ul>
           </details>)}
+          {list.truncated && !(search.text.trim() && search.kind === "query") && (
+            <button type="button" className="secondary small notes-more" disabled={loadingMore}
+              onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Show more notes"}</button>
+          )}
         </>}
       </div>
       <div className="notes-detail" ref={detailRef}>

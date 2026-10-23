@@ -227,16 +227,23 @@ class KnowledgeRepository:
             raise KnowledgeNotFound("knowledge document not found")
         return self._from_row(row)
 
-    def list(self, *, project: str, path_prefix: str | None = None, limit: int = 50) -> list[KnowledgeEntry]:
+    def list(self, *, project: str, path_prefix: str | None = None, limit: int = 50,
+             after: str | None = None) -> list[KnowledgeEntry]:
+        """Notes in path order. ``after`` continues a previous page after that exact path."""
         project = self.validate_project(project)
         if path_prefix is not None:
             path_prefix = self.validate_path(path_prefix)
+        if after is not None:
+            after = self.validate_path(after)
         limit = min(max(1, int(limit)), MAX_RESULTS)
         sql = "SELECT * FROM knowledge WHERE project=?"
         params: list[object] = [project]
         if path_prefix is not None:
             sql += " AND (path=? OR substr(path,1,?)=?)"
             params.extend((path_prefix, len(path_prefix) + 1, path_prefix + "/"))
+        if after is not None:
+            sql += " AND path>?"
+            params.append(after)
         sql += " ORDER BY path LIMIT ?"
         params.append(limit)
         with self._connection() as conn:
