@@ -25,7 +25,7 @@ from engineering_hub.container_pilot_manifest import PilotManifest, Platform
 from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
 from .build_enrollment import BuildEnrollment
 from .daemon_backend import DockerEngineBinding
-from .launch_transport import UnixLaunchReceiptTransport
+from .launch_transport import UnixLaunchReceiptTransport, UnixCurrentObservationTransport
 from .local_providers import ImmutableTestSecretResolver
 from .local_resources import local_host_adapter_resources
 from .runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVerifier
@@ -264,6 +264,8 @@ async def run_installed_executor(config):
             owned.callback(verifier.close)
             _require(verifier.implementation_commit() == config.release.implementation_commit
                      == config.manifest.driver.implementation_commit)
+            observations = UnixCurrentObservationTransport(**config.transport)
+            owned.callback(observations.close)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)
@@ -271,7 +273,8 @@ async def run_installed_executor(config):
                 binding=config.binding, **config.resources, driver_identity_verifier=verifier)
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
-                socket_path=config.socket_path)
+                socket_path=config.socket_path, current_observation_transport=observations,
+                current_observation_timeout_ms=config.timeout_ms)
     except Exception:
         raise InstalledRunnerError() from None
 

@@ -226,6 +226,12 @@ def lifecycle(monkeypatch):
             return config.release.implementation_commit
         def close(self):
             events.append('identity-close')
+    class Observations:
+        def __init__(self, **kwargs):
+            assert kwargs == dict(config.transport)
+            events.append('observation-transport')
+        def close(self):
+            events.append('observation-close')
     class Secrets:
         def __init__(self, root, *, bindings):
             assert root == config.resources['secret_root']
@@ -250,6 +256,8 @@ def lifecycle(monkeypatch):
         finally:
             events.append('resources-close')
     async def service(factory, **kwargs):
+        assert type(kwargs.pop('current_observation_transport')) is Observations
+        assert kwargs.pop('current_observation_timeout_ms') == config.timeout_ms
         assert kwargs == dict(bearer_token='synthetic-executor-only-token',
             supervisor_stop_grace_seconds=config.stop_grace_seconds, socket_path=config.socket_path)
         events.append('service')
@@ -257,6 +265,7 @@ def lifecycle(monkeypatch):
             events.append('draining')
         events.append('drained')
     monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, 'UnixCurrentObservationTransport', Observations)
     monkeypatch.setattr(module, 'LaunchReceiptIdentityVerifier', Verifier)
     monkeypatch.setattr(module, 'ImmutableTestSecretResolver', Secrets)
     monkeypatch.setattr(module, 'local_host_adapter_resources', resources)
@@ -268,9 +277,9 @@ def lifecycle(monkeypatch):
 async def test_direct_identity_precedes_secret_provider_state_and_service_drains_first(lifecycle):
     config, events = lifecycle
     await module.run_installed_executor(config)
-    assert events == ['transport', 'identity', 'identity-check', 'secret-open', 'secret-read',
+    assert events == ['transport', 'identity', 'identity-check', 'observation-transport', 'secret-open', 'secret-read',
         'secret-close', 'service', 'resources', 'draining', 'resources-close', 'drained',
-        'identity-close', 'transport-close']
+        'observation-close', 'identity-close', 'transport-close']
 
 
 @pytest.mark.asyncio
@@ -294,7 +303,7 @@ async def test_failed_service_closes_identity_only_after_accepted_cleanup(lifecy
     monkeypatch.setattr(module, 'serve_owned_host_executor_unix', denied)
     with pytest.raises(module.InstalledRunnerError):
         await module.run_installed_executor(config)
-    assert events[-4:] == ['drained-before-failure', 'resources-close', 'identity-close', 'transport-close']
+    assert events[-5:] == ['drained-before-failure', 'resources-close', 'observation-close', 'identity-close', 'transport-close']
 
 
 @pytest.mark.asyncio
@@ -307,7 +316,7 @@ async def test_cancelled_service_finishes_owned_lifecycle_before_identity_cleanu
     monkeypatch.setattr(module, 'serve_owned_host_executor_unix', cancelled)
     with pytest.raises(asyncio.CancelledError):
         await module.run_installed_executor(config)
-    assert events[-3:] == ['resources-close', 'identity-close', 'transport-close']
+    assert events[-4:] == ['resources-close', 'observation-close', 'identity-close', 'transport-close']
 
 
 @pytest.mark.asyncio

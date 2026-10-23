@@ -3,9 +3,10 @@
 # No certificate, credential, socket permission or service is provisioned here.
 
 # Match the ORIGINAL URI, including any arguments, not nginx's normalized $uri.
-# These deliberately case-sensitive regexes admit exactly three wire routes.
+# These deliberately case-sensitive regexes admit exactly four wire routes.
 map "$request_method:$request_uri" $eh_executor_route {
     default 0;
+    "~^POST:/v1/container-pilot/current-observation$" 1;
     "~^POST:/v1/container-pilot/commands$" 1;
     "~^GET:/v1/container-pilot/commands/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" 1;
     "~^POST:/v1/container-pilot/commands/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/reconcile$" 1;

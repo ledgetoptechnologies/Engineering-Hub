@@ -81,10 +81,19 @@ def _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_
             and type(install_signals) is bool)
 
 
+def _valid_observation_options(transport, timeout_ms):
+    try:
+        return (type(timeout_ms) is int and 100 <= timeout_ms <= 10000
+                and (transport is None or _synchronous(getattr(transport, 'observe_current_launch', None))))
+    except Exception:
+        return False
+
+
 async def serve_owned_host_executor(resource_factory, *, bearer_token,
                                     supervisor_stop_grace_seconds, port,
                                     host='127.0.0.1', stop_event=None,
-                                    on_ready=None, install_signals=True):
+                                    on_ready=None, install_signals=True,
+                                    current_observation_transport=None, current_observation_timeout_ms=2000):
     """Bind explicit loopback, then own a dedicated adapter/provider bundle.
 
     The synchronous factory returns a synchronous context manager yielding an
@@ -106,18 +115,22 @@ async def serve_owned_host_executor(resource_factory, *, bearer_token,
     """
     if (not _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_seconds,
                                   stop_event, on_ready, install_signals)
+            or not _valid_observation_options(current_observation_transport, current_observation_timeout_ms)
             or type(host) is not str or host not in {'127.0.0.1', '::1'}
             or type(port) is not int or not 0 <= port <= 65535):
         raise ValueError('explicit owned loopback executor configuration required')
     await _serve_owned_executor(resource_factory, bearer_token=bearer_token,
         listener_factory=lambda: _bind(host, port), stop_event=stop_event,
-        on_ready=on_ready, install_signals=install_signals)
+        on_ready=on_ready, install_signals=install_signals,
+        current_observation_transport=current_observation_transport,
+        current_observation_timeout_ms=current_observation_timeout_ms)
 
 
 async def serve_owned_host_executor_unix(resource_factory, *, bearer_token,
                                          supervisor_stop_grace_seconds, socket_path,
                                          stop_event=None, on_ready=None,
-                                         install_signals=True):
+                                         install_signals=True, current_observation_transport=None,
+                                         current_observation_timeout_ms=2000):
     """Bind one explicitly selected private Linux Unix socket, then own resources.
 
     The factory/adapter/provider ownership and shutdown contract is identical to
@@ -139,15 +152,19 @@ async def serve_owned_host_executor_unix(resource_factory, *, bearer_token,
     """
     if (not _valid_common_options(resource_factory, bearer_token, supervisor_stop_grace_seconds,
                                   stop_event, on_ready, install_signals)
+            or not _valid_observation_options(current_observation_transport, current_observation_timeout_ms)
             or not isinstance(socket_path, (str, os.PathLike))):
         raise ValueError('explicit owned private Unix executor configuration required')
     await _serve_owned_executor(resource_factory, bearer_token=bearer_token,
         listener_factory=lambda: private_browser_socket(socket_path), stop_event=stop_event,
-        on_ready=on_ready, install_signals=install_signals)
+        on_ready=on_ready, install_signals=install_signals,
+        current_observation_transport=current_observation_transport,
+        current_observation_timeout_ms=current_observation_timeout_ms)
 
 
 async def _serve_owned_executor(resource_factory, *, bearer_token, listener_factory,
-                                 stop_event, on_ready, install_signals):
+                                 stop_event, on_ready, install_signals,
+                                 current_observation_transport=None, current_observation_timeout_ms=2000):
     """Shared internal lifetime; public APIs alone select the listener policy."""
     stop = stop_event if stop_event is not None else asyncio.Event()
 
@@ -185,7 +202,9 @@ async def _serve_owned_executor(resource_factory, *, bearer_token, listener_fact
                     'baseline_provider', 'state_provisioner', 'secret_resolver',
                     'driver_identity_verifier')):
                     raise HostExecutorServiceError()
-                gate = _AdmissionGate(PilotASGI(adapter, bearer_token), stop)
+                gate = _AdmissionGate(PilotASGI(adapter, bearer_token,
+                    current_observation_transport=current_observation_transport,
+                    current_observation_timeout_ms=current_observation_timeout_ms), stop)
                 try:
                     await _serve_listeners((gate,), (listener,), stop, on_ready,
                                            (listener.getsockname(),),

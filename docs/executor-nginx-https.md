@@ -41,6 +41,7 @@ Only these exact methods and original URI forms are forwarded:
 | Method | URI | Body |
 | --- | --- | --- |
 | POST | `/v1/container-pilot/commands` | Existing closed request JSON, ≤8192 bytes |
+| POST | `/v1/container-pilot/current-observation` | Exact nonce-only JSON, ≤256 bytes; unchanged signed envelope ≤8192 bytes |
 | GET | `/v1/container-pilot/commands/<canonical-lowercase-UUID>` | Empty |
 | POST | `/v1/container-pilot/commands/<canonical-lowercase-UUID>/reconcile` | Empty |
 

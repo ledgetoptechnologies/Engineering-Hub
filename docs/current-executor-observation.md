@@ -39,7 +39,7 @@ Entire envelope is at most 8192 bytes. Exact payload fields:
 - integer `observed_at_ms`, `expires_at_ms`, `approval_expires_at_ms`.
 
 `approval_expires_at_ms` is the original independently pinned approval wall
-ceiling. Future supervisor must capture it ONCE at original launch and clip all
+ceiling. The retained supervisor captures it ONCE at original launch and clips all
 observations to both it and its original local monotonic launch deadline. It must
 never recompute a renewed approval expiry for a new request. Hub derives a fixed
 LOCAL monotonic ceiling once from the remaining pinned wall interval; it never
@@ -74,6 +74,8 @@ Returned gate identity is exactly `generation_id=launch_id` and
 `artifact_digest=executor image_config_id`. It does **not** prove inventory,
 writer exclusion, restored-state correctness, absence of unknown effects,
 ongoing process integrity, session acceptance, task execution approval or
-renewal of original launch approval. Future supervisor/transport/service wiring,
-independent pins and manual reconciliation remain required; this file alone is
-not a completed usable installed operator path.
+renewal of original launch approval. The supervisor, executor relay and core
+HTTPS transport are described in `current-observation-supervisor.md` and
+`current-executor-https-transport.md`. Their synthetic integration tests do not
+replace trusted live composition, independent pins or manual reconciliation;
+this file alone is not a completed usable installed operator path.

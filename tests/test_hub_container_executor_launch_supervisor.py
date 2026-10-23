@@ -325,7 +325,7 @@ def current_pins(authority):
 
 
 def current_exchange(path, *, nonce, timeout_ms):
-    """Test-only actual UDS client; no installed executor relay is implemented."""
+    """Test-only direct UDS client; the production relay is tested separately."""
     with socket.socket(socket.AF_UNIX) as peer:
         peer.settimeout(timeout_ms / 1000)
         peer.connect(str(path))

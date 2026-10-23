@@ -46,11 +46,38 @@ Native filesystem/Engine checks remain cooperatively bounded, not forcibly
 interruptible. The issuer does not cache or adopt a launch receipt as current
 evidence, and its original one-shot receipt behavior is unchanged.
 
-This is **not yet a remote Hub observation path**. The installed executor still
-needs an explicitly composed current-observation Unix client/HTTP relay, exact
-authenticated route/private proxy allowlist and core Hub transport wiring.
-Those are not implemented here. Future relay HTTP bearer authentication is
-separate from signed evidence verification, with no generic trust header.
+The installed executor composes a separate `UnixCurrentObservationTransport`
+after its original launch receipt has passed verification. It reuses the same
+explicit issuer socket path and UID/GID. No configuration, credential, port or
+service is added. The new transport supports independent no-retry exchanges,
+using the request protocol above; it does not expose `issue_receipt` or cache
+signed results. Whole-call remaining budgets may be 1..10000 milliseconds,
+because body/dispatch time must be deducted from the configured 100..10000ms
+HTTP operation budget rather than minting a fresh minimum window.
+
+An explicitly supplied observation transport enables only authenticated
+`POST /v1/container-pilot/current-observation` on the existing executor listener.
+The request has exactly one `nonce` field and at most 256 bytes. The relay uses
+the existing dedicated executor bearer, rejects malformed/duplicate framing,
+queries and other methods, and returns unchanged canonical signed-envelope
+bytes with explicit Content-Length, application/json, no-store and Connection:
+close. No PID, issuer, launch, release, key or deadline selector is accepted.
+The inert private NGINX template admits that exact additional method/original
+URI while retaining its original NAS restriction, TLS and executor UDS.
+
+Observation and command work have separate no-queue admission gates. A busy
+command therefore does not falsely invalidate current identity; simultaneous
+observation requests are denied, not queued. Accepted raw executor Futures drain
+through repeated cancellation before their gate is released. The service drains
+HTTP and adapter/provider work before the installed runner closes its borrowed
+observation transport. The synchronous transport enforces remaining socket I/O
+deadlines; native filesystem work remains cooperatively bounded. Neither this
+relay nor a successful HTTP bearer check verifies signed identity claims.
+
+This is **not yet installed NAS-to-staging acceptance**. The core HTTPS transport
+has synthetic local TLS and signed round-trip tests; trusted live composition
+still requires separate verification. HTTP bearer authentication is separate
+from signed evidence verification, with no generic trust header.
 Independent release/current launch pins must arrive through trusted operator
 handoff, never from accepting the response's claimed pins. Current identity
 still does not prove inventory, writer exclusion, unknown-effects absence,
