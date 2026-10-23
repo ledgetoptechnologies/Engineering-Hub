@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import { audit, blocking } from "./audit";
 
 const human = "human:cf:" + "e".repeat(64);
 type Overview = ReturnType<typeof createDemoOverview>;
@@ -55,6 +56,9 @@ test("a person creates a notes-only project; the ID follows the name and nothing
   await page.getByRole("button", { name: "New project" }).click();
   const form = page.getByRole("form", { name: "New project" });
   await form.getByLabel("Name", { exact: true }).fill("Mlsna LandScript");
+  // The ID is shown as the project's address and only edited on request.
+  await expect(form.locator(".project-address code")).toHaveText("/projects/mlsna-landscript");
+  await form.getByRole("button", { name: "Change", exact: true }).click();
   await expect(form.getByLabel("Project ID")).toHaveValue("mlsna-landscript");
   await form.getByLabel("Description").fill("Client project, notes only.");
   await form.getByLabel("Status").selectOption("At risk");
@@ -73,12 +77,14 @@ test("editing reads the latest revision, sends it with CAS, and shows the human 
   await page.goto("/#/projects/treedar");
   await page.getByRole("button", { name: "Edit project" }).click();
   const form = page.getByRole("form", { name: "Edit project" });
-  await expect(form.getByLabel("Project ID")).toHaveAttribute("readonly", "");
+  await expect(form.getByRole("button", { name: "Change", exact: true })).toHaveCount(0);
   await form.getByLabel("Name", { exact: true }).fill("TreeDar Survey");
-  await expect(form.getByLabel("Project ID")).toHaveValue("treedar");
+  await expect(form.locator(".project-address")).toContainText("/projects/treedar");
+  await expect(form.locator(".project-address")).toContainText("can't be changed");
   await form.getByLabel("Status").selectOption("Off track");
   await form.getByLabel("Lead agent").selectOption("Codex");
-  await form.getByLabel("Repository (optional)").fill("https://github.com/ledgetop/treedar");
+  await form.getByText("More options").click();
+  await form.getByLabel(/Repository/).fill("https://github.com/ledgetop/treedar");
   await form.getByRole("button", { name: "Save changes" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(state.writes[0]).toMatchObject({ method: "PATCH", path: "/api/hub/v1/projects/treedar",
@@ -133,7 +139,7 @@ test("same-project refresh preserves an editable draft and project switching loa
   await page.evaluate(() => { location.hash = "#/projects/project-alpha"; });
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await page.getByRole("button", { name: "Edit project" }).click();
-  await expect(form.getByLabel("Project ID")).toHaveValue("project-alpha");
+  await expect(form.locator(".project-address code")).toHaveText("/projects/project-alpha");
   expect(state.reads).toEqual(["treedar", "project-alpha"]);
   expect(state.writes).toHaveLength(0);
 });
@@ -214,3 +220,19 @@ test("a server without project routes says it needs an update and does not sign 
   await expect(form.getByRole("alert")).toContainText("needs an update");
   await expect(page.getByText("operator@example.test", { exact: true })).toBeVisible();
 });
+
+for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone", { width: 390, height: 844 }]] as const) {
+  test(`the new-project dialog fits the window without sideways scrolling (${name})`, async ({ page }) => {
+    await fixture(page);
+    await page.setViewportSize(size);
+    await page.goto("/#/projects");
+    await page.getByRole("button", { name: "New project" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("More options").click();
+    const overflow = await dialog.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right }));
+    expect(overflow.scroll).toBeLessThanOrEqual(overflow.client);
+    expect(overflow.right).toBeLessThanOrEqual(size.width);
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
+    await page.screenshot({ path: test.info().outputPath(`new-project-${name}.png`) });
+  });
+}

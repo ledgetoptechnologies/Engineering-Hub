@@ -89,8 +89,10 @@ export function EmptyState({ title, children }: { title: string; children?: Reac
   );
 }
 
-export function Modal({ title, onClose, children }: {
+export function Modal({ title, onClose, children, size = "default" }: {
   title: string; onClose: () => void; children: ReactNode;
+  /** "wide" for viewers (images, maps), "full" for a whole question with its images; forms use the default width. */
+  size?: "default" | "wide" | "full";
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const headingId = useId();
@@ -98,7 +100,10 @@ export function Modal({ title, onClose, children }: {
     ref.current?.showModal();
   }, []);
   return (
-    <dialog ref={ref} aria-labelledby={headingId} onClose={onClose} onCancel={onClose}>
+    <dialog ref={ref} className={size === "default" ? undefined : `modal-${size}`} aria-labelledby={headingId}
+      // React passes a nested dialog's close/cancel up to this one; only react to our own.
+      onClose={(event) => { if (event.target === event.currentTarget) onClose(); }}
+      onCancel={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="modal-head">
         <h2 id={headingId}>{title}</h2>
         <button type="button" className="icon-button" aria-label="Close dialog" onClick={() => ref.current?.close()}>

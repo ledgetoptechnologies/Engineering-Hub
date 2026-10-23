@@ -8,7 +8,7 @@ import { Modal } from "./ui";
 
 const external = (href: string) => !href.startsWith("/");
 
-function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => void }) {
+export function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => void }) {
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const drag = useRef<{ x: number; y: number } | null>(null);
@@ -18,7 +18,7 @@ function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => vo
     if (next === 1) setOffset({ x: 0, y: 0 });
   };
   return (
-    <Modal title={image.title} onClose={onClose}>
+    <Modal title={image.title} onClose={onClose} size="wide">
       <div className="image-viewer-tools" role="group" aria-label="Zoom">
         <button type="button" className="secondary small" onClick={() => setScale(zoom / 1.5)} disabled={zoom <= 1}>−</button>
         <span aria-live="polite">{Math.round(zoom * 100)}%</span>
@@ -46,16 +46,13 @@ function ImageViewer({ image, onClose }: { image: DetailImage; onClose: () => vo
 }
 
 /**
- * `load` gates the attachments read (decision cards load at once; task rows when
- * expanded). Demo mode never reads. Only a real 401/403 clears the workspace.
+ * Reads an entity's image attachments. `load` gates the read (decision cards load at once;
+ * task rows when expanded). Demo mode never reads. Only a real 401/403 clears the workspace.
  */
-export function DetailsBlock({ entity, kind, load, onUnauthorized }: {
-  entity: { id: string; revision: number }; kind: "task" | "decision"; load: boolean; onUnauthorized: () => void;
-}) {
-  const context = parseContext(entity);
+export function useAttachments(kind: "task" | "decision", entity: { id: string; revision: number }, load: boolean,
+  onUnauthorized: () => void) {
   const [images, setImages] = useState<DetailImage[]>([]);
   const [failed, setFailed] = useState(false);
-  const [open, setOpen] = useState<DetailImage | null>(null);
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
   useEffect(() => {
@@ -71,6 +68,37 @@ export function DetailsBlock({ entity, kind, load, onUnauthorized }: {
     });
     return () => controller.abort();
   }, [load, kind, entity.id, entity.revision]);
+  return { images, failed };
+}
+
+export function DetailLinks({ links }: { links: { label: string; href: string }[] }) {
+  if (links.length === 0) return null;
+  return (
+    <ul className="detail-links" aria-label="Links">
+      {links.map((item) => (
+        <li key={item.href + item.label}>
+          <a href={external(item.href) ? item.href : link(item.href)}
+            {...(external(item.href) ? { target: "_blank", rel: "noopener noreferrer" } : {})}>
+            {item.label}
+          </a>
+          {external(item.href) && <small>{new URL(item.href).hostname}</small>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * Context text, links and image thumbnails. With `onOpenImage`, a thumbnail opens the caller's
+ * view (the full question); without it, the image opens in the zoom viewer.
+ */
+export function DetailsBlock({ entity, kind, load, onUnauthorized, onOpenImage }: {
+  entity: { id: string; revision: number }; kind: "task" | "decision"; load: boolean; onUnauthorized: () => void;
+  onOpenImage?: (image: DetailImage) => void;
+}) {
+  const context = parseContext(entity);
+  const { images, failed } = useAttachments(kind, entity, load, onUnauthorized);
+  const [open, setOpen] = useState<DetailImage | null>(null);
   if (!context && images.length === 0 && !failed) return null;
   return (
     <div className="item-details">
@@ -79,7 +107,7 @@ export function DetailsBlock({ entity, kind, load, onUnauthorized }: {
         <ul className="attachment-grid" aria-label="Attached images">
           {images.map((image) => (
             <li key={image.id}>
-              <button type="button" className="attachment-thumb" onClick={() => setOpen(image)}
+              <button type="button" className="attachment-thumb" onClick={() => (onOpenImage ?? setOpen)(image)}
                 aria-label={`View ${image.title}`}>
                 <img src={attachmentUrl(image.id)} alt="" loading="lazy" />
                 <span>{image.title}</span>
@@ -89,19 +117,7 @@ export function DetailsBlock({ entity, kind, load, onUnauthorized }: {
         </ul>
       )}
       {failed && <p className="panel-footnote">Attached images could not be loaded right now.</p>}
-      {context && context.links.length > 0 && (
-        <ul className="detail-links" aria-label="Links">
-          {context.links.map((item) => (
-            <li key={item.href + item.label}>
-              <a href={external(item.href) ? item.href : link(item.href)}
-                {...(external(item.href) ? { target: "_blank", rel: "noopener noreferrer" } : {})}>
-                {item.label}
-              </a>
-              {external(item.href) && <small>{new URL(item.href).hostname}</small>}
-            </li>
-          ))}
-        </ul>
-      )}
+      {context && <DetailLinks links={context.links} />}
       {open && <ImageViewer image={open} onClose={() => setOpen(null)} />}
     </div>
   );

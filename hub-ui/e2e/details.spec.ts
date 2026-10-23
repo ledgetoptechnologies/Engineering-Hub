@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
+import { audit, blocking } from "./audit";
 
 const human = "human:cf:" + "e".repeat(64);
 // 1x1 transparent PNG.
@@ -71,6 +72,9 @@ test("decision details show a formatted summary, safe links and a zoomable map i
   const thumbs = card.getByRole("list", { name: "Attached images" }).getByRole("button");
   await expect(thumbs).toHaveCount(1);
   await thumbs.first().click();
+  const full = page.getByRole("dialog", { name: "Choose the initial scratch-storage benchmark" });
+  await expect(full).toBeVisible();
+  await full.getByRole("button", { name: "Zoom Plot A1 canopy map" }).click();
   const dialog = page.getByRole("dialog", { name: "Plot A1 canopy map" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("img", { name: "Plot A1 canopy map" })).toBeVisible();
@@ -105,7 +109,7 @@ test("closing an attached image never records a selected decision", async ({ pag
   await card.getByRole("radio").first().check();
   await expect(card.getByRole("button", { name: /Record decision/ })).toBeEnabled();
   await card.getByRole("list", { name: "Attached images" }).getByRole("button").click();
-  const dialog = page.getByRole("dialog", { name: "Plot A1 canopy map" });
+  const dialog = page.getByRole("dialog", { name: "Choose the initial scratch-storage benchmark" });
   await dialog.getByRole("button", { name: "Close dialog" }).click();
   await expect(dialog).toHaveCount(0);
   expect(state.answers).toHaveLength(0);
@@ -183,3 +187,82 @@ test("the Activity tab shows the Hub's recorded history with paging, newest firs
   await expect(history.getByRole("listitem")).toHaveCount(3);
   await expect(page.getByRole("button", { name: "Show older" })).toHaveCount(0);
 });
+
+for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone", { width: 390, height: 844 }]] as const) {
+  test(`a wide map opens fitted inside the viewer with no sideways scrolling (${name})`, async ({ page }) => {
+    // Draw a 1600x900 "map" so the viewer has a realistic wide image to fit.
+    await page.goto("about:blank");
+    const wide = await page.evaluate(() => {
+      const canvas = document.createElement("canvas"); canvas.width = 1600; canvas.height = 900;
+      const g = canvas.getContext("2d")!; g.fillStyle = "#e8f5e9"; g.fillRect(0, 0, 1600, 900);
+      g.strokeStyle = "#c62828"; g.lineWidth = 8; g.strokeRect(300, 200, 700, 400); g.fillStyle = "#1b5e20"; g.font = "64px sans-serif"; g.fillText("A1", 600, 420);
+      return canvas.toDataURL("image/png").split(",")[1];
+    });
+    const { state } = await fixture(page, withDetails);
+    await page.route(/\/api\/hub\/v1\/attachments\/[0-9a-f-]+\/image$/, (route) =>
+      route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from(wide, "base64") }));
+    state.attachments[DECISION_IDS[0]] = [{ ...IMAGE, title: "Area map: this question is about area A1 (red outline, labelled A1)" }];
+    await page.setViewportSize(size);
+    await page.goto("/#/inbox");
+    await page.locator("form.decision").first().getByRole("list", { name: "Attached images" }).getByRole("button").click();
+    const dialog = page.getByRole("dialog", { name: "Choose the initial scratch-storage benchmark" });
+    await dialog.getByRole("button", { name: /Zoom Area map/ }).click();
+    const viewer = page.getByRole("dialog", { name: /Area map/ });
+    const img = viewer.getByRole("img", { name: /Area map/ });
+    await expect(img).toBeVisible();
+    await expect.poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth)).toBe(1600);
+    const box = await viewer.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, right: el.getBoundingClientRect().right }));
+    expect(box.scroll).toBeLessThanOrEqual(box.client);
+    expect(box.right).toBeLessThanOrEqual(size.width);
+    const fit = await img.evaluate((el) => { const i = el.getBoundingClientRect(), v = el.parentElement!.getBoundingClientRect();
+      return { inside: i.left >= v.left - 1 && i.right <= v.right + 1 && i.top >= v.top - 1 && i.bottom <= v.bottom + 1 }; });
+    expect(fit.inside).toBe(true);
+    await viewer.getByRole("button", { name: "Close dialog" }).click();
+    await expect(dialog).toBeVisible();
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
+  });
+
+  test(`clicking an image opens the whole question large, images side by side, answerable there (${name})`, async ({ page }) => {
+    const { state } = await fixture(page, (overview) => { withDetails(overview); Object.assign(overview.decisions[0], { allow_text: true }); });
+    state.attachments[DECISION_IDS[0]] = [IMAGE, { ...IMAGE, id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", title: "Plot A2 canopy map" }];
+    await page.setViewportSize(size);
+    await page.goto("/#/inbox");
+    const card = page.locator("form.decision").first();
+    await card.getByRole("list", { name: "Attached images" }).getByRole("button", { name: "View Plot A2 canopy map" }).click();
+    const full = page.getByRole("dialog", { name: "Choose the initial scratch-storage benchmark" });
+    await expect(full.locator(".item-summary strong")).toHaveText("crown counts");
+    await expect(full.getByRole("link", { name: "Vendor page" })).toBeVisible();
+    const shots = full.getByRole("list", { name: "Images" }).getByRole("img");
+    await expect(shots).toHaveCount(2);
+    const [a, b] = [await shots.nth(0).boundingBox(), await shots.nth(1).boundingBox()];
+    if (name === "desktop") {
+      expect(Math.abs(a!.y - b!.y)).toBeLessThan(2);
+      expect(b!.x).toBeGreaterThan(a!.x + a!.width - 1);
+      expect(a!.width).toBeGreaterThan(300);
+    } else expect(b!.y).toBeGreaterThan(a!.y + a!.height - 1);
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
+    await page.screenshot({ path: test.info().outputPath(`question-view-${name}.png`) });
+    await full.getByRole("radio", { name: "Type my own answer" }).check();
+    await full.getByRole("textbox", { name: "Your answer" }).fill("A1 14, A2 22");
+    await expect(card.getByRole("radio", { name: "Type my own answer" })).toBeChecked();
+    await full.getByRole("button", { name: /Record decision/ }).click();
+    await expect.poll(() => state.answers.length).toBe(1);
+    expect(state.answers[0].body).toEqual({ expected_revision: 1, answer: "A1 14, A2 22" });
+  });
+
+  test(`Open full view works without images and closing it records nothing (${name})`, async ({ page }) => {
+    const { state } = await fixture(page, withDetails);
+    await page.setViewportSize(size);
+    await page.goto("/#/inbox");
+    const card = page.locator("form.decision").first();
+    await card.getByRole("radio").first().check();
+    await card.getByRole("button", { name: "Open full view" }).click();
+    const full = page.getByRole("dialog", { name: "Choose the initial scratch-storage benchmark" });
+    await expect(full.getByRole("radio").first()).toBeChecked();
+    expect(blocking(await audit(page, "dialog", size.width))).toEqual([]);
+    await page.keyboard.press("Escape");
+    await expect(full).toHaveCount(0);
+    expect(state.answers).toHaveLength(0);
+    await expect(card.getByRole("radio").first()).toBeChecked();
+  });
+}

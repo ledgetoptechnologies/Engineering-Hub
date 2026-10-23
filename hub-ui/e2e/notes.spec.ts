@@ -102,7 +102,8 @@ for (const mode of MODES) test(`dirty note navigation can be cancelled or explic
   page.once("dialog", dialog => { void dialog.accept(); });
   await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Home", exact: true }).click();
   await expect(page).toHaveURL(/:\d+\/(#\/)?$/);
-  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
+  await page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "Engineering Hub", exact: true }).click();
+  await page.getByRole("navigation", { name: "Engineering Hub sections" }).getByRole("link", { name: "Notes & plans" }).click();
   await expect(panel.getByLabel("Content")).toHaveCount(0);
   await expectMode(page, mode);
   expect(state.posts).toHaveLength(0);
@@ -112,7 +113,9 @@ for (const mode of MODES) test(`cancelled browser Back and Forward preserve both
   const state = await fixture(page);
   await addressMode(page, mode);
   await page.goto("/#/");
-  await page.getByRole("navigation", { name: "Workspace navigation" }).getByRole("link", { name: "Notes", exact: true }).click();
+  // Notes live inside the project: Projects → Engineering Hub → Notes & plans.
+  await page.getByRole("navigation", { name: "Projects", exact: true }).getByRole("link", { name: "Engineering Hub", exact: true }).click();
+  await page.getByRole("navigation", { name: "Engineering Hub sections" }).getByRole("link", { name: "Notes & plans" }).click();
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   await panel.getByRole("button", { name: "Edit", exact: true }).click();
@@ -123,7 +126,7 @@ for (const mode of MODES) test(`cancelled browser Back and Forward preserve both
   await expect(panel.getByLabel("Content")).toHaveValue("back history draft");
   page.once("dialog", dialog => { void dialog.accept(); });
   await page.goBack();
-  await expect(page).toHaveURL(/:\d+\/(#\/)?$/);
+  await expect(page).toHaveURL(/\/(#\/)?projects\/engineering-hub$/);
   await page.goForward();
   await expect(page).toHaveURL(/\/(#\/)?notes$/);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
@@ -181,7 +184,7 @@ for (const mode of MODES) test(`project-to-project navigation protects the proje
   page.once("dialog", dialog => { void dialog.accept(); });
   await nextProject.click();
   await expect(page).toHaveURL(/\/(#\/)?projects\/treedar$/);
-  await page.getByRole("navigation", { name: "TreeDar sections" }).getByRole("link", { name: "Notes" }).click();
+  await page.getByRole("navigation", { name: "TreeDar sections" }).getByRole("link", { name: "Notes & plans" }).click();
   await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
   await expect(panel.getByLabel("Content")).toHaveCount(0);
   await expectMode(page, mode);

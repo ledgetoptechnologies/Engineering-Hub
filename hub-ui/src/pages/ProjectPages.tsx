@@ -307,11 +307,12 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
     { key: "overview", label: "Overview" },
     { key: "decisions", label: "Needs you", count: stats.waiting.length },
     { key: "work", label: "Work", count: stats.active },
-    { key: "notes", label: "Notes" },
-    { key: "plans", label: "Plans" },
+    // Notes and plans are one place: written context, with the plan/idea backlog beside it.
+    { key: "notes", label: "Notes & plans" },
     { key: "labeling", label: "Labeling" },
     { key: "activity", label: "Activity" },
   ];
+  const tabIs = (key: ProjectTab) => tab === key || (key === "notes" && tab === "plans");
   const tabHref = (key: ProjectTab) => link(`/projects/${id}${key === "overview" ? "" : "/" + key}`);
   return (
     <>
@@ -342,8 +343,8 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
       {dialog === "archive" && <ArchiveProjectDialog hub={hub} project={project} onClose={() => setDialog(null)} />}
       <nav className="tabs" aria-label={`${project.name} sections`}>
         {tabs.map((item) => (
-          <a key={item.key} href={tabHref(item.key)} className={tab === item.key ? "tab current" : "tab"}
-            aria-current={tab === item.key ? "page" : undefined}>
+          <a key={item.key} href={tabHref(item.key)} className={tabIs(item.key) ? "tab current" : "tab"}
+            aria-current={tabIs(item.key) ? "page" : undefined}>
             {item.label}{item.count ? <span className={`tab-count ${item.key === "decisions" ? "attention" : ""}`}>{item.count}</span> : null}
           </a>
         ))}
@@ -393,7 +394,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
               <div><dt>Repository</dt><dd>{repository
                 ? <a className="text-link" href={repository} target="_blank" rel="noopener noreferrer">{new URL(repository).pathname.replace(/^\//, "") || new URL(repository).host}</a>
                 : "None (notes-only)"}</dd></div>
-              <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "Not set up yet"}</dd></div>
+              <div><dt>Staging</dt><dd>{project.executor_enabled ? "Target set up" : "No staging target"}</dd></div>
               <div><dt>Health</dt><dd>{project.health === "unknown" ? "Not reported" : pretty(project.health)}</dd></div>
               <div><dt>Agents</dt><dd><AgentStack agents={stats.agents} /></dd></div>
               <div><dt>Open tasks</dt><dd>{stats.active}</dd></div>
@@ -428,6 +429,12 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
         </>
       )}
 
+      {(tab === "notes" || tab === "plans") && (
+        <div className="chip-row subview-switch" role="group" aria-label="Notes and plans">
+          <a className={tab === "notes" ? "chip selected" : "chip"} aria-current={tab === "notes" ? "page" : undefined} href={tabHref("notes")}>Notes</a>
+          <a className={tab === "plans" ? "chip selected" : "chip"} aria-current={tab === "plans" ? "page" : undefined} href={tabHref("plans")}>Plans &amp; ideas</a>
+        </div>
+      )}
       {tab === "notes" && <NotesPanel {...notesProps} writable={notesProps.writable && !project.archived} selectedProject={id} />}
 
       {/* Topic proposals scoped to this project; never execution approval. */}

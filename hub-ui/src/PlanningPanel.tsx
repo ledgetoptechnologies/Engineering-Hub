@@ -13,6 +13,16 @@ export interface PlanningPanelProps {
 }
 interface Editor { value: PlanningDraft; base: PlanningItem | null }
 interface Conflict { current: number; latest: PlanningItem | null; failed: boolean }
+const PROGRESS_ORDER: Record<PlanningMeta["status"], number> = { in_progress: 0, planned: 1, proposed: 2, done: 3, declined: 4 };
+/** Open work first (in progress, planned, proposed), then shipped, then declined, so finished items stop crowding the backlog. */
+export function groupByProgress<T extends Pick<PlanningMeta, "status">>(items: T[]): { key: string; label: string; items: T[] }[] {
+  const sorted = [...items].sort((a, b) => PROGRESS_ORDER[a.status] - PROGRESS_ORDER[b.status]);
+  return [
+    { key: "open", label: "Open", items: sorted.filter(item => item.status !== "done" && item.status !== "declined") },
+    { key: "done", label: "Done", items: sorted.filter(item => item.status === "done") },
+    { key: "declined", label: "Declined", items: sorted.filter(item => item.status === "declined") },
+  ];
+}
 /** Says which kind of failure happened, by fixed code only (never the server's text). */
 function listFailure(error: unknown): string {
   const code = error instanceof HubApiError ? error.code : "";
@@ -173,9 +183,12 @@ export function PlanningPanel({ mode, selectedProject, knownProjects, topic: ini
         {loading && <p role="status">Reading plans…</p>}
         {list && <><p className="panel-footnote">{list.items.length ? `${list.items.length} item(s).` : "No items yet."}
           {list.truncated && " Showing the first 50; narrow Show kind or use shared-note paths to inspect more."}</p>
-          <ul>{list.items.map(item => <li key={item.path}><button className={selected?.path === item.path ? "note-link current" : "note-link"}
-            type="button" onClick={() => void open(item)}><strong>{item.title}</strong><span>{pretty(item.kind)} · {pretty(item.status)}</span>
-            <span>v{item.version} · {actorLabel(item.updated_by, viewerActor)}</span></button></li>)}</ul></>}
+          {groupByProgress(list.items).map(group => group.items.length > 0 && <section key={group.key} className="plan-group" aria-label={group.label}>
+            <h3 className="plan-group-title">{group.label} <span>({group.items.length})</span></h3>
+            <ul>{group.items.map(item => <li key={item.path}><button className={selected?.path === item.path ? "note-link current" : "note-link"}
+              type="button" onClick={() => void open(item)}><strong>{item.status === "done" && <span className="plan-done-mark" aria-hidden="true">✓ </span>}{item.title}</strong>
+              <span>{pretty(item.kind)} · <span className={`plan-status plan-status-${item.status}`}>{pretty(item.status)}</span></span>
+              <span>v{item.version} · {actorLabel(item.updated_by, viewerActor)}</span></button></li>)}</ul></section>)}</>}
       </div><div className="notes-detail">
         {editor ? <form className="note-editor" aria-label={editor.base ? "Edit planning item" : "New planning item"} onSubmit={submit}><fieldset disabled={saving || !canWrite}>
           <legend>{editor.base ? "Edit planning item" : "New planning item"}</legend>
