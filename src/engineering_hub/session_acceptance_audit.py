@@ -5,6 +5,7 @@ the existing repository's WAL plus FULL/EXTRA synchronous durability settings.
 No settings are repaired and no audit history can open a session or task gate.
 """
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -171,6 +172,17 @@ class OwnedSessionAcceptanceAudit:
                         _require(intent.get('outcome') in {'accept', 'decline'} and intent == expected)
                     db.execute('INSERT INTO ' + _TABLE + '(request_id,event,record) VALUES(?,?,?)',
                                (record.request_id, record.event, raw))
+                    if record.event == 'result':
+                        # The native feed watches this existing durable outbox,
+                        # not arbitrary WAL writes. Commit a sanitized pointer
+                        # with the result so an already-queued pending session
+                        # wakes after acceptance, without polling or new work.
+                        # This pointer is invalidation only: no report, actor,
+                        # executor pins or reloadable admission bit is emitted.
+                        self._repository._emit(db, 'staging.session.' + record.outcome, {
+                            'id': 'staging-session-' + record.request_id,
+                            'revision': record.revision,
+                            'updated_at': datetime.now(timezone.utc).isoformat()})
                     self._durability(db)
                     self._identity()
                 # Commit has returned. A failure now is an uncertain retained

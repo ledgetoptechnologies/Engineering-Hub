@@ -7,14 +7,17 @@ original commands; an uncertain effect is never retried under a fresh identity.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
+import asyncio
+import hashlib
 import json
+import time
 import uuid
 
 from .container_pilot import ContainerPilotWorkflow
 from .container_pilot_client import ContainerPilotResponse
 from .pilot_recovery import ACTIONS, PilotRecovery
 from .repository import AGENTS, HubError
-from .startup_reconciliation import StartupReconciliation, StartupReconciliationError
+from .startup_reconciliation import AdmissionSubject, StartupReconciliation, StartupReconciliationError
 from .work_queue import ClosedClaimPolicy, WorkQueue, WorkTarget, WorkWorker
 
 
@@ -46,8 +49,10 @@ class QueuedContainerPilot:
         if type(reconciliation) is not StartupReconciliation:
             raise HubError('queued_pilot_reconciliation_required', 409)
         try:
-            reconciliation.assert_binding(owner=workflow.pilot_owner, target_id=target.target_id,
-                                          manifest_digest=target.manifest_digest)
+            binding = (reconciliation.assert_local_binding if reconciliation.async_admission_required
+                       else reconciliation.assert_binding)
+            binding(owner=workflow.pilot_owner, target_id=target.target_id,
+                    manifest_digest=target.manifest_digest)
         except StartupReconciliationError:
             raise HubError('queued_pilot_reconciliation_required', 409) from None
         if (any(getattr(queue, name) is not None for name in
@@ -63,6 +68,10 @@ class QueuedContainerPilot:
         self._additional_target_verifier = queue.target_verifier
         self.worker = WorkWorker('executor:container-pilot', self.owner.epoch)
         self._permit = ContextVar('queued-pilot-private-permit', default=None)
+        self._scope_task = ContextVar('queued-pilot-private-task', default=None)
+        self._claim_preview = ContextVar('queued-pilot-claim-preview', default=None)
+        self._admission_subject = ContextVar('queued-pilot-admission-subject', default=None)
+        self._lease_deadlines = {}
         self._runtime = None
         # Initialize recovery tables before enrollment closes legacy entrypoints.
         self.recovery = PilotRecovery(workflow)
@@ -131,14 +140,70 @@ class QueuedContainerPilot:
     def _runtime_admission(self):
         """An attached native runtime can only veto existing authority."""
         if self._runtime is None:
-            self._reconciliation_admission()
+            self._metadata_admission() if self.async_admission_required else self._reconciliation_admission()
             return
         from .queued_pilot_runtime import QueuedPilotRuntime
         if (type(self._runtime) is not QueuedPilotRuntime
                 or self._runtime.bridge is not self
                 or self._runtime.admission_allowed() is not True):
             raise HubError('queued_pilot_runtime_unavailable', 409)
-        self._reconciliation_admission()
+        self._metadata_admission() if self.async_admission_required else self._reconciliation_admission()
+
+    @property
+    def async_admission_required(self):
+        return self.reconciliation.async_admission_required
+
+    def _metadata_admission(self, *, pending=False):
+        """Local policy only: never a fresh identity or effect capability."""
+        try:
+            method = (self.reconciliation.assert_local_binding if pending
+                      else self.reconciliation.assert_local_permitted)
+            method(owner=self.owner, target_id=self.target.target_id,
+                   manifest_digest=self.target.manifest_digest)
+        except StartupReconciliationError:
+            raise HubError('queued_pilot_reconciliation_required', 409) from None
+
+    def _active_admission(self, *, kinds):
+        subject = self._admission_subject.get()
+        if type(subject) is not AdmissionSubject or subject.kind not in kinds:
+            raise HubError('queued_pilot_admission_required', 409)
+        try:
+            self.reconciliation.assert_active_subject(owner=self.owner, subject=subject)
+        except StartupReconciliationError:
+            raise HubError('queued_pilot_admission_required', 409) from None
+        return subject
+
+    @contextmanager
+    def _consume(self, prepared, subject):
+        with self.reconciliation.admission_scope(prepared, owner=self.owner, subject=subject):
+            token = self._admission_subject.set(subject)
+            try:
+                yield
+            finally:
+                self._admission_subject.reset(token)
+
+    def _subject(self, kind, value, *, job_id, run_id=None, action=None, phase=None):
+        return AdmissionSubject(kind=kind, target_id=self.target.target_id,
+            manifest_digest=self.target.manifest_digest,
+            subject_digest='sha256:' + hashlib.sha256(_canonical(value).encode()).hexdigest(),
+            job_id=job_id, run_id=run_id, action=action, phase=phase)
+
+    def _remember_lease(self, job):
+        # Capture once before yielding; a backwards queue clock cannot renew it.
+        key = (job['id'], job['fence'])
+        if key not in self._lease_deadlines:
+            self._lease_deadlines[key] = (job['lease_until'], time.monotonic() +
+                max(0, job['lease_until'] - self.queue._now()))
+        return self._lease_deadlines[key]
+
+    def _preparation_deadline(self, job=None):
+        deadline = time.monotonic() + 5.0
+        if job is not None:
+            original, ceiling = self._remember_lease(job)
+            if job['lease_until'] != original:
+                raise HubError('queued_pilot_lease_changed', 409)
+            deadline = min(deadline, ceiling)
+        return deadline
 
     def _reconciliation_admission(self):
         try:
@@ -180,7 +245,10 @@ class QueuedContainerPilot:
     def target_verifier(self, actor, action_key, environment, target):
         try:
             self._guard()
-            self._reconciliation_admission()
+            if self.async_admission_required:
+                self._metadata_admission(pending=True)
+            else:
+                self._reconciliation_admission()
             if action_key != self.action_key or environment != 'staging' or type(target) is not WorkTarget:
                 return False
             if (self._additional_target_verifier is not None
@@ -197,6 +265,8 @@ class QueuedContainerPilot:
         try:
             self._guard()
             self._runtime_admission()
+            if self.async_admission_required and self._claim_preview.get() is not asyncio.current_task():
+                self._active_admission(kinds={'claim', 'command'})
             return (worker == self.worker and action_key == self.action_key
                 and environment == 'staging' and machine_id == self.machine_id
                 and type(target) is WorkTarget and target.source_commit == self.target.candidate_commit
@@ -207,10 +277,12 @@ class QueuedContainerPilot:
     @contextmanager
     def _scope(self, job_id, mode):
         token = self._permit.set((job_id, mode))
+        task_token = self._scope_task.set(asyncio.current_task() if self.async_admission_required else None)
         try:
             yield
         finally:
             self._permit.reset(token)
+            self._scope_task.reset(task_token)
 
     def _bound(self, db, job_id, *, recovery=False):
         self._guard()
@@ -274,18 +346,38 @@ class QueuedContainerPilot:
         if operation in {'create_run', 'advance', 'command'}:
             self._runtime_admission()
         permit = self._permit.get()
+        if self.async_admission_required:
+            if self._scope_task.get() is not asyncio.current_task():
+                raise HubError('queued_pilot_admission_required', 409)
+            if operation == 'create_run':
+                self._active_admission(kinds={'claim'})
+            elif operation == 'command':
+                subject = self._active_admission(kinds={'command'})
+                if subject.run_id != context.get('run_id') or subject.action != context.get('action'):
+                    raise HubError('queued_pilot_admission_required', 409)
         if permit is None or operation == 'dispatch':
             raise HubError('queued_pilot_admission_required', 409)
         if db is None:
             with self.repo._connection() as connection:
                 return self.authorize(operation, db=connection, **context)
         job_id, mode = permit
+        if self.async_admission_required and operation in {'create_run', 'command'}:
+            if self._admission_subject.get().job_id != job_id:
+                raise HubError('queued_pilot_admission_required', 409)
         recovery = mode == 'recover'
         if operation in {'create_run', 'advance', 'command'} and recovery:
             raise HubError('queued_pilot_no_effect_replay', 409)
         if operation not in {'create_run', 'advance', 'command', 'inspect', 'recover'}:
             raise HubError('queued_pilot_admission_required', 409)
         intent, job = self._bound(db, job_id, recovery=recovery)
+        if self.async_admission_required and operation == 'command':
+            run = self.repo._get(db, context['run_id'], 'run')
+            command = self.workflow._request(run, self.target, context['action'])
+            expected = self._subject('command', {'job': dict(job), 'run': run, 'command': command.model_dump()},
+                job_id=job_id, run_id=run['id'], action=command.action, phase=command.action)
+            if self._admission_subject.get() != expected:
+                raise HubError('queued_pilot_admission_required', 409)
+            self._preparation_deadline(dict(job))  # Deny renewed or backwards-clock-extended lease.
         if operation == 'create_run':
             expected = dict(actor=intent['actor'], task_id=intent['task_id'],
                 expected_revision=intent['task_revision'], artifact_digest=intent['artifact_digest'],
@@ -297,6 +389,9 @@ class QueuedContainerPilot:
             raise HubError('queued_pilot_mapping_required', 409)
         if operation in {'inspect', 'recover'} and not recovery:
             raise HubError('queued_pilot_admission_required', 409)
+        if self.async_admission_required and operation in {'create_run', 'command'}:
+            # Local binding/ledger reads can consume the proof window too.
+            self._active_admission(kinds={'claim'} if operation == 'create_run' else {'command'})
         return True
 
     def _intent(self, job):
@@ -362,13 +457,25 @@ class QueuedContainerPilot:
     def _verify_completion(self, job, evidence_id, outcome, *, recovery):
         try:
             self._guard()
+            if self.async_admission_required:
+                if self._scope_task.get() is not asyncio.current_task():
+                    return False
+                subject = self._active_admission(kinds={'reconcile'})
+                expected = self._release_subject(job, evidence_id, outcome)
+                if subject != expected:
+                    return False
             if self._permit.get() != (job['id'], 'recover' if recovery else 'execute'):
                 return False
             with self.repo._connection() as db:
                 intent, current = self._bound(db, job['id'], recovery=recovery)
                 if job['worker'] != intent['worker'] or job['fence'] != intent['fence']:
                     return False
-                return evidence_id == self._evidence_id(intent) and self._proof(db, intent) == outcome
+                verified = evidence_id == self._evidence_id(intent) and self._proof(db, intent) == outcome
+                if verified and self.async_admission_required:
+                    # Release is admitted only after the final proof reads,
+                    # not using freshness from before potentially slow SQL.
+                    self.reconciliation.assert_active_subject(owner=self.owner, subject=subject)
+                return verified
         except Exception:
             return False
 
@@ -392,6 +499,8 @@ class QueuedContainerPilot:
 
     async def run_once(self):
         """Claim one eligible staging job; no worker loop or implicit retry."""
+        if self.async_admission_required:
+            return await self._run_once_async()
         self._guard()
         self._runtime_admission()
         job = self.queue.claim(worker=self.worker, lease_seconds=600, action_keys=(self.action_key,))
@@ -414,6 +523,103 @@ class QueuedContainerPilot:
                     outcome=outcome, evidence_id=evidence_id)
             except Exception:
                 return self._hold(job)
+
+    async def _run_once_async(self):
+        self._guard()
+        self._runtime_admission()
+        preview = self._claim_preview.set(asyncio.current_task())
+        try:
+            plan = self.queue.plan_claim(worker=self.worker, action_keys=(self.action_key,))
+        finally:
+            self._claim_preview.reset(preview)
+        if plan is None:
+            return None
+        def claim_subject():
+            return self._subject('claim', {'plan': plan.binding_digest,
+                'task': self.repo.get_task(plan.job['target']['task_id'])}, job_id=plan.job_id,
+                action=self.action_key, phase='claim')
+        subject = claim_subject()
+        prepared = await self.reconciliation.prepare_admission(owner=self.owner,
+            subject=subject, deadline=self._preparation_deadline())
+        job = None
+        try:
+            with self._consume(prepared, subject):
+                self._guard()
+                self._runtime_admission()
+                if claim_subject() != subject:
+                    return None
+                job = self.queue.claim_exact(plan, worker=self.worker, lease_seconds=600)
+                if job is None:
+                    return None
+                self._remember_lease(job)
+                with self._scope(job['id'], 'execute'):
+                    intent = self._intent(job)
+                    run = self.workflow.create_run(intent['actor'], intent['task_id'], intent['task_revision'],
+                        intent['artifact_digest'], intent['target_id'], client_request_id=intent['request_id'])
+                    self._map(intent, run)
+                    self.queue.live_claim(job_id=job['id'], worker=self.worker, fence=job['fence'])
+            with self._scope(job['id'], 'execute'):
+                await self.workflow.advance(run['id'])
+                with self.repo._connection() as db:
+                    intent, _ = self._bound(db, job['id'])
+                    outcome, evidence_id = self._proof(db, intent), self._evidence_id(intent)
+                if outcome is None:
+                    return self._hold(job)
+                release = self._release_subject(job, evidence_id, outcome)
+                prepared = await self.reconciliation.prepare_admission(owner=self.owner,
+                    subject=release, deadline=self._preparation_deadline(job))
+                with self._consume(prepared, release):
+                    return self.queue.complete(job_id=job['id'], worker=self.worker, fence=job['fence'],
+                        outcome=outcome, evidence_id=evidence_id)
+        except BaseException as error:
+            if job is not None:
+                try:
+                    result = self._hold(job)
+                except Exception:
+                    if not isinstance(error, Exception):
+                        raise error from None
+                    raise
+                if isinstance(error, Exception):
+                    return result
+            raise
+
+    def _release_subject(self, job, evidence_id, outcome, *, db=None):
+        if db is None:
+            with self.repo._connection() as connection:
+                return self._release_subject(job, evidence_id, outcome, db=connection)
+        intent = db.execute('SELECT * FROM hub_queued_pilot_jobs WHERE job_id=?', (job['id'],)).fetchone()
+        if intent is None or intent['run_id'] is None:
+            raise HubError('queued_pilot_mapping_required', 409)
+        run = self.repo._get(db, intent['run_id'], 'run')
+        fields = ('id', 'actor', 'worker', 'fence', 'lease_until', 'target', 'action_key',
+                  'environment', 'machine_id', 'project')
+        return self._subject('reconcile', {'job': {key: job[key] for key in fields},
+            'intent': dict(intent), 'run': run, 'commands': PilotRecovery._rows(db, run['id']),
+            'evidence_id': evidence_id, 'outcome': outcome},
+            job_id=job['id'], run_id=run['id'], action=self.action_key, phase='release')
+
+    def command_metadata(self, run_id, action):
+        """Exact private caller binding, never permission to POST."""
+        self._guard()
+        self._runtime_admission()
+        permit = self._permit.get()
+        if (self._scope_task.get() is not asyncio.current_task() or permit is None or permit[1] != 'execute'):
+            raise HubError('queued_pilot_admission_required', 409)
+        with self.repo._connection() as db:
+            intent, job = self._bound(db, permit[0])
+            if intent['run_id'] != run_id:
+                raise HubError('queued_pilot_mapping_required', 409)
+            return dict(job)
+
+    async def prepare_command(self, command):
+        job = self.command_metadata(command.run_id, command.action)
+        run = self.repo.get_run(command.run_id)
+        subject = self._subject('command', {'job': job, 'run': run, 'command': command.model_dump()},
+            job_id=job['id'], run_id=command.run_id, action=command.action, phase=command.action)
+        prepared = await self.reconciliation.prepare_admission(owner=self.owner,
+            subject=subject, deadline=self._preparation_deadline(job))
+        # The caller must enter this scope immediately, without yielding again.
+        return prepared, subject
 
     async def recover(self, job_id):
         """Inspect the original held attempt; never create/replay a host effect."""
@@ -447,6 +653,15 @@ class QueuedContainerPilot:
                 return current
             # Original-command GETs may retain historical evidence while closed,
             # but they cannot prove current-host exclusion or release capacity.
+            if self.async_admission_required:
+                try:
+                    subject = self._release_subject(current, evidence_id, outcome)
+                    prepared = await self.reconciliation.prepare_admission(owner=self.owner,
+                        subject=subject, deadline=self._preparation_deadline())
+                    with self._consume(prepared, subject):
+                        return self.queue.reconcile(job_id=job_id, evidence_id=evidence_id, outcome=outcome)
+                except (HubError, StartupReconciliationError):
+                    return self.queue.get_job(job_id)
             try:
                 self._reconciliation_admission()
             except HubError:

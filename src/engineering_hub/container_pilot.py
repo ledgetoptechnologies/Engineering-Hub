@@ -284,6 +284,9 @@ class ContainerPilotWorkflow:
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
 
     async def _command(self, run, target, action):
+        bridge = getattr(self.repo, '_queued_pilot', None)
+        if bridge is not None and bridge.async_admission_required:
+            return await self._command_with_preparation(run, target, action, bridge)
         self._assert_pilot_owner()
         self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         command = self._request(run, target, action)
@@ -316,6 +319,58 @@ class ContainerPilotWorkflow:
             db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                        (state, response_json, run['id'], action))
         return state
+
+    async def _command_with_preparation(self, run, target, action, bridge):
+        """Fresh I/O outside SQL, then one no-yield admission of the original POST."""
+        from .lifecycle import finish_owned
+        self._assert_pilot_owner()
+        bridge.command_metadata(run['id'], action)
+        command = self._request(run, target, action)
+        canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        with self.repo._connection() as db:
+            row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                             (run['id'], action)).fetchone()
+        if row is not None:
+            if row['payload'] != canonical:
+                raise HubError('container_pilot_manifest_changed', 409)
+            return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+        prepared, subject = await bridge.prepare_command(command)
+        with bridge._consume(prepared, subject):
+            self._assert_pilot_owner()
+            self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
+            with self.repo._transaction() as db:
+                self._assert_pilot_owner()
+                self.repo._assert_queued_pilot('command', db=db, run_id=run['id'], action=action)
+                row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                                 (run['id'], action)).fetchone()
+                if row is not None:
+                    if row['payload'] != canonical:
+                        raise HubError('container_pilot_manifest_changed', 409)
+                    return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+                db.execute('INSERT INTO hub_container_pilot_commands(run_id,action,payload,state) VALUES(?,?,?,?)',
+                           (run['id'], action, canonical, 'unknown'))
+            self._assert_pilot_owner()
+            self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
+            # No yield before phase admission is complete. Closing the gate now
+            # prevents the next phase, not retention of this accepted original.
+
+        async def exchange_and_retain():
+            response_json = None
+            try:
+                response = self._validated_response(await self.client.submit_command(command))
+                state = self._verified_state(response, command, target)
+                response_json = response.model_dump_json()
+            except Exception:
+                state = 'held'
+            self._assert_pilot_owner()
+            with self.repo._transaction() as db:
+                self._assert_pilot_owner()
+                db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
+                           (state, response_json, run['id'], action))
+            return state
+        # The retained child owns both accepted I/O and its evidence write. It
+        # does not inherit permission for another command or queue admission.
+        return await finish_owned(exchange_and_retain())
 
     async def advance(self, run_id):
         self._assert_pilot_owner()

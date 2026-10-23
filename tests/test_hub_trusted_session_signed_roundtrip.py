@@ -8,8 +8,10 @@ from dataclasses import replace
 import json
 import os
 import time
+import threading
 
 import pytest
+import httpx
 
 pytest.importorskip('fcntl', reason='Linux fixture ownership')
 
@@ -37,7 +39,7 @@ from tests.test_hub_container_executor_launch_supervisor import (
 )
 
 
-def test_fixed_composition_actual_signed_path_stays_pending_until_manual_acceptance(synthetic_issuer, material, monkeypatch):
+async def test_fixed_composition_actual_signed_path_stays_pending_until_manual_acceptance(synthetic_issuer, material, monkeypatch):
     import engineering_hub.pilot_ownership as ownership
     # Reused journal fixture's explicitly synthetic filesystem hook accepts only
     # fd; adapt its signature for the additional real owned Hub repository.
@@ -59,7 +61,11 @@ def test_fixed_composition_actual_signed_path_stays_pending_until_manual_accepta
         expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())
     no_commands = NoCommands()
     executor = executor_app(no_commands, bearer_token=TOKEN.decode(), current_observation_transport=relay)
+    entered, released = threading.Event(), threading.Event()
     def respond(conn, _):
+        entered.set()
+        if not released.wait(2):
+            raise TimeoutError('Synthetic TLS delay was not drained')
         header, body = seen[-1]
         with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
             events = runner.run(request(executor, header, body))
@@ -106,14 +112,33 @@ def test_fixed_composition_actual_signed_path_stays_pending_until_manual_accepta
                 assert gate.admission_state == 'pending' and client.submissions == []
                 actor = data['operator_actor']
                 snapshot = broker.snapshot(actor=actor)
-                broker.decide(actor=actor, request_id=snapshot['request_id'],
-                    expected_revision=snapshot['revision'], action='accept')
+                assert gate.async_admission_required and seen == []
+                operation = asyncio.create_task(broker.decide_async(actor=actor,
+                    request_id=snapshot['request_id'], expected_revision=snapshot['revision'], action='accept'))
+                try:
+                    async with asyncio.timeout(1):
+                        while not entered.is_set():
+                            await asyncio.sleep(.001)
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core),
+                                                 base_url='https://hub.example') as human:
+                        latencies = []
+                        for _ in range(5):
+                            before = time.monotonic()
+                            response = await asyncio.wait_for(human.get('/health'), timeout=.25)
+                            latencies.append(time.monotonic() - before)
+                            assert response.status_code == 200
+                        assert max(latencies) < .25
+                    assert not operation.done() and gate.admission_state == 'pending'
+                finally:
+                    released.set()
+                    await operation
                 assert gate.admission_state == 'accepted' and client.submissions == []
                 with repo._connection() as db:
                     assert db.execute('SELECT count(*) FROM hub_session_acceptance_audit').fetchone()[0] == 2
                 assert checks and seen and not no_commands.touched
                 composition.close()
     finally:
+        released.set()
         if composition is not None:
             composition.close()
         relay.close()

@@ -156,6 +156,16 @@ class CurrentLaunchPins:
             raise CurrentExecutorObservationError("Invalid independent launch pins") from None
 
 
+@dataclass(frozen=True)
+class VerifiedExecutorObservation:
+    """Trusted verifier output, not a wire-selected identity or reusable permit."""
+    identity: ExecutorSessionIdentity
+    nonce: str
+    observation_id: str
+    started_monotonic: float
+    expires_monotonic: float
+
+
 class CurrentExecutorObserver:
     """Callable fresh observer; sticky denial, no retry, cached result or renewal.
 
@@ -224,6 +234,10 @@ class CurrentExecutorObserver:
                 self._lock.release()
 
     def __call__(self):
+        return self.observe_verified().identity
+
+    def observe_verified(self):
+        """Fresh verified proof; TTL starts at nonce issuance, never response finish."""
         # Never acquire an inherited mutex in a child process.
         if os.getpid() != self._pid:
             raise CurrentExecutorObservationError("Current executor identity unavailable")
@@ -276,7 +290,11 @@ class CurrentExecutorObserver:
                 final, final_wall = self._guard()
                 _require(final < deadline and final_wall < expires)
                 self._observations.add(payload["observation_id"])
-                return ExecutorSessionIdentity(self._launch.launch_id, self._release.image_config_id)
+                proof_expiry = min(self._deadline, start + (expires - observed) / 1000)
+                _require(final < proof_expiry)
+                return VerifiedExecutorObservation(
+                    ExecutorSessionIdentity(self._launch.launch_id, self._release.image_config_id),
+                    nonce, payload['observation_id'], start, proof_expiry)
             except BaseException as error:
                 self._closed = True
                 if not isinstance(error, Exception):

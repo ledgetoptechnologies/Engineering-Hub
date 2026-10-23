@@ -84,6 +84,7 @@ class SessionAcceptanceBroker:
         self._lock = threading.RLock()
         self._closed = False
         self._processing = False
+        self._preparing = None
         self._state = 'pending'
         self._revision = 1
         self._gate = gate
@@ -106,7 +107,8 @@ class SessionAcceptanceBroker:
                      and report.unresolved_effects_absent is True
                      and report.report_digest == 'sha256:' + hashlib.sha256(evidence.encode()).hexdigest()
                      and report.challenge == gate.challenge)
-            gate.assert_binding(owner=owner, target_id=target_id, manifest_digest=manifest_digest)
+            binding = gate.assert_local_binding if gate.async_admission_required else gate.assert_binding
+            binding(owner=owner, target_id=target_id, manifest_digest=manifest_digest)
             self._owner, self._target, self._manifest = owner, target_id, manifest_digest
             self._executor, self._report = executor, report
             self._evidence, self._operator, self._audit = evidence, operator_actor, audit
@@ -141,8 +143,81 @@ class SessionAcceptanceBroker:
         now = time.monotonic()
         _require(type(now) in (int, float) and self._last_time <= now < self._deadline, 410)
         self._last_time = now
-        self._gate.assert_binding(owner=self._owner, target_id=self._target,
-                                  manifest_digest=self._manifest)
+        binding = (self._gate.assert_local_binding if self._gate.async_admission_required
+                   else self._gate.assert_binding)
+        binding(owner=self._owner, target_id=self._target, manifest_digest=self._manifest)
+
+    def _accept_subject(self, actor):
+        from .startup_reconciliation import AdmissionSubject
+        canonical = json.dumps(dict(actor=actor, request_id=self._id,
+            revision=self._revision, report_digest=self._report.report_digest),
+            sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return AdmissionSubject(kind='operator_accept', target_id=self._target,
+            manifest_digest=self._manifest, subject_digest='sha256:' + hashlib.sha256(canonical).hexdigest(),
+            job_id=None, run_id=None, phase='operator_accept', action='accept')
+
+    def _request(self, request_id, expected_revision, action):
+        _require(type(request_id) is str and request_id.isascii()
+                 and secrets.compare_digest(request_id, self._id)
+                 and type(expected_revision) is int and expected_revision == self._revision
+                 and action in ('accept', 'decline') and type(action) is str
+                 and self._state == 'pending')
+
+    async def decide_async(self, *, actor, request_id, expected_revision, action):
+        """Prepare remote identity without broker locks, then decide without yield.
+
+        A reservation is not acceptance. Gate-owned observation I/O must drain
+        before cancellation returns; any failed preparation seals this broker.
+        Decline and explicit synchronous mode retain their original local path.
+        """
+        self._process()
+        self._authorize(actor)
+        if not self._gate.async_admission_required or action == 'decline':
+            return self.decide(actor=actor, request_id=request_id,
+                               expected_revision=expected_revision, action=action)
+        with self._lock:
+            self._request(request_id, expected_revision, action)
+            _require(self._preparing is None and not self._processing)
+            try:
+                self._current()
+                subject = self._accept_subject(actor)
+                retained = (self._owner, self._report, self._executor, self._evidence,
+                            self._operator, self._deadline, self._id, self._revision)
+                token = object()
+                self._preparing = token
+            except BaseException as error:
+                self._seal()
+                if isinstance(error, Exception):
+                    raise SessionAcceptanceError(503) from None
+                raise
+        try:
+            prepared = await self._gate.prepare_admission(
+                owner=self._owner, subject=subject, deadline=self._deadline)
+            with self._lock:
+                self._process()
+                self._authorize(actor)
+                self._request(request_id, expected_revision, action)
+                _require(self._preparing is token and not self._processing
+                         and self._owner is retained[0] and self._report is retained[1]
+                         and (self._executor, self._evidence, self._operator, self._deadline,
+                              self._id, self._revision) == retained[2:])
+                self._current()
+                _require(self._accept_subject(actor) == subject)
+                # Exactly one synchronous segment: scope, intent, opening,
+                # result. No observation or await occurs while holding this lock.
+                with self._gate.admission_scope(prepared, owner=self._owner, subject=subject):
+                    return self.decide(actor=actor, request_id=request_id,
+                                       expected_revision=expected_revision, action=action)
+        except BaseException as error:
+            with self._lock:
+                self._seal()
+            if isinstance(error, Exception):
+                raise SessionAcceptanceError(503) from None
+            raise
+        finally:
+            with self._lock:
+                if self._preparing is token:
+                    self._preparing = None
 
     def _write_audit(self, event, outcome, actor):
         record = SessionAcceptanceAudit(event, outcome, self._id, self._revision,
@@ -183,22 +258,33 @@ class SessionAcceptanceBroker:
                 self._seal()
                 raise SessionAcceptanceError(503)
             # Stale/foreign requests do not revoke an already accepted session.
-            _require(type(request_id) is str and request_id.isascii()
-                     and secrets.compare_digest(request_id, self._id)
-                     and type(expected_revision) is int and expected_revision == self._revision
-                     and action in ('accept', 'decline') and type(action) is str
-                     and self._state == 'pending')
+            self._request(request_id, expected_revision, action)
             self._processing = True
             intent_recorded = result_attempted = False
             try:
                 self._current()
+                if action == 'accept' and self._gate.async_admission_required:
+                    self._gate.assert_active_subject(owner=self._owner,
+                                                     subject=self._accept_subject(actor))
                 self._write_audit('intent', action, actor)
                 intent_recorded = True
                 if action == 'accept':
+                    # Audit callbacks may consume freshness without yielding.
+                    if self._gate.async_admission_required:
+                        self._authorize(actor)
+                        self._request(request_id, expected_revision, action)
+                        self._gate.assert_active_subject(owner=self._owner,
+                                                         subject=self._accept_subject(actor))
                     self._gate.accept_operator_reconciliation(owner=self._owner, report=self._report)
                     self._state = 'accepted'
                     result_attempted = True
                     self._write_audit('result', 'accepted', actor)
+                    if self._gate.async_admission_required:
+                        # A durable result may itself consume the remaining
+                        # proof window. Retain it as uncertainty and seal rather
+                        # than returning a late accepted response.
+                        self._gate.assert_active_subject(owner=self._owner,
+                                                         subject=self._accept_subject(actor))
                 else:
                     self._gate.close()
                     self._state = 'declined'
@@ -329,7 +415,7 @@ def attach_session_acceptance_routes(app, *, broker, config, sessions):
             # No await between gate opening and synchronous result audit. This
             # serializes event-loop admissions, not arbitrary other threads.
             from fastapi.responses import JSONResponse
-            return JSONResponse(broker.decide(actor=identity, **payload.model_dump()),
+            return JSONResponse(await broker.decide_async(actor=identity, **payload.model_dump()),
                                 headers={'Cache-Control': 'no-store'})
         except SessionAcceptanceError as error:
             unavailable(error)

@@ -6,8 +6,11 @@ There is deliberately no CLI, persisted approval, environment or HTTP opener.
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from dataclasses import dataclass
 import inspect
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +20,7 @@ import time
 from uuid import UUID
 
 from .pilot_ownership import PilotOwner
+from .lifecycle import finish_owned
 
 
 class StartupReconciliationError(RuntimeError):
@@ -61,6 +65,51 @@ class OperatorReconciliation:
     unresolved_effects_absent: bool
 
 
+@dataclass(frozen=True)
+class AdmissionSubject:
+    """Closed operation metadata; possession of this value grants nothing."""
+    kind: str
+    target_id: str
+    manifest_digest: str
+    subject_digest: str
+    job_id: str | None = None
+    run_id: str | None = None
+    phase: str | None = None
+    action: str | None = None
+
+    def __post_init__(self):
+        _require(type(self.kind) is str
+                 and self.kind in {'operator_accept', 'claim', 'command', 'reconcile'}
+                 and self.target_id == 'engineering-hub:staging'
+                 and _digest(self.manifest_digest) and _digest(self.subject_digest))
+        _require(all(value is None or type(value) is str and 0 < len(value) <= 128
+                     and value.isascii() and all(33 <= ord(c) <= 126 for c in value)
+                     for value in (self.phase, self.action)))
+        if self.kind == 'operator_accept':
+            _require(self.job_id is None and self.run_id is None
+                     and self.phase == 'operator_accept' and self.action == 'accept')
+        else:
+            _require(_uuid(self.job_id))
+            if self.kind == 'claim':
+                _require(self.run_id is None)
+            else:
+                _require(_uuid(self.run_id))
+            _require(self.phase is not None and self.action is not None)
+
+
+@dataclass(frozen=True, eq=False)
+class _PreparedAdmission:
+    gate: object
+    owner: object
+    pid: int
+    loop: object
+    task: object
+    epoch: str
+    generation: int
+    subject: AdmissionSubject
+    deadline: float
+
+
 class StartupReconciliation:
     """Single-use, PID/owner/identity/deadline-bound manual admission capability.
 
@@ -74,7 +123,7 @@ class StartupReconciliation:
     phase. This does not cancel accepted effects or synchronize a remote writer.
     """
     def __init__(self, *, owner, database, target_id, manifest_digest, executor,
-                 lifetime_seconds, current_executor_identity):
+                 lifetime_seconds, current_executor_identity, async_admission=False):
         self._pid = os.getpid()
         self._lock = threading.RLock()
         self._closed = False
@@ -83,7 +132,14 @@ class StartupReconciliation:
         self._checking = False
         self._challenge = secrets.token_hex(32)
         self._created = time.monotonic()
+        self._async_admission = async_admission
+        self._loop = None
+        self._generation = 0
+        self._preparing = self._prepared = self._active_scope = None
+        self._scope_transitioned = None
+        self._proof_nonces, self._proof_observations = set(), set()
         try:
+            _require(type(async_admission) is bool)
             _require(type(owner) is PilotOwner and isinstance(database, (str, Path)))
             self._database = Path(database)
             _require(self._database.is_absolute())
@@ -105,7 +161,10 @@ class StartupReconciliation:
             self._observer = current_executor_identity
             self._deadline = self._created + lifetime_seconds
             self._last_time = self._created
-            self._validate()
+            if self._async_admission:
+                self._validate_local()
+            else:
+                self._validate()
         except BaseException as error:
             self._closed = True
             if isinstance(error, Exception):
@@ -131,6 +190,9 @@ class StartupReconciliation:
         self._last_time = now
 
     def _validate(self):
+        if self._async_admission:
+            self._assert_scope()
+            return
         _require(not self._closed and not self._checking)
         self._time()
         self._owner.assert_active(self._database)
@@ -152,6 +214,168 @@ class StartupReconciliation:
         self._owner.assert_active(self._database)
         _require(self._owner.epoch == self._epoch)
 
+    @property
+    def async_admission(self):
+        return self._async_admission
+
+    @property
+    def async_admission_required(self):
+        return self._async_admission
+
+    def _validate_local(self):
+        try:
+            _require(not self._closed)
+            self._time()
+            self._owner.assert_active(self._database)
+            _require(self._owner.epoch == self._epoch)
+        except BaseException as error:
+            self._closed = True
+            if isinstance(error, Exception):
+                raise StartupReconciliationError() from None
+            raise
+
+    def assert_local_binding(self, *, owner, target_id, manifest_digest):
+        """Local metadata only: never fresh identity or effect admission."""
+        self._same_process()
+        with self._lock:
+            _require(owner is self._owner and target_id == self._target
+                     and manifest_digest == self._manifest)
+            self._validate_local()
+
+    def assert_local_permitted(self, *, owner, target_id, manifest_digest):
+        """Local lifecycle veto only; not a replacement for consumed admission."""
+        self.assert_local_binding(owner=owner, target_id=target_id, manifest_digest=manifest_digest)
+        _require(self._accepted)
+
+    def _async_context(self):
+        self._same_process()
+        try:
+            loop, task = asyncio.get_running_loop(), asyncio.current_task()
+        except RuntimeError:
+            raise StartupReconciliationError() from None
+        _require(task is not None and (self._loop is None or loop is self._loop))
+        if self._loop is None:
+            self._loop = loop
+        return loop, task
+
+    def _assert_scope(self, *, owner=None, subject=None):
+        loop, task = self._async_context()
+        scope = self._active_scope
+        _require(self._async_admission and scope is not None and scope.gate is self
+                 and scope.pid == os.getpid() and scope.loop is loop and scope.task is task
+                 and scope.owner is self._owner and scope.epoch == self._epoch
+                 and (scope.generation == self._generation
+                      or self._scope_transitioned is scope and scope.generation == 0
+                      and self._generation == 1 and self._accepted
+                      and scope.subject.kind == 'operator_accept')
+                 and (owner is None or owner is self._owner)
+                 and (subject is None or type(subject) is AdmissionSubject and scope.subject == subject))
+        self._validate_local()
+        _require(time.monotonic() < scope.deadline)
+        return scope
+
+    def assert_active_subject(self, *, owner, subject):
+        """Check the exact consumed scope; metadata alone never satisfies this."""
+        self._same_process()
+        with self._lock:
+            self._assert_scope(owner=owner, subject=subject)
+
+    assert_scope = assert_active_subject
+
+    async def prepare_admission(self, *, owner, subject, deadline):
+        """Await one owned fresh exchange without holding gate or SQL locks."""
+        from .current_executor_observation import VerifiedExecutorObservation
+        loop, task = self._async_context()
+        with self._lock:
+            _require(self._async_admission and type(subject) is AdmissionSubject
+                     and owner is self._owner and subject.target_id == self._target
+                     and subject.manifest_digest == self._manifest
+                     and type(deadline) in (int, float) and math.isfinite(deadline)
+                     and self._preparing is None and self._prepared is None and self._active_scope is None)
+            self._validate_local()
+            _require((subject.kind == 'operator_accept' and not self._accepted and not self._attempted)
+                     or (subject.kind != 'operator_accept' and self._accepted))
+            started = time.monotonic()
+            ceiling = min(float(deadline), self._deadline)
+            _require(started < ceiling)
+            token, generation = object(), self._generation
+            self._preparing = token
+        try:
+            proof = await finish_owned(loop.run_in_executor(None, self._observer))
+            if inspect.iscoroutine(proof) and inspect.getcoroutinestate(proof) == inspect.CORO_CREATED:
+                proof.close()
+            with self._lock:
+                _require(self._preparing is token and self._generation == generation)
+                self._validate_local()
+                _require(type(proof) is VerifiedExecutorObservation
+                         and type(proof.identity) is ExecutorSessionIdentity and proof.identity == self._executor
+                         and type(proof.nonce) is str and re.fullmatch('[0-9a-f]{64}', proof.nonce)
+                         and _uuid(proof.observation_id)
+                         and all(type(t) in (int, float) and math.isfinite(t)
+                                 for t in (proof.started_monotonic, proof.expires_monotonic))
+                         and started <= proof.started_monotonic <= time.monotonic()
+                         and proof.started_monotonic < proof.expires_monotonic)
+                _require(len(self._proof_nonces) < 4096 and proof.nonce not in self._proof_nonces
+                         and proof.observation_id not in self._proof_observations)
+                self._proof_nonces.add(proof.nonce)
+                self._proof_observations.add(proof.observation_id)
+                ceiling = min(ceiling, proof.expires_monotonic)
+                _require(time.monotonic() < ceiling and self._async_context() == (loop, task))
+                prepared = _PreparedAdmission(self, owner, self._pid, loop, task, self._epoch,
+                    generation, subject, ceiling)
+                self._prepared = prepared
+                def unconsumed_after_yield():
+                    if self._prepared is prepared:
+                        self.close()
+                loop.call_soon(unconsumed_after_yield)
+                return prepared
+        except BaseException as error:
+            self.close()
+            if isinstance(error, Exception):
+                raise StartupReconciliationError() from None
+            raise
+        finally:
+            with self._lock:
+                if self._preparing is token:
+                    self._preparing = None
+
+    @contextmanager
+    def admission_scope(self, prepared, *, owner, subject):
+        """Consume once, on this task/loop, without yielding until local completion."""
+        self._same_process()
+        entered = False
+        try:
+            with self._lock:
+                loop, task = self._async_context()
+                _require(self._async_admission and type(prepared) is _PreparedAdmission
+                         and self._prepared is prepared and self._active_scope is None
+                         and prepared.gate is self and prepared.owner is owner is self._owner
+                         and prepared.pid == os.getpid() and prepared.loop is loop and prepared.task is task
+                         and prepared.epoch == self._epoch and prepared.generation == self._generation
+                         and type(subject) is AdmissionSubject and prepared.subject == subject)
+                self._prepared = None
+                self._active_scope = prepared
+                self._assert_scope(owner=owner, subject=subject)
+                entered = True
+                def yielded():
+                    if self._active_scope is prepared:
+                        self.close()
+                tripwire = loop.call_soon(yielded)
+            try:
+                yield
+            finally:
+                tripwire.cancel()
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if entered:
+                with self._lock:
+                    if self._active_scope is prepared:
+                        self._active_scope = None
+                    if self._scope_transitioned is prepared:
+                        self._scope_transitioned = None
+
     def accept_operator_reconciliation(self, *, owner, report):
         """Trusted local composition only. One attempt; any failure seals closed.
 
@@ -162,6 +386,9 @@ class StartupReconciliation:
         with self._lock:
             try:
                 _require(not self._attempted and not self._accepted)
+                if self._async_admission:
+                    scope = self._assert_scope(owner=owner)
+                    _require(scope.subject.kind == 'operator_accept' and self._generation == 0)
                 self._attempted = True
                 self._validate()
                 _require(owner is self._owner and type(report) is OperatorReconciliation)
@@ -177,7 +404,14 @@ class StartupReconciliation:
                          and report.inventory_reconciled is True
                          and report.writers_excluded is True
                          and report.unresolved_effects_absent is True)
+                if self._async_admission:
+                    self._assert_scope(owner=owner)
                 self._accepted = True
+                if self._async_admission:
+                    # Sole permitted generation transition within one consumed
+                    # operator scope; result-audit checks retain this exact scope.
+                    self._generation = 1
+                    self._scope_transitioned = scope
             except BaseException as error:
                 self._closed = True
                 if isinstance(error, Exception):
@@ -200,6 +434,8 @@ class StartupReconciliation:
                     raise
                 raise StartupReconciliationError()
             try:
+                if self._async_admission:
+                    _require(self._assert_scope(owner=owner).subject.kind != 'operator_accept')
                 _require(owner is self._owner
                          and type(target_id) is str and target_id == self._target
                          and type(manifest_digest) is str and manifest_digest == self._manifest
@@ -251,3 +487,6 @@ class StartupReconciliation:
             return
         with self._lock:
             self._closed = True
+            self._generation += 1
+            self._prepared = self._active_scope = None
+            self._scope_transitioned = None

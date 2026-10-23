@@ -101,23 +101,43 @@ Tests use bounded isolated containers, synthetic host observations and real loca
 SQLite ownership/auditing where stated. They are not actual NAS enrollment,
 installation, host inventory, deployment, rollback, restore or reboot acceptance.
 
-## Outstanding shared-loop latency acceptance
+## Explicit asynchronous admission and remaining latency acceptance
 
-The signed observer is currently synchronous on the owned Hub event loop. A
-broker snapshot performs one fresh observation, acceptance four, and decline two.
-An instrumented queued-runtime fixture counted 25 observations before its first
-command POST and 33 before its second; these are fixture counts, not measured live
-NAS latency. With the current two-second per-observation budget, legitimate slow
-responses can accumulate substantial shared-loop blocking (roughly 50 seconds of
-observer time for 25 calls). Other MCP/UI requests cannot progress while an
-individual synchronous call occupies that loop. The new test deliberately adds
-5ms per synthetic observation and demonstrates both the broker counts and a
-scheduled peer waiting until the synchronous decision returns.
+The former synchronous installed composition performed one observation for a
+broker snapshot, four for acceptance and two for decline. An earlier instrumented
+queued-runtime fixture counted 25 observations before its first command POST and
+33 before its second. Those were historical source-path counts, not live NAS
+measurements; bounded blocking calls still stalled the shared loop. The former
+5 ms fixture characterization is superseded by responsiveness requirements, not
+silently reclassified as acceptable behavior.
 
-**Usable concurrent MCP/UI latency acceptance remains outstanding.** This explicit
-selector is unactivated; passing functional/container tests is not a claim that
-its current latency is acceptable for a live unified Hub. The next step is a
-reviewed asynchronous preflight at semantic admission boundaries with a safe
-handover barrier and cancellation/identity revalidation. Blind thread-pool
-offloading, caching identity results, dropping checks or arbitrarily tightening
-timeouts are not implemented fixes and would require separate evidence/review.
+The fixed trusted selector now explicitly constructs an async-admission gate.
+Its bounded synchronous verifier runs in a retained executor Future, drained
+through cancellation; it returns verified proof rather than a cached identity.
+The composition checks original enrollment/report freshness before and after
+each observation and clips proof expiry to the original report's monotonic
+ceiling. It uses the same captured TLS/credential bytes and independently retained
+issuer/release/launch pins. It never renews the original launch or report.
+
+Snapshot and decline use local binding only and claim no fresh remote readiness.
+Acceptance awaits one fresh operator-specific preparation outside locks, then
+rechecks exact actor/CAS/report/owner and consumes a one-use task/loop-bound scope.
+Intent audit, opening and result audit stay on the owned loop without an await;
+slow intent audits must not outlive proof freshness. Legacy scope-free effect
+calls are denied in this mode. Independently explicit legacy synchronous unit
+compositions retain their previous verification contract.
+
+Focused fixtures check health requests below 250 ms while observation I/O is
+deliberately blocked, including an actual signed supervisor/UDS/ASGI/TLS round
+trip and the real fixed-selector callback wiring. Separate unified Hub/bus tests
+measure MCP ping and overview requests during one-second synthetic observations;
+actual isolated TCP service tests cover human acceptance, an already-queued job's
+native wake, healthy deployment and rollback with simulated executor responses.
+The audit result and sanitized outbox invalidation commit atomically. Intent
+alone cannot wake work or restore authority in another process.
+These measure isolated source integration, not audit/fsync latency guarantees,
+network-wide MCP p95, real Engine checks, a NAS route, restart or deployed
+concurrency acceptance. **Real-host latency and acceptance remain outstanding.**
+This source selector remains unactivated; no cached readiness, blanket
+`to_thread(broker.decide)`, automatic launch or reduced timeout is a substitute
+for exact semantic admission boundaries and independent deployment acceptance.

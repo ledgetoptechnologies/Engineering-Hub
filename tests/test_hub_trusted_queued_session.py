@@ -1,5 +1,6 @@
 """Fixed composition with real SQLite owner/audit and synthetic host facts only."""
 from contextlib import contextmanager
+import asyncio
 from dataclasses import replace
 import hashlib
 import json
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import httpx
 
 pytest.importorskip('fcntl', reason='Linux protected ownership')
 
@@ -25,6 +27,7 @@ from engineering_hub.queued_pilot import QueuedContainerPilot
 from engineering_hub.queued_pilot_runtime import QueuedPilotRuntime
 from engineering_hub.repository import HubRepository
 from engineering_hub.startup_reconciliation import StartupReconciliationError
+from engineering_hub.current_executor_observation import VerifiedExecutorObservation
 from engineering_hub.work_queue import WorkAction, WorkQueue
 from tests.test_hub_queued_pilot import DistinctContainerClient, ACTION, MACHINE
 from tests.test_hub_unified_pilot_startup import profile_document, encode, installed
@@ -111,10 +114,14 @@ def dependencies(monkeypatch):
             self.closed = False
             observers.append(self)
             events.append('observer')
-        def __call__(self):
+        def observe_verified(self):
             assert not self.closed
             events.append('observe')
-            return self.identity
+            started = time.monotonic()
+            return VerifiedExecutorObservation(self.identity, os.urandom(32).hex(), str(uuid4()),
+                                               started, started + 5)
+        def __call__(self):
+            pytest.fail('Installed async composition must request verified proof, not bare identity')
         def close(self):
             self.closed = True
             events.append('observer-close')
@@ -186,17 +193,16 @@ def composed(tmp_path, dependencies):
             composition.close()
 
 
-def test_exact_same_gate_manual_acceptance_and_real_owned_audit(tmp_path, dependencies):
+async def test_exact_same_gate_manual_acceptance_and_real_owned_audit(tmp_path, dependencies):
     with composed(tmp_path, dependencies) as state:
         assert state.gate.admission_state == 'pending'
         actor = state.composition._enrollment.operator_actor
         snapshot = state.broker.snapshot(actor=actor)
         assert 'Original observed_at_ms:' in snapshot['evidence']
         assert state.client.submissions == [] and not dependencies.observers[0].closed
-        with pytest.raises(StartupReconciliationError):
-            state.gate.assert_current_permitted(owner=state.owner, target_id=state.target.target_id,
-                manifest_digest=state.target.manifest_digest)
-        state.broker.decide(actor=actor, request_id=snapshot['request_id'],
+        assert state.gate.async_admission_required
+        assert dependencies.events.count('observe') == 0
+        await state.broker.decide_async(actor=actor, request_id=snapshot['request_id'],
             expected_revision=snapshot['revision'], action='accept')
         assert state.gate.admission_state == 'accepted' and state.client.submissions == []
         with state.repo._connection() as db:
@@ -205,7 +211,7 @@ def test_exact_same_gate_manual_acceptance_and_real_owned_audit(tmp_path, depend
     assert dependencies.observers[0].closed
 
 
-def test_expired_original_report_cannot_be_accepted_as_new_facts(tmp_path, dependencies, monkeypatch):
+async def test_expired_original_report_cannot_be_accepted_as_new_facts(tmp_path, dependencies, monkeypatch):
     with composed(tmp_path, dependencies) as state:
         actor = state.composition._enrollment.operator_actor
         snapshot = state.broker.snapshot(actor=actor)
@@ -214,7 +220,7 @@ def test_expired_original_report_cannot_be_accepted_as_new_facts(tmp_path, depen
         monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: mono + 120,
             time=lambda: (expiry + 1000) / 1000))
         with pytest.raises(Exception):
-            state.broker.decide(actor=actor, request_id=snapshot['request_id'],
+            await state.broker.decide_async(actor=actor, request_id=snapshot['request_id'],
                 expected_revision=snapshot['revision'], action='accept')
         assert state.gate.admission_state == 'closed'
         assert state.client.submissions == []
@@ -299,41 +305,105 @@ async def test_selector_rejects_ambiguous_or_relative_activation_before_io(monke
                                          reconciliation_factory=callback)
 
 
-@pytest.mark.parametrize('action,expected_calls', [('accept', 4), ('decline', 2)])
-async def test_current_sync_observer_call_count_and_shared_loop_blocking(
-        tmp_path, dependencies, monkeypatch, action, expected_calls):
-    """Characterize a limitation, NOT acceptable live latency or async proof.
+async def test_installed_selector_uses_actual_async_composition_callbacks(installed, dependencies, monkeypatch):
+    """Actual fixed selector/callback wiring; synthetic observer/command client."""
+    from engineering_hub import unified_pilot_startup as startup
+    from engineering_hub import unified_queued_pilot_service as serving
+    with PilotOwner(installed['database'], allow_ephemeral_test_storage=True):
+        pass
+    original_owner = startup.PilotOwner
+    monkeypatch.setattr(startup, 'PilotOwner', lambda path, **kw:
+        original_owner(path, allow_ephemeral_test_storage=True, **kw))
+    selected = installed['profile'].parent / 'actual-async-session.json'
+    data = document()
+    selected.write_bytes(encode(data))
+    selected.chmod(0o600)
+    seen = []
+    async def serve(settings, manifest, client_factory, **kwargs):
+        owner = kwargs['owner']
+        target = ContainerPilotTarget.from_manifest(manifest)
+        gate = kwargs['reconciliation_factory'](owner, target)
+        assert gate.async_admission_required and dependencies.events.count('observe') == 0
+        repo = HubRepository(settings.database, execution_principal='executor:container-pilot', pilot_owner=owner)
+        client = DistinctContainerClient()
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project='engineering-hub')})
+        bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE,
+                                      reconciliation=gate)
+        feed = NativeHubEventFeed(repo.path)
+        runtime = QueuedPilotRuntime(bridge, feed)
+        core = create_app(settings, repository=repo, event_feed=feed, work_queue=queue,
+                          queued_pilot_runtime=runtime)
+        broker = kwargs['session_acceptance_factory'](core, owner, repo, target, gate)
+        assert broker._gate is gate and dependencies.events.count('observe') == 0
+        snapshot = broker.snapshot(actor=data['operator_actor'])
+        await broker.decide_async(actor=data['operator_actor'], request_id=snapshot['request_id'],
+                                  expected_revision=snapshot['revision'], action='accept')
+        assert gate.admission_state == 'accepted' and not client.submissions
+        assert dependencies.events.count('observe') == 1
+        seen.append(True)
+    monkeypatch.setattr(serving, 'serve_owned_unified_queued_pilot', serve)
+    await startup.serve_configuration(installed['config'], installed['profile'],
+                                      session_enrollment_path=selected)
+    assert seen == [True] and dependencies.observers[0].closed
 
-    Each synthetic observation deliberately consumes 5ms synchronously. The
-    scheduled peer cannot execute until the synchronous broker call returns.
-    No freshness checks are removed, combined, cached or moved across barriers.
+
+@pytest.mark.parametrize('action,expected_calls', [('accept', 1), ('decline', 0)])
+async def test_installed_async_acceptance_keeps_shared_loop_health_responsive(
+        tmp_path, dependencies, monkeypatch, action, expected_calls):
+    """Supersedes the old 1/4/2 synchronous snapshot/accept/decline counts.
+
+    Metadata and decline no longer observe; one owned preflight checks accept.
+    This measures only isolated ASGI health while synthetic identity I/O waits,
+    not real NAS/Engine latency or responsiveness during durable audit commits.
     """
-    import asyncio
+    import threading
     with composed(tmp_path, dependencies) as state:
         actor = state.composition._enrollment.operator_actor
         before = dependencies.events.count('observe')
         snapshot = state.broker.snapshot(actor=actor)
-        assert dependencies.events.count('observe') - before == 1
+        assert dependencies.events.count('observe') - before == 0
         observer_type = type(dependencies.observers[0])
-        original = observer_type.__call__
-        progressed = []
-        async def peer():
-            progressed.append(True)
-        waiting = asyncio.create_task(peer())
+        original = observer_type.observe_verified
+        entered, release = threading.Event(), threading.Event()
         def slow_observation(observer):
-            assert not progressed
-            time.sleep(.005)  # Deliberate bounded stand-in for synchronous I/O.
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError('Synthetic observation was not drained')
             return original(observer)
-        monkeypatch.setattr(observer_type, '__call__', slow_observation)
+        monkeypatch.setattr(observer_type, 'observe_verified', slow_observation)
         before = dependencies.events.count('observe')
-        started = time.monotonic()
+        operation = asyncio.create_task(state.broker.decide_async(actor=actor,
+            request_id=snapshot['request_id'], expected_revision=snapshot['revision'], action=action))
         try:
-            state.broker.decide(actor=actor, request_id=snapshot['request_id'],
-                expected_revision=snapshot['revision'], action=action)
-            elapsed = time.monotonic() - started
-            assert dependencies.events.count('observe') - before == expected_calls
-            assert elapsed >= expected_calls * .005
-            assert progressed == [] and not waiting.done()
+            if action == 'accept':
+                async with asyncio.timeout(1):
+                    while not entered.is_set():
+                        await asyncio.sleep(.001)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=state.core),
+                                         base_url='https://hub.example') as client:
+                latencies = []
+                for _ in range(5):
+                    started = time.monotonic()
+                    result = await asyncio.wait_for(client.get('/health'), timeout=.25)
+                    latencies.append(time.monotonic() - started)
+                    assert result.status_code == 200
+                assert max(latencies) < .25
+            if action == 'accept':
+                assert not operation.done() and state.client.submissions == []
         finally:
-            await waiting
-        assert progressed == [True]
+            release.set()
+            await operation
+        assert dependencies.events.count('observe') - before == expected_calls
+        assert state.client.submissions == []
+
+
+def test_verified_proof_clipped_to_original_report_deadline(tmp_path, dependencies):
+    composition = construct(tmp_path)
+    try:
+        composition._deadline = time.monotonic() + .5
+        proof = composition._current_verified()
+        assert proof.expires_monotonic == composition._deadline
+        assert proof.started_monotonic < proof.expires_monotonic
+    finally:
+        composition.close()

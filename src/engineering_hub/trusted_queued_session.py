@@ -3,7 +3,7 @@
 Protected operator material is an attestation, not automated inventory proof.
 Neither JSON nor executor responses can select code, providers or identity pins.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -16,7 +16,7 @@ from .container_pilot_manifest import Platform
 from .container_pilot import ContainerPilotTarget
 from .pilot_ownership import PilotOwner
 from .current_executor_observation import (CurrentExecutorObserver,
-    CurrentExecutorReleasePins, CurrentLaunchPins)
+    CurrentExecutorReleasePins, CurrentLaunchPins, VerifiedExecutorObservation)
 from .current_executor_transport import CurrentExecutorHTTPSTransport
 from .queued_session_acceptance import attach_queued_session_acceptance
 from .session_acceptance_audit import OwnedSessionAcceptanceAudit
@@ -175,11 +175,15 @@ class TrustedQueuedSessionComposition:
         self._last_mono, self._last_wall = mono, wall
         return mono
 
-    def _current(self):
+    def _current_verified(self):
         self._fresh()
-        value = self._observer()
+        value = self._observer.observe_verified()
         self._fresh()
-        return value
+        _require(type(value) is VerifiedExecutorObservation)
+        # Never refresh the original operator-report ceiling when a newer
+        # signed identity response arrives. Gate-owned async preparation runs
+        # this bounded synchronous verifier off the shared Hub event loop.
+        return replace(value, expires_monotonic=min(value.expires_monotonic, self._deadline))
 
     def reconciliation_factory(self, owner, target):
         try:
@@ -194,7 +198,8 @@ class TrustedQueuedSessionComposition:
             _require(lifetime >= 1)
             self._gate = StartupReconciliation(owner=owner, database=self._database,
                 target_id=target.target_id, manifest_digest=self._manifest, executor=self._identity,
-                lifetime_seconds=lifetime, current_executor_identity=self._current)
+                lifetime_seconds=lifetime, current_executor_identity=self._current_verified,
+                async_admission=True)
             return self._gate
         except BaseException as error:
             self.close()

@@ -200,7 +200,8 @@ def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task
         raise QueuedPilotServiceError()
     if type(value) is not StartupReconciliation:
         raise QueuedPilotServiceError()
-    value.assert_binding(owner=owner, target_id=target.target_id, manifest_digest=target.manifest_digest)
+    binding = value.assert_local_binding if value.async_admission_required else value.assert_binding
+    binding(owner=owner, target_id=target.target_id, manifest_digest=target.manifest_digest)
     return value
 
 

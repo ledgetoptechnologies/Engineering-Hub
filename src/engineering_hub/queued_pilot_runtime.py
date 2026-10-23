@@ -76,7 +76,10 @@ class QueuedPilotRuntime:
         """A synchronous, sticky admission veto; never an authority issuer."""
         try:
             self._identity()
-            self.bridge._reconciliation_admission()
+            if self.bridge.async_admission_required:
+                self.bridge._metadata_admission()
+            else:
+                self.bridge._reconciliation_admission()
             return (self._state == 'active' and self._loop is not None
                 and self._task is not None and not self._task.done()
                 and self._task.cancelling() == 0

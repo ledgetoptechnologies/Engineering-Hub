@@ -67,8 +67,8 @@ def attach_queued_session_acceptance(core, *, owner, repository, target, gate,
             raise QueuedSessionAcceptanceError()
         owner.assert_active(repository.path)
         target.validated_manifest()
-        gate.assert_binding(owner=owner, target_id=target.target_id,
-                            manifest_digest=target.manifest_digest)
+        binding = gate.assert_local_binding if gate.async_admission_required else gate.assert_binding
+        binding(owner=owner, target_id=target.target_id, manifest_digest=target.manifest_digest)
         broker = SessionAcceptanceBroker(gate=gate, owner=owner,
             target_id=target.target_id, manifest_digest=target.manifest_digest,
             executor=report.executor, report=report, evidence=evidence,
