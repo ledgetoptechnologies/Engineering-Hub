@@ -65,6 +65,32 @@ def test_existing_private_copy_parity_then_separate_enrollment(files):
     assert source.read_bytes() == raw
 
 
+def test_current_withdrawn_records_and_replacement_history_survive_parity(files):
+    # PR58 changes record data, not the enrollment schema. A cold-copy report
+    # must retain that history rather than interpret withdrawal as deletion.
+    source, target = files
+    repo = HubRepository(source)
+    old_task = repo.list_tasks()[0]
+    new_task = repo.create_task('human:42', 'engineering-hub', 'Replacement', 'replacement')
+    task = repo.withdraw('human:42', 'task', old_task['id'], old_task['revision'],
+                         'Superseded task', new_task['id'])
+    old_question = repo.create_decision('codex', 'engineering-hub', 'Old question', ['Yes', 'No'])
+    new_question = repo.create_decision('codex', 'engineering-hub', 'New question', ['Yes', 'No'])
+    question = repo.withdraw('human:42', 'decision', old_question['id'], old_question['revision'],
+                             'Superseded question', new_question['id'])
+    raw = source.read_bytes()
+    shutil.copyfile(source, target)
+    target.chmod(0o600)
+    report = preparation.inspect_preparation(source, destination=target)['report']
+    assert report['byte_and_logical_parity'] is True
+    assert source.read_bytes() == target.read_bytes() == raw
+    assert report['source']['snapshot'] == report['destination']['snapshot']
+    copied = HubRepository(target)
+    assert task in copied.list_tasks() and question in copied.list_decisions()
+    assert copied.list_audit() == repo.list_audit()
+    assert not target.with_name(target.name + '.pilot-owner.lock').exists()
+
+
 @pytest.mark.parametrize('hazard', ['wal', 'shm', 'journal', 'lock', 'hardlink', 'symlink',
     'ancestor-symlink', 'owner', 'unknown', 'active-run', 'oversize'])
 def test_source_hazards_refuse_without_repair(files, hazard, monkeypatch):
