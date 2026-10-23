@@ -5,6 +5,17 @@ Beau applies TrueNAS changes; no NAS management or automatic deployment is suppl
 by this checklist. Keep the current Compose, settings, token values and storage
 mapping unchanged. Do not add an alias port or the retired Agent_MCP mount.
 
+Later checkpoint (2026-10-22, America/Chicago): the ordinary NAS update to
+`49dcbcd` was observed healthy, including a fresh health read during the later
+continuation. The older `a333704` observation below is superseded. PR53/54 and
+PR55 are now published (latest verified source `11d045a`, workflow
+`39871121323`); PR56 source `055cecb` is merged with publication still pending
+at this checkpoint. This document remains the exact **49d** handoff, not a
+floating instruction to install whichever image is newest. Use the Hub document
+`runbooks/current-staging-readiness-20261022.md` and the selected release's exact
+publication evidence for later updates. Ordinary updates still require no
+Compose change and do not activate staging.
+
 ## Published artifact
 
 - Source: `49dcbcd3da6254739c85299a581a0d34d3b9a4ea` (PR52).

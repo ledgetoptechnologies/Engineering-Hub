@@ -8,6 +8,26 @@ are included.
 
 ## Release prerequisite
 
+### Later release checkpoint (2026-10-22, America/Chicago)
+
+The original release discussion below is historical: PR53 and PR54 were merged
+and published together in `5e53b43ca4bea10cf647d5e7550f2f46b3347a39`.
+PR55 was subsequently published in
+`11d045a1062b7b2bc200a96842a3992f08c52368`, verified by workflow
+`39871121323`; both saved registry/latest manifests hash to
+`sha256:3494a48a927e43b07fb7e62fe1f348a9700ebcc83d5d3bdbf7f9d2318f3fd240`.
+PR56 is merged at `055cecb306f4041a28d1c520da99ad553d7b6436`, but its
+publication workflow `39901194959` was still running at this checkpoint.
+
+A fresh NAS health read still identified ordinary `49dcbcd`, not these later
+releases. Publication resolves the source/image prerequisite only; it does not
+establish NAS enrollment, protected storage, executor adoption, restore or reboot
+acceptance. All operator gates below remain in force. Consult the Hub document
+`runbooks/current-staging-readiness-20261022.md` for subsequent observations before
+selecting an artifact; do not treat this dated checkpoint as current deployment.
+
+### Original 49d checkpoint
+
 Published ordinary release `49dcbcd3da6254739c85299a581a0d34d3b9a4ea` is suitable
 for its separately documented ordinary update. It does **not** include PR53's
 current-ledger enrollment compatibility or PR54's ordinary idle-stream drain fix.
