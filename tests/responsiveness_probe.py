@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import warnings
+from uuid import uuid4
 
 LIMIT = .25
 PREFIX = 'EH_RESPONSIVENESS_REPORT '
@@ -222,6 +223,68 @@ async def health(root, patches, action):
                       operation_drained=True, no_command_posts=True)
 
 
+def retain_probe_evidence(value):
+    """Opt-in CI diagnostics, never an alternative acceptance decision.
+
+    Store only the synthetic structured report, not arbitrary child output or
+    environment variables. Unique names preserve all calls and rerun attempts.
+    """
+    directory = os.environ.get('EH_RESPONSIVENESS_ARTIFACT_DIR')
+    if directory:
+        encoded = json.dumps(value, sort_keys=True, allow_nan=False) + '\n'
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / (uuid4().hex + '.json')).open('x', encoding='utf-8') as output:
+            output.write(encoded)
+
+
+def reject_nonfinite_report_constant(value):
+    raise ValueError('nonfinite_probe_report_constant')
+
+
+def finite_report_float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError('nonfinite_probe_report_number')
+    return result
+
+
+def diagnostic_report(value, expected_source):
+    """Only the fixed synthetic report schema can enter a shared CI artifact."""
+    def number(item):
+        try:
+            return type(item) in (int, float) and math.isfinite(item)
+        except OverflowError:
+            return False
+    def intervals(items):
+        return isinstance(items, list) and all(isinstance(item, dict)
+            and set(item) <= {'thread', 'start', 'end'} and all(number(v) for v in item.values())
+            for item in items)
+    validators = {
+        'schema': lambda item: item == 'engineering-hub.isolated-responsiveness.v1',
+        'scenario': lambda item: item in ('unified', 'health'),
+        'action': lambda item: item in ('accept', 'decline', None),
+        'rejection': lambda item: item in ('latency_limit_exceeded', None),
+        'workflow_state': lambda item: item == 'succeeded',
+        'samples': lambda item: isinstance(item, list) and all(number(v) for v in item),
+        'inline_observation_intervals': intervals,
+        'measured_request_intervals': intervals,
+    }
+    for name in ('negative_control', 'gc_enabled', 'warmup', 'functional_verified',
+                 'latency_accepted', 'resource_audit_passed', 'session_deleted',
+                 'lifespan_drained', 'inline_observation_overlaps_request',
+                 'operation_drained', 'no_command_posts'):
+        validators[name] = lambda item: type(item) is bool
+    for name in ('latency_limit_seconds', 'sample_count', 'max_seconds',
+                 'observation_calls', 'inline_observations'):
+        validators[name] = number
+    safe = {name: item for name, item in value.items()
+            if name in validators and validators[name](item)}
+    if value.get('source') == expected_source:
+        safe['source'] = expected_source
+    return safe, len(value) - len(safe)
+
+
 def run_isolated_probe(scenario, *, action=None, negative_control=False):
     root = Path(__file__).resolve().parent.parent
     env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(root/'src'),str(root))),
@@ -231,13 +294,38 @@ def run_isolated_probe(scenario, *, action=None, negative_control=False):
         command += ['--action', action]
     if negative_control:
         command += ['--negative-control']
-    child = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
-    assert child.returncode == 0, (child.returncode, child.stdout[-4000:], child.stderr[-4000:])
-    lines = [line[len(PREFIX):] for line in child.stdout.splitlines() if line.startswith(PREFIX)]
-    assert len(lines) == 1
-    value = json.loads(lines[0])
-    return validate_report(value,scenario=scenario,action=action,negative_control=negative_control,
-                           expected_source=source_provenance())
+    evidence = dict(schema='engineering-hub.responsiveness-evidence.v1',
+                    scenario=scenario, action=action, negative_control=negative_control,
+                    validation='not_completed', report=None)
+    try:
+        child = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
+        evidence['child_returncode'] = child.returncode
+        lines = [line[len(PREFIX):] for line in child.stdout.splitlines() if line.startswith(PREFIX)]
+        evidence['report_count'] = len(lines)
+        if len(lines) == 1:
+            # A corrupt/noisy child cannot produce an unbounded CI artifact.
+            assert len(lines[0].encode('utf-8')) <= 1024 * 1024, 'probe_report_too_large'
+            value = json.loads(lines[0], parse_constant=reject_nonfinite_report_constant,
+                               parse_float=finite_report_float)
+            assert isinstance(value, dict), 'probe_report_not_object'
+            expected_source = source_provenance()
+            evidence['report'], evidence['omitted_field_count'] = diagnostic_report(value, expected_source)
+        else:
+            value = None
+        summary = {key: value.get(key) for key in ('max_seconds', 'latency_limit_seconds',
+            'sample_count', 'latency_accepted', 'rejection', 'resource_audit_passed')} if value else None
+        assert child.returncode == 0, (child.returncode, summary, child.stderr[-4000:])
+        assert len(lines) == 1
+        result = validate_report(value,scenario=scenario,action=action,negative_control=negative_control,
+                                 expected_source=expected_source)
+        evidence['validation'] = 'passed'
+        return result
+    except BaseException as error:
+        evidence['validation'] = 'failed'
+        evidence['error_type'] = type(error).__name__
+        raise
+    finally:
+        retain_probe_evidence(evidence)
 
 
 def validate_report(value, *, scenario, action, negative_control, expected_source):
