@@ -3,7 +3,9 @@ import json
 import io
 import hashlib
 import os
+from fractions import Fraction
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -11,6 +13,16 @@ import time
 import tarfile
 
 from .core import Rejected, ensure, tree_manifest, relative
+
+
+_CGROUP_PROBE = ('exec /bin/cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max '
+                 '/sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/pids.max')
+
+
+def _positive(value):
+    ensure(type(value) is bytes and re.fullmatch(rb'[1-9][0-9]{0,19}', value) is not None,
+           'resource_limits_unverified')
+    return int(value)
 
 
 class DockerBackend:
@@ -36,6 +48,7 @@ class DockerBackend:
                 '--label', 'engineering-hub.staging.stage=' + stage,
                 '--label', 'engineering-hub.staging.scope=' + scope,
                 '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                '--cgroupns=private',
                 '--read-only', '--user', str(os.getuid()) + ':' + str(os.getgid()),
                 '--pids-limit', str(profile['pids']), '--memory', str(profile['memory_mb']) + 'm',
                 '--memory-swap', str(profile['memory_mb']) + 'm', '--cpus', str(profile['cpus']),
@@ -50,6 +63,82 @@ class DockerBackend:
             args += ['--mount', 'type=bind,src=' + str(paths['build']) + ',dst=/output,readonly']
         args += ['--entrypoint=/bin/sh', profile['image_id'], '-c', 'while :; do sleep 3600; done']
         return name, args
+
+    def _checked_output(self, parts, *, limit, timeout=10):
+        """Bound trusted CLI output while reading; never capture an unlimited pipe."""
+        process = subprocess.Popen(self.command(*parts), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env)
+        output = bytearray()
+        overflow, read_failed = threading.Event(), threading.Event()
+        def drain():
+            try:
+                while chunk := process.stdout.read(4096):
+                    available = limit - len(output)
+                    output.extend(chunk[:max(0, available)])
+                    if len(chunk) > available:
+                        overflow.set()
+            except Exception:
+                read_failed.set()
+            finally:
+                process.stdout.close()
+        reader = threading.Thread(target=drain)
+        started = False
+        expired = False
+        try:
+            reader.start()
+            started = True
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if overflow.is_set() or read_failed.is_set() or time.monotonic() >= deadline:
+                    expired = True
+                    process.kill()  # Only this retained CLI child, never a discovered process.
+                    break
+                time.sleep(0.01)
+            process.wait(timeout=5)
+        except Exception:
+            raise Rejected('resource_limits_unverified') from None
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if started:
+                reader.join(timeout=5)
+            else:
+                process.stdout.close()
+        ensure(process.returncode == 0 and not expired and not overflow.is_set()
+               and not read_failed.is_set() and not reader.is_alive(), 'resource_limits_unverified')
+        return bytes(output)
+
+    def _verify_daemon(self):
+        raw = self._checked_output(('info', '--format', '{{json .}}'), limit=65536)
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                ensure(key not in result, 'rootless_cgroup_policy_unverified')
+                result[key] = value
+            return result
+        try:
+            info = json.loads(raw, object_pairs_hook=unique)
+        except (ValueError, TypeError, RecursionError):
+            raise Rejected('rootless_cgroup_policy_unverified') from None
+        ensure(type(info) is dict and type(info.get('SecurityOptions')) is list
+               and all(type(value) is str for value in info['SecurityOptions'])
+               and 'name=rootless' in info['SecurityOptions']
+               and info.get('CgroupVersion') == '2' and info.get('CgroupDriver') == 'systemd',
+               'rootless_cgroup_policy_unverified')
+
+    def _verify_kernel_limits(self, name, profile):
+        raw = self._checked_output(('exec', name, '/bin/sh', '-c', _CGROUP_PROBE), limit=4096)
+        lines = raw.splitlines()
+        ensure(len(lines) == 4, 'resource_limits_unverified')
+        cpu = lines[0].split(b' ')
+        ensure(len(cpu) == 2, 'resource_limits_unverified')
+        quota, period = (_positive(value) for value in cpu)
+        requested = Fraction(str(profile['cpus']))
+        ensure(quota * requested.denominator <= period * requested.numerator
+               and _positive(lines[1]) <= profile['memory_mb'] * 1024**2
+               and lines[2] == b'0' and _positive(lines[3]) <= profile['pids'],
+               'resource_limits_unverified')
 
     def _stop_owned(self, name, command_id, stage, scope):
         try:
@@ -127,6 +216,7 @@ class DockerBackend:
                         shutil.copyfileobj(src, dst, 65536)
 
     def _stage(self, paths, profile, command_id, stage):
+        self._verify_daemon()
         name, _ = self.argv(paths, profile, command_id, stage)
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
         try:
@@ -142,6 +232,7 @@ class DockerBackend:
         started = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, timeout=20, check=False, env=self.env)
         ensure(started.returncode == 0, 'container_start_failed')
+        self._verify_kernel_limits(name, profile)
         process = subprocess.Popen(self.command('exec', name, '/bin/sh', '-c',
                                    'cp -R /source/. /workspace/ && exec "$@"',
                                    'eh-staging-recipe') + profile[stage + '_argv'],

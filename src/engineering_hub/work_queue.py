@@ -142,7 +142,9 @@ class WorkQueue:
             _key(key)
             if type(action) is not WorkAction:
                 raise HubError('invalid_work_registry')
-            repo._project(action.project)
+            # Retain historical profiles at startup; archival denies new
+            # admission/claims below without taking the whole Hub offline.
+            repo._project(action.project, require_active=False)
         if type(max_jobs) is not int or not 1 <= max_jobs <= 100000:
             raise HubError('invalid_work_capacity')
         if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier, production_readiness_verifier)):
@@ -263,6 +265,7 @@ class WorkQueue:
         action = self.actions.get(action_key)
         if action is None or environment not in action.environments:
             raise HubError('work_action_not_registered', 403)
+        self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
         if not self._target_verified(actor, action_key, environment, target):
@@ -299,6 +302,7 @@ class WorkQueue:
     def _eligible_target(self, row):
         """Current registry, approval and target policy, independent of worker."""
         try:
+            self.repo._project(row['project'])
             action = self.actions.get(row['action_key'])
             return (type(action) is WorkAction and action.machine_id == row['machine_id']
                 and action.project == row['project']

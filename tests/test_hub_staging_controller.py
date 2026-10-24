@@ -269,6 +269,28 @@ async def test_caller_cancellation_does_not_cancel_owned_dispatch_and_close_drai
     assert controller.queue.get_job(submitted['job']['id'])['state'] == 'succeeded'
 
 
+def test_archived_dynamic_profile_keeps_history_but_denies_new_admission(tmp_path):
+    repo = HubRepository(tmp_path / 'archive.db')
+    projects = ProjectRepository(repo)
+    project = projects.create_project('human:1', 'client-notes', 'Client notes', 'create-client')
+    actions = {'client-check': WorkAction('staging-pc', project='client-notes',
+                                        requires_execution_proof=False)}
+    queue = WorkQueue(repo, actions, target_verifier=lambda *args: True)
+    target = WorkTarget(str(uuid.uuid4()), 'a' * 40, 'sha256:' + 'b' * 64)
+    job = queue.submit(actor='codex', request_id='before-archive', action_key='client-check',
+                       environment='staging', target=target)
+    worker = WorkWorker('codex', str(uuid.uuid4()))
+    claimed = queue.claim(worker=worker)
+    queue.complete(job_id=job['id'], worker=worker, fence=claimed['fence'], outcome='succeeded')
+    projects.archive_project('human:1', 'client-notes', project['revision'])
+    reopened = WorkQueue(repo, actions, target_verifier=lambda *args: True)
+    assert reopened.get_job(job['id'])['state'] == 'succeeded'
+    assert reopened.claim(worker=WorkWorker('codex', str(uuid.uuid4()))) is None
+    with pytest.raises(HubError, match='project_archived'):
+        reopened.submit(actor='codex', request_id='after-archive', action_key='client-check',
+                        environment='staging', target=target)
+
+
 @pytest.mark.asyncio
 async def test_actual_client_contract_through_registered_worker_core(env, tmp_path):
     import httpx

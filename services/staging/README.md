@@ -4,6 +4,20 @@ This separately packaged standard-library service accepts one EH-issued build/te
 
 Run `python -m hub_staging_service --config /private/staging.json --check-config`, then omit `--check-config` to serve. Install the wheel built from this directory; runtime dependencies are empty. Use an unprivileged Linux account and its isolated rootless Docker daemon. The Docker executable is fixed at `/usr/bin/docker`. A private TLS proxy must protect any traffic leaving localhost. Do not expose this worker to the public tunnel.
 
+Kernel enforcement is mandatory, not inferred from Docker CLI flags. Before
+each stage the fixed endpoint must report `name=rootless`, cgroup v2 and the
+`systemd` cgroup driver. Containers explicitly request a private cgroup namespace.
+After the trusted idle container starts and **before any source copy or recipe
+execution**, a fixed, bounded `/bin/sh` probe invokes `/bin/cat` on `cpu.max`,
+`memory.max`, `memory.swap.max` and `pids.max` inside that exact container.
+Finite positive CPU quota/period, memory and PIDs must be at most the recipe
+limits, and swap must be zero. Missing/unlimited/malformed/ignored limits deny
+execution. The enrolled cached image must therefore contain working `/bin/sh`,
+`/bin/cat`, `sleep` and `cp`; no package install or alternate probe is attempted.
+Rejected checks still use the existing exact label/scope cleanup; uncertain
+cleanup holds the operation. These source/mock checks do not prove a live daemon,
+delegated host controllers or actual staging execution acceptance.
+
 Storage settings are explicit integer bytes: `capacity_bytes` defaults to1073741824 (1 GiB), minimum67108864 (64 MiB); `free_floor_bytes` defaults to536870912 (512 MiB), minimum536870912. Both are validated by `--check-config` before state is opened. Configure the approved staging host with `free_floor_bytes: 4294967296` (4 GiB). At approximately4.7 GiB free, the worker must admit only reservations that preserve that4 GiB floor; the1 GiB inventory budget is not a promise that1 GiB is currently available. Capacity admission counts existing private state plus the bounded new source/workspace/output reservation. No storage setting increases kernel job limits or permits cleanup outside owned state.
 
 Configuration contains `worker_root` (private absolute directory), `token_file` (existing dedicated secret file, mode 0600), `allowed_peer_ips` (real socket peers, including the NAS or approved TLS proxy), `docker_endpoint` (explicit local Unix socket, for example `unix:///run/user/10001/docker.sock`), `bind`, `port`, and `projects`. Every Docker invocation pins that same endpoint with `--host` and a sanitized environment; host context/environment changes cannot select another daemon. TCP/SSH endpoints and remote contexts are rejected. Each project maps to an operator-reviewed fixed recipe:
