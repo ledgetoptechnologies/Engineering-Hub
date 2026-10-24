@@ -20,7 +20,7 @@ async function fixture(page: Page, options: { actor?: string; unsupported?: bool
   overview.projects = overview.projects.map((project) => ({ ...project, description: "", repository_url: null, lead_agent: null,
     status: "on_track", parent_project: null, archived: false, revision: 1 }));
   const reviews = new DemoReviewStore(options.review), components = new DemoComponentStore();
-  const state = { posts: [] as { body: Record<string, unknown>; csrf?: string }[], conflictNext: false, componentChanged: false, signedOut: false, assetReads: 0,
+  const state = { posts: [] as { body: Record<string, unknown>; csrf?: string }[], conflictNext: false, componentChanged: false, signedOut: false, assetReads: 0, postBytes: [] as number[],
     // Set to hold the next answers POST (or the other review's read) until released.
     holdPost: null as Promise<void> | null, holdRead: null as Promise<void> | null };
   await page.route("**/api/hub/v1/**", async (route) => {
@@ -49,6 +49,7 @@ async function fixture(page: Page, options: { actor?: string; unsupported?: bool
       if (answers && method === "POST") {
         const body = request.postDataJSON() as Record<string, unknown>;
         state.posts.push({ body, csrf: request.headers()["x-hub-csrf"] });
+        state.postBytes.push(Buffer.byteLength(request.postData() ?? "", "utf8"));
         if (state.holdPost) { const hold = state.holdPost; state.holdPost = null; await hold; }
         if (state.signedOut) return respond({ detail: { code: "sign_in_required" } }, 401);
         if (state.conflictNext) { state.conflictNext = false; return respond({ detail: { code: "revision_conflict" } }, 409); }
@@ -248,4 +249,32 @@ test("a finished review still lets an authorized reader inspect its 3D sample", 
   await question(page, "Tree 1").getByRole("button", { name: "Show 3D sample" }).click();
   await expect(page.getByText("400 points · m")).toBeVisible();
   await expect(page.getByRole("button", { name: "Rotate right" })).toBeEnabled();
+});
+
+test("long Unicode answers save in several requests, each under the gateway's size limit, on the returned revision", async ({ page }) => {
+  const items = Array.from({ length: 30 }, (_, i) => ({ id: `t${i + 1}`, title: `Note ${i + 1}`, prompt: "Describe it." }));
+  const { state } = await fixture(page, { review: { items } });
+  await page.goto(reviewUrl);
+  const long = "\u6811\u6728".repeat(1000);
+  for (let pageNumber = 0; pageNumber < 2; pageNumber++) {
+    await expect(page.getByText(`Page ${pageNumber + 1} of 2`)).toBeVisible();
+    for (const box of await page.getByLabel("Your answer").all()) await box.fill(long);
+    if (pageNumber === 0) await page.getByRole("button", { name: "Next" }).click();
+  }
+  await page.getByRole("button", { name: "Save answers" }).click();
+  await expect(page.locator(".review-bar")).toContainText("30 answers saved.");
+  expect(state.posts.length).toBeGreaterThan(1);
+  expect(state.postBytes.every((size) => size <= 48 * 1024)).toBe(true);
+  expect(state.posts.map((post) => post.body.expected_revision)).toEqual(state.posts.map((_, i) => i + 1));
+  expect(state.posts.every((post) => (post.body.answers as unknown[]).length > 0)).toBe(true);
+  expect(state.posts.flatMap((post) => (post.body.answers as { item_id: string }[]).map((answer) => answer.item_id))).toEqual(items.map((item) => item.id));
+});
+
+test("a review too large for the Hub to send says so plainly", async ({ page }) => {
+  await fixture(page);
+  // Registered after the fixture, so it takes precedence for this one path.
+  await page.route(`**/api/hub/v1/interactive-reviews/${DEMO_REVIEW_ID}`, (route) =>
+    route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ detail: { code: "review_state_too_large" } }) }));
+  await page.goto(reviewUrl);
+  await expect(page.getByText("This review is too large for the Hub to send, so it can't be shown here.")).toBeVisible();
 });

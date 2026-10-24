@@ -10,7 +10,7 @@ import type { ProjectComponent } from "./componentsApi";
 import type { Hub } from "./hub";
 import { relativeAge } from "./dashboardText";
 import {
-  ANSWER_BATCH, ANSWER_MAX, assetPath, listReviews, progressText, readReview, sendAnswers, unsavedAnswers,
+  ANSWER_MAX, answerBatches, assetPath, listReviews, progressText, readReview, sendAnswers, unsavedAnswers,
   type AnswerRequest, type Review, type ReviewItem, type ReviewPage,
 } from "./reviewsApi";
 import { DemoReviewStore } from "./reviewsDemo";
@@ -54,6 +54,7 @@ const errorText: Record<string, string> = {
   csrf_required: "Your session needs refreshing before answers can be saved.",
   network_unavailable: "The Hub didn't answer. Your answers are still here; nothing was confirmed saved.",
   review_request_too_large: "That's too much to save at once. Nothing was saved; try again.",
+  review_state_too_large: "This review is too large for the Hub to send back, so it can't be shown or answered here. Nothing was saved.",
 };
 const denials = new Set(["forbidden", "interactive_forbidden", "interactive_review_forbidden", "review_component_scope", "human_session_required",
   "review_asset_not_registered"]);
@@ -120,7 +121,7 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
   const source = useReviewSource(hub, given);
   const components = useComponentSource(hub);
   const [review, setReview] = useState<Review | null>(null);
-  const [state, setState] = useState<"loading" | "loaded" | "missing" | "denied" | "unsupported" | "failed">("loading");
+  const [state, setState] = useState<"loading" | "loaded" | "missing" | "denied" | "unsupported" | "too_large" | "failed">("loading");
   const [component, setComponent] = useState<ProjectComponent | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<"saving" | "finishing" | null>(null);
@@ -159,7 +160,8 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
       if (controller.signal.aborted || generation.current !== current) return;
       if (isSignOut(error)) { clear.current(); return; }
       setState(!(error instanceof HubApiError) ? "failed" : error.status === 404 && error.code !== "reviews_unavailable" ? "missing"
-        : error.code === "reviews_unavailable" ? "unsupported" : error.status === 403 ? "denied" : "failed");
+        : error.code === "reviews_unavailable" ? "unsupported" : error.code === "review_state_too_large" ? "too_large"
+        : error.status === 403 ? "denied" : "failed");
     });
     return () => controller.abort();
   }, [source, components, id, project, reload]);
@@ -170,7 +172,8 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
     <a href={link(`/projects/${project}`)}>{projectName}</a> <span>/</span> Review</nav>;
   if (!review) {
     const message = { loading: "Reading the review…", missing: "This review isn't in this project.", denied: "You don't have access to this review.",
-      unsupported: "This Hub can't show reviews yet. It needs an update.", failed: "The review couldn't be loaded.", loaded: "" }[state];
+      unsupported: "This Hub can't show reviews yet. It needs an update.",
+      too_large: "This review is too large for the Hub to send, so it can't be shown here.", failed: "The review couldn't be loaded.", loaded: "" }[state];
     return <>{crumbs}<header className="list-header"><div><p className="eyebrow">REVIEW</p>
       <h1>{state === "loading" ? "Loading review" : "Review unavailable"}<span>.</span></h1></div></header>
       <section className="panel"><p role={state === "loading" ? "status" : undefined}>{message}{" "}
@@ -194,13 +197,13 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
     setBusy(finish ? "finishing" : "saving"); setNotice(null);
     let current = review;
     try {
-      // The Hub takes at most 100 answers per save; each batch builds on the revision the last one returned.
+      // Saves are split by count and size; each batch builds on the revision the last one returned.
       // If the page changed meanwhile, no further batch is sent and nothing is shown for the old review.
       const pending = unsavedAnswers(current, drafts);
-      for (let start = 0; start < pending.length; start += ANSWER_BATCH) {
+      for (const batch of answerBatches(pending)) {
         if (!live()) return;
         current = await source.answer(current, { expected_revision: current.revision, client_request_id: crypto.randomUUID(),
-          answers: pending.slice(start, start + ANSWER_BATCH), complete: false });
+          answers: batch, complete: false });
         if (!live()) return;
         setReview(current);
       }

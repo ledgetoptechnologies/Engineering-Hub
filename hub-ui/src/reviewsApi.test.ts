@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { HubApiError } from "./api";
 import { parseRoute, pathOf } from "./router";
 import {
-  assetPath, listReviews, parseReview, parseReviewPage, progressText, readReview, sendAnswers, unsavedAnswers, type Review,
+  ANSWER_BATCH_BYTES, answerBatches, assetPath, listReviews, parseReview, parseReviewPage, progressText, readReview, sendAnswers, unsavedAnswers, type Review,
 } from "./reviewsApi";
 import { DemoReviewStore } from "./reviewsDemo";
 import wire from "./fixtures/interactive-reviews-wire-v1.json";
@@ -89,5 +89,34 @@ describe("review drafts and routes", () => {
     expect(saved.revision).toBe(2);
     expect(() => store.answer(summary.id, { expected_revision: 1, client_request_id: "c", answers: [{ item_id: "crown-2", value: "no" }], complete: false }))
       .toThrow(expect.objectContaining({ code: "review_conflict" }));
+  });
+});
+
+describe("answer batching", () => {
+  const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+  it("splits 100 long Unicode answers into several saves, each within 48 KiB with its envelope", () => {
+    const answers = Array.from({ length: 100 }, (_, i) => ({ item_id: `q${i}`, value: "\u6811\u{1F333}".repeat(666) + "x".repeat(2000 - 666 * 3) }));
+    expect(answers.every((answer) => answer.value.length === 2000)).toBe(true);
+    const batches = answerBatches(answers);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.flat()).toEqual(answers);
+    for (const batch of batches) {
+      expect(batch.length).toBeGreaterThan(0);
+      expect(bytes({ expected_revision: Number.MAX_SAFE_INTEGER, client_request_id: crypto.randomUUID(), answers: batch, complete: false }))
+        .toBeLessThanOrEqual(ANSWER_BATCH_BYTES);
+    }
+  });
+  it("still caps short answers at 100 per save and never makes an empty batch", () => {
+    const answers = Array.from({ length: 250 }, (_, i) => ({ item_id: `q${i}`, value: "a" }));
+    expect(answerBatches(answers).map((batch) => batch.length)).toEqual([100, 100, 50]);
+    expect(answerBatches([])).toEqual([]);
+  });
+  it("refuses to send a body over the limit even if called directly", async () => {
+    const items = Array.from({ length: 40 }, (_, i) => ({ id: `q${i}`, title: `Q${i}`, prompt: "Say something." }));
+    const review = parseReview({ ...wire.detail.body, items, answers: {} });
+    const fetchImpl = vi.fn<typeof fetch>();
+    await expect(sendAnswers(review, { expected_revision: 1, client_request_id: "r", complete: false,
+      answers: items.map((item) => ({ item_id: item.id, value: "\u6811".repeat(2000) })) }, "csrf", fetchImpl)).rejects.toMatchObject({ code: "invalid_review_answers" });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

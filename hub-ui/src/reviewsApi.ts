@@ -9,6 +9,10 @@ import { isProjectId } from "./projectsApi";
 export const ANSWER_MAX = 2000;
 /** The Hub takes at most this many answers per save; longer reviews save in several batches. */
 export const ANSWER_BATCH = 100;
+/** And at most this many bytes of JSON per save, under the private gateway's 64 KiB request limit with room for headers. */
+export const ANSWER_BATCH_BYTES = 48 * 1024;
+const utf8 = new TextEncoder();
+const bodyBytes = (body: unknown) => utf8.encode(JSON.stringify(body)).length;
 const ITEM_MAX = 1000;
 const keyPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const digestPattern = /^sha256:[a-f0-9]{64}$/;
@@ -141,7 +145,8 @@ export async function readReview(id: string, signal?: AbortSignal, fetchImpl: ty
 export async function sendAnswers(review: Review, input: AnswerRequest, csrf: string, fetchImpl: typeof fetch = globalThis.fetch): Promise<Review> {
   if (review.state !== "open") throw new HubApiError(409, "interactive_review_completed");
   if (!Number.isSafeInteger(input.expected_revision) || input.expected_revision < 1 || !text(input.client_request_id, 128)
-      || input.answers.length > ANSWER_BATCH || (!input.answers.length && !input.complete)) throw new HubApiError(422, "invalid_review_answers");
+      || input.answers.length > ANSWER_BATCH || (!input.answers.length && !input.complete)
+      || bodyBytes(input) > ANSWER_BATCH_BYTES) throw new HubApiError(422, "invalid_review_answers");
   for (const answer of input.answers) {
     const item = review.items.find((entry) => entry.id === answer.item_id);
     if (!item || !text(answer.value, ANSWER_MAX) || (item.choices && !item.choices.some((choice) => choice.id === answer.value)))
@@ -159,6 +164,22 @@ export function assetPath(reviewId: string, assetId: string): string {
 export function unsavedAnswers(review: Review, drafts: Record<string, string>): { item_id: string; value: string }[] {
   return review.items.filter((item) => drafts[item.id] !== undefined && drafts[item.id].trim() !== ""
     && drafts[item.id] !== review.answers[item.id]?.value).map((item) => ({ item_id: item.id, value: drafts[item.id] }));
+}
+/**
+ * Split answers into saves of at most 100 answers and 48 KiB of JSON each, measured with the
+ * largest possible revision and request key so the real request can't be bigger. Never yields an empty batch.
+ */
+export function answerBatches(answers: { item_id: string; value: string }[]): { item_id: string; value: string }[][] {
+  const envelope = (batch: { item_id: string; value: string }[]) =>
+    bodyBytes({ expected_revision: Number.MAX_SAFE_INTEGER, client_request_id: "x".repeat(128), answers: batch, complete: false });
+  const batches: { item_id: string; value: string }[][] = [];
+  let batch: { item_id: string; value: string }[] = [];
+  for (const answer of answers) {
+    if (batch.length && (batch.length >= ANSWER_BATCH || envelope([...batch, answer]) > ANSWER_BATCH_BYTES)) { batches.push(batch); batch = []; }
+    batch.push(answer);
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
 }
 export const progressText = (answered: number, total: number) =>
   answered === total ? `All ${total} answered` : `${answered} of ${total} answered`;
