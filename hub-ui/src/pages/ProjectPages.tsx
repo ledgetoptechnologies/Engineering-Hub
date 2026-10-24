@@ -18,6 +18,7 @@ import { safeHref } from "../markdown";
 import type { Project } from "../types";
 import { readProject } from "../projectsApi";
 import { ComponentsPanel, GroupedProjectsPanel } from "../ComponentsPanel";
+import { ReviewsPanel } from "../ReviewsPanel";
 
 const STATUSES: Task["status"][] = ["assigned", "claimed", "in_review", "verified"];
 const columnName: Record<Task["status"], string> = {
@@ -368,6 +369,7 @@ export function ProjectPage({ hub, id, tab, actions, notesProps }: {
                 ) : null)}
               </div>
             )}
+            <ReviewsPanel hub={hub} project={project.id} />
             <ComponentsPanel hub={hub} project={project} />
             <GroupedProjectsPanel hub={hub} project={project} />
             <section className="panel" aria-label="Waiting on you">
