@@ -409,6 +409,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .attachments import EntityImageRepository
     from .projects import ProjectRepository
     project_registry = ProjectRepository(repo)
+    from .components import ProjectComponentRepository
+    component_registry = ProjectComponentRepository(repo)
     from .staging_module import compose_staging, configure_preview
     staging_module = compose_staging(repo,
         path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
@@ -434,6 +436,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           label_sets=label_sets,
                           entity_images=entity_images,
                           project_registry=project_registry,
+                          component_registry=component_registry,
                           staging_controller=staging_module.controller,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
@@ -611,6 +614,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_activity_routes(app, repository=repo, actor=actor)
     from .projects_api import attach_project_routes
     attach_project_routes(app, repository=project_registry, actor=actor, human=human)
+    from .components_api import attach_component_routes
+    attach_component_routes(app, repository=component_registry, actor=actor, human=human)
     app.state.project_registry = project_registry
     from .topic_catalog_api import attach_topic_catalog_route
     attach_topic_catalog_route(app, bridge=registry_bridge, human=human)

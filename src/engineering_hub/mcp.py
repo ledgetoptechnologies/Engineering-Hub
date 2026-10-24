@@ -41,7 +41,7 @@ class HubMCPAuthMiddleware:
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
                   planning_repository=None, label_sets=None, entity_images=None, project_registry=None,
-                  staging_controller=None) -> FastMCP:
+                  staging_controller=None, component_registry=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -305,6 +305,10 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     if project_registry is not None:
         from .projects_api import register_project_tools
         register_project_tools(mcp, repository=project_registry, identity=identity, invoke=invoke)
+
+    if component_registry is not None:
+        from .components_api import register_component_tools
+        register_component_tools(mcp, repository=component_registry, identity=identity, invoke=invoke)
 
     if staging_controller is not None:
         from .staging_tools import register_staging_tools

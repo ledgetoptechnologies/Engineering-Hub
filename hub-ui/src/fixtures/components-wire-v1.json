@@ -1,0 +1,69 @@
+{
+  "conflict": {
+    "body": {
+      "detail": {
+        "code": "revision_conflict"
+      }
+    },
+    "status": 409
+  },
+  "forbidden": {
+    "body": {
+      "detail": {
+        "code": "human_session_required"
+      }
+    },
+    "status": 403
+  },
+  "list": {
+    "body": {
+      "items": [
+        {
+          "created_at": "2026-10-24T12:00:00+00:00",
+          "created_by": "human:1",
+          "description": "Synthetic component catalog example; metadata only.",
+          "id": "c8e2a429-954e-5232-9ab2-8db6663b99c4",
+          "kind": "web_app",
+          "legacy_project_id": null,
+          "name": "Pointcloud review",
+          "package_url": null,
+          "project": "treedar",
+          "repository_url": "https://github.com/example/synthetic-component",
+          "revision": 1,
+          "slug": "pointcloud-review",
+          "status": "planned",
+          "updated_at": "2026-10-24T12:00:00+00:00"
+        }
+      ],
+      "next_after": null
+    },
+    "status": 200
+  },
+  "single": {
+    "body": {
+      "created_at": "2026-10-24T12:00:00+00:00",
+      "created_by": "human:1",
+      "description": "Synthetic component catalog example; metadata only.",
+      "id": "c8e2a429-954e-5232-9ab2-8db6663b99c4",
+      "kind": "web_app",
+      "legacy_project_id": null,
+      "name": "Pointcloud review",
+      "package_url": null,
+      "project": "treedar",
+      "repository_url": "https://github.com/example/synthetic-component",
+      "revision": 1,
+      "slug": "pointcloud-review",
+      "status": "planned",
+      "updated_at": "2026-10-24T12:00:00+00:00"
+    },
+    "status": 200
+  },
+  "validation": {
+    "body": {
+      "detail": {
+        "code": "invalid_input"
+      }
+    },
+    "status": 422
+  }
+}

@@ -59,6 +59,8 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
+                or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/(?:resources|jobs)/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/attachments', path) is not None
@@ -69,11 +71,14 @@ def browser_route_allowed(method, path):
         return (re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None)
     if method == 'PATCH':
-        return re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
+        return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
     return method == 'POST' and (path in _POST or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         or path == '/api/hub/v1/projects'
+        or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
+        or re.fullmatch(r'/api/hub/v1/components/' + _UUID + '/retire', path) is not None
         or re.fullmatch(r'/api/hub/v1/staging/resources/' + _UUID + '/(?:keep|preview-session)', path) is not None
         or re.fullmatch(r'/api/hub/v1/staging/jobs/' + _UUID + '/reconcile', path) is not None
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/archive', path) is not None)
