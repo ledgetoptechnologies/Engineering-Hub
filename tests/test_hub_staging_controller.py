@@ -523,6 +523,69 @@ async def test_rejected_uncreated_command_distinct_from_unknown_busy_machine(env
 
 
 @pytest.mark.asyncio
+async def test_claim_crash_before_dispatch_is_proven_unstarted_after_expiry(env):
+    controller, client, _, _, _ = env
+    now = [1000.0]
+    controller.queue.clock = lambda: now[0]
+    submitted = await controller.submit('codex', payload())
+    assert controller.queue.claim(worker=controller.worker, lease_seconds=10)
+    # Simulate process death between the queue commit and dispatch-intent save.
+    assert controller._read(job_id=submitted['job']['id'])['phase'] == 'queued'
+    now[0] += 11
+    result = await controller.reconcile_for('human:1', submitted['job']['id'])
+    assert result['job']['state'] == 'failed' and client.posts == 0
+    with controller.repo._connection() as db:
+        assert db.execute('SELECT job_id FROM hub_work_machines').fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_unchanged_unknown_hold_does_not_grow_audit_history(env):
+    controller, client, _, _, _ = env
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload())
+    await controller.run_once()
+    async def unavailable(identity):
+        raise HubError('staging_connection_unavailable', 503)
+    client.job = unavailable
+    before = controller.repo.list_audit()
+    await controller.reconcile_for('human:1', submitted['job']['id'])
+    await controller.reconcile_for('human:1', submitted['job']['id'])
+    assert controller.repo.list_audit() == before and client.posts == 1
+
+
+@pytest.mark.asyncio
+async def test_public_operations_report_busy_without_waiting_for_long_job(env):
+    controller, client, _, _, _ = env
+    submitted = await controller.submit('codex', payload())
+    await controller.lock.acquire()
+    try:
+        async with asyncio.timeout(2):
+            for operation in (controller.submit('codex', payload()),
+                              controller.cleanup_apply('human:1', str(uuid.uuid4()), 'sha256:' + 'a' * 64),
+                              controller.reconcile_for('human:1', submitted['job']['id'])):
+                with pytest.raises(HubError, match='staging_busy'):
+                    await operation
+    finally:
+        controller.lock.release()
+    assert client.posts == 0 and client.deposits == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_background_still_closes_private_client(env):
+    controller, client, _, _, _ = env
+    closed = []
+    async def failure():
+        raise HubError('synthetic_background_failure', 503)
+    async def close():
+        closed.append(True)
+    client.aclose = close
+    controller.background = asyncio.create_task(failure())
+    with pytest.raises(HubError, match='synthetic_background_failure'):
+        await controller.close()
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
 async def test_actual_client_contract_through_registered_worker_core(env, tmp_path):
     import httpx
     from engineering_hub.staging_client import StagingClient, StagingConnectionConfig

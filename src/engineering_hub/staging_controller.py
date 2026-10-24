@@ -5,6 +5,7 @@ production priority, machine reservations and proofs retain their verifiers.
 Dispatch intent is durable before an HTTP effect; uncertainty is never retried.
 """
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import hashlib
 import json
@@ -14,7 +15,6 @@ import uuid
 
 from .repository import AGENTS, HubError
 from .staging_resources import KINDS
-from .staging_client import StagingNotAccepted
 from .staging_client import _FILE_TYPES, StagingNotAccepted
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
 
@@ -73,6 +73,7 @@ class StagingController:
         self.lock, self.wake = asyncio.Lock(), asyncio.Event()
         self.background, self.stopping = None, False
         self.inflight = set()
+        self.recheck_backoff = {}
         for (project, recipe), key in self.actions.items():
             repo._project(project)
             _require(key in queue.actions and queue.actions[key].project == project and
@@ -99,6 +100,17 @@ class StagingController:
     def _save(self, item):
         with self.repo._transaction() as db:
             db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
+
+    @asynccontextmanager
+    async def _short_lock(self):
+        try:
+            await asyncio.wait_for(self.lock.acquire(), timeout=0.25)
+        except TimeoutError:
+            raise HubError('staging_busy', 409) from None
+        try:
+            yield
+        finally:
+            self.lock.release()
 
     def _grants(self, actor, project):
         self.resources.authorize(actor, project, 'build')
@@ -179,7 +191,7 @@ class StagingController:
         public = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
         public['topic'] = topic  # Omitted and explicit null have one request identity.
         fingerprint = hashlib.sha256(_json(public).encode()).hexdigest()
-        async with self.lock:
+        async with self._short_lock():
             with self.repo._transaction() as db:
                 old = db.execute('SELECT * FROM hub_staging_submissions WHERE actor=? AND request_id=?', (actor, payload['request_id'])).fetchone()
                 if old:
@@ -291,15 +303,17 @@ class StagingController:
         return self._view(item)
 
     def _hold(self, item, claim=None):
-        item['phase'] = 'held'; self._save(item)
+        if item['phase'] != 'held':
+            item['phase'] = 'held'; self._save(item)
         job = self.resources.inspect_job(self.principal, item['job_id'])
         protected = list(job['protected'])
         hold = {'reason': 'held_campaign', 'ref': item['job_id']}
         if hold not in protected:
             protected.append(hold)
-        self.resources.update_job(self.principal, item['job_id'], job['revision'], terminal=job['terminal'],
-            protected=protected)
-        if claim:
+        if protected != job['protected']:
+            self.resources.update_job(self.principal, item['job_id'], job['revision'], terminal=job['terminal'],
+                protected=protected)
+        if claim and self.queue.get_job(item['job_id'])['state'] != 'held':
             try:
                 self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=claim['fence'], outcome='held')
             except HubError:
@@ -311,7 +325,11 @@ class StagingController:
         # drains this same task; cancellation never starts a replacement POST.
         task = asyncio.create_task(self._run_once())
         self.inflight.add(task)
-        task.add_done_callback(self.inflight.discard)
+        def finished(done):
+            self.inflight.discard(done)
+            if not done.cancelled():
+                done.exception()  # Retrieve detached failures; awaiting still raises them.
+        task.add_done_callback(finished)
         return await asyncio.shield(task)
 
     async def _run_once(self):
@@ -413,9 +431,12 @@ class StagingController:
             self.resources.supersede_latest_failure(self.principal, prior['job_id'])
 
     async def reconcile(self, identity):
-        async with self.lock:
+        async with self._short_lock():
             item = self._read(job_id=_id(identity))
             current = self.queue.get_job(identity)
+            if (item['phase'] in ('queued', 'deposited') and
+                    (current['state'] == 'held' or current.get('requires_reconciliation'))):
+                return self._finish_no_effect(item, None, 'never_sent', 'restart_before_dispatch')
             if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
                 return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
             if item['phase'] == 'verified' and current['state'] == item['outcome']:
@@ -428,7 +449,7 @@ class StagingController:
                 return {'job': self.queue.get_job(identity), 'resource_ids': item['resource_ids'], 'phase': 'held'}
 
     async def cleanup_apply(self, actor, plan_id, digest):
-        async with self.lock:
+        async with self._short_lock():
             begun = self.resources.cleanup_begin(actor, plan_id, digest)
             result = {'removed': [], 'failed': [], 'skipped_changed': [entry['id'] for entry in begun['skipped']]}
             for operation in begun['operations']:
@@ -585,22 +606,37 @@ class StagingController:
         with self.repo._connection() as db:
             entries = [json.loads(row[0]) for row in db.execute('SELECT data FROM hub_staging_submissions')]
         for item in entries:
-            if self.stopping or item.get('job_id') is None or item['phase'] not in ('held', 'accepted', 'dispatching', 'verified'):
+            if self.stopping or item.get('job_id') is None or item['phase'] not in ('queued', 'deposited', 'held', 'accepted', 'dispatching', 'verified'):
                 continue
-            job = self.queue.get_job(item['job_id'])
+            due, delay = self.recheck_backoff.get(item['job_id'], (0, 15))
+            if time.monotonic() < due:
+                continue
+            try:
+                job = self.queue.get_job(item['job_id'])
+            except HubError:
+                continue
             if job['state'] not in ('claimed', 'held'):
                 continue
             # An unexpired other-generation lease is not ours to replace.
             if (job['state'] == 'claimed' and not job.get('requires_reconciliation')
                     and job.get('worker') != self.worker.encoded()):
                 continue
-            await self.reconcile(item['job_id'])
+            try:
+                await self.reconcile(item['job_id'])
+            except Exception:
+                pass  # One unavailable item cannot kill the execution service.
+            finally:
+                self.recheck_backoff[item['job_id']] = (time.monotonic() + delay, min(delay * 2, 300))
 
     async def close(self):
         self.stopping = True
         self.wake.set()
-        if self.background:
-            await self.background  # Drain the current accepted operation, never cancel it.
-        if self.inflight:
-            await asyncio.gather(*tuple(self.inflight))
-        await self.client.aclose()
+        try:
+            if self.background:
+                await self.background  # Drain accepted work, never cancel it.
+        finally:
+            try:
+                if self.inflight:
+                    await asyncio.gather(*tuple(self.inflight))
+            finally:
+                await self.client.aclose()
