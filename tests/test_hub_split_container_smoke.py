@@ -8,6 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
+# Reuse the exact contract data without importing Linux-only bus fixtures.
+HUB_TOOLS = ast.literal_eval(next(node.value for node in ast.parse(
+    Path(__file__).with_name('test_hub_unified_mcp.py').read_text()).body
+    if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+        and target.id == 'HUB_TOOLS' for target in node.targets)))
+
 
 def load(monkeypatch):
     scripts = Path(__file__).parents[1] / "scripts"
@@ -72,7 +78,7 @@ def simulation(monkeypatch, module, *, fail=None):
             volumes.discard(args[-1])
         elif args[1] == "exec" and args[-2] == module.PROBE:
             stdout = json.dumps({"split_image_smoke": "passed", "build_commit": "b" * 40 if fail == "probe" else commit,
-                                 "authenticated_agents": 3, "mcp_tools": 22, "agent_bind": "0.0.0.0:8770",
+                                 "authenticated_agents": 3, "mcp_tools": len(HUB_TOOLS), "agent_bind": "0.0.0.0:8770",
                                  "browser_bind": "127.0.0.1:8771", "human_sign_in": "not_tested", "network": "none"})
         elif args[1] == "exec" and args[-2] == module.DURABILITY_PROBE:
             stdout = json.dumps({"durable_records_verified": fail != "durable",
@@ -117,6 +123,7 @@ def test_plan_hardening_split_entrypoint_recreation_and_owned_cleanup(monkeypatc
     assert report["named_volume_recreation"] == "passed" and report["registry_publication"] == "not_tested"
     assert report["truenas"] == "not_deployed" and report["autonomous_pilot"] == "not_tested"
     assert report["durable_task_decision_recreation"] is True
+    assert report["mcp_tools"] == len(HUB_TOOLS)
     assert not containers and not volumes
     assert calls[-1][1:3] == ["volume", "inspect"]
 
@@ -148,9 +155,12 @@ def test_probe_compiles_and_contains_no_fake_login_or_network_dependency(monkeyp
     tree = ast.parse(module.PROBE)
     assert any(isinstance(node, ast.Assert) for node in tree.body)
     for required in ("/proc/net/tcp", "/proc/net/tcp6", "00000000", "0100007F", "expected_commit",
-                     "expected_tools", "len(tools) == 22", "os.getuid() == 568", "ProxyHandler({})",
+                     "expected_tools", "len(tools) == len(expected_tools)", "os.getuid() == 568", "ProxyHandler({})",
                      "X-Forwarded-For", "CF-Access-Authenticated-User-Email", "forged"):
         assert required in module.PROBE
+    tool_sets = [node.value for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == 'expected_tools' for target in node.targets)]
+    assert len(tool_sets) == 1 and ast.literal_eval(tool_sets[0]) == HUB_TOOLS
     assert "https://" not in module.PROBE
     assert "cookie" not in module.PROBE.lower()
 

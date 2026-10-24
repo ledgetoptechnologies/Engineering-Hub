@@ -250,6 +250,57 @@ def test_real_private_tls_san_validation_and_bearer_read(tmp_path):
         tls_context(cert_file, None)
 
 
+@pytest.mark.parametrize('failed_handshake', [False, True])
+def test_tls_replacement_socket_closed_without_garbage_collection(tmp_path, failed_handshake):
+    cert_file, key_file = tls_files(tmp_path)
+    root, _, manifest, identity, _ = asset_files(tmp_path)
+    context = tls_context(cert_file, key_file)
+    retained = []  # Strong references prevent garbage collection hiding a leak.
+    class ObservedContext:
+        def wrap_socket(self, *args, **kwargs):
+            wrapped = context.wrap_socket(*args, **kwargs)
+            retained.append(wrapped)
+            return wrapped
+    with running(AssetCatalog(root, manifest), context=ObservedContext()) as server:
+        if failed_handshake:
+            with socket.create_connection(server.server_address, timeout=3) as connection:
+                connection.sendall(b'GET /health HTTP/1.0\r\n\r\n')
+        else:
+            trust = ssl.create_default_context(cafile=str(cert_file))
+            assert request(server, '/v1/assets/' + identity, context=trust,
+                           headers={'Range': 'bytes=1-4'})[2] == b'1234'
+        deadline = time.monotonic() + 3
+        while (not retained or retained[0].fileno() != -1) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(retained) == 1
+        assert retained[0].fileno() == -1
+
+
+def test_real_tls_four_concurrent_ranges_close_all_wrapped_sockets(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    cert_file, key_file = tls_files(tmp_path)
+    content = b'x' * (1024 * 1024)
+    root, _, manifest, identity, _ = asset_files(tmp_path, content)
+    context, retained = tls_context(cert_file, key_file), []
+    class ObservedContext:
+        def wrap_socket(self, *args, **kwargs):
+            wrapped = context.wrap_socket(*args, **kwargs)
+            retained.append(wrapped)
+            return wrapped
+    trust = ssl.create_default_context(cafile=str(cert_file))
+    with running(AssetCatalog(root, manifest), context=ObservedContext()) as server:
+        def read(_):
+            status, _, data = request(server, '/v1/assets/' + identity, context=trust,
+                                      headers={'Range': 'bytes=0-1048575'})
+            assert status == 206 and data == content
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(read, range(4)))
+        deadline = time.monotonic() + 3
+        while any(s.fileno() != -1 for s in retained) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(retained) == 4 and all(s.fileno() == -1 for s in retained)
+
+
 def test_peer_gate_is_before_tls_wrapping(tmp_path, monkeypatch):
     root, _, manifest, _, _ = asset_files(tmp_path)
     class ForbiddenContext:

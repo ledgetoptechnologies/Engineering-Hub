@@ -269,6 +269,20 @@ class AssetServer(ThreadingHTTPServer):
         finally:
             self.slots.release()
 
+    def finish_request(self, request, address):
+        # TCPServer owns the raw socket, but wrap_socket detaches its descriptor.
+        # Keep explicit ownership of the replacement through handshake and handler
+        # failures; shutdown_request(raw) cannot close the detached TLS socket.
+        if self.ssl_context is None:
+            return super().finish_request(request, address)
+        wrapped = self.ssl_context.wrap_socket(request, server_side=True,
+                                               do_handshake_on_connect=False)
+        try:
+            wrapped.do_handshake()  # Accepted socket retains its 5-second timeout.
+            self.RequestHandlerClass(wrapped, address, self)
+        finally:
+            wrapped.close()
+
     def handle_error(self, request, address):
         pass  # No header/path/credential or raw exception logging.
 
@@ -277,8 +291,6 @@ class Handler(BaseHTTPRequestHandler):
     server_version = 'HubAssets/1'
 
     def setup(self):
-        if self.server.ssl_context is not None:
-            self.request = self.server.ssl_context.wrap_socket(self.request, server_side=True)
         super().setup()
         self.connection.settimeout(15)
 

@@ -6,7 +6,14 @@ phone interface remains behind EH's existing login and project permissions; EH
 fetches registered asset bytes over private TLS. Browser cookies, Cloudflare
 assertions and agent credentials never go to the asset service.
 
-## Current acceptance state (0.1.1)
+## Current acceptance state (0.1.2)
+
+Version 0.1.2 explicitly owns each wrapped TLS socket in the bounded request
+thread, through handshake and HTTP handling, closing it in `finally` on success
+or failure. Tests retain real wrapped sockets and verify closed descriptors
+without garbage collection, including failed handshakes and concurrent ranges.
+The source has 37 passing local tests (one POSIX skip on Windows), with
+ResourceWarning treated as an error.
 
 On 24 October 2026, an explicitly authorized synthetic pilot ran as UID1000
 (`bkoltz`) on staging `192.168.50.90`, then stopped. The exact transient unit is
@@ -15,9 +22,11 @@ on port 8790 and has no boot autostart. Existing linger settings were observed,
 not changed. No NAS-side connection or live EH-to-staging integration has been
 verified; the Hub update/configuration is a separate step.
 
-Version 0.1.1 completed one explicitly approved follow-up window after the byte
-integrity fix. The original manifest, original 112-byte asset, TLS identity and
-token were preserved; the old 0.1.0 package was retained without activation.
+Version 0.1.2 completed one explicitly approved follow-up window after the TLS
+socket ownership fix. Version 0.1.1 had previously verified the byte-integrity fix. The original manifest, original 112-byte asset, TLS identity and
+token were preserved; 0.1.1 remains the known-good rollback. After successful acceptance and stopped-unit
+proof, only the exact owned 0.1.0 wheel was removed, after path, type, owner, link
+count and expected SHA checks. Historical receipts remain unchanged.
 The runtime independently proved these kernel settings before serving:
 
 | Setting | Actual value |
@@ -28,7 +37,7 @@ The runtime independently proved these kernel settings before serving:
 | Tasks | `pids.max=16` |
 | User | UID/GID 1000, unprivileged user service |
 
-Actual 0.1.1 HTTPS acceptance verified the private-IP certificate SAN, missing-token
+Actual 0.1.2 HTTPS acceptance verified the private-IP certificate SAN, missing-token
 401, authenticated health, accurate HEAD/ETag, single-range206, exact synthetic
 asset bytes and rejection of an unapproved source address before HTTP. The
 asset is a 112-byte JSON tetrahedron, not client data. Its UUID is
@@ -43,26 +52,26 @@ window arrived; it also passed and stopped. No further 0.1.0 window followed.
 Use process ownership plus listening-socket checks for absence, not a bare bind.
 
 The final private evidence receipt is
-`C:/Users/fstor/.codex/artifacts/native-staging-assets-011-acceptance-20261024.json`.
+`C:/Users/fstor/.codex/artifacts/native-staging-assets-012-acceptance-20261024.json`.
 It records package/certificate hashes, file references, actual resource caps,
 HTTPS checks and stopped-listener proof; it contains no credential values.
 The historical 0.1.0 receipt is
 `C:/Users/fstor/.codex/artifacts/native-staging-assets-acceptance-20261024.json`.
 
 The final window also verified four simultaneous 8 MiB range responses under
-the same limits. Actual kernel memory peak was 56,397,824 bytes. A separate
+the same limits. Actual kernel memory peak was 54,366,208 bytes. A separate
 temporary synthetic asset was modified in place without changing its size and
 its old mtime was restored; the service refused the changed range with 409.
 That probe and its separate temporary manifest were removed only after the
 exact unit stopped. The registered 112-byte asset was never replaced. These
-host checks complement 34 passing local tests (one POSIX-only skip on Windows),
+host checks complement 37 passing local tests (one POSIX-only skip on Windows),
 including byte-digest rejection when metadata observations reveal no change.
 
 ## Package and protected layout
 
 The standalone wheel has zero runtime dependencies and runs with the installed
-Python3.12.3 standard library. The tested 0.1.1 wheel is 7,529 bytes, SHA256
-`396bb662c6087e4c5c1e285a79846ec6ae2e87ea15e3297114bb40a6658dca07`.
+Python3.12.3 standard library. The tested 0.1.2 wheel is 7,720 bytes, SHA256
+`14786cfc94f4397c9033aa03ff8deba9ee3f1f39ecabd5c4b63f365f72f3c6ff`.
 It can run directly from its wheel through PYTHONPATH; no pip installation or
 network package download is needed.
 
@@ -71,14 +80,14 @@ The pilot's user-owned root is
 
 | Relative path | Purpose |
 | --- | --- |
-| `releases/hub_staging_assets-0.1.1-py3-none-any.whl` | Pinned reviewed runtime |
-| `releases/hub_staging_assets-0.1.0-py3-none-any.whl` | Retained previous package; no automatic downgrade |
+| `releases/hub_staging_assets-0.1.2-py3-none-any.whl` | Pinned reviewed runtime |
+| `releases/hub_staging_assets-0.1.1-py3-none-any.whl` | Retained previous package; no automatic downgrade |
 | `data/synthetic-pointcloud.json` | Immutable synthetic data only |
 | `manifest.json` | Operator-owned UUID/path/size/SHA/media registration |
 | `private/service-token` | Dedicated asset-service bearer credential,0600 |
 | `private/leaf-key.pem` | Dedicated private TLS key,0600 |
 | `private/leaf-cert.pem` | Public certificate in protected storage,0600 |
-| `acceptance.json`, `acceptance-0.1.1.json` | Sanitized historical/final pilot evidence |
+| `acceptance.json`, `acceptance-0.1.1.json`, `acceptance-0.1.2.json` | Sanitized historical/final pilot evidence |
 
 The certificate's public PEM-file SHA256 is
 `64200e9c6f96c79ff96569704b5881a6cba9eebc2a603567b46894305cf6f8cb`.
@@ -89,7 +98,7 @@ must use protected file references; no NAS files were installed by this pilot.
 Installed files and records remain below 64 KiB. The deployment budget, including one
 known-good rollback package, synthetic assets, SQLite-free metadata and bounded
 operational records, is at most 128 MiB. Disk available after acceptance was
-5,114,880,000 bytes. Recheck space before any later copy; require at least4GiB
+5,111,963,648 bytes. Recheck space before any later copy; require at least4GiB
 free plus 64 MiB operating margin and the full proposed allocation. Reserve at
 least 2 GiB available host RAM beyond the service's 128 MiB limit. None of the old
 TEST image/backup storage is available to this service or its cleanup.
