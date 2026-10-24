@@ -122,7 +122,7 @@ async def main():
         fields = line.split()
         assert not (fields[3] == '0A' and int(fields[1].split(':')[1],16) in (8765,8770,8771))
     print(json.dumps({'settings_profile':'passed','build_commit':commit,'authenticated_agents':3,
-        'mcp_tools':46,'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
+        'mcp_tools':len(BUS | HUB),'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
         'agent_bind':'0.0.0.0:8770','browser_bind':'0.0.0.0:8771','alias':'none'}))
 
 asyncio.run(asyncio.wait_for(main(),50))

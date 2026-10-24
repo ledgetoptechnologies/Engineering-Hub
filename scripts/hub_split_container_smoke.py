@@ -90,7 +90,7 @@ for agent, token in tokens.items():
     status, body = rpc('tools/list', {}, token)
     assert status == 200
     tools = json.loads(body)['result']['tools']
-    assert len(tools) == 27 and {tool['name'] for tool in tools} == expected_tools
+    assert len(tools) == len(expected_tools) and {tool['name'] for tool in tools} == expected_tools
 
 for path in ('/', '/index.html', '/hub.svg', '/assets/anything.js', '/api/hub/v1/auth/login',
              '/api/hub/v1/auth/me', '/api/hub/v1/overview'):
@@ -114,7 +114,7 @@ for line in Path('/proc/net/tcp6').read_text().splitlines()[1:]:
     fields = line.split()
     assert not (fields[3] == '0A' and int(fields[1].split(':')[1], 16) in (8770, 8771)), 'Unexpected IPv6 Hub listener'
 print(json.dumps({'split_image_smoke': 'passed', 'build_commit': expected_commit,
-                  'authenticated_agents': 3, 'mcp_tools': 22,
+                  'authenticated_agents': 3, 'mcp_tools': len(expected_tools),
                   'agent_bind': '0.0.0.0:8770', 'browser_bind': '127.0.0.1:8771',
                   'human_sign_in': 'not_tested', 'network': 'none'}))
 '''
