@@ -33,6 +33,16 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -q
+        env:
+          EH_RESPONSIVENESS_ARTIFACT_DIR: ${{ runner.temp }}/eh-responsiveness
+      - name: Preserve responsiveness evidence on success and failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-responsiveness-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/eh-responsiveness/*.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Validate Compose files
         run: |
