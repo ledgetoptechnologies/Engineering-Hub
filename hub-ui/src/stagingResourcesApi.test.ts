@@ -36,8 +36,7 @@ describe("parseResource", () => {
     expect(parseResource(resource({ topic: "a ".repeat(100) })).topic).toHaveLength(200);
     expect(parseResource(resource({ topic: "🌲".repeat(200) })).topic).toBe("🌲".repeat(200));
     expect(() => parseResource(resource({ topic: "a".repeat(201) }))).toThrow(HubApiError);
-    expect(() => parseResource(resource({ topic: "line
-break" }))).toThrow(HubApiError);
+    expect(() => parseResource(resource({ topic: "line\nbreak" }))).toThrow(HubApiError);
   });
   it("needs the job that made it and an update time", () => {
     expect(() => parseResource({ ...resource(), job_id: null })).toThrow(HubApiError);
