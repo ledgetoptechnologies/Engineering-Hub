@@ -33,7 +33,7 @@ _GET = frozenset({
     *('/api/hub/v1/' + name for name in (
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
-        'planning', 'planning/document', 'activity', 'label-sets', 'topics',
+        'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
         'staging/session-reconciliation', 'staging/status', 'staging/resources')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
@@ -42,13 +42,13 @@ _POST = frozenset('/api/hub/v1/' + name for name in (
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',
-    b'if-modified-since', b'cache-control', b'user-agent',
+    b'if-modified-since', b'cache-control', b'user-agent', b'range',
 })
 _RESPONSE_HEADERS = frozenset({
     b'content-type', b'content-length', b'cache-control', b'set-cookie',
     b'location', b'content-security-policy', b'x-content-type-options',
     b'referrer-policy', b'x-accel-buffering', b'etag', b'last-modified',
-    b'vary', b'www-authenticate',
+    b'vary', b'www-authenticate', b'content-range', b'accept-ranges',
 })
 
 
@@ -56,6 +56,7 @@ def browser_route_allowed(method, path):
     """Closed browser surface; new backend routes are not exposed implicitly."""
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
+                or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
@@ -74,6 +75,7 @@ def browser_route_allowed(method, path):
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
     return method == 'POST' and (path in _POST or re.fullmatch(
+        r'/api/hub/v1/interactive-reviews/' + _UUID + '/answers', path) is not None or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         or path == '/api/hub/v1/projects'
@@ -131,7 +133,7 @@ def _scope_headers(scope):
         if name in _REQUEST_HEADERS:
             selected.append((name, value))
     if counts.get(b'host') != 1 or any(counts.get(name, 0) > 1 for name in (
-            b'content-length', b'origin', b'cookie', b'x-hub-csrf')):
+            b'content-length', b'origin', b'cookie', b'x-hub-csrf', b'range')):
         raise _Denied('gateway_invalid_headers', 400)
     lengths = [value for name, value in headers if name == b'content-length']
     if lengths and re.fullmatch(rb'(?:0|[1-9][0-9]{0,9})', lengths[0]) is None:
@@ -260,6 +262,8 @@ class PublicBrowserGateway:
                 raw_path += b'?' + scope['query_string']
             # Direct Request bypasses client cookie/default-header merging.
             # Explicit auth/redirect options bypass configured client defaults.
+            asset_stream = scope['method'] == 'GET' and re.fullmatch(
+                r'/api/hub/v1/interactive-reviews/' + _UUID + '/assets/' + _UUID, scope['path']) is not None
             streaming = scope['method'] == 'GET' and _is_events(scope['path'])
             request = httpx.Request(scope['method'], httpx.URL(PRIVATE_ORIGIN).copy_with(
                 raw_path=raw_path), headers=headers + [(b'accept-encoding', b'identity')], content=body,
@@ -273,7 +277,22 @@ class PublicBrowserGateway:
                     or response.headers.get('content-encoding', 'identity') != 'identity'):
                 raise _Denied('gateway_invalid_upstream', 502)
             outgoing = [(k.lower(), v) for k, v in raw_headers if k.lower() in _RESPONSE_HEADERS]
-            if streaming and response.status_code == 200:
+            if asset_stream and response.status_code in (200, 206):
+                length = response.headers.get('content-length', '')
+                if not length.isdigit() or not 0 < int(length) <= 8 * 1024 * 1024:
+                    raise _Denied('gateway_invalid_upstream', 502)
+                async def asset_chunks():
+                    remaining = int(length)
+                    async with asyncio.timeout(self.request_timeout):
+                        async for chunk in response.aiter_raw(chunk_size=65536):
+                            if len(chunk) > remaining:
+                                raise _Denied('gateway_invalid_upstream', 502)
+                            remaining -= len(chunk)
+                            yield chunk
+                        if remaining:
+                            raise _Denied('gateway_invalid_upstream', 502)
+                result = StreamingResponse(asset_chunks(), status_code=response.status_code)
+            elif streaming and response.status_code == 200:
                 if response.headers.get('content-type', '').split(';')[0] != 'text/event-stream':
                     raise _Denied('gateway_invalid_upstream', 502)
                 async def chunks():

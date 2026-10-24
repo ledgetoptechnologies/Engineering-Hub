@@ -411,6 +411,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     project_registry = ProjectRepository(repo)
     from .components import ProjectComponentRepository
     component_registry = ProjectComponentRepository(repo)
+    from .interactive_service import compose_interactive
+    from .interactive_reviews import InteractiveReviewRepository
+    interactive_service = compose_interactive(Path(settings.database).parent / 'interactive-service.json')
+    interactive_service.pin_assets(repo)
+    interactive_reviews = InteractiveReviewRepository(repo, component_registry,
+        authorize=interactive_service.authorize, asset_authorize=interactive_service.asset_authorize)
     from .staging_module import compose_staging, configure_preview
     staging_module = compose_staging(repo,
         path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
@@ -437,6 +443,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           entity_images=entity_images,
                           project_registry=project_registry,
                           component_registry=component_registry,
+                          interactive_reviews=interactive_reviews,
                           staging_controller=staging_module.controller,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
@@ -474,7 +481,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     elif staging_module.client is not None:
                         await staging_module.client.aclose()
                 finally:
-                    await stop_existing_components()
+                    try:
+                        await interactive_service.close()
+                    finally:
+                        await stop_existing_components()
             await finish_owned(stop_all())
 
         async def stop_existing_components():
@@ -529,6 +539,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
     app.state.modular_staging = staging_module
+    app.state.interactive_service = interactive_service
+    app.state.interactive_reviews = interactive_reviews
     app.state.preview_app = staging_module.preview_app
     app.state.preview_origin = (staging_module.preview_broker.preview_origin
                                 if staging_module.preview_broker is not None else None)
@@ -616,6 +628,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_project_routes(app, repository=project_registry, actor=actor, human=human)
     from .components_api import attach_component_routes
     attach_component_routes(app, repository=component_registry, actor=actor, human=human)
+    from .interactive_reviews_api import attach_interactive_review_routes
+    from .interactive_service import attach_interactive_assets
+    attach_interactive_review_routes(app, interactive_reviews, actor, human)
+    attach_interactive_assets(app, interactive_service, interactive_reviews, human)
     app.state.project_registry = project_registry
     from .topic_catalog_api import attach_topic_catalog_route
     attach_topic_catalog_route(app, bridge=registry_bridge, human=human)
