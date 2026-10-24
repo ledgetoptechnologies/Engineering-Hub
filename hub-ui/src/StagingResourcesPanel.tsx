@@ -324,8 +324,7 @@ export function CleanupDialog({ source, project, projectName, lookup, nameOf, on
       <p><strong>{summary.remove}</strong></p>
       {summary.keep && <p>{summary.keep}</p>}
       {plan.remove.length > 0 && <details><summary>What will be removed ({plan.remove.length})</summary>
-        <ul className="plan-list">{plan.remove.map(item => <li key={item.id}>{kindLabel(item.kind)}{where(item.id)} · {formatBytes(item.size_bytes)}
-          · expired</li>)}</ul></details>}
+        <ul className="plan-list">{plan.remove.map(item => <li key={item.id}>{kindLabel(item.kind)}{where(item.id)} · {formatBytes(item.size_bytes)} · expired</li>)}</ul></details>}
       {plan.kept.length > 0 && <details><summary>What will be kept ({plan.kept.length})</summary>
         <ul className="plan-list">{plan.kept.map(item => { const found = lookup(item.id);
           return <li key={item.id}>{found ? kindLabel(found.kind) : "item"}{where(item.id)} · {keptLabel(item.why)}</li>; })}</ul></details>}
