@@ -241,6 +241,19 @@ def test_plan_rechecks_pin_and_revision_atomically(env):
     assert result['skipped'] == [{'id': item['id'], 'why': 'kept'}]
 
 
+def test_deleted_receipts_remain_history_but_leave_default_inventory(env):
+    store, control = env[:2]
+    item, _ = expired(env)
+    plan = store.cleanup_plan(OWNER, PROJECT)
+    operation = store.cleanup_begin(OWNER, plan['plan_id'], plan['digest'])['operations'][0]
+    store.cleanup_finish(control, plan['plan_id'], item['id'], operation['expected_revision'],
+                         absent=True, receipt_id=str(uuid.uuid4()))
+    assert store.list_resources(OWNER, PROJECT)['items'] == []
+    assert store.cleanup_plan(OWNER, PROJECT)['kept'] == []
+    assert store.get_resource(OWNER, item['id'])['state'] == 'deleted'
+    assert store.list_resources(OWNER, PROJECT, state='deleted')['items'][0]['id'] == item['id']
+
+
 def test_deletion_blocks_pin_and_replay_never_dispatches_again(env):
     store = env[0]
     item, _ = expired(env)

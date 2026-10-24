@@ -332,6 +332,8 @@ class StagingResourceStore:
                 item = json.loads(row['data'])
                 if project is not None and item['project'] != project or kind is not None and item['kind'] != kind or state is not None and item['state'] != state:
                     continue
+                if state is None and item['state'] == 'deleted':
+                    continue  # Compact history is available explicitly, not inventory clutter.
                 try:
                     self._authorize(db, actor, item['project'], 'read')
                 except HubError as exc:
@@ -528,6 +530,8 @@ class StagingResourceStore:
             remove, kept, revisions = [], [], {}
             for row in db.execute("SELECT data FROM hub_entities WHERE kind='staging_resource' ORDER BY id"):
                 item = json.loads(row['data'])
+                if item['state'] == 'deleted':
+                    continue  # There are no retained bytes left to plan for.
                 if project is not None and item['project'] != project or kinds is not None and item['kind'] not in kinds:
                     continue
                 try:

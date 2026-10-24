@@ -12,7 +12,7 @@ import threading
 import time
 import tarfile
 
-from .core import Rejected, ensure, tree_manifest, relative
+from .core import Rejected, ensure, tree_manifest, relative, make_job_readable
 
 
 _CGROUP_PROBE = ('exec /bin/cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max '
@@ -40,6 +40,15 @@ class DockerBackend:
     def command(self, *parts):
         return [self.executable, '--host', self.endpoint, *parts]
 
+    @staticmethod
+    def _volume_specs(paths, name, profile, stage):
+        specs = {'tests': {'name': name + '-tests', 'size': profile['output_bytes'] // 4,
+                           'resource_id': paths['test_run'].name}}
+        if stage == 'build':
+            specs['output'] = {'name': name + '-output', 'size': profile['output_bytes'],
+                               'resource_id': paths['build'].name}
+        return specs
+
     def argv(self, paths, profile, command_id, stage):
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
         name = 'eh-stage-' + scope[:12] + '-' + command_id + '-' + stage
@@ -54,15 +63,70 @@ class DockerBackend:
                 '--memory-swap', str(profile['memory_mb']) + 'm', '--cpus', str(profile['cpus']),
                 '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777',
                 '--workdir=/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true']
+        specs = self._volume_specs(paths, name, profile, stage)
         args += ['--mount', 'type=bind,src=' + str(paths['workspace']) + ',dst=/source,readonly',
                  '--tmpfs', '/workspace:rw,nosuid,nodev,mode=1777,size=' + str(profile['workspace_bytes']),
-                 '--tmpfs', '/test-output:rw,noexec,nosuid,nodev,mode=1777,size=' + str(profile['output_bytes'] // 4)]
+                 '--mount', 'type=volume,source=' + specs['tests']['name'] + ',target=/test-output,volume-nocopy']
         if stage == 'build':
-            args += ['--tmpfs', '/output:rw,noexec,nosuid,nodev,mode=1777,size=' + str(profile['output_bytes'])]
+            args += ['--mount', 'type=volume,source=' + specs['output']['name'] + ',target=/output,volume-nocopy']
         else:
             args += ['--mount', 'type=bind,src=' + str(paths['build']) + ',dst=/output,readonly']
         args += ['--entrypoint=/bin/sh', profile['image_id'], '-c', 'while :; do sleep 3600; done']
         return name, args
+
+    def _container_absent(self, name):
+        raw = self._checked_output(('ps', '--all', '--quiet', '--filter', 'name=^/' + name + '$'), limit=4096)
+        ensure(not raw.strip(), 'execution_uncertain')
+
+    def _volume_absent(self, name):
+        raw = self._checked_output(('volume', 'ls', '--quiet', '--filter', 'name=^' + name + '$'), limit=4096)
+        ensure(not raw.strip(), 'execution_uncertain')
+
+    @staticmethod
+    def _volume_options(size):
+        return {'type': 'tmpfs', 'device': 'tmpfs', 'o': 'size=' + str(size) + ',mode=1777,nosuid,nodev,noexec'}
+
+    @staticmethod
+    def _volume_labels(spec, command_id, stage, scope, kind):
+        return {'engineering-hub.staging.command': command_id,
+                'engineering-hub.staging.stage': stage, 'engineering-hub.staging.scope': scope,
+                'engineering-hub.staging.volume': kind, 'engineering-hub.staging.resource': spec['resource_id']}
+
+    def _verify_volume(self, spec, command_id, stage, scope, kind):
+        try:
+            raw = self._checked_output(('volume', 'inspect', spec['name']), limit=8192)
+            values = json.loads(raw)
+            ensure(type(values) is list and len(values) == 1, 'execution_uncertain')
+            info = values[0]
+            wanted = self._volume_labels(spec, command_id, stage, scope, kind)
+            ensure(info.get('Name') == spec['name'] and info.get('Driver') == 'local' and
+                   info.get('Options') == self._volume_options(spec['size']) and
+                   type(info.get('Labels')) is dict and
+                   all(info['Labels'].get(key) == value for key, value in wanted.items()), 'execution_uncertain')
+        except Exception:
+            raise Rejected('execution_uncertain') from None
+
+    def _create_volume(self, spec, command_id, stage, scope, kind):
+        parts = ['volume', 'create', '--driver=local']
+        for key, value in self._volume_labels(spec, command_id, stage, scope, kind).items():
+            parts += ['--label', key + '=' + value]
+        for key, value in self._volume_options(spec['size']).items():
+            parts += ['--opt', key + '=' + value]
+        self._checked_output(tuple(parts + [spec['name']]), limit=4096)
+        self._verify_volume(spec, command_id, stage, scope, kind)
+
+    def _remove_volume(self, spec, command_id, stage, scope, kind):
+        try:
+            existing = self._checked_output(('volume', 'ls', '--quiet', '--filter', 'name=^' + spec['name'] + '$'), limit=4096)
+            if not existing.strip():
+                return
+            self._verify_volume(spec, command_id, stage, scope, kind)
+            refs = self._checked_output(('ps', '--all', '--quiet', '--filter', 'volume=' + spec['name']), limit=4096)
+            ensure(not refs.strip(), 'execution_uncertain')
+            self._checked_output(('volume', 'rm', spec['name']), limit=4096)
+            self._volume_absent(spec['name'])
+        except Exception:
+            raise Rejected('execution_uncertain') from None
 
     def _checked_output(self, parts, *, limit, timeout=10):
         """Bound trusted CLI output while reading; never capture an unlimited pipe."""
@@ -163,10 +227,68 @@ class DockerBackend:
                labels.get('engineering-hub.staging.scope') == scope, 'container_identity_drift')
         subprocess.run(self.command('rm', '--force', name), stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True, env=self.env)
+        self._container_absent(name)
 
-    def _export(self, name, source, destination, limit):
-        """Read a bounded Docker tar stream; never use tarfile.extract/extractall."""
-        process = subprocess.Popen(self.command('cp', name + ':' + source + '/.', '-'),
+    def exporter_argv(self, name, volume, profile, command_id, stage, scope):
+        policy = dict(profile, cpus=min(profile['cpus'], 0.25), memory_mb=min(profile['memory_mb'], 128),
+                      pids=min(profile['pids'], 32))
+        args = self.command('run', '--detach', '--pull=never', '--name', name) + [
+            '--label', 'engineering-hub.staging.command=' + command_id,
+            '--label', 'engineering-hub.staging.stage=' + stage,
+            '--label', 'engineering-hub.staging.scope=' + scope,
+            '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--cgroupns=private',
+            '--read-only', '--user', str(os.getuid()) + ':' + str(os.getgid()),
+            '--pids-limit', str(policy['pids']), '--memory', str(policy['memory_mb']) + 'm',
+            '--memory-swap', str(policy['memory_mb']) + 'm', '--cpus', str(policy['cpus']),
+            '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777',
+            '--mount', 'type=volume,source=' + volume + ',target=/artifacts,readonly,volume-nocopy',
+            '--entrypoint=/bin/sh', profile['image_id'], '-c', 'while :; do sleep 3600; done']
+        return args, policy
+
+    def _export(self, name, volume, destination, limit, *, profile, command_id, stage, scope):
+        """Writers stay paused; only a trusted readonly-volume exporter reads them."""
+        args, policy = self.exporter_argv(name, volume, profile, command_id, stage, scope)
+        try:
+            subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=20, check=True, env=self.env)
+            self._verify_kernel_limits(name, policy)
+            self._verify_export_mount(name, limit)
+            self._export_stream(name, destination, limit)
+        finally:
+            self._stop_owned(name, command_id, stage, scope)
+
+    def _verify_export_mount(self, name, limit):
+        self._verify_tmpfs_mount(name, '/artifacts', limit, readonly=True)
+
+    def _verify_job_mounts(self, name, profile, stage):
+        self._verify_tmpfs_mount(name, '/test-output', profile['output_bytes'] // 4, readonly=False)
+        if stage == 'build':
+            self._verify_tmpfs_mount(name, '/output', profile['output_bytes'], readonly=False)
+
+    def _verify_tmpfs_mount(self, name, destination, limit, *, readonly):
+        raw = self._checked_output(('exec', name, '/bin/cat', '/proc/self/mountinfo'), limit=65536)
+        matches = []
+        for line in raw.decode('ascii').splitlines():
+            fields = line.split()
+            if len(fields) > 8 and fields[4] == destination:
+                split = fields.index('-')
+                matches.append((set(fields[5].split(',')), fields[split + 1], fields[split + 3].split(',')))
+        ensure(len(matches) == 1, 'artifact_mount_unverified')
+        options, filesystem, super_options = matches[0]
+        access, forbidden = ('ro', 'rw') if readonly else ('rw', 'ro')
+        ensure(filesystem == 'tmpfs' and {access, 'nosuid', 'nodev', 'noexec'} <= options and forbidden not in options,
+               'artifact_mount_unverified')
+        sizes = [value[5:] for value in super_options if value.startswith('size=')]
+        ensure(len(sizes) == 1 and re.fullmatch('[1-9][0-9]*[kmg]?', sizes[0]), 'artifact_mount_unverified')
+        suffix = sizes[0][-1]
+        actual = int(sizes[0][:-1]) * {'k': 1024, 'm': 1024**2, 'g': 1024**3}[suffix] if suffix in 'kmg' else int(sizes[0])
+        # tmpfs rounds its byte budget to a kernel page; exported file bytes
+        # still obey the exact recipe limit in the validated tar reader.
+        ensure(limit <= actual <= ((limit + 4095) // 4096) * 4096, 'artifact_mount_unverified')
+
+    def _export_stream(self, name, destination, limit):
+        """Read bounded raw tar; never use docker cp or tarfile.extract/all."""
+        process = subprocess.Popen(self.command('exec', name, '/bin/tar', '-C', '/artifacts', '-cf', '-', '.'),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=self.env)
         data = bytearray()
         overflow = threading.Event()
@@ -219,20 +341,37 @@ class DockerBackend:
         self._verify_daemon()
         name, _ = self.argv(paths, profile, command_id, stage)
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
+        specs = self._volume_specs(paths, name, profile, stage)
+        # No adoption: any deterministic name left by another/earlier attempt
+        # refuses before this attempt creates or removes anything.
+        self._container_absent(name)
+        for kind, spec in specs.items():
+            self._container_absent(name + '-export-' + kind)
+            self._volume_absent(spec['name'])
+        possible = []
         try:
+            for kind, spec in specs.items():
+                possible.append((kind, spec))  # Includes a lost creation acknowledgement.
+                self._create_volume(spec, command_id, stage, scope, kind)
             return self._stage_inner(paths, profile, command_id, stage)
         finally:
+            for kind in specs:
+                self._stop_owned(name + '-export-' + kind, command_id, stage, scope)
             self._stop_owned(name, command_id, stage, scope)
+            for kind, spec in reversed(possible):
+                self._remove_volume(spec, command_id, stage, scope, kind)
 
     def _stage_inner(self, paths, profile, command_id, stage):
         name, args = self.argv(paths, profile, command_id, stage)
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
+        specs = self._volume_specs(paths, name, profile, stage)
         log = bytearray()
         overflow = threading.Event()
         started = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, timeout=20, check=False, env=self.env)
         ensure(started.returncode == 0, 'container_start_failed')
         self._verify_kernel_limits(name, profile)
+        self._verify_job_mounts(name, profile, stage)
         process = subprocess.Popen(self.command('exec', name, '/bin/sh', '-c',
                                    'cp -R /source/. /workspace/ && exec "$@"',
                                    'eh-staging-recipe') + profile[stage + '_argv'],
@@ -278,18 +417,33 @@ class DockerBackend:
             # any descendant the build left behind after its foreground exit.
             subprocess.run(self.command('pause', name), stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=True, env=self.env)
+            paused = self._checked_output(('inspect', '--format', '{{json .State.Paused}}', name), limit=4096)
+            ensure(paused.strip() == b'true', 'execution_uncertain')
             if stage == 'build':
-                self._export(name, '/output', paths['build'], profile['output_bytes'])
+                self._export(name + '-export-output', specs['output']['name'], paths['build'], profile['output_bytes'],
+                             profile=profile, command_id=command_id, stage=stage, scope=scope)
             test_output = paths['test_run'] / stage
             test_output.mkdir()
-            self._export(name, '/test-output', test_output, profile['output_bytes'] // 4)
+            self._export(name + '-export-tests', specs['tests']['name'], test_output, profile['output_bytes'] // 4,
+                         profile=profile, command_id=command_id, stage=stage, scope=scope)
+            paused = self._checked_output(('inspect', '--format', '{{json .State.Paused}}', name), limit=4096)
+            ensure(paused.strip() == b'true', 'execution_uncertain')
             return {'exit_code': process.returncode, 'log_bytes': len(log)}
         finally:
             self._stop_owned(name, command_id, stage, scope)
 
     def run(self, paths, profile, command_id):
         ensure(os.name == 'posix' and os.getuid() != 0, 'nonroot_linux_worker_required')
-        stages = {stage: self._stage(paths, profile, command_id, stage) for stage in ('build', 'test')}
+        return self._run_stages(paths, profile, command_id)
+
+    def _run_stages(self, paths, profile, command_id):
+        stages = {'build': self._stage(paths, profile, command_id, 'build')}
+        ensure(bool(tree_manifest(paths['build'], profile['output_bytes'])[0]), 'empty_build_output')
+        # _stage has frozen/exported the bounded output and removed the owned
+        # build container. Only then make the validated immutable output tree
+        # readable to the next rootless job UID; the test bind stays read-only.
+        make_job_readable(paths['build'], profile['output_bytes'])
+        stages['test'] = self._stage(paths, profile, command_id, 'test')
         tree_manifest(paths['build'], profile['output_bytes'])
         for directory, dirs, files in os.walk(paths['build'], followlinks=False):
             destination = paths['preview'] / Path(directory).relative_to(paths['build'])
