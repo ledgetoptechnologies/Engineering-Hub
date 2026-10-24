@@ -6,8 +6,9 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { HubApiError, type HubMode } from "./api";
 import {
   applyCleanup, canChangeKeep, expiryLabel, extendedUntil, formatBytes, keepResource, keptLabel, kindLabel, KEEP_REASON_MAX,
-  listResources, planCleanup, planSummary, protectedLabel, resultSummary, ResourceConflictError, startPreview,
+  listResources, planCleanup, planSummary, protectedLabel, readStagingStatus, resultSummary, ResourceConflictError, startPreview, statusLine,
   type CleanupPlan, type CleanupResult, type KeepRequest, type PreviewSession, type ResourcePage, type ResourceQuery, type StagingResource,
+  type StagingStatus,
 } from "./stagingResourcesApi";
 import { DemoResourceStore } from "./stagingResourcesDemo";
 import { Badge, Modal, names } from "./ui";
@@ -19,6 +20,7 @@ export interface ResourceSource {
   plan(project: string | null): Promise<CleanupPlan>;
   apply(plan: CleanupPlan): Promise<CleanupResult>;
   preview(resource: StagingResource): Promise<PreviewSession>;
+  status(signal: AbortSignal): Promise<StagingStatus>;
 }
 export function liveSource(csrf: string): ResourceSource {
   return {
@@ -27,6 +29,7 @@ export function liveSource(csrf: string): ResourceSource {
     plan: (project) => planCleanup(project, csrf),
     apply: (plan) => applyCleanup(plan, csrf),
     preview: (resource) => startPreview(resource, csrf),
+    status: (signal) => readStagingStatus(signal),
   };
 }
 export function demoSource(store = new DemoResourceStore()): ResourceSource {
@@ -37,6 +40,8 @@ export function demoSource(store = new DemoResourceStore()): ResourceSource {
     apply: async (plan) => store.apply(plan),
     // Demo mode has no preview origin, and says so rather than faking one.
     preview: async () => { throw new HubApiError(503, "preview_not_configured"); },
+    status: async () => ({ configured: true, running: true, reachable: true, profiles: { "engineering-hub": ["vite-build"] },
+      state: null, previews_configured: false }),
   };
 }
 
@@ -48,6 +53,8 @@ const errorText: Record<string, string> = {
   staging_plan_changed: "Staging changed since the plan was made. Nothing was removed; make a new plan.",
   staging_unavailable: "The staging PC isn't answering. Nothing was changed.",
   staging_busy: "The staging PC is busy with another job. Nothing was changed; try again shortly.",
+  staging_forbidden: "You don't have permission for that on this project. Nothing was changed.",
+  staging_cleanup_in_progress: "Another cleanup is already running. Nothing was changed; try again when it finishes.",
   preview_not_configured: "Previews can't be opened yet: the separate preview address hasn't been set up.",
   preview_unavailable: "This preview can't be opened right now.",
   keep_reason_required: "Say why it should be kept.",
@@ -103,6 +110,19 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
     });
     return () => { generation.current++; controller.abort(); };
   }, [source, project, refreshToken, revision]);
+  // Service status is read on its own: a failure here says "unknown", it never blocks the list or claims readiness.
+  const [status, setStatus] = useState<StagingStatus | "unknown" | "unsupported" | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    setStatus(null);
+    if (!source) return;
+    source.status(controller.signal).then(value => { if (!controller.signal.aborted) setStatus(value); })
+      .catch(error => {
+        if (controller.signal.aborted) return;
+        setStatus(error instanceof HubApiError && error.code === "staging_resources_unsupported" ? "unsupported" : "unknown");
+      });
+    return () => controller.abort();
+  }, [source, refreshToken, revision]);
 
   async function loadMore() {
     if (!source || !next || loadingMore) return;
@@ -167,6 +187,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
       </span></div>
     <p className="panel-description">Workspaces, builds, test runs and previews the staging PC keeps for EH jobs. Cleanup shows its plan first,
       and never removes pinned or protected items, or anything an EH job didn't create.</p>
+    <StatusLine status={status} />
     {mode === "demo" && <p role="status">Demo: illustrative items only. Nothing is read from or removed on the staging PC.</p>}
     {stale && <p role="status">Workspace events are stale, so changes are paused until the Hub reconnects.</p>}
     <div className="filter-bar">
@@ -201,6 +222,16 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
       onClose={changed => { setCleaning(false); if (changed) setRevision(value => value + 1); }}
       onUnauthorized={() => { setCleaning(false); failed(new HubApiError(401, "human_session_required")); }} />}
   </section>;
+}
+
+function StatusLine({ status }: { status: StagingStatus | "unknown" | "unsupported" | null }) {
+  if (status === null || status === "unsupported") return null;
+  if (status === "unknown") return <p className="staging-status" role="status">Staging service status is unknown right now.</p>;
+  const line = statusLine(status);
+  return <div className="staging-status" role="status">
+    <Badge tone={line.tone}>{line.tone === "forest" ? "Service reachable" : "Service not ready"}</Badge> <span>{line.text}</span>
+    {status.previews_configured === false && <small>Previews can't be opened yet: the separate preview address hasn't been set up.</small>}
+  </div>;
 }
 
 function ResourceRow({ resource, now, projectName, disabled, busy, onExtend, onPin, onPreview, onRelease }: {

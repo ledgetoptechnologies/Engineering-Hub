@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { HubApiError } from "./api";
 import {
   applyCleanup, expiryLabel, extendedUntil, formatBytes, keepResource, keptLabel, listResources, parseCleanupPlan, parseCleanupResult,
-  parsePreviewSession, parseResource, planSummary, resultSummary, ResourceConflictError, startPreview,
+  parsePreviewSession, parseResource, parseStagingStatus, planCleanup, planSummary, resultSummary, ResourceConflictError, startPreview, statusLine,
   type CleanupPlan, type StagingResource,
 } from "./stagingResourcesApi";
 import { createDemoResources, DemoResourceStore } from "./stagingResourcesDemo";
@@ -171,5 +171,46 @@ describe("wording", () => {
     expect(formatBytes(null)).toBe("size unknown");
     expect(formatBytes(0)).toBe("0 bytes");
     expect(formatBytes(1_200_000_000)).toBe("1.2 GB");
+  });
+});
+
+describe("service status", () => {
+  const ready = { configured: true, running: true, reachable: true, profiles: { "engineering-hub": ["vite-build"] } };
+  it("says reachable only when configured, running and reachable", () => {
+    expect(statusLine(parseStagingStatus(ready))).toEqual({ text: "Staging PC reachable. 1 project has build or test recipes you can use.", tone: "forest" });
+    expect(statusLine(parseStagingStatus({ ...ready, reachable: false })).tone).toBe("amber");
+    expect(statusLine(parseStagingStatus({ ...ready, running: false })).text).toContain("isn't running");
+  });
+  it("puts a stated reason ahead of the flags, and refuses contradictions and unknown states", () => {
+    expect(statusLine(parseStagingStatus({ ...ready, state: "existing_executor_owner" })).text).toContain("earlier executor");
+    expect(() => parseStagingStatus({ ...ready, configured: false })).toThrow(HubApiError);
+    expect(() => parseStagingStatus({ ...ready, state: "fine" })).toThrow(HubApiError);
+    expect(() => parseStagingStatus({ ...ready, profiles: { "Bad Project": [] } })).toThrow(HubApiError);
+  });
+  it("keeps an unstated preview setting distinct from false", () => {
+    expect(parseStagingStatus(ready).previews_configured).toBeNull();
+    expect(parseStagingStatus({ ...ready, previews_configured: false }).previews_configured).toBe(false);
+  });
+});
+
+describe("resource store error names", () => {
+  it("folds the store's names onto the panel's codes", async () => {
+    const cases: [string, number, string][] = [["revision_conflict", 409, "staging_resource_conflict"], ["not_found", 404, "staging_resource_not_found"],
+      ["staging_plan_digest_conflict", 409, "staging_plan_changed"], ["staging_preview_not_configured", 503, "preview_not_configured"],
+      ["staging_forbidden", 403, "staging_forbidden"], ["staging_cleanup_in_progress", 409, "staging_cleanup_in_progress"],
+      ["__proto__", 409, "staging_resource_conflict"]];
+    for (const [code, status, expected] of cases) {
+      const { fetchImpl } = recorder(jsonResponse({ detail: { code } }, status));
+      await expect(planCleanup(null, "token", fetchImpl)).rejects.toMatchObject({ status, code: expected });
+    }
+  });
+  it("treats a store revision conflict with its current revision as a typed conflict", async () => {
+    const { fetchImpl } = recorder(jsonResponse({ detail: { code: "revision_conflict", current_revision: 3 } }, 409));
+    await expect(keepResource(resource(), { mode: "none", reason: "x" }, "token", fetchImpl)).rejects.toBeInstanceOf(ResourceConflictError);
+  });
+  it("names the store's kept reasons", () => {
+    expect(keptLabel("kept")).toBe("kept by request");
+    expect(keptLabel("protected")).toBe("protected");
+    expect(keptLabel("active_job")).toBe("in use by a running job");
   });
 });

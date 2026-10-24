@@ -30,6 +30,15 @@ export interface CleanupPlan {
 }
 export interface CleanupResult { removed: string[]; failed: { id: string; code: string }[]; skipped_changed: string[] }
 export interface PreviewSession { url: string; expires_at: string }
+export const STATUS_STATES = ["not_configured", "invalid", "disabled", "existing_executor_owner", "no_profiles", "unavailable"] as const;
+export interface StagingStatus {
+  configured: boolean; running: boolean; reachable: boolean;
+  /** Recipe names per project this human may use. */
+  profiles: Record<string, string[]>;
+  state: typeof STATUS_STATES[number] | null;
+  /** Absent means the server didn't say, which is not the same as configured. */
+  previews_configured: boolean | null;
+}
 /** Every keep change carries a reason, including letting an item expire again. */
 export type KeepRequest = { mode: "until"; until: string; reason: string } | { mode: "pinned" | "none"; reason: string };
 
@@ -43,6 +52,12 @@ const codePattern = /^[a-z][a-z0-9_.:-]{0,63}$/;
 const knownCodes = new Set(["staging_resource_conflict", "staging_resource_not_found", "staging_resource_protected",
   "staging_plan_expired", "staging_plan_changed", "staging_unavailable", "staging_busy", "preview_unavailable",
   "preview_not_configured", "keep_reason_required", "human_session_required", "forbidden", "csrf_required"]);
+/** The resource store's own names, folded onto the codes the panel words. */
+const codeAliases: Record<string, string> = {
+  revision_conflict: "staging_resource_conflict", not_found: "staging_resource_not_found", staging_forbidden: "staging_forbidden",
+  staging_cleanup_in_progress: "staging_cleanup_in_progress", staging_plan_digest_conflict: "staging_plan_changed",
+  staging_preview_not_configured: "preview_not_configured",
+};
 
 export function isResourceId(value: string): boolean { return uuid.test(value); }
 export function isStagingProject(value: string): boolean { return projectPattern.exec(value)?.[0] === value; }
@@ -154,17 +169,19 @@ export function parsePreviewSession(value: unknown, dashboardOrigin: string): Pr
 }
 
 async function failure(response: Response): Promise<never> {
-  if (await isMissingRoute(response)) throw new HubApiError(404, "staging_resources_unsupported");
   let code = response.status === 503 ? "staging_unavailable" : response.status === 404 ? "staging_resource_not_found"
     : response.status === 409 ? "staging_resource_conflict" : "staging_request_failed";
-  let current: number | null = null;
+  let current: number | null = null, named = false;
   if (response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     try {
-      const detail = object(object(await response.json()).detail);
-      if (typeof detail.code === "string" && knownCodes.has(detail.code)) code = detail.code;
+      const detail = object(object(await response.clone().json()).detail);
+      if (typeof detail.code === "string" && knownCodes.has(detail.code)) { code = detail.code; named = true; }
+      else if (typeof detail.code === "string" && Object.hasOwn(codeAliases, detail.code)) { code = codeAliases[detail.code]; named = true; }
       if (Number.isSafeInteger(detail.current_revision) && (detail.current_revision as number) >= 1) current = detail.current_revision as number;
     } catch { /* Never reflect proxy HTML or raw server exceptions. */ }
   }
+  // A missing item names itself; only an unnamed 404 or the gateway's refusal means this Hub lacks the feature.
+  if (!named && await isMissingRoute(response)) throw new HubApiError(404, "staging_resources_unsupported");
   if (response.status === 409 && code === "staging_resource_conflict" && current !== null) throw new ResourceConflictError(current);
   throw new HubApiError(response.status, code);
 }
@@ -216,6 +233,46 @@ export async function startPreview(resource: StagingResource, csrf: string, dash
   if (!isResourceId(resource.id) || resource.kind !== "preview") throw new HubApiError(422, "invalid_input");
   const response = await fetchImpl.call(globalThis, `/api/hub/v1/staging/resources/${resource.id}/preview-session`, postInit(csrf, {}));
   return parsePreviewSession(await json(response), dashboardOrigin);
+}
+
+export function parseStagingStatus(value: unknown): StagingStatus {
+  const row = object(value);
+  const bool = (field: unknown) => typeof field === "boolean" ? field : invalid();
+  const profiles: Record<string, string[]> = {};
+  const entries = Object.entries(object(row.profiles));
+  if (entries.length > 200) return invalid();
+  for (const [project, recipes] of entries) {
+    if (!isStagingProject(project) || !Array.isArray(recipes) || recipes.length > 50) return invalid();
+    profiles[project] = recipes.map(recipe => matching(recipe, /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/));
+  }
+  const status: StagingStatus = { configured: bool(row.configured), running: bool(row.running), reachable: bool(row.reachable), profiles,
+    state: row.state === undefined || row.state === null ? null : oneOf(row.state, STATUS_STATES),
+    previews_configured: row.previews_configured === undefined || row.previews_configured === null ? null : bool(row.previews_configured) };
+  // Unconfigured can't also claim to be running or reachable.
+  if (!status.configured && (status.running || status.reachable)) return invalid();
+  return status;
+}
+export async function readStagingStatus(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<StagingStatus> {
+  const response = await fetchImpl.call(globalThis, "/api/hub/v1/staging/status", getInit(signal));
+  return parseStagingStatus(await json(response));
+}
+const statusStates: Record<typeof STATUS_STATES[number], string> = {
+  not_configured: "The staging service isn't set up yet.",
+  invalid: "The staging service settings aren't valid, so it isn't being used.",
+  disabled: "The staging service is turned off.",
+  existing_executor_owner: "The staging PC is still owned by the earlier executor, so the new service isn't in use.",
+  no_profiles: "The staging service has no build or test recipes yet.",
+  unavailable: "The staging service isn't available right now.",
+};
+/** One honest line: never "ready" unless the server says configured, running and reachable. */
+export function statusLine(status: StagingStatus): { text: string; tone: "neutral" | "amber" | "forest" } {
+  if (status.state) return { text: statusStates[status.state], tone: "amber" };
+  if (!status.configured) return { text: statusStates.not_configured, tone: "amber" };
+  if (!status.running) return { text: "The staging queue controller isn't running, so no new builds or tests will start.", tone: "amber" };
+  if (!status.reachable) return { text: "The staging PC isn't answering, so new builds or tests can't start.", tone: "amber" };
+  const projects = Object.keys(status.profiles).length;
+  return { text: `Staging PC reachable. ${projects === 0 ? "No projects have" : projects === 1 ? "1 project has" : `${projects} projects have`
+    } build or test recipes you can use.`, tone: "forest" };
 }
 
 // Wording shared by the panel, the cleanup dialog and tests.
@@ -271,7 +328,8 @@ function countPhrase<T>(items: T[], key: (item: T) => string, label: (key: strin
   return parts.length <= 1 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
 }
 const keptNames: Record<string, string> = {
-  pinned: "pinned", keep_until: "kept by request", not_expired: "not expired yet", not_owned: "not created by an EH job",
+  pinned: "pinned", keep_until: "kept by request", kept: "kept by request", protected: "protected",
+  not_expired: "not expired yet", not_owned: "not created by an EH job",
 };
 export function keptLabel(why: string): string {
   const reason = why.startsWith("protected:") ? why.slice(10) : why;

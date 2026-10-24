@@ -7,7 +7,7 @@ import { audit, blocking } from "./audit";
 const human = "human:cf:" + "e".repeat(64);
 
 /** The demo store plays the staging API behind the real gateway paths, so the live code path is exercised. */
-async function fixture(page: Page, options: { unsupported?: boolean; previewUrl?: string } = {}) {
+async function fixture(page: Page, options: { unsupported?: boolean; previewUrl?: string; status?: Record<string, unknown> | "error" } = {}) {
   const store = new DemoResourceStore();
   const state = { posts: [] as { path: string; body: Record<string, unknown>; csrf?: string }[], conflictNext: false, pinOnApply: "",
     lastPlan: null as ReturnType<DemoResourceStore["plan"]> | null };
@@ -21,6 +21,8 @@ async function fixture(page: Page, options: { unsupported?: boolean; previewUrl?
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
     if (path.startsWith("/api/hub/v1/staging/") && options.unsupported) return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
+    if (path === "/api/hub/v1/staging/status" && options.status)
+      return options.status === "error" ? respond({ detail: { code: "staging_unavailable" } }, 503) : respond(options.status);
     if (path === "/api/hub/v1/staging/resources" && request.method() === "GET")
       return respond(store.list({ project: url.searchParams.get("project") ?? undefined }));
     if (request.method() === "POST" && path.startsWith("/api/hub/v1/staging/")) {
@@ -200,4 +202,24 @@ test("a preview runs in an opaque sandbox on its own origin: ES modules and JSON
   for (const item of seen) { expect(item.cookie).toBeUndefined(); expect(item.referer ?? "").not.toContain("127.0.0.1"); }
   expect(seen[0].referer).toBeUndefined();
   expect(blocking(await audit(page, "dialog", 1440))).toEqual([]);
+});
+
+test("the service status line never claims readiness the server didn't report", async ({ page }) => {
+  await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: { "engineering-hub": ["vite-build"] }, previews_configured: false } });
+  await page.goto("/#/staging");
+  const line = panel(page).locator(".staging-status");
+  await expect(line).toContainText("Staging PC reachable. 1 project has build or test recipes you can use.");
+  await expect(line).toContainText("the separate preview address hasn't been set up");
+});
+
+test("an unset-up service says so, and a failed status read says unknown without hiding the list", async ({ page }) => {
+  await fixture(page, { status: { configured: false, running: false, reachable: false, profiles: {}, state: "not_configured" } });
+  await page.goto("/#/staging");
+  await expect(panel(page).locator(".staging-status")).toContainText("Service not ready");
+  await expect(panel(page).locator(".staging-status")).toContainText("The staging service isn't set up yet.");
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await fixture(page, { status: "error" });
+  await page.reload();
+  await expect(panel(page).locator(".staging-status")).toHaveText("Staging service status is unknown right now.");
+  await expect(panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem")).toHaveCount(7);
 });
