@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import { HubApiError } from "./api";
 import {
   applyCleanup, expiryLabel, extendedUntil, formatBytes, keepResource, keptLabel, listResources, parseCleanupPlan, parseCleanupResult,
-  parsePreviewSession, parseResource, parseStagingStatus, planCleanup, planSummary, resultSummary, ResourceConflictError, startPreview, statusLine, recheckJob, recheckSummary, parseRecheckResult,
+  parsePreviewSession, parseResource, parseResourcePage, parseStagingStatus, planCleanup, planSummary, resultSummary, ResourceConflictError, startPreview, statusLine, recheckJob, recheckSummary, parseRecheckResult,
   type CleanupPlan, type StagingResource,
 } from "./stagingResourcesApi";
 import { createDemoResources, DemoResourceStore } from "./stagingResourcesDemo";
+import wire from "./fixtures/staging-wire-v1.json";
 
 const now = new Date("2026-10-24T12:00:00Z");
 const id = (n: number) => `5ea9e000-0000-4000-8000-${String(n).padStart(12, "0")}`;
@@ -269,5 +270,30 @@ describe("held jobs and recheck", () => {
     expect(at("succeeded").settled).toBe(true);
     expect(at("held").settled).toBe(false);
     expect(at("held").text).toContain("needs an operator to review");
+  });
+});
+
+describe("real backend wire fixture (fixtures/staging-wire-v1.json, produced from the HTTP endpoints)", () => {
+  it("parses the status exactly as sent, including held jobs and the owner flag", () => {
+    const status = parseStagingStatus(wire.status);
+    expect(status).toMatchObject({ configured: true, running: false, reachable: false, can_reconcile: true, previews_configured: false });
+    expect(status.held_jobs.map(job => job.id)).toEqual([wire.reconcile.job.id]);
+    expect(statusLine(status).tone).toBe("amber");
+  });
+  it("parses the resource page, including free-text topics, pins and unknown sizes", () => {
+    const page = parseResourcePage(wire.resources, {});
+    expect(page.items).toHaveLength(2);
+    expect(page.items[0]).toMatchObject({ kind: "preview", keep: { mode: "pinned" }, size_bytes: null, topic: "Synthetic wire example" });
+  });
+  it("parses the cleanup plan with its sha256: digest and checks a result against it", () => {
+    const plan = parseCleanupPlan(wire.cleanup_plan);
+    expect(plan.digest).toBe(wire.cleanup_plan.digest);
+    expect(planSummary(plan)).toEqual({ remove: "Will remove 1 build (2.0 KB).", keep: "Will keep 1 protected." });
+    expect(parseCleanupResult({ removed: [plan.remove[0].id], failed: [], skipped_changed: [] }, plan).removed).toHaveLength(1);
+  });
+  it("parses the recheck reply with its kind-keyed resource map", () => {
+    const result = parseRecheckResult(wire.reconcile, wire.reconcile.job.id);
+    expect(result.resource_ids).toEqual(wire.reconcile.resource_ids);
+    expect(recheckSummary(result).settled).toBe(false);
   });
 });
