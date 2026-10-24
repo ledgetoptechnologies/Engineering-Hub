@@ -32,6 +32,13 @@ describe("parseResource", () => {
     expect(() => parseResource(resource({ protected: [{ reason: "because" as never, ref: "x" }] }))).toThrow(HubApiError);
     expect(() => parseResource({ ...resource(), protected: [{ reason: "active_job", ref: null }] })).toThrow(HubApiError);
   });
+  it("accepts a free-text topic up to the store's 200 characters, and no more", () => {
+    expect(parseResource(resource({ topic: "a ".repeat(100) })).topic).toHaveLength(200);
+    expect(parseResource(resource({ topic: "🌲".repeat(200) })).topic).toBe("🌲".repeat(200));
+    expect(() => parseResource(resource({ topic: "a".repeat(201) }))).toThrow(HubApiError);
+    expect(() => parseResource(resource({ topic: "line
+break" }))).toThrow(HubApiError);
+  });
   it("needs the job that made it and an update time", () => {
     expect(() => parseResource({ ...resource(), job_id: null })).toThrow(HubApiError);
     expect(() => parseResource({ ...resource(), updated_at: undefined })).toThrow(HubApiError);
