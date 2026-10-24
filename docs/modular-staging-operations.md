@@ -8,7 +8,30 @@ existing ownership; this document does not release held work, authorize
 filesystem repair or change production/Cloudflare routes. Existing EH Compose
 and its MCP/browser ports remain unchanged.
 
-## Current staging host assessment
+## Later TEST maintenance checkpoint
+
+Later on 24 October, separately approved TEST maintenance restored the original
+4 GiB filesystem and original Engine. The manual recovery user unit uses short
+temporary paths beneath `/run/user/10001`; its original data root and consumer
+socket remain unchanged. Actual private-socket acceptance made 22 GET requests
+and no writes, verified the original Engine identity, all 18 retained containers
+stopped, and enforced unit/aggregate limits of one CPU, 1 GiB RAM, zero swap and
+256 PIDs. Six historical referenced image IDs and seven current images were
+verified; the seventh image's historical identity was unavailable.
+
+This is TEST maintenance acceptance, **not modular-worker enrollment or job
+authority**. No worker, application job, image import, held-work release or boot
+autostart followed. Old campaigns, the recovery backup and failed-start evidence
+remain protected. The bound loop intentionally retains its backing-file lease;
+do not repeat earlier detached-loop cleanup or raw-source locking.
+
+Current evidence and operator requirements live in the Hub notes
+`reviews/test-engine-restored-20261024.md` and
+`runbooks/current-staging-readiness-20261022.md`. Consult those before selecting
+an endpoint, artifact or capacity budget. The observations below predate this
+maintenance and must not be used as current process/capacity facts.
+
+## Historical read-only staging host assessment
 
 Read-only SSH observations on `192.168.50.90`, 24 October 2026, approximately
 15:15 UTC. No credential contents, service environment or private key files were
@@ -35,9 +58,10 @@ IDs and available memory are point-in-time facts.
 
 ## Non-negotiable shared-host boundary
 
-The old UID10001 daemon, offline `loop8` TEST filesystem, and campaigns identified
-as `5550`/`8a5b` remain outside this module's ownership. Do not mount, repair,
-activate, release, adopt, migrate or delete them. Do not create a fresh queue,
+The UID10001 TEST daemon, `loop8` filesystem, and campaigns identified as
+`5550`/`8a5b` remain outside this module's ownership. Their separately approved
+maintenance does not authorize this module to mount, repair, activate, release,
+adopt, migrate or delete them. Do not create a fresh queue,
 database, machine alias or Docker daemon to evade their canonical physical-machine
 hold. Offline processes and missing sockets are not proof that an uncertain
 operation has been reconciled.
@@ -105,10 +129,10 @@ IP SAN, with no environment proxy, default-CA or disabled-TLS fallback.
    `capacity_bytes` and `free_floor_bytes`; the proposed small-host configuration
    uses 128 MiB and 4 GiB respectively. These checks bound worker storage but do
    not bound a separate Docker image store or unrelated application growth.
-   Current approximately 677 MiB headroom cannot justify the old default 1 GiB
+   The historical approximately 677 MiB headroom could not justify the default 1 GiB
    worker budget, and even 128 MiB is not acceptance without the remaining budget.
    Additional storage or cleanup needs an exact ownership and capacity plan; never
-   repair or reclaim `loop8` to make this fit.
+   repair or reclaim `loop8` under modular-worker authority to make this fit.
 4. Provision the dedicated worker credential, private TLS material and source
    allowlist through the protected-file workflow. Do not reuse an agent MCP
    token, paste secrets into chat, commit them or expose them to build jobs.
