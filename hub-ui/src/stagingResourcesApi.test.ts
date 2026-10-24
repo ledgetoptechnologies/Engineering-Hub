@@ -251,16 +251,20 @@ describe("held jobs and recheck", () => {
     expect(() => parseStagingStatus({ ...ready, held_jobs: [held, held] })).toThrow(HubApiError);
   });
   it("posts an empty body with CSRF to the job's reconcile route and checks the reply is for that job", async () => {
-    const { calls, fetchImpl } = recorder(jsonResponse({ job: { id: id(990), state: "failed" }, resource_ids: [id(3)], phase: "failed" }));
+    const { calls, fetchImpl } = recorder(jsonResponse({ job: { id: id(990), state: "failed" }, resource_ids: { workspace: id(3), build: id(4) }, phase: "failed" }));
     const result = await recheckJob(id(990), "token", fetchImpl);
     expect(calls[0].url).toBe(`/api/hub/v1/staging/jobs/${id(990)}/reconcile`);
     expect(calls[0].init.body).toBe("{}");
     expect((calls[0].init.headers as Record<string, string>)["X-Hub-CSRF"]).toBe("token");
     expect(result.job.state).toBe("failed");
-    expect(() => parseRecheckResult({ job: { id: id(991), state: "failed" }, resource_ids: [], phase: "failed" }, id(990))).toThrow(HubApiError);
+    expect(result.resource_ids).toEqual({ workspace: id(3), build: id(4) });
+    for (const resource_ids of [[id(3)], { container: id(3) }, { workspace: "x" }])
+      expect(() => parseRecheckResult({ job: { id: id(990), state: "failed" }, resource_ids, phase: "failed" }, id(990))).toThrow(HubApiError);
+    expect(parseRecheckResult({ job: { id: id(990), state: "held" }, resource_ids: {}, phase: "held" }, id(990)).resource_ids).toEqual({});
+    expect(() => parseRecheckResult({ job: { id: id(991), state: "failed" }, resource_ids: {}, phase: "failed" }, id(990))).toThrow(HubApiError);
   });
   it("calls only a finished outcome settled", () => {
-    const at = (state: string) => recheckSummary({ job: { id: id(990), state }, resource_ids: [], phase: "x" });
+    const at = (state: string) => recheckSummary({ job: { id: id(990), state }, resource_ids: {}, phase: "x" });
     expect(at("failed")).toEqual({ text: "Confirmed: the original job failed. It's no longer on hold.", settled: true });
     expect(at("succeeded").settled).toBe(true);
     expect(at("held").settled).toBe(false);

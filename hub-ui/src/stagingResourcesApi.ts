@@ -44,7 +44,7 @@ export interface StagingStatus {
 }
 export interface HeldJob { id: string; project: string; recipe: string; state: "claimed" | "held"; phase: string; source_commit: string }
 /** A recheck reads the original operation's outcome. It never re-runs the job or force-releases the machine. */
-export interface RecheckResult { job: { id: string; state: string }; resource_ids: string[]; phase: string }
+export interface RecheckResult { job: { id: string; state: string }; resource_ids: Partial<Record<ResourceKind, string>>; phase: string }
 /** Every keep change carries a reason, including letting an item expire again. */
 export type KeepRequest = { mode: "until"; until: string; reason: string } | { mode: "pinned" | "none"; reason: string };
 
@@ -278,7 +278,13 @@ export function parseRecheckResult(value: unknown, jobId: string): RecheckResult
   const row = object(value), job = object(row.job);
   if (matching(job.id, uuid) !== jobId) return invalid();
   return { job: { id: jobId, state: oneOf(job.state, ["queued", "claimed", "held", "succeeded", "failed", "cancelled"] as const) },
-    resource_ids: idList(row.resource_ids, 100), phase: matching(row.phase, codePattern) };
+    resource_ids: resourceIdMap(row.resource_ids), phase: matching(row.phase, codePattern) };
+}
+/** A job's resources by kind: at most one of each known kind, each a canonical UUID. */
+function resourceIdMap(value: unknown): Partial<Record<ResourceKind, string>> {
+  const map: Partial<Record<ResourceKind, string>> = {};
+  for (const [kind, id] of Object.entries(object(value))) map[oneOf(kind, RESOURCE_KINDS)] = matching(id, uuid);
+  return map;
 }
 export async function recheckJob(jobId: string, csrf: string, fetchImpl: typeof fetch = globalThis.fetch): Promise<RecheckResult> {
   if (!isResourceId(jobId)) throw new HubApiError(422, "invalid_input");

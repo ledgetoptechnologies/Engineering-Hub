@@ -49,7 +49,7 @@ export function demoSource(store = new DemoResourceStore()): ResourceSource {
     recheck: async (jobId) => {
       // The demo's held job turns out to have failed; nothing re-runs.
       demoHeld = demoHeld.filter(job => job.id !== jobId);
-      return { job: { id: jobId, state: "failed" }, resource_ids: [], phase: "failed" };
+      return { job: { id: jobId, state: "failed" }, resource_ids: {}, phase: "failed" };
     },
   };
 }

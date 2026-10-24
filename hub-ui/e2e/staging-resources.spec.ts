@@ -255,7 +255,7 @@ test("the owner can recheck a held job: it's confirmed, says it won't re-run, an
   const { state } = await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: {}, can_reconcile: true, held_jobs: [heldJob] } });
   await page.route(`**/api/hub/v1/staging/jobs/${heldJob.id}/reconcile`, (route) => {
     state.posts.push({ path: new URL(route.request().url()).pathname, body: route.request().postDataJSON(), csrf: route.request().headers()["x-hub-csrf"] });
-    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ job: { id: heldJob.id, state: "held" }, resource_ids: [], phase: "held" }) });
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ job: { id: heldJob.id, state: "held" }, resource_ids: { workspace: "5ea9e000-0000-4000-8000-000000000003" }, phase: "held" }) });
   });
   await page.goto("/#/staging");
   const held = panel(page).getByRole("group", { name: "Held staging jobs" });
