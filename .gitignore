@@ -13,6 +13,7 @@ hub-ui/playwright-report/
 .coverage
 htmlcov/
 services/staging/build/
+services/staging-assets/build/
 data/
 *.sqlite3
 *.sqlite3-*
