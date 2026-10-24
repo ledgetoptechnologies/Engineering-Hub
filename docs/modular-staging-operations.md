@@ -107,7 +107,7 @@ IP SAN, with no environment proxy, default-CA or disabled-TLS fallback.
    not bound a separate Docker image store or unrelated application growth.
    Current approximately 677 MiB headroom cannot justify the old default 1 GiB
    worker budget, and even 128 MiB is not acceptance without the remaining budget.
-   Additional storage or known-owned cleanup must be separately approved; never
+   Additional storage or cleanup needs an exact ownership and capacity plan; never
    repair or reclaim `loop8` to make this fit.
 4. Provision the dedicated worker credential, private TLS material and source
    allowlist through the protected-file workflow. Do not reuse an agent MCP

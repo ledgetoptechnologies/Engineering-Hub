@@ -411,7 +411,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     project_registry = ProjectRepository(repo)
     from .staging_module import compose_staging, configure_preview
     staging_module = compose_staging(repo,
-        path=settings.staging_config_path or settings.database.parent / 'staging-service.json',
+        path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
         machine_id=settings.staging_machine_id, queue=work_queue,
         conflicts=any(component is not None for component in (
             fixture_workflow, staging_dispatcher, container_pilot_workflow,

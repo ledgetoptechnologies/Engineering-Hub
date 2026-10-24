@@ -5,7 +5,7 @@ import pytest
 
 from engineering_hub.projects import ProjectRepository
 from engineering_hub.repository import HubError, PROJECTS
-from engineering_hub.work_queue import WorkAction
+from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget
 from tests.test_hub_api import BASE, agent_headers, hub, human_headers
 from tests.test_hub_interactive_api import call, rpc
 
@@ -99,8 +99,14 @@ def test_new_project_tasks_decisions_and_archive_history(hub):
     decision = call(client, 'hub_decision_request', {'project': 'landscript', 'title': 'Next meeting?',
         'options': ['Monday', 'Tuesday']})
     assert decision['project'] == 'landscript'
-    with pytest.raises(HubError, match='invalid_work_project'):
-        WorkAction('staging-pc', project='landscript')
+    # Dynamic metadata may be named by a trusted operator profile, but does not
+    # grant target admission or execution. No verifier means no submitted work.
+    queue = WorkQueue(app.state.repository,
+        {'landscript-check': WorkAction('staging-pc', project='landscript')})
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        queue.submit(actor='codex', request_id='metadata-is-not-authority',
+            action_key='landscript-check', environment='staging',
+            target=WorkTarget(task['id'], 'a' * 40, 'sha256:' + 'b' * 64))
     assert client.get(BASE + '/overview').json()['capabilities']['host_dispatch'] is False
     assert client.post(BASE + '/projects/landscript/archive', headers=human,
         json={'expected_revision': 1}).status_code == 200
