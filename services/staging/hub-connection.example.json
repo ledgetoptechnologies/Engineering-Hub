@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "enabled": false,
+  "auto_run": false,
+  "origin": "https://192.168.50.90:9443",
+  "credential_file": "/var/lib/hub/staging-private/worker.token",
+  "ca_file": "/var/lib/hub/staging-private/worker-ca.pem",
+  "admin_actors": [],
+  "preview_origin": null,
+  "projects": {
+    "engineering-hub": {"recipes": ["static-check"]}
+  }
+}

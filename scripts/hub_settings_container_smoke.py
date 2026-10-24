@@ -59,7 +59,8 @@ HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_
  'hub_planning_list','hub_planning_get','hub_planning_put',
  'hub_label_set_create','hub_label_set_put_image','hub_label_set_results',
  'hub_label_set_list','hub_entity_put_image','hub_entity_images','hub_entity_withdraw',
- 'hub_project_list','hub_project_get'}
+ 'hub_project_list','hub_project_get','hub_component_list','hub_component_get',
+ 'hub_interactive_review_create','hub_interactive_review_get','hub_interactive_review_list'}
 
 async def call(session, name, args=None):
     result = await session.call_tool(name, args or {})
@@ -121,7 +122,7 @@ async def main():
         fields = line.split()
         assert not (fields[3] == '0A' and int(fields[1].split(':')[1],16) in (8765,8770,8771))
     print(json.dumps({'settings_profile':'passed','build_commit':commit,'authenticated_agents':3,
-        'mcp_tools':46,'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
+        'mcp_tools':len(BUS | HUB),'preserved_message_and_task':'passed','browser_unauthorized':'rejected',
         'agent_bind':'0.0.0.0:8770','browser_bind':'0.0.0.0:8771','alias':'none'}))
 
 asyncio.run(asyncio.wait_for(main(),50))

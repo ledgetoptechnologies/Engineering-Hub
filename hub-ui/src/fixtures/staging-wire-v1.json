@@ -1,0 +1,111 @@
+{
+  "cleanup_plan": {
+    "digest": "sha256:6358dfe2480fae82e16ef06925e60016b4bb17c3fdbf4a9c2f85da2699eea146",
+    "expires_at": "2027-01-15T08:10:00+00:00",
+    "kept": [
+      {
+        "id": "01f7b8d6-a0f6-5a3a-8115-b06c627ed327",
+        "why": "protected"
+      }
+    ],
+    "plan_id": "dfcf48ca-7ed6-5591-a56e-edd9b2aedff5",
+    "remove": [
+      {
+        "id": "d7f4be8c-3b7c-519c-aa55-df20b62191a3",
+        "kind": "build",
+        "size_bytes": 2048,
+        "why": "expired"
+      }
+    ],
+    "total_bytes": 2048
+  },
+  "reconcile": {
+    "job": {
+      "actor": "codex",
+      "environment": "staging",
+      "id": "80f5b9fe-2138-50c2-afd5-758585210e1f",
+      "project": "engineering-hub",
+      "state": "held"
+    },
+    "phase": "held",
+    "resource_ids": {
+      "build": "d7f4be8c-3b7c-519c-aa55-df20b62191a3",
+      "preview": "01f7b8d6-a0f6-5a3a-8115-b06c627ed327"
+    },
+    "source_id": "ffd38110-e27b-5820-9d7d-40ef36105c7a"
+  },
+  "resources": {
+    "items": [
+      {
+        "artifact_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "created_at": "2026-12-31T08:00:00+00:00",
+        "created_by": "codex",
+        "expires_at": "2027-01-03T08:00:00+00:00",
+        "id": "01f7b8d6-a0f6-5a3a-8115-b06c627ed327",
+        "job_id": "80f5b9fe-2138-50c2-afd5-758585210e1f",
+        "keep": {
+          "at": "2027-01-15T08:00:00+00:00",
+          "by": "human:1",
+          "mode": "pinned",
+          "reason": "Synthetic example retained for review",
+          "until": null
+        },
+        "kind": "preview",
+        "last_viewed_at": null,
+        "preview_path": "/staging/previews/01f7b8d6-a0f6-5a3a-8115-b06c627ed327",
+        "project": "engineering-hub",
+        "protected": [
+          {
+            "reason": "decision_evidence",
+            "ref": "synthetic-wire-review"
+          }
+        ],
+        "revision": 5,
+        "size_bytes": null,
+        "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": "ready",
+        "topic": "Synthetic wire example",
+        "updated_at": "2027-01-15T08:00:00+00:00"
+      },
+      {
+        "artifact_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": "2026-12-31T08:00:00+00:00",
+        "created_by": "codex",
+        "expires_at": "2027-01-14T08:00:00+00:00",
+        "id": "d7f4be8c-3b7c-519c-aa55-df20b62191a3",
+        "job_id": "80f5b9fe-2138-50c2-afd5-758585210e1f",
+        "keep": null,
+        "kind": "build",
+        "last_viewed_at": null,
+        "preview_path": null,
+        "project": "engineering-hub",
+        "protected": [],
+        "revision": 3,
+        "size_bytes": 2048,
+        "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": "ready",
+        "topic": "Synthetic wire example",
+        "updated_at": "2026-12-31T08:00:00+00:00"
+      }
+    ],
+    "next_after": null
+  },
+  "status": {
+    "can_reconcile": true,
+    "configured": true,
+    "held_jobs": [
+      {
+        "id": "80f5b9fe-2138-50c2-afd5-758585210e1f",
+        "phase": "held",
+        "project": "engineering-hub",
+        "recipe": "static",
+        "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "state": "held"
+      }
+    ],
+    "previews_configured": false,
+    "profiles": {},
+    "reachable": false,
+    "running": false
+  }
+}

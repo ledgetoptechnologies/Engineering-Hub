@@ -1,0 +1,12 @@
+{
+  "purpose": "Beau-requested initial catalog; apply through authenticated human catalog API after update. Never an automatic startup seed or access grant.",
+  "components": [
+    {"project":"ledge-top-ops","slug":"viewer","name":"3D Viewer","kind":"web_app","status":"active","legacy_project_id":"3d-viewer"},
+    {"project":"ledge-top-ops","slug":"thumbnail-generation","name":"Thumbnail generation","kind":"package","status":"active"},
+    {"project":"ledge-top-ops","slug":"windows-app","name":"Windows app","kind":"desktop_app","status":"active"},
+    {"project":"ledge-top-processing","slug":"treedar","name":"TreeDAR","kind":"tool","status":"active","legacy_project_id":"treedar"},
+    {"project":"project-alpha","slug":"community","name":"Project Alpha Community","kind":"web_app","status":"active"},
+    {"project":"project-alpha","slug":"enterprise","name":"Project Alpha Enterprise","kind":"web_app","status":"paused"},
+    {"project":"project-alpha","slug":"ios","name":"Project Alpha iOS","kind":"mobile_app","status":"paused"}
+  ]
+}

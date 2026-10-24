@@ -13,6 +13,7 @@ import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
+import { ReviewPage } from "./ReviewsPanel";
 import type {
   Decision,
   EventsStatus,
@@ -552,9 +553,10 @@ export function HubApp() {
     { route: { page: "staging" }, label: "Staging", icon: "staging" },
   ];
   const isCurrent = (target: Route) => target.page === route.page
-    || (target.page === "projects" && (route.page === "project" || route.page === "labels"));
+    || (target.page === "projects" && (route.page === "project" || route.page === "labels" || route.page === "review"));
   const pageTitle = route.page === "project" ? projectName(route.id)
     : route.page === "labels" ? `${projectName(route.project)} labeling`
+    : route.page === "review" ? `${projectName(route.project)} review`
     : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
   const actions = (
     <>
@@ -700,7 +702,9 @@ export function HubApp() {
           </>
         ) : (
           <div className="page" key={route.page === "project" ? `project-${route.id}`
-            : route.page === "labels" ? `labels-${route.project}-${route.set}` : route.page}>
+            : route.page === "labels" ? `labels-${route.project}-${route.set}`
+            // A different review, project or signed-in person is a fresh page with no state carried over.
+            : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
@@ -714,6 +718,7 @@ export function HubApp() {
               </>
             )}
             {route.page === "labels" && <LabelSetPage hub={hub} project={route.project} setId={route.set} actions={actions} />}
+            {route.page === "review" && <ReviewPage hub={hub} project={route.project} id={route.id} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
             {route.page === "planning" && (
               <>

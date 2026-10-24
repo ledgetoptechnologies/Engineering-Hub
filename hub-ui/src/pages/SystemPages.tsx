@@ -8,6 +8,7 @@ import type { Hub } from "../hub";
 import type { AgentSummary } from "../types";
 import { Badge, Icon, PageHeader, PanelTitle, names, pretty } from "../ui";
 import { WorkQueuePanel } from "../WorkQueuePanel";
+import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { StagingBadge } from "./WorkPages";
 
@@ -237,6 +238,10 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
         )}
         <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
           stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+        <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
+          csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
+          projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
+          onUnauthorized={hub.clearPrivateWorkspace} />
       </div>
     </>
   );

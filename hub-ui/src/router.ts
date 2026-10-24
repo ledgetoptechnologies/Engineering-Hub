@@ -14,6 +14,7 @@ export type Route =
   | { page: "projects" }
   | { page: "project"; id: string; tab: ProjectTab }
   | { page: "labels"; project: string; set: string }
+  | { page: "review"; project: string; id: string }
   | { page: "notes" }
   | { page: "planning" }
   | { page: "agents" }
@@ -21,6 +22,7 @@ export type Route =
 
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const reviewId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
   decisions: { page: "inbox" },
@@ -78,6 +80,8 @@ export function parseRoute(value: string): Route {
         return { page: "project", id: parts[1], tab: parts[2] as ProjectTab };
       if (parts.length === 4 && parts[2] === "labels" && setId.test(parts[3]))
         return { page: "labels", project: parts[1], set: parts[3] };
+      if (parts.length === 4 && parts[2] === "reviews" && reviewId.test(parts[3]))
+        return { page: "review", project: parts[1], id: parts[3] };
       return { page: "project", id: parts[1], tab: "overview" };
     }
     default: return { page: "home" };
@@ -89,6 +93,7 @@ export function pathOf(route: Route): string {
     case "home": return "/";
     case "project": return `/projects/${route.id}${route.tab === "overview" ? "" : "/" + route.tab}`;
     case "labels": return `/projects/${route.project}/labels/${route.set}`;
+    case "review": return `/projects/${route.project}/reviews/${route.id}`;
     default: return `/${route.page}`;
   }
 }

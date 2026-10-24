@@ -53,6 +53,12 @@ _DDL = {
     'hub_label_items': 'CREATE TABLE hub_label_items (set_id TEXT NOT NULL, id TEXT NOT NULL, position INTEGER NOT NULL, meta TEXT NOT NULL, label TEXT, revision INTEGER NOT NULL, PRIMARY KEY(set_id,id))',
     'hub_label_images': 'CREATE TABLE hub_label_images (set_id TEXT NOT NULL, item_id TEXT NOT NULL, media_type TEXT NOT NULL, data BLOB NOT NULL, source_sha256 TEXT NOT NULL, PRIMARY KEY(set_id,item_id))',
     'hub_entity_images': 'CREATE TABLE hub_entity_images (id TEXT PRIMARY KEY, entity_kind TEXT NOT NULL, entity_id TEXT NOT NULL, data BLOB NOT NULL, media_type TEXT NOT NULL, source_sha256 TEXT NOT NULL, title TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL, entity_revision INTEGER NOT NULL)',
+    'hub_project_components': 'CREATE TABLE hub_project_components (id TEXT PRIMARY KEY, project TEXT NOT NULL, slug TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(project,slug))',
+    'hub_component_requests': 'CREATE TABLE hub_component_requests (actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, component_id TEXT NOT NULL, PRIMARY KEY(actor,key))',
+    'hub_interactive_reviews': 'CREATE TABLE hub_interactive_reviews (id TEXT PRIMARY KEY, project TEXT NOT NULL, component_id TEXT NOT NULL, data TEXT NOT NULL)',
+    'hub_interactive_review_requests': 'CREATE TABLE hub_interactive_review_requests (actor TEXT NOT NULL,key TEXT NOT NULL,fingerprint TEXT NOT NULL,review_id TEXT NOT NULL,PRIMARY KEY(actor,key))',
+    'hub_interactive_review_answer_events': 'CREATE TABLE hub_interactive_review_answer_events (review_id TEXT NOT NULL,revision INTEGER NOT NULL,item_id TEXT NOT NULL,actor TEXT NOT NULL,value TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(review_id,revision,item_id))',
+    'hub_interactive_asset_bindings': 'CREATE TABLE hub_interactive_asset_bindings (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)',
 }
 # Exact current native-module indexes only; this is not generic index admission.
 _INDEX_DDL = {
@@ -67,11 +73,14 @@ _GROUPS = (
     frozenset({'hub_delivery_namespace', 'hub_delivery_receipts', 'hub_delivery_sender'}),
     frozenset({'hub_projects', 'hub_project_registry_meta', 'hub_project_requests'}),
     frozenset({'hub_label_sets', 'hub_label_items', 'hub_label_images'}),
+    frozenset({'hub_project_components', 'hub_component_requests'}),
+    frozenset({'hub_interactive_reviews', 'hub_interactive_review_requests', 'hub_interactive_review_answer_events'}),
 )
 _OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
 _MAX_DB_BYTES = 256 * 1024 * 1024
 _MAX_ROWS = 1_000_000
 _MAX_CELL_BYTES = 1024 * 1024
+_MAX_REVIEW_DATA_BYTES = 4 * 1024 * 1024
 _MAX_LOGICAL_BYTES = 512 * 1024 * 1024
 
 
@@ -179,22 +188,26 @@ class _ColdFile:
             os.close(fd)
 
 
-def _typed(value):
+def _typed(value, *, maximum=None):
+    maximum = _MAX_CELL_BYTES if maximum is None else maximum
     if value is None:
         return ['null']
     if type(value) is bytes:
-        if len(value) > _MAX_CELL_BYTES:
+        if len(value) > maximum:
             raise EnrollmentError()
         return ['blob', value.hex()]
     if type(value) in {str, int, float}:
-        if type(value) is str and len(value.encode('utf-8')) > _MAX_CELL_BYTES:
+        if type(value) is str and len(value.encode('utf-8')) > maximum:
             raise EnrollmentError()
         return [type(value).__name__, value]
     raise EnrollmentError()
 
 
 def _snapshot(db, *, enrolled=False):
-    db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_CELL_BYTES)
+    # SQLite's length setting also bounds whole encoded rows. Permit the one
+    # reviewed larger TEXT cell plus its small fixed ID/project columns; every
+    # other individual cell retains the independent 1MiB check below.
+    db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_REVIEW_DATA_BYTES + 4096)
     if db.execute('SELECT COUNT(*) FROM sqlite_master').fetchone()[0] > 128:
         raise EnrollmentError()
     if db.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
@@ -247,8 +260,11 @@ def _snapshot(db, *, enrolled=False):
     for table in sorted(tables):
         digest = hashlib.sha256()
         count = 0
+        columns = ['rowid'] + [row[1] for row in db.execute('PRAGMA table_info("' + table + '")')]
         for row in db.execute('SELECT rowid,* FROM "' + table + '" ORDER BY rowid'):
-            encoded = canonical_json([_typed(value) for value in row]).encode()
+            encoded = canonical_json([_typed(value, maximum=_MAX_REVIEW_DATA_BYTES)
+                if table == 'hub_interactive_reviews' and column == 'data' and type(value) is str
+                else _typed(value) for column, value in zip(columns, row)]).encode()
             total_rows += 1
             total_bytes += len(encoded)
             if total_rows > _MAX_ROWS or total_bytes > _MAX_LOGICAL_BYTES:

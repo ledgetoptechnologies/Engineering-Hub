@@ -17,6 +17,9 @@ from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.attachments import EntityImageRepository
 from engineering_hub.label_sets import LabelSetRepository
+from engineering_hub.components import ProjectComponentRepository
+from engineering_hub.interactive_reviews import InteractiveReviewRepository
+from engineering_hub.interactive_service import InteractiveService
 from engineering_hub.pilot_ownership import PilotOwner
 from engineering_hub.repository import HubRepository
 from engineering_hub import pilot_enrollment as enrollment
@@ -60,6 +63,25 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
     labels.upload_image('fixture', 'item-1', content=output.getvalue(), content_type='image/png', actor='codex')
     labels.label('fixture', 'item-1', choice='yes', expected_revision=0, actor='human:42')
     expected_labels, expected_label_image = labels.results('fixture'), labels.image('fixture', 'item-1')
+    components = ProjectComponentRepository(repo)
+    component = components.create_component('human:42', '3d-viewer', 'native-review',
+        'Native review component', 'component-request', status='active', legacy_project_id='treedar')
+    asset_id = str(uuid.uuid4())
+    assets = InteractiveService(assets={asset_id: {'project': '3d-viewer', 'component_id': component['id'],
+        'size': 17, 'sha256': 'b' * 64, 'media_type': 'application/octet-stream'}})
+    assets.pin_assets(repo)
+    reviews = InteractiveReviewRepository(repo, components, authorize=lambda *args: True,
+                                         asset_authorize=assets.asset_authorize)
+    review = reviews.create_review('codex', '3d-viewer', component['id'], component['revision'],
+        'native-review-topic', 'sha256:' + 'c' * 64, 'Preserve review',
+        [{'id': 'label', 'title': 'Classify', 'prompt': 'Synthetic classification', 'asset_id': asset_id,
+          'choices': [{'id': 'yes', 'label': 'Yes'}, {'id': 'no', 'label': 'No'}]},
+         {'id': 'note', 'title': 'Note', 'prompt': 'Synthetic note'}], 'review-request')
+    completed_review = reviews.answer_review('human:42', review['id'], review['revision'], 'answers-request',
+        [{'item_id': 'label', 'value': 'yes'}, {'item_id': 'note', 'value': 'Preserve human attribution'}], complete=True)
+    with repo._connection() as db:
+        expected_asset_bindings = [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_asset_bindings ORDER BY id')]
+        expected_answer_events = [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_review_answer_events ORDER BY revision,item_id')]
     archived = projects.archive_project('human:42', project['id'], project['revision'])
     # All operations above use scoped connections. No active app/queue exists.
     repo.close()
@@ -87,6 +109,14 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
         assert EntityImageRepository(owned).image(image_id=image_id, actor='human:42') == expected_image
         assert LabelSetRepository(owned).results('fixture') == expected_labels
         assert LabelSetRepository(owned).image('fixture', 'item-1') == expected_label_image
+        owned_components = ProjectComponentRepository(owned)
+        assert owned_components.get_component(component['id']) == component
+        owned_reviews = InteractiveReviewRepository(owned, owned_components,
+            authorize=lambda *args: True, asset_authorize=assets.asset_authorize)
+        assert owned_reviews.get_review('human:42', review['id']) == completed_review
+        with owned._connection() as db:
+            assert [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_asset_bindings ORDER BY id')] == expected_asset_bindings
+            assert [tuple(row) for row in db.execute('SELECT * FROM hub_interactive_review_answer_events ORDER BY revision,item_id')] == expected_answer_events
         with closing(sqlite3.connect(copied)) as db:
             assert enrollment._snapshot(db, enrolled=True) == before
     assert source.read_bytes() == original and snapshot(source) == before
@@ -98,6 +128,7 @@ def test_current_composed_app_cold_copy_initial_enrollment_preserves_native_stat
 @pytest.mark.parametrize('hazard', [
     'partial-project', 'partial-label', 'project-shape', 'image-shape',
     'unknown-index', 'index-wrong-columns', 'missing-native-index', 'native-trigger',
+    'partial-component', 'partial-review', 'review-shape', 'asset-binding-shape', 'unknown-review-index',
 ])
 def test_current_optional_schema_admission_remains_exact_and_read_only(ledger, hazard):
     path, repo, *_ = ledger
@@ -118,6 +149,17 @@ def test_current_optional_schema_admission_remains_exact_and_read_only(ledger, h
             db.execute('CREATE INDEX hub_label_sets_project ON hub_label_sets(id)')
         elif hazard == 'missing-native-index':
             db.execute('DROP INDEX hub_entity_images_entity')
+        elif hazard == 'partial-component':
+            db.execute('DROP TABLE hub_component_requests')
+        elif hazard == 'partial-review':
+            db.execute('DROP TABLE hub_interactive_review_answer_events')
+        elif hazard == 'review-shape':
+            db.execute('ALTER TABLE hub_interactive_reviews ADD COLUMN extra TEXT')
+        elif hazard == 'asset-binding-shape':
+            db.execute(enrollment._DDL['hub_interactive_asset_bindings'])
+            db.execute('ALTER TABLE hub_interactive_asset_bindings ADD COLUMN extra TEXT')
+        elif hazard == 'unknown-review-index':
+            db.execute('CREATE INDEX unreviewed_index ON hub_interactive_reviews(project)')
         else:
             db.execute('CREATE TRIGGER extra AFTER INSERT ON hub_projects BEGIN SELECT 1; END')
     before = path.read_bytes()

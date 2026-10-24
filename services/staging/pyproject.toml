@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hub-staging-service"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+description = "Private one-operation staging worker for Engineering Hub"
+
+[project.scripts]
+hub-staging-service = "hub_staging_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "../../src"}
+packages = ["hub_staging_service"]

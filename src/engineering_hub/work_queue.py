@@ -29,6 +29,7 @@ from .repository import AGENTS, PROJECTS, HubError
 # Public REST/MCP derive their worker from authenticated AGENTS and cannot select it.
 SOFTWARE_VALIDATION_EXECUTOR = 'executor:software-validation'
 CONTAINER_PILOT_EXECUTOR = 'executor:container-pilot'
+STAGING_SERVICE_EXECUTOR = 'executor:staging-service'
 
 
 def _key(value):
@@ -46,7 +47,7 @@ class WorkAction:
 
     def __post_init__(self):
         _key(self.machine_id)
-        if type(self.project) is not str or self.project not in PROJECTS:
+        if type(self.project) is not str or re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', self.project) is None:
             raise HubError('invalid_work_project')
         if type(self.requires_execution_proof) is not bool:
             raise HubError('invalid_work_execution_proof_policy')
@@ -80,7 +81,7 @@ class WorkWorker:
         except ValueError:
             valid = False
         if (type(self.agent) is not str
-                or self.agent not in {*AGENTS, SOFTWARE_VALIDATION_EXECUTOR, CONTAINER_PILOT_EXECUTOR} or not valid):
+                or self.agent not in {*AGENTS, SOFTWARE_VALIDATION_EXECUTOR, CONTAINER_PILOT_EXECUTOR, STAGING_SERVICE_EXECUTOR} or not valid):
             raise HubError('invalid_work_worker')
 
     def encoded(self):
@@ -141,6 +142,9 @@ class WorkQueue:
             _key(key)
             if type(action) is not WorkAction:
                 raise HubError('invalid_work_registry')
+            # Retain historical profiles at startup; archival denies new
+            # admission/claims below without taking the whole Hub offline.
+            repo._project(action.project, require_active=False)
         if type(max_jobs) is not int or not 1 <= max_jobs <= 100000:
             raise HubError('invalid_work_capacity')
         if not callable(clock) or any(v is not None and not callable(v) for v in (approval_verifier, reconciliation_verifier, completion_verifier, target_verifier, claim_verifier, production_readiness_verifier)):
@@ -261,6 +265,7 @@ class WorkQueue:
         action = self.actions.get(action_key)
         if action is None or environment not in action.environments:
             raise HubError('work_action_not_registered', 403)
+        self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
         if not self._target_verified(actor, action_key, environment, target):
@@ -297,6 +302,7 @@ class WorkQueue:
     def _eligible_target(self, row):
         """Current registry, approval and target policy, independent of worker."""
         try:
+            self.repo._project(row['project'])
             action = self.actions.get(row['action_key'])
             return (type(action) is WorkAction and action.machine_id == row['machine_id']
                 and action.project == row['project']
