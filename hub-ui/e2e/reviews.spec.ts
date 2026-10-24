@@ -18,7 +18,7 @@ async function fixture(page: Page, options: { actor?: string; unsupported?: bool
   overview.projects = overview.projects.map((project) => ({ ...project, description: "", repository_url: null, lead_agent: null,
     status: "on_track", parent_project: null, archived: false, revision: 1 }));
   const reviews = new DemoReviewStore(), components = new DemoComponentStore();
-  const state = { posts: [] as { body: Record<string, unknown>; csrf?: string }[], conflictNext: false, componentChanged: false, assetReads: 0 };
+  const state = { posts: [] as { body: Record<string, unknown>; csrf?: string }[], conflictNext: false, componentChanged: false, signedOut: false, assetReads: 0 };
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname, method = request.method();
     const respond = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
@@ -45,6 +45,7 @@ async function fixture(page: Page, options: { actor?: string; unsupported?: bool
       if (answers && method === "POST") {
         const body = request.postDataJSON() as Record<string, unknown>;
         state.posts.push({ body, csrf: request.headers()["x-hub-csrf"] });
+        if (state.signedOut) return respond({ detail: { code: "sign_in_required" } }, 401);
         if (state.conflictNext) { state.conflictNext = false; return respond({ detail: { code: "revision_conflict" } }, 409); }
         if (state.componentChanged) return respond({ detail: { code: "review_component_changed" } }, 409);
         try { return respond(reviews.answer(answers[1], body as never, human)); }
@@ -171,4 +172,18 @@ test("demo mode shows a placeholder review, and its sample says it can't load", 
   await question(page, "Tree 1").getByRole("button", { name: "Show 3D sample" }).click();
   await expect(page.getByText("Samples don't load in demo mode.")).toBeVisible();
   expect(requests.filter((url) => url.includes("/interactive-reviews/"))).toEqual([]);
+});
+
+test("a sign-out while answering clears the review and its unsaved text, without asking", async ({ page }) => {
+  const { state } = await fixture(page);
+  await page.goto(reviewUrl);
+  await question(page, "Anything else").getByLabel("Your answer").fill("private unsaved review note");
+  const dialogs: string[] = [];
+  page.on("dialog", (dialog) => { dialogs.push(dialog.type()); void dialog.dismiss(); });
+  state.signedOut = true;
+  await page.getByRole("button", { name: "Save answers" }).click();
+  await expect(page.getByRole("link", { name: /Sign in securely/ })).toBeVisible();
+  await expect(page.getByText("private unsaved review note")).toHaveCount(0);
+  await expect(page.getByText("Check sample tree crowns")).toHaveCount(0);
+  expect(dialogs).toEqual([]);
 });
