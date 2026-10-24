@@ -7,6 +7,35 @@ export type Point = [number, number, number] | [number, number, number, number, 
 export type PointCloud = { schema: "pointcloud.v1"; points: Point[]; units?: string };
 const unsupported = () => new Error("This asset is not a supported small pointcloud.v1 JSON preview.");
 
+/** Normalize before subtraction: finite extremes must never overflow the canvas. */
+export function projectPointCloud(points: Point[], view: { yaw: number; pitch: number; zoom: number },
+                                  width: number, height: number): [number, number][] {
+  let magnitude = 0;
+  for (const p of points) magnitude = Math.max(magnitude, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+  magnitude ||= 1;
+  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+  for (const p of points) for (let i = 0; i < 3; i++) {
+    const normalized = p[i] / magnitude;
+    low[i] = Math.min(low[i], normalized); high[i] = Math.max(high[i], normalized);
+  }
+  const center = low.map((v, i) => (v + high[i]) / 2);
+  const span = Math.max(...low.map((v, i) => high[i] - v)) || 1;
+  const zoom = Number.isFinite(view.zoom) ? Math.max(0.25, Math.min(4, view.zoom)) : 1;
+  const yaw = Number.isFinite(view.yaw) ? view.yaw : 0;
+  const pitch = Number.isFinite(view.pitch) ? view.pitch : 0;
+  const scale = Math.min(width, height) * 0.75 * zoom;
+  const sy = Math.sin(yaw), cy = Math.cos(yaw), sp = Math.sin(pitch), cp = Math.cos(pitch);
+  return points.map(p => {
+    const x = (p[0] / magnitude - center[0]) / span;
+    const y = (p[1] / magnitude - center[1]) / span;
+    const z = (p[2] / magnitude - center[2]) / span;
+    const rx = cy * x - sy * y, depth = sy * x + cy * y;
+    const ry = cp * z - sp * depth;
+    return [Math.max(-width * 4, Math.min(width * 5, width / 2 + rx * scale)),
+      Math.max(-height * 4, Math.min(height * 5, height / 2 - ry * scale))];
+  });
+}
+
 export function parsePointCloud(value: unknown): PointCloud {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw unsupported();
   const item = value as Record<string, unknown>;
@@ -96,24 +125,11 @@ export function PointCloudReview({ url }: { url: string }) {
       element.width = Math.round(width * ratio); element.height = Math.round(height * ratio);
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.fillStyle = "#101b2a"; context.fillRect(0, 0, width, height);
-      let magnitude = 1;
-      for (const p of cloud.points) magnitude = Math.max(magnitude, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
-      const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
-      for (const p of cloud.points) for (let i = 0; i < 3; i++) {
-        low[i] = Math.min(low[i], p[i] / magnitude); high[i] = Math.max(high[i], p[i] / magnitude);
-      }
-      const center = low.map((v, i) => (v + high[i]) / 2);
-      const span = Math.max(...low.map((v, i) => high[i] - v)) || 1;
-      const scale = Math.min(width, height) * 0.75 * view.zoom;
-      const sy = Math.sin(view.yaw), cy = Math.cos(view.yaw), sp = Math.sin(view.pitch), cp = Math.cos(view.pitch);
-      for (const p of cloud.points) {
-        const x = (p[0] / magnitude - center[0]) / span;
-        const y = (p[1] / magnitude - center[1]) / span;
-        const z = (p[2] / magnitude - center[2]) / span;
-        const rx = cy * x - sy * y, depth = sy * x + cy * y;
-        const ry = cp * z - sp * depth;
+      const projected = projectPointCloud(cloud.points, view, width, height);
+      for (let i = 0; i < cloud.points.length; i++) {
+        const p = cloud.points[i];
         context.fillStyle = p.length === 6 ? `rgb(${p[3]},${p[4]},${p[5]})` : "#77d8bc";
-        context.fillRect(width / 2 + rx * scale, height / 2 - ry * scale, 2, 2);
+        context.fillRect(projected[i][0], projected[i][1], 2, 2);
       }
     };
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw); };
