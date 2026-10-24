@@ -58,6 +58,7 @@ class Settings:
     registry_origin: str | None = None
     registry_events_enabled: bool = False
     require_owned_ledger: bool = False
+    staging_config_path: Path | None = None
 
     def __post_init__(self):
         if type(self.require_owned_ledger) is not bool:
@@ -133,7 +134,9 @@ class Settings:
                    registry_enabled=registry_flag == '1',
                    registry_origin=os.environ.get('HUB_REGISTRY_ORIGIN'),
                    registry_events_enabled=registry_events_flag == '1',
-                   require_owned_ledger=deployment.protected_ledger if deployment is not None else False)
+                   require_owned_ledger=deployment.protected_ledger if deployment is not None else False,
+                   staging_config_path=(deployment.state_root / 'staging-service.json'
+                                        if deployment is not None else path.parent / 'staging-service.json'))
 
 
 class Input(BaseModel):
@@ -406,6 +409,17 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .attachments import EntityImageRepository
     from .projects import ProjectRepository
     project_registry = ProjectRepository(repo)
+    from .staging_module import compose_staging, configure_preview
+    staging_module = compose_staging(repo,
+        path=settings.staging_config_path or settings.database.parent / 'staging-service.json',
+        machine_id=settings.staging_machine_id, queue=work_queue,
+        conflicts=any(component is not None for component in (
+            fixture_workflow, staging_dispatcher, container_pilot_workflow,
+            owned_pilot_service, queued_pilot_runtime)))
+    if staging_module.controller is not None:
+        work_queue = staging_module.controller.queue
+    configure_preview(staging_module, repo=repo, sessions=sessions,
+                      hub_origin=settings.auth_config.origin)
     if notes_repository is not None:
         # Configure the one writer captured by the original MCP tools as well
         # as notes/planning. No per-request or remotely supplied guard exists.
@@ -420,6 +434,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           label_sets=label_sets,
                           entity_images=entity_images,
                           project_registry=project_registry,
+                          staging_controller=staging_module.controller,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
     origin = urlsplit(settings.auth_config.origin)
@@ -448,6 +463,18 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         async def stop_components():
             nonlocal cleanup_started
             cleanup_started = True
+            from .lifecycle import finish_owned
+            async def stop_all():
+                try:
+                    if staging_module.controller is not None:
+                        await staging_module.controller.close()
+                    elif staging_module.client is not None:
+                        await staging_module.client.aclose()
+                finally:
+                    await stop_existing_components()
+            await finish_owned(stop_all())
+
+        async def stop_existing_components():
             if owned_pilot_service is not None:
                 await owned_pilot_service.stop(runtime, feed)
             else:
@@ -481,6 +508,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                             raise HubError('queued_pilot_startup_unavailable', 503)
                     if runtime is not None:
                         await runtime.start()
+                    if (staging_module.controller is not None
+                            and staging_module.config.auto_run):
+                        await staging_module.controller.start()
                     yield
                 finally:
                     if bus_app is not None:
@@ -495,6 +525,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
+    app.state.modular_staging = staging_module
+    app.state.preview_app = staging_module.preview_app
+    app.state.preview_origin = (staging_module.preview_broker.preview_origin
+                                if staging_module.preview_broker is not None else None)
     app.state.embedded_bus = bus_app
     if bus_app is not None:
         bus_app.state.hub_owner = app
@@ -536,9 +570,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         if "Content-Security-Policy" not in response.headers:
+            frame_source = ("; frame-src " + staging_module.preview_broker.preview_origin
+                            if staging_module.preview_broker is not None else "")
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
+                + frame_source
             )
         return response
 
@@ -584,6 +621,19 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     def agent(request: Request):
         return settings.agent_auth.agent(request)
+
+    def preview_session(request: Request):
+        principal = human(request, mutation=True)
+        binding = sessions.preview_session_binding(
+            principal, request.cookies.get(settings.auth_config.cookie_name))
+        if binding is None:
+            raise HubError('preview_unavailable', 403)
+        return binding
+
+    from .staging_api import attach_staging_routes
+    attach_staging_routes(app, staging_module.controller, actor, human,
+        preview_broker=staging_module.preview_broker, preview_session=preview_session,
+        module_status=staging_module.status)
 
     from .task_proposal_api import attach_staging_task_routes
     attach_staging_task_routes(app, repo=repo, agent=agent)

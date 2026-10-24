@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import secrets
 import sqlite3
 import time
@@ -186,6 +187,37 @@ class SessionStore:
         if token:
             with self._db() as db:
                 db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (_hash(token),))
+
+    def preview_session_binding(self, actor, token):
+        """Bind an already authenticated human to an existing local session.
+
+        The caller still performs normal identity and CSRF verification. Only a
+        hash and expiry leave this boundary; preview readers never get cookies.
+        """
+        if type(token) is not str or not token:
+            return None
+        digest = _hash(token)
+        expiry = self._preview_session_expiry(actor, digest)
+        return (digest, expiry) if expiry is not None else None
+
+    def preview_session_alive(self, actor, token_hash):
+        return self._preview_session_expiry(actor, token_hash) is not None
+
+    def _preview_session_expiry(self, actor, token_hash):
+        if (type(actor) is not str or type(token_hash) is not str
+                or re.fullmatch('[a-f0-9]{64}', token_hash) is None):
+            return None
+        with self._read_db() as db:
+            if actor.startswith('human:cf:'):
+                if db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('auth_access_sessions','auth_access_identities')").fetchone()[0] != 2:
+                    return None
+                row = db.execute('''SELECT s.expires FROM auth_access_sessions s
+                    JOIN auth_access_identities i ON i.actor=s.actor AND i.binding=s.binding
+                    WHERE s.token_hash=? AND s.actor=?''', (token_hash, actor)).fetchone()
+            else:
+                row = db.execute("SELECT expires FROM auth_sessions WHERE token_hash=? AND 'human:' || github_id=?",
+                                 (token_hash, actor)).fetchone()
+        return row[0] if row and row[0] > self.clock() else None
 
     @staticmethod
     def _cloudflare_binding(config, identity):

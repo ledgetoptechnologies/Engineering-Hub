@@ -1,0 +1,28 @@
+{
+  "worker_root": "/home/bkoltz/.local/state/engineering-hub-staging/v1",
+  "token_file": "/home/bkoltz/.config/engineering-hub-staging/worker.token",
+  "bind": "127.0.0.1",
+  "port": 8782,
+  "allowed_peer_ips": ["127.0.0.1"],
+  "docker_endpoint": "unix:///run/user/1000/eh-staging-docker.sock",
+  "capacity_bytes": 134217728,
+  "free_floor_bytes": 4294967296,
+  "projects": {
+    "engineering-hub": {
+      "recipes": {
+        "static-check": {
+          "image_id": "sha256:REPLACE_WITH_REVIEWED_CACHED_TOOLCHAIN_DIGEST",
+          "build_argv": ["/bin/sh", "-c", "cp -R public/. /output/"],
+          "test_argv": ["/bin/sh", "-c", "test -f /output/index.html"],
+          "cpus": 1,
+          "memory_mb": 256,
+          "pids": 64,
+          "timeout_seconds": 120,
+          "workspace_bytes": 67108864,
+          "output_bytes": 1048576,
+          "log_bytes": 65536
+        }
+      }
+    }
+  }
+}

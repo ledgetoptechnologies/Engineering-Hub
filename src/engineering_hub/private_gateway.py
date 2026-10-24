@@ -34,11 +34,11 @@ _GET = frozenset({
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics',
-        'staging/session-reconciliation')),
+        'staging/session-reconciliation', 'staging/status', 'staging/resources')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
     'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning',
-    'staging/session-reconciliation'))
+    'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply'))
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',
@@ -59,18 +59,22 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/staging/(?:resources|jobs)/' + _UUID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/attachments', path) is not None
                 or re.fullmatch(r'/api/hub/v1/attachments/' + _UUID + '/image', path) is not None
                 or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + r'(?:/results|/items/' + _LABEL_ID + '/image)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/topics/' + _TOPIC + r'/(?:peers|preflight|events)', path) is not None)
     if method == 'PUT':
-        return re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
+        return (re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
+                or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None)
     if method == 'PATCH':
         return re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
     return method == 'POST' and (path in _POST or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         or path == '/api/hub/v1/projects'
+        or re.fullmatch(r'/api/hub/v1/staging/resources/' + _UUID + '/(?:keep|preview-session)', path) is not None
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/archive', path) is not None)
 
 

@@ -5,6 +5,7 @@ This composes application boundaries; it does not bind sockets, establish a
 tunnel, or permit another process to open an owner-enrolled database.
 """
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
@@ -16,6 +17,7 @@ from .ingress import HubIngressMiddleware
 class _FrontDoor:
     def __init__(self, pair, mode):
         self.pair = pair
+        self.mode = mode
         self.ingress = HubIngressMiddleware(
             pair.core, mode=mode, agent_auth=pair.settings.agent_auth,
             cloudflare_config=pair.settings.auth_config.cloudflare_config,
@@ -37,6 +39,17 @@ class _FrontDoor:
             await JSONResponse({"detail": {"code": "hub_not_ready"}}, status_code=503,
                                headers={"Cache-Control": "no-store"})(scope, receive, send)
             return
+        # Static arbitrary website code has a separate origin and a short-lived
+        # scoped capability. It never enters the Hub cookie/Access middleware.
+        # The agent listener has no such exception. Exact Host and ticket checks
+        # remain inside the preview app; forwarded host headers are ignored.
+        preview = getattr(self.pair.core.state, 'preview_app', None)
+        origin = getattr(self.pair.core.state, 'preview_origin', None)
+        if self.mode == 'browser' and preview is not None and origin is not None:
+            hosts = [v for k, v in scope.get('headers', []) if k.lower() == b'host']
+            if hosts == [urlsplit(origin).netloc.encode('ascii')]:
+                await preview(scope, receive, send)
+                return
         await self.ingress(scope, receive, send)
 
 

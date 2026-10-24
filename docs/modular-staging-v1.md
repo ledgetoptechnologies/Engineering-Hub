@@ -42,10 +42,19 @@ SHA256 is independently verified. Resource IDs and canonical ownership are
 issued by EH, not supplied by a browser or inferred from Docker discovery.
 Unknown size stays null. A project record alone grants no execution or read access.
 
+V1 accepts ZIP sources for fixed offline build/test profiles and serves static
+website output. It does not host arbitrary long-running backend services or
+download dependencies during a job. Preview builds must use relative asset URLs;
+paths are canonical ASCII, with no query strings or SPA fallback routing yet.
+
 ### EH API
 
 - `GET /api/hub/v1/staging/status`: configured state, worker reachability and
   supported profiles. Never expose credentials, host paths or internal URLs.
+  Shape: `{configured, running, reachable, profiles, previews_configured}`;
+  the first three fields are booleans. An optional `state` explains an absent,
+  invalid, disabled or unavailable configuration. Reachable is an HTTP status
+  observation, not verified execution readiness.
 - `GET /api/hub/v1/staging/resources?project=&kind=&state=&after=&limit=`:
   `{items: Resource[], next_after: string | null}`; limit 1–100.
 - `GET /api/hub/v1/staging/resources/{id}`: one Resource.
