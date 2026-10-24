@@ -6,6 +6,7 @@ const at = "2026-10-20T15:00:00.000Z";
 export const DEMO_REVIEW_ID = "d0e0a000-0000-4000-8000-000000000001";
 
 export class DemoReviewStore {
+  constructor(override: Partial<Review> = {}) { this.review = { ...this.review, ...override }; }
   private review: Review = {
     id: DEMO_REVIEW_ID, project: "treedar", component_id: "c0a1e000-0000-4000-8000-000000000004", component_revision: 1,
     topic: "demo-review", dataset_digest: "sha256:" + "b".repeat(64), schema: "choice-text.v1", title: "Check sample tree crowns",

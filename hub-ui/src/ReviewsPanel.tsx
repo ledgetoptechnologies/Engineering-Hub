@@ -130,25 +130,40 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
   const [reload, setReload] = useState(0);
   const clear = useRef(hub.clearPrivateWorkspace);
   clear.current = hub.clearPrivateWorkspace;
+  // Bumped whenever this page stops being the same review for the same session (or unmounts):
+  // late answers from an earlier load or save are then dropped, and no further batch is sent.
+  const generation = useRef(0);
+  const identity = useRef<{ id: string; project: string; source: ReviewSource } | null>(null);
   const unsaved = review ? unsavedAnswers(review, drafts) : [];
   const unsavedRef = useRef(0); unsavedRef.current = unsaved.length;
   useEffect(() => registerRouteLeaveGuard(() => !unsavedRef.current || window.confirm("Leave without saving your answers?")), []);
 
   useEffect(() => {
+    const previous = identity.current;
+    if (!previous || previous.id !== id || previous.project !== project || previous.source !== source) {
+      // A new review or session never shows the old one's questions, answers or drafts, even while loading.
+      generation.current++;
+      identity.current = { id, project, source };
+      setReview(null); setComponent(null); setDrafts({}); setNotice(null); setPageIndex(0); setOnlyUnanswered(false); setBusy(null); setState("loading");
+    }
+    const current = generation.current;
     const controller = new AbortController();
     source.read(id, controller.signal).then((value) => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || generation.current !== current) return;
       if (value.project !== project) { setReview(null); setState("missing"); return; }
       setReview(value); setState("loaded");
-      components.read(value.component_id).then((item) => { if (!controller.signal.aborted) setComponent(item); }).catch(() => undefined);
+      components.read(value.component_id).then((item) => {
+        if (!controller.signal.aborted && generation.current === current) setComponent(item);
+      }).catch(() => undefined);
     }).catch((error) => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || generation.current !== current) return;
       if (isSignOut(error)) { clear.current(); return; }
       setState(!(error instanceof HubApiError) ? "failed" : error.status === 404 && error.code !== "reviews_unavailable" ? "missing"
         : error.code === "reviews_unavailable" ? "unsupported" : error.status === 403 ? "denied" : "failed");
     });
     return () => controller.abort();
   }, [source, components, id, project, reload]);
+  useEffect(() => () => { generation.current++; }, []);
 
   const projectName = hub.projectName(project);
   const crumbs = <nav className="crumbs" aria-label="Breadcrumb"><a href={link("/projects")}>Projects</a> <span>/</span>{" "}
@@ -174,24 +189,35 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
 
   async function save(finish: boolean) {
     if (!review || busy) return;
+    const started = generation.current;
+    const live = () => generation.current === started;
     setBusy(finish ? "finishing" : "saving"); setNotice(null);
     let current = review;
     try {
       // The Hub takes at most 100 answers per save; each batch builds on the revision the last one returned.
+      // If the page changed meanwhile, no further batch is sent and nothing is shown for the old review.
       const pending = unsavedAnswers(current, drafts);
       for (let start = 0; start < pending.length; start += ANSWER_BATCH) {
+        if (!live()) return;
         current = await source.answer(current, { expected_revision: current.revision, client_request_id: crypto.randomUUID(),
           answers: pending.slice(start, start + ANSWER_BATCH), complete: false });
+        if (!live()) return;
         setReview(current);
       }
-      if (finish) { current = await source.answer(current, { expected_revision: current.revision, client_request_id: crypto.randomUUID(), answers: [], complete: true }); setReview(current); }
+      if (finish) {
+        if (!live()) return;
+        current = await source.answer(current, { expected_revision: current.revision, client_request_id: crypto.randomUUID(), answers: [], complete: true });
+        if (!live()) return;
+        setReview(current);
+      }
       setNotice({ text: finish ? "Review finished. The answers are final and the agent can read them." : pending.length === 1 ? "Answer saved." : `${pending.length} answers saved.`, error: false });
     } catch (error) {
+      if (!live()) return;
       if (isSignOut(error)) { clear.current(); return; }
       const code = error instanceof HubApiError ? error.code : "";
       setNotice({ text: current !== review && !finish ? `Some answers were saved before this: ${describe(error)}` : describe(error), error: true,
         reload: ["review_conflict", "interactive_review_completed", "idempotency_conflict"].includes(code) });
-    } finally { setBusy(null); }
+    } finally { if (live()) setBusy(null); }
   }
 
   return (
@@ -218,7 +244,7 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
         <label><input type="checkbox" checked={onlyUnanswered} onChange={(event) => { setOnlyUnanswered(event.target.checked); setPageIndex(0); }} />
           {" "}Show only unanswered</label></div> : null}
       <ol className="review-items" start={review.items.indexOf(shown[0] ?? review.items[0]) + 1}>
-        {shown.map((item) => <ReviewQuestion key={item.id} item={item} reviewId={review.id} saved={review.answers[item.id]?.value}
+        {shown.map((item) => <ReviewQuestion key={`${review.id}:${item.id}`} item={item} reviewId={review.id} saved={review.answers[item.id]?.value}
           savedBy={review.answers[item.id] ? who(review.answers[item.id].by) : null} draft={drafts[item.id]} disabled={!canAnswer || !!busy} demo={hub.demo}
           onChange={(value) => setDrafts((current) => ({ ...current, [item.id]: value }))} />)}
         {!shown.length && <li className="panel"><p>Every question has an answer.</p></li>}
@@ -253,9 +279,10 @@ function ReviewQuestion({ item, reviewId, saved, savedBy, draft, disabled, demo,
   const changed = draft !== undefined && draft.trim() !== "" && draft !== saved;
   return (
     <li className="review-item">
-      <fieldset disabled={disabled}>
+      <fieldset>
         <legend>{item.title}</legend>
         <p className="review-prompt">{item.prompt}</p>
+        {/* Answer controls are disabled one by one, never the whole group, so the sample stays viewable on finished reviews. */}
         {item.asset_id && (showAsset
           ? <div className="review-asset">{demo
               // Demo mode makes no Hub requests, so there is no sample to read.
@@ -267,7 +294,8 @@ function ReviewQuestion({ item, reviewId, saved, savedBy, draft, disabled, demo,
           <div className="review-choices" role="radiogroup" aria-label={item.title}>
             {item.choices.map((choice) => (
               <label key={choice.id} className={`review-choice${value === choice.id ? " selected" : ""}`}>
-                <input type="radio" name={`review-${item.id}`} value={choice.id} checked={value === choice.id} onChange={() => onChange(choice.id)} />
+                <input type="radio" name={`review-${reviewId}-${item.id}`} value={choice.id} checked={value === choice.id} disabled={disabled}
+                  onChange={() => onChange(choice.id)} />
                 <span>{choice.label}</span>
               </label>
             ))}
@@ -275,7 +303,7 @@ function ReviewQuestion({ item, reviewId, saved, savedBy, draft, disabled, demo,
         ) : (
           <label className="field">
             <span className="field-label">Your answer</span>
-            <textarea rows={3} maxLength={ANSWER_MAX} value={value} onChange={(event) => onChange(event.target.value)} />
+            <textarea rows={3} maxLength={ANSWER_MAX} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
             <small>{value.length} / {ANSWER_MAX}</small>
           </label>
         )}

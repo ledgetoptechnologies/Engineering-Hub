@@ -703,7 +703,8 @@ export function HubApp() {
         ) : (
           <div className="page" key={route.page === "project" ? `project-${route.id}`
             : route.page === "labels" ? `labels-${route.project}-${route.set}`
-            : route.page === "review" ? `review-${route.id}` : route.page}>
+            // A different review, project or signed-in person is a fresh page with no state carried over.
+            : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
