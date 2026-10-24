@@ -120,3 +120,25 @@ def test_invalid_range_never_becomes_unbounded(value):
     with pytest.raises(HubError) as error:
         byte_range(value, 4)
     assert error.value.status == 416
+
+
+@pytest.mark.asyncio
+async def test_disconnect_while_sending_headers_closes_unstarted_asset_body():
+    stream = Bytes()
+    headers = {'Content-Range': 'bytes 0-3/4', 'Content-Length': '4',
+               'ETag': '"sha256:' + DIGEST + '"', 'Content-Type': 'application/octet-stream'}
+    async with httpx.AsyncClient(base_url='https://192.168.50.90', transport=httpx.MockTransport(
+            lambda request: httpx.Response(206, headers=headers, stream=stream))) as worker:
+        app = app_for(service_for(worker))
+        scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.4'},
+                 'http_version': '1.1', 'method': 'GET', 'scheme': 'https',
+                 'path': PATH, 'raw_path': PATH.encode(), 'query_string': b'',
+                 'headers': [(b'x-synthetic-human', b'yes')],
+                 'client': ('127.0.0.1', 1), 'server': ('hub.invalid', 443), 'root_path': ''}
+        async def receive():
+            return {'type': 'http.disconnect'}
+        async def send(message):
+            raise RuntimeError('synthetic_transport_closed')
+        with pytest.raises(RuntimeError, match='synthetic_transport_closed'):
+            await app(scope, receive, send)
+    assert stream.closed and stream.reads == 0

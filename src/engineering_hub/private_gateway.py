@@ -304,15 +304,20 @@ class PublicBrowserGateway:
                 result = StreamingResponse(chunks(), status_code=200)
             else:
                 content = bytearray()
+                # Full bounded reviews include saved answers; other routes keep
+                # the configured general response budget unchanged.
+                review_detail = re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID
+                    + r'(?:/state|/answers)?', scope['path']) is not None
+                response_limit = 4 * 1024 * 1024 if review_detail else self.max_response_bytes
                 async with asyncio.timeout(self.request_timeout):
                     if response.is_stream_consumed:
                         content.extend(response.content)
-                        if len(content) > self.max_response_bytes:
+                        if len(content) > response_limit:
                             raise _Denied('gateway_response_too_large', 502)
                     else:
                         async for chunk in response.aiter_raw(chunk_size=16384):
                             content.extend(chunk)
-                            if len(content) > self.max_response_bytes:
+                            if len(content) > response_limit:
                                 raise _Denied('gateway_response_too_large', 502)
                 result = Response(bytes(content), status_code=response.status_code)
             result.raw_headers = outgoing

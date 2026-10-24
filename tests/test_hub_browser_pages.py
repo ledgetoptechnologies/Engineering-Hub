@@ -11,6 +11,7 @@ from engineering_hub.private_gateway import browser_route_allowed
     '/projects/treedar', '/projects/client-notes', '/projects/unknown',
     '/projects/engineering-hub/plans', '/projects/treedar/activity',
     '/projects/treedar/labels/crowns', '/notes/runbooks/check.md', '/agents',
+    '/projects/treedar/reviews/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     '/agents/topics/auto-wake-v1-test', '/staging'])
 def test_closed_client_paths(path):
     assert client_page_allowed('GET', path)
@@ -24,6 +25,13 @@ def test_closed_client_paths(path):
     '/notes/../settings.json', '/notes/%2e%2e/settings.json', '/notes//test',
     '/agents/topics/a/b', '/agents/topics/a?secret=x', '/notes/ü', '/notes/a\\b'])
 def test_unknown_paths_not_spa(path):
+    assert not client_page_allowed('GET', path)
+
+
+@pytest.mark.parametrize('path', ['/projects/treedar/reviews/not-a-uuid',
+    '/projects/treedar/reviews/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/assets',
+    '/projects/treedar/reviews/AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE'])
+def test_review_page_never_becomes_generic_service_proxy(path):
     assert not client_page_allowed('GET', path)
 
 

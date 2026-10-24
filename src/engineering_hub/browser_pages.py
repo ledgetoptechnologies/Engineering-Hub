@@ -26,7 +26,9 @@ def client_page_allowed(method, path):
     if len(parts) >= 2 and parts[0] == 'projects' and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', parts[1]):
         return (len(parts) == 2 or len(parts) == 3 and parts[2] in _TABS
                 or len(parts) == 4 and parts[2] == 'labels'
-                and re.fullmatch(_SEGMENT, parts[3]) is not None)
+                and re.fullmatch(_SEGMENT, parts[3]) is not None
+                or len(parts) == 4 and parts[2] == 'reviews'
+                and re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', parts[3]) is not None)
     if len(parts) == 3 and parts[:2] == ['agents', 'topics']:
         return re.fullmatch(_SEGMENT, parts[2]) is not None
     if 2 <= len(parts) <= 10 and parts[0] == 'notes':
@@ -63,5 +65,6 @@ def attach_browser_page_routes(app, *, ui_directory, human, anonymous_shell=Fals
     for route in sorted(_PAGES) + [
             '/projects/{project}', '/projects/{project}/{tab}',
             '/projects/{project}/labels/{label_set}', '/notes/{note_path:path}',
+            '/projects/{project}/reviews/{review_id}',
             '/agents/topics/{topic}']:
         app.add_api_route(route, page, methods=['GET', 'HEAD'], include_in_schema=False)

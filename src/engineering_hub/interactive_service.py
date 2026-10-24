@@ -19,6 +19,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .repository import HubError, HubRepository
+from .lifecycle import finish_owned
 from .staging_client import _origin, _read_file, _unique
 
 
@@ -26,6 +27,19 @@ ACTION = frozenset({'review_read', 'review_create', 'review_answer'})
 TYPES = frozenset({'application/json', 'image/jpeg', 'image/png',
                   'model/gltf-binary', 'application/octet-stream'})
 MAX_RANGE = 8 * 1024 * 1024
+
+
+class _AssetResponse(StreamingResponse):
+    """Own the acquired socket even when sending headers/body is cancelled."""
+    def __init__(self, *args, upstream, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.upstream = upstream
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await finish_owned(self.upstream.aclose())
 
 
 @dataclass
@@ -158,7 +172,8 @@ def byte_range(value, size):
 
 
 def attach_interactive_assets(app, service, reviews, human):
-    @app.api_route('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}', methods=['GET', 'HEAD'])
+    @app.head('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}', include_in_schema=False)
+    @app.get('/api/hub/v1/interactive-reviews/{review_id}/assets/{asset_id}')
     async def asset(review_id: str, asset_id: str, request: Request):
         def admitted():
             actor = human(request)
@@ -186,9 +201,15 @@ def attach_interactive_assets(app, service, reviews, human):
             return Response(headers=headers, media_type=metadata['media_type'])
         upstream = None
         try:
-            outgoing = service.client.build_request('GET', '/v1/assets/' + asset_id,
-                headers={'Range': f'bytes={start}-{end}'})
-            upstream = await service.client.send(outgoing, stream=True)
+            # A direct Request bypasses client cookie/default-header merging.
+            # Only the dedicated private service credential is admitted here.
+            private_headers = {'Range': f'bytes={start}-{end}', 'Accept-Encoding': 'identity'}
+            credential = service.client.headers.get('authorization')
+            if credential:
+                private_headers['Authorization'] = credential
+            outgoing = httpx.Request('GET', service.client.base_url.join('/v1/assets/' + asset_id),
+                                     headers=private_headers)
+            upstream = await service.client.send(outgoing, stream=True, auth=None, follow_redirects=False)
             if (upstream.status_code != 206
                     or upstream.headers.get('content-range') != f'bytes {start}-{end}/{size}'
                     or upstream.headers.get('content-length') != str(end - start + 1)
@@ -218,6 +239,6 @@ def attach_interactive_assets(app, service, reviews, human):
                     raise ValueError('invalid_asset_length')
             finally:
                 await upstream.aclose()
-        return StreamingResponse(body(), status_code=206 if partial else 200,
+        return _AssetResponse(body(), upstream=upstream, status_code=206 if partial else 200,
                                  headers=headers, media_type=metadata['media_type'],
                                  background=BackgroundTask(upstream.aclose))

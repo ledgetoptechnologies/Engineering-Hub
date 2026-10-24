@@ -17,6 +17,7 @@ from .repository import HubError, HubRepository, _json
 
 SCHEMA = 'choice-text.v1'
 MAX_MANIFEST = 1024 * 1024
+MAX_REVIEW_BYTES = 4 * 1024 * 1024
 _KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z')
 
 
@@ -136,8 +137,11 @@ class InteractiveReviewRepository:
 
     def _save(self, db, actor, action, item):
         item['updated_at'] = datetime.now(timezone.utc).isoformat()
+        encoded = _json(item)
+        if len(encoded.encode('utf-8')) > MAX_REVIEW_BYTES:
+            raise HubError('review_state_too_large', 413)
         db.execute('INSERT INTO hub_interactive_reviews VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
-                   (item['id'], item['project'], item['component_id'], _json(item)))
+                   (item['id'], item['project'], item['component_id'], encoded))
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
         # Global event/activity consumers may not possess the review grant.

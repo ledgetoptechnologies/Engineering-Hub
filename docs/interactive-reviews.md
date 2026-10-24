@@ -53,6 +53,14 @@ without it, asset references are rejected. This module serves no asset bytes.
   item answered. Completed reviews reject further edits.
 
 Each answer records `value`, authenticated human`by` and ISO timestamp`at`.
+The complete normalized saved review, including questions, answers and binding
+metadata, is limited to4 MiB of serialized UTF-8 JSON. A batch that would exceed
+this limit returns413 `review_state_too_large` and preserves all prior answers
+and revision. Unicode JSON encoding counts toward this limit; the per-answer
+character limit does not promise that1000 maximum-length answers will fit.
+Offline enrollment admits this reviewed4 MiB TEXT bound only for
+`hub_interactive_reviews.data`; other cells retain their1 MiB bound and the
+overall logical snapshot remains limited to512 MiB.
 Same-ledger answer events retain previous submissions and attribution. Revision
 CAS prevents accidental overwrites. Actor plus request key supplies idempotency;
 an identical retry returns current state without reapplying, while changed key

@@ -28,9 +28,22 @@ def test_real_session_agent_creation_csrf_answers_restart_and_logout(tmp_path):
             'prompt': 'Select species', 'choices': [{'id': 'oak', 'label': 'Oak'}, {'id': 'pine', 'label': 'Pine'}]}]}
     root = '/api/hub/v1/interactive-reviews'
     with TestClient(app, base_url='https://hub.test') as client:
+        mcp_headers = {'Authorization': 'Bearer codex-token',
+                       'Accept': 'application/json, text/event-stream',
+                       'MCP-Protocol-Version': '2025-06-18'}
+        discovery = client.post('/mcp/', headers=mcp_headers,
+            json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
+        assert discovery.status_code == 200
+        tools = {tool['name'] for tool in discovery.json()['result']['tools']}
+        assert {'hub_interactive_review_create', 'hub_interactive_review_get',
+                'hub_interactive_review_list'} <= tools
         created = client.post(root, headers={'Authorization': 'Bearer codex-token'}, json=payload)
         assert created.status_code == 201, created.text
         review = created.json()
+        through_mcp = client.post('/mcp/', headers=mcp_headers, json={'jsonrpc': '2.0', 'id': 2,
+            'method': 'tools/call', 'params': {'name': 'hub_interactive_review_get',
+                                             'arguments': {'review_id': review['id']}}})
+        assert through_mcp.status_code == 200 and not through_mcp.json()['result'].get('isError')
         path = root + '/' + review['id']
         assert client.get(path).status_code == 401
         assert client.get(path, headers={'Authorization': 'Bearer hermes-token'}).status_code == 403
