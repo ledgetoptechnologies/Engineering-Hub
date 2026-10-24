@@ -143,7 +143,7 @@ test("demo mode works without any staging API and says it's illustrative", async
   await page.route("**/api/hub/v1/staging/**", (route) => route.abort());
   await page.goto("/?demo=1#/staging");
   await expect(panel(page)).toContainText("Demo: illustrative items only.");
-  await expect(panel(page).getByRole("listitem")).toHaveCount(7);
+  await expect(panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem")).toHaveCount(7);
 });
 
 test("fits a phone screen", async ({ page }) => {
@@ -246,4 +246,45 @@ test("a Hub whose staging service isn't set up says so, not that the PC is down"
   await expect(panel(page)).toContainText("The staging service isn't set up yet, so nothing is being kept");
   await expect(panel(page).locator(".staging-status")).toContainText("The staging service isn't set up yet.");
   await expect(panel(page).getByRole("button", { name: "Clean up staging…" })).toBeDisabled();
+});
+
+const heldJob = { id: "5ea9e000-0000-4000-8000-000000000990", project: "engineering-hub", recipe: "vite-build", state: "held",
+  phase: "dispatching", source_commit: "497021a5d3c19f086b12e52f964e22df84720040" };
+
+test("the owner can recheck a held job: it's confirmed, says it won't re-run, and sends nothing but CSRF", async ({ page }) => {
+  const { state } = await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: {}, can_reconcile: true, held_jobs: [heldJob] } });
+  await page.route(`**/api/hub/v1/staging/jobs/${heldJob.id}/reconcile`, (route) => {
+    state.posts.push({ path: new URL(route.request().url()).pathname, body: route.request().postDataJSON(), csrf: route.request().headers()["x-hub-csrf"] });
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ job: { id: heldJob.id, state: "held" }, resource_ids: [], phase: "held" }) });
+  });
+  await page.goto("/#/staging");
+  const held = panel(page).getByRole("group", { name: "Held staging jobs" });
+  await expect(held).toContainText("1 staging job is on hold.");
+  await held.getByRole("button", { name: "Recheck outcome…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Recheck the held job for Engineering Hub?" });
+  await expect(dialog).toContainText("It won't run the job again, and it won't force the staging PC free.");
+  await dialog.getByRole("button", { name: "Recheck outcome" }).click();
+  await expect(dialog.getByRole("status")).toHaveText(/stays on hold and needs an operator to review it/);
+  expect(state.posts.filter((post) => post.path.endsWith("/reconcile"))).toEqual([{ path: `/api/hub/v1/staging/jobs/${heldJob.id}/reconcile`, body: {}, csrf: "fixture-csrf" }]);
+  expect(blocking(await audit(page, "dialog", 1440))).toEqual([]);
+});
+
+test("someone who isn't the owner sees held jobs but no recheck control", async ({ page }) => {
+  await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: {}, can_reconcile: false, held_jobs: [heldJob] } });
+  await page.goto("/#/staging");
+  const held = panel(page).getByRole("group", { name: "Held staging jobs" });
+  await expect(held).toContainText("Only the Hub owner can recheck held jobs.");
+  await expect(held.getByRole("button")).toHaveCount(0);
+});
+
+test("demo: rechecking the illustrative held job confirms it failed and the hold disappears", async ({ page }) => {
+  await page.route("**/api/hub/v1/staging/**", (route) => route.abort());
+  await page.goto("/?demo=1#/staging");
+  const held = panel(page).getByRole("group", { name: "Held staging jobs" });
+  await held.getByRole("button", { name: "Recheck outcome…" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Recheck outcome" }).click();
+  await expect(dialog.getByRole("status")).toHaveText("Confirmed: the original job failed. It's no longer on hold.");
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(held).toHaveCount(0);
 });

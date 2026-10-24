@@ -6,9 +6,9 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { HubApiError, type HubMode } from "./api";
 import {
   applyCleanup, canChangeKeep, expiryLabel, extendedUntil, formatBytes, keepResource, keptLabel, kindLabel, KEEP_REASON_MAX,
-  listResources, planCleanup, planSummary, protectedLabel, readStagingStatus, resultSummary, ResourceConflictError, startPreview, statusLine,
+  listResources, planCleanup, planSummary, protectedLabel, readStagingStatus, recheckJob, recheckSummary, resultSummary, ResourceConflictError, startPreview, statusLine,
   type CleanupPlan, type CleanupResult, type KeepRequest, type PreviewSession, type ResourcePage, type ResourceQuery, type StagingResource,
-  type StagingStatus,
+  type HeldJob, type RecheckResult, type StagingStatus,
 } from "./stagingResourcesApi";
 import { DemoResourceStore } from "./stagingResourcesDemo";
 import { Badge, Modal, names } from "./ui";
@@ -21,6 +21,7 @@ export interface ResourceSource {
   apply(plan: CleanupPlan): Promise<CleanupResult>;
   preview(resource: StagingResource): Promise<PreviewSession>;
   status(signal: AbortSignal): Promise<StagingStatus>;
+  recheck(jobId: string): Promise<RecheckResult>;
 }
 export function liveSource(csrf: string): ResourceSource {
   return {
@@ -30,9 +31,12 @@ export function liveSource(csrf: string): ResourceSource {
     apply: (plan) => applyCleanup(plan, csrf),
     preview: (resource) => startPreview(resource, csrf),
     status: (signal) => readStagingStatus(signal),
+    recheck: (jobId) => recheckJob(jobId, csrf),
   };
 }
 export function demoSource(store = new DemoResourceStore()): ResourceSource {
+  let demoHeld: HeldJob[] = [{ id: "5ea9e000-0000-4000-8000-000000000990", project: "engineering-hub", recipe: "vite-build",
+    state: "held", phase: "dispatching", source_commit: "497021a5d3c19f086b12e52f964e22df84720040" }];
   return {
     list: async (query) => store.list(query),
     keep: async (resource, request) => store.keep(resource, request),
@@ -41,7 +45,12 @@ export function demoSource(store = new DemoResourceStore()): ResourceSource {
     // Demo mode has no preview origin, and says so rather than faking one.
     preview: async () => { throw new HubApiError(503, "preview_not_configured"); },
     status: async () => ({ configured: true, running: true, reachable: true, profiles: { "engineering-hub": ["vite-build"] },
-      state: null, previews_configured: false }),
+      state: null, previews_configured: false, can_reconcile: true, held_jobs: demoHeld.map(job => ({ ...job })) }),
+    recheck: async (jobId) => {
+      // The demo's held job turns out to have failed; nothing re-runs.
+      demoHeld = demoHeld.filter(job => job.id !== jobId);
+      return { job: { id: jobId, state: "failed" }, resource_ids: [], phase: "failed" };
+    },
   };
 }
 
@@ -85,6 +94,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [pinning, setPinning] = useState<StagingResource | null>(null);
+  const [rechecking, setRechecking] = useState<HeldJob | null>(null);
   const [previewing, setPreviewing] = useState<{ resource: StagingResource; session: PreviewSession } | null>(null);
   const [cleaning, setCleaning] = useState(false);
   const generation = useRef(0);
@@ -194,6 +204,9 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
     <p className="panel-description">Workspaces, builds, test runs and previews the staging PC keeps for EH jobs. Cleanup shows its plan first,
       and never removes pinned or protected items, or anything an EH job didn't create.</p>
     <StatusLine status={status} />
+    {status !== null && typeof status === "object" && status.held_jobs.length > 0 &&
+      <HeldJobs jobs={status.held_jobs} canRecheck={status.can_reconcile && canWrite} projectName={projectName}
+        onRecheck={job => { setNotice(null); setRechecking(job); }} />}
     {mode === "demo" && <p role="status">Demo: illustrative items only. Nothing is read from or removed on the staging PC.</p>}
     {stale && <p role="status">Workspace events are stale, so changes are paused until the Hub reconnects.</p>}
     <div className="filter-bar">
@@ -221,6 +234,9 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
     <p className="panel-footnote">Sizes come from the staging PC; "size unknown" means it hasn't reported one, not zero.</p>
     {pinning && <PinDialog resource={pinning} onClose={() => setPinning(null)}
       onPin={async reason => { if (await keep(pinning, { mode: "pinned", reason }, "Pinned. It won't be removed until you unpin it.")) setPinning(null); }} />}
+    {rechecking && source && <RecheckDialog job={rechecking} source={source} projectName={projectName(rechecking.project)}
+      onClose={changed => { setRechecking(null); if (changed) setRevision(value => value + 1); }}
+      onUnauthorized={() => { setRechecking(null); failed(new HubApiError(401, "human_session_required")); }} />}
     {previewing && <PreviewDialog resource={previewing.resource} session={previewing.session} projectName={projectName(previewing.resource.project)}
       onClose={() => setPreviewing(null)} />}
     {cleaning && source && <CleanupDialog source={source} project={project || null} projectName={project ? projectName(project) : null}
@@ -228,6 +244,55 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
       onClose={changed => { setCleaning(false); if (changed) setRevision(value => value + 1); }}
       onUnauthorized={() => { setCleaning(false); failed(new HubApiError(401, "human_session_required")); }} />}
   </section>;
+}
+
+function HeldJobs({ jobs, canRecheck, projectName, onRecheck }: {
+  jobs: HeldJob[]; canRecheck: boolean; projectName: (id: string) => string; onRecheck: (job: HeldJob) => void;
+}) {
+  return <div className="held-jobs" role="group" aria-label="Held staging jobs">
+    <p className="notice"><strong>{jobs.length === 1 ? "1 staging job is" : `${jobs.length} staging jobs are`} on hold.</strong> While a job is on hold
+      the staging PC stays reserved, so other work on it waits. Holding is deliberate when the outcome isn't certain.</p>
+    <ul className="resource-list">{jobs.map(job => <li key={job.id} className="resource-row" aria-label={`Held job for ${projectName(job.project)}`}>
+      <div className="resource-main"><strong>{projectName(job.project)} · {job.recipe}</strong>
+        <small>{job.state === "held" ? "On hold" : "Claimed"} at step "{job.phase.replace(/[_:.-]+/g, " ")}" · source {job.source_commit.slice(0, 7)} (as declared)</small></div>
+      {canRecheck ? <span className="resource-actions"><button className="secondary small" type="button" onClick={() => onRecheck(job)}>Recheck outcome…</button></span>
+        : <small className="resource-actions">Only the Hub owner can recheck held jobs.</small>}
+    </li>)}</ul>
+  </div>;
+}
+
+/** Asks the staging PC what happened to the original operation. Never re-runs it and never forces the machine free. */
+function RecheckDialog({ job, source, projectName, onClose, onUnauthorized }: {
+  job: HeldJob; source: ResourceSource; projectName: string; onClose: (changed: boolean) => void; onUnauthorized: () => void;
+}) {
+  const [step, setStep] = useState<"confirm" | "checking" | "done" | "error">("confirm");
+  const [text, setText] = useState("");
+  const changed = useRef(false);
+  async function recheck() {
+    setStep("checking");
+    try {
+      const summary = recheckSummary(await source.recheck(job.id));
+      changed.current = true;
+      setText(summary.text); setStep("done");
+    } catch (error) {
+      if (isAuthLoss(error)) { onUnauthorized(); return; }
+      setText(describe(error)); setStep("error");
+    }
+  }
+  return <Modal title={`Recheck the held job for ${projectName}?`} onClose={() => onClose(changed.current)}>
+    {(step === "confirm" || step === "checking") && <>
+      <p>This asks the staging PC what happened to the original <strong>{job.recipe}</strong> job.</p>
+      <p className="panel-footnote">It won't run the job again, and it won't force the staging PC free. If the original outcome is confirmed, the hold
+        clears; if not, the job stays on hold for an operator to review.</p>
+      <footer className="dialog-footer">
+        <button type="button" className="secondary" disabled={step === "checking"} onClick={() => onClose(false)}>Cancel</button>
+        <button type="button" className="dark-button" disabled={step === "checking"} onClick={() => void recheck()}>
+          {step === "checking" ? "Checking…" : "Recheck outcome"}</button>
+      </footer></>}
+    {(step === "done" || step === "error") && <>
+      <p className={step === "error" ? "notice error" : "notice"} role={step === "error" ? "alert" : "status"}>{text}</p>
+      <footer className="dialog-footer"><button type="button" className="dark-button" onClick={() => onClose(changed.current)}>Close</button></footer></>}
+  </Modal>;
 }
 
 function StatusLine({ status }: { status: StagingStatus | "unknown" | "unsupported" | null }) {

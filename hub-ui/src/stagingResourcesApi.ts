@@ -38,7 +38,13 @@ export interface StagingStatus {
   state: string | null;
   /** Absent means the server didn't say, which is not the same as configured. */
   previews_configured: boolean | null;
+  /** Whether this person may ask for a held job's original outcome to be rechecked (owner only). */
+  can_reconcile: boolean;
+  held_jobs: HeldJob[];
 }
+export interface HeldJob { id: string; project: string; recipe: string; state: "claimed" | "held"; phase: string; source_commit: string }
+/** A recheck reads the original operation's outcome. It never re-runs the job or force-releases the machine. */
+export interface RecheckResult { job: { id: string; state: string }; resource_ids: string[]; phase: string }
 /** Every keep change carries a reason, including letting an item expire again. */
 export type KeepRequest = { mode: "until"; until: string; reason: string } | { mode: "pinned" | "none"; reason: string };
 
@@ -250,10 +256,40 @@ export function parseStagingStatus(value: unknown): StagingStatus {
   const status: StagingStatus = { configured: bool(row.configured), running: bool(row.running), reachable: bool(row.reachable), profiles,
     // A state this UI has no wording for still means "not ready", never ready.
     state: row.state === undefined || row.state === null ? null : matching(row.state, codePattern),
-    previews_configured: row.previews_configured === undefined || row.previews_configured === null ? null : bool(row.previews_configured) };
+    previews_configured: row.previews_configured === undefined || row.previews_configured === null ? null : bool(row.previews_configured),
+    can_reconcile: row.can_reconcile === undefined ? false : bool(row.can_reconcile),
+    held_jobs: row.held_jobs === undefined ? [] : parseHeldJobs(row.held_jobs) };
   // Unconfigured can't also claim to be running or reachable.
   if (!status.configured && (status.running || status.reachable)) return invalid();
   return status;
+}
+function parseHeldJobs(value: unknown): HeldJob[] {
+  if (!Array.isArray(value) || value.length > 50) return invalid();
+  const jobs = value.map(entry => {
+    const row = object(entry);
+    return { id: matching(row.id, uuid), project: matching(row.project, projectPattern), recipe: matching(row.recipe, /^[a-z0-9][a-z0-9_-]{0,63}$/),
+      state: oneOf(row.state, ["claimed", "held"] as const), phase: matching(row.phase, codePattern),
+      source_commit: matching(row.source_commit, /^[a-f0-9]{7,64}$/) };
+  });
+  if (new Set(jobs.map(job => job.id)).size !== jobs.length) return invalid();
+  return jobs;
+}
+export function parseRecheckResult(value: unknown, jobId: string): RecheckResult {
+  const row = object(value), job = object(row.job);
+  if (matching(job.id, uuid) !== jobId) return invalid();
+  return { job: { id: jobId, state: oneOf(job.state, ["queued", "claimed", "held", "succeeded", "failed", "cancelled"] as const) },
+    resource_ids: idList(row.resource_ids, 100), phase: matching(row.phase, codePattern) };
+}
+export async function recheckJob(jobId: string, csrf: string, fetchImpl: typeof fetch = globalThis.fetch): Promise<RecheckResult> {
+  if (!isResourceId(jobId)) throw new HubApiError(422, "invalid_input");
+  const response = await fetchImpl.call(globalThis, `/api/hub/v1/staging/jobs/${jobId}/reconcile`, postInit(csrf, {}));
+  return parseRecheckResult(await json(response), jobId);
+}
+/** What a recheck established, in one sentence. Only a finished outcome counts as settled. */
+export function recheckSummary(result: RecheckResult): { text: string; settled: boolean } {
+  if (result.job.state === "succeeded" || result.job.state === "failed" || result.job.state === "cancelled")
+    return { text: `Confirmed: the original job ${result.job.state}. It's no longer on hold.`, settled: true };
+  return { text: "The outcome still can't be confirmed, so the job stays on hold and needs an operator to review it.", settled: false };
 }
 export async function readStagingStatus(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<StagingStatus> {
   const response = await fetchImpl.call(globalThis, "/api/hub/v1/staging/status", getInit(signal));

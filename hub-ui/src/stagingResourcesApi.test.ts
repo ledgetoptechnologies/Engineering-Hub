@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { HubApiError } from "./api";
 import {
   applyCleanup, expiryLabel, extendedUntil, formatBytes, keepResource, keptLabel, listResources, parseCleanupPlan, parseCleanupResult,
-  parsePreviewSession, parseResource, parseStagingStatus, planCleanup, planSummary, resultSummary, ResourceConflictError, startPreview, statusLine,
+  parsePreviewSession, parseResource, parseStagingStatus, planCleanup, planSummary, resultSummary, ResourceConflictError, startPreview, statusLine, recheckJob, recheckSummary, parseRecheckResult,
   type CleanupPlan, type StagingResource,
 } from "./stagingResourcesApi";
 import { createDemoResources, DemoResourceStore } from "./stagingResourcesDemo";
@@ -238,5 +238,32 @@ describe("backend reply shapes (PR64)", () => {
   it("labels the backend's kept reasons", () => {
     expect(keptLabel("unknown_ownership")).toBe("not recorded as made by an EH job");
     expect(keptLabel("provisioning")).toBe("still being made");
+  });
+});
+
+describe("held jobs and recheck", () => {
+  const ready = { configured: true, running: true, reachable: true, profiles: {} };
+  const held = { id: id(990), project: "engineering-hub", recipe: "vite-build", state: "held", phase: "dispatching", source_commit: "497021a" };
+  it("reads held jobs and the owner flag, defaulting to none and not allowed", () => {
+    expect(parseStagingStatus(ready)).toMatchObject({ can_reconcile: false, held_jobs: [] });
+    expect(parseStagingStatus({ ...ready, can_reconcile: true, held_jobs: [held] }).held_jobs).toEqual([held]);
+    expect(() => parseStagingStatus({ ...ready, held_jobs: [{ ...held, state: "running" }] })).toThrow(HubApiError);
+    expect(() => parseStagingStatus({ ...ready, held_jobs: [held, held] })).toThrow(HubApiError);
+  });
+  it("posts an empty body with CSRF to the job's reconcile route and checks the reply is for that job", async () => {
+    const { calls, fetchImpl } = recorder(jsonResponse({ job: { id: id(990), state: "failed" }, resource_ids: [id(3)], phase: "failed" }));
+    const result = await recheckJob(id(990), "token", fetchImpl);
+    expect(calls[0].url).toBe(`/api/hub/v1/staging/jobs/${id(990)}/reconcile`);
+    expect(calls[0].init.body).toBe("{}");
+    expect((calls[0].init.headers as Record<string, string>)["X-Hub-CSRF"]).toBe("token");
+    expect(result.job.state).toBe("failed");
+    expect(() => parseRecheckResult({ job: { id: id(991), state: "failed" }, resource_ids: [], phase: "failed" }, id(990))).toThrow(HubApiError);
+  });
+  it("calls only a finished outcome settled", () => {
+    const at = (state: string) => recheckSummary({ job: { id: id(990), state }, resource_ids: [], phase: "x" });
+    expect(at("failed")).toEqual({ text: "Confirmed: the original job failed. It's no longer on hold.", settled: true });
+    expect(at("succeeded").settled).toBe(true);
+    expect(at("held").settled).toBe(false);
+    expect(at("held").text).toContain("needs an operator to review");
   });
 });
