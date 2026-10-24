@@ -35,7 +35,7 @@ export interface StagingStatus {
   configured: boolean; running: boolean; reachable: boolean;
   /** Recipe names per project this human may use. */
   profiles: Record<string, string[]>;
-  state: typeof STATUS_STATES[number] | null;
+  state: string | null;
   /** Absent means the server didn't say, which is not the same as configured. */
   previews_configured: boolean | null;
 }
@@ -56,7 +56,8 @@ const knownCodes = new Set(["staging_resource_conflict", "staging_resource_not_f
 const codeAliases: Record<string, string> = {
   revision_conflict: "staging_resource_conflict", not_found: "staging_resource_not_found", staging_forbidden: "staging_forbidden",
   staging_cleanup_in_progress: "staging_cleanup_in_progress", staging_plan_digest_conflict: "staging_plan_changed",
-  staging_preview_not_configured: "preview_not_configured",
+  staging_preview_not_configured: "preview_not_configured", staging_not_configured: "staging_not_configured",
+  staging_admin_required: "staging_admin_required", staging_resource_not_owned: "staging_resource_not_owned",
 };
 
 export function isResourceId(value: string): boolean { return uuid.test(value); }
@@ -142,7 +143,7 @@ export function parseCleanupPlan(value: unknown): CleanupPlan {
   const kept = row.kept.map(entry => { const item = object(entry); return { id: matching(item.id, uuid), why: matching(item.why, codePattern) }; });
   const ids = [...remove, ...kept].map(item => item.id);
   if (new Set(ids).size !== ids.length) return invalid();
-  return { plan_id: matching(row.plan_id, uuid), digest: matching(row.digest, /^[a-f0-9]{64}$/),
+  return { plan_id: matching(row.plan_id, uuid), digest: matching(row.digest, /^sha256:[a-f0-9]{64}$/),
     expires_at: timestamp(row.expires_at), total_bytes: bytes(row.total_bytes), remove, kept };
 }
 export function parseCleanupResult(value: unknown, plan: CleanupPlan): CleanupResult {
@@ -239,14 +240,16 @@ export function parseStagingStatus(value: unknown): StagingStatus {
   const row = object(value);
   const bool = (field: unknown) => typeof field === "boolean" ? field : invalid();
   const profiles: Record<string, string[]> = {};
-  const entries = Object.entries(object(row.profiles));
+  // An unconfigured service reports no profiles at all.
+  const entries = row.profiles === undefined ? [] : Object.entries(object(row.profiles));
   if (entries.length > 200) return invalid();
   for (const [project, recipes] of entries) {
     if (!isStagingProject(project) || !Array.isArray(recipes) || recipes.length > 50) return invalid();
     profiles[project] = recipes.map(recipe => matching(recipe, /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/));
   }
   const status: StagingStatus = { configured: bool(row.configured), running: bool(row.running), reachable: bool(row.reachable), profiles,
-    state: row.state === undefined || row.state === null ? null : oneOf(row.state, STATUS_STATES),
+    // A state this UI has no wording for still means "not ready", never ready.
+    state: row.state === undefined || row.state === null ? null : matching(row.state, codePattern),
     previews_configured: row.previews_configured === undefined || row.previews_configured === null ? null : bool(row.previews_configured) };
   // Unconfigured can't also claim to be running or reachable.
   if (!status.configured && (status.running || status.reachable)) return invalid();
@@ -266,7 +269,8 @@ const statusStates: Record<typeof STATUS_STATES[number], string> = {
 };
 /** One honest line: never "ready" unless the server says configured, running and reachable. */
 export function statusLine(status: StagingStatus): { text: string; tone: "neutral" | "amber" | "forest" } {
-  if (status.state) return { text: statusStates[status.state], tone: "amber" };
+  if (status.state) return { text: Object.hasOwn(statusStates, status.state) ? statusStates[status.state as typeof STATUS_STATES[number]]
+    : `The staging service isn't ready (${status.state.replace(/[_:.-]+/g, " ")}).`, tone: "amber" };
   if (!status.configured) return { text: statusStates.not_configured, tone: "amber" };
   if (!status.running) return { text: "The staging queue controller isn't running, so no new builds or tests will start.", tone: "amber" };
   if (!status.reachable) return { text: "The staging PC isn't answering, so new builds or tests can't start.", tone: "amber" };
@@ -329,7 +333,9 @@ function countPhrase<T>(items: T[], key: (item: T) => string, label: (key: strin
 }
 const keptNames: Record<string, string> = {
   pinned: "pinned", keep_until: "kept by request", kept: "kept by request", protected: "protected",
-  not_expired: "not expired yet", not_owned: "not created by an EH job",
+  not_expired: "not expired yet", not_owned: "made by someone else", unknown_ownership: "not recorded as made by an EH job",
+  unknown_job: "its job isn't recorded", unknown_job_binding: "doesn't match its job's record", provisioning: "still being made",
+  deleting: "already being removed", deleted: "already removed", delete_failed: "an earlier removal failed",
 };
 export function keptLabel(why: string): string {
   const reason = why.startsWith("protected:") ? why.slice(10) : why;

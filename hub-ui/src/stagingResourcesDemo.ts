@@ -62,7 +62,7 @@ export class DemoResourceStore {
       else kept.push({ id: resource.id, why: resource.keep ? "keep_until" : "not_expired" });
     }
     const total = remove.every(entry => entry.size_bytes !== null) ? remove.reduce((sum, entry) => sum + (entry.size_bytes ?? 0), 0) : null;
-    return { plan_id: id(800), digest: "d".repeat(64), expires_at: new Date(now + 10 * 60_000).toISOString(), total_bytes: total, remove, kept };
+    return { plan_id: id(800), digest: `sha256:${"d".repeat(64)}`, expires_at: new Date(now + 10 * 60_000).toISOString(), total_bytes: total, remove, kept };
   }
   apply(plan: CleanupPlan): CleanupResult {
     const result: CleanupResult = { removed: [], failed: [], skipped_changed: [] };

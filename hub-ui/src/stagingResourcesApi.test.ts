@@ -184,7 +184,7 @@ describe("service status", () => {
   it("puts a stated reason ahead of the flags, and refuses contradictions and unknown states", () => {
     expect(statusLine(parseStagingStatus({ ...ready, state: "existing_executor_owner" })).text).toContain("earlier executor");
     expect(() => parseStagingStatus({ ...ready, configured: false })).toThrow(HubApiError);
-    expect(() => parseStagingStatus({ ...ready, state: "fine" })).toThrow(HubApiError);
+    expect(statusLine(parseStagingStatus({ ...ready, state: "warming_up" }))).toEqual({ text: "The staging service isn't ready (warming up).", tone: "amber" });
     expect(() => parseStagingStatus({ ...ready, profiles: { "Bad Project": [] } })).toThrow(HubApiError);
   });
   it("keeps an unstated preview setting distinct from false", () => {
@@ -212,5 +212,31 @@ describe("resource store error names", () => {
     expect(keptLabel("kept")).toBe("kept by request");
     expect(keptLabel("protected")).toBe("protected");
     expect(keptLabel("active_job")).toBe("in use by a running job");
+  });
+});
+
+describe("backend reply shapes (PR64)", () => {
+  it("reads the unconfigured status exactly as the backend sends it, with no profiles", () => {
+    const status = parseStagingStatus({ configured: false, running: false, reachable: false, previews_configured: false });
+    expect(statusLine(status).text).toBe("The staging service isn't set up yet.");
+  });
+  it("accepts plan digests with their sha256: prefix and sends them back unchanged", async () => {
+    const reviewed = new DemoResourceStore(() => now).plan(null);
+    expect(reviewed.digest.startsWith("sha256:")).toBe(true);
+    expect(parseCleanupPlan(reviewed).digest).toBe(reviewed.digest);
+    expect(() => parseCleanupPlan({ ...reviewed, digest: "d".repeat(64) })).toThrow(HubApiError);
+    const { calls, fetchImpl } = recorder(jsonResponse({ removed: [], failed: [], skipped_changed: [] }));
+    await applyCleanup(reviewed, "token", fetchImpl);
+    expect(JSON.parse(calls[0].init.body as string).digest).toBe(reviewed.digest);
+  });
+  it("names the backend's not-set-up and refusal codes instead of guessing", async () => {
+    for (const [code, status] of [["staging_not_configured", 503], ["staging_admin_required", 403], ["staging_resource_not_owned", 403]] as const) {
+      const { fetchImpl } = recorder(jsonResponse({ detail: { code } }, status));
+      await expect(listResources({}, new AbortController().signal, fetchImpl)).rejects.toMatchObject({ status, code });
+    }
+  });
+  it("labels the backend's kept reasons", () => {
+    expect(keptLabel("unknown_ownership")).toBe("not recorded as made by an EH job");
+    expect(keptLabel("provisioning")).toBe("still being made");
   });
 });

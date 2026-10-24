@@ -54,6 +54,8 @@ const errorText: Record<string, string> = {
   staging_unavailable: "The staging PC isn't answering. Nothing was changed.",
   staging_busy: "The staging PC is busy with another job. Nothing was changed; try again shortly.",
   staging_forbidden: "You don't have permission for that on this project. Nothing was changed.",
+  staging_admin_required: "Only the Hub owner can pin, or change a pin. Nothing was changed.",
+  staging_resource_not_owned: "That was made by someone else, so it can't be changed from here. Nothing was changed.",
   staging_cleanup_in_progress: "Another cleanup is already running. Nothing was changed; try again when it finishes.",
   preview_not_configured: "Previews can't be opened yet: the separate preview address hasn't been set up.",
   preview_unavailable: "This preview can't be opened right now.",
@@ -62,7 +64,9 @@ const errorText: Record<string, string> = {
 };
 const describe = (error: unknown) => error instanceof HubApiError
   ? errorText[error.code] ?? "That didn't work, and nothing was changed. Try again." : "That didn't work, and nothing was changed. Try again.";
-const isAuthLoss = (error: unknown) => error instanceof HubApiError && [401, 403].includes(error.status) && error.code !== "csrf_required";
+// Only a lost sign-in clears the panel; a refusal of one action (not the owner, not allowed on this project) is explained instead.
+const refusals = new Set(["csrf_required", "staging_forbidden", "staging_admin_required", "staging_resource_not_owned"]);
+const isAuthLoss = (error: unknown) => error instanceof HubApiError && [401, 403].includes(error.status) && !refusals.has(error.code);
 const who = (actor: string) => names[actor as keyof typeof names] ?? (actor.startsWith("human:") ? "You" : actor);
 
 export interface StagingResourcesPanelProps {
@@ -75,7 +79,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
   const [project, setProject] = useState("");
   const [items, setItems] = useState<StagingResource[]>([]);
   const [next, setNext] = useState<string | null>(null);
-  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "unavailable" | "unauthorized" | "unknown">("loading");
+  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "unconfigured" | "unavailable" | "unauthorized" | "unknown">("loading");
   const [loadingMore, setLoadingMore] = useState(false);
   const [revision, setRevision] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
@@ -92,6 +96,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
   function failed(error: unknown) {
     if (isAuthLoss(error)) { setItems([]); setNext(null); setState("unauthorized"); unauthorized.current(); return; }
     setState(error instanceof HubApiError && error.code === "staging_resources_unsupported" ? "unsupported"
+      : error instanceof HubApiError && error.code === "staging_not_configured" ? "unconfigured"
       : error instanceof HubApiError && error.status === 503 ? "unavailable" : "unknown");
   }
   useEffect(() => {
@@ -175,6 +180,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
   const messages: Record<string, string> = {
     loading: "Reading what staging is keeping…",
     unsupported: "This Hub doesn't have staging resources yet. Nothing is being kept on the staging PC for EH jobs.",
+    unconfigured: "The staging service isn't set up yet, so nothing is being kept on the staging PC for EH jobs.",
     unavailable: "The staging PC isn't answering, so what it's keeping is unknown right now.",
     unauthorized: "Staging records cleared. Sign-in or access must be verified again.",
     unknown: "What staging is keeping is unknown. Use Check to retry.",

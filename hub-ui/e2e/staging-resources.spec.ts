@@ -223,3 +223,27 @@ test("an unset-up service says so, and a failed status read says unknown without
   await expect(panel(page).locator(".staging-status")).toHaveText("Staging service status is unknown right now.");
   await expect(panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem")).toHaveCount(7);
 });
+
+test("a refusal to pin is explained and doesn't sign you out", async ({ page }) => {
+  await fixture(page);
+  await page.route("**/api/hub/v1/staging/resources/*/keep", (route) =>
+    route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "staging_admin_required" } }) }));
+  await page.goto("/#/staging");
+  const rows = panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem");
+  await rows.filter({ hasText: "Test run" }).getByRole("button", { name: "Pin…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Pin this test run?" });
+  await dialog.getByLabel("Why keep it (required)").fill("Keep for comparison");
+  await dialog.getByRole("button", { name: "Pin" }).click();
+  await expect(panel(page).getByRole("alert")).toHaveText(/Only the Hub owner can pin/);
+  await expect(rows).toHaveCount(7);
+});
+
+test("a Hub whose staging service isn't set up says so, not that the PC is down", async ({ page }) => {
+  await fixture(page, { status: { configured: false, running: false, reachable: false, previews_configured: false } });
+  await page.route("**/api/hub/v1/staging/resources?*", (route) =>
+    route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: { code: "staging_not_configured" } }) }));
+  await page.goto("/#/staging");
+  await expect(panel(page)).toContainText("The staging service isn't set up yet, so nothing is being kept");
+  await expect(panel(page).locator(".staging-status")).toContainText("The staging service isn't set up yet.");
+  await expect(panel(page).getByRole("button", { name: "Clean up staging…" })).toBeDisabled();
+});
