@@ -32,9 +32,13 @@ and `PreviewBroker`. Test-only login/control endpoints create and revoke the
 synthetic human session and advance the fixture clock. They are not production
 routes. An immutable byte mapping implements the fixed artifact reader, without
 worker HTTP or Docker execution. The HTTPS transport adapter and minimal parent
-page are test infrastructure, not a replacement Hub frontend.
+page are test infrastructure, not a replacement Hub frontend. The minimal parent
+iframe has `sandbox="allow-scripts"` and `referrerpolicy="no-referrer"`; it does
+not reproduce the React dashboard's `credentialless` or `allow` attributes.
+Absence of preview cookies here proves hostname separation, not those dashboard
+attributes.
 
-Six tests cover:
+Seven tests cover:
 
 - Real static and dynamic ES-module imports, CSS, JSON and decoded TrueType font
   through capability URLs. `document.fonts.load` must return the loaded face and
@@ -43,11 +47,14 @@ Six tests cover:
   and absence of cookies, authorization and referrer headers at the preview server.
 - Browser CSP denial of a sibling capability, resource-specific file binding and
   anonymous capability-issuance denial.
+- A valid authenticated session receives 403 when capability issuance lacks CSRF,
+  supplies the wrong CSRF value or supplies a foreign Origin with valid CSRF.
+  Successful issuance before and after establishes that the session remains valid.
 - Immediate denial of retained capability requests after actual session logout,
   project-grant revocation and capability expiry; navigating the frame again also
   fails to load the application.
 
-Run on 24 October 2026: **6 passed**, using real Edge and the pinned Python image.
+Run on 24 October 2026: **7 passed**, using real Edge and the pinned Python image.
 The owned servers shut down and the exact container is removed in `afterAll`,
 including test failures; the test verifies container absence. A UUID ownership
 label and exact container ID guard cleanup, including ambiguous create failures;

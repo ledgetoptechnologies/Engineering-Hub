@@ -103,6 +103,29 @@ test(`actual HTTPS gateway loads modules, dynamic import, CSS, JSON and decoded 
   expect(observations.referer).toBe(false);
 });
 }
+test("authenticated preview issuance rejects missing or wrong CSRF and foreign Origin", async ({ page }) => {
+  const user = await login(page);
+  // A successful request before/after proves this is an active, authorized session,
+  // rather than an anonymous-cookie denial accidentally satisfying the test.
+  await issue(page, user.csrf, user.resources[0]);
+  for (const csrf of [null, "invalid-test-csrf"]) {
+    const status = await page.evaluate(async ({ hub, id, csrf }) => {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (csrf !== null) headers["x-hub-csrf"] = csrf;
+      return (await fetch(hub + "/api/hub/v1/staging/resources/" + id + "/preview-session",
+        { method: "POST", headers, body: "{}" })).status;
+    }, { hub, id: user.resources[0], csrf });
+    expect(status).toBe(403);
+  }
+  // The context request shares the real cookie jar, but permits an explicit
+  // foreign Origin header without navigating to or contacting another server.
+  const foreign = await page.request.post(hub + "/api/hub/v1/staging/resources/" + user.resources[0] + "/preview-session", {
+    headers: { "origin": "https://foreign.example.invalid", "x-hub-csrf": user.csrf }, data: {},
+  });
+  expect(foreign.status()).toBe(403);
+  await issue(page, user.csrf, user.resources[0]);
+});
+
 test("actual gateway denies sibling capabilities in-browser and binds files to their own resource", async ({ page }) => {
   const user = await login(page);
   const first = await issue(page, user.csrf, user.resources[0]);
