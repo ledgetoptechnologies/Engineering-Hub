@@ -1,9 +1,17 @@
 """Release helper planning tests; actual Docker acceptance runs in Hub CI."""
 import importlib.util
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 import json
 import pytest
+
+# Read the shared registration contract without importing its Linux-only bus
+# transport fixture into this offline helper test.
+HUB_TOOLS = ast.literal_eval(next(node.value for node in ast.parse(
+    Path(__file__).with_name('test_hub_unified_mcp.py').read_text()).body
+    if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+        and target.id == 'HUB_TOOLS' for target in node.targets)))
 
 
 def load(monkeypatch):
@@ -54,7 +62,8 @@ def test_isolated_568_profile_and_owned_recreation_plan(monkeypatch):
         if args[1:3] == ['volume', 'rm']:
             volumes.discard(args[-1])
         if args[1] == 'exec' and 'image_smoke' in args[-2]:
-            stdout = json.dumps({'image_smoke': 'passed', 'build_commit': commit})
+            stdout = json.dumps({'image_smoke': 'passed', 'build_commit': commit,
+                                 'authenticated_agents': 3, 'mcp_tools': len(HUB_TOOLS)})
         return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
     monkeypatch.setattr(module.subprocess, 'run', fake)
     # This test covers the existing normal-startup plan. Standby is tested
@@ -72,6 +81,7 @@ def test_isolated_568_profile_and_owned_recreation_plan(monkeypatch):
     probes = [c for c in calls if c[1] == 'exec' and 'image_smoke' in c[-2]]
     assert len(probes) == 2 and all("'Host': expected_host" in c[-2] for c in probes)
     assert result['named_volume_recreation'] == 'passed'
+    assert result['mcp_tools'] == len(HUB_TOOLS)
     assert result['truenas'] == 'not_deployed'
     assert not containers and not volumes
     assert calls[-1][1:3] == ['volume', 'inspect']

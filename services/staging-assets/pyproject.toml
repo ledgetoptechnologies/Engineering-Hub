@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hub-staging-assets"
-version = "0.1.1"
+version = "0.1.2"
 description = "Native read-only immutable asset transport for Engineering Hub"
 requires-python = ">=3.12"
 dependencies = []
