@@ -11,7 +11,7 @@ from engineering_hub.projects import ProjectRepository
 from engineering_hub.repository import HubRepository, HubError
 from engineering_hub.staging_resources import StagingResourceStore
 from engineering_hub.staging_controller import StagingController, compose_queue
-from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget
+from engineering_hub.work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker
 
 
 class Client:
