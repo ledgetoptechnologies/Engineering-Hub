@@ -18,3 +18,8 @@ Artifacts are diagnostics, not an alternative pass decision. The existing
 negative control are unchanged. A child failure still fails its calling test.
 No retry or acceptance override is introduced. Source/runtime tests are not
 proof of actual NAS latency, physical staging acceptance or reboot recovery.
+
+Local artifact retention is optional: filesystem or serialization failures leave
+the original probe pass/failure unchanged. A fixed error-type-only stderr message
+reports lost evidence without exposing paths or exception messages; a broken
+stderr stream is also ignored. This does not change CI upload failure semantics.

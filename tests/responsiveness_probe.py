@@ -325,7 +325,17 @@ def run_isolated_probe(scenario, *, action=None, negative_control=False):
         evidence['error_type'] = type(error).__name__
         raise
     finally:
-        retain_probe_evidence(evidence)
+        try:
+            retain_probe_evidence(evidence)
+        except (OSError, ValueError, TypeError) as error:
+            # Optional diagnostics must not turn a pass into a failure or mask
+            # the original acceptance rejection. Never expose paths/messages,
+            # and do not use warnings: strict warning filters are intentional.
+            try:
+                print('EH_RESPONSIVENESS_EVIDENCE_ERROR ' + type(error).__name__,
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError, TypeError):
+                pass  # Even a broken diagnostic stream cannot change acceptance.
 
 
 def validate_report(value, *, scenario, action, negative_control, expected_source):

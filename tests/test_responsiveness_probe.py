@@ -1,10 +1,12 @@
 """The negative control must reject latency, never accept generic child failure."""
 import copy
+import errno
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +142,86 @@ def test_artifacts_exclude_unknown_values_and_unverified_source_paths(monkeypatc
 def test_diagnostic_filter_handles_huge_integer_without_masking_failure():
     value, omitted = probe.diagnostic_report({'max_seconds': 10**1000}, {})
     assert value == {} and omitted == 1
+
+
+@pytest.mark.parametrize('latency_failure', [False, True])
+@pytest.mark.parametrize('storage_failure', ['path_is_file', 'permission', 'disk_full',
+                                          'serialization_value', 'serialization_type'])
+def test_optional_retention_failure_preserves_acceptance_under_strict_warnings(
+        monkeypatch, tmp_path, capsys, latency_failure, storage_failure):
+    value = valid()
+    value['negative_control'] = False
+    if not latency_failure:
+        value.update(samples=[.001] * 5, max_seconds=.001,
+                     latency_accepted=True, rejection=None)
+    stdout = probe.PREFIX + json.dumps(value) + '\n'
+    destination = tmp_path / 'synthetic-private-path'
+    if storage_failure == 'path_is_file':
+        destination.write_text('occupied', encoding='utf-8')
+    monkeypatch.setenv('EH_RESPONSIVENESS_ARTIFACT_DIR', str(destination))
+    monkeypatch.setattr(probe, 'source_provenance', lambda: {})
+    monkeypatch.setattr(probe.subprocess, 'run', lambda *args, **kwargs:
+        SimpleNamespace(returncode=3 if latency_failure else 0, stdout=stdout, stderr=''))
+
+    def fail(*args, **kwargs):
+        if storage_failure == 'permission':
+            raise PermissionError('synthetic-private-message')
+        if storage_failure == 'disk_full':
+            raise OSError(errno.ENOSPC, 'synthetic-private-message')
+        if storage_failure == 'serialization_value':
+            raise ValueError('synthetic-private-message')
+        raise TypeError('synthetic-private-message')
+
+    if storage_failure in {'permission', 'disk_full'}:
+        monkeypatch.setattr(probe.Path, 'mkdir', fail)
+    elif storage_failure.startswith('serialization_'):
+        monkeypatch.setattr(probe.json, 'dumps', fail)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        if latency_failure:
+            with pytest.raises(AssertionError) as rejection:
+                probe.run_isolated_probe('unified')
+            assert rejection.value.args[0][0] == 3
+            assert rejection.value.args[0][1]['max_seconds'] == .31
+        else:
+            assert probe.run_isolated_probe('unified') == value
+    captured = capsys.readouterr()
+    expected_type = {'path_is_file': 'FileExistsError', 'permission': 'PermissionError',
+        'disk_full': 'OSError', 'serialization_value': 'ValueError',
+        'serialization_type': 'TypeError'}[storage_failure]
+    assert captured.err == 'EH_RESPONSIVENESS_EVIDENCE_ERROR ' + expected_type + '\n'
+    assert not captured.out
+    assert 'synthetic-private' not in captured.err
+
+
+@pytest.mark.parametrize('latency_failure', [False, True])
+def test_optional_retention_and_stderr_failures_preserve_acceptance(monkeypatch, tmp_path, latency_failure):
+    value = valid()
+    value['negative_control'] = False
+    if not latency_failure:
+        value.update(samples=[.001] * 5, max_seconds=.001,
+                     latency_accepted=True, rejection=None)
+    stdout = probe.PREFIX + json.dumps(value) + '\n'
+    destination = tmp_path / 'occupied'
+    destination.write_text('occupied', encoding='utf-8')
+    monkeypatch.setenv('EH_RESPONSIVENESS_ARTIFACT_DIR', str(destination))
+    monkeypatch.setattr(probe, 'source_provenance', lambda: {})
+    monkeypatch.setattr(probe.subprocess, 'run', lambda *args, **kwargs:
+        SimpleNamespace(returncode=3 if latency_failure else 0, stdout=stdout, stderr=''))
+    class BrokenStderr:
+        def write(self, text):
+            raise OSError('synthetic-private-message')
+        def flush(self):
+            raise OSError('synthetic-private-message')
+    monkeypatch.setattr(probe.sys, 'stderr', BrokenStderr())
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        if latency_failure:
+            with pytest.raises(AssertionError) as rejection:
+                probe.run_isolated_probe('unified')
+            assert rejection.value.args[0][0] == 3
+        else:
+            assert probe.run_isolated_probe('unified') == value
 
 
 @pytest.mark.skipif(sys.platform != 'linux',reason='Linux owned responsiveness scenario')
