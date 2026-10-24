@@ -47,6 +47,38 @@ class StagingClientError(HubError):
         super().__init__(code, status)
 
 
+_NOT_ACCEPTED = {
+    '/v1/jobs': {
+        409: frozenset({'worker_busy_or_held', 'worker_storage_capacity', 'resource_conflict'}),
+        403: frozenset({'project_not_allowed', 'recipe_not_allowed', 'peer_not_allowed'}),
+        401: frozenset({'unauthorized'}),
+    },
+    '/v1/cleanup': {
+        409: frozenset({'worker_busy', 'cleanup_revision_or_reference', 'resource_job_not_terminal'}),
+        403: frozenset({'peer_not_allowed'}),
+        401: frozenset({'unauthorized'}),
+    },
+}
+_REJECTION_REASONS = frozenset(reason for statuses in _NOT_ACCEPTED.values()
+                               for reasons in statuses.values() for reason in reasons)
+
+
+class StagingNotAccepted(StagingClientError):
+    """Known rejection of THIS POST, not proof an older operation never ran.
+
+    Controllers must retain the original dispatch/ownership history. This
+    subtype is admitted only on configured private HTTPS or explicit synthetic
+    MockTransport, never a real plaintext loopback response. It permits no
+    retry, reinterpretation of a lost acknowledgment, or
+    replacing a local preflight-only ``not dispatched`` proof.
+    """
+    def __init__(self, reason):
+        if type(reason) is not str or reason not in _REJECTION_REASONS:
+            raise StagingClientError() from None
+        self.reason = reason
+        super().__init__('staging_worker_rejected', 409)
+
+
 def _check(condition):
     if not condition:
         raise StagingClientError('staging_connection_invalid', 400)
@@ -233,6 +265,8 @@ class StagingClient:
                 certificate = _read_file(config.ca_file, 128 * 1024)
                 context = ssl.create_default_context(cadata=certificate.decode('ascii'))
             self._token, self.config = token, config
+            self._definitive_rejections = (config.origin.startswith('https://')
+                                          or type(test_transport) is httpx.MockTransport)
             self._client = httpx.AsyncClient(transport=test_transport, verify=context,
                 trust_env=False, follow_redirects=False, timeout=15,
                 limits=httpx.Limits(max_connections=4, max_keepalive_connections=4))
@@ -283,9 +317,9 @@ class StagingClient:
                 extensions={'timeout': dict(connect=15.0, read=timeout, write=timeout, pool=15.0)})
             async with asyncio.timeout(timeout):
                 response = await self._client.send(request, auth=None, follow_redirects=False, stream=True)
-                _check(response.status_code in ({200, 202} if path == '/v1/jobs' else {200})
-                       and 'set-cookie' not in response.headers and 'location' not in response.headers
-                       and response.headers.get('content-encoding', 'identity') == 'identity')
+                _check('set-cookie' not in response.headers and 'location' not in response.headers
+                       and response.headers.get('content-encoding', 'identity') == 'identity'
+                       and all(self._token not in value for value in response.headers.values()))
                 media = response.headers.get('content-type', '')
                 if file_types:
                     _check(media in file_types)
@@ -302,10 +336,20 @@ class StagingClient:
                     _check(len(data) == int(length))
                 _check(self._token.encode() not in data)
                 if file_types:
+                    _check(response.status_code == 200)
                     return bytes(data), media
                 result = json.loads(data, object_pairs_hook=_unique)
                 _check(type(result) is dict)
+                if (self._definitive_rejections and method == 'POST'
+                        and path in _NOT_ACCEPTED and set(result) == {'error'}):
+                    reason = result['error']
+                    allowed = _NOT_ACCEPTED[path].get(response.status_code, frozenset())
+                    if type(reason) is str and reason in allowed:
+                        raise StagingNotAccepted(reason)
+                _check(response.status_code in ({200, 202} if path == '/v1/jobs' else {200}))
                 return result
+        except StagingNotAccepted:
+            raise
         except Exception:
             raise StagingClientError() from None
         finally:

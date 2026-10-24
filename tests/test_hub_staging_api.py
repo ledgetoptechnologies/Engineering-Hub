@@ -42,6 +42,13 @@ class Controller:
         self.resources.authorize(actor, PROJECT, 'read')
         return {'job_id': job_id, 'state': 'queued'}
 
+    async def reconcile_for(self, actor, job_id):
+        if actor not in self.resources.admin_actors:
+            raise HubError('staging_admin_required', 403)
+        self.resources.authorize(actor, PROJECT, 'read')
+        self.calls.append(('reconcile', actor, job_id))
+        return {'job': {'id': job_id, 'state': 'held'}, 'phase': 'held', 'resource_ids': {}}
+
     async def cleanup_apply(self, actor, plan_id, digest):
         self.calls.append(('cleanup', actor, plan_id, digest))
         begun = self.resources.cleanup_begin(actor, plan_id, digest)
@@ -131,7 +138,7 @@ def test_disabled_status_is_authenticated_and_actions_closed():
     client, _ = application(None)
     assert client.get(PREFIX + '/status').status_code == 401
     assert client.get(PREFIX + '/status', headers=headers()).json() == {
-        'configured': False, 'running': False, 'reachable': False, 'previews_configured': False}
+        'configured': False, 'running': False, 'reachable': False, 'profiles': {}, 'previews_configured': False}
     assert client.get(PREFIX + '/resources', headers=headers()).status_code == 503
     assert client.post(PREFIX + '/jobs', headers=headers(), json=submission()).status_code == 503
 
@@ -217,6 +224,18 @@ def test_job_schema_rejects_coercion_and_invalid_provenance(env):
     client, _ = application(env[3])
     for changed in ({'request_id': 123}, {'project': '../unsafe'}, {'source_digest': DIGEST}, {'source_commit': 'latest'}, {'topic': ''}):
         assert client.post(PREFIX + '/jobs', headers=headers(), json=dict(submission(), **changed)).status_code == 422
+
+
+def test_recheck_is_owner_human_csrf_only_and_accepts_no_release_command(env):
+    client, _ = application(env[3])
+    identity = str(uuid.uuid4())
+    path = PREFIX + '/jobs/' + identity + '/reconcile'
+    assert client.post(path, headers=headers(), json={}).status_code == 403
+    assert client.post(path, headers=headers('human:2', csrf=True), json={}).status_code == 403
+    assert client.post(path, headers=headers(ADMIN), json={}).status_code == 403
+    assert client.post(path, headers=headers(ADMIN, csrf=True), json={'force': True}).status_code == 422
+    assert client.post(path, headers=headers(ADMIN, csrf=True), json={}).json()['phase'] == 'held'
+    assert env[3].calls[-1] == ('reconcile', ADMIN, identity)
 
 
 def test_policy_owner_only_cas_and_human_csrf(env):

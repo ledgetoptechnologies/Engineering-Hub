@@ -14,7 +14,8 @@ import uuid
 
 from .repository import AGENTS, HubError
 from .staging_resources import KINDS
-from .staging_client import _FILE_TYPES
+from .staging_client import StagingNotAccepted
+from .staging_client import _FILE_TYPES, StagingNotAccepted
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
 
 
@@ -59,11 +60,11 @@ def compose_queue(repo, existing_queue, projects, machine_id):
 
 class StagingController:
     def __init__(self, repo, queue, client, *, resources, control_principal,
-                 actions, worker=None, poll_interval=1, max_poll_seconds=300):
+                 actions, worker=None, poll_interval=1, max_poll_seconds=2700):
         _require(queue.repo is repo and resources.repo is repo and resources._control is control_principal,
                  'invalid_staging_configuration')
         _require(type(actions) is dict and bool(actions) and 0 < poll_interval <= 30 and
-                 0 < max_poll_seconds <= 1800, 'invalid_staging_configuration')
+                 0 < max_poll_seconds <= 2700, 'invalid_staging_configuration')
         self.repo, self.queue, self.client, self.resources = repo, queue, client, resources
         self.principal, self.actions = control_principal, dict(actions)
         self.worker = worker or WorkWorker(STAGING_SERVICE_EXECUTOR, str(uuid.uuid4()))
@@ -79,6 +80,7 @@ class StagingController:
                      queue.actions[key].requires_execution_proof, 'invalid_staging_action')
         with repo._transaction() as db:
             db.execute('CREATE TABLE IF NOT EXISTS hub_staging_submissions (id TEXT PRIMARY KEY,actor TEXT NOT NULL,request_id TEXT NOT NULL,fingerprint TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(actor,request_id))')
+            db.execute("CREATE INDEX IF NOT EXISTS hub_staging_submission_job ON hub_staging_submissions(json_extract(data,'$.job_id'))")
             db.execute('CREATE TABLE IF NOT EXISTS hub_staging_dispatch_cleanup (id TEXT PRIMARY KEY,data TEXT NOT NULL)')
         self._install_verifiers()
 
@@ -89,10 +91,9 @@ class StagingController:
                 if row:
                     return json.loads(row[0])
             else:
-                for row in db.execute('SELECT data FROM hub_staging_submissions'):
-                    value = json.loads(row[0])
-                    if value.get('job_id') == job_id:
-                        return value
+                row = db.execute("SELECT data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=?", (job_id,)).fetchone()
+                if row:
+                    return json.loads(row[0])
         raise HubError('staging_job_not_found', 404)
 
     def _save(self, item):
@@ -127,7 +128,10 @@ class StagingController:
                 return old_claim(worker, action, environment, machine, value) if old_claim else True
             if self._unknown_production(machine, old_target):
                 return False
-            return worker == self.worker and target(self._read(value.task_id)['actor'], action, environment, value)
+            item = self._read(value.task_id)
+            return (worker == self.worker and item['phase'] == 'queued'
+                    and set(item['resource_ids']) == KINDS
+                    and target(item['actor'], action, environment, value))
 
         def proof(job, evidence_id, outcome):
             if job['action_key'] not in owned:
@@ -223,7 +227,8 @@ class StagingController:
 
     async def status(self, actor=None):
         result = {'configured': True, 'running': self.background is not None and not self.background.done(),
-                  'reachable': False, 'profiles': {}}
+                  'reachable': False, 'profiles': {}, 'held_jobs': [],
+                  'can_reconcile': actor in self.resources.admin_actors}
         try:
             remote = await self.client.status()
             result['reachable'] = True
@@ -235,8 +240,55 @@ class StagingController:
                     self.resources.authorize(actor, project, 'read')
                 except HubError:
                     continue
-                result['profiles'][project] = remote.get('projects', {}).get(project, [])
+                result['profiles'][project] = [recipe for recipe in remote.get('projects', {}).get(project, [])
+                                               if (project, recipe) in self.actions]
+            with self.repo._connection() as db:
+                projects = tuple(result['profiles'])
+                entries = [] if not projects else [json.loads(row[0]) for row in db.execute(
+                    "SELECT s.data FROM hub_staging_submissions s JOIN hub_work_jobs j ON j.id=json_extract(s.data,'$.job_id') "
+                    "WHERE j.state IN ('claimed','held') AND j.project IN (" + ','.join('?' for _ in projects) + ') ORDER BY j.sequence LIMIT 50', projects)]
+            for item in entries:
+                if item['project'] not in result['profiles'] or item.get('job_id') is None:
+                    continue
+                job = self.queue.get_job(item['job_id'])
+                if job['state'] not in ('claimed', 'held'):
+                    continue
+                if (job['state'] == 'claimed' and not job.get('requires_reconciliation')
+                        and item['phase'] != 'held' and job.get('worker') == self.worker.encoded()):
+                    continue  # Normal in-flight work is not a held outcome.
+                result['held_jobs'].append({'id': job['id'], 'project': item['project'],
+                    'recipe': item['recipe'], 'state': job['state'], 'phase': item['phase'],
+                    'source_commit': item['source_commit']})
+                if len(result['held_jobs']) == 50:
+                    break
         return result
+
+    async def reconcile_for(self, actor, identity):
+        self.repo._actor(actor, human=True)
+        _require(actor in self.resources.admin_actors, 'staging_admin_required', 403)
+        item = self._read(job_id=_id(identity))
+        self.resources.authorize(actor, item['project'], 'read')
+        return await self.reconcile(identity)
+
+    def _finish_no_effect(self, item, claim, proof, reason):
+        """Local intent or authenticated rejection proves THIS command did not run."""
+        item.update(phase='verified', outcome='failed', dispatch_proof=proof,
+                    rejection_reason=reason, evidence_id=item.get('evidence_id', str(uuid.uuid4())))
+        if claim is not None:
+            item['claim'] = claim
+        self._save(item)
+        self.resources.abandon_not_created(self.principal, item['job_id'])
+        current = self.queue.get_job(item['job_id'])
+        if current['state'] == 'failed':
+            return self._view(item)
+        if current.get('requires_reconciliation') or current['state'] == 'held':
+            self.queue.reconcile(job_id=item['job_id'], evidence_id=item['evidence_id'], outcome='failed')
+        else:
+            bound = claim or item.get('claim')
+            _require(bound is not None, 'staging_reconciliation_pending', 409)
+            self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=bound['fence'],
+                                outcome='failed', evidence_id=item['evidence_id'])
+        return self._view(item)
 
     def _hold(self, item, claim=None):
         item['phase'] = 'held'; self._save(item)
@@ -280,7 +332,15 @@ class StagingController:
                     'source_id': item['source_id'], 'resource_ids': item['resource_ids']})
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)
-            except Exception:
+            except Exception as error:
+                if item['phase'] in ('queued', 'deposited'):
+                    return self._finish_no_effect(item, claim, 'never_sent', 'admission_changed')
+                if isinstance(error, StagingNotAccepted) and error.reason not in ('worker_busy', 'worker_busy_or_held'):
+                    return self._finish_no_effect(item, claim, 'definitively_rejected', error.reason)
+                if isinstance(error, StagingNotAccepted):
+                    # A different busy/held operation is not proof that the
+                    # physical machine is idle. Preserve its conservative hold.
+                    item['rejection_reason'] = error.reason
                 self._hold(item, claim)
                 return self._view(item)
 
@@ -334,7 +394,7 @@ class StagingController:
         item.update(phase='verified', outcome=outcome, evidence_id=item.get('evidence_id', str(uuid.uuid4())))
         self._save(item)
         current = self.queue.get_job(item['job_id'])
-        if current['state'] == 'held':
+        if current['state'] == 'held' or current.get('requires_reconciliation'):
             self.queue.reconcile(job_id=item['job_id'], evidence_id=item['evidence_id'], outcome=outcome)
         else:
             self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=claim['fence'],
@@ -350,22 +410,16 @@ class StagingController:
             if (prior['id'] == newest['id'] or prior['project'] != newest['project'] or
                     prior['recipe'] != newest['recipe'] or prior.get('phase') != 'verified' or prior.get('outcome') != 'failed'):
                 continue
-            job = self.resources.inspect_job(self.principal, prior['job_id'])
-            protections = [p for p in job['protected'] if not(p['reason'] == 'latest_failure' and p['ref'] == prior['job_id'])]
-            self.resources.update_job(self.principal, prior['job_id'], job['revision'], terminal=True, protected=protections)
-            for identity in prior['resource_ids'].values():
-                resource = self.resources.inspect_resource(self.principal, identity)
-                if resource['state'] in ('deleting', 'deleted'):
-                    continue
-                protected = [p for p in resource['protected'] if not(p['reason'] == 'latest_failure' and p['ref'] == prior['job_id'])]
-                self.resources.set_protection(self.principal, identity, resource['revision'], protected)
+            self.resources.supersede_latest_failure(self.principal, prior['job_id'])
 
     async def reconcile(self, identity):
         async with self.lock:
             item = self._read(job_id=_id(identity))
             current = self.queue.get_job(identity)
+            if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
+                return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
             if item['phase'] == 'verified' and current['state'] == item['outcome']:
-                return self.get_job(item['actor'], identity)
+                return self._view(item)  # Public owner authorization was checked separately.
             _require(item['phase'] in ('held', 'dispatching', 'accepted', 'verified'), 'staging_reconcile_not_needed', 409)
             try:
                 return await self._follow(item, await self.client.job(identity), item.get('claim'))
@@ -385,6 +439,14 @@ class StagingController:
                     saved = json.loads(old[0])
                     if saved['state'] == 'verified':
                         result['removed'].append(identity)
+                    elif saved['state'] in ('not_dispatched', 'not_accepted'):
+                        result['failed'].append({'id': identity, 'code': saved['state']})
+                    elif saved['state'] == 'rejected':
+                        code = self._cleanup_not_accepted(plan_id, operation, saved.get('reason'))
+                        result['failed'].append({'id': identity, 'code': code})
+                    elif saved['state'] == 'preflight':
+                        code = self._cleanup_not_dispatched(plan_id, operation, 'preflight_interrupted')
+                        result['failed'].append({'id': identity, 'code': code})
                     else:
                         try:
                             receipt = await self.client.operation(command)
@@ -396,26 +458,75 @@ class StagingController:
                         except Exception:
                             result['failed'].append({'id': identity, 'code': 'reconciliation_required'})
                     continue
+                # This must precede the first metadata await. It also covers a
+                # crash after cleanup_begin committed but before this row existed.
+                saved = {'state': 'preflight', 'plan_id': plan_id, 'resource_id': identity,
+                         'resource_revision': operation['expected_revision']}
+                with self.repo._transaction() as db:
+                    db.execute('INSERT INTO hub_staging_dispatch_cleanup VALUES(?,?)', (command, _json(saved)))
                 if not begun['dispatch']:
-                    result['failed'].append({'id': identity, 'code': 'reconciliation_required'}); continue
+                    code = self._cleanup_not_dispatched(plan_id, operation, 'preflight_interrupted')
+                    result['failed'].append({'id': identity, 'code': code})
+                    continue
                 try:
                     fact = await self.client.resource(identity)
-                    _require(fact['job_id'] == operation['job_id'] and fact['kind'] == operation['kind'] and
+                    _require(fact['id'] == identity and fact['job_id'] == operation['job_id'] and fact['kind'] == operation['kind'] and
                              fact['state'] in ('ready', 'building') and not fact['refs'], 'staging_cleanup_scope_changed', 409)
                     payload = {'command_id': command, 'idempotency_key': command,
                                'resources': [{'resource_id': identity, 'expected_revision': fact['revision']}]}
-                    saved = {'state': 'dispatching', 'payload': payload}
                     with self.repo._transaction() as db:
-                        db.execute('INSERT INTO hub_staging_dispatch_cleanup VALUES(?,?)', (command, _json(saved)))
-                    receipt = await self.client.cleanup(payload)
+                        local = self.resources._resource(db, identity)
+                        self.repo._cas(local, operation['expected_revision'])
+                        self.resources._authorize(db, actor, local['project'], 'cleanup')
+                        _require(local['state'] == 'deleting', 'staging_cleanup_scope_changed', 409)
+                        current = json.loads(db.execute('SELECT data FROM hub_staging_dispatch_cleanup WHERE id=?', (command,)).fetchone()[0])
+                        _require(current == saved, 'staging_cleanup_outcome_uncertain', 409)
+                        saved.update(state='dispatching', payload=payload)
+                        db.execute('UPDATE hub_staging_dispatch_cleanup SET data=? WHERE id=?', (_json(saved), command))
+                    try:
+                        receipt = await self.client.cleanup(payload)
+                    except StagingNotAccepted as rejected:
+                        # Only the first original POST reaches this branch.
+                        # Persist the typed rejection before restoring metadata;
+                        # replays never send POST or reinterpret unknown results.
+                        with self.repo._transaction() as db:
+                            current = json.loads(db.execute('SELECT data FROM hub_staging_dispatch_cleanup WHERE id=?', (command,)).fetchone()[0])
+                            _require(current == saved, 'staging_cleanup_outcome_uncertain', 409)
+                            saved.update(state='rejected', reason=rejected.reason)
+                            db.execute('UPDATE hub_staging_dispatch_cleanup SET data=? WHERE id=?', (_json(saved), command))
+                        code = self._cleanup_not_accepted(plan_id, operation, rejected.reason)
+                        result['failed'].append({'id': identity, 'code': code})
+                        continue
                     await self._cleanup_receipt(plan_id, operation, payload, receipt)
                     saved['state'] = 'verified'
                     with self.repo._transaction() as db:
                         db.execute('UPDATE hub_staging_dispatch_cleanup SET data=? WHERE id=?', (_json(saved), command))
                     result['removed'].append(identity)
+                except asyncio.CancelledError:
+                    self._cleanup_not_dispatched(plan_id, operation, 'preflight_cancelled')
+                    raise
                 except Exception:
-                    result['failed'].append({'id': identity, 'code': 'reconciliation_required'})
+                    code = self._cleanup_not_dispatched(plan_id, operation, 'preflight_failed')
+                    result['failed'].append({'id': identity, 'code': code})
             return result
+
+    def _cleanup_not_dispatched(self, plan_id, operation, reason):
+        try:
+            self.resources.cleanup_not_dispatched(self.principal, plan_id, operation['id'],
+                operation['expected_revision'], receipt_id=operation['operation_id'], reason=reason)
+            return 'not_dispatched'
+        except Exception:
+            # Once the durable boundary is dispatching, even a timeout before
+            # response headers cannot establish that the POST had no effect.
+            return 'reconciliation_required'
+
+    def _cleanup_not_accepted(self, plan_id, operation, reason):
+        try:
+            self.resources.cleanup_not_accepted(self.principal, plan_id, operation['id'],
+                operation['expected_revision'], receipt_id=operation['operation_id'], reason=reason)
+            return 'not_accepted'
+        except Exception:
+            return 'reconciliation_required'
 
     async def _cleanup_receipt(self, plan_id, operation, payload, receipt):
         identity, command = operation['id'], operation['operation_id']
@@ -461,12 +572,29 @@ class StagingController:
     async def _loop(self):
         while not self.stopping:
             self.wake.clear()
+            await self._recover_pending()
             while not self.stopping and await self.run_once() is not None:
                 pass
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=5)
             except TimeoutError:
                 pass  # Reconsider canonical priority when an external reservation ends.
+
+    async def _recover_pending(self):
+        """Follow original receipts after restart; never repeat a command POST."""
+        with self.repo._connection() as db:
+            entries = [json.loads(row[0]) for row in db.execute('SELECT data FROM hub_staging_submissions')]
+        for item in entries:
+            if self.stopping or item.get('job_id') is None or item['phase'] not in ('held', 'accepted', 'dispatching', 'verified'):
+                continue
+            job = self.queue.get_job(item['job_id'])
+            if job['state'] not in ('claimed', 'held'):
+                continue
+            # An unexpired other-generation lease is not ours to replace.
+            if (job['state'] == 'claimed' and not job.get('requires_reconciliation')
+                    and job.get('worker') != self.worker.encoded()):
+                continue
+            await self.reconcile(item['job_id'])
 
     async def close(self):
         self.stopping = True

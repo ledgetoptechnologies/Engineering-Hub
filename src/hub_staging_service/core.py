@@ -157,6 +157,20 @@ def tree_manifest(path, limit):
     return result, total
 
 
+def make_job_readable(path, limit):
+    """Validate an owned immutable tree before exposing it via a read-only bind.
+
+    Rootless Docker maps the host owner to container root; the configured job
+    UID therefore needs read/traverse bits. Only this resource tree changes;
+    its private worker/resource ancestors remain inaccessible to other hosts.
+    """
+    tree_manifest(path, limit)
+    for directory, dirs, files in os.walk(path, followlinks=False):
+        Path(directory).chmod(0o755)
+        for name in files:
+            (Path(directory) / name).chmod(0o644)
+
+
 class Service:
     def __init__(self, root, projects, backend, *, capacity_bytes=1024 * 1024 * 1024,
                  free_floor_bytes=512 * 1024 * 1024):
@@ -342,8 +356,11 @@ class Service:
                        and not (self.resources / resource_id).exists(), 'resource_conflict', 409)
             reservation = MAX_EXPANDED + 3 * profile['output_bytes'] + len(raw)
             self._capacity(reservation)
+            # The full incoming payload is already bound by `identity`. Retain
+            # compact provenance/idempotency facts, not an inline archive forever.
+            persisted = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
-                            (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(payload), '{}'))
+                            (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
             self.db.commit()
             self.active = payload['command_id']
             self.thread = threading.Thread(target=self._execute, args=(payload, raw), daemon=False)
@@ -370,13 +387,7 @@ class Service:
                         (resource_id, payload['job_id'], kind, 1, 'building', path.stat().st_ino, '{}', 0, '[]'))
                     self.db.commit()
             extract(raw, paths['workspace'])
-            # Rootless Docker maps host owner to container root. Read-only
-            # source must also be readable by the explicitly non-root job UID;
-            # the private worker-root ancestor still prevents host-wide access.
-            for directory, dirs, files in os.walk(paths['workspace'], followlinks=False):
-                Path(directory).chmod(0o755)
-                for name in files:
-                    (Path(directory) / name).chmod(0o644)
+            make_job_readable(paths['workspace'], MAX_EXPANDED)
             profile = self.projects[payload['project']][payload['recipe']]
             result = self.backend.run(paths, profile, payload['command_id'])
             for kind, path in paths.items():

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import sqlite3
+import json
 import uuid
 
 import pytest
@@ -136,7 +137,7 @@ def test_pins_require_admin_and_agents_cannot_remove_pin(env):
     with pytest.raises(HubError, match='staging_admin_required'):
         store.set_keep('codex', item['id'], 'pinned', reason='needed', expected_revision=item['revision'])
     item = store.set_keep(OWNER, item['id'], 'pinned', reason='important', expected_revision=item['revision'])
-    with pytest.raises(HubError, match='staging_admin_required'):
+    with pytest.raises(HubError, match='staging_human_keep_required'):
         store.set_keep('codex', item['id'], 'none', expected_revision=item['revision'])
     assert store.cleanup_plan(OWNER, PROJECT)['kept'] == [{'id': item['id'], 'why': 'kept'}]
 
@@ -157,6 +158,21 @@ def test_keep_until_bounded_expiry_and_cas(env):
     assert store.cleanup_plan('codex', PROJECT)['remove'] == []
     now[0] += 101
     assert store.cleanup_plan('codex', PROJECT)['remove'][0]['id'] == kept['id']
+
+
+@pytest.mark.parametrize('mode,delta', [('none', None), ('until', 50), ('until', 200)])
+def test_agent_cannot_clear_shorten_or_replace_human_retention(env, mode, delta):
+    store, _, now, _, _ = env
+    item, _ = expired(env)
+    kept = store.set_keep(OWNER, item['id'], 'until',
+        until=datetime.fromtimestamp(now[0] + 100, timezone.utc).isoformat(),
+        reason='Human review', expected_revision=item['revision'])
+    until = datetime.fromtimestamp(now[0] + delta, timezone.utc).isoformat() if delta else None
+    with pytest.raises(HubError, match='staging_human_keep_required') as error:
+        store.set_keep('codex', item['id'], mode, until=until, reason='Agent change',
+                       expected_revision=kept['revision'])
+    assert error.value.status == 403
+    assert store.get_resource(OWNER, item['id']) == kept
 
 
 @pytest.mark.parametrize('protection', ['current_release', 'rollback_target', 'held_campaign', 'decision_evidence', 'latest_failure'])
@@ -268,6 +284,108 @@ def test_trusted_receipt_cas_idempotence_and_tombstone(env, absent, final):
     with repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_staging_cleanup_receipts').fetchone()[0] == 1
         assert db.execute("SELECT count(*) FROM hub_audit WHERE action='staging.cleanup_finish'").fetchone()[0] == 1
+
+
+def preflight_cleanup(env):
+    store, _, _, repo, _ = env
+    item, _ = expired(env)
+    plan = store.cleanup_plan(OWNER, PROJECT)
+    operation = store.cleanup_begin(OWNER, plan['plan_id'], plan['digest'])['operations'][0]
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE IF NOT EXISTS hub_staging_dispatch_cleanup (id TEXT PRIMARY KEY,data TEXT NOT NULL)')
+        data = dict(state='preflight', plan_id=plan['plan_id'], resource_id=item['id'],
+                    resource_revision=operation['expected_revision'])
+        db.execute('INSERT INTO hub_staging_dispatch_cleanup VALUES(?,?)', (operation['operation_id'], json.dumps(data)))
+    return item, plan, operation
+
+
+def test_not_dispatched_receipt_restores_previous_state_once_and_never_claims_deletion(env):
+    store, control, _, repo, _ = env
+    item, plan, operation = preflight_cleanup(env)
+    args = (plan['plan_id'], item['id'], operation['expected_revision'])
+    kwargs = dict(receipt_id=operation['operation_id'], reason='preflight_failed')
+    with pytest.raises(HubError, match='staging_control_required'):
+        store.cleanup_not_dispatched(object(), *args, **kwargs)
+    restored = store.cleanup_not_dispatched(control, *args, **kwargs)
+    assert restored['state'] == item['state'] == 'ready'
+    assert restored['revision'] == operation['expected_revision'] + 1
+    assert store.cleanup_not_dispatched(control, *args, **kwargs) == restored
+    with pytest.raises(HubError, match='staging_receipt_conflict'):
+        store.cleanup_not_dispatched(control, *args, **(kwargs | {'reason': 'preflight_cancelled'}))
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_staging_cleanup_receipts').fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM hub_audit WHERE action='staging.cleanup_not_dispatched'").fetchone()[0] == 1
+        journal = json.loads(db.execute('SELECT data FROM hub_staging_dispatch_cleanup').fetchone()[0])
+        assert journal['state'] == 'not_dispatched' and 'payload' not in journal
+    assert store.cleanup_plan(OWNER, PROJECT)['remove'][0]['id'] == item['id']
+
+
+@pytest.mark.parametrize('change', ['dispatching', 'unknown', 'missing-previous', 'different-resource', 'payload'])
+def test_not_dispatched_never_restores_uncertain_or_unbound_operation(env, change):
+    store, control, _, repo, _ = env
+    item, plan, operation = preflight_cleanup(env)
+    with repo._transaction() as db:
+        row = db.execute('SELECT data FROM hub_staging_dispatch_cleanup').fetchone()
+        journal = json.loads(row[0])
+        if change in ('dispatching', 'unknown'):
+            journal['state'] = change
+        elif change == 'different-resource':
+            journal['resource_id'] = str(uuid.uuid4())
+        elif change == 'payload':
+            journal['payload'] = {}
+        else:
+            stored = json.loads(db.execute('SELECT data FROM hub_staging_cleanup_plans').fetchone()[0])
+            stored['operations'][0].pop('previous_state')
+            db.execute('UPDATE hub_staging_cleanup_plans SET data=?', (json.dumps(stored),))
+        db.execute('UPDATE hub_staging_dispatch_cleanup SET data=?', (json.dumps(journal),))
+    with pytest.raises(HubError, match='staging_cleanup_outcome_uncertain'):
+        store.cleanup_not_dispatched(control, plan['plan_id'], item['id'], operation['expected_revision'],
+            receipt_id=operation['operation_id'], reason='preflight_interrupted')
+    assert store.get_resource(OWNER, item['id'])['state'] == 'deleting'
+
+
+def test_not_dispatched_audit_failure_rolls_back_restoration_receipt_and_journal(env, monkeypatch):
+    store, control, _, repo, _ = env
+    item, plan, operation = preflight_cleanup(env)
+    original = repo._emit
+    monkeypatch.setattr(repo, '_emit', lambda *args: (_ for _ in ()).throw(sqlite3.OperationalError('fixture failure')))
+    with pytest.raises(sqlite3.OperationalError):
+        store.cleanup_not_dispatched(control, plan['plan_id'], item['id'], operation['expected_revision'],
+            receipt_id=operation['operation_id'], reason='preflight_failed')
+    assert store.get_resource(OWNER, item['id'])['state'] == 'deleting'
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_staging_cleanup_receipts').fetchone()[0] == 0
+        assert json.loads(db.execute('SELECT data FROM hub_staging_dispatch_cleanup').fetchone()[0])['state'] == 'preflight'
+    monkeypatch.setattr(repo, '_emit', original)
+    assert store.cleanup_not_dispatched(control, plan['plan_id'], item['id'], operation['expected_revision'],
+        receipt_id=operation['operation_id'], reason='preflight_failed')['state'] == 'ready'
+
+
+@pytest.mark.parametrize('valid_binding', [True, False])
+def test_not_accepted_uses_distinct_exact_rejected_payload_proof_not_no_post_claim(env, valid_binding):
+    store, control, _, repo, _ = env
+    item, plan, operation = preflight_cleanup(env)
+    with repo._transaction() as db:
+        journal = json.loads(db.execute('SELECT data FROM hub_staging_dispatch_cleanup').fetchone()[0])
+        journal.update(state='rejected', reason='worker_busy', payload={
+            'command_id': operation['operation_id'], 'idempotency_key': operation['operation_id'],
+            'resources': [{'resource_id': item['id'] if valid_binding else str(uuid.uuid4()), 'expected_revision': 1}]})
+        db.execute('UPDATE hub_staging_dispatch_cleanup SET data=?', (json.dumps(journal),))
+    with pytest.raises(HubError, match='staging_cleanup_outcome_uncertain'):
+        store.cleanup_not_dispatched(control, plan['plan_id'], item['id'], operation['expected_revision'],
+            receipt_id=operation['operation_id'], reason='preflight_failed')
+    if valid_binding:
+        restored = store.cleanup_not_accepted(control, plan['plan_id'], item['id'], operation['expected_revision'],
+            receipt_id=operation['operation_id'], reason='worker_busy')
+        assert restored['state'] == 'ready'
+        with repo._connection() as db:
+            assert db.execute("SELECT count(*) FROM hub_audit WHERE action='staging.cleanup_not_accepted'").fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM hub_audit WHERE action='staging.cleanup_not_dispatched'").fetchone()[0] == 0
+    else:
+        with pytest.raises(HubError, match='staging_cleanup_outcome_uncertain'):
+            store.cleanup_not_accepted(control, plan['plan_id'], item['id'], operation['expected_revision'],
+                receipt_id=operation['operation_id'], reason='worker_busy')
+        assert store.get_resource(OWNER, item['id'])['state'] == 'deleting'
 
 
 def test_outbox_failure_rolls_back_deleting_and_plan(env, monkeypatch):

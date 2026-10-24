@@ -12,7 +12,7 @@ import unittest
 import uuid
 import zipfile
 
-from hub_staging_service.core import Service, Rejected, extract, relative, recipe, storage_limits
+from hub_staging_service.core import Service, Rejected, extract, relative, recipe, storage_limits, make_job_readable
 
 
 def uid():
@@ -83,6 +83,34 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(Rejected) as caught:
             self.service.submit(payload)
         self.assertEqual(caught.exception.status, 409)
+
+    def test_inline_archive_is_not_persisted_but_full_payload_identity_and_receipts_survive(self):
+        from unittest.mock import patch
+        payload = job(zipped('index.html', b'unique inline archive fixture'))
+        with patch.object(self.service.backend, 'run', wraps=self.service.backend.run) as execute:
+            self.service.submit(payload); self.service.wait()
+            original = self.service.status(payload['job_id'])
+            stored = self.service.db.execute('SELECT * FROM operations WHERE command_id=?',
+                                             (payload['command_id'],)).fetchone()
+            compact = json.loads(stored['payload'])
+            assert compact == {key: value for key, value in payload.items() if key != 'source_zip_base64'}
+            assert payload['source_zip_base64'] not in stored['payload']
+            full_identity = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            assert stored['identity'] == full_identity
+            assert self.service.submit(payload) == original
+            command, cleanup = self.delete_job_resources(payload)
+            assert self.service.submit(payload) == original
+            assert self.service.cleanup(command) == cleanup
+            assert execute.call_count == 1
+            changed = dict(payload, source_zip_base64=base64.b64encode(zipped('index.html', b'changed archive')).decode())
+            with self.assertRaises(Rejected) as error:
+                self.service.submit(changed)
+            assert error.exception.code == 'idempotency_conflict'
+        self.service.close()
+        self.service = Service(self.temp.name, {'demo': profile()}, Backend())
+        with patch.object(self.service.backend, 'run', side_effect=AssertionError('no restart replay')):
+            assert self.service.submit(payload) == original
+            assert self.service.cleanup(command) == cleanup
 
     def test_busy_is_not_another_queue(self):
         entered, release = threading.Event(), threading.Event()
@@ -327,6 +355,32 @@ class CoreTests(unittest.TestCase):
 
 
 class GuardTests(unittest.TestCase):
+    def test_job_readable_tree_checks_bound_before_any_permissions_change(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'large').write_bytes(b'12345')
+            with patch('hub_staging_service.core.Path.chmod') as chmod, self.assertRaises(Rejected):
+                make_job_readable(root, 4)
+            chmod.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'posix', 'Actual POSIX resource permissions')
+    def test_job_readable_source_or_output_preserves_private_ancestors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            private = Path(temporary)
+            private.chmod(0o700)
+            owned = private / 'resource'
+            owned.mkdir(mode=0o700)
+            nested = owned / 'nested'
+            nested.mkdir(mode=0o700)
+            file = nested / 'index.html'
+            file.write_bytes(b'fixture')
+            file.chmod(0o600)
+            make_job_readable(owned, 100)
+            assert stat.S_IMODE(private.stat().st_mode) == 0o700
+            assert stat.S_IMODE(owned.stat().st_mode) == stat.S_IMODE(nested.stat().st_mode) == 0o755
+            assert stat.S_IMODE(file.stat().st_mode) == 0o644
+
     def test_storage_limits_are_exact_bounded_integers_and_default_compatible(self):
         assert storage_limits() == (1024**3, 512 * 1024**2)
         assert storage_limits(64 * 1024**2, 4 * 1024**3) == (64 * 1024**2, 4 * 1024**3)

@@ -255,6 +255,40 @@ class StagingResourceStore:
         with self.repo._connection() as db:
             return self._job(db, _uuid(job_id))
 
+    def abandon_not_created(self, principal, job_id):
+        """Record absence only from the controller's durable no-effect proof.
+
+        This removes no host files and cannot turn an uncertain dispatch into
+        absence. Public callers never possess the composition capability.
+        """
+        self._trusted(principal)
+        with self.repo._transaction() as db:
+            job = self._job(db, _uuid(job_id))
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='hub_staging_submissions'").fetchone():
+                raise HubError('staging_no_effect_proof_required', 409)
+            row = db.execute("SELECT data FROM hub_staging_submissions WHERE json_extract(data,'$.job_id')=?", (job_id,)).fetchone()
+            proof = json.loads(row[0]) if row else {}
+            if (proof.get('phase') != 'verified' or proof.get('outcome') != 'failed'
+                    or proof.get('dispatch_proof') not in ('never_sent', 'definitively_rejected')
+                    or any(proof.get(k) != job[k] for k in ('project', 'source_commit'))
+                    or proof.get('actor') != job['created_by']):
+                raise HubError('staging_no_effect_proof_required', 409)
+            entries = db.execute("SELECT e.data FROM hub_entities e JOIN hub_staging_resource_ownership o ON o.id=e.id WHERE o.job_id=?", (job_id,)).fetchall()
+            items = [json.loads(entry[0]) for entry in entries]
+            if len(items) != 4 or {i['kind'] for i in items} != KINDS or any(
+                    i['state'] not in ('provisioning', 'deleted') for i in items):
+                raise HubError('staging_no_effect_proof_required', 409)
+            if job['terminal'] and all(item['state'] == 'deleted' for item in items):
+                return job
+            for item in items:
+                if item['state'] == 'deleted':
+                    continue
+                item.update(state='deleted', size_bytes=0, protected=[], expires_at=_iso(self._now()))
+                self._save(db, job['created_by'], 'staging.resource_not_created', item)
+            job.update(terminal=True, protected=[])
+            return self._save(db, job['created_by'], 'staging.job_not_dispatched', job,
+                              table='hub_staging_resource_jobs')
+
     def preview_binding(self, actor, identity):
         """One SQLite read snapshot binds the resource and current grant revision.
 
@@ -398,12 +432,37 @@ class StagingResourceStore:
                 item['protected'].append({'reason': 'active_job', 'ref': job['id']})
             return self._save(db, item['created_by'], 'staging.resource_protection', item)
 
+    def supersede_latest_failure(self, principal, job_id):
+        """Remove only this terminal job's own latest-failure reference atomically.
+
+        Already superseded jobs cause no writes. Deleting/deleted resources are
+        never revised by this maintenance operation or a stale caller snapshot.
+        """
+        self._trusted(principal)
+        with self.repo._transaction() as db:
+            job = self._job(db, _uuid(job_id))
+            if job['terminal'] is not True:
+                return
+            reference = {'reason': 'latest_failure', 'ref': job_id}
+            rows = [json.loads(row['data']) for row in db.execute(
+                "SELECT data FROM hub_entities WHERE kind='staging_resource'")]
+            items = [item for item in rows if item['job_id'] == job_id]
+            if reference not in job['protected'] and not any(reference in item['protected'] for item in items):
+                return
+            if reference in job['protected']:
+                job['protected'] = [item for item in job['protected'] if item != reference]
+                self._save(db, job['created_by'], 'staging.failure_superseded', job,
+                           table='hub_staging_resource_jobs')
+            for item in items:
+                if item['state'] in ('deleting', 'deleted') or reference not in item['protected']:
+                    continue
+                item['protected'] = [protection for protection in item['protected'] if protection != reference]
+                self._save(db, item['created_by'], 'staging.resource_protection', item)
+
     def set_keep(self, actor, identity, mode, *, until=None, reason='', expected_revision):
         _actor(actor)
         if mode not in ('until', 'pinned', 'none'):
             raise HubError('invalid_staging_keep')
-        if mode == 'pinned' and actor not in self.admin_actors:
-            raise HubError('staging_admin_required', 403)
         if mode != 'none':
             reason = _text(reason)
         if mode == 'until':
@@ -415,6 +474,10 @@ class StagingResourceStore:
             self._authorize(db, actor, item['project'], 'retain')
             self._owned(actor, item)
             self.repo._cas(item, expected_revision)
+            if actor in AGENTS and item['keep'] and item['keep']['by'] not in AGENTS:
+                raise HubError('staging_human_keep_required', 403)
+            if mode == 'pinned' and actor not in self.admin_actors:
+                raise HubError('staging_admin_required', 403)
             if item['state'] in ('deleting', 'deleted'):
                 raise HubError('staging_cleanup_in_progress', 409)
             if mode == 'none' and item['protected']:
@@ -515,15 +578,91 @@ class StagingResourceStore:
                 if item['revision'] != stored['revisions'][item['id']] or why:
                     stored['skipped'].append({'id': item['id'], 'why': why or 'changed'})
                     continue
+                previous_state = item['state']
                 item['state'] = 'deleting'
                 self._save(db, actor, 'staging.cleanup_begin', item)
                 stored['operations'].append({'id': item['id'], 'kind': item['kind'],
                     'project': item['project'], 'job_id': item['job_id'],
-                    'expected_revision': item['revision'], 'operation_id': str(uuid.uuid4())})
+                    'expected_revision': item['revision'], 'operation_id': str(uuid.uuid4()),
+                    'previous_state': previous_state})
             stored['begun'] = True
             db.execute('UPDATE hub_staging_cleanup_plans SET data=? WHERE id=?', (_json(stored), plan_id))
             return {'plan_id': plan_id, 'operations': stored['operations'],
                     'skipped': stored['skipped'], 'dispatch': True, 'reconcile_required': False}
+
+    def cleanup_not_dispatched(self, principal, plan_id, identity, expected_revision, *, receipt_id, reason):
+        """Trusted local proof of a durable preflight that never crossed POST.
+
+        An absent/legacy prior-state record or any dispatching/unknown journal
+        cannot authorize restoration. The receipt, restoration and terminal
+        not-dispatched journal state commit together under the live Hub owner.
+        """
+        if reason not in ('preflight_failed', 'preflight_cancelled', 'preflight_interrupted'):
+            raise HubError('invalid_cleanup_receipt')
+        return self._cleanup_restore(principal, plan_id, identity, expected_revision,
+                                     receipt_id, reason, 'not_dispatched')
+
+    def cleanup_not_accepted(self, principal, plan_id, identity, expected_revision, *, receipt_id, reason):
+        """A fixed worker rejection of the first POST is not a no-POST claim."""
+        if reason not in ('worker_busy', 'cleanup_revision_or_reference', 'resource_job_not_terminal',
+                          'peer_not_allowed', 'unauthorized'):
+            raise HubError('invalid_cleanup_receipt')
+        return self._cleanup_restore(principal, plan_id, identity, expected_revision,
+                                     receipt_id, reason, 'not_accepted')
+
+    def _cleanup_restore(self, principal, plan_id, identity, expected_revision, receipt_id, reason, proof):
+        self._trusted(principal)
+        _uuid(receipt_id)
+        fingerprint = _json([proof, plan_id, identity, expected_revision, reason])
+        with self.repo._transaction() as db:
+            prior = db.execute('SELECT * FROM hub_staging_cleanup_receipts WHERE id=?', (receipt_id,)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('staging_receipt_conflict', 409)
+                return json.loads(prior['data'])
+            row = db.execute('SELECT * FROM hub_staging_cleanup_plans WHERE id=?', (_uuid(plan_id),)).fetchone()
+            if row is None:
+                raise HubError('not_found', 404)
+            plan = json.loads(row['data'])
+            operation = next((item for item in plan['operations'] if item['id'] == identity
+                and item['expected_revision'] == expected_revision and item['operation_id'] == receipt_id), None)
+            if (not plan['begun'] or operation is None
+                    or operation.get('previous_state') not in ('ready', 'failed', 'expiring')):
+                raise HubError('staging_cleanup_outcome_uncertain', 409)
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_dispatch_cleanup'").fetchone():
+                raise HubError('staging_cleanup_outcome_uncertain', 409)
+            row_dispatch = db.execute('SELECT data FROM hub_staging_dispatch_cleanup WHERE id=?', (receipt_id,)).fetchone()
+            dispatch = json.loads(row_dispatch['data']) if row_dispatch else None
+            if (not dispatch or dispatch.get('state') != ('preflight' if proof == 'not_dispatched' else 'rejected')
+                    or dispatch.get('plan_id') != plan_id or dispatch.get('resource_id') != identity
+                    or dispatch.get('resource_revision') != expected_revision):
+                raise HubError('staging_cleanup_outcome_uncertain', 409)
+            if proof == 'not_dispatched':
+                if 'payload' in dispatch:
+                    raise HubError('staging_cleanup_outcome_uncertain', 409)
+            else:
+                payload = dispatch.get('payload')
+                if (dispatch.get('reason') != reason or type(payload) is not dict
+                        or set(payload) != {'command_id', 'idempotency_key', 'resources'}
+                        or payload['command_id'] != receipt_id or payload['idempotency_key'] != receipt_id
+                        or type(payload['resources']) is not list or len(payload['resources']) != 1
+                        or type(payload['resources'][0]) is not dict
+                        or set(payload['resources'][0]) != {'resource_id', 'expected_revision'}
+                        or payload['resources'][0]['resource_id'] != identity
+                        or type(payload['resources'][0]['expected_revision']) is not int
+                        or payload['resources'][0]['expected_revision'] < 1):
+                    raise HubError('staging_cleanup_outcome_uncertain', 409)
+            item = self._resource(db, identity)
+            self.repo._cas(item, expected_revision)
+            if item['state'] != 'deleting':
+                raise HubError('staging_resource_state_conflict', 409)
+            item['state'] = operation['previous_state']
+            result = self._save(db, row['actor'], 'staging.cleanup_' + proof, item)
+            db.execute('INSERT INTO hub_staging_cleanup_receipts VALUES(?,?,?)',
+                       (receipt_id, fingerprint, _json(result)))
+            dispatch.update(state=proof, reason=reason)
+            db.execute('UPDATE hub_staging_dispatch_cleanup SET data=? WHERE id=?', (_json(dispatch), receipt_id))
+            return result
 
     def cleanup_finish(self, principal, plan_id, identity, expected_revision, *,
                        absent, receipt_id, error=None):

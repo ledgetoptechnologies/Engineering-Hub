@@ -116,15 +116,15 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         principal = authenticated(request)
         if controller is None:
             return {'configured': False, 'running': False, 'reachable': False,
-                    'previews_configured': False, **({'state': module_status['state']}
+                    'profiles': {}, 'previews_configured': False, **({'state': module_status['state']}
                     if module_status is not None else {})}
         result = await controller.status(principal)
         # Only the controller's public status fields are surfaced. Never expose
         # private endpoint, credentials, configured host paths or raw exceptions.
-        return dict({'configured': False, 'running': False, 'reachable': False},
+        return dict({'configured': False, 'running': False, 'reachable': False, 'profiles': {}},
             **{key: value for key, value in result.items() if key in {
             'configured', 'running', 'reachable', 'worker_reachable', 'state', 'reason',
-            'profiles', 'supported_profiles', 'projects', 'active_job_id'}},
+            'profiles', 'supported_profiles', 'projects', 'active_job_id', 'held_jobs', 'can_reconcile'}},
             previews_configured=preview_broker is not None)
 
     @app.get('/api/hub/v1/staging/resources')
@@ -176,6 +176,13 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
     def job(job_id: Identity, request: Request):
         principal = authenticated(request)
         return configured().get_job(principal, job_id)
+
+    @app.post('/api/hub/v1/staging/jobs/{job_id}/reconcile')
+    async def reconcile(job_id: Identity, request: Request):
+        principal = authenticated(request, mutation=True, human_only=True)
+        service = configured()
+        await _payload(request, ClosedInput)
+        return await service.reconcile_for(principal, job_id)
 
     @app.get('/api/hub/v1/staging/projects/{project}/policy')
     def get_policy(project: Project, request: Request):

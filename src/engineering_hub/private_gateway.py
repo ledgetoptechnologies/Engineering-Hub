@@ -75,6 +75,7 @@ def browser_route_allowed(method, path):
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
         or path == '/api/hub/v1/projects'
         or re.fullmatch(r'/api/hub/v1/staging/resources/' + _UUID + '/(?:keep|preview-session)', path) is not None
+        or re.fullmatch(r'/api/hub/v1/staging/jobs/' + _UUID + '/reconcile', path) is not None
         or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/archive', path) is not None)
 
 

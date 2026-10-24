@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from engineering_hub.staging_client import (
-    StagingClient, StagingClientError, StagingConnectionConfig, load_optional_config,
+    StagingClient, StagingClientError, StagingNotAccepted, StagingConnectionConfig, load_optional_config,
 )
 
 
@@ -91,6 +91,162 @@ async def test_cleanup_operation_invalid_id_never_reaches_transport(config):
     try:
         with pytest.raises(StagingClientError):
             await client.operation('../cleanup')
+    finally:
+        await client.aclose()
+
+
+def cleanup_payload():
+    return {'command_id': str(uuid4()), 'idempotency_key': 'synthetic-cleanup',
+            'resources': [{'resource_id': str(uuid4()), 'expected_revision': 1}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method,status,reason', [
+    ('submit', 409, 'worker_busy_or_held'), ('submit', 409, 'worker_storage_capacity'),
+    ('submit', 409, 'resource_conflict'), ('submit', 403, 'project_not_allowed'),
+    ('submit', 403, 'recipe_not_allowed'), ('submit', 401, 'unauthorized'),
+    ('submit', 403, 'peer_not_allowed'), ('cleanup', 409, 'worker_busy'),
+    ('cleanup', 409, 'cleanup_revision_or_reference'), ('cleanup', 409, 'resource_job_not_terminal'),
+    ('cleanup', 401, 'unauthorized'), ('cleanup', 403, 'peer_not_allowed'),
+])
+async def test_exact_known_post_rejection_is_safe_subtype_without_retry(config, method, status, reason):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(status, json={'error': reason})
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(StagingNotAccepted) as error:
+            await getattr(client, method)(job() if method == 'submit' else cleanup_payload())
+        assert error.value.reason == reason
+        assert error.value.code == 'staging_worker_rejected' and error.value.status == 409
+        assert str(error.value) == 'staging_worker_rejected'
+        assert TOKEN not in repr(error.value)
+        assert len(requests) == 1 and requests[0].method == 'POST'
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method,status,body', [
+    ('submit', 409, {'error': 'idempotency_conflict'}),
+    ('submit', 409, {'error': 'job_conflict'}),
+    ('submit', 409, {'error': 'execution_uncertain'}),
+    ('submit', 500, {'error': 'worker_busy_or_held'}),
+    ('submit', 400, {'error': 'worker_busy_or_held'}),
+    ('submit', 409, {'error': 'worker_busy'}),
+    ('cleanup', 409, {'error': 'worker_busy_or_held'}),
+    ('cleanup', 409, {'error': 'cleanup_uncertain'}),
+    ('cleanup', 409, {'error': 'idempotency_conflict'}),
+    ('cleanup', 409, {'error': 'resource_conflict'}),
+    ('cleanup', 409, {'error': 'worker_busy', 'private': TOKEN}),
+    ('cleanup', 409, {'error': []}),
+])
+async def test_conflict_unknown_wrong_status_or_wrong_route_remains_uncertain(config, method, status, body):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(status, json=body)
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(StagingClientError) as error:
+            await getattr(client, method)(job() if method == 'submit' else cleanup_payload())
+        assert type(error.value) is StagingClientError
+        assert TOKEN not in str(error.value) and len(requests) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('response', [
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'set-cookie': 'session=x'}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'location': 'https://foreign.invalid'}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'content-type': 'text/html'}),
+    lambda: httpx.Response(409, content=b'{"error":"worker_busy_or_held","error":"worker_busy_or_held"}', headers={'content-type': 'application/json'}),
+    lambda: httpx.Response(409, content=b'{"error":"worker_busy_or_held"', headers={'content-type': 'application/json'}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'content-length': '1'}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'content-length': str(16 * 1024**2 + 1)}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'content-encoding': 'gzip'}),
+    lambda: httpx.Response(409, json={'error': 'worker_busy_or_held'}, headers={'x-reflected-token': TOKEN}),
+    lambda: httpx.Response(409, json={'error': TOKEN}),
+    lambda: httpx.Response(302, json={'error': 'worker_busy_or_held'}, headers={'location': 'https://foreign.invalid'}),
+])
+async def test_rejection_subtype_requires_full_bounded_validated_private_response(config, response):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return response()
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(StagingClientError) as error:
+            await client.submit(job())
+        assert type(error.value) is StagingClientError
+        assert TOKEN not in str(error.value) and 'foreign.invalid' not in str(error.value)
+        assert len(requests) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_known_error_get_source_and_file_responses_remain_opaque(config):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        if '/files/' in request.url.path:
+            return httpx.Response(404, content=b'not found', headers={'content-type': 'text/html'})
+        return httpx.Response(401, json={'error': 'unauthorized'})
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    try:
+        for invoke in (client.status, lambda: client.put_source(source()),
+                       lambda: client.operation(str(uuid4())), lambda: client.file(str(uuid4()), 'index.html')):
+            with pytest.raises(StagingClientError) as error:
+                await invoke()
+            assert type(error.value) is StagingClientError
+        assert len(requests) == 4
+    finally:
+        await client.aclose()
+
+
+def test_not_accepted_constructor_never_accepts_unvalidated_reason():
+    for reason in (TOKEN, 'unknown_worker_error', {}, None):
+        with pytest.raises(StagingClientError) as error:
+            StagingNotAccepted(reason)
+        assert type(error.value) is StagingClientError
+        assert TOKEN not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_plaintext_channel_policy_keeps_even_valid_rejection_opaque(config):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(409, json={'error': 'worker_busy_or_held'})
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    assert client._definitive_rejections is True  # Explicit synthetic-only exception.
+    # Exercise the exact gate used by real plaintext-loopback clients, without
+    # opening a real connection or weakening the private credential reader.
+    client._definitive_rejections = False
+    try:
+        with pytest.raises(StagingClientError) as error:
+            await client.submit(job())
+        assert type(error.value) is StagingClientError and len(requests) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_accepted_held_operation_receipt_never_becomes_not_accepted(config):
+    payload = cleanup_payload()
+    original = operation(command_id=payload['command_id'], state='held',
+                         result={'error': 'cleanup_uncertain'})
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json=original)
+    client = StagingClient(config, test_transport=httpx.MockTransport(respond))
+    try:
+        assert await client.cleanup(payload) == original
+        assert len(requests) == 1
     finally:
         await client.aclose()
 
