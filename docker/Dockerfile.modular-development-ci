@@ -1,0 +1,19 @@
+# Candidate only: prepare/review a matching offline dependency cache separately.
+# No dependency installation, fetch, image pull or job enrollment in this recipe.
+ARG REVIEWED_CI_CACHE_IMAGE
+FROM ${REVIEWED_CI_CACHE_IMAGE}
+USER root
+ARG REVIEWED_CI_CACHE_IMAGE
+ARG PREPARED_SOURCE_COMMIT
+ARG BOOTSTRAP_SHA256
+COPY pyproject.toml uv.lock /opt/eh-ci/modular-locks/
+COPY hub-ui/package.json hub-ui/package-lock.json /opt/eh-ci/modular-locks/hub-ui/
+COPY scripts/modular_ci_container.py /opt/eh-ci/modular-bootstrap.py
+RUN --network=none /opt/validation-venv/bin/python -I -B -c "import hashlib,json,os,pathlib,re; r=pathlib.Path('/opt/eh-ci'); names=('pyproject.toml','uv.lock','hub-ui/package.json','hub-ui/package-lock.json'); d={n:hashlib.sha256((r/'modular-locks'/n).read_bytes()).hexdigest() for n in names}; assert json.loads((r/'dependencies.json').read_bytes()) == d, 'Matching reviewed dependency cache required'; base=os.environ['REVIEWED_CI_CACHE_IMAGE']; commit=os.environ['PREPARED_SOURCE_COMMIT']; sha=hashlib.sha256((r/'modular-bootstrap.py').read_bytes()).hexdigest(); assert re.fullmatch(r'(?:[^\s@]+@)?sha256:[0-9a-f]{64}',base) and re.fullmatch('[0-9a-f]{40}',commit) and sha == os.environ['BOOTSTRAP_SHA256'], 'Immutable preparation inputs required'; assert (r/'node_modules').is_dir(); (r/'modular-cache.json').write_text(json.dumps(dict(schema='engineering-hub.modular-ci-cache.v1', dependency_sha256=d, cache_base_image=base, prepared_source_commit=commit, bootstrap_sha256=sha),sort_keys=True))"
+LABEL io.engineering-hub.modular-ci.bootstrap-sha256=${BOOTSTRAP_SHA256} \
+      io.engineering-hub.modular-ci.prepared-source-commit=${PREPARED_SOURCE_COMMIT}
+USER 10001:10001
+WORKDIR /workspace
+# Backend overrides entrypoint and invokes this fixed script only after its
+# daemon, kernel cgroup and job mount proofs. This is not the legacy bootstrap.
+ENTRYPOINT ["/opt/validation-venv/bin/python", "-I", "-B", "/opt/eh-ci/modular-bootstrap.py"]
