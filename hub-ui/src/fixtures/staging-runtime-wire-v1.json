@@ -9,8 +9,8 @@
       { "id": "host", "state": "stale", "observed_at": "2026-10-25T11:20:00Z" }
     ],
     "containers": [
-      { "id": "0123456789ab", "name": "eh-build", "image": "registry.example.test:5000/eh/build@sha256:aaaa", "state": "running", "scope": "worker", "managed": false },
-      { "id": "abcdef012345abcdef012345", "name": "viewer", "image": "viewer:5", "state": "Exited", "scope": "host", "managed": false }
+      { "id": "0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab0123", "name": "eh-build", "image": "registry.example.test:5000/eh/build@sha256:aaaa", "state": "running", "scope": "worker", "managed": false },
+      { "id": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd", "name": "viewer", "image": "viewer:5", "state": "Exited", "scope": "host", "managed": false }
     ],
     "services": [{ "name": "Asset service", "state": "running", "scope": "host" }]
   }

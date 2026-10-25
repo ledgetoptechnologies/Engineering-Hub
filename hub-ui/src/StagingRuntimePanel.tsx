@@ -25,6 +25,12 @@ export function StagingRuntimePanel({ mode, read: given, onUnauthorized, now = (
   reader.current = read;
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
+  // Repaints so ages keep counting and a page left open goes out of date on its own. It never reads the staging PC.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick(value => value + 1), 15_000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -66,11 +72,11 @@ export function StagingRuntimePanel({ mode, read: given, onUnauthorized, now = (
     {load === "loading" && !runtime && <p role="status">Reading what's running on the staging PC…</p>}
     {load === "failed" && <p className="notice error" role="alert">{failure}
       {snapshot && ` Showing what was seen ${ago(snapshot.observed_at, now())}.`}</p>}
-    {runtime && <RuntimeBody runtime={runtime} now={now()} />}
+    {runtime && <RuntimeBody runtime={runtime} now={now()} retained={load === "failed"} />}
   </section>;
 }
 
-function RuntimeBody({ runtime, now }: { runtime: StagingRuntime; now: Date }) {
+function RuntimeBody({ runtime, now, retained }: { runtime: StagingRuntime; now: Date; retained: boolean }) {
   const { snapshot } = runtime;
   const lead = !runtime.configured || runtime.state === "not_configured"
     ? "Watching the staging PC isn't set up yet, so what runs on it isn't shown."
@@ -79,15 +85,15 @@ function RuntimeBody({ runtime, now }: { runtime: StagingRuntime; now: Date }) {
       : null;
   return <>
     {lead && <p className="staging-status" role="status">{lead}</p>}
-    {snapshot && <Snapshot snapshot={snapshot} now={now} />}
+    {snapshot && <Snapshot snapshot={snapshot} now={now} retained={retained || runtime.state === "unavailable"} />}
   </>;
 }
 
-function Snapshot({ snapshot, now }: { snapshot: RuntimeSnapshot; now: Date }) {
+function Snapshot({ snapshot, now, retained }: { snapshot: RuntimeSnapshot; now: Date; retained: boolean }) {
   return <div className="runtime-sources">
     <p className="panel-footnote">Checked <time dateTime={snapshot.observed_at} title={new Date(snapshot.observed_at).toLocaleString()}>
       {ago(snapshot.observed_at, now)}</time>.</p>
-    {sourceViews(snapshot, now).map(view => <SourceSection key={view.id} view={view} />)}
+    {sourceViews(snapshot, now, retained).map(view => <SourceSection key={view.id} view={view} />)}
   </div>;
 }
 
@@ -96,18 +102,19 @@ function SourceSection({ view }: { view: SourceView }) {
   return <section className="runtime-source" aria-label={view.title}>
     <div className="runtime-source-head">
       <div><h3>{view.title}</h3><small>{view.description}</small></div>
-      {view.listed && <Badge tone={view.tone === "forest" ? "neutral" : view.tone}>{countLine(view.containers, view.services)}</Badge>}
+      {view.listed && <Badge tone={view.tone === "forest" ? "neutral" : view.tone}>
+        {view.stale && "Last seen: "}{countLine(view.containers, view.services)}</Badge>}
     </div>
     <p className={view.tone === "amber" ? "runtime-source-line amber" : "runtime-source-line"}>{view.line}</p>
     {view.listed && empty && <p className="runtime-empty">Nothing was reported here.</p>}
     {view.listed && !empty && <ul className="resource-list" aria-label={`${view.title}: programs`}>
       {view.containers.map(item => <li key={item.id} className="resource-row" aria-label={item.name}>
         <div className="resource-main"><strong>{item.name}</strong><small>Container · {imageLabel(item.image)}</small></div>
-        <Badge tone={containerTone(item.state)}>{containerStateLabel(item.state)}</Badge>
+        <Badge tone={view.stale ? "amber" : containerTone(item.state)}>{containerStateLabel(item.state, view.stale)}</Badge>
       </li>)}
       {view.services.map(item => <li key={`service:${item.name}`} className="resource-row" aria-label={item.name}>
         <div className="resource-main"><strong>{item.name}</strong><small>Service</small></div>
-        <Badge tone="forest">Running</Badge>
+        <Badge tone={view.stale ? "amber" : "forest"}>{containerStateLabel("running", view.stale)}</Badge>
       </li>)}
     </ul>}
   </section>;
