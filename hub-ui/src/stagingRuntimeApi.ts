@@ -24,8 +24,11 @@ export interface RuntimeSnapshot {
 }
 export interface StagingRuntime { configured: boolean; state: typeof RUNTIME_STATES[number]; snapshot: RuntimeSnapshot | null }
 
-export const RUNTIME_ITEM_MAX = 500;
-const labelPattern = /^[^\u0000-\u001f\u007f]{1,128}$/u;
+/** The backend's bounds: at most 256 containers and 256 services, names up to 256 characters. */
+export const RUNTIME_ITEM_MAX = 256;
+/** An observation older than this, by this browser's clock, is shown as out of date whatever the server called it. */
+export const FRESH_SECONDS = 90;
+const labelPattern = /^[^\u0000-\u001f\u007f]{1,256}$/u;
 const imagePattern = /^[^\u0000-\u001f\u007f\s]{1,512}$/u;
 
 function invalid(): never { throw new HubApiError(502, "invalid_staging_runtime"); }
@@ -42,8 +45,8 @@ function matching(value: unknown, pattern: RegExp): string {
 function timestamp(value: unknown): string {
   return typeof value === "string" && value.length <= 64 && !Number.isNaN(Date.parse(value)) ? value : invalid();
 }
-function list(value: unknown): unknown[] {
-  return Array.isArray(value) && value.length <= RUNTIME_ITEM_MAX ? value : invalid();
+function list(value: unknown, max: number): unknown[] {
+  return Array.isArray(value) && value.length <= max ? value : invalid();
 }
 
 function parseSource(value: unknown): RuntimeSourceReport {
@@ -56,7 +59,7 @@ function parseContainer(value: unknown): RuntimeContainer {
   if (row.managed !== false) return invalid();
   const state = typeof row.state === "string" && (CONTAINER_STATES as readonly string[]).includes(row.state.toLowerCase())
     ? row.state.toLowerCase() as ContainerState : typeof row.state === "string" ? "unknown" : invalid();
-  return { id: matching(row.id, /^[a-f0-9]{12,64}$/), name: matching(row.name, labelPattern), image: matching(row.image, imagePattern),
+  return { id: matching(row.id, /^[a-f0-9]{64}$/), name: matching(row.name, labelPattern), image: matching(row.image, imagePattern),
     state, scope: oneOf(row.scope, SOURCE_IDS), managed: false };
 }
 function parseService(value: unknown): RuntimeService {
@@ -70,12 +73,12 @@ export function parseStagingRuntime(value: unknown): StagingRuntime {
   if (row.snapshot === null) return { configured: row.configured, state, snapshot: null };
   const snap = object(row.snapshot);
   if (snap.schema !== "hub-staging-runtime.v1") return invalid();
-  const sources = list(snap.sources).map(parseSource);
+  const sources = list(snap.sources, SOURCE_IDS.length).map(parseSource);
   // One report per source: two disagreeing reports for the same engine would make the page contradict itself.
   if (new Set(sources.map(source => source.id)).size !== sources.length) return invalid();
   return { configured: row.configured, state, snapshot: {
     schema: "hub-staging-runtime.v1", observed_at: timestamp(snap.observed_at), sources,
-    containers: list(snap.containers).map(parseContainer), services: list(snap.services).map(parseService),
+    containers: list(snap.containers, RUNTIME_ITEM_MAX).map(parseContainer), services: list(snap.services, RUNTIME_ITEM_MAX).map(parseService),
   } };
 }
 
@@ -112,23 +115,27 @@ const containerStateNames: Record<ContainerState, string> = {
   running: "Running", restarting: "Restarting", paused: "Paused", created: "Created, not started", exited: "Stopped",
   stopped: "Stopped", dead: "Failed", removing: "Being removed", unknown: "State unknown",
 };
-export const containerStateLabel = (state: ContainerState) => containerStateNames[state];
+/** On an out-of-date list the state is what was last seen, so it says so. */
+export const containerStateLabel = (state: ContainerState, stale = false) =>
+  stale ? `Last seen: ${containerStateNames[state].toLowerCase()}` : containerStateNames[state];
 export const containerTone = (state: ContainerState): "forest" | "amber" | "neutral" =>
   state === "running" ? "forest" : state === "restarting" || state === "dead" || state === "unknown" ? "amber" : "neutral";
 
 export function ago(iso: string, now: Date): string {
-  const minutes = Math.round((now.getTime() - Date.parse(iso)) / 60_000);
+  const minutes = Math.floor((now.getTime() - Date.parse(iso)) / 60_000);
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.round(minutes / 60);
+  const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours} h ago`;
-  return `${Math.round(hours / 24)} days ago`;
+  return `${Math.floor(hours / 24)} days ago`;
 }
 
 export interface SourceView {
   id: SourceId; title: string; description: string;
   /** Whether the list below can be read as what's there. Stale lists are shown, but marked. */
   listed: boolean; tone: "forest" | "amber" | "neutral"; line: string;
+  /** The list is a past observation: rows say what was last seen, never a current state. */
+  stale: boolean;
   containers: RuntimeContainer[]; services: RuntimeService[];
 }
 const sourceText: Record<SourceId, { title: string; description: string; notConfigured: string }> = {
@@ -137,20 +144,28 @@ const sourceText: Record<SourceId, { title: string; description: string; notConf
   host: { title: "Other programs on the PC", description: "Seen on the PC, but not run or controlled by EH (for example PA or the Viewer).",
     notConfigured: "The host view isn't set up, so other programs on the PC aren't shown." },
 };
-/** One section per source, worded from that source's own report; a missing report is unknown, never "nothing running". */
-export function sourceViews(snapshot: RuntimeSnapshot, now: Date): SourceView[] {
+/**
+ * One section per source, worded from that source's own report; a missing report is unknown, never "nothing running".
+ * An "observed" report goes out of date by this browser's clock after FRESH_SECONDS, and `retained` (a refresh failed,
+ * so this is the earlier observation) marks every listed source out of date.
+ */
+export function sourceViews(snapshot: RuntimeSnapshot, now: Date, retained = false): SourceView[] {
   return SOURCE_IDS.map(id => {
     const report = snapshot.sources.find(source => source.id === id);
     const text = sourceText[id];
     const containers = snapshot.containers.filter(item => item.scope === id);
     const services = id === "host" ? snapshot.services : [];
-    const base = { id, title: text.title, description: text.description, containers, services };
+    const base = { id, title: text.title, description: text.description, containers, services, stale: false };
     if (!report) return { ...base, listed: false, tone: "amber", line: "Not reported, so what's running here is unknown." };
+    const at = report.observed_at ?? snapshot.observed_at;
     const seen = report.observed_at ? ago(report.observed_at, now) : null;
+    const old = { ...base, listed: true, tone: "amber" as const, stale: true,
+      line: `Out of date: last seen ${seen ?? "at an unknown time"}. It may have changed since.` };
     switch (report.state) {
-      case "observed": return { ...base, listed: true, tone: "forest", line: `Seen ${seen ?? "at an unreported time"}.` };
-      case "stale": return { ...base, listed: true, tone: "amber",
-        line: `Out of date: last seen ${seen ?? "at an unknown time"}. It may have changed since.` };
+      case "observed":
+        if (retained || now.getTime() - Date.parse(at) > FRESH_SECONDS * 1000) return old;
+        return { ...base, listed: true, tone: "forest", line: `Seen ${seen ?? "at an unreported time"}.` };
+      case "stale": return old;
       case "unavailable": return { ...base, listed: false, tone: "amber",
         line: `Couldn't be read${seen ? ` (last seen ${seen})` : ""}, so what's running here is unknown.` };
       case "not_configured": return { ...base, listed: false, tone: "neutral", line: text.notConfigured };

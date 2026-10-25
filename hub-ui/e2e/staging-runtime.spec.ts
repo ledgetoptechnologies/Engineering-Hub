@@ -30,12 +30,12 @@ async function fixture(page: Page, runtime: Reply[]) {
   return state;
 }
 const panel = (page: Page) => page.getByRole("region", { name: "Running on the staging PC" });
-const fresh = () => {
+const fresh = (base = Date.now()) => {
   const body = structuredClone(wire);
-  const at = new Date(Date.now() - 2 * 60_000).toISOString();
+  const at = new Date(base - 20_000).toISOString();
   body.snapshot.observed_at = at;
   body.snapshot.sources[0].observed_at = at;
-  body.snapshot.sources[1].observed_at = new Date(Date.now() - 40 * 60_000).toISOString();
+  body.snapshot.sources[1].observed_at = new Date(base - 40 * 60_000).toISOString();
   return body;
 };
 
@@ -44,11 +44,12 @@ test("splits the staging engine from other programs, marks the stale one, and of
   await page.goto("/#/staging");
   const engine = panel(page).getByRole("region", { name: "Staging engine" });
   const host = panel(page).getByRole("region", { name: "Other programs on the PC" });
-  await expect(engine).toContainText("Seen 2 min ago.");
+  await expect(engine).toContainText("Seen just now.");
   await expect(engine.getByRole("listitem")).toHaveText([/eh-build.*Container · build.*Running/]);
   await expect(host).toContainText("Out of date: last seen 40 min ago. It may have changed since.");
   await expect(host).toContainText("not run or controlled by EH");
-  await expect(host.getByRole("listitem")).toHaveText([/viewer.*Stopped/, /Asset service.*Service.*Running/]);
+  // An out-of-date list says what was last seen, never a current state.
+  await expect(host.getByRole("listitem")).toHaveText([/viewer.*Last seen: stopped/, /Asset service.*Service.*Last seen: running/]);
   // The registry address and digest are never shown, and there is nothing to press but Refresh.
   await expect(panel(page)).not.toContainText("registry.example.test");
   await expect(panel(page)).not.toContainText("sha256");
@@ -95,9 +96,31 @@ test("reads once, refreshes only when asked, and keeps the earlier observation w
   expect(state.reads).toBe(1);
   await panel(page).getByRole("button", { name: "Refresh" }).click();
   await expect(panel(page).getByRole("alert")).toHaveText(
-    "The staging PC isn't answering, so what's running on it is unknown right now. Showing what was seen 2 min ago.");
-  await expect(panel(page).getByRole("region", { name: "Staging engine" })).toContainText("eh-build");
+    "The staging PC isn't answering, so what's running on it is unknown right now. Showing what was seen just now.");
+  // The kept observation is marked out of date, row by row.
+  const engine = panel(page).getByRole("region", { name: "Staging engine" });
+  await expect(engine).toContainText("Out of date: last seen just now.");
+  await expect(engine.getByRole("listitem")).toHaveText([/eh-build.*Last seen: running/]);
+  await expect(panel(page).getByText("Running", { exact: true })).toHaveCount(0);
   expect(state.reads).toBe(2);
+});
+
+test("a page left open goes out of date by its own clock, without reading again", async ({ page }) => {
+  const start = Date.now();
+  await page.clock.install({ time: start });
+  const state = await fixture(page, [{ status: 200, body: fresh(start) }]);
+  await page.goto("/#/staging");
+  const engine = panel(page).getByRole("region", { name: "Staging engine" });
+  await expect(engine).toContainText("Seen just now.");
+  await expect(engine.getByRole("listitem")).toHaveText([/eh-build.*Running/]);
+  await page.clock.runFor(60_000);
+  await expect(engine).toContainText("Seen 1 min ago.");
+  await page.clock.runFor(30_000);
+  await expect(engine).toContainText("Out of date: last seen 1 min ago. It may have changed since.");
+  await expect(engine.getByRole("listitem")).toHaveText([/eh-build.*Last seen: running/]);
+  await page.clock.runFor(3 * 60_000);
+  await expect(engine).toContainText("Out of date: last seen 4 min ago.");
+  expect(state.reads).toBe(1);
 });
 
 test("steps aside for people who aren't the staging admin, and on Hubs without it", async ({ page }) => {
