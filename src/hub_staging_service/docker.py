@@ -65,7 +65,7 @@ class DockerBackend:
                 '--workdir=/workspace', '--env', 'HOME=/tmp', '--env', 'CI=true']
         specs = self._volume_specs(paths, name, profile, stage)
         args += ['--mount', 'type=bind,src=' + str(paths['workspace']) + ',dst=/source,readonly',
-                 '--tmpfs', '/workspace:rw,nosuid,nodev,mode=1777,size=' + str(profile['workspace_bytes']),
+                 '--tmpfs', '/workspace:rw,exec,nosuid,nodev,mode=1777,size=' + str(profile['workspace_bytes']),
                  '--mount', 'type=volume,source=' + specs['tests']['name'] + ',target=/test-output,volume-nocopy']
         if stage == 'build':
             args += ['--mount', 'type=volume,source=' + specs['output']['name'] + ',target=/output,volume-nocopy']
@@ -261,11 +261,13 @@ class DockerBackend:
         self._verify_tmpfs_mount(name, '/artifacts', limit, readonly=True)
 
     def _verify_job_mounts(self, name, profile, stage):
+        self._verify_tmpfs_mount(name, '/tmp', 64 * 1024**2, readonly=False)
+        self._verify_tmpfs_mount(name, '/workspace', profile['workspace_bytes'], readonly=False, executable=True)
         self._verify_tmpfs_mount(name, '/test-output', profile['output_bytes'] // 4, readonly=False)
         if stage == 'build':
             self._verify_tmpfs_mount(name, '/output', profile['output_bytes'], readonly=False)
 
-    def _verify_tmpfs_mount(self, name, destination, limit, *, readonly):
+    def _verify_tmpfs_mount(self, name, destination, limit, *, readonly, executable=False):
         raw = self._checked_output(('exec', name, '/bin/cat', '/proc/self/mountinfo'), limit=65536)
         matches = []
         for line in raw.decode('ascii').splitlines():
@@ -276,7 +278,9 @@ class DockerBackend:
         ensure(len(matches) == 1, 'artifact_mount_unverified')
         options, filesystem, super_options = matches[0]
         access, forbidden = ('ro', 'rw') if readonly else ('rw', 'ro')
-        ensure(filesystem == 'tmpfs' and {access, 'nosuid', 'nodev', 'noexec'} <= options and forbidden not in options,
+        required = {access, 'nosuid', 'nodev'} | (set() if executable else {'noexec'})
+        ensure(filesystem == 'tmpfs' and required <= options and forbidden not in options
+               and (not executable or 'noexec' not in options),
                'artifact_mount_unverified')
         sizes = [value[5:] for value in super_options if value.startswith('size=')]
         ensure(len(sizes) == 1 and re.fullmatch('[1-9][0-9]*[kmg]?', sizes[0]), 'artifact_mount_unverified')

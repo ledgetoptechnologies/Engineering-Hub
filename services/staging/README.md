@@ -1,5 +1,15 @@
 # Hub staging worker
 
+The job's bounded `/workspace` tmpfs explicitly requests `exec`: build tools and
+repository tests can execute generated workspace files. Before copying source or
+running its recipe, the backend verifies the actual workspace is writable,
+executable tmpfs with `nosuid,nodev` and the configured size. Omitting `noexec`
+from the Docker argv is insufficient because Docker can supply that default.
+The separate `/tmp` must remain a writable 64 MiB `nosuid,nodev,noexec` tmpfs.
+Artifact/test-output mounts and read-only exporter mounts keep their existing
+`noexec` policy and independent byte budgets. A missing mount or any option,
+filesystem or size drift refuses the stage before source execution.
+
 Read-only source and exported build trees are validated against their byte/file limits before their own directories/files receive0755/0644 read/traverse permissions for the rootless job UID. Private worker/resource ancestors remain0700, and no host-writable bind is granted to a job. Build outputs receive these permissions only after bounded export and build-container cleanup, before the test's read-only `/output` bind.
 
 Export uses labelled local-driver named tmpfs volumes with fixed hard size/options, not `docker cp` (which omits tmpfs content). The writer stays paused while a separate cached-image exporter mounts exactly one output volume read-only, verifies its own kernel CPU/RAM/swap/PID limits and the actual readonly tmpfs mount budget, then runs fixed `/bin/tar`. The bounded receiver rejects traversal, links, devices, duplicates and oversized output. Empty build output fails instead of publishing an empty preview. A24 October2026 isolated rootful Docker Desktop mechanism check verified ENOSPC, immutable paused-writer export, a real build/test/nonempty preview, and complete owned-container/volume cleanup. This is not rootless acceptance: an actual approved rootless staging integration check is still required before deployment.

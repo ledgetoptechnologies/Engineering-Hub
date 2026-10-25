@@ -7,7 +7,7 @@ import tarfile
 import stat
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -43,7 +43,8 @@ class DockerTests(unittest.TestCase):
         self.assertFalse(any('docker.sock' in part for part in mounts))
         self.assertEqual(len(mounts), 3)
         self.assertTrue(mounts[0].endswith(',dst=/source,readonly'))
-        self.assertTrue(any(part.startswith('/workspace:rw,nosuid,nodev,mode=1777,size=') for part in argv))
+        self.assertTrue(any(part.startswith('/workspace:rw,exec,nosuid,nodev,mode=1777,size=') for part in argv))
+        self.assertIn('/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777', argv)
         self.assertFalse(any(part.startswith('/workspace:') and 'noexec' in part for part in argv))
         self.assertTrue(any(part.startswith('type=volume,source=') and 'target=/output,volume-nocopy' in part for part in argv))
         self.assertTrue(any(part.startswith('type=volume,source=') and 'target=/test-output,volume-nocopy' in part for part in argv))
@@ -264,7 +265,9 @@ def test_verified_daemon_and_kernel_checks_precede_source_copy_and_recipe_execut
         if parts[:3] == ('exec', parts[1], '/bin/cat'):
             events.append('job-hard-mounts')
             return (b'23 1 0:50 / /test-output rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=256k\n'
-                    b'24 1 0:51 / /output rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k\n')
+                    b'24 1 0:51 / /output rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k\n'
+                    b'25 1 0:52 / /workspace rw,nosuid,nodev - tmpfs tmpfs rw,size=65536k\n'
+                    b'26 1 0:53 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=65536k\n')
         events.append('daemon' if parts[0] == 'info' else 'kernel')
         return daemon_info() if parts[0] == 'info' else b'100000 100000\n134217728\n0\n32\n'
     def run(args, **kwargs):
@@ -282,7 +285,7 @@ def test_verified_daemon_and_kernel_checks_precede_source_copy_and_recipe_execut
          patch('hub_staging_service.docker.subprocess.Popen', side_effect=popen), \
          patch.object(backend, '_export'), patch.object(backend, '_stop_owned'):
         assert backend._stage(paths, recipe(profile()), uid(), 'build')['exit_code'] == 0
-    assert events[:6] == ['daemon', 'start', 'kernel', 'job-hard-mounts', 'job-hard-mounts', 'untrusted-source-copy-and-recipe']
+    assert events[:8] == ['daemon', 'start', 'kernel'] + ['job-hard-mounts'] * 4 + ['untrusted-source-copy-and-recipe']
 
 
 @pytest.mark.parametrize('raw,limit,accepted', [(b'bounded', 16, True), (b'x' * 17, 16, False)])
@@ -474,7 +477,9 @@ def test_export_mount_actual_readonly_tmpfs_budget_is_proven(flags, filesystem, 
 def test_bad_job_output_mount_blocks_before_untrusted_process(tmp_path, flags, filesystem, size):
     backend = DockerBackend('unix:///run/user/1000/docker.sock')
     raw = (f'23 1 0:50 / /test-output rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=256k\n'
-           f'24 1 0:51 / /output {flags} - {filesystem} tmpfs rw,size={size}\n').encode()
+           f'24 1 0:51 / /output {flags} - {filesystem} tmpfs rw,size={size}\n'
+           '25 1 0:52 / /workspace rw,nosuid,nodev - tmpfs tmpfs rw,size=65536k\n'
+           '26 1 0:53 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=65536k\n').encode()
     with patch('os.getuid', return_value=1000, create=True), patch('os.getgid', return_value=1000, create=True), \
          patch('hub_staging_service.docker.subprocess.run', return_value=subprocess.CompletedProcess([], 0)), \
          patch.object(backend, '_verify_kernel_limits') as kernel, \
@@ -486,11 +491,65 @@ def test_bad_job_output_mount_blocks_before_untrusted_process(tmp_path, flags, f
     untrusted.assert_not_called()
 
 
-def test_test_stage_proves_test_output_only_and_does_not_require_tmpfs_build_bind():
+def test_test_stage_proves_workspace_tmp_and_test_output_without_tmpfs_build_bind():
     backend = DockerBackend('unix:///run/user/1000/docker.sock')
     with patch.object(backend, '_verify_tmpfs_mount') as mount:
         backend._verify_job_mounts('test-owned', recipe(profile()), 'test')
-    mount.assert_called_once_with('test-owned', '/test-output', 262144, readonly=False)
+    assert mount.call_args_list == [
+        call('test-owned', '/tmp', 64 * 1024**2, readonly=False),
+        call('test-owned', '/workspace', 64 * 1024**2, readonly=False, executable=True),
+        call('test-owned', '/test-output', 262144, readonly=False),
+    ]
+
+
+@pytest.mark.parametrize('target,flags,filesystem,size', [
+    ('/workspace', 'rw,nosuid,nodev,noexec', 'tmpfs', '65536k'),
+    ('/workspace', 'ro,nosuid,nodev', 'tmpfs', '65536k'),
+    ('/workspace', 'rw,nodev', 'tmpfs', '65536k'),
+    ('/workspace', 'rw,nosuid', 'tmpfs', '65536k'),
+    ('/workspace', 'rw,nosuid,nodev', 'ext4', '65536k'),
+    ('/workspace', 'rw,nosuid,nodev', 'tmpfs', '131072k'),
+    ('/workspace', 'rw,nosuid,nodev', 'tmpfs', '32768k'),
+    ('/tmp', 'rw,nosuid,nodev', 'tmpfs', '65536k'),
+    ('/tmp', 'ro,nosuid,nodev,noexec', 'tmpfs', '65536k'),
+    ('/tmp', 'rw,nodev,noexec', 'tmpfs', '65536k'),
+    ('/tmp', 'rw,nosuid,noexec', 'tmpfs', '65536k'),
+    ('/tmp', 'rw,nosuid,nodev,noexec', 'ext4', '65536k'),
+    ('/tmp', 'rw,nosuid,nodev,noexec', 'tmpfs', '131072k'),
+    ('/tmp', 'rw,nosuid,nodev,noexec', 'tmpfs', '32768k'),
+])
+@pytest.mark.parametrize('stage', ['build', 'test'])
+def test_bad_workspace_or_tmp_refuses_before_source_copy_or_recipe(
+        tmp_path, target, flags, filesystem, size, stage):
+    backend = DockerBackend('unix:///run/user/1000/docker.sock')
+    rows = {
+        '/workspace': ('rw,nosuid,nodev', 'tmpfs', '65536k'),
+        '/tmp': ('rw,nosuid,nodev,noexec', 'tmpfs', '65536k'),
+        '/output': ('rw,nosuid,nodev,noexec', 'tmpfs', '1024k'),
+        '/test-output': ('rw,nosuid,nodev,noexec', 'tmpfs', '256k'),
+    }
+    rows[target] = (flags, filesystem, size)
+    raw = ''.join(f'{index} 1 0:{index} / {name} {opts} - {fs} tmpfs rw,size={budget}\n'
+                  for index, (name, (opts, fs, budget)) in enumerate(rows.items(), 30)).encode()
+    with patch('os.getuid', return_value=1000, create=True), patch('os.getgid', return_value=1000, create=True), \
+         patch('hub_staging_service.docker.subprocess.run', return_value=subprocess.CompletedProcess([], 0)), \
+         patch.object(backend, '_verify_kernel_limits') as kernel, \
+         patch.object(backend, '_checked_output', return_value=raw), \
+         patch('hub_staging_service.docker.subprocess.Popen') as source_process:
+        with pytest.raises(Rejected, match='artifact_mount_unverified'):
+            backend._stage_inner(stage_paths(tmp_path), recipe(profile()), uid(), stage)
+    kernel.assert_called_once()
+    source_process.assert_not_called()
+
+
+def test_workspace_exec_does_not_relax_default_artifact_or_tmp_policy():
+    backend = DockerBackend('unix:///run/user/1000/docker.sock')
+    raw = b'25 1 0:52 / /workspace rw,nosuid,nodev - tmpfs tmpfs rw,size=65536k\n'
+    with patch.object(backend, '_checked_output', return_value=raw):
+        backend._verify_tmpfs_mount('owned', '/workspace', 64 * 1024**2,
+                                    readonly=False, executable=True)
+        with pytest.raises(Rejected, match='artifact_mount_unverified'):
+            backend._verify_tmpfs_mount('owned', '/workspace', 64 * 1024**2, readonly=False)
 
 
 if __name__ == '__main__':
