@@ -34,7 +34,7 @@ _GET = frozenset({
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
-        'staging/session-reconciliation', 'staging/status', 'staging/resources')),
+        'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
     'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning',

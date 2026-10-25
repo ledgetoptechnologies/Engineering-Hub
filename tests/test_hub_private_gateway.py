@@ -89,6 +89,23 @@ async def test_image_version_status_is_read_only_through_closed_gateway():
         assert len(calls) == 1
 
 
+async def test_runtime_inventory_reaches_owner_through_read_only_browser_gateway():
+    calls = []
+    async def upstream(request):
+        calls.append(request)
+        assert request.method == 'GET' and request.url.path == BASE + '/staging/runtime'
+        assert 'authorization' not in request.headers
+        return httpx.Response(503, json={'detail': {'code': 'staging_not_configured'}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = PublicBrowserGateway(client)
+        response = await exchange(gateway, BASE + '/staging/runtime')
+        assert status(response) == 503 and len(calls) == 1
+        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            denied = await exchange(gateway, BASE + '/staging/runtime', method=method)
+            assert status(denied) == 403
+        assert len(calls) == 1
+
+
 async def test_constructor_inert_and_original_credentials_forward_without_client_defaults():
     async def run():
         calls = []
