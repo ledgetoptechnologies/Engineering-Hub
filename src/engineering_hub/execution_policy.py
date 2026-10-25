@@ -251,7 +251,15 @@ class SharedExecutionPolicies:
             family = self._routing.get(stored['action_key'])
             binding = self.assert_binding(family)
             action = self._actions[stored['action_key']]
-            if (stored['worker'] != binding.worker.encoded() or stored['machine_id'] != action.machine_id
+            agent, instance = stored['worker'].rsplit(':', 1)
+            original_worker = WorkWorker(agent, instance)
+            # A live completion belongs to this exact worker generation.
+            # Recovery instead routes the unchanged original job to its own
+            # executor family; that family's journal/owner verifier must still
+            # authorize the original command, fence and (for pilot) prior epoch.
+            worker_matches = (original_worker == binding.worker if kind == 'completion'
+                              else original_worker.agent == binding.worker.agent)
+            if (not worker_matches or stored['machine_id'] != action.machine_id
                     or stored['project'] != action.project or stored['environment'] not in action.environments
                     or stored['requires_execution_proof'] is not True):
                 return False

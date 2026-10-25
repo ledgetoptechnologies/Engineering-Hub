@@ -7,7 +7,7 @@ from engineering_hub.execution_policy import SharedExecutionPolicies
 from engineering_hub.repository import HubError, HubRepository
 from engineering_hub.staging_controller import StagingController, compose_queue
 from engineering_hub.staging_resources import StagingResourceStore
-from engineering_hub.work_queue import WorkAction, WorkWorker, CONTAINER_PILOT_EXECUTOR
+from engineering_hub.work_queue import WorkAction, WorkQueue, WorkWorker, CONTAINER_PILOT_EXECUTOR
 from tests.test_hub_staging_controller import Client, payload
 
 
@@ -195,3 +195,31 @@ async def test_close_after_lost_cleanup_ack_reconciles_only_original_operation(s
     result = await controller.cleanup_apply('codex', plan['plan_id'], plan['digest'])
     assert result['removed'] == [submitted['resource_ids']['preview']]
     assert client.cleanup_posts == 1
+
+
+@pytest.mark.asyncio
+async def test_recreated_controller_recovers_lost_ack_before_open_without_repost(shared):
+    controller = opened(shared)
+    old_policies, client, resources, _, repo = shared[1:]
+    client.lost_ack = True
+    submitted = await controller.submit('codex', payload())
+    held = await controller.run_once()
+    assert held['job']['state'] == 'held'
+    original_worker, original_fence = held['job']['worker'], held['job']['fence']
+    old_policies.close()
+
+    queue = WorkQueue(repo, dict(controller.queue.actions))
+    policies = SharedExecutionPolicies(repo, queue)
+    restored = StagingController(repo, queue, client, resources=resources,
+        control_principal=controller.principal, actions=controller.actions, execution_policies=policies)
+    policies.bind('pilot', {'pilot-fixture': queue.actions['pilot-fixture']},
+        WorkWorker(CONTAINER_PILOT_EXECUTOR, str(uuid.uuid4())), target=lambda *a: True,
+        claim=lambda *a: True, completion=lambda *a: True, reconciliation=lambda *a: True)
+    policies.install()  # Admission remains closed until original recovery completes.
+    assert restored.worker != controller.worker
+    result = await restored.reconcile(submitted['job']['id'])
+    assert result['job']['state'] == 'succeeded'
+    assert result['job']['worker'] == original_worker and result['job']['fence'] == original_fence
+    assert client.posts == client.deposits == 1
+    with pytest.raises(HubError, match='admission_closed'):
+        await restored.run_once()

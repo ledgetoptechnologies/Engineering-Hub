@@ -252,6 +252,60 @@ def test_lease_expiry_holds_across_other_family_filter_and_drains_after_close(sy
         assert db.execute('SELECT job_id FROM hub_work_machines').fetchone()[0] is None
 
 
+@pytest.mark.parametrize('family', ['pilot', 'modular'])
+def test_restart_routes_original_held_job_to_family_without_accepting_old_live_completion(system, family):
+    activate(system)
+    repo, old_queue, old_registry, _, old_workers, _, clock = system
+    job = submit(system, family)
+    claimed = old_queue.claim(worker=old_workers[family], action_keys=(family,))
+    old_queue.complete(job_id=job['id'], worker=old_workers[family], fence=claimed['fence'], outcome='held')
+    original = old_queue.get_job(job['id'])
+    old_registry.close()
+
+    # Recreate the queue and dispatcher generations against the same durable
+    # ledger. This is registry routing proof, not PilotOwner epoch acceptance.
+    queue = WorkQueue(repo, dict(old_queue.actions), clock=lambda: clock[0])
+    registry = SharedExecutionPolicies(repo, queue)
+    families = {name: Family(name) for name in ('pilot', 'modular')}
+    workers = {'pilot': worker(CONTAINER_PILOT_EXECUTOR), 'modular': worker(STAGING_SERVICE_EXECUTOR)}
+    for name, handlers in families.items():
+        registry.bind(name, {name: queue.actions[name]}, workers[name], target=handlers.target,
+                      claim=handlers.claim, completion=handlers.completion, reconciliation=handlers.reconciliation)
+    registry.install()
+    registry.ready('pilot'); registry.ready('modular'); registry.open()
+
+    assert workers[family] != old_workers[family]
+    assert queue.completion_verifier(original, family, 'succeeded') is False
+    other = 'modular' if family == 'pilot' else 'pilot'
+    assert queue.reconciliation_verifier(original, other, 'failed') is False
+    assert queue.reconciliation_verifier(original | {'worker': workers[other].encoded()}, family, 'failed') is False
+    assert families[other].calls == []
+    result = queue.reconcile(job_id=job['id'], evidence_id=family, outcome='failed')
+    assert result['state'] == 'failed'
+    assert result['worker'] == original['worker'] and result['fence'] == original['fence']
+    with repo._connection() as db:
+        assert db.execute('SELECT job_id FROM hub_work_machines').fetchone()[0] is None
+
+
+@pytest.mark.parametrize('encoded', ['not-a-worker', 'executor:container-pilot:not-a-uuid',
+                                    'executor:staging-service:' + '00000000-0000-0000-0000-000000000000'])
+def test_malformed_or_wrong_family_original_worker_keeps_reservation(system, encoded):
+    activate(system)
+    repo, queue, _, families, workers, _, _ = system
+    job = submit(system, 'pilot')
+    claimed = queue.claim(worker=workers['pilot'])
+    queue.complete(job_id=job['id'], worker=workers['pilot'], fence=claimed['fence'], outcome='held')
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_work_jobs SET worker=? WHERE id=?', (encoded, job['id']))
+    families['pilot'].calls.clear()
+    with pytest.raises(HubError, match='work_reconciliation_required'):
+        queue.reconcile(job_id=job['id'], evidence_id='pilot', outcome='failed')
+    assert families['pilot'].calls == []
+    assert queue.get_job(job['id'])['state'] == 'held'
+    with repo._connection() as db:
+        assert db.execute('SELECT job_id FROM hub_work_machines').fetchone()[0] == job['id']
+
+
 def test_unknown_reserved_family_denies_open_and_preserves_hold_bytes(system):
     activate(system)
     repo, queue, registry, _, workers, _, _ = system
