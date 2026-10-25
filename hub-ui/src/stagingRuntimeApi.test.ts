@@ -57,6 +57,8 @@ describe("readStagingRuntime", () => {
       .rejects.toMatchObject({ status: 403, code: "staging_admin_required" });
     await expect(readWith(new Response("", { status: 401 })).result).rejects.toMatchObject({ status: 401 });
     await expect(readWith(new Response("<html>", { status: 503 })).result).rejects.toMatchObject({ status: 503, code: "staging_unavailable" });
+    await expect(readWith(jsonResponse({ detail: { code: "staging_not_configured" } }, 503)).result)
+      .rejects.toMatchObject({ status: 503, code: "staging_not_configured" });
   });
   it("refuses a non-JSON success", async () => {
     await expect(readWith(new Response("ok", { status: 200, headers: { "content-type": "text/plain" } })).result).rejects.toMatchObject({ status: 502 });

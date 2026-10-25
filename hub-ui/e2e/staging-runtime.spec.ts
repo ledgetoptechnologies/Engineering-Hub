@@ -79,6 +79,14 @@ test("not set up and not answering are said plainly", async ({ page }) => {
   await expect(panel(page)).toContainText("The staging PC isn't answering, so what's running on it is unknown.");
 });
 
+test("a Hub without staging set up says so, not that the PC is down", async ({ page }) => {
+  await fixture(page, [{ status: 503, body: { detail: { code: "staging_not_configured" } } }]);
+  await page.goto("/#/staging");
+  await expect(panel(page)).toContainText("Watching the staging PC isn't set up yet, so what runs on it isn't shown.");
+  await expect(panel(page)).not.toContainText("isn't answering");
+  await expect(panel(page).getByRole("alert")).toHaveCount(0);
+});
+
 test("reads once, refreshes only when asked, and keeps the earlier observation when a refresh fails", async ({ page }) => {
   const state = await fixture(page, [{ status: 200, body: fresh() }, { status: 503, body: { detail: { code: "staging_unavailable" } } }]);
   await page.goto("/#/staging");

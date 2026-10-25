@@ -39,6 +39,10 @@ export function StagingRuntimePanel({ mode, read: given, onUnauthorized, now = (
       if (error instanceof HubApiError && (error.status === 403 || error.code === "staging_runtime_unsupported")) {
         setRuntime(null); setLoad("hidden"); return;
       }
+      // Not set up is a fact about the Hub, not a network failure, so it's worded like the server's own not_configured state.
+      if (error instanceof HubApiError && error.code === "staging_not_configured") {
+        setRuntime({ configured: false, state: "not_configured", snapshot: null }); setLoad("loaded"); return;
+      }
       // A failed refresh keeps the earlier observation on screen, labelled with when it was seen.
       setFailure(error instanceof HubApiError && error.status === 503
         ? "The staging PC isn't answering, so what's running on it is unknown right now."
