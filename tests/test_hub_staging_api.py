@@ -33,6 +33,13 @@ class Controller:
         return {'configured': True, 'reachable': True, 'profiles': {PROJECT: ['static']},
                 'worker_url': 'https://private.invalid', 'token_file': '/private/secret'}
 
+    async def runtime(self, actor):
+        self.calls.append(('runtime', actor))
+        return {'configured': True, 'state': 'ready', 'snapshot': {
+            'schema': 'hub-staging-runtime.v1', 'observed_at': datetime.now(timezone.utc).isoformat(),
+            'sources': [{'id': 'worker', 'state': 'unavailable', 'observed_at': None}],
+            'containers': [], 'services': []}, 'worker_url': 'https://private.invalid'}
+
     async def submit(self, actor, payload):
         self.resources.authorize(actor, payload['project'], 'build')
         self.calls.append(('submit', actor, payload))
@@ -150,6 +157,27 @@ def test_status_strips_private_configuration(env):
     assert response.json() == {'configured': True, 'running': False, 'reachable': True,
                                'profiles': {PROJECT: ['static']}, 'previews_configured': False}
     assert 'private' not in response.text and 'secret' not in response.text
+
+
+def test_runtime_is_human_admin_only_before_upstream_call(env):
+    client, _ = application(env[3])
+    for principal in (None, 'codex', 'human:2'):
+        response = client.get(PREFIX + '/runtime', headers={} if principal is None else headers(principal))
+        assert response.status_code == (401 if principal is None else 403)
+    assert not env[3].calls
+    response = client.get(PREFIX + '/runtime', headers=headers(ADMIN))
+    assert response.status_code == 200
+    assert set(response.json()) == {'configured', 'state', 'snapshot'}
+    assert response.json()['snapshot']['sources'][0]['state'] == 'unavailable'
+    assert 'private.invalid' not in response.text
+    assert env[3].calls == [('runtime', ADMIN)]
+
+
+def test_runtime_not_configured_does_not_report_empty_healthy_host():
+    client, _ = application(None)
+    response = client.get(PREFIX + '/runtime', headers=headers(ADMIN))
+    assert response.status_code == 503
+    assert response.json()['code'] == 'staging_not_configured'
 
 
 def test_resource_listing_pagination_scopes_and_query_validation(env):

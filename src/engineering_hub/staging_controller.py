@@ -237,6 +237,15 @@ class StagingController:
         return {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
                 'resource_ids': item['resource_ids'], 'phase': item['phase']}
 
+    async def runtime(self, actor):
+        self.repo._actor(actor, human=True)
+        _require(actor in self.resources.admin_actors, 'staging_admin_required', 403)
+        try:
+            snapshot = await self.client.runtime()
+        except Exception:
+            return {'configured': True, 'state': 'unavailable', 'snapshot': None}
+        return {'configured': True, 'state': 'ready', 'snapshot': snapshot}
+
     async def status(self, actor=None):
         result = {'configured': True, 'running': self.background is not None and not self.background.done(),
                   'reachable': False, 'profiles': {}, 'held_jobs': [],

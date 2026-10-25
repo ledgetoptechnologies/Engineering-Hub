@@ -300,10 +300,11 @@ class StagingClient:
             _check(len(raw) <= 8 * 1024**2 and hashlib.sha256(raw).hexdigest() == payload['source_digest'])
             return len(raw)
 
-    async def _request(self, method, path, payload=None, *, file_types=None):
+    async def _request(self, method, path, payload=None, *, file_types=None, maximum=None):
         if self._client.is_closed:
             raise StagingClientError()
         response = None
+        response_limit = self.MAX_RESPONSE_BYTES if maximum is None else maximum
         try:
             content = None if payload is None else json.dumps(payload, separators=(',', ':'), allow_nan=False).encode()
             _check(content is None or len(content) <= self.MAX_UPLOAD_BYTES)
@@ -327,10 +328,10 @@ class StagingClient:
                     _check(media in {'application/json', 'application/json; charset=utf-8'})
                 length = response.headers.get('content-length')
                 _check(length is None or re.fullmatch(r'0|[1-9][0-9]{0,8}', length)
-                       and int(length) <= self.MAX_RESPONSE_BYTES)
+                       and int(length) <= response_limit)
                 data = bytearray()
                 async for chunk in response.aiter_bytes(chunk_size=65536):
-                    _check(len(data) + len(chunk) <= self.MAX_RESPONSE_BYTES)
+                    _check(len(data) + len(chunk) <= response_limit)
                     data.extend(chunk)
                 if length is not None:
                     _check(len(data) == int(length))
@@ -371,6 +372,11 @@ class StagingClient:
                    and all(type(recipe) is str and _NAME.fullmatch(recipe) for recipe in recipes)
                    and len(set(recipes)) == len(recipes))
         return result
+
+    @_opaque
+    async def runtime(self):
+        from .staging_runtime import validate_runtime_snapshot
+        return validate_runtime_snapshot(await self._request('GET', '/v1/runtime', maximum=128 * 1024))
 
     @_opaque
     async def put_source(self, payload):
