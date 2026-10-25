@@ -416,14 +416,18 @@ class DockerBackend:
         try:
             (paths['test_run'] / (stage + '.log')).write_bytes(log)
             ensure(failure is None and not overflow.is_set(), failure or 'stage_log_limit')
-            ensure(process.returncode == 0, 'stage_' + stage + '_failed')
+            ensure(type(process.returncode) is int and process.returncode >= 0, 'execution_uncertain')
             # Freeze all job processes before exporting tmpfs outputs, including
             # any descendant the build left behind after its foreground exit.
             subprocess.run(self.command('pause', name), stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=True, env=self.env)
             paused = self._checked_output(('inspect', '--format', '{{json .State.Paused}}', name), limit=4096)
             ensure(paused.strip() == b'true', 'execution_uncertain')
-            if stage == 'build':
+            # A nonnegative Docker CLI exit permits only a frozen diagnostic
+            # observation; it does not prove the recipe exited normally. Keep
+            # the existing failure classification and never publish its build.
+            # Timeout/overflow/signal or failed freeze checks cannot reach here.
+            if stage == 'build' and process.returncode == 0:
                 self._export(name + '-export-output', specs['output']['name'], paths['build'], profile['output_bytes'],
                              profile=profile, command_id=command_id, stage=stage, scope=scope)
             test_output = paths['test_run'] / stage
@@ -432,6 +436,7 @@ class DockerBackend:
                          profile=profile, command_id=command_id, stage=stage, scope=scope)
             paused = self._checked_output(('inspect', '--format', '{{json .State.Paused}}', name), limit=4096)
             ensure(paused.strip() == b'true', 'execution_uncertain')
+            ensure(process.returncode == 0, 'stage_' + stage + '_failed')
             return {'exit_code': process.returncode, 'log_bytes': len(log)}
         finally:
             self._stop_owned(name, command_id, stage, scope)

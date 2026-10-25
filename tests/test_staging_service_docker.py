@@ -552,5 +552,116 @@ def test_workspace_exec_does_not_relax_default_artifact_or_tmp_policy():
             backend._verify_tmpfs_mount('owned', '/workspace', 64 * 1024**2, readonly=False)
 
 
+def diagnostic_stage_probe(monkeypatch, tmp_path, *, mode='nonzero', exit_code=7):
+    """Known owned writer with synthetic Docker CLI exit; no actual Docker."""
+    backend = DockerBackend('unix:///run/user/1000/docker.sock')
+    paths, events = stage_paths(tmp_path), []
+
+    class Process:
+        stdout = io.BytesIO(b'x' * 65537 if mode == 'overflow' else b'failed recipe log')
+        returncode = -15 if mode == 'signal' else exit_code
+        running = mode == 'timeout'
+        def poll(self):
+            return None if self.running else self.returncode
+        def wait(self, **kwargs):
+            self.running = False
+            return self.returncode
+
+    process = Process()
+    def run(argv, **kwargs):
+        if 'pause' in argv:
+            events.append('pause')
+            if mode == 'pause_failure':
+                raise subprocess.CalledProcessError(1, argv)
+        return subprocess.CompletedProcess(argv, 0)
+    def inspect(parts, **kwargs):
+        events.append('verify-paused')
+        unpaused_after_export = mode == 'unpaused_after_export' and events.count('verify-paused') == 2
+        return b'false' if mode == 'not_paused' or unpaused_after_export else b'true'
+    def export(name, volume, destination, limit, **kwargs):
+        events.append(('export', destination, limit))
+        if mode == 'export_uncertain':
+            raise Rejected('execution_uncertain')
+        (destination / 'failure.json').write_text('{"fixture":"failed"}')
+
+    monkeypatch.setattr('os.getuid', lambda: 1000, raising=False)
+    monkeypatch.setattr('os.getgid', lambda: 1000, raising=False)
+    monkeypatch.setattr(backend, '_verify_kernel_limits', lambda *args: None)
+    monkeypatch.setattr(backend, '_verify_job_mounts', lambda *args: None)
+    monkeypatch.setattr(backend, '_checked_output', inspect)
+    monkeypatch.setattr(backend, '_export', export)
+    monkeypatch.setattr(backend, '_stop_owned', lambda *args: events.append('cleanup'))
+    monkeypatch.setattr('hub_staging_service.docker.subprocess.run', run)
+    monkeypatch.setattr('hub_staging_service.docker.subprocess.Popen', lambda *a, **kw: process)
+    if mode == 'timeout':
+        clock = iter([0, 31])
+        monkeypatch.setattr('hub_staging_service.docker.time.monotonic', lambda: next(clock))
+    return backend, paths, events
+
+
+@pytest.mark.parametrize('stage', ['build', 'test'])
+@pytest.mark.parametrize('exit_code', [1, 7, 125, 126, 127])
+def test_nonzero_cli_freezes_exports_only_diagnostic_observation_and_stays_failed(tmp_path, monkeypatch, stage, exit_code):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path, exit_code=exit_code)
+    with pytest.raises(Rejected, match='stage_' + stage + '_failed'):
+        backend._stage_inner(paths, recipe(profile()), uid(), stage)
+    assert events == ['pause', 'verify-paused',
+                      ('export', paths['test_run'] / stage, profile()['output_bytes'] // 4),
+                      'verify-paused', 'cleanup']
+    assert (paths['test_run'] / stage / 'failure.json').exists()
+    assert (paths['test_run'] / (stage + '.log')).read_bytes() == b'failed recipe log'
+    assert list(paths['build'].iterdir()) == [] and list(paths['preview'].iterdir()) == []
+
+
+def test_failed_build_does_not_run_test_or_publish_preview(tmp_path, monkeypatch):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path)
+    stages = []
+    def stage(paths, selected, command, name):
+        stages.append(name)
+        return backend._stage_inner(paths, selected, command, name)
+    monkeypatch.setattr(backend, '_stage', stage)
+    with pytest.raises(Rejected, match='stage_build_failed'):
+        backend._run_stages(paths, recipe(profile()), uid())
+    assert stages == ['build']
+    assert not list(paths['build'].iterdir()) and not list(paths['preview'].iterdir())
+    assert (paths['test_run'] / 'build/failure.json').exists()
+
+
+@pytest.mark.parametrize('mode', ['pause_failure', 'not_paused'])
+def test_failed_writer_freeze_does_not_export_and_still_cleans_owned_writer(tmp_path, monkeypatch, mode):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path, mode=mode)
+    expected = subprocess.CalledProcessError if mode == 'pause_failure' else Rejected
+    with pytest.raises(expected):
+        backend._stage_inner(paths, recipe(profile()), uid(), 'test')
+    assert not any(isinstance(event, tuple) and event[0] == 'export' for event in events)
+    assert events[-1] == 'cleanup'
+
+
+def test_uncertain_diagnostic_export_preserves_held_classification(tmp_path, monkeypatch):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path, mode='export_uncertain')
+    with pytest.raises(Rejected, match='execution_uncertain'):
+        backend._stage_inner(paths, recipe(profile()), uid(), 'test')
+    assert events[-1] == 'cleanup'
+
+
+def test_writer_unpaused_after_diagnostic_observation_stays_uncertain(tmp_path, monkeypatch):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path, mode='unpaused_after_export')
+    with pytest.raises(Rejected, match='execution_uncertain'):
+        backend._stage_inner(paths, recipe(profile()), uid(), 'test')
+    assert events.count('verify-paused') == 2 and events[-1] == 'cleanup'
+    assert (paths['test_run'] / 'test/failure.json').exists()
+    assert not list(paths['preview'].iterdir())
+
+
+@pytest.mark.parametrize('mode,error', [('overflow', 'stage_log_limit'), ('timeout', 'stage_timeout'),
+                                        ('signal', 'execution_uncertain')])
+def test_timeout_overflow_and_unknown_exit_never_export_diagnostics(tmp_path, monkeypatch, mode, error):
+    backend, paths, events = diagnostic_stage_probe(monkeypatch, tmp_path, mode=mode)
+    with pytest.raises(Rejected, match=error):
+        backend._stage_inner(paths, recipe(profile()), uid(), 'test')
+    assert not any(isinstance(event, tuple) and event[0] == 'export' for event in events)
+    assert 'pause' not in events and events[-1] == 'cleanup'
+
+
 if __name__ == '__main__':
     unittest.main()
