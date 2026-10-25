@@ -1,0 +1,17 @@
+# Shared staging execution policies
+
+This is a private source integration boundary, not joint pilot enrollment or an activated application mode. The application's existing executor-conflict guard remains in place. No new owner, database, machine alias, credential, listener or Docker endpoint is created.
+
+`SharedExecutionPolicies` binds the exact repository and canonical `WorkQueue` to disjoint action families, fixed workers and synchronous target/claim/completion/reconciliation handlers. It snapshots action values, handler identities, queue callbacks, approval authority and global readiness authority. Unknown actions, callback replacement and binding drift deny admission; a missing claim callback cannot restore standalone admission semantics after shared installation.
+
+Construction and binding do not install queue callbacks. Explicit installation leaves admission closed. Opening requires all expected families to be bound and ready, every snapshot action to be covered, and existing reservations to have known family/machine bindings. A reservation whose family is absent raises `foreign_hold_family_absent`; this audit never adopts, reconciles or releases it. Marking a family ready is a trusted composition step, not independent proof that its recovery completed.
+
+Closing admission is terminal for that registry instance. New claims, source uploads and job/cleanup dispatch stop. Intact original completion/reconciliation remains available. Stored job identity, action, worker and fence determine proof routing; a caller cannot redirect evidence into another family. A read-only claim plan is rechecked against the current barrier when claimed.
+
+Shared-mode production priority covers the physical machine before worker/action filters. A target-policy denial is not global unavailability. Unknown, unbound or malformed production bindings/approval/readiness retain the barrier. An intact binding with trusted approval exactly `False` establishes revocation; trusted global readiness exactly `False` establishes unavailability for an approved bound row. Neither grants production execution. Standalone queue behavior remains unchanged.
+
+`StagingController(..., execution_policies=...)` optionally registers its modular actions without replacing the registry callbacks. It checks admission before new effects, and checks original identity after awaited replies before updating local state. Closing admission after acceptance permits original receipt processing; binding drift preserves the original claim for reconciliation rather than authorizing a replacement POST. The repository's execution principal is unchanged and modular jobs create no pilot run entity.
+
+## Remaining joint composition
+
+The real container-pilot bridge still needs an explicit shared binding that preserves all owner/epoch/manifest/review/private-permit guards. Enrollment must recognize only exact durable foreign submissions while preserving their holds. One startup composition must recover both original identities before marking either family ready, and shutdown must drain both clients before releasing the single owner. Owner-facing wait-reason contracts, real joint deployment/rollback acceptance and NAS/app/reboot checks remain separate requirements. Synthetic family tests do not prove them. Keep the application conflict guard until those requirements pass.

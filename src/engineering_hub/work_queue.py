@@ -218,6 +218,49 @@ class WorkQueue:
         except Exception:
             return False
 
+    def _shared_policy_present(self):
+        return (hasattr(self, '_shared_execution_policies')
+                or getattr(self, '_shared_execution_required', False) is not False)
+
+    def _shared_policy_valid(self, action_key=None):
+        """No legacy None-callback admission after shared composition installs."""
+        if not self._shared_policy_present():
+            return True
+        try:
+            from .execution_policy import SharedExecutionPolicies
+            policy = getattr(self, '_shared_execution_policies', None)
+            if (type(policy) is not SharedExecutionPolicies or policy.queue is not self
+                    or policy.repo is not self.repo):
+                return False
+            policy.assert_integrity()
+            return action_key is None or policy.action_bound(action_key) is True
+        except Exception:
+            return False
+
+    def _shared_approval(self, row):
+        """Only an explicit trusted False releases shared production priority."""
+        if self.approval_verifier is None or row['approval_id'] is None:
+            return None
+        try:
+            value = self.approval_verifier(row['actor'], row['action_key'], row['environment'],
+                row['approval_id'], WorkTarget(**json.loads(row['target'])))
+            if type(value) is bool:
+                return value
+            if inspect.iscoroutine(value) and inspect.getcoroutinestate(value) == inspect.CORO_CREATED:
+                value.close()
+        except Exception:
+            pass
+        return None
+
+    def _shared_row_bound(self, row):
+        if not self._shared_policy_valid(row['action_key']):
+            return False
+        action = self.actions.get(row['action_key'])
+        return (type(action) is WorkAction and action.machine_id == row['machine_id']
+                and action.project == row['project']
+                and action.requires_execution_proof == bool(row['requires_execution_proof'])
+                and row['environment'] in action.environments)
+
     def action_project(self, action_key):
         _key(action_key)
         action = self.actions.get(action_key)
@@ -226,6 +269,8 @@ class WorkQueue:
         return action.project
 
     def _target_verified(self, actor, action_key, environment, target):
+        if not self._shared_policy_valid(action_key):
+            return False
         if not self.repo.task_allows_environment(target.task_id, environment):
             return False
         if self.target_verifier is None:
@@ -291,6 +336,8 @@ class WorkQueue:
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
     def _admitted(self, worker, row):
+        if not self._shared_policy_valid(row['action_key']):
+            return False
         if self.claim_verifier is None:
             return True
         try:
@@ -302,6 +349,8 @@ class WorkQueue:
     def _eligible_target(self, row):
         """Current registry, approval and target policy, independent of worker."""
         try:
+            if not self._shared_policy_valid(row['action_key']):
+                return False
             self.repo._project(row['project'])
             action = self.actions.get(row['action_key'])
             return (type(action) is WorkAction and action.machine_id == row['machine_id']
@@ -365,12 +414,26 @@ class WorkQueue:
         # Callbacks are point-in-time observations under the SQLite job
         # transaction, not an atomic snapshot of external policy/readiness.
         readiness_verifier = self.production_readiness_verifier
+        shared = self._shared_policy_present()
+        if shared and not self._shared_policy_valid():
+            return None
         production_machines = set()
         for row in rows:
             if row['environment'] == 'production':
-                if not self._eligible_target(row):
-                    continue
-                readiness = self._production_readiness(row, readiness_verifier)
+                if shared:
+                    # A routed target denial is not evidence of global
+                    # unavailability. Unbound production retains its machine
+                    # barrier even when another family's worker filters it out.
+                    bound = self._shared_row_bound(row)
+                    approval = self._shared_approval(row) if bound else None
+                    if bound and approval is False:
+                        continue
+                    readiness = (self._production_readiness(row, readiness_verifier)
+                                 if bound and approval is True else None)
+                else:
+                    if not self._eligible_target(row):
+                        continue
+                    readiness = self._production_readiness(row, readiness_verifier)
                 if readiness is not False:
                     production_machines.add(row['machine_id'])
             elif row['machine_id'] in production_machines:
@@ -380,7 +443,9 @@ class WorkQueue:
             if row['environment'] == 'production':
                 if readiness is False:
                     continue
-                if readiness_verifier is not None and readiness is not True:
+                if (shared or readiness_verifier is not None) and readiness is not True:
+                    continue
+                if shared and not self._eligible_target(row):
                     continue
             elif not self._eligible_target(row):
                 continue
@@ -526,6 +591,8 @@ class WorkQueue:
             _key(evidence_id)
         with self.repo._transaction() as db:
             row = self._owned(db, job_id, worker, fence, self._now())
+            if outcome != 'held' and not self._shared_policy_valid(row['action_key']):
+                raise HubError('work_completion_proof_required', 409)
             if outcome != 'held' and row['requires_execution_proof']:
                 verified = False
                 if evidence_id is not None and self.completion_verifier is not None:
@@ -551,6 +618,8 @@ class WorkQueue:
             row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()
             if row is None or row['state'] != 'held':
                 raise HubError('work_not_held', 409)
+            if not self._shared_policy_valid(row['action_key']):
+                raise HubError('work_reconciliation_required', 403)
             verified = False
             if self.reconciliation_verifier is not None:
                 try:
