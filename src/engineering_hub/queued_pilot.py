@@ -33,7 +33,7 @@ class QueuedContainerPilot:
     It does not start an event loop, listener, network call or background worker.
     """
     def __init__(self, queue, workflow, *, action_key, machine_id, reconciliation,
-                 execution_policies=None):
+                 execution_policies=None, modular_controller=None):
         if (type(queue) is not WorkQueue or type(workflow) is not ContainerPilotWorkflow
                 or queue.repo is not workflow.repo or workflow.pilot_owner is None
                 or workflow.repo.execution_principal != 'executor:container-pilot'):
@@ -43,6 +43,8 @@ class QueuedContainerPilot:
             if (type(execution_policies) is not SharedExecutionPolicies
                     or execution_policies.repo is not queue.repo or execution_policies.queue is not queue):
                 raise HubError('queued_pilot_policy_conflict', 409)
+        elif modular_controller is not None:
+            raise HubError('queued_pilot_policy_conflict', 409)
         workflow._assert_pilot_owner()
         action = queue.actions.get(action_key)
         target = workflow.targets.get('engineering-hub:staging')
@@ -114,9 +116,18 @@ class QueuedContainerPilot:
                     'WHERE j.run_id=? OR (j.run_id IS NULL AND r.run_id=?)', (run['id'], run['id'])).fetchone()
                 if bound is None:
                     raise HubError('queued_pilot_unbound_run_present', 409)
-            for reservation in db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (machine_id,)):
+            for reservation in db.execute('SELECT machine_id,generation,job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (machine_id,)):
                 if db.execute('SELECT 1 FROM hub_queued_pilot_jobs WHERE job_id=?', (reservation['job_id'],)).fetchone() is None:
-                    raise HubError('queued_pilot_unbound_reservation_present', 409)
+                    # Only the explicitly composed modular controller can bind
+                    # a foreign reservation. This read-only match preserves the
+                    # original hold; it never gives this pilot its ownership.
+                    if not self._shared_mode or modular_controller is None:
+                        raise HubError('queued_pilot_unbound_reservation_present', 409)
+                    from .shared_hold_binding import modular_hold_matches
+                    if modular_hold_matches(db, repo=self.repo, queue=self.queue,
+                            policies=self._execution_policies, modular_controller=modular_controller,
+                            reservation=reservation) is not True:
+                        raise HubError('queued_pilot_unbound_reservation_present', 409)
             db.execute('INSERT OR IGNORE INTO hub_queued_pilot_policy VALUES(1,?,?,?,?)', expected)
         self.repo._queued_pilot = self
         if self._shared_mode:

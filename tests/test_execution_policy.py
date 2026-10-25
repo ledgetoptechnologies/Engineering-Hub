@@ -336,3 +336,95 @@ def test_open_requires_every_snapshot_action_explicitly_bound(tmp_path):
     with pytest.raises(HubError, match='execution_policy_not_ready'):
         registry.open()
     assert registry.claim_verifier(worker(CONTAINER_PILOT_EXECUTOR), 'unbound', 'staging', 'machine', target()) is False
+
+
+@pytest.fixture
+def pending(tmp_path):
+    repo = HubRepository(tmp_path / 'pending.db')
+    queue = WorkQueue(repo, {name: WorkAction('machine', project='engineering-hub')
+                            for name in ('pilot', 'modular')}, claim_verifier=ClosedClaimPolicy())
+    registry = SharedExecutionPolicies(repo, queue)
+    handler = Family('modular')
+    identity = worker(STAGING_SERVICE_EXECUTOR)
+    binding = registry.bind('modular', {'modular': queue.actions['modular']}, identity,
+        target=handler.target, claim=handler.claim,
+        completion=handler.completion, reconciliation=handler.reconciliation)
+    return repo, queue, registry, handler, binding
+
+
+def test_pending_binding_is_exact_readonly_metadata_and_never_admits(pending):
+    _, queue, registry, handler, binding = pending
+    callbacks = tuple(getattr(queue, name) for name in
+        ('target_verifier', 'claim_verifier', 'completion_verifier', 'reconciliation_verifier'))
+    assert registry.assert_pending_binding('modular', binding) is binding
+    assert registry.assert_pending_binding('modular', binding) is binding
+    assert not registry._installed and not registry._open and registry._ready == frozenset()
+    assert not hasattr(queue, '_shared_execution_policies')
+    assert not hasattr(queue, '_shared_execution_required')
+    assert callbacks == tuple(getattr(queue, name) for name in
+        ('target_verifier', 'claim_verifier', 'completion_verifier', 'reconciliation_verifier'))
+    assert registry.target_verifier('codex', 'modular', 'staging', target()) is False
+    assert registry.claim_verifier(binding.worker, 'modular', 'staging', 'machine', target()) is False
+    assert handler.calls == []
+    with pytest.raises(HubError):
+        registry.ready('modular')
+    with pytest.raises(HubError):
+        registry.open()
+
+
+@pytest.mark.parametrize('family,binding_value', [('pilot', 'actual'), ('unknown', 'actual'),
+                                                ('modular', None), ('modular', 'foreign')])
+def test_pending_binding_never_defaults_missing_family_or_capability(pending, family, binding_value):
+    registry, binding = pending[2], pending[4]
+    value = binding if binding_value == 'actual' else object() if binding_value == 'foreign' else None
+    with pytest.raises(HubError):
+        registry.assert_pending_binding(family, value)
+
+
+@pytest.mark.parametrize('which', ['queue_callback', 'global_approval', 'global_readiness', 'action',
+    'action_dict', 'queue_context', 'repo_context', 'handler', 'binding_worker', 'registry_callback',
+    'attachment', 'sticky'])
+def test_pending_binding_rejects_callback_context_action_and_handler_drift(pending, which):
+    repo, queue, registry, handler, binding = pending
+    if which == 'queue_callback': queue.claim_verifier = None
+    elif which == 'global_approval': queue.approval_verifier = lambda *args: True
+    elif which == 'global_readiness': queue.production_readiness_verifier = lambda *args: False
+    elif which == 'action': queue.actions['modular'] = WorkAction('machine', project='engineering-hub')
+    elif which == 'action_dict': queue.actions = dict(queue.actions)
+    elif which == 'queue_context': registry.queue = object()
+    elif which == 'repo_context': queue.repo = object()
+    elif which == 'handler': handler.claim = MethodType(lambda self, *args: True, handler)
+    elif which == 'binding_worker': object.__setattr__(binding, 'worker', worker(STAGING_SERVICE_EXECUTOR))
+    elif which == 'registry_callback': registry.target_verifier = lambda *args: True
+    elif which == 'attachment': queue._shared_execution_policies = None
+    elif which == 'sticky': queue._shared_execution_required = False
+    with pytest.raises(HubError):
+        registry.assert_pending_binding('modular', binding)
+    assert handler.calls == []
+
+
+def test_pending_binding_denies_after_install_but_installed_binding_still_works(pending):
+    _, queue, registry, _, binding = pending
+    handler = Family('pilot')
+    registry.bind('pilot', {'pilot': queue.actions['pilot']}, worker(CONTAINER_PILOT_EXECUTOR),
+        target=handler.target, claim=handler.claim,
+        completion=handler.completion, reconciliation=handler.reconciliation)
+    registry.install()
+    with pytest.raises(HubError, match='execution_policy_pending_closed'):
+        registry.assert_pending_binding('modular', binding)
+    assert registry.assert_binding('modular', binding) is binding
+    registry.close()
+    assert registry.assert_binding('modular', binding) is binding
+    with pytest.raises(HubError, match='execution_policy_pending_closed'):
+        registry.assert_pending_binding('modular', binding)
+
+
+def test_pending_binding_denies_closed_or_open_state_without_install(pending):
+    registry, binding = pending[2], pending[4]
+    registry._open = True
+    with pytest.raises(HubError, match='execution_policy_pending_closed'):
+        registry.assert_pending_binding('modular', binding)
+    registry._open = False
+    registry.close()
+    with pytest.raises(HubError, match='execution_policy_pending_closed'):
+        registry.assert_pending_binding('modular', binding)

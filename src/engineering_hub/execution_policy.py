@@ -168,6 +168,24 @@ class SharedExecutionPolicies:
         """Raise on drift; closing admissions does not invalidate drain policy."""
         _require(self._intact())
 
+    def assert_pending_binding(self, family, binding):
+        """Read-only enrollment metadata, never admission or foreign-hold proof.
+
+        Only a previously bound exact capability is accepted before install.
+        After install callers must use assert_binding instead; this method
+        neither installs callbacks nor acknowledges either family's recovery.
+        """
+        _require(not self._installed and not self._closed and not self._open
+                 and not self._ready, 'execution_policy_pending_closed')
+        _require(self._intact(installed=False))
+        _require(all(getattr(self.queue, name) is initial
+                     for name, initial in zip(_CALLBACKS, self._initial)))
+        _require(all(getattr(self, name) is callback and callback.__code__ is code
+                     for name, callback, code in zip(_CALLBACKS, self._dispatchers, self._dispatcher_code)))
+        _require(type(family) is str and binding is not None
+                 and self._bindings.get(family) is binding)
+        return binding
+
     def action_bound(self, action_key):
         try:
             self.assert_integrity()
