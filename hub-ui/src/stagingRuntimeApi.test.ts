@@ -17,8 +17,8 @@ describe("parseStagingRuntime", () => {
   it("accepts the wire fixture and the demo, folding engine state case and unknown states", () => {
     expect(parseStagingRuntime(wire).snapshot?.containers.map(item => item.state)).toEqual(["running", "exited"]);
     expect(parseStagingRuntime(createDemoRuntime(now)).snapshot?.containers).toHaveLength(5);
-    const odd = snap(); odd.snapshot.containers[0].state = "hibernating";
-    expect(parseStagingRuntime(odd).snapshot?.containers[0].state).toBe("unknown");
+    const odd = snap(); odd.snapshot.containers[0].state = "hibernating"; odd.snapshot.containers[1].state = "Exited";
+    expect(parseStagingRuntime(odd).snapshot?.containers.map(item => item.state)).toEqual(["unknown", "exited"]);
   });
   it("accepts no snapshot for an unconfigured or unreachable PC", () => {
     expect(parseStagingRuntime({ configured: false, state: "not_configured", snapshot: null }).snapshot).toBeNull();
@@ -74,13 +74,20 @@ describe("wording", () => {
     const off = sourceViews(parseStagingRuntime(snap({ sources: [{ id: "host", state: "not_configured", observed_at: null }] })).snapshot!, now);
     expect(off[1]).toMatchObject({ listed: false, line: "The host view isn't set up, so other programs on the PC aren't shown." });
   });
-  it("shows a stale list but marks it, and splits by scope", () => {
+  it("splits by scope, and words a stale source the Hub sent without rows as unknown", () => {
     const [worker, host] = sourceViews(parseStagingRuntime(wire).snapshot!, now);
     expect(worker).toMatchObject({ listed: true, tone: "forest", line: "Seen just now.", stale: false });
     expect(worker.containers.map(item => item.name)).toEqual(["eh-build"]);
-    expect(host).toMatchObject({ listed: true, tone: "amber", line: "Out of date: last seen 40 min ago. It may have changed since.", stale: true });
-    expect(host.services).toHaveLength(1);
+    expect(host).toMatchObject({ listed: true, tone: "forest", stale: false });
     expect(countLine(host.containers, host.services)).toBe("0 running · 1 not running · 1 service");
+    // The Hub drops a stale source's rows, so an empty stale list must never read as "nothing running".
+    const dropped = snap({ sources: [wire.snapshot.sources[0], { id: "host", state: "stale", observed_at: "2026-10-25T11:20:00Z" }] as never,
+      containers: wire.snapshot.containers.filter(item => item.scope === "worker") as never, services: [] });
+    expect(sourceViews(parseStagingRuntime(dropped).snapshot!, now)[1]).toMatchObject({ listed: false, tone: "amber",
+      line: "Out of date (last seen 40 min ago), so what's running here is unknown." });
+    // Should rows ever arrive with a stale source, they're shown as last seen.
+    expect(sourceViews(parseStagingRuntime(snap({ sources: dropped.snapshot.sources as never })).snapshot!, now)[1]).toMatchObject({
+      listed: true, stale: true, line: "Out of date: last seen 40 min ago. It may have changed since." });
   });
   it("ages an observed source by this browser's clock, and marks a retained observation out of date", () => {
     const snapshot = parseStagingRuntime(wire).snapshot!;

@@ -35,21 +35,20 @@ const fresh = (base = Date.now()) => {
   const at = new Date(base - 20_000).toISOString();
   body.snapshot.observed_at = at;
   body.snapshot.sources[0].observed_at = at;
-  body.snapshot.sources[1].observed_at = new Date(base - 40 * 60_000).toISOString();
+  body.snapshot.sources[1].observed_at = at;
   return body;
 };
 
-test("splits the staging engine from other programs, marks the stale one, and offers no controls", async ({ page }) => {
+test("splits the staging engine from other programs, and offers no controls", async ({ page }) => {
   await fixture(page, [{ status: 200, body: fresh() }]);
   await page.goto("/#/staging");
   const engine = panel(page).getByRole("region", { name: "Staging engine" });
   const host = panel(page).getByRole("region", { name: "Other programs on the PC" });
   await expect(engine).toContainText("Seen just now.");
   await expect(engine.getByRole("listitem")).toHaveText([/eh-build.*Container · build.*Running/]);
-  await expect(host).toContainText("Out of date: last seen 40 min ago. It may have changed since.");
+  await expect(host).toContainText("Seen just now.");
   await expect(host).toContainText("not run or controlled by EH");
-  // An out-of-date list says what was last seen, never a current state.
-  await expect(host.getByRole("listitem")).toHaveText([/viewer.*Last seen: stopped/, /Asset service.*Service.*Last seen: running/]);
+  await expect(host.getByRole("listitem")).toHaveText([/viewer.*Stopped/, /asset-service\.service.*Service.*Running/]);
   // The registry address and digest are never shown, and there is nothing to press but Refresh.
   await expect(panel(page)).not.toContainText("registry.example.test");
   await expect(panel(page)).not.toContainText("sha256");
@@ -69,6 +68,19 @@ test("an unreadable source says unknown, not empty", async ({ page }) => {
   await expect(panel(page).getByRole("region", { name: "Other programs on the PC" })).toContainText("Not reported, so what's running here is unknown.");
   await expect(panel(page)).not.toContainText("Nothing was reported here.");
   await expect(panel(page).getByRole("listitem")).toHaveCount(0);
+});
+
+test("a stale source the Hub sent without rows says unknown, not empty", async ({ page }) => {
+  const body = fresh();
+  body.snapshot.sources[1] = { id: "host", state: "stale", observed_at: new Date(Date.now() - 40 * 60_000).toISOString() };
+  body.snapshot.containers = body.snapshot.containers.filter(item => item.scope === "worker"); body.snapshot.services = [];
+  await fixture(page, [{ status: 200, body }]);
+  await page.goto("/#/staging");
+  const host = panel(page).getByRole("region", { name: "Other programs on the PC" });
+  await expect(host).toContainText("Out of date (last seen 40 min ago), so what's running here is unknown.");
+  await expect(host).not.toContainText("Nothing was reported here.");
+  await expect(host.getByRole("listitem")).toHaveCount(0);
+  await expect(host.getByText(/running · /)).toHaveCount(0);
 });
 
 test("not set up and not answering are said plainly", async ({ page }) => {

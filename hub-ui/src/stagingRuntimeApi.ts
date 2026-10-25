@@ -165,7 +165,9 @@ export function sourceViews(snapshot: RuntimeSnapshot, now: Date, retained = fal
       case "observed":
         if (retained || now.getTime() - Date.parse(at) > FRESH_SECONDS * 1000) return old;
         return { ...base, listed: true, tone: "forest", line: `Seen ${seen ?? "at an unreported time"}.` };
-      case "stale": return old;
+      // The backend drops a stale source's rows, so an empty stale list is unknown, not "nothing running".
+      case "stale": return containers.length || services.length ? old : { ...base, listed: false, tone: "amber",
+        line: `Out of date (last seen ${seen ?? "at an unknown time"}), so what's running here is unknown.` };
       case "unavailable": return { ...base, listed: false, tone: "amber",
         line: `Couldn't be read${seen ? ` (last seen ${seen})` : ""}, so what's running here is unknown.` };
       case "not_configured": return { ...base, listed: false, tone: "neutral", line: text.notConfigured };
