@@ -34,11 +34,13 @@ _GET = frozenset({
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
-        'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources')),
+        'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources',
+        'staging/shared/status')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
     'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning',
-    'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply'))
+    'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply',
+    'staging/shared/recover'))
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',

@@ -25,13 +25,16 @@ class QueuedPilotRuntime:
                 or getattr(bridge, '_runtime', None) is not None):
             raise HubError('queued_pilot_runtime_binding_required', 409)
         self.bridge, self.feed = bridge, feed
+        self._original_bridge, self._original_feed = bridge, feed
         self._pid = os.getpid()
         self._loop = None
         self._task = None
         self._active = None
         self._closed = False
+        self._claims_suspended = False
         self._source_failed = False
         self._wakeup = asyncio.Event()
+        self._original_wakeup = self._wakeup
         self._state = 'not_started'
         self._last_job = None
         self._generation_drain = None
@@ -65,7 +68,9 @@ class QueuedPilotRuntime:
             last_job=None if self._last_job is None else dict(self._last_job))
 
     def _identity(self):
-        if os.getpid() != self._pid or getattr(self.bridge, '_runtime', None) is not self:
+        if (os.getpid() != self._pid or self.bridge is not self._original_bridge
+                or self.feed is not self._original_feed
+                or getattr(self.bridge, '_runtime', None) is not self):
             raise HubError('queued_pilot_runtime_identity_lost', 409)
         if self._loop is not None and self._loop is not asyncio.get_running_loop():
             raise HubError('queued_pilot_runtime_wrong_loop', 409)
@@ -125,7 +130,7 @@ class QueuedPilotRuntime:
         ownership. The lifecycle owner must still await stop() afterward.
         """
         self._identity()
-        self.bridge.close_admission()
+        self._original_bridge.close_admission()
         # Never cancel a task which may be awaiting an accepted remote phase.
         # The bridge veto closes any following phase immediately; the accepted
         # phase drains before the idle observer and subscription are closed.
@@ -134,6 +139,35 @@ class QueuedPilotRuntime:
         if self._state not in {'failed', 'native_source_unavailable', 'stopped'}:
             self._state = 'stopping'
         return self.status
+
+    def suspend_claims(self):
+        """Sticky new-claim veto; retain the gate for original accepted drain.
+
+        The shared lifecycle closes its policy registry before this call.
+        This does not authorize another command, cancel work or close a client.
+        """
+        if os.getpid() != self._pid:
+            raise HubError('queued_pilot_runtime_identity_lost', 409)
+        try:
+            self._identity()
+        finally:
+            # Veto and wake only our original supervisor, even when an owned
+            # reference has drifted. The identity failure still propagates.
+            self._claims_suspended = True
+            self._original_wakeup.set()
+
+    async def drain_current(self):
+        """Wait for the actual accepted task without cancelling or replacing it."""
+        self._identity()
+        if not self._claims_suspended:
+            raise HubError('queued_pilot_claims_not_suspended', 409)
+        active = self._active
+        if active is not None:
+            try:
+                await finish_owned(active)
+            except HubError as error:
+                if error.code != 'execution_policy_admission_closed':
+                    raise
 
     async def stop(self):
         self.close_admission()
@@ -151,7 +185,7 @@ class QueuedPilotRuntime:
         return self.status
 
     def _unavailable(self):
-        self.bridge.close_admission()
+        self._original_bridge.close_admission()
         self._source_failed = True
         self._closed = True
         self._state = 'native_source_unavailable'
@@ -183,7 +217,7 @@ class QueuedPilotRuntime:
 
     async def _one(self):
         self._identity()
-        if not self.admission_allowed():
+        if self._claims_suspended or not self.admission_allowed():
             return False
         self.bridge._guard()
         self._active = asyncio.create_task(self.bridge.run_once())
@@ -192,7 +226,8 @@ class QueuedPilotRuntime:
         except HubError as exc:
             # Admission may close after this supervisor creates the task but
             # before its first claim. That expected stop race is not a failure.
-            if self._closed and exc.code == 'queued_pilot_runtime_unavailable':
+            if ((self._closed and exc.code == 'queued_pilot_runtime_unavailable')
+                    or (self._claims_suspended and exc.code == 'execution_policy_admission_closed')):
                 return False
             raise
         except asyncio.CancelledError:
@@ -210,7 +245,7 @@ class QueuedPilotRuntime:
         return self._save_result(result)
 
     async def _run(self):
-        source = self.feed.broker.events()
+        source = self._original_feed.broker.events()
         observer = None
         try:
             # Calling events() alone does not subscribe. The first anext does;
@@ -239,7 +274,7 @@ class QueuedPilotRuntime:
             self._closed = True
             self._state = 'failed'
         finally:
-            self.bridge.close_admission()
+            self._original_bridge.close_admission()
             if observer is not None:
                 observer.cancel()  # Only the idle subscription, never effects.
                 await asyncio.gather(observer, return_exceptions=True)

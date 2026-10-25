@@ -415,7 +415,13 @@ def attach_session_acceptance_routes(app, *, broker, config, sessions):
             # No await between gate opening and synchronous result audit. This
             # serializes event-loop admissions, not arbitrary other threads.
             from fastapi.responses import JSONResponse
-            return JSONResponse(await broker.decide_async(actor=identity, **payload.model_dump()),
-                                headers={'Cache-Control': 'no-store'})
+            result = await broker.decide_async(actor=identity, **payload.model_dump())
+            shared = getattr(app.state, 'shared_staging', None)
+            if shared is not None and result['state'] == 'accepted':
+                # Session acceptance is not execution proof. The exact private
+                # composition must still recover both original operation sets
+                # before opening shared admission; pending HTTP already serves.
+                await shared.recover_and_open()
+            return JSONResponse(result, headers={'Cache-Control': 'no-store'})
         except SessionAcceptanceError as error:
             unavailable(error)

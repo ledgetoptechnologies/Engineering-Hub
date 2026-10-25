@@ -2168,6 +2168,42 @@
         }
       }
     },
+    "/api/hub/v1/staging/shared/status": {
+      "get": {
+        "summary": "Status",
+        "operationId": "status_api_hub_v1_staging_shared_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedLifecycleStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/staging/shared/recover": {
+      "post": {
+        "summary": "Recover",
+        "operationId": "recover_api_hub_v1_staging_shared_recover_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedLifecycleStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/staging/tasks": {
       "post": {
         "tags": [
@@ -6393,6 +6429,48 @@
           "items"
         ],
         "title": "RunListDTO"
+      },
+      "SharedLifecycleStatus": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "pending",
+              "recovering",
+              "recovery_required",
+              "active",
+              "stopping",
+              "stopped",
+              "shutdown_failed"
+            ],
+            "title": "State"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "operator_acceptance_required",
+                  "original_operations_pending",
+                  "original_operations_unverified",
+                  "owned_drain_failed"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "reason"
+        ],
+        "title": "SharedLifecycleStatus"
       },
       "StagingTaskProposal": {
         "properties": {

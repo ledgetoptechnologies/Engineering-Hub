@@ -173,6 +173,11 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
                     or getattr(pair.core.state, 'owned_pilot_service', None) is not None):
                 raise SplitServerError()
             runtime = getattr(pair.core.state, 'queued_pilot_runtime', None)
+            shared = getattr(pair.core.state, 'shared_staging', None)
+            if shared is not None:
+                from .shared_staging_lifecycle import SharedStagingLifecycle
+                if type(shared) is not SharedStagingLifecycle or shared.pilot_runtime is not runtime:
+                    raise SplitServerError()
             if runtime is not None:
                 from .queued_pilot_runtime import QueuedPilotRuntime
                 if type(runtime) is not QueuedPilotRuntime:
@@ -182,7 +187,9 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
                 try:
                     pair.close_admission()
                 finally:
-                    if runtime is not None:
+                    if shared is not None:
+                        shared.close_admission()
+                    elif runtime is not None:
                         runtime.close_admission()
 
             receiver = PrivateBrowserGateway(

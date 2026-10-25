@@ -656,8 +656,14 @@ class StagingController:
         while not self.stopping:
             self.wake.clear()
             await self._recover_pending()
-            while not self.stopping and await self.run_once() is not None:
-                pass
+            try:
+                while not self.stopping and await self.run_once() is not None:
+                    pass
+            except HubError as error:
+                if not (self.stopping and error.code in {
+                        'staging_controller_closing', 'execution_policy_admission_closed'}):
+                    raise
+                break
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=5)
             except TimeoutError:
@@ -690,15 +696,25 @@ class StagingController:
             finally:
                 self.recheck_backoff[item['job_id']] = (time.monotonic() + delay, min(delay * 2, 300))
 
-    async def close(self):
+    def close_admission(self):
+        """Veto new work synchronously, retaining the client for original drain."""
         self.stopping = True
         self.wake.set()
+
+    async def drain(self):
+        """Drain the original background/in-flight tasks without closing transport."""
+        _require(self.stopping, 'staging_admission_still_open', 409)
+        from .owned_tasks import finish_owned
+        tasks = ([self.background] if self.background is not None else []) + list(self.inflight)
+        if tasks:
+            results = await finish_owned(asyncio.gather(*tasks, return_exceptions=True))
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def close(self):
+        self.close_admission()
         try:
-            if self.background:
-                await self.background  # Drain accepted work, never cancel it.
+            await self.drain()
         finally:
-            try:
-                if self.inflight:
-                    await asyncio.gather(*tuple(self.inflight))
-            finally:
-                await self.client.aclose()
+            await self.client.aclose()

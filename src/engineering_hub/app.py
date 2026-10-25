@@ -221,8 +221,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None, work_queue=None, archive_reader=None,
-               queued_pilot_runtime=None, bus_app=None):
+               queued_pilot_runtime=None, bus_app=None, shared_staging=None):
     settings = settings or Settings.from_env()
+    if shared_staging is not None and repository is None:
+        raise ValueError('shared_staging_application_binding_required')
     if settings.require_owned_ledger:
         # Refuse before any bus/notes/auth/feed/schema construction. In
         # particular, a missing private mount must not create an empty ledger.
@@ -326,6 +328,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 or getattr(queued_pilot_runtime, '_application', None) is not None
                 or feed._source is not None):
             raise ValueError('queued_pilot_application_binding_required')
+    if shared_staging is not None:
+        from .shared_staging_lifecycle import SharedStagingLifecycle
+        if (type(shared_staging) is not SharedStagingLifecycle
+                or queued_pilot_runtime is None or settings.ingress_mode == 'browser'):
+            raise ValueError('shared_staging_application_binding_required')
+        shared_staging.validate_application(repo, work_queue, queued_pilot_runtime, feed)
     sessions = SessionStore(settings.database, repository=repo,
                             session_ttl=settings.auth_config.local_session_ttl_seconds)
     if staging_dispatcher is not None and (
@@ -418,12 +426,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     interactive_reviews = InteractiveReviewRepository(repo, component_registry,
         authorize=interactive_service.authorize, asset_authorize=interactive_service.asset_authorize)
     from .staging_module import compose_staging, configure_preview
-    staging_module = compose_staging(repo,
-        path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
-        machine_id=settings.staging_machine_id, queue=work_queue,
-        conflicts=any(component is not None for component in (
-            fixture_workflow, staging_dispatcher, container_pilot_workflow,
-            owned_pilot_service, queued_pilot_runtime)))
+    staging_module = (shared_staging.staging_module if shared_staging is not None else
+        compose_staging(repo,
+            path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
+            machine_id=settings.staging_machine_id, queue=work_queue,
+            conflicts=any(component is not None for component in (
+                fixture_workflow, staging_dispatcher, container_pilot_workflow,
+                owned_pilot_service, queued_pilot_runtime))))
     if staging_module.controller is not None:
         work_queue = staging_module.controller.queue
     configure_preview(staging_module, repo=repo, sessions=sessions,
@@ -476,7 +485,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             from .lifecycle import finish_owned
             async def stop_all():
                 try:
-                    if staging_module.controller is not None:
+                    if shared_staging is not None:
+                        await shared_staging.close()
+                    elif staging_module.controller is not None:
                         await staging_module.controller.close()
                     elif staging_module.client is not None:
                         await staging_module.client.aclose()
@@ -493,7 +504,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             else:
                 async def drain():
                     try:
-                        if queued_pilot_runtime is not None:
+                        if queued_pilot_runtime is not None and shared_staging is None:
                             await queued_pilot_runtime.stop()
                         if runtime is not None:
                             await runtime.stop()
@@ -513,7 +524,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                          else hub_mcp.session_manager.run())
             async with mcp_owner:
                 try:
-                    if queued_pilot_runtime is not None:
+                    if shared_staging is not None:
+                        await shared_staging.start_pending()
+                        # Never wait for human session acceptance before HTTP
+                        # can serve its existing authenticated decision screen.
+                        if queued_pilot_runtime.bridge.reconciliation_state == 'accepted':
+                            await shared_staging.recover_and_open()
+                    elif queued_pilot_runtime is not None:
                         status = await queued_pilot_runtime.start()
                         # A live observer may serve read/status routes while its
                         # mandatory manual-session gate still denies execution.
@@ -521,7 +538,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                             raise HubError('queued_pilot_startup_unavailable', 503)
                     if runtime is not None:
                         await runtime.start()
-                    if (staging_module.controller is not None
+                    if (shared_staging is None and staging_module.controller is not None
                             and staging_module.config.auto_run):
                         await staging_module.controller.start()
                     yield
@@ -550,6 +567,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.event_feed = feed
     app.state.staging_runtime = runtime
     app.state.queued_pilot_runtime = queued_pilot_runtime
+    app.state.shared_staging = shared_staging
     if queued_pilot_runtime is not None:
         # One-use application ownership, not transfer of its owner/client.
         queued_pilot_runtime._application = app
@@ -655,6 +673,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_staging_routes(app, staging_module.controller, actor, human,
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
         module_status=staging_module.status)
+    from .shared_staging_api import attach_shared_staging_routes
+    attach_shared_staging_routes(app, shared_staging, human)
 
     from .task_proposal_api import attach_staging_task_routes
     attach_staging_task_routes(app, repo=repo, agent=agent)
