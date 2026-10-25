@@ -8,6 +8,7 @@ import type { Hub } from "../hub";
 import type { AgentSummary } from "../types";
 import { Badge, Icon, PageHeader, PanelTitle, names, pretty } from "../ui";
 import { WorkQueuePanel } from "../WorkQueuePanel";
+import { StagingRuntimePanel } from "../StagingRuntimePanel";
 import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { StagingBadge } from "./WorkPages";
@@ -231,6 +232,9 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
           )}
           <p className="panel-footnote">Production, GitHub merge and real processing capabilities are not enabled.</p>
         </section>
+        {(hub.demo || hub.session?.authenticated) && (
+          <StagingRuntimePanel mode={hub.demo ? "demo" : "live"} onUnauthorized={hub.clearPrivateWorkspace} />
+        )}
         {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
           <SessionReconciliationPanel csrf={hub.session.csrf_token}
             enabled={true} writable={hub.writable} stale={hub.stale}
