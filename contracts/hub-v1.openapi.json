@@ -1707,6 +1707,22 @@
         }
       }
     },
+    "/api/hub/v1/staging/runtime": {
+      "get": {
+        "summary": "Runtime",
+        "operationId": "runtime_api_hub_v1_staging_runtime_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/staging/resources": {
       "get": {
         "summary": "Resources",

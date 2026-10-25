@@ -15,9 +15,9 @@ from engineering_hub.repository import HubRepository, HubError
 NOW = datetime.now(timezone.utc)
 
 
-def snapshot():
-    return {'schema': 'hub-staging-runtime.v1', 'observed_at': NOW.isoformat(),
-        'sources': [{'id': 'worker', 'state': 'observed', 'observed_at': NOW.isoformat()},
+def snapshot(now=NOW):
+    return {'schema': 'hub-staging-runtime.v1', 'observed_at': now.isoformat(),
+        'sources': [{'id': 'worker', 'state': 'observed', 'observed_at': now.isoformat()},
                     {'id': 'host', 'state': 'not_configured', 'observed_at': None}],
         'containers': [{'id': 'a' * 64, 'name': 'example', 'image': 'example:local',
                         'state': 'running', 'scope': 'worker', 'managed': False}], 'services': []}
@@ -64,7 +64,9 @@ async def test_runtime_client_uses_only_fixed_authenticated_get_and_rejects_secr
     credential.chmod(0o600)
     config = StagingConnectionConfig('http://127.0.0.1:8782', credential, enabled=True)
     calls = []
-    response = snapshot()
+    # Collection can precede this test by minutes in the full release suite.
+    # Produce the remote observation when this request test actually starts.
+    response = snapshot(datetime.now(timezone.utc))
 
     def remote(request):
         calls.append(request)
