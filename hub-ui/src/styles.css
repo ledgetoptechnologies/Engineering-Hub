@@ -4073,3 +4073,14 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
   color: var(--forest);
   font-weight: 600;
 }
+
+/* Running on the staging PC: one section per source; observation only, no controls. */
+.runtime-sources { display: grid; gap: 16px; }
+.runtime-sources > .panel-footnote { margin: 0; }
+.runtime-source { display: grid; gap: 4px; }
+.runtime-source-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 6px 12px; }
+.runtime-source-head h3 { margin: 0; font-size: 14px; }
+.runtime-source-head small { color: var(--muted); font-size: 12px; }
+.runtime-source-line, .runtime-empty { margin: 0; font-size: 13px; }
+.runtime-source-line.amber { font-weight: 600; padding-left: 8px; border-left: 3px solid var(--amber); }
+.runtime-empty { color: var(--muted); }

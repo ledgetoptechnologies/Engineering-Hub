@@ -14,6 +14,7 @@ from hub_staging_service.core import Rejected
 
 class Stub:
     active = None
+    backend = object()
     projects = {'demo': {'static': {}}}
     def put_source(self, payload):
         return {'source_id': payload['source_id'], 'source_digest': 'a' * 64, 'size_bytes': 4}
@@ -51,6 +52,17 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(body['projects'], {'demo': ['static']})
         self.assertNotIn(self.token, json.dumps(body))
         self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+
+    def test_runtime_inventory_uses_same_bearer_gate_before_collection(self):
+        with patch('hub_staging_service.runtime_inventory.collect_runtime', return_value={
+                'schema': 'hub-staging-runtime.v1', 'sources': [], 'containers': [], 'services': []}) as collect:
+            self.assertEqual(self.request(path='/v1/runtime')[0], 401)
+            collect.assert_not_called()
+            code, body, headers = self.request(path='/v1/runtime', headers={'Authorization': 'Bearer ' + self.token})
+            self.assertEqual(code, 200)
+            collect.assert_called_once_with(Stub.backend, None)
+            self.assertNotIn(self.token, json.dumps(body))
+            self.assertEqual(headers['Cache-Control'], 'no-store')
 
     def test_operation_get_uses_same_private_bearer_gate_and_original_command(self):
         command = '59e01102-54a0-4c26-8d8c-4d68be82badb'

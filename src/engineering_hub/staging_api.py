@@ -127,6 +127,24 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
             'profiles', 'supported_profiles', 'projects', 'active_job_id', 'held_jobs', 'can_reconcile'}},
             previews_configured=preview_broker is not None)
 
+    @app.get('/api/hub/v1/staging/runtime')
+    async def runtime(request: Request):
+        principal = authenticated(request, human_only=True)
+        if controller is None:
+            raise HubError('staging_not_configured', 503)
+        # Host-wide observations are owner-only, never inherited from a project
+        # read grant. The controller repeats this check for non-HTTP callers.
+        if principal not in controller.resources.admin_actors:
+            raise HubError('staging_admin_required', 403)
+        result = await controller.runtime(principal)
+        if result.get('snapshot') is not None:
+            from .staging_runtime import validate_runtime_snapshot
+            try:
+                validate_runtime_snapshot(result['snapshot'])
+            except ValueError:
+                raise HubError('staging_runtime_unavailable', 503) from None
+        return {key: result[key] for key in ('configured', 'state', 'snapshot')}
+
     @app.get('/api/hub/v1/staging/resources')
     def resources(request: Request, project: Project | None = None,
                   kind: Kind | None = None, state: State | None = None,

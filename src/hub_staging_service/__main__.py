@@ -55,7 +55,7 @@ def credentials(path):
     return token
 
 
-def handler(service, token, peers):
+def handler(service, token, peers, *, host_snapshot=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'HubStaging/1'
 
@@ -89,6 +89,9 @@ def handler(service, token, peers):
                 path = unquote(urlsplit(self.path).path)
                 parts = path.strip('/').split('/')
                 if self.command == 'GET':
+                    if parts == ['v1', 'runtime']:
+                        from .runtime_inventory import collect_runtime
+                        return self.respond(200, collect_runtime(service.backend, host_snapshot))
                     if parts == ['v1', 'status']:
                         return self.respond(200, {'schema': 'hub-staging.v1', 'active_command_id': service.active,
                                                   'projects': {name: sorted(recipes) for name, recipes in service.projects.items()}})
@@ -145,6 +148,10 @@ def main():
     port = config.get('port', 8780)
     ensure(type(port) is int and 1024 <= port <= 65535, 'invalid_port')
     backend = DockerBackend(config['docker_endpoint'])
+    host_snapshot = config.get('host_snapshot')
+    if host_snapshot is not None:
+        ensure(type(host_snapshot) is str and Path(host_snapshot).is_absolute()
+               and '..' not in Path(host_snapshot).parts, 'invalid_host_snapshot')
     capacity_bytes, free_floor_bytes = storage_limits(
         config.get('capacity_bytes', 1024**3), config.get('free_floor_bytes', 512 * 1024**2))
     if args.check_config:
@@ -152,7 +159,7 @@ def main():
         return
     service = Service(config['worker_root'], projects, backend,
                       capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
-    server = BoundedServer((bind, port), handler(service, token, peers))
+    server = BoundedServer((bind, port), handler(service, token, peers, host_snapshot=host_snapshot))
     server.daemon_threads = True
     server.timeout = 10
     try:

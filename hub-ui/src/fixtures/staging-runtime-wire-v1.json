@@ -1,0 +1,17 @@
+{
+  "configured": true,
+  "state": "ready",
+  "snapshot": {
+    "schema": "hub-staging-runtime.v1",
+    "observed_at": "2026-10-25T12:00:00Z",
+    "sources": [
+      { "id": "worker", "state": "observed", "observed_at": "2026-10-25T12:00:00Z" },
+      { "id": "host", "state": "observed", "observed_at": "2026-10-25T11:59:50Z" }
+    ],
+    "containers": [
+      { "id": "0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab0123", "name": "eh-build", "image": "registry.example.test:5000/eh/build@sha256:aaaa", "state": "running", "scope": "worker", "managed": false },
+      { "id": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd", "name": "viewer", "image": "viewer:5", "state": "exited", "scope": "host", "managed": false }
+    ],
+    "services": [{ "name": "asset-service.service", "state": "running", "scope": "host" }]
+  }
+}
