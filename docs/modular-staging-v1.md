@@ -47,6 +47,13 @@ website output. It does not host arbitrary long-running backend services or
 download dependencies during a job. Preview builds must use relative asset URLs;
 paths are canonical ASCII, with no query strings or SPA fallback routing yet.
 
+Use the [committed-source packager](staging-source-package.md) to prepare a
+development ref without including working-tree changes or fetching missing Git
+objects. It records the archive digest and exact dependency/cache-label inputs.
+This is local source verification only: worker commit provenance remains
+declared, and a matching reviewed CI cache/profile must still be enrolled before
+repository tests can run. Packaging neither submits work nor grants access.
+
 ### EH API
 
 - `GET /api/hub/v1/staging/status`: configured state, worker reachability and
