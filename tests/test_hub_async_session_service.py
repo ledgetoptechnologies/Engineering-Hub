@@ -25,13 +25,22 @@ from tests.test_hub_unified_queued_pilot_service import (
 async def test_pending_manual_acceptance_wakes_existing_job_without_new_work(rig, rollback):
     observations = []
     entered = threading.Event()
+    release = threading.Event()
+    first_finished = threading.Event()
+    first_timed_out = threading.Event()
     identity = ExecutorSessionIdentity(str(uuid4()), 'sha256:' + 'e' * 64)
     def observe():
         started = time.monotonic()
         started_wall_ms = int(time.time() * 1000)
         observations.append(threading.get_ident())
-        entered.set()
-        time.sleep(.15)
+        if len(observations) == 1:
+            entered.set()
+            try:
+                if not release.wait(5):
+                    first_timed_out.set()
+                    raise AssertionError('First observer was not released')
+            finally:
+                first_finished.set()
         return VerifiedExecutorObservation(identity, secrets.token_hex(32), str(uuid4()),
                                            started, started + 5,
                                            int(time.time() * 1000), started_wall_ms + 5000)
@@ -94,23 +103,33 @@ async def test_pending_manual_acceptance_wakes_existing_job_without_new_work(rig
                 'action': 'accept'}))
             try:
                 await until(entered.is_set)
-                started = time.monotonic()
-                ping, overview = await asyncio.gather(
+                assert not release.is_set() and not first_finished.is_set()
+                assert not accepting.done() and len(observations) == 1
+                ping, overview = await asyncio.wait_for(asyncio.gather(
                     agent.post('/mcp', headers=headers, json={
                         'jsonrpc': '2.0', 'id': 2, 'method': 'ping'}),
-                    browser.get(BASE + '/overview'))
+                    browser.get(BASE + '/overview')), 2)
                 assert ping.status_code == overview.status_code == 200
-                assert time.monotonic() - started < .25
-                accepted = checked(await accepting)
+                # Success must overlap the original blocked observer. A
+                # synchronous regression cannot pass by serving requests only
+                # after the worker's bounded wait expires.
+                assert not release.is_set() and not first_finished.is_set()
+                assert not first_timed_out.is_set() and len(observations) == 1
+                assert not accepting.done()
+                release.set()
+                accepted = checked(await asyncio.wait_for(accepting, 8))
                 assert accepted['state'] == 'accepted'
                 with rig.core.state.repository._connection() as db:
                     audit_events = list(db.execute(
                         'SELECT event FROM hub_session_acceptance_audit ORDER BY rowid'))
                 assert [row['event'] for row in audit_events] == ['intent', 'result']
             finally:
+                release.set()
                 if not accepting.done():
                     accepting.cancel()
-                await asyncio.gather(accepting, return_exceptions=True)
+                await asyncio.wait_for(asyncio.gather(accepting, return_exceptions=True), 8)
+                if entered.is_set():
+                    await until(first_finished.is_set)
             # No synthetic _wakeup.set(), queue submission or unrelated Hub
             # mutation is allowed between acceptance and this original result.
             await until(lambda: runtime.status['last_job'] is not None)
@@ -120,6 +139,7 @@ async def test_pending_manual_acceptance_wakes_existing_job_without_new_work(rig
             assert len(observations) == (7 if rollback else 5)
             assert all(value != threading.get_ident() for value in observations)
     finally:
+        release.set()
         stop.set()
         await asyncio.wait_for(serving, 8)
         rig.manual_audit.close()
