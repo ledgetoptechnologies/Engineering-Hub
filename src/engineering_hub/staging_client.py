@@ -404,7 +404,7 @@ class StagingClient:
                and type(result['result']) is dict)
         details = result['result']
         _check(not set(details) - {'error', 'stages', 'preview_ready', 'source_commit',
-               'source_commit_verification', 'source_digest', 'resource_ids', 'deleted_resource_ids'})
+               'source_commit_verification', 'source_digest', 'resource_ids', 'deleted_resource_ids', 'diagnostic'})
         if 'error' in details:
             _check(type(details['error']) is str and re.fullmatch(r'[a-z][a-z0-9_]{0,127}', details['error']))
         if 'preview_ready' in details:
@@ -425,6 +425,15 @@ class StagingClient:
             _shape(details['resource_ids'], _KINDS)
             identifiers = [_uuid(item) for item in details['resource_ids'].values()]
             _check(len(set(identifiers)) == len(identifiers))
+        if 'diagnostic' in details:
+            fact = details['diagnostic']
+            _shape(fact, {'resource_id', 'manifest_sha256', 'bytes', 'stage', 'scope'})
+            _uuid(fact['resource_id'])
+            _check(result['state'] == 'failed' and type(fact['manifest_sha256']) is str
+                   and _SHA.fullmatch(fact['manifest_sha256']) and type(fact['bytes']) is int
+                   and 0 < fact['bytes'] <= 64*1024**2 and fact['stage'] in ('build', 'test')
+                   and fact['scope'] == 'original_engine_owned_writers_exporters_volumes_absent'
+                   and details.get('error') == 'stage_' + fact['stage'] + '_failed')
         if 'deleted_resource_ids' in details:
             _check(type(details['deleted_resource_ids']) is list and len(details['deleted_resource_ids']) <= 4)
             identifiers = [_uuid(item) for item in details['deleted_resource_ids']]
@@ -500,6 +509,13 @@ class StagingClient:
         _check(extension in _FILE_TYPES)
         return await self._request('GET', '/v1/resources/' + identity + '/files/' + path,
                                    file_types=_FILE_TYPES[extension])
+
+    @_opaque
+    async def diagnostic_file(self, identity, path, manifest_sha256):
+        identity, path = _uuid(identity), _relative(path)
+        _check(type(manifest_sha256) is str and _SHA.fullmatch(manifest_sha256))
+        return await self._request('GET', '/v1/resources/' + identity + '/diagnostics/' + manifest_sha256 + '/' + path,
+                                   file_types=('application/octet-stream',), maximum=8*1024**2)
 
     @_opaque
     async def cleanup(self, payload):

@@ -88,6 +88,20 @@ def _positive(value):
     return int(value)
 
 
+class FrozenDiagnosticFailure(Rejected):
+    """Host-generated original-command evidence after frozen export + absence.
+
+    Construction alone is not authority: Service accepts only its exact trusted
+    DockerBackend and rehashes the exported private resource before registration.
+    """
+    def __init__(self, command_id, resource_id, stage, engine_id, manifest, size):
+        super().__init__('stage_' + stage + '_failed')
+        self.command_id, self.resource_id, self.stage = command_id, resource_id, stage
+        self.engine_id = engine_id
+        self.manifest = json.loads(json.dumps(manifest, sort_keys=True))
+        self.size = size
+
+
 class DockerBackend:
     def __init__(self, endpoint, executable='/usr/bin/docker'):
         ensure(executable == '/usr/bin/docker', 'fixed_docker_executable')
@@ -96,6 +110,7 @@ class DockerBackend:
                all(part not in ('', '.', '..') for part in endpoint[8:].split('/')),
                'local_unix_docker_endpoint_required')
         self._scratch_engine = None
+        self._frozen_diagnostic = None
         self.executable = executable
         self.endpoint = endpoint
         self.env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
@@ -801,28 +816,69 @@ class DockerBackend:
                          profile=profile, command_id=command_id, stage=stage, scope=scope)
             paused = self._checked_output(('inspect', '--format', '{{json .State.Paused}}', name), limit=4096)
             ensure(paused.strip() == b'true', 'execution_uncertain')
+            if process.returncode != 0:
+                ensure(1 <= process.returncode <= 127, 'execution_uncertain')
+                manifest, size = tree_manifest(paths['test_run'], profile['output_bytes'])
+                self._frozen_diagnostic = (command_id, paths['test_run'].name, stage, manifest, size)
             ensure(process.returncode == 0, 'stage_' + stage + '_failed')
             return {'exit_code': process.returncode, 'log_bytes': len(log)}
         finally:
             self._stop_owned(name, command_id, stage, scope)
 
+    def _runtime_absent(self, paths, profile, command_id):
+        """Bounded original Engine/known writer+exporter+volume scope only.
+
+        No global privileged-host FD claim. Source has no Engine socket or
+        capabilities to create another container; operator concurrency remains
+        a separate host acceptance fact. Never discover/adopt/delete unknowns.
+        """
+        ensure(self._scratch_engine is not None, 'execution_uncertain')
+        ensure(self._verify_daemon() == self._scratch_engine[1], 'execution_uncertain')
+        for stage in ('build', 'test'):
+            name, _ = self.argv(paths, profile, command_id, stage)
+            for suffix in ('', '-export-tests', '-export-output'):
+                self._container_absent(name + suffix)
+            for spec in self._volume_specs(paths, name, profile, stage).values():
+                self._volume_absent(spec['name'])
+        ensure(self._verify_daemon() == self._scratch_engine[1], 'execution_uncertain')
+
     def run(self, paths, profile, command_id, *, scratch_lease=None):
         ensure(os.name == 'posix' and os.getuid() != 0, 'nonroot_linux_worker_required')
-        if scratch_lease is None:
-            return self._run_stages(paths, profile, command_id)
-        self._scratch_lease(scratch_lease, paths, command_id)
+        if scratch_lease is not None:
+            self._scratch_lease(scratch_lease, paths, command_id)
         ensure(self._scratch_engine is None, 'execution_uncertain')
         engine_id = self._verify_daemon()
         ensure(type(engine_id) is str and re.fullmatch('[A-Za-z0-9:_-]{1,128}', engine_id),
                'rootless_cgroup_policy_unverified')
         self._scratch_engine = (scratch_lease, engine_id)
+        self._frozen_diagnostic = None
         try:
-            return self._run_stages(paths, profile, command_id, scratch_lease=scratch_lease)
-        finally:
+            failure = None
+            result = None
             try:
-                self._confirm_scratch_absent(paths, profile, command_id, scratch_lease)
-            finally:
-                self._scratch_engine = None
+                options = {'scratch_lease': scratch_lease} if scratch_lease is not None else {}
+                result = self._run_stages(paths, profile, command_id, **options)
+            except Exception as exc:
+                failure = exc
+            try:
+                self._runtime_absent(paths, profile, command_id)
+                if scratch_lease is not None:
+                    self._confirm_scratch_absent(paths, profile, command_id, scratch_lease)
+            except Exception:
+                raise Rejected('execution_uncertain') from None
+            if failure is not None:
+                candidate = self._frozen_diagnostic
+                if (type(failure) is Rejected and failure.code in ('stage_build_failed', 'stage_test_failed')
+                        and candidate is not None and candidate[:2] == (command_id, paths['test_run'].name)
+                        and failure.code == 'stage_' + candidate[2] + '_failed'):
+                    manifest, size = tree_manifest(paths['test_run'], profile['output_bytes'])
+                    ensure(manifest == candidate[3] and size == candidate[4] and bool(manifest), 'execution_uncertain')
+                    raise FrozenDiagnosticFailure(command_id, candidate[1], candidate[2], engine_id, manifest, size)
+                raise Rejected('execution_uncertain') from None
+            return result
+        finally:
+            self._scratch_engine = None
+            self._frozen_diagnostic = None
 
     def _run_stages(self, paths, profile, command_id, *, scratch_lease=None):
         options = {'scratch_lease': scratch_lease} if scratch_lease is not None else {}

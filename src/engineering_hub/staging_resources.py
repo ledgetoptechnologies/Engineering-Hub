@@ -314,6 +314,24 @@ class StagingResourceStore:
                 raise HubError('staging_preview_expired', 409)
             return item, self._policy(db, item['project'])['revision']
 
+    def diagnostic_binding(self, actor, identity):
+        """Current project read grant and retained terminal-failure artifact."""
+        with self.repo._connection() as db:
+            db.execute('BEGIN')
+            item = self._resource(db, identity)
+            self._authorize(db, actor, item['project'], 'read')
+            job = self._job(db, item['job_id'])
+            if (item['kind'] != 'test_run' or item['state'] != 'failed'
+                    or item['artifact_digest'] is None or job.get('terminal') is not True
+                    or any(p['reason'] == 'active_job' for p in item['protected'])
+                    or any(job[k] != item[k] for k in ('project', 'created_by', 'source_commit'))):
+                raise HubError('staging_diagnostic_unavailable', 409)
+            now, keep = self._now(), item['keep']
+            retained = keep and (keep['mode'] == 'pinned' or _seconds(keep['until']) > now)
+            if not retained and (item['expires_at'] is None or _seconds(item['expires_at']) <= now):
+                raise HubError('staging_diagnostic_unavailable', 409)
+            return item, self._policy(db, item['project'])['revision']
+
     def list_resources(self, actor, project=None, *, kind=None, state=None, after=None, limit=100):
         _actor(actor)
         if type(limit) is not int or not 1 <= limit <= 100:

@@ -167,13 +167,17 @@ def test_failed_stage_still_needs_absence_proof_but_never_releases_lease(env,mon
     monkeypatch.setattr('hub_staging_service.docker.os',SimpleNamespace(name='posix',getuid=lambda:10001,getgid=lambda:10001))
     monkeypatch.setattr(env.backend,'_run_stages',Mock(side_effect=Rejected('stage_test_failed')))
     proof=Mock(); monkeypatch.setattr(env.backend,'_confirm_scratch_absent',proof)
-    with pytest.raises(Rejected,match='stage_test_failed'):
+    monkeypatch.setattr(env.backend,'_runtime_absent',Mock())
+    # A bare error has no frozen-export receipt, so it remains held.
+    with pytest.raises(Rejected,match='execution_uncertain'):
         env.backend.run(env.paths,env.profile,env.command,scratch_lease=env.lease)
     proof.assert_called_once_with(env.paths,env.profile,env.command,env.lease)
     assert not env.lease.backend_absent
 
 
 def test_optional_absence_keeps_legacy_backend_callshape(env,monkeypatch):
+    env.backend._scratch_engine=None
+    monkeypatch.setattr(env.backend,'_runtime_absent',Mock())
     monkeypatch.setattr('hub_staging_service.docker.os',SimpleNamespace(name='posix',getuid=lambda:10001,getgid=lambda:10001))
     stages=Mock(return_value={'stages':{},'preview_ready':True})
     monkeypatch.setattr(env.backend,'_run_stages',stages)
