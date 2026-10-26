@@ -195,7 +195,7 @@ def compose_infrastructure(path,*,state_root,on_change=None):
         captured_fd=root_fd
         def directory_identity(value):
             return (value.st_dev,value.st_ino,value.st_uid,value.st_gid,
-                    stat.S_IMODE(value.st_mode),value.st_nlink)
+                    stat.S_IMODE(value.st_mode))
         selected_capture=directory_identity(selected_info)
         directory_capture=directory_identity(info)
         file_capture=(before.st_dev,before.st_ino,before.st_uid,before.st_gid,

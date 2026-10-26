@@ -159,6 +159,26 @@ def test_explicit_enabled_no_grants_never_assigns_first_user(tmp_path):
 
 
 @POSIX
+def test_sibling_module_directory_does_not_invalidate_shared_state_root(tmp_path):
+    settings=write(tmp_path/'settings.json',config())
+    module=compose_infrastructure(settings,state_root=tmp_path)
+    try:
+        assert module.state=='ready'
+        service=module.service
+        before=tmp_path.stat()
+        (tmp_path/'another-module').mkdir(mode=0o700)
+        # On ext4, a legitimate sibling directory changes the parent's link count.
+        # It does not replace the named state root or weaken its owner/mode checks.
+        after=tmp_path.stat()
+        assert (after.st_dev,after.st_ino)==(before.st_dev,before.st_ino)
+        assert after.st_nlink>=before.st_nlink
+        service.upsert_device('human:1',dict(id='fixture',name='Fixture',addresses=[],role='Fixture'),expected_revision=0)
+        assert service.list_devices('human:1')['items'][0]['id']=='fixture'
+        assert module.state=='ready'
+    finally:module.close()
+
+
+@POSIX
 def test_live_directory_rename_replacement_denies_before_sqlite_write_and_latches(tmp_path):
     settings=write(tmp_path/'settings.json',config())
     module=compose_infrastructure(settings,state_root=tmp_path);assert module.state=='ready'
