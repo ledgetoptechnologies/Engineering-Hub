@@ -9,6 +9,7 @@ import json
 from typing import Annotated, Literal
 
 from fastapi import Path, Query, Request
+from starlette.responses import Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -177,7 +178,9 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
         return await diagnostic_manifest(service.resources, service.client, principal, resource_id,
                                          session_alive=alive)
 
-    @app.get('/api/hub/v1/staging/diagnostics/{resource_id}/files/{relative_path:path}')
+    @app.get('/api/hub/v1/staging/diagnostics/{resource_id}/files/{relative_path:path}',
+             response_class=Response, responses={200: {'content': {
+                 'application/octet-stream': {'schema': {'type': 'string', 'format': 'binary'}}}}})
     async def diagnostic_file(resource_id: Identity, relative_path: str, request: Request):
         from .staging_diagnostics import diagnostic_download
         service, principal, alive = diagnostic_context(request)
