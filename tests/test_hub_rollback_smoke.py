@@ -34,6 +34,12 @@ class Docker(helpers.Docker):
 
     def __call__(self, args, **kwargs):
         out = None
+        if (args[:2] == ['volume','inspect'] and args[-1] not in self.volumes):
+            self.calls.append((args,kwargs))
+            return subprocess.CompletedProcess(args,1,stdout='',stderr='Error response from daemon: get '+args[-1]+': no such volume\n')
+        if (args[:2] == ['container','inspect'] and args[-1] not in self.containers and args[-1] not in self.profiles):
+            self.calls.append((args,kwargs))
+            return subprocess.CompletedProcess(args,1,stdout='',stderr='Error response from daemon: No such container: '+args[-1]+'\n')
         if args[:2] == ['image', 'inspect']:
             old = args[-1] == BASE
             out = json.dumps(dict({'id': OLD_ID if old else NEW_ID, 'revision': 'f'*40 if self.wrong_commit else
@@ -136,19 +142,22 @@ def test_unknown_stop_denies_second_writer_and_retains_owned_resources(monkeypat
     assert not any(a[0]=='rm' for a,k in docker.calls)
     assert not any(a[:2]==['volume','rm'] for a,k in docker.calls)
     assert len([a for a,k in docker.calls if a[0]=='kill'])==1
-    assert 'container_cleanup_unverified' in result['cleanup_errors']
+    assert any(x['kind']=='container_cleanup_unverified' for x in result['cleanup_errors'])
+    assert result['failure_phase']=='baseline.terminal' and result['error_class']=='timeout'
 
 
 def test_bad_image_label_refuses_before_fixture_creation(monkeypatch):
     docker=Docker();docker.wrong_commit=True
-    with pytest.raises(ValueError,match='identity'):run(monkeypatch,docker)
+    result=run(monkeypatch,docker)
+    assert result['state']=='failed' and result['failure_phase']=='baseline.image'
     assert not any(a[0] in ('create','volume') for a,k in docker.calls)
 
 
 @pytest.mark.parametrize('changes',[{'digests':[]},{'user':'0:0'},{'id':'mutable-name'}])
 def test_image_digest_uid_and_id_must_match_before_effect(monkeypatch,changes):
     docker=Docker();docker.image_changes=changes
-    with pytest.raises(ValueError):run(monkeypatch,docker)
+    result=run(monkeypatch,docker)
+    assert result['state']=='failed' and result['failure_phase']=='baseline.image'
     assert not any(a[0] in ('create','volume') for a,k in docker.calls)
 
 
@@ -193,3 +202,52 @@ def test_workflow_manual_main_read_only_package_scope_and_receipt_only():
     assert text.count('timeout 180s docker pull "'+smoke.PACKAGE+'@sha256:')==2
     assert 'path: rollback-receipt.json' in text and 'docker push' not in text and 'internal-mcp' not in text
     assert '${{ inputs.' not in text[text.index('        run: |'):text.index('      - uses: docker/login-action')].split('        run: |',1)[1]
+
+
+@pytest.mark.parametrize('kind', ['volume','container'])
+def test_scoped_missing_daemon_response_is_allowed_only_for_absence_probe(monkeypatch,kind):
+    name='hub-rollback-'+'a'*32+('-state' if kind=='volume' else '-baseline')
+    error=('Error response from daemon: get '+name+': no such volume' if kind=='volume' else
+           'Error response from daemon: No such container: '+name)
+    monkeypatch.setattr(smoke,'_docker',lambda *a,**k:subprocess.CompletedProcess([],1,stdout='',stderr=error+'\n'))
+    function=smoke._volume if kind=='volume' else smoke._container
+    assert function(name,'owner',missing_ok=True) is (False if kind=='volume' else None)
+    with pytest.raises(smoke.PublicFailure):function(name,'owner')
+
+
+@pytest.mark.parametrize('kind', ['volume','container'])
+@pytest.mark.parametrize('change', ['foreign','permission','prefix','suffix','stdout','code','unscoped'])
+def test_ambiguous_permission_or_foreign_missing_never_allows_creation(monkeypatch,kind,change):
+    name='hub-rollback-'+'a'*32+('-state' if kind=='volume' else '-baseline')
+    error=('Error response from daemon: get '+name+': no such volume' if kind=='volume' else
+           'Error response from daemon: No such container: '+name)
+    raw={'foreign':error.replace(name,name+'-foreign'),'permission':'permission denied: '+error,
+         'prefix':'daemon unavailable\n'+error,'suffix':error+'\npermission denied',
+         'unscoped':'No such '+kind}.get(change,error)
+    result=subprocess.CompletedProcess([],2 if change=='code' else 1,stdout='partial' if change=='stdout' else '',stderr=raw)
+    monkeypatch.setattr(smoke,'_docker',lambda *a,**k:result)
+    function=smoke._volume if kind=='volume' else smoke._container
+    with pytest.raises(smoke.PublicFailure):function(name,'owner',missing_ok=True)
+
+
+def test_first_fixture_failure_has_safe_phase_code_and_no_private_error(monkeypatch):
+    docker=Docker()
+    def failure(args,**kwargs):
+        if args[:2]==['volume','inspect']:
+            return subprocess.CompletedProcess(args,1,stdout='',stderr='permission denied SECRET_DO_NOT_PUBLISH')
+        return docker(args,**kwargs)
+    monkeypatch.setattr(smoke,'_docker',failure)
+    result=smoke.run_smoke(BASE,OLD_COMMIT,NEW,NEW_COMMIT)
+    assert result['failure_phase']=='fixture.volume0.absence'
+    assert result['entered_steps']==['baseline.image','candidate.image','fixture.volume0.absence']
+    assert result['completed_steps']==['baseline.image','candidate.image']
+    assert result['error_code']=='volume_inspection_unverified' and result['cli_exit_code']==1
+    assert result['cleanup']=='completed' and 'SECRET' not in json.dumps(result)
+    assert not any(a[0] in ('create','volume') for a,k in docker.calls)
+
+
+def test_missing_inspect_timeout_remains_unknown(monkeypatch):
+    def timeout(*a,**k):raise TimeoutError('private socket path')
+    monkeypatch.setattr(smoke,'_docker',timeout)
+    with pytest.raises(TimeoutError):smoke._volume('hub-rollback-'+'a'*32+'-state','owner',missing_ok=True)
+    assert smoke._failure(TimeoutError('private socket path'))=={'error_class':'timeout','error_code':'timeout'}

@@ -50,6 +50,22 @@ No image layers, database/backup bytes, credentials, or private container logs
 are uploaded. A failed or held result exits nonzero. Missing registry access
 can prevent this evidence; it does not justify substituting another baseline.
 
+Receipts retain the entered and completed fixed step names, the first failed
+phase, and allowlisted error categories/codes. A known CLI failure may include
+only its bounded integer exit code. Exception messages, command strings and raw
+stdout/stderr are never published. Cleanup failures retain their own safe phase
+without replacing the original verification failure. Exact target-scoped Docker
+missing-volume/container messages are accepted only for an explicit absence
+check with exit1 and empty stdout. Permission, timeout, mixed, unscoped or
+foreign-target diagnostics remain unknown and cannot authorize creation.
+
+The initial direct workflow run40269086431 remains failed with an unknown
+failure phase; its original receipt was insufficient to diagnose the cause.
+A subsequent read-only local probe reproduced a lower-case Docker missing-volume
+variant that the earlier reused helper rejected. The scoped compatibility fix
+and improved diagnostics do not retroactively establish that run's cause or
+constitute a successful rollback run.
+
 This is synthetic app-state evidence. It does not cover live NAS state,
 protected-owner enrollment/epoch restoration, machine reboot, live human OAuth,
 native agent wake, or arbitrary migrations/data shapes. Container resource

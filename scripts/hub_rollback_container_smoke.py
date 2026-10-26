@@ -23,6 +23,67 @@ _deadline = None
 _term_issued = set()
 
 
+class PublicFailure(RuntimeError):
+    """Fixed local codes only; never exception messages or raw Docker stderr."""
+    def __init__(self, code, exit_code=None):
+        self.code = code
+        self.exit_code = exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else None
+        super().__init__(code)
+
+
+def _failure(error):
+    kind = ('known_cli_failure' if isinstance(error, PublicFailure) else
+            'timeout' if isinstance(error, TimeoutError) else
+            'invalid_json' if isinstance(error, json.JSONDecodeError) else
+            'validation' if isinstance(error, ValueError) else
+            'local_io' if isinstance(error, OSError) else
+            'runtime_unverified' if isinstance(error, RuntimeError) else 'unexpected_exception')
+    result = {'error_class': kind, 'error_code': error.code if isinstance(error, PublicFailure) else kind}
+    if isinstance(error, PublicFailure) and error.exit_code is not None:
+        result['cli_exit_code'] = error.exit_code
+    return result
+
+
+def _volume(name, owner, *, missing_ok=False):
+    """Only exact missing-target diagnostics admit a new disposable volume."""
+    if not re.fullmatch('hub-rollback-[a-f0-9]{32}-(state|restore)', name):
+        raise ValueError('Unexpected disposable volume name')
+    result = _docker(['volume', 'inspect', '--format',
+        '{{.Name}}|{{index .Labels "' + durable.LABEL + '"}}|{{.Driver}}|{{json .Options}}', name],
+        check=False, timeout=15)
+    if result.returncode:
+        # Docker Engine and CLI variants, each scoped to this exact generated
+        # name. No case-insensitive substring, permission or timeout fallback.
+        missing = {
+            'Error response from daemon: get ' + name + ': no such volume',
+            'Error: No such volume: ' + name,
+            'Error response from daemon: No such volume: ' + name,
+        }
+        if missing_ok and result.returncode == 1 and not result.stdout.strip() and result.stderr.strip() in missing:
+            return False
+        raise PublicFailure('volume_inspection_unverified', result.returncode)
+    if result.stdout.strip() not in {name + '|' + owner + '|local|null', name + '|' + owner + '|local|{}'}:
+        raise PublicFailure('volume_identity_unverified')
+    return True
+
+
+def _container(name, owner, *, missing_ok=False):
+    if not re.fullmatch('hub-rollback-[a-f0-9]{32}-(baseline|candidate|old|copy)', name):
+        raise ValueError('Unexpected disposable container name')
+    result = _docker(['container', 'inspect', '--format',
+        '{{.Id}}|{{index .Config.Labels "' + durable.LABEL + '"}}', name], check=False, timeout=15)
+    if result.returncode:
+        missing = {'Error response from daemon: No such container: ' + name,
+                   'Error: No such container: ' + name, 'Error: No such object: ' + name}
+        if missing_ok and result.returncode == 1 and not result.stdout.strip() and result.stderr.strip() in missing:
+            return None
+        raise PublicFailure('container_inspection_unverified', result.returncode)
+    identity, _, actual_owner = result.stdout.strip().partition('|')
+    if not re.fullmatch('[a-f0-9]{64}', identity) or actual_owner != owner:
+        raise PublicFailure('container_identity_unverified')
+    return identity
+
+
 def validate(image, commit):
     if (type(image) is not str or re.fullmatch(re.escape(PACKAGE) + r'@sha256:[a-f0-9]{64}', image) is None
             or type(commit) is not str or re.fullmatch('[a-f0-9]{40}', commit) is None):
@@ -47,7 +108,7 @@ def _docker(args, *, check=True, timeout=30):
             result = subprocess.CompletedProcess(args, child.returncode,
                 out.read().decode('utf-8'), err.read().decode('utf-8'))
             if check and result.returncode:
-                raise RuntimeError('Docker command failed; private output withheld')
+                raise PublicFailure('docker_command_nonzero', result.returncode)
             return result
         finally:
             if child.poll() is None:
@@ -70,7 +131,7 @@ def _image(ref, commit):
 
 
 def _stop(name, owner, *, already_terminal=False):
-    identity = durable._container(name, owner)
+    identity = _container(name, owner)
     until = time.monotonic() + 12
     while True:
         value = json.loads(_docker(['container', 'inspect', '--format',
@@ -135,97 +196,113 @@ def run_smoke(baseline, baseline_commit, candidate, candidate_commit, *, rollbac
     _deadline = time.monotonic() + 480
     _term_issued = set()
     durable._docker = _docker
-    old_id, new_id = _image(baseline, baseline_commit), _image(candidate, candidate_commit)
-    if old_id == new_id:
-        raise ValueError('Distinct immutable image IDs required')
     owner = uuid.uuid4().hex
     prefix = 'hub-rollback-' + owner
     volumes = [prefix + '-state', prefix + '-restore']
     names = [prefix + '-baseline', prefix + '-candidate', prefix + '-old', prefix + '-copy']
     issued_names, issued_volumes = [], []
     report = {'schema': 'engineering-hub.disposable-rollback.v1', 'state': 'failed',
-        'baseline': {'digest': baseline, 'commit': baseline_commit, 'image_id': old_id},
-        'candidate': {'digest': candidate, 'commit': candidate_commit, 'image_id': new_id},
+        'baseline': {'digest': baseline, 'commit': baseline_commit},
+        'candidate': {'digest': candidate, 'commit': candidate_commit},
         'rollback_mode': rollback_mode, 'protected_owner_restore': 'not_tested',
         'nas_or_host_rollout': 'not_tested', 'cleanup': 'pending',
-        'fixture_owner': owner, 'fixture_names': names, 'fixture_volumes': volumes}
+        'fixture_owner': owner, 'fixture_names': names, 'fixture_volumes': volumes,
+        'entered_steps': [], 'completed_steps': []}
 
-    def app(name, image, volume):
-        if durable._container(name, owner, missing_ok=True) is not None:
+    def step(phase, callback, *args, **kwargs):
+        report['phase'] = phase
+        report['entered_steps'].append(phase)
+        value = callback(*args, **kwargs)
+        report['completed_steps'].append(phase)
+        return value
+
+    def app(name, image, volume, stage):
+        if step(stage + '.absence', _container, name, owner, missing_ok=True) is not None:
             raise ValueError('Refuse existing fixture')
         issued_names.append(name)  # Unknown create acknowledgement is inspected, never replayed.
-        _docker(_options(name, owner, volume) + [image])
-        identity = durable._container(name, owner)
-        _profile(identity, image, {'/var/lib/hub': (volume, True)})
-        _docker(['start', identity])
+        step(stage + '.create', _docker, _options(name, owner, volume) + [image])
+        identity = step(stage + '.identity', _container, name, owner)
+        step(stage + '.profile', _profile, identity, image, {'/var/lib/hub': (volume, True)})
+        step(stage + '.start', _docker, ['start', identity])
         return identity
 
     try:
-        for volume in volumes[:1 if rollback_mode == 'direct' else 2]:
-            if durable._volume(volume, owner, missing_ok=True):
+        old_id = step('baseline.image', _image, baseline, baseline_commit)
+        report['baseline']['image_id'] = old_id
+        new_id = step('candidate.image', _image, candidate, candidate_commit)
+        report['candidate']['image_id'] = new_id
+        if old_id == new_id:
+            raise ValueError('Distinct immutable image IDs required')
+        for index, volume in enumerate(volumes[:1 if rollback_mode == 'direct' else 2]):
+            phase = 'fixture.volume' + str(index)
+            if step(phase + '.absence', _volume, volume, owner, missing_ok=True):
                 raise ValueError('Refuse existing fixture')
             issued_volumes.append(volume)
-            _docker(['volume', 'create', '--driver', 'local', '--label', durable.LABEL + '=' + owner, volume])
-            durable._volume(volume, owner)
-        original = app(names[0], old_id, volumes[0])
-        initial = _probe(original, 'seed', baseline_commit)
-        backup = durable._backup_report(json.loads(_docker(['exec', original, 'python', '-c', durable.BACKUP]).stdout))
-        _stop(names[0], owner)
-        upgraded = app(names[1], new_id, volumes[0])
-        _probe(upgraded, 'verify', candidate_commit, initial)
-        written = _probe(upgraded, 'seed', candidate_commit, candidate_write=True)
+            step(phase + '.create', _docker, ['volume', 'create', '--driver', 'local', '--label', durable.LABEL + '=' + owner, volume])
+            step(phase + '.identity', _volume, volume, owner)
+        original = app(names[0], old_id, volumes[0], 'baseline')
+        initial = step('baseline.seed', _probe, original, 'seed', baseline_commit)
+        backup = step('baseline.backup', lambda: durable._backup_report(json.loads(
+            _docker(['exec', original, 'python', '-c', durable.BACKUP]).stdout)))
+        step('baseline.terminal', _stop, names[0], owner)
+        upgraded = app(names[1], new_id, volumes[0], 'candidate')
+        step('candidate.old_read', _probe, upgraded, 'verify', candidate_commit, initial)
+        written = step('candidate.write', _probe, upgraded, 'seed', candidate_commit, candidate_write=True)
         if written['task_id'] == initial['task_id']:
             raise ValueError('Candidate did not perform a distinct durable write')
-        _probe(upgraded, 'verify', candidate_commit, written)
-        _stop(names[1], owner)
+        step('candidate.new_read', _probe, upgraded, 'verify', candidate_commit, written)
+        step('candidate.terminal', _stop, names[1], owner)
         rollback_volume = volumes[0]
         if rollback_mode == 'backup-restore':
-            if durable._container(names[3], owner, missing_ok=True) is not None:
+            if step('restore.absence', _container, names[3], owner, missing_ok=True) is not None:
                 raise ValueError('Refuse existing fixture')
             issued_names.append(names[3])
-            _docker(_options(names[3], owner, volumes[1]) + [
+            step('restore.create', _docker, _options(names[3], owner, volumes[1]) + [
                 '--mount', 'type=volume,source=' + volumes[0] + ',target=/backup-source,readonly',
                 '--entrypoint', 'python', old_id, '-c', durable.RESTORE])
-            helper = durable._container(names[3], owner)
-            _profile(helper, old_id, {'/var/lib/hub': (volumes[1], True), '/backup-source': (volumes[0], False)})
-            restored = durable._backup_report(json.loads(_docker(['start', '--attach', helper]).stdout), restored=True)
-            _stop(names[3], owner, already_terminal=True)
+            helper = step('restore.identity', _container, names[3], owner)
+            step('restore.profile', _profile, helper, old_id, {'/var/lib/hub': (volumes[1], True), '/backup-source': (volumes[0], False)})
+            restored = step('restore.copy', lambda: durable._backup_report(json.loads(
+                _docker(['start', '--attach', helper]).stdout), restored=True))
+            step('restore.terminal', _stop, names[3], owner, already_terminal=True)
             if (restored['sha256'], restored['size_bytes']) != (backup['sha256'], backup['size_bytes']):
                 raise ValueError('Original backup bytes differ')
             rollback_volume = volumes[1]
-        rolled_back = app(names[2], old_id, rollback_volume)
-        _probe(rolled_back, 'verify', baseline_commit, initial)
+        rolled_back = app(names[2], old_id, rollback_volume, 'rollback')
+        step('rollback.old_read', _probe, rolled_back, 'verify', baseline_commit, initial)
         if rollback_mode == 'direct':
-            _probe(rolled_back, 'verify', baseline_commit, written)
+            step('rollback.new_read', _probe, rolled_back, 'verify', baseline_commit, written)
         else:
             absence = ("import json,os;from engineering_hub.repository import HubRepository;"
                 "r=HubRepository(os.environ['HUB_DB']);assert not any(t['id']==" + repr(written['task_id']) +
                 " for t in r.list_tasks());print('original-backup-only')")
-            if _docker(['exec', rolled_back, 'python', '-c', absence]).stdout.strip() != 'original-backup-only':
+            if step('rollback.candidate_absence', _docker, ['exec', rolled_back, 'python', '-c', absence]).stdout.strip() != 'original-backup-only':
                 raise ValueError('Backup restore included candidate writes')
-        _stop(names[2], owner)
+        step('rollback.terminal', _stop, names[2], owner)
         report.update(state='passed', auth_denials='passed', baseline_state='matched',
             candidate_write='distinct_task_claimed_revision2',
             candidate_state_after_rollback='matched' if rollback_mode == 'direct' else 'intentionally_discarded')
-    except Exception:
-        report['error'] = 'verification_failed_private_output_withheld'
+    except Exception as error:
+        report.update(_failure(error), failure_phase=report['phase'])
     finally:
         _deadline = time.monotonic() + 120
         errors = []
         for name in reversed(issued_names):
             try:
-                identity = durable._container(name, owner, missing_ok=True)
+                stage = 'cleanup.' + name.rsplit('-', 1)[1]
+                identity = step(stage + '.identity', _container, name, owner, missing_ok=True)
                 if identity:
-                    _stop(name, owner)
-                    _docker(['rm', identity])  # Never force an unknown/live writer.
-            except Exception:
-                errors.append('container_cleanup_unverified')
+                    step(stage + '.terminal', _stop, name, owner)
+                    step(stage + '.remove', _docker, ['rm', identity])
+            except Exception as error:
+                errors.append(dict(_failure(error), phase=report['phase'], kind='container_cleanup_unverified'))
         for volume in reversed(issued_volumes) if not errors else []:
             try:
-                if durable._volume(volume, owner, missing_ok=True):
-                    _docker(['volume', 'rm', volume])
-            except Exception:
-                errors.append('volume_cleanup_unverified')
+                stage = 'cleanup.volume.' + volume.rsplit('-', 1)[1]
+                if step(stage + '.identity', _volume, volume, owner, missing_ok=True):
+                    step(stage + '.remove', _docker, ['volume', 'rm', volume])
+            except Exception as error:
+                errors.append(dict(_failure(error), phase=report['phase'], kind='volume_cleanup_unverified'))
         report['cleanup'] = 'held' if errors else 'completed'
         if errors:
             report['state'] = 'failed'; report['cleanup_errors'] = errors
@@ -241,8 +318,9 @@ def main():
     try:
         report = run_smoke(args.baseline_image, args.baseline_commit, args.candidate_image,
             args.candidate_commit, rollback_mode=args.rollback_mode)
-    except Exception:
-        report = {'state': 'failed', 'error': 'image_or_input_unverified_no_fixture_started'}
+    except Exception as error:
+        report = dict(_failure(error), state='failed', failure_phase='input.validation',
+            entered_steps=['input.validation'], completed_steps=[])
     print(json.dumps(report, sort_keys=True))
     raise SystemExit(0 if report['state'] == 'passed' else 1)
 
