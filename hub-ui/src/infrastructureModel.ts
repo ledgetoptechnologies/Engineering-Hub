@@ -135,6 +135,11 @@ function isIpv6(value: string): boolean {
   try { return new URL(`http://[${value}]/`).hostname.length > 2; } catch { return false; }
 }
 export function isIpAddress(value: string): boolean { return ipv4(value) !== null || isIpv6(value); }
+/** 4 or 6 for an address or a CIDR network's base address, or null when it's neither. */
+export function ipFamily(value: string): 4 | 6 | null {
+  const address = value.split("/")[0];
+  return ipv4(address) ? 4 : isIpv6(address) ? 6 : null;
+}
 /** A network in CIDR form. For IPv4 the host bits must be zero, as the server requires. */
 export function isNetwork(value: string): boolean {
   const [address, bits, extra] = value.split("/");
@@ -147,10 +152,15 @@ export function isNetwork(value: string): boolean {
   }
   return isIpv6(address) && prefix <= 128;
 }
-/** Whether an IPv4 address falls inside an IPv4 network; other combinations are left to the server. */
+/**
+ * Whether an address falls inside a network. An address of the other IP family is never inside it,
+ * as the server requires; IPv6 inside IPv6 is left to the server.
+ */
 export function inNetwork(address: string, network: string): boolean | null {
   const [base, bits] = network.split("/");
   const a = ipv4(address), b = ipv4(base);
+  const family = ipFamily(address), networkFamily = ipFamily(base);
+  if (family && networkFamily && family !== networkFamily) return false;
   if (!a || !b) return null;
   const size = 2 ** (32 - Number(bits));
   const value = (parts: number[]) => parts.reduce((total, part) => total * 256 + part, 0);

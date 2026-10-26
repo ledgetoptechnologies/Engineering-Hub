@@ -10,7 +10,7 @@ import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
 import { demoInfrastructure } from "../infrastructureDemo";
 import {
-  actorLabel, ago, inNetwork, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, needsAttention, observationView,
+  actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, needsAttention, observationView,
   TEXT_MAX, type Device, type DeviceDetail, type DeviceList, type Maintenance,
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
@@ -315,7 +315,13 @@ function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   if (bad.length) problems.push(`Not an IP address: ${bad.join(", ")}.`);
   if (new Set(addresses).size !== addresses.length) problems.push("An address is listed twice.");
   if (draft.network && !isNetwork(draft.network)) problems.push("The network must be in CIDR form with no host bits, e.g. 192.0.2.0/24.");
-  else if (draft.network && addresses.some(item => inNetwork(item, draft.network) === false)) problems.push("Every address must be inside the network.");
+  else if (draft.network) {
+    const family = ipFamily(draft.network);
+    const otherFamily = addresses.filter(item => ipFamily(item) !== null && ipFamily(item) !== family);
+    if (otherFamily.length) problems.push(`The network is IPv${family}, so it can't hold ${otherFamily.join(", ")}. `
+      + "Leave the network empty for a device with both IPv4 and IPv6 addresses.");
+    else if (addresses.some(item => inNetwork(item, draft.network) === false)) problems.push("Every address must be inside the network.");
+  }
   if (draft.vlan && !(/^\d{1,4}$/.test(draft.vlan) && Number(draft.vlan) >= 1 && Number(draft.vlan) <= 4094)) problems.push("The VLAN must be a number from 1 to 4094.");
   return problems;
 }

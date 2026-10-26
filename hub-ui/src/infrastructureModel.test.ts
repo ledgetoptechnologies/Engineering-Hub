@@ -3,7 +3,7 @@ import { HubApiError } from "./api";
 import { httpInfrastructure, writeFailureText } from "./infrastructureApi";
 import { demoDevices } from "./infrastructureDemo";
 import {
-  actorLabel, inNetwork, isHostname, isIpAddress, isNetwork, maintenanceView, needsAttention, observationView,
+  actorLabel, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, maintenanceView, needsAttention, observationView,
   parseDevice, parseDeviceDetail, parseDeviceList, type Observation,
 } from "./infrastructureModel";
 import fixture from "./fixtures/infrastructure-v1.json";
@@ -76,6 +76,11 @@ describe("form checks", () => {
     expect(isNetwork("2001:db8::/32")).toBe(true);
     expect(inNetwork("192.0.2.9", "192.0.2.0/24")).toBe(true);
     expect(inNetwork("198.51.100.9", "192.0.2.0/24")).toBe(false);
+    // A single network holds one IP family, as the server requires.
+    expect(inNetwork("2001:db8::20", "198.51.100.0/24")).toBe(false);
+    expect(inNetwork("198.51.100.20", "2001:db8::/32")).toBe(false);
+    expect(inNetwork("2001:db8::20", "2001:db8::/32")).toBeNull();
+    expect([ipFamily("192.0.2.1"), ipFamily("2001:db8::/32"), ipFamily("host")]).toEqual([4, 6, null]);
     expect(isHostname("build.example.test")).toBe(true);
     expect(isHostname("-bad.example.test")).toBe(false);
   });
