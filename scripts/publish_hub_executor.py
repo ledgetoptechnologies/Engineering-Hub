@@ -1,18 +1,20 @@
 """Explicit staging-only executor publication approved by Beau on 2026-10-26.
 
-Uses Docker's existing login and the job's existing GH_TOKEN for one fixed
-package metadata read; never reads operator credentials or configuration.
+Uses Docker's existing login and the job's existing GH_TOKEN for fixed package
+metadata and pull-only registry checks; never reads operator configuration.
 An intent tag is a locator, not an atomic immutable registry reservation.
 """
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import urllib.request
+import urllib.error
 import uuid
 
 import hub_executor_compatibility_ci as ci
@@ -23,6 +25,9 @@ PACKAGE = 'ghcr.io/ledgetoptechnologies/engineering-hub-control'
 RECEIPT = Path('executor-publication-receipt.json')
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}\Z')
 PACKAGE_API = 'https://api.github.com/orgs/ledgetoptechnologies/packages/container/engineering-hub-control'
+REGISTRY_TOKEN = 'https://ghcr.io/token?service=ghcr.io&scope=repository:ledgetoptechnologies/engineering-hub-control:pull'
+REGISTRY_MANIFEST = 'https://ghcr.io/v2/ledgetoptechnologies/engineering-hub-control/manifests/'
+MANIFEST_ACCEPT = 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
 INGRESS_PROBE = r'''
 import inspect, os, sys
 from engineering_hub.build_info import read_build_commit
@@ -130,19 +135,96 @@ def run(*args, timeout=180):
     return ci.run(*args, timeout=timeout)
 
 
-def absent(target):
-    """Only Docker's exact manifest-not-found result permits publication.
+def registry_get(opener, url, headers, *, limit, allow_missing=False):
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = opener.open(request, timeout=20)
+    except urllib.error.HTTPError as exc:
+        if not allow_missing or exc.code != 404:
+            raise
+        response = exc
+    with response:
+        if response.geturl() != url or response.status not in ((200, 404) if allow_missing else (200,)):
+            raise ValueError('Unexpected registry response')
+        raw = response.read(limit + 1)
+        if not 0 < len(raw) <= limit:
+            raise ValueError('Registry response size invalid')
+        return response.status, raw
 
-    Authorization errors, timeouts, different CLI wording and transport errors
-    are unknown, never absence. This is not an atomic create-if-absent operation.
+
+def registry_json(raw):
+    """Reject ambiguous object keys in the three registry protocol responses."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Ambiguous registry JSON')
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError('Invalid registry JSON constant')
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid_constant)
+
+
+def absent(target, values, evidence=None):
+    """Verify private pull access first, then require typed authenticated absence.
+
+    Fixed GHCR endpoints only; no write scope, redirect, CLI wording heuristic or
+    retry. This preflight is not an atomic registry create-if-absent operation.
     """
-    result = subprocess.run(['docker', 'manifest', 'inspect', target],
-                            capture_output=True, timeout=60)
-    if result.returncode == 0:
-        raise ValueError('Publication intent tag already exists')
-    if (result.returncode != 1 or result.stdout.strip()
-            or result.stderr.strip() != ('no such manifest: ' + target).encode()):
-        raise RuntimeError('Registry absence not established')
+    evidence = evidence if evidence is not None else {}
+    evidence['registry_absence_phase'] = 'target_validation'
+    evidence.pop('registry_absence_http_status', None)
+    evidence.pop('registry_private_core_verified', None)
+    try:
+        checked, _, expected_target = invocation(os.environ)
+        if target != expected_target or values != checked:
+            raise ValueError('Unexpected publication target or immutable inputs')
+        actor = os.environ.get('GITHUB_ACTOR', '')
+        token = os.environ.get('GH_TOKEN', '')
+        if (not re.fullmatch(r'[A-Za-z0-9-]{1,100}(?:\[bot\])?', actor)
+                or not 0 < len(token) <= 4096 or '\r' in token or '\n' in token):
+            raise ValueError('Existing job authentication required')
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        basic = base64.b64encode((actor + ':' + token).encode()).decode('ascii')
+        evidence['registry_absence_phase'] = 'pull_token'
+        evidence.pop('registry_absence_http_status', None)
+        status, raw = registry_get(opener, REGISTRY_TOKEN,
+                              {'Authorization': 'Basic ' + basic, 'Accept': 'application/json'}, limit=65536)
+        evidence['registry_absence_http_status'] = status
+        pull_token = registry_json(raw).get('token')
+        if type(pull_token) is not str or not re.fullmatch(r'[A-Za-z0-9._~+/=-]{1,16384}', pull_token):
+            raise ValueError('Invalid pull token response')
+        headers = {'Authorization': 'Bearer ' + pull_token, 'Accept': MANIFEST_ACCEPT}
+        evidence['registry_absence_phase'] = 'known_private_core'
+        evidence.pop('registry_absence_http_status', None)
+        status, core_raw = registry_get(opener, REGISTRY_MANIFEST + 'sha256:' + values['CORE_DIGEST'],
+                                   headers, limit=1024 * 1024)
+        evidence['registry_absence_http_status'] = status
+        core = registry_json(core_raw)
+        if (hashlib.sha256(core_raw).hexdigest() != values['CORE_DIGEST']
+                or core.get('schemaVersion') != 2
+                or core.get('mediaType') not in MANIFEST_ACCEPT.split(', ')
+                or core.get('config', {}).get('digest') != 'sha256:' + values['CORE_CONFIG']):
+            raise ValueError('Known private core identity mismatch')
+        evidence['registry_private_core_verified'] = True
+        evidence['registry_absence_phase'] = 'intent_tag'
+        evidence.pop('registry_absence_http_status', None)
+        status, raw = registry_get(opener, REGISTRY_MANIFEST + target.rsplit(':', 1)[1],
+                                   headers, limit=65536, allow_missing=True)
+        evidence['registry_absence_http_status'] = status
+        if status != 404:
+            raise ValueError('Publication intent tag already exists')
+        errors = registry_json(raw).get('errors')
+        if (type(errors) is not list or len(errors) != 1 or type(errors[0]) is not dict
+                or errors[0].get('code') != 'MANIFEST_UNKNOWN'):
+            raise ValueError('Typed registry absence required')
+        evidence['registry_absence_phase'] = 'complete'
+    except Exception as exc:
+        if (isinstance(exc, urllib.error.HTTPError) and type(exc.code) is int
+                and 100 <= exc.code <= 599):
+            evidence['registry_absence_http_status'] = exc.code
+        raise RuntimeError('Authenticated registry absence not established; refusing upload') from None
 
 
 def image(reference, expected=None):
@@ -223,7 +305,8 @@ def publish(values, local, target, record):
     private_package()
     record['private_package_verified'] = True
     record['stage'] = 'intent_absence'
-    absent(target)
+    absent(target, values, record)
+    record['authenticated_intent_absence_verified'] = True
     record['stage'] = 'local_intent_tag'
     # Tag the exact verified config identity, never a potentially moved build tag.
     run('docker', 'tag', expected, target)

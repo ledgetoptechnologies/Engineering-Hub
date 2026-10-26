@@ -8,6 +8,7 @@ import sys
 import types
 import builtins
 import inspect
+import io
 
 import pytest
 
@@ -20,6 +21,7 @@ SPEC.loader.exec_module(P)
 CONFIG = 'sha256:' + 'd' * 64
 PRIVATE_PACKAGE_CHECK = P.private_package
 INSTALLED_INGRESS_CHECK = P.installed_ingress
+ABSENCE_CHECK = P.absent
 
 
 def environment():
@@ -45,21 +47,164 @@ def test_fixed_intent_destination():
     assert target == P.PACKAGE + ':staging-executor-123-1'
 
 
-@pytest.mark.parametrize('code,stdout,stderr,allowed', [
-    (1, b'', b'no such manifest: fixture', True),
-    (0, b'{}', b'', False), (1, b'', b'denied: secret', False),
-    (1, b'', b'not found', False), (2, b'', b'no such manifest: fixture', False),
-    (1, b'private', b'no such manifest: fixture', False)])
-def test_only_exact_absence_allows_publication(monkeypatch, code, stdout, stderr, allowed):
-    monkeypatch.setattr(P.subprocess, 'run', lambda *a, **k:
-                        subprocess.CompletedProcess(a, code, stdout, stderr))
-    if allowed:
-        P.absent('fixture')
+def registry_access(monkeypatch, changes=None, core_bytes=None):
+    env = environment()
+    env.update(GITHUB_ACTOR='fixture-actor', GH_TOKEN='job-token-fixture')
+    core = (core_bytes if core_bytes is not None else
+            json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                        'config': {'digest': 'sha256:' + env['CORE_CONFIG']}}).encode())
+    env['CORE_DIGEST'] = hashlib.sha256(core).hexdigest()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    values, _, target = P.invocation(env)
+    urls = [P.REGISTRY_TOKEN, P.REGISTRY_MANIFEST + 'sha256:' + values['CORE_DIGEST'],
+            P.REGISTRY_MANIFEST + 'staging-executor-123-1']
+    responses = [(200, b'{"token":"pull-only-fixture"}'), (200, core),
+                 (404, b'{"errors":[{"code":"MANIFEST_UNKNOWN"}]}')]
+    for index, response in (changes or {}).items():
+        responses[index] = response
+    calls = []
+    class Response:
+        def __init__(self, status, raw, url):
+            self.status, self.raw, self.url = status, raw, url
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def geturl(self):
+            return self.url
+        def read(self, size):
+            assert size == (1048577 if len(calls) == 2 else 65537)
+            return self.raw
+    class Opener:
+        def open(self, request, timeout):
+            index = len(calls)
+            assert request.full_url == urls[index] and timeout == 20
+            auth = request.get_header('Authorization')
+            if index == 0:
+                assert auth == 'Basic ' + P.base64.b64encode(b'fixture-actor:job-token-fixture').decode()
+                assert request.full_url.endswith(':pull') and ':push' not in request.full_url
+            else:
+                assert auth == 'Bearer pull-only-fixture'
+            calls.append(request.full_url)
+            response = responses[index]
+            if isinstance(response, Exception):
+                raise response
+            status, raw = response
+            if status != 200:
+                raise P.urllib.error.HTTPError(request.full_url, status, 'private diagnostic', {}, io.BytesIO(raw))
+            return Response(status, raw, request.full_url)
+    def opener(*handlers):
+        assert handlers[0].proxies == {} and isinstance(handlers[1], P.NoRedirect)
+        return Opener()
+    monkeypatch.setattr(P.urllib.request, 'build_opener', opener)
+    return values, target, calls
+
+
+def test_authenticated_absence_checks_known_core_first_with_same_pull_token(monkeypatch):
+    values, target, calls = registry_access(monkeypatch)
+    evidence = {}
+    P.absent(target, values, evidence)
+    assert calls == [P.REGISTRY_TOKEN, P.REGISTRY_MANIFEST + 'sha256:' + values['CORE_DIGEST'],
+                     P.REGISTRY_MANIFEST + 'staging-executor-123-1']
+    assert evidence == {'registry_absence_phase': 'complete', 'registry_absence_http_status': 404,
+                        'registry_private_core_verified': True}
+
+
+@pytest.mark.parametrize('stage,status,raw', [
+    (0, 401, b'{"secret":"denied"}'), (0, 403, b'private'), (0, 302, b'redirect'),
+    (0, 200, b'{}'), (0, 200, b'x' * 65537),
+    (1, 401, b'private'), (1, 403, b'private'), (1, 404, b'{"errors":[{"code":"MANIFEST_UNKNOWN"}]}'),
+    (1, 200, b'{}'), (1, 200, b'x' * 1048577),
+    (2, 200, b'{}'), (2, 401, b'private'), (2, 403, b'private'),
+    (2, 404, b'{"errors":[{"code":"NAME_UNKNOWN"}]}'),
+    (2, 404, b'{"errors":"MANIFEST_UNKNOWN"}'),
+    (2, 404, b'{"errors":[{"code":"MANIFEST_UNKNOWN"},{"code":"DENIED"}]}'),
+    (2, 404, b'not-json')], ids=['token401', 'token403', 'token-redirect', 'missing-token',
+    'oversize-token', 'core401', 'core403', 'core-missing', 'core-hash-mismatch',
+    'oversize-core', 'tag-exists', 'tag401', 'tag403', 'name-unknown', 'bad-errors-type',
+    'multiple-errors', 'bad-json'])
+def test_unknown_registry_outcomes_fail_closed_without_leaking(monkeypatch, stage, status, raw):
+    values, target, calls = registry_access(monkeypatch, {stage: (status, raw)})
+    with pytest.raises(RuntimeError) as failure:
+        P.absent(target, values)
+    assert len(calls) == stage + 1
+    assert str(failure.value) == 'Authenticated registry absence not established; refusing upload'
+
+
+def test_known_core_config_mismatch_prevents_tag_check(monkeypatch):
+    values, target, calls = registry_access(monkeypatch)
+    values['CORE_CONFIG'] = '0' * 64
+    monkeypatch.setenv('CORE_CONFIG', values['CORE_CONFIG'])
+    with pytest.raises(RuntimeError):
+        P.absent(target, values)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('stage,body', [
+    (0, b'{"token":"denied","token":"pull-only-fixture"}'),
+    (0, b'{"token":"pull-only-fixture","expires_in":1,"expires_in":1}'),
+    (2, b'{"errors":[{"code":"DENIED"}],"errors":[{"code":"MANIFEST_UNKNOWN"}]}'),
+    (2, b'{"errors":[{"code":"DENIED","code":"MANIFEST_UNKNOWN"}]}')],
+    ids=['duplicate-token', 'duplicate-token-metadata', 'duplicate-errors', 'duplicate-code'])
+def test_duplicate_registry_keys_never_authorize_absence(monkeypatch, stage, body):
+    values, target, calls = registry_access(monkeypatch, {stage: (200 if stage == 0 else 404, body)})
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.absent(target, values)
+    assert len(calls) == stage + 1
+
+
+def test_duplicate_core_keys_rejected_even_with_exact_approved_raw_hash(monkeypatch):
+    core = ('{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",'
+            '"config":{"digest":"sha256:' + 'c' * 64 + '"},'
+            '"config":{"digest":"sha256:' + 'c' * 64 + '"}}').encode()
+    values, target, calls = registry_access(monkeypatch, core_bytes=core)
+    assert hashlib.sha256(core).hexdigest() == values['CORE_DIGEST']
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.absent(target, values)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('phase,index', [('pull_token', 0), ('known_private_core', 1), ('intent_tag', 2)])
+def test_timeout_status_never_borrows_previous_phase_200(monkeypatch, phase, index):
+    values, target, calls = registry_access(monkeypatch, {index: TimeoutError('private diagnostic')})
+    evidence = {'registry_absence_http_status': 200, 'registry_private_core_verified': True}
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.absent(target, values, evidence)
+    assert len(calls) == index + 1
+    assert evidence['registry_absence_phase'] == phase
+    assert 'registry_absence_http_status' not in evidence
+    assert evidence.get('registry_private_core_verified', False) is (index == 2)
+
+
+def test_registry_timeout_is_sanitized_and_not_retried(monkeypatch):
+    values, target, calls = registry_access(monkeypatch)
+    class Unavailable:
+        def open(self, *args, **kwargs):
+            calls.append('attempt')
+            raise TimeoutError('private token diagnostic')
+    monkeypatch.setattr(P.urllib.request, 'build_opener', lambda *a: Unavailable())
+    evidence = {}
+    with pytest.raises(RuntimeError) as failure:
+        P.absent(target, values, evidence)
+    assert calls == ['attempt'] and evidence == {'registry_absence_phase': 'pull_token'}
+    assert 'private' not in str(failure.value)
+
+
+@pytest.mark.parametrize('case', ['target', 'inputs', 'token', 'actor'])
+def test_invalid_registry_identity_fails_before_any_http(monkeypatch, case):
+    values, target, calls = registry_access(monkeypatch)
+    if case == 'target':
+        target = P.PACKAGE + ':latest'
+    elif case == 'inputs':
+        values['CORE_DIGEST'] = '0' * 64
+    elif case == 'token':
+        monkeypatch.delenv('GH_TOKEN')
     else:
-        with pytest.raises((ValueError, RuntimeError)) as failure:
-            P.absent('fixture')
-        assert 'secret' not in str(failure.value)
-        assert 'private' not in str(failure.value)
+        monkeypatch.setenv('GITHUB_ACTOR', 'invalid:actor')
+    with pytest.raises(RuntimeError):
+        P.absent(target, values)
+    assert calls == []
 
 
 def registry(monkeypatch, *, config=CONFIG, descriptor=None, size=123):
@@ -303,7 +448,7 @@ def test_wrong_smoke_image_never_pushes(monkeypatch, candidate):
 
 def test_existing_tag_never_pushes(monkeypatch, candidate):
     calls = []
-    def existing(target):
+    def existing(target, values, evidence):
         raise ValueError('Publication intent tag already exists')
     monkeypatch.setattr(P, 'absent', existing)
     monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a))
@@ -312,9 +457,28 @@ def test_existing_tag_never_pushes(monkeypatch, candidate):
     assert calls == []
 
 
+def test_real_authenticated_absence_failure_never_pushes(monkeypatch, candidate):
+    values, target, reads = registry_access(monkeypatch, {2: (403, b'private diagnostic')})
+    receipt = json.loads(Path('executor-compatibility-receipt.json').read_text())
+    receipt['inputs'] = values
+    Path('executor-compatibility-receipt.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(P, 'absent', ABSENCE_CHECK)
+    commands = []
+    monkeypatch.setattr(P, 'run', lambda *a, **k: commands.append(a))
+    record = candidate[-1]
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.publish(values, candidate[1], target, record)
+    assert len(reads) == 3 and commands == []
+    assert record['publication_attempted'] is False and record['image_published'] is False
+    assert record['registry_private_core_verified'] is True
+    assert record['registry_absence_phase'] == 'intent_tag'
+    assert record['registry_absence_http_status'] == 403
+    assert 'authenticated_intent_absence_verified' not in record
+
+
 def test_push_failure_is_persisted_unknown_and_never_retried(monkeypatch, candidate):
     calls = []
-    monkeypatch.setattr(P, 'absent', lambda t: None)
+    monkeypatch.setattr(P, 'absent', lambda *a: None)
     def fail(*args, **kwargs):
         calls.append(args)
         if args[:2] == ('docker', 'push'):
@@ -334,7 +498,7 @@ def test_success_binds_receipt_to_exact_pulled_config_and_digest(monkeypatch, ca
     calls, smokes = [], []
     digest = 'sha256:' + '1' * 64
     immutable = P.PACKAGE + '@' + digest
-    monkeypatch.setattr(P, 'absent', lambda t: None)
+    monkeypatch.setattr(P, 'absent', lambda *a: None)
     monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a) or b'')
     monkeypatch.setattr(P, 'image', lambda *a: {'Id': CONFIG, 'Size': 999, 'RepoDigests': [immutable]})
     monkeypatch.setattr(P, 'smoke', lambda *a: smokes.append(a) or {'image_id': CONFIG})
@@ -418,7 +582,7 @@ def test_attach_timeout_cleans_and_blocks_publication(monkeypatch, candidate):
 
 
 def test_readback_failure_retains_unknown_outcome(monkeypatch, candidate):
-    monkeypatch.setattr(P, 'absent', lambda t: None)
+    monkeypatch.setattr(P, 'absent', lambda *a: None)
     monkeypatch.setattr(P, 'run', lambda *a, **k: b'')
     def unknown(*args):
         raise ValueError('secret registry mismatch')

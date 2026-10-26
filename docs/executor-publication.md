@@ -22,8 +22,8 @@ One manual main dispatch rebuilds the exact reviewed tuple
 using the existing canonical wheel and compatibility helpers, then reinspect
 the exact smoke-verified image ID, fixed defaults, source provenance and wheel.
 Docker uses the existing Actions login. Only the publication step also receives
-that same job token as `GH_TOKEN` for one bounded, fixed GitHub package metadata
-read with redirects disabled. The exact existing organization/package must be
+that same job token as `GH_TOKEN` for bounded, fixed GitHub package metadata
+and pull-only registry reads with redirects disabled. The exact existing organization/package must be
 private before upload; missing, public, wrong or unavailable metadata stops.
 No additional secret, visibility, access, host enrollment or deployment change
 is included.
@@ -37,13 +37,27 @@ serialized workflow and exact absence preflight prevent ordinary duplicates;
 another equally authorized racing writer could still move that tag. Consumers
 must use the receipt's verified `@sha256:...` manifest digest as authority.
 
-Only the CLI's exact manifest-not-found result permits a push. Existing tags,
-denial, unavailable credentials, unknown CLI wording and network failures stop.
+Absence is checked through fixed authenticated Registry V2 endpoints. The
+existing job actor/token requests a fresh bearer token with only the exact
+package's `pull` scope. First, that bearer must read the approved known core
+manifest and match its raw SHA256 and config digest. Only then is the unique
+intent tag read under the same bearer. Only HTTP 404 with the typed single
+`MANIFEST_UNKNOWN` error permits a push. An existing manifest, authorization
+failure, `NAME_UNKNOWN`, malformed response, redirect or unknown outcome stops.
+Requests have a 20-second timeout, explicit byte bounds and no proxies; no token,
+raw response, header or exception text enters receipts. Fixed phase and HTTP
+status facts distinguish failed preflights without inferring their cause.
 A local receipt is written with an unknown outcome before push. Runner loss
 before artifact upload or interruption during a receipt overwrite can lose or
 truncate it. An interrupted run remains unknown: independently reconcile the
 original run/attempt tag before any further attempt; never blindly rerun. No
 automatic retry occurs. A later attempt must use a new run/attempt locator.
+
+Historical run `40380330557` stopped before any push at the former CLI absence
+guard; its sanitized receipt could not establish the underlying CLI error.
+Its private-package and installed-seam checks passed and its probe was removed.
+That evidence remains valid; the revised protocol check does not relabel the
+earlier failure or justify retrying the old intent blindly.
 
 Registry raw manifest SHA256 and config digest must match the exact local
 verified image. Both the tag and immutable digest are read back, then the
