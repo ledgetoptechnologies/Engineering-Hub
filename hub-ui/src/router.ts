@@ -18,7 +18,9 @@ export type Route =
   | { page: "notes" }
   | { page: "planning" }
   | { page: "agents" }
-  | { page: "staging" };
+  | { page: "staging" }
+  | { page: "infrastructure" }
+  | { page: "device"; id: string };
 
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -73,6 +75,9 @@ export function parseRoute(value: string): Route {
     case "planning": return { page: "planning" };
     case "agents": return { page: "agents" };
     case "staging": return { page: "staging" };
+    case "infrastructure":
+      if (parts.length === 1) return { page: "infrastructure" };
+      return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
     case "projects": {
       if (parts.length === 1 || !projectId.test(parts[1])) return { page: "projects" };
       if (parts.length === 2) return { page: "project", id: parts[1], tab: "overview" };
@@ -94,6 +99,7 @@ export function pathOf(route: Route): string {
     case "project": return `/projects/${route.id}${route.tab === "overview" ? "" : "/" + route.tab}`;
     case "labels": return `/projects/${route.project}/labels/${route.set}`;
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
+    case "device": return `/infrastructure/${route.id}`;
     default: return `/${route.page}`;
   }
 }

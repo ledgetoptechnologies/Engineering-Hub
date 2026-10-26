@@ -1,0 +1,47 @@
+{
+  "list": {
+    "items": [
+      {
+        "id": "build-pc", "name": "Build PC", "hostname": "build.example.test", "addresses": ["198.51.100.20", "2001:db8::20"],
+        "network": "198.51.100.0/24", "vlan": 20, "role": "Staging builds", "retired": false, "revision": 3,
+        "updated_at": "2026-10-25T10:00:00+00:00",
+        "observations": [
+          { "probe_id": "exporter", "source_label": "Exporter scrape", "state": "ok", "observed_at": "2026-10-25T11:59:00+00:00", "valid_until": "2026-10-25T12:04:00+00:00" },
+          { "probe_id": "ping", "source_label": null, "state": "failed", "observed_at": "2026-10-25T11:58:00+00:00", "valid_until": "2026-10-25T12:03:00+00:00" }
+        ],
+        "open_maintenance": {
+          "id": "6f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b", "revision": 1, "device_id": "build-pc",
+          "reason": "Planned shutdown to replace the disk.", "expected_end": "2026-10-25T11:40:00+00:00", "state": "open",
+          "opened_at": "2026-10-25T10:30:00+00:00", "opened_by": { "kind": "agent", "identity": "hermes" },
+          "resolved_at": null, "resolved_by": null, "resolution": null
+        }
+      },
+      {
+        "id": "camera-hub", "name": "Camera hub", "hostname": null, "addresses": [], "network": null, "vlan": null,
+        "role": "Security cameras", "retired": false, "revision": 1, "updated_at": "2026-10-20T09:00:00+00:00",
+        "observations": [], "open_maintenance": null
+      }
+    ],
+    "capabilities": { "device_write": true, "maintenance_write": true }
+  },
+  "detail": {
+    "device": {
+      "id": "camera-hub", "name": "Camera hub", "hostname": null, "addresses": [], "network": null, "vlan": null,
+      "role": "Security cameras", "retired": false, "revision": 1, "updated_at": "2026-10-20T09:00:00+00:00",
+      "observations": [], "open_maintenance": null
+    },
+    "maintenance": {
+      "items": [
+        {
+          "id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "revision": 2, "device_id": "camera-hub",
+          "reason": "Firmware update.\nCameras offline for about 20 minutes.", "expected_end": null, "state": "resolved",
+          "opened_at": "2026-10-19T08:00:00+00:00", "opened_by": { "kind": "human", "identity": "human:cf:example" },
+          "resolved_at": "2026-10-19T08:40:00+00:00", "resolved_by": { "kind": "agent", "identity": "hermes" },
+          "resolution": "Updated and checked."
+        }
+      ],
+      "truncated": false
+    },
+    "capabilities": { "device_write": false, "maintenance_write": true }
+  }
+}
