@@ -224,8 +224,16 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None, work_queue=None, archive_reader=None,
-               queued_pilot_runtime=None, bus_app=None, shared_staging=None):
+               queued_pilot_runtime=None, bus_app=None, shared_staging=None, access_verifier=None):
     settings = settings or Settings.from_env()
+    if access_verifier is not None:
+        from .cloudflare_access import CloudflareAccessVerifier
+        if (type(access_verifier) is not CloudflareAccessVerifier
+                or settings.auth_config is None
+                or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                or access_verifier.config != settings.auth_config.cloudflare_config
+                or settings.ingress_mode != 'combined'):
+            raise ValueError('explicit_access_verifier_binding_required')
     if shared_staging is not None and repository is None:
         raise ValueError('shared_staging_application_binding_required')
     if settings.require_owned_ledger:
@@ -605,7 +613,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     if (settings.auth_config.human_auth_mode == "cloudflare_access"
             and settings.ingress_mode == "combined"):
         from .cloudflare_access import install_cloudflare_access
-        install_cloudflare_access(app, settings.auth_config.cloudflare_config)
+        install_cloudflare_access(app, settings.auth_config.cloudflare_config, verifier=access_verifier)
     app.include_router(build_auth_router(settings.auth_config, sessions, github_client))
     if bus_app is None:
         app.mount("/mcp", HubMCPAuthMiddleware(mcp_app, settings.agent_auth))
