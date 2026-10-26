@@ -154,7 +154,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core)
+        return HubFrontends(core, access_verifier=access_verifier)
 
     async def cleanup():
         failed = False

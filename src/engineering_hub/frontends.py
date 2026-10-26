@@ -22,6 +22,7 @@ class _FrontDoor:
             pair.core, mode=mode, agent_auth=pair.settings.agent_auth,
             cloudflare_config=pair.settings.auth_config.cloudflare_config,
             legacy_bus_enabled=getattr(pair.core.state, 'embedded_bus', None) is not None,
+            access_verifier=pair.access_verifier if mode == 'browser' else None,
         )
 
     async def __call__(self, scope, receive, send):
@@ -61,7 +62,7 @@ class HubFrontends:
     A failed/closed pair requires a new process/core under normal owner rules.
     """
 
-    def __init__(self, core):
+    def __init__(self, core, *, access_verifier=None):
         if not isinstance(core, FastAPI):
             raise ValueError("Hub frontends require one existing FastAPI Hub core")
         settings = getattr(core.state, "settings", None)
@@ -71,7 +72,13 @@ class HubFrontends:
             raise ValueError("Shared Hub core requires combined ingress and configured Cloudflare Access")
         if getattr(core.state, "hub_frontends", None) is not None:
             raise ValueError("Hub core already has a frontend lifecycle coordinator")
+        if access_verifier is not None:
+            from .cloudflare_access import CloudflareAccessVerifier
+            if (type(access_verifier) is not CloudflareAccessVerifier
+                    or access_verifier.config != settings.auth_config.cloudflare_config):
+                raise ValueError('explicit_access_verifier_binding_required')
         self.core, self.settings = core, settings
+        self.access_verifier = access_verifier
         self.state = "new"
         self.agents = _FrontDoor(self, "agents")
         self.browser = _FrontDoor(self, "browser")
