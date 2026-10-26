@@ -2,7 +2,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import tarfile
 import tomllib
 
@@ -15,6 +17,21 @@ SPEC = importlib.util.spec_from_file_location(
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 REVISION = "a" * 40
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX wheel mode reproducibility')
+@pytest.mark.parametrize('mask', [0o022, 0o077, 0o002])
+def test_prepared_modes_do_not_depend_on_umask(tmp_path, mask):
+    previous = os.umask(mask)
+    try:
+        out = MODULE.prepare_archive(archive(), revision=REVISION,
+                                     output_directory=tmp_path / 'new')
+    finally:
+        os.umask(previous)
+    files = [p for p in out.rglob('*') if p.is_file()]
+    assert files
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o644 for p in files)
+    assert json.loads((out / 'src/hub_container_executor/_executor_source.json').read_bytes())['source_commit'] == REVISION
 
 
 def archive(extra=(), *, comment=REVISION, omit=None):

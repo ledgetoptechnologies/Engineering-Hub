@@ -1,5 +1,6 @@
 """Fail-closed dispatch inputs and canonical source preparation; no Docker/network."""
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -13,6 +14,32 @@ SPEC = importlib.util.spec_from_file_location('executor_compatibility_ci', ROOT 
 CI = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CI)
 SOURCE = '40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc'
+
+
+@pytest.fixture
+def source_repository(tmp_path, monkeypatch):
+    """Real immutable Git bytes without depending on checkout history depth."""
+    repo = tmp_path / 'repository'
+    repo.mkdir()
+    names = ['packaging/hub-executor/pyproject.toml', 'packaging/hub-executor/README.md',
+             'scripts/inspect_hub_image_identity.py']
+    names += [p.relative_to(ROOT).as_posix() for p in (ROOT / 'hub_container_executor').glob('*.py')]
+    names += ['docker/Dockerfile.hub-executor', 'scripts/verify_hub_executor_wheel.py']
+    for name in names:
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / name).read_bytes())
+    def git(*args):
+        return subprocess.check_output(['git', '-c', 'core.autocrlf=false',
+                                        '-C', str(repo), *args], stderr=subprocess.PIPE)
+    git('init')
+    git('add', '.')
+    git('-c', 'commit.gpgsign=false', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit', '-m', 'Immutable fixture source')
+    source = git('rev-parse', 'HEAD').decode().strip()
+    raw = git('archive', '--format=tar', source)
+    monkeypatch.chdir(repo)
+    return source, raw
 
 
 def environment():
@@ -42,15 +69,17 @@ def test_validated_inputs_do_not_contain_credentials():
                                   'CORE_CONFIG', 'WHEEL_SHA256', 'SOURCE_DATE_EPOCH'}
 
 
-def test_preparation_uses_immutable_git_bytes(tmp_path):
-    # Historical reviewed source remains an ancestor; source is never checkout-normalized.
-    source, context = CI.prepare(CI.inputs(environment()), tmp_path)
+def test_preparation_uses_immutable_git_bytes(tmp_path, source_repository):
+    revision, archive = source_repository
+    values = CI.inputs(environment())
+    values['SOURCE_COMMIT'] = revision
+    source, context = CI.prepare(values, tmp_path)
     provenance = json.loads((source / 'src/hub_container_executor/_executor_source.json').read_bytes())
-    assert provenance['source_commit'] == SOURCE
-    assert provenance['source_archive_sha256'] == '07306b40c628191d4d57802b18d5575e0feb8676571aa487a2eda3190784b8f0'
+    assert provenance['source_commit'] == revision
+    assert provenance['source_archive_sha256'] == hashlib.sha256(archive).hexdigest()
     for original, destination in [('docker/Dockerfile.hub-executor', 'Dockerfile'),
                                   ('scripts/verify_hub_executor_wheel.py', 'validate_executor_wheel.py')]:
-        raw = subprocess.check_output(['git', 'cat-file', 'blob', SOURCE + ':' + original], cwd=ROOT)
+        raw = subprocess.check_output(['git', 'cat-file', 'blob', revision + ':' + original])
         assert (context / destination).read_bytes() == raw
     assert sorted(p.name for p in context.iterdir()) == ['Dockerfile', 'validate_executor_wheel.py']
 
@@ -106,17 +135,20 @@ def test_failure_codes_are_bounded_and_do_not_copy_exception_text(exc, kind, cod
     assert CI.failure(exc, 'wheel_build') == {'stage': 'wheel_build', 'kind': kind, 'exit_code': code}
 
 
-def test_source_diagnostics_survive_preparation_failure(monkeypatch, tmp_path):
+def test_source_diagnostics_survive_preparation_failure(monkeypatch, tmp_path, source_repository):
+    revision, archive = source_repository
+    values = CI.inputs(environment())
+    values['SOURCE_COMMIT'] = revision
     def reject(*args, **kwargs):
         raise ValueError('private source path')
 
     monkeypatch.setattr(CI, 'prepare_archive', reject)
     evidence = {}
     with pytest.raises(ValueError):
-        CI.prepare(CI.inputs(environment()), tmp_path, evidence)
+        CI.prepare(values, tmp_path, evidence)
     assert evidence['stage'] == 'source_prepare'
-    assert evidence['source_archive_sha256'] == '07306b40c628191d4d57802b18d5575e0feb8676571aa487a2eda3190784b8f0'
-    assert evidence['source_archive_bytes'] == 10168320
+    assert evidence['source_archive_sha256'] == hashlib.sha256(archive).hexdigest()
+    assert evidence['source_archive_bytes'] == len(archive)
 
 
 def test_observed_wheel_preserved_before_expected_verification(monkeypatch, tmp_path):

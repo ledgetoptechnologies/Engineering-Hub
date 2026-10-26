@@ -86,6 +86,10 @@ def prepare_archive(archive: bytes, *, revision: str, output_directory: Path) ->
             destination = staged / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(value)
+            # Wheel ZIP attributes include source modes. In particular the
+            # generated provenance must not inherit the builder's umask.
+            # Build on Linux; Windows bind mounts cannot preserve POSIX modes.
+            destination.chmod(0o644)
         if output.exists() or output.is_symlink():
             raise ValueError("output appeared during preparation")
         staged.rename(output)
