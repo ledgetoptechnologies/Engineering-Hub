@@ -1,5 +1,25 @@
 name: Publish verified staging executor
 on:
+  workflow_call:
+    inputs:
+      source_commit:
+        type: string
+        required: true
+      core_digest:
+        type: string
+        required: true
+      core_commit:
+        type: string
+        required: true
+      core_config:
+        type: string
+        required: true
+      wheel_sha256:
+        type: string
+        required: true
+      source_date_epoch:
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       source_commit:

@@ -6,6 +6,18 @@ Beau approved staging-only publication directly in this chat on October 26,
 production. Existing compatibility CI remains read-only. Publication success
 must still be established by the actual run and verified registry receipt.
 
+The already registered **Verify disposable executor compatibility** manual
+workflow provides an opt-in route while GitHub has not indexed the new publisher
+for direct dispatch. Its boolean `publish_staging` defaults to `false`: normal
+compatibility runs keep their existing read-only permissions and steps. An
+explicit `true` on main selects a separate job with the approved package-write
+permission and calls the fixed local publisher workflow from the same commit.
+The read-only job is skipped for that opt-in. The caller passes the same six
+reviewed immutable inputs without changing them; supply the newer core tuple
+listed below rather than compatibility's historical default core. The child
+retains its manual/main guard and input/ancestry checks. No push trigger, generic
+loader, credentials, normal control publication or `latest` promotion is added.
+
 One manual main dispatch rebuilds the exact reviewed tuple
 using the existing canonical wheel and compatibility helpers, then reinspect
 the exact smoke-verified image ID, fixed defaults, source provenance and wheel.
