@@ -1,7 +1,6 @@
 /**
- * PROVISIONAL HTTP adapter for the infrastructure registry. The route shapes are the UI's proposal
- * (see docs/infrastructure-ui.md) until the backend freezes its HTTP wiring; everything else in the
- * UI goes through the Reader/Writer interfaces so only this file changes when it does.
+ * HTTP adapter for the capability-gated infrastructure registry. The backend validates the full
+ * reference fixture against its response projection (see docs/infrastructure-ui.md).
  */
 import { HubApiError, isMissingRoute } from "./api";
 import { parseDevice, parseDeviceDetail, parseDeviceList, parseMaintenance, type Device, type DeviceDetail, type DeviceList, type Maintenance } from "./infrastructureModel";

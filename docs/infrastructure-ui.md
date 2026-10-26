@@ -4,9 +4,10 @@ The dashboard's Infrastructure page (`#/infrastructure`, `#/infrastructure/<devi
 devices the Hub knows about, what its checks last saw, and any maintenance in progress. Nothing on
 the page powers, restarts or changes a device.
 
-**Status:** UI built against a fixture. The HTTP routes below are the UI's proposal. Until the
-backend freezes them, only `hub-ui/src/infrastructureApi.ts` should need to change. No live data,
-access grants or deployment come with this page.
+**Status:** UI and HTTP/MCP adapters are integrated. The backend checks the complete reference
+fixture against its real response projection; Linux app tests exercise authentication, CSRF,
+capabilities and persistence. Browser tests exercise the page at desktop and phone widths.
+No live data, access grants or deployment come with this source change.
 
 ## Access: the current limit
 
@@ -22,7 +23,7 @@ everything, so the page must not rely on "any signed-in person".
   "Infrastructure isn't available to you on this Hub." It never reveals whether any devices exist.
 - 401 signs the workspace out, as on other pages.
 
-## Proposed routes
+## Routes
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -74,10 +75,10 @@ everything, so the page must not rely on "any signed-in person".
   inside it) and VLAN (1 to 4094) before saving. The server stays the authority. The VLAN is never
   guessed from an address.
 
-## Needed on the server before this goes live
+## Activation
 
-1. The routes above, or the backend's final ones, so `infrastructureApi.ts` can be updated.
-2. The default-deny capability on HTTP and MCP, plus `capabilities.infrastructure` per caller in the overview.
-3. The client-route fallback must serve `/infrastructure` and `/infrastructure/<id>`, so path URLs
-   work as well as `#/` ones.
-4. A backend test that validates `hub-ui/src/fixtures/infrastructure-v1.json` against the real response models.
+The optional module remains disabled until the owner supplies explicit infrastructure settings.
+See [infrastructure-registry.md](infrastructure-registry.md) for its fixed storage layout and
+capabilities. The existing Hub Compose and Cloudflare login stay as they are. Importing declared
+devices and connecting an actual observation source are separate steps; the fixture is never
+imported as live inventory. No Prometheus collector or new background polling is activated here.

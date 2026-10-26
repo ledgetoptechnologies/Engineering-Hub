@@ -78,9 +78,13 @@ class InfrastructurePrincipal:
 
 class InfrastructureRegistry:
     """Dedicated connection ownership transfers here on successful creation."""
-    def __init__(self, connection, *, capabilities=None, clock=None):
+    def __init__(self, connection, *, capabilities=None, clock=None, admission_guard=None):
         if type(connection) is not sqlite3.Connection or connection.in_transaction:
             raise TypeError('An idle dedicated SQLite connection is required')
+        if admission_guard is not None and not callable(admission_guard):
+            raise TypeError('admission_guard must be a trusted callable')
+        self._admission_guard, self._admission_failed = admission_guard, False
+        self._assert_admission()
         if (any(row[1] != 'main' for row in connection.execute('PRAGMA database_list'))
                 or connection.execute('SELECT 1 FROM sqlite_temp_master LIMIT 1').fetchone()):
             raise HubError('dedicated_infrastructure_database_required', 409)
@@ -113,6 +117,20 @@ class InfrastructureRegistry:
                 REFERENCES infra_devices(id),principal TEXT NOT NULL,data TEXT NOT NULL);
         ''')
         self.db.commit()
+        self._assert_admission()
+
+    def _assert_admission(self):
+        # This callback is trusted composition metadata, never request input.
+        # Loss is sticky: a later True cannot adopt replacement storage.
+        if self._admission_failed:
+            raise HubError('infrastructure_unavailable',503)
+        if self._admission_guard is not None:
+            try:
+                if self._admission_guard() is not True:
+                    raise ValueError()
+            except Exception:
+                self._admission_failed = True
+                raise HubError('infrastructure_unavailable',503) from None
 
     @staticmethod
     def _principal(principal):
@@ -127,6 +145,7 @@ class InfrastructureRegistry:
         if ('read' not in allowed or action not in allowed
                 or (action == 'device_write' and principal.kind != 'human')):
             raise HubError('forbidden', 403)
+        self._assert_admission()
 
     def _now(self):
         value = self.clock()
@@ -137,13 +156,26 @@ class InfrastructureRegistry:
     @contextmanager
     def _transaction(self):
         with self.lock:
+            self._assert_admission()
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield self.db
+                self._assert_admission()
                 self.db.commit()
+                self._assert_admission()
             except Exception:
                 self.db.rollback()
+                self._assert_admission()
                 raise
+
+    @contextmanager
+    def _reading(self):
+        with self.lock:
+            self._assert_admission()
+            try:
+                yield
+            finally:
+                self._assert_admission()
 
     @staticmethod
     def _device(db, identity):
@@ -219,14 +251,14 @@ class InfrastructureRegistry:
 
     def get_device(self, principal, device_id):
         self._authorize(principal, 'read')
-        with self.lock:
+        with self._reading():
             return self._device(self.db, device_id)
 
     def list_devices(self, principal, *, include_retired=False):
         self._authorize(principal, 'read')
         if type(include_retired) is not bool:
             raise HubError('invalid_filter')
-        with self.lock:
+        with self._reading():
             items = [json.loads(row[0]) for row in self.db.execute('SELECT data FROM infra_devices ORDER BY id LIMIT 257')]
             if len(items) > 256:
                 raise HubError('device_limit', 409)
@@ -287,7 +319,7 @@ class InfrastructureRegistry:
         self._authorize(principal,'read')
         if type(limit) is not int or not 1<=limit<=50:
             raise HubError('invalid_limit')
-        with self.lock:
+        with self._reading():
             self._device(self.db,device_id)
             rows=self.db.execute('SELECT data FROM infra_maintenance WHERE device_id=? ORDER BY rowid DESC LIMIT ?',
                                  (device_id,limit+1)).fetchall()
@@ -336,7 +368,7 @@ class InfrastructureRegistry:
     def probe_state(self, principal, device_id, *, probe_id='default'):
         self._authorize(principal,'read')
         probe_id=_slug(probe_id)
-        with self.lock:
+        with self._reading():
             self._device(self.db,device_id)
             rows=self.db.execute('SELECT data FROM infra_probes WHERE device_id=? ORDER BY sequence DESC LIMIT ?',
                                  (device_id,MAX_PROBES_PER_DEVICE+1)).fetchall()
@@ -363,7 +395,7 @@ class InfrastructureRegistry:
 
     def probe_states(self, principal, device_id):
         self._authorize(principal,'read')
-        with self.lock:
+        with self._reading():
             self._device(self.db,device_id)
             rows=self.db.execute('SELECT data FROM infra_probes WHERE device_id=? LIMIT ?',
                                  (device_id,MAX_PROBES_PER_DEVICE+1)).fetchall()

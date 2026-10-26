@@ -58,6 +58,8 @@ def browser_route_allowed(method, path):
     """Closed browser surface; new backend routes are not exposed implicitly."""
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
+                or path == '/api/hub/v1/infrastructure/devices'
+                or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
@@ -71,12 +73,16 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + r'(?:/results|/items/' + _LABEL_ID + '/image)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/topics/' + _TOPIC + r'/(?:peers|preflight|events)', path) is not None)
     if method == 'PUT':
-        return (re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
+        return (re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None)
     if method == 'PATCH':
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
-    return method == 'POST' and (path in _POST or re.fullmatch(
+    return method == 'POST' and (path in _POST
+        or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID + '/maintenance', path) is not None
+        or re.fullmatch(r'/api/hub/v1/infrastructure/maintenance/' + _UUID + '/resolve', path) is not None
+        or re.fullmatch(
         r'/api/hub/v1/interactive-reviews/' + _UUID + '/answers', path) is not None or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None

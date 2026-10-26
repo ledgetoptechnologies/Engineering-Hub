@@ -1,7 +1,7 @@
 # Infrastructure registry source contract
 
-`engineering_hub.infrastructure` supplies a standalone, dedicated SQLite ledger.
-It is not connected to application startup, HTTP, MCP, settings or the dashboard.
+`engineering_hub.infrastructure` supplies a standalone, dedicated SQLite ledger,
+composed optionally at application startup with capability-gated HTTP, MCP and dashboard adapters.
 Adding the module does not provision access, import inventory, probe machines or
 change existing Cloudflare policies. Production still lacks project-only human
 access; adding a collaborator to its global allowlist would not isolate them.
@@ -54,13 +54,48 @@ ledger integration must use its writer-fenced transactions instead of bypassing
 them. Any connection factory used across threads must select SQLite's appropriate
 threading configuration; the registry lock alone does not change that setting.
 
-Before exposing the feature, enforce the same default-deny capability on every
+The adapters enforce the same default-deny capability on every
 HTTP and MCP list/read/write route, require human CSRF for mutations, and expose
 caller-specific UI capabilities. Client/project-only collaborators must not
 inherit global infrastructure access. UI hiding is not authorization. Default
 configuration remains disabled until the owner provisions the intended policy.
 
-The later UI should show declared facts, each probe's age/source and the
-maintenance journal, with manual refresh and existing event invalidation. It
-must age observations locally and never manufacture a new last-seen timestamp
-from a cached read. This source candidate does not claim those UI/API checks.
+The UI shows declared facts, each probe's age/source and the maintenance journal,
+with manual refresh and existing event invalidation. It ages observations locally
+and never manufactures a new last-seen timestamp from a cached read. Invalidation
+uses only a generic refresh event; device details and reasons do not enter the
+global Hub event payload.
+
+## Optional startup settings and storage
+
+The existing state mount is sufficient. Place `infrastructure.json` beside the Hub
+database; no Compose changes, new token or Cloudflare setting is needed. The file
+is bounded to 16 KiB and uses this closed schema (identities below are examples):
+
+```json
+{"schema_version":1,"enabled":true,"principals":[
+  {"kind":"human","identity":"human:42","capabilities":["read","device_write","maintenance_write"]},
+  {"kind":"agent","identity":"hermes","capabilities":["read","maintenance_write","probe_write"]}
+]}
+```
+
+Use the actual authenticated human identity, never a guessed email or display name.
+Every writer also needs `read`. Agents cannot receive `device_write`. Unlisted
+callers have no access; being signed into another project grants nothing here.
+Settings are read on startup, with no automatic credential or grant provisioning.
+On Linux the regular, single-link configuration file must be root/current-user
+owned and not group/other writable. Keep the mounted state paths stable while live.
+
+Missing or disabled settings create no inventory directory/database. Valid enabled
+settings create a private `infrastructure/` directory and dedicated `inventory.sqlite3`
+under that state root (0700/0600 on Linux). A lifetime owner lock prevents a second
+module writer. Foreign schemas, symlinks, changed live storage identity and existing
+SQLite journal/WAL/SHM files fail closed. Existing journals require reviewed recovery;
+the module does not delete them or silently adopt another writer's database.
+Invalid optional settings leave the rest of Hub running with infrastructure unavailable.
+
+Five MCP tools expose list/get, maintenance open/resolve and probe record under the
+authenticated agent's capabilities. Probe recording accepts actual observation and
+expiry times and performs no network probe. There is no collector, arbitrary target URL,
+power control or automatic shutdown. Reconcile Hermes's historical device facts before
+import; old manual status labels are not current observations.

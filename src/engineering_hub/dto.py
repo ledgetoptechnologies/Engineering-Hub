@@ -239,6 +239,7 @@ class AutonomyDTO(ResponseDTO):
 
 
 class CapabilitiesDTO(ResponseDTO):
+    infrastructure: bool = False
     production: bool
     host_dispatch: bool
     github_merge: bool

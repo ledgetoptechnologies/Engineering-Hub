@@ -59,6 +59,7 @@ class Settings:
     registry_events_enabled: bool = False
     require_owned_ledger: bool = False
     staging_config_path: Path | None = None
+    infrastructure_config_path: Path | None = None
 
     def __post_init__(self):
         if type(self.require_owned_ledger) is not bool:
@@ -136,7 +137,9 @@ class Settings:
                    registry_events_enabled=registry_events_flag == '1',
                    require_owned_ledger=deployment.protected_ledger if deployment is not None else False,
                    staging_config_path=(deployment.state_root / 'staging-service.json'
-                                        if deployment is not None else path.parent / 'staging-service.json'))
+                                        if deployment is not None else path.parent / 'staging-service.json'),
+                   infrastructure_config_path=(deployment.state_root / 'infrastructure.json'
+                                        if deployment is not None else path.parent / 'infrastructure.json'))
 
 
 class Input(BaseModel):
@@ -443,7 +446,22 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         notes_repository.configure_write_admission(project_registry.knowledge_write_admission)
     label_sets = LabelSetRepository(repo)
     entity_images = EntityImageRepository(repo)
-    hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
+    from .infrastructure_module import compose_infrastructure
+
+    def infrastructure_changed(_event):
+        # Invalidate the existing event feed without disclosing device IDs,
+        # maintenance reasons or even their category to other Hub principals.
+        # The ordinary repository transaction retains its real writer fence.
+        with repo._transaction() as db:
+            repo._emit(db, 'views.invalidated', {
+                'id': '00000000-0000-0000-0000-000000000000', 'revision': 0,
+                'updated_at': datetime.now(timezone.utc).isoformat()})
+
+    infrastructure = compose_infrastructure(
+        settings.infrastructure_config_path or Path(settings.database).parent / 'infrastructure.json',
+        state_root=Path(settings.database).parent, on_change=infrastructure_changed)
+    try:
+        hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
                           work_queue=work_queue, mcp=bus_mcp,
                           agent_status=agents_for if bus_app is not None else None,
@@ -453,27 +471,31 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           project_registry=project_registry,
                           component_registry=component_registry,
                           interactive_reviews=interactive_reviews,
+                          infrastructure_service=infrastructure.service,
                           staging_controller=staging_module.controller,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
-    origin = urlsplit(settings.auth_config.origin)
-    transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=list(dict.fromkeys([origin.netloc] + (
-            list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
-        allowed_origins=[settings.auth_config.origin],
-    )
-    if bus_app is None:
-        hub_mcp.settings.transport_security = transport_security
-        mcp_app = hub_mcp.streamable_http_app()
-    else:
-        # The bus session manager already captured its transport policy during
-        # factory construction. Never pretend changing settings afterward fixes it.
-        actual = hub_mcp.settings.transport_security
-        if (actual is None or not actual.enable_dns_rebinding_protection
-                or set(actual.allowed_hosts or ()) != set(transport_security.allowed_hosts or ())
-                or set(actual.allowed_origins or ()) != set(transport_security.allowed_origins or ())):
-            raise ValueError('Unified transport policy must be installed before bus construction')
+        origin = urlsplit(settings.auth_config.origin)
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(dict.fromkeys([origin.netloc] + (
+                list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
+            allowed_origins=[settings.auth_config.origin],
+        )
+        if bus_app is None:
+            hub_mcp.settings.transport_security = transport_security
+            mcp_app = hub_mcp.streamable_http_app()
+        else:
+            # The bus session manager already captured its transport policy during
+            # factory construction. Never pretend changing settings afterward fixes it.
+            actual = hub_mcp.settings.transport_security
+            if (actual is None or not actual.enable_dns_rebinding_protection
+                    or set(actual.allowed_hosts or ()) != set(transport_security.allowed_hosts or ())
+                    or set(actual.allowed_origins or ()) != set(transport_security.allowed_origins or ())):
+                raise ValueError('Unified transport policy must be installed before bus construction')
+    except BaseException:
+        infrastructure.close()
+        raise
 
     @asynccontextmanager
     async def lifespan(app):
@@ -495,7 +517,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     try:
                         await interactive_service.close()
                     finally:
-                        await stop_existing_components()
+                        try:
+                            await stop_existing_components()
+                        finally:
+                            infrastructure.close()
             await finish_owned(stop_all())
 
         async def stop_existing_components():
@@ -636,6 +661,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_notes_routes(app, repository=notes_repository, actor=actor)
     from .planning_api import attach_planning_routes
     attach_planning_routes(app, repository=notes_repository, actor=actor)
+    from .infrastructure_api import attach_infrastructure_routes
+    attach_infrastructure_routes(app, infrastructure.service, actor)
+    app.state.infrastructure = infrastructure
     from .label_sets_api import attach_label_set_routes
     attach_label_set_routes(app, repository=label_sets, actor=actor, human=human)
     from .attachments_api import attach_image_routes
@@ -822,12 +850,20 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
 
     @app.get("/api/hub/v1/overview", response_model=OverviewDTO, response_model_exclude_unset=True)
     async def overview(request: Request):
-        actor(request)
+        principal = actor(request)
+        infrastructure_visible = False
+        if infrastructure.service is not None:
+            try:
+                infrastructure.service.require(principal)
+                infrastructure_visible = True
+            except HubError:
+                pass
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
                 "image_versions": image_versions_for(notes_repository),
                 "capabilities": {"production": False, "host_dispatch": False,
+                                 "infrastructure": infrastructure_visible,
                                  "github_merge": False, "processing": False,
                                  "fixture_dispatch": fixture_workflow is not None,
                                  "container_pilot_dispatch": container_pilot_workflow is not None,

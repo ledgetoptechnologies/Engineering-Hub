@@ -63,6 +63,7 @@ def test_overview_requires_identity_and_has_explicit_unknown_readiness(hub):
     assert response.status_code == 200
     overview = response.json()
     assert overview["capabilities"] == {
+        "infrastructure": False,
         "production": False, "host_dispatch": False, "github_merge": False,
         "processing": False, "fixture_dispatch": False, "container_pilot_dispatch": False,
         "merge_gate_strength": "not_enforced",

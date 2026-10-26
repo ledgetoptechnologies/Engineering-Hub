@@ -23,7 +23,7 @@ export function demoDevices(now = new Date()): { devices: Device[]; history: Rec
     device({ id: "storage-server", name: "Storage server", hostname: "storage.example.test", addresses: ["192.0.2.10"],
       network: "192.0.2.0/24", vlan: 10, role: "File storage and the Hub", observations: [probe("exporter", "Exporter scrape", "ok", 1)] }),
     device({ id: "build-pc", name: "Build PC", hostname: "build.example.test", addresses: ["198.51.100.20", "2001:db8::20"],
-      network: "198.51.100.0/24", vlan: 20, role: "Staging builds", open_maintenance: maintenance,
+      network: null, vlan: 20, role: "Staging builds", open_maintenance: maintenance,
       observations: [probe("exporter", "Exporter scrape", "ok", 100)] }),
     device({ id: "office-printer", name: "Office printer", addresses: ["192.0.2.40"], network: "192.0.2.0/24", vlan: 10, role: "Printing",
       observations: [probe("ping", "Ping check", "failed", 2)] }),
