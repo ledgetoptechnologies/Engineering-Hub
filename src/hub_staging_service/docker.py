@@ -4,15 +4,78 @@ import io
 import hashlib
 import os
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
 import tarfile
 
-from .core import Rejected, ensure, tree_manifest, relative, make_job_readable
+from .core import Rejected, ensure, tree_manifest, relative, make_job_readable, identifier
+
+
+# Trusted immutable-image Python only, before source copy/recipe execution.
+# Scratch-enabled images must provide this fixed interpreter and stdlib.
+_SCRATCH_PROBE = """import json,os,stat
+p='/ci-scratch'
+s=os.stat(p,follow_symlinks=False);v=os.statvfs(p)
+with open('/proc/self/mountinfo','rb') as f:m=f.read(65537)
+with open('/proc/self/uid_map','rb') as f:u=f.read(4097)
+with open('/proc/self/gid_map','rb') as f:g=f.read(4097)
+print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'owner_uid':s.st_uid,'owner_gid':s.st_gid,
+'mode':stat.S_IMODE(s.st_mode),'device':s.st_dev,'inode':s.st_ino,
+'block_size':v.f_frsize,'blocks':v.f_blocks,'capacity_inodes':v.f_files,
+'free_bytes':v.f_bavail*v.f_frsize,'free_inodes':v.f_favail,'filesystem_id':v.f_fsid,
+'mountinfo':m.decode('utf-8'),'uid_map':u.decode('ascii'),'gid_map':g.decode('ascii')},separators=(',',':')))
+"""
+
+
+# Owned cleanup, not source execution: fixed isolated-image Python, same mapped
+# nonroot identity, only the exact scratch bind. Never chmod the worker-owned top.
+_SCRATCH_CLEANUP = """import json,os,stat,sys,time
+expected_device,expected_inode,uid,gid,maximum=map(int,sys.argv[1:])
+assert uid>0 and gid>0 and os.getuid()==uid and os.getgid()==gid and 0<maximum<=100000
+root=os.open('/ci-scratch',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+identity=os.fstat(root);assert identity.st_dev==expected_device and identity.st_ino==expected_inode
+removed=0;deadline=time.monotonic()+45
+
+def sweep(parent,depth):
+ global removed
+ assert depth<=64
+ with os.scandir(parent) as entries:
+  for entry in entries:
+   assert time.monotonic()<deadline and removed<maximum
+   info=entry.stat(follow_symlinks=False)
+   assert info.st_dev==expected_device
+   if stat.S_ISDIR(info.st_mode):
+    anchor=os.open(entry.name,os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+    try:
+     actual=os.fstat(anchor)
+     assert (actual.st_dev,actual.st_ino)==(info.st_dev,info.st_ino) and actual.st_uid==uid
+     if stat.S_IMODE(actual.st_mode)&0o700 != 0o700:
+      os.chmod('/proc/self/fd/'+str(anchor),stat.S_IMODE(actual.st_mode)|0o700)
+     child=os.open(entry.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+     try:
+      opened=os.fstat(child);assert (opened.st_dev,opened.st_ino)==(actual.st_dev,actual.st_ino)
+      sweep(child,depth+1)
+     finally:os.close(child)
+     check=os.stat(entry.name,dir_fd=parent,follow_symlinks=False)
+     assert (check.st_dev,check.st_ino)==(actual.st_dev,actual.st_ino)
+     os.rmdir(entry.name,dir_fd=parent)
+    finally:os.close(anchor)
+   else:
+    os.unlink(entry.name,dir_fd=parent)
+   removed+=1
+try:
+ sweep(root,0)
+ with os.scandir(root) as remaining:assert next(remaining,None) is None
+ final=os.fstat(root);assert (final.st_dev,final.st_ino)==(expected_device,expected_inode)
+ os.fsync(root)
+ print(json.dumps({'empty':True,'removed':removed,'device':expected_device,'inode':expected_inode}))
+finally:os.close(root)
+"""
 
 
 _CGROUP_PROBE = ('exec /bin/cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max '
@@ -32,12 +95,17 @@ class DockerBackend:
                '\x00' not in endpoint and '\\' not in endpoint and
                all(part not in ('', '.', '..') for part in endpoint[8:].split('/')),
                'local_unix_docker_endpoint_required')
+        self._scratch_engine = None
         self.executable = executable
         self.endpoint = endpoint
         self.env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
                     'DOCKER_HOST': endpoint, 'DOCKER_CONFIG': '/nonexistent/eh-staging-no-config'}
 
     def command(self, *parts):
+        # Every controlled Engine interaction is rechecked while a scratch run
+        # is bound, including finally-path cleanup and trusted probes.
+        if self._scratch_engine is not None and parts[:1] != ('info',):
+            ensure(self._verify_daemon() == self._scratch_engine[1], 'execution_uncertain')
         return [self.executable, '--host', self.endpoint, *parts]
 
     @staticmethod
@@ -49,16 +117,35 @@ class DockerBackend:
                                'resource_id': paths['build'].name}
         return specs
 
-    def argv(self, paths, profile, command_id, stage):
+    @staticmethod
+    def _scratch_lease(lease, paths, command_id, *, admission=True):
+        from .scratch import ScratchLease, ScratchSlot
+        ensure(type(lease) is ScratchLease and type(lease.slot) is ScratchSlot,
+               'scratch_lease_required')
+        identifier(command_id)
+        identifier(lease.job_id)
+        ensure(lease.command_id == command_id and
+               lease.path == lease.slot.path / ('job-' + command_id)
+               and ',' not in str(lease.path)
+               and lease.resource_ids == {kind: paths[kind].name for kind in
+                                                    ('workspace', 'build', 'test_run', 'preview')},
+               'scratch_command_drift')
+        return lease.verify(admission=admission)
+
+    def argv(self, paths, profile, command_id, stage, *, scratch_lease=None):
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
         name = 'eh-stage-' + scope[:12] + '-' + command_id + '-' + stage
+        if scratch_lease is not None:
+            self._scratch_lease(scratch_lease, paths, command_id)
+        uid, gid = ((scratch_lease.container_uid, scratch_lease.container_gid)
+                    if scratch_lease is not None else (os.getuid(), os.getgid()))
         args = self.command('run', '--detach', '--pull=never', '--name', name) + [
                 '--label', 'engineering-hub.staging.command=' + command_id,
                 '--label', 'engineering-hub.staging.stage=' + stage,
                 '--label', 'engineering-hub.staging.scope=' + scope,
                 '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                 '--cgroupns=private',
-                '--read-only', '--user', str(os.getuid()) + ':' + str(os.getgid()),
+                '--read-only', '--user', str(uid) + ':' + str(gid),
                 '--pids-limit', str(profile['pids']), '--memory', str(profile['memory_mb']) + 'm',
                 '--memory-swap', str(profile['memory_mb']) + 'm', '--cpus', str(profile['cpus']),
                 '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777',
@@ -71,6 +158,10 @@ class DockerBackend:
             args += ['--mount', 'type=volume,source=' + specs['output']['name'] + ',target=/output,volume-nocopy']
         else:
             args += ['--mount', 'type=bind,src=' + str(paths['build']) + ',dst=/output,readonly']
+        if scratch_lease is not None:
+            args += ['--env', 'EH_CI_SCRATCH=1']
+            args += ['--mount', 'type=bind,src=' + str(scratch_lease.path) +
+                     ',dst=/ci-scratch,bind-propagation=rprivate,bind-recursive=disabled']
         args += ['--entrypoint=/bin/sh', profile['image_id'], '-c', 'while :; do sleep 3600; done']
         return name, args
 
@@ -190,6 +281,16 @@ class DockerBackend:
                and 'name=rootless' in info['SecurityOptions']
                and info.get('CgroupVersion') == '2' and info.get('CgroupDriver') == 'systemd',
                'rootless_cgroup_policy_unverified')
+        engine_id = info.get('ID')
+        if self._scratch_engine is not None:
+            ensure(type(engine_id) is str and engine_id == self._scratch_engine[1],
+                   'execution_uncertain')
+        return engine_id
+
+    def _verify_scratch_engine(self, lease):
+        ensure(self._scratch_engine is not None and self._scratch_engine[0] is lease,
+               'execution_uncertain')
+        ensure(self._verify_daemon() == self._scratch_engine[1], 'execution_uncertain')
 
     def _verify_kernel_limits(self, name, profile):
         raw = self._checked_output(('exec', name, '/bin/sh', '-c', _CGROUP_PROBE), limit=4096)
@@ -290,6 +391,259 @@ class DockerBackend:
         # still obey the exact recipe limit in the validated tar reader.
         ensure(limit <= actual <= ((limit + 4095) // 4096) * 4096, 'artifact_mount_unverified')
 
+    @staticmethod
+    def _scratch_json(raw):
+        def unique(entries):
+            value = {}
+            for key, item in entries:
+                ensure(key not in value, 'scratch_reference_unverified')
+                value[key] = item
+            return value
+        try:
+            return json.loads(raw, object_pairs_hook=unique,
+                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        except (ValueError, TypeError, RecursionError):
+            raise Rejected('scratch_reference_unverified') from None
+
+    @staticmethod
+    def _scratch_mount_rows(raw):
+        ensure(type(raw) is str and len(raw.encode('utf-8')) <= 128 * 1024, 'scratch_mount_unverified')
+        rows = []
+        def unescape(value):
+            return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), value)
+        for line in raw.splitlines():
+            fields = line.split()
+            ensure(len(fields) >= 10 and '-' in fields, 'scratch_mount_unverified')
+            split = fields.index('-')
+            ensure(split >= 6 and len(fields) >= split + 4, 'scratch_mount_unverified')
+            rows.append({'id': fields[0], 'device': fields[2], 'root': unescape(fields[3]),
+                         'destination': unescape(fields[4]), 'filesystem': fields[split + 1],
+                         'options': set(fields[5].split(',')) | set(fields[split + 3].split(',')),
+                         'propagation': fields[6:split]})
+        return rows
+
+    @staticmethod
+    def _scratch_id_map(raw, value, *, inverse=False):
+        ensure(type(raw) is str and len(raw) <= 4096, 'scratch_uid_mapping_unverified')
+        ranges, found = [], []
+        for line in raw.splitlines():
+            fields = line.split()
+            ensure(len(fields) == 3 and all(re.fullmatch('[0-9]{1,10}', f) for f in fields),
+                   'scratch_uid_mapping_unverified')
+            inside, outside, count = map(int, fields)
+            ensure(count > 0 and inside + count <= 2**32 and outside + count <= 2**32
+                   and len(ranges) < 16, 'scratch_uid_mapping_unverified')
+            for old_inside, old_outside, old_count in ranges:
+                ensure(inside + count <= old_inside or old_inside + old_count <= inside,
+                       'scratch_uid_mapping_unverified')
+                ensure(outside + count <= old_outside or old_outside + old_count <= outside,
+                       'scratch_uid_mapping_unverified')
+            ranges.append((inside, outside, count))
+            start, target = (outside, inside) if inverse else (inside, outside)
+            if start <= value < start + count:
+                found.append(target + value - start)
+        ensure(len(found) == 1, 'scratch_uid_mapping_unverified')
+        return found[0]
+
+    def _verify_scratch_mount(self, name, lease, paths, command_id, *, admission=True):
+        facts = self._scratch_lease(lease, paths, command_id, admission=admission)
+        raw = self._checked_output(('inspect', '--format', '{{json .Mounts}}', name), limit=65536)
+        mounts = self._scratch_json(raw)
+        ensure(type(mounts) is list and len(mounts) <= 64, 'scratch_mount_unverified')
+        selected = [item for item in mounts if type(item) is dict and
+                    (item.get('Destination') == '/ci-scratch' or
+                     str(item.get('Destination', '')).startswith('/ci-scratch/'))]
+        ensure(len(selected) == 1 and selected[0].get('Type') == 'bind'
+               and selected[0].get('Source') == str(lease.path)
+               and selected[0].get('Destination') == '/ci-scratch'
+               and selected[0].get('RW') is True and selected[0].get('Propagation') == 'rprivate',
+               'scratch_mount_unverified')
+        raw = self._checked_output(('exec', name, '/usr/local/bin/python', '-I', '-B', '-c', _SCRATCH_PROBE),
+                                   limit=256 * 1024)
+        def unique(entries):
+            value = {}
+            for key, item in entries:
+                ensure(key not in value, 'scratch_mount_unverified')
+                value[key] = item
+            return value
+        observation = json.loads(raw, object_pairs_hook=unique)
+        expected = {'uid', 'gid', 'owner_uid', 'owner_gid', 'mode', 'device', 'inode', 'block_size',
+                    'blocks', 'capacity_inodes', 'free_bytes', 'free_inodes', 'filesystem_id',
+                    'mountinfo', 'uid_map', 'gid_map'}
+        ensure(type(observation) is dict and set(observation) == expected, 'scratch_mount_unverified')
+        ensure(all(type(observation[key]) is int and observation[key] >= 0 for key in expected -
+                   {'mountinfo', 'uid_map', 'gid_map'}), 'scratch_mount_unverified')
+        ensure(observation['uid'] == lease.container_uid and observation['gid'] == lease.container_gid
+               and observation['device'] == lease.device and observation['inode'] == lease.inode
+               and observation['mode'] == 0o777
+               and all(observation[key] == facts[key] for key in
+                       ('block_size', 'blocks', 'capacity_inodes', 'filesystem_id'))
+               and (lease.free_floor_bytes if admission else 0) <= observation['free_bytes'] <= facts['capacity_bytes']
+               and (lease.free_floor_inodes if admission else 0) <= observation['free_inodes'] <= facts['capacity_inodes'],
+               'scratch_mount_unverified')
+        ensure(self._scratch_id_map(observation['uid_map'], lease.container_uid) == lease.mapped_uid
+               and self._scratch_id_map(observation['gid_map'], lease.container_gid) == lease.mapped_gid
+               and self._scratch_id_map(observation['uid_map'], os.getuid(), inverse=True) == observation['owner_uid']
+               and self._scratch_id_map(observation['gid_map'], os.getgid(), inverse=True) == observation['owner_gid'],
+               'scratch_uid_mapping_unverified')
+        mountinfo = observation['mountinfo']
+        ensure(type(mountinfo) is str and len(mountinfo.encode('utf-8')) <= 65536, 'scratch_mount_unverified')
+        rows = [row for row in self._scratch_mount_rows(mountinfo)
+                if row['destination'] == '/ci-scratch' or row['destination'].startswith('/ci-scratch/')]
+        ensure(len(rows) == 1 and rows[0]['root'] == '/' + lease.path.name
+               and rows[0]['device'] == facts['mount_device'] and rows[0]['filesystem'] == facts['filesystem']
+               and {'rw', 'nosuid', 'nodev'} <= rows[0]['options']
+               and not {'ro', 'noexec'} & rows[0]['options'] and not rows[0]['propagation'],
+               'scratch_mount_unverified')
+        self._scratch_lease(lease, paths, command_id, admission=admission)
+
+    @staticmethod
+    def _scratch_paths_overlap(left, right):
+        def parse(value):
+            ensure(type(value) is str and value.startswith('/') and '\\' not in value
+                   and '\x00' not in value and (value == '/' or all(p not in ('', '.', '..') for p in value[1:].split('/'))),
+                   'scratch_reference_unverified')
+            return PurePosixPath(value)
+        a, b = parse(left), parse(right)
+        return a == b or a in b.parents or b in a.parents
+
+    def _scratch_reference_disjoint(self, source, lease):
+        ensure(not self._scratch_paths_overlap(source, str(lease.path)), 'scratch_reference_present')
+        # A symlink, missing path or inaccessible namespace is unknown, not an
+        # absence receipt. A different pathname on the dedicated device is an
+        # alias too; never infer disjointness solely from string prefixes.
+        try:
+            value = os.stat(source, follow_symlinks=False)
+        except OSError:
+            raise Rejected('scratch_reference_unverified') from None
+        ensure(not stat.S_ISLNK(value.st_mode), 'scratch_reference_unverified')
+        ensure(value.st_dev != lease.device
+               and not (stat.S_ISBLK(value.st_mode) and value.st_rdev == lease.device),
+               'scratch_reference_present')
+
+    def _scratch_volumes_absent(self, lease):
+        # Detached local bind volumes can retain the path too; container Mounts
+        # alone is not enough. Read selected metadata, never full driver options.
+        def names():
+            raw = self._checked_output(('volume', 'ls', '--quiet'), limit=256 * 257 + 1)
+            result = raw.decode('ascii').splitlines()
+            ensure(len(result) <= 256 and len(set(result)) == len(result)
+                   and all(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,255}', value) for value in result),
+                   'scratch_reference_unverified')
+            return tuple(sorted(result))
+        before = names()
+        if before:
+            template = '[{{json .Name}},{{json .Driver}},{{json .Mountpoint}},{{json .Options.device}},{{json .Options.type}}]'
+            raw = self._checked_output(('volume', 'inspect', '--format', template, *before),
+                                       limit=128 * 1024, timeout=15)
+            rows = raw.decode('utf-8').splitlines()
+            ensure(len(rows) == len(before), 'scratch_reference_unverified')
+            for name, row in zip(before, rows):
+                value = self._scratch_json(row)
+                ensure(type(value) is list and len(value) == 5 and value[0] == name
+                       and value[1] == 'local' and type(value[2]) is str,
+                       'scratch_reference_unverified')
+                _, _, mountpoint, device, filesystem = value
+                self._scratch_reference_disjoint(mountpoint, lease)
+                if filesystem == 'tmpfs':
+                    ensure(device == 'tmpfs', 'scratch_reference_unverified')
+                else:
+                    ensure(filesystem in (None, '', 'none'), 'scratch_reference_unverified')
+                    if device is not None:
+                        ensure(type(device) is str, 'scratch_reference_unverified')
+                        self._scratch_reference_disjoint(device, lease)
+        ensure(names() == before, 'scratch_reference_unverified')
+
+    def _scratch_references_absent(self, paths, profile, command_id, lease):
+        self._verify_scratch_engine(lease)
+        self._scratch_lease(lease, paths, command_id, admission=False)
+        for stage in ('build', 'test'):
+            name, _ = self.argv(paths, profile, command_id, stage)
+            for suffix in ('', '-export-tests', '-export-output'):
+                self._container_absent(name + suffix)
+        self._container_absent(self._scratch_cleanup_name(paths, command_id))
+        def identities():
+            raw = self._checked_output(('ps', '--all', '--quiet', '--no-trunc'), limit=256 * 65 + 1)
+            ids = raw.decode('ascii').splitlines()
+            ensure(len(ids) <= 256 and len(set(ids)) == len(ids)
+                   and all(re.fullmatch('[a-f0-9]{64}', value) for value in ids),
+                   'scratch_reference_unverified')
+            return tuple(sorted(ids))
+        before = identities()
+        if before:
+            raw = self._checked_output(('inspect', '--type', 'container', '--format', '{{json .Mounts}}', *before),
+                                       limit=128 * 1024, timeout=15)
+            lines = raw.decode('utf-8').splitlines()
+            ensure(len(lines) == len(before), 'scratch_reference_unverified')
+            for line in lines:
+                mounts = self._scratch_json(line)
+                ensure(type(mounts) is list and len(mounts) <= 64, 'scratch_reference_unverified')
+                for mount in mounts:
+                    ensure(type(mount) is dict and mount.get('Type') in {'bind', 'volume', 'tmpfs'}, 'scratch_reference_unverified')
+                    if mount['Type'] == 'bind':
+                        self._scratch_reference_disjoint(mount.get('Source'), lease)
+        ensure(identities() == before, 'scratch_reference_unverified')
+        self._scratch_volumes_absent(lease)
+        with open('/proc/self/mountinfo', 'rb') as stream:
+            raw = stream.read(128 * 1024 + 1)
+        ensure(len(raw) <= 128 * 1024, 'scratch_reference_unverified')
+        for row in self._scratch_mount_rows(raw.decode('utf-8')):
+            if row['device'] == lease.mount_device and row['destination'] != str(lease.slot.path):
+                ensure(not self._scratch_paths_overlap(row['root'], '/' + lease.path.name),
+                       'scratch_reference_present')
+            ensure(not (row['destination'] == str(lease.path) or
+                        row['destination'].startswith(str(lease.path) + '/')), 'scratch_reference_present')
+        self._scratch_lease(lease, paths, command_id, admission=False)
+        self._verify_scratch_engine(lease)
+
+    @staticmethod
+    def _scratch_cleanup_name(paths, command_id):
+        scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
+        return 'eh-stage-' + scope[:12] + '-' + command_id + '-scratch-cleanup'
+
+    def _cleanup_scratch(self, paths, profile, command_id, lease):
+        self._verify_scratch_engine(lease)
+        self._scratch_lease(lease, paths, command_id, admission=False)
+        name = self._scratch_cleanup_name(paths, command_id)
+        scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
+        stage = 'scratch-cleanup'
+        self._container_absent(name)
+        args, policy = self.exporter_argv(name, 'unused', profile, command_id, stage, scope)
+        args[args.index('--user') + 1] = str(lease.container_uid) + ':' + str(lease.container_gid)
+        index = args.index('--mount') + 1
+        args[index] = ('type=bind,src=' + str(lease.path) +
+                       ',dst=/ci-scratch,bind-propagation=rprivate,bind-recursive=disabled')
+        try:
+            self._verify_scratch_engine(lease)
+            started = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=20, check=False, env=self.env)
+            ensure(started.returncode == 0, 'execution_uncertain')
+            self._verify_kernel_limits(name, policy)
+            self._verify_tmpfs_mount(name, '/tmp', 16 * 1024**2, readonly=False)
+            self._verify_scratch_mount(name, lease, paths, command_id, admission=False)
+            raw = self._checked_output(('exec', name, '/usr/local/bin/python', '-I', '-B', '-c',
+                _SCRATCH_CLEANUP, str(lease.device), str(lease.inode), str(lease.container_uid),
+                str(lease.container_gid), str(min(lease.ceiling_inodes, 100000))), limit=4096, timeout=60)
+            result = self._scratch_json(raw)
+            ensure(type(result) is dict and set(result) == {'empty', 'removed', 'device', 'inode'}
+                   and result['empty'] is True and result['device'] == lease.device
+                   and result['inode'] == lease.inode and type(result['removed']) is int
+                   and 0 <= result['removed'] <= min(lease.ceiling_inodes, 100000), 'execution_uncertain')
+        finally:
+            self._stop_owned(name, command_id, stage, scope)
+        self._container_absent(name)
+        self._verify_scratch_engine(lease)
+
+    def _confirm_scratch_absent(self, paths, profile, command_id, lease):
+        # Contents cleanup runs before the core terminal receipt; it never runs
+        # source code and never releases the durable lease or machine hold.
+        self._scratch_references_absent(paths, profile, command_id, lease)
+        self._cleanup_scratch(paths, profile, command_id, lease)
+        self._scratch_references_absent(paths, profile, command_id, lease)
+        self._scratch_lease(lease, paths, command_id, admission=False)
+        self._verify_scratch_engine(lease)
+        lease.confirm_backend_absent(command_id)
+
     def _export_stream(self, name, destination, limit):
         """Read bounded raw tar; never use docker cp or tarfile.extract/all."""
         process = subprocess.Popen(self.command('exec', name, '/bin/tar', '-C', '/artifacts', '-cf', '-', '.'),
@@ -341,9 +695,13 @@ class DockerBackend:
                     with bundle.extractfile(item) as src, target.open('xb') as dst:
                         shutil.copyfileobj(src, dst, 65536)
 
-    def _stage(self, paths, profile, command_id, stage):
-        self._verify_daemon()
-        name, _ = self.argv(paths, profile, command_id, stage)
+    def _stage(self, paths, profile, command_id, stage, *, scratch_lease=None):
+        if scratch_lease is None:
+            self._verify_daemon()
+        else:
+            self._verify_scratch_engine(scratch_lease)
+        options = {'scratch_lease': scratch_lease} if scratch_lease is not None else {}
+        name, _ = self.argv(paths, profile, command_id, stage, **options)
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
         specs = self._volume_specs(paths, name, profile, stage)
         # No adoption: any deterministic name left by another/earlier attempt
@@ -357,7 +715,7 @@ class DockerBackend:
             for kind, spec in specs.items():
                 possible.append((kind, spec))  # Includes a lost creation acknowledgement.
                 self._create_volume(spec, command_id, stage, scope, kind)
-            return self._stage_inner(paths, profile, command_id, stage)
+            return self._stage_inner(paths, profile, command_id, stage, **options)
         finally:
             for kind in specs:
                 self._stop_owned(name + '-export-' + kind, command_id, stage, scope)
@@ -365,17 +723,24 @@ class DockerBackend:
             for kind, spec in reversed(possible):
                 self._remove_volume(spec, command_id, stage, scope, kind)
 
-    def _stage_inner(self, paths, profile, command_id, stage):
-        name, args = self.argv(paths, profile, command_id, stage)
+    def _stage_inner(self, paths, profile, command_id, stage, *, scratch_lease=None):
+        options = {'scratch_lease': scratch_lease} if scratch_lease is not None else {}
+        name, args = self.argv(paths, profile, command_id, stage, **options)
         scope = hashlib.sha256(str(paths['workspace'].parent.absolute()).encode()).hexdigest()
         specs = self._volume_specs(paths, name, profile, stage)
         log = bytearray()
         overflow = threading.Event()
+        if scratch_lease is not None:
+            self._verify_scratch_engine(scratch_lease)
         started = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, timeout=20, check=False, env=self.env)
         ensure(started.returncode == 0, 'container_start_failed')
         self._verify_kernel_limits(name, profile)
         self._verify_job_mounts(name, profile, stage)
+        if scratch_lease is not None:
+            self._verify_scratch_engine(scratch_lease)
+            self._verify_scratch_mount(name, scratch_lease, paths, command_id)
+            self._verify_scratch_engine(scratch_lease)
         process = subprocess.Popen(self.command('exec', name, '/bin/sh', '-c',
                                    'cp -R /source/. /workspace/ && exec "$@"',
                                    'eh-staging-recipe') + profile[stage + '_argv'],
@@ -441,18 +806,33 @@ class DockerBackend:
         finally:
             self._stop_owned(name, command_id, stage, scope)
 
-    def run(self, paths, profile, command_id):
+    def run(self, paths, profile, command_id, *, scratch_lease=None):
         ensure(os.name == 'posix' and os.getuid() != 0, 'nonroot_linux_worker_required')
-        return self._run_stages(paths, profile, command_id)
+        if scratch_lease is None:
+            return self._run_stages(paths, profile, command_id)
+        self._scratch_lease(scratch_lease, paths, command_id)
+        ensure(self._scratch_engine is None, 'execution_uncertain')
+        engine_id = self._verify_daemon()
+        ensure(type(engine_id) is str and re.fullmatch('[A-Za-z0-9:_-]{1,128}', engine_id),
+               'rootless_cgroup_policy_unverified')
+        self._scratch_engine = (scratch_lease, engine_id)
+        try:
+            return self._run_stages(paths, profile, command_id, scratch_lease=scratch_lease)
+        finally:
+            try:
+                self._confirm_scratch_absent(paths, profile, command_id, scratch_lease)
+            finally:
+                self._scratch_engine = None
 
-    def _run_stages(self, paths, profile, command_id):
-        stages = {'build': self._stage(paths, profile, command_id, 'build')}
+    def _run_stages(self, paths, profile, command_id, *, scratch_lease=None):
+        options = {'scratch_lease': scratch_lease} if scratch_lease is not None else {}
+        stages = {'build': self._stage(paths, profile, command_id, 'build', **options)}
         ensure(bool(tree_manifest(paths['build'], profile['output_bytes'])[0]), 'empty_build_output')
         # _stage has frozen/exported the bounded output and removed the owned
         # build container. Only then make the validated immutable output tree
         # readable to the next rootless job UID; the test bind stays read-only.
         make_job_readable(paths['build'], profile['output_bytes'])
-        stages['test'] = self._stage(paths, profile, command_id, 'test')
+        stages['test'] = self._stage(paths, profile, command_id, 'test', **options)
         tree_manifest(paths['build'], profile['output_bytes'])
         for directory, dirs, files in os.walk(paths['build'], followlinks=False):
             destination = paths['preview'] / Path(directory).relative_to(paths['build'])

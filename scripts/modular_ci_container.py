@@ -194,6 +194,56 @@ def check_report(evidence, name):
         return {'available': False, 'state': 'failed', 'complete': False}
 
 
+def scratch_facts(root):
+    """Child observation only; the worker owns quota/lease/mapping verification."""
+    rows = []
+    for line in read_regular(Path('/proc/self/mountinfo'), 1024 * 1024).decode().splitlines():
+        left, right = line.split(' - ', 1)
+        fields, tail = left.split(), right.split()
+        if fields[4] == str(root):
+            rows.append((fields, tail))
+    if len(rows) != 1:
+        raise CIError('ci_scratch_mount_required')
+    fields, tail = rows[0]
+    options = set(fields[5].split(',')) | set(tail[2].split(','))
+    if (tail[0] != 'ext4' or not {'rw', 'nosuid', 'nodev'} <= options
+            or {'ro', 'noexec'} & options):
+        raise CIError('ci_scratch_mount_policy')
+    fs = os.statvfs(root)
+    if fs.f_bavail * fs.f_frsize < 512 * 1024**2 or fs.f_favail < 1024:
+        raise CIError('ci_scratch_capacity')
+
+
+def _phase_layout(root, stage):
+    if stage not in {'build', 'test'}:
+        raise CIError('invalid_ci_stage')
+    phase = root / ('eh-ci-' + stage)
+    phase.mkdir(mode=0o700)
+    for name in ('home', 'tmp', 'pytest-cache', 'npm-cache'):
+        (phase / name).mkdir(mode=0o700)
+    return ({'HOME': str(phase / 'home'), 'TMPDIR': str(phase / 'tmp'),
+             'TMP': str(phase / 'tmp'), 'TEMP': str(phase / 'tmp'),
+             'npm_config_cache': str(phase / 'npm-cache')},
+            phase / 'pytest', phase / 'pytest-cache')
+
+
+def temporary_layout(stage):
+    signal = os.environ.get('EH_CI_SCRATCH')
+    if signal is None:
+        if stage == 'test':
+            raise CIError('ci_scratch_required')
+        return {'HOME': '/tmp/eh-ci-home'}, Path('/tmp/pytest'), Path('/tmp/pytest-cache')
+    if signal != '1':
+        raise CIError('invalid_ci_scratch_signal')
+    root = Path('/ci-scratch')
+    if root.is_symlink() or not root.is_dir():
+        raise CIError('ci_scratch_mount_required')
+    scratch_facts(root)
+    # Each stage runs once per original worker command. Refuse a pre-existing
+    # phase directory instead of traversing or clearing source-created paths.
+    return _phase_layout(root, stage)
+
+
 def run_stage(stage, *, workspace=Path('/workspace'), cache=Path('/opt/eh-ci'),
               output=Path('/output'), evidence=Path('/test-output'), runner=subprocess.run):
     if stage not in {'build', 'test'}:
@@ -205,20 +255,22 @@ def run_stage(stage, *, workspace=Path('/workspace'), cache=Path('/opt/eh-ci'),
               'dependency_sha256': manifest['dependency_sha256'],
               'checks': [], 'state': 'failed', 'commit_verification': 'declared'}
     env = os.environ.copy()
+    temporary_env, pytest_temp, pytest_cache = temporary_layout(stage)
     env.update(PYTHONPATH=str(workspace / 'src') + os.pathsep + str(workspace),
-               HOME='/tmp/eh-ci-home', PYTHONDONTWRITEBYTECODE='1',
+               PYTHONDONTWRITEBYTECODE='1',
                HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', CI='true',
                PIP_NO_INDEX='1', npm_config_offline='true', npm_config_audit='false',
                npm_config_fund='false', NODE_OPTIONS='--max-old-space-size=320',
                EH_CI_VITEST_REPORT_DIR=str(evidence),
                EH_RESPONSIVENESS_ARTIFACT_DIR=str(evidence / 'responsiveness'))
+    env.update(temporary_env)
     node_facade(workspace, cache)
     commands = ([('ui_build', [NPM, 'run', 'build', '--', '--base', './'], workspace / 'hub-ui')]
                 if stage == 'build' else [
                     ('python_pytest', [PYTHON, '-I', '-B', str(cache / REPORTERS[0]),
                                       '--source-root', str(workspace),
                                       '--report', str(evidence / 'python-summary.json'), '--', '-q',
-                                      '--basetemp=/tmp/pytest', '-o', 'cache_dir=/tmp/pytest-cache',
+                                      '--basetemp=' + str(pytest_temp), '-o', 'cache_dir=' + str(pytest_cache),
                                       ], workspace),
                     ('ui_unit', [NPM, 'test', '--', '--maxWorkers=1', '--no-file-parallelism',
                                  '--reporter=' + str(cache / REPORTERS[1])], workspace / 'hub-ui')])
@@ -230,6 +282,15 @@ def run_stage(stage, *, workspace=Path('/workspace'), cache=Path('/opt/eh-ci'),
                     or build.get('dependency_sha256') != manifest['dependency_sha256']):
                 raise CIError('ci_build_binding_mismatch')
         for name, argv, cwd in commands:
+            if stage == 'test' and name == 'ui_unit':
+                try:
+                    scratch_facts(Path('/ci-scratch'))
+                except (CIError, OSError, ValueError):
+                    report['checks'].append({'name': name, 'exit_code': None,
+                                             'state': 'blocked', 'reason': 'ci_scratch_unavailable',
+                                             'report': {'available': False, 'state': 'failed',
+                                                        'complete': False}})
+                    raise CIError('ci_scratch_unavailable') from None
             result = runner(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             check=False, shell=False)
             check = {'name': name, 'exit_code': result.returncode}

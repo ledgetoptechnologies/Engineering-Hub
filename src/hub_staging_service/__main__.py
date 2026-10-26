@@ -148,6 +148,10 @@ def main():
     port = config.get('port', 8780)
     ensure(type(port) is int and 1024 <= port <= 65535, 'invalid_port')
     backend = DockerBackend(config['docker_endpoint'])
+    scratch_slot = None
+    if config.get('scratch_slot') is not None:
+        from .scratch import ScratchSlot
+        scratch_slot = ScratchSlot.from_config(config['scratch_slot'])
     host_snapshot = config.get('host_snapshot')
     if host_snapshot is not None:
         ensure(type(host_snapshot) is str and Path(host_snapshot).is_absolute()
@@ -157,8 +161,10 @@ def main():
     if args.check_config:
         print(json.dumps({'valid': True, 'projects': sorted(projects), 'credentials_disclosed': False}))
         return
-    service = Service(config['worker_root'], projects, backend,
-                      capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
+    storage = dict(capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
+    if scratch_slot is not None:
+        storage['scratch_slot'] = scratch_slot
+    service = Service(config['worker_root'], projects, backend, **storage)
     server = BoundedServer((bind, port), handler(service, token, peers, host_snapshot=host_snapshot))
     server.daemon_threads = True
     server.timeout = 10

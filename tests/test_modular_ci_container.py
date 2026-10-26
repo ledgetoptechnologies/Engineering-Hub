@@ -14,16 +14,23 @@ spec = importlib.util.spec_from_file_location(
     'modular_ci_container', Path(__file__).parents[1] / 'scripts/modular_ci_container.py')
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+ACTUAL_LAYOUT = ci.temporary_layout
 
 
 @pytest.fixture
-def layout(tmp_path):
+def layout(tmp_path, monkeypatch):
     root = tmp_path / 'workspace'
     cache = tmp_path / 'cache'
     output = tmp_path / 'output'
     evidence = tmp_path / 'evidence'
     for path in (root, cache, output, evidence):
         path.mkdir()
+    scratch = tmp_path / 'synthetic-scratch'
+    scratch.mkdir()
+    # Pure orchestration tests supply a synthetic preverified scratch layout.
+    # They do not establish a mount, disk quota or actual worker acceptance.
+    monkeypatch.setattr(ci, 'temporary_layout', lambda stage: ci._phase_layout(scratch, stage))
+    monkeypatch.setattr(ci, 'scratch_facts', lambda root: None)
     reporters = {}
     for name in ci.REPORTERS:
         raw = ('synthetic image-owned ' + name).encode()
@@ -208,6 +215,80 @@ def test_python_deselected_count_is_not_subtracted_from_already_selected_count(l
     report['outcomes']['deselected'] = 10
     (layout.evidence / 'python-summary.json').write_text(json.dumps(report))
     assert ci.check_report(layout.evidence, 'python_pytest')['state'] == 'passed'
+
+
+def test_full_test_phase_refuses_legacy_tmp_without_verified_scratch_signal(monkeypatch):
+    monkeypatch.delenv('EH_CI_SCRATCH', raising=False)
+    with pytest.raises(ci.CIError, match='ci_scratch_required'):
+        ACTUAL_LAYOUT('test')
+    assert ACTUAL_LAYOUT('build')[0]['HOME'] == '/tmp/eh-ci-home'
+
+
+@pytest.mark.parametrize('signal', ['0', 'true', '/other', ''])
+def test_scratch_signal_cannot_select_an_arbitrary_path(monkeypatch, signal):
+    monkeypatch.setenv('EH_CI_SCRATCH', signal)
+    with pytest.raises(ci.CIError, match='invalid_ci_scratch_signal'):
+        ACTUAL_LAYOUT('test')
+
+
+@pytest.mark.parametrize('change', ['absent', 'tmpfs', 'ro', 'noexec', 'missing_nodev', 'low_bytes', 'low_inodes'])
+def test_child_scratch_observation_refuses_unusable_mount_or_capacity(monkeypatch, change):
+    options = 'rw,nosuid,nodev'
+    filesystem = 'tmpfs' if change == 'tmpfs' else 'ext4'
+    if change == 'noexec': options += ',noexec'
+    if change == 'ro': options = 'ro,nosuid,nodev'
+    if change == 'missing_nodev': options = 'rw,nosuid'
+    mount = ('19 18 7:3 /job-original /ci-scratch ' + options + ' - ' + filesystem + ' /dev/loop3 rw\n').encode()
+    monkeypatch.setattr(ci, 'read_regular', lambda *args: b'' if change == 'absent' else mount)
+    facts = SimpleNamespace(f_bavail=1 if change == 'low_bytes' else 262144, f_frsize=4096,
+                            f_favail=1 if change == 'low_inodes' else 10000)
+    monkeypatch.setattr(ci.os, 'statvfs', lambda *args: facts, raising=False)
+    with pytest.raises(ci.CIError):
+        ci.scratch_facts(Path('/ci-scratch'))
+
+
+def test_scratch_mount_reader_accepts_bounded_proc_style_regular_input(tmp_path, monkeypatch):
+    mountinfo = tmp_path / 'mountinfo'
+    mountinfo.write_bytes(b'19 18 7:3 /job-original /ci-scratch rw,nosuid,nodev - ext4 /dev/loop3 rw\n')
+    real_read = ci.read_regular
+    monkeypatch.setattr(ci, 'read_regular', lambda path, maximum: real_read(mountinfo, maximum))
+    monkeypatch.setattr(ci.os, 'statvfs', lambda root: SimpleNamespace(
+        f_bavail=262144, f_frsize=4096, f_favail=10000), raising=False)
+    ci.scratch_facts(Path('/ci-scratch'))
+
+
+def test_python_scratch_exhaustion_blocks_ui_with_explicit_failed_evidence(layout, monkeypatch):
+    fake_facade(monkeypatch, [])
+    stage(layout, 'build', lambda *a, **kw: SimpleNamespace(returncode=0))
+    executed = []
+
+    def execute(argv, **kwargs):
+        executed.append(argv)
+        assert argv[0] == ci.PYTHON
+        # The Python phase may fail normally and also exhaust the shared slot.
+        monkeypatch.setattr(ci, 'scratch_facts', lambda root: (_ for _ in ()).throw(
+            ci.CIError('ci_scratch_capacity')))
+        return SimpleNamespace(returncode=7)
+
+    with pytest.raises(ci.CIError, match='ci_scratch_unavailable'):
+        stage(layout, 'test', execute)
+    report = json.loads((layout.evidence / 'test-summary.json').read_text())
+    assert len(executed) == 1 and report['state'] == 'failed'
+    assert report['checks'][0]['exit_code'] == 7
+    assert report['checks'][1]['state'] == 'blocked'
+    assert report['checks'][1]['reason'] == 'ci_scratch_unavailable'
+    assert report['checks'][1]['report']['complete'] is False
+
+
+def test_stage_paths_keep_all_test_temporaries_on_scratch_and_never_reuse_old_phase(tmp_path):
+    env, base, cache = ci._phase_layout(tmp_path, 'test')
+    phase = tmp_path / 'eh-ci-test'
+    assert base == phase / 'pytest' and cache == phase / 'pytest-cache'
+    assert env['TMPDIR'] == env['TMP'] == env['TEMP'] == str(phase / 'tmp')
+    assert env['HOME'] == str(phase / 'home') and env['npm_config_cache'] == str(phase / 'npm-cache')
+    with pytest.raises(FileExistsError):
+        ci._phase_layout(tmp_path, 'test')
+    assert not base.exists()  # pytest itself owns its basetemp creation.
 
 
 def test_missing_image_manifest_refuses(layout):

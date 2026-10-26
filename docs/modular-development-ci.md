@@ -72,6 +72,9 @@ resolution or performance.
    `FileNotFoundError: git`. Candidate preparation now checks `git --version`
    offline and refuses that cache; it does not install the missing tool. A newly
    reviewed cache with Git remains necessary before full-suite acceptance.
+   A subsequent local offline cache diagnostic exercised Git object operations
+   and packaging tests successfully. That diagnostic does not enroll its image
+   on staging or prove the full suite fits the worker's resource envelope.
 3. The candidate `docker/Dockerfile.modular-development-ci` consumes that exact
    reviewed immutable base, the four committed lock inputs and this bootstrap.
    Its `--network=none` preparation step refuses mismatching inputs and emits
@@ -103,11 +106,12 @@ workspace tmpfs also consume bounded memory. A full-suite failure under `/tmp`
 noexec, tmpfs capacity or the memory ceiling must be diagnosed honestly; do not
 silently skip tests, disable kernel checks or reuse the old 2 GiB runner.
 
-An eventual scratch implementation must bind an operator-provisioned dedicated
-filesystem slot, verify its actual capacity/mount identity and retain its lease
-across held/interrupted work. A plain host directory or Docker volume is not a
-disk quota. Failed diagnostic registration/download and ENOSPC-safe worker receipt
-publication remain separate work; a source-visible JSON file supplies neither.
+The optional scratch implementation binds an operator-provisioned dedicated
+filesystem slot, verifies its actual capacity/mount identity and retains its lease
+across held/interrupted work. See [the scratch contract](modular-ci-scratch.md).
+A plain host directory or Docker volume is not a disk quota. Failed diagnostic
+registration/download and ENOSPC-safe worker receipt publication remain separate
+work; a source-visible JSON file supplies neither.
 
 Before image import, size the exact prepared artifact and retained layers against
 the TEST volume and underlying host free floor. No build, pull, image import,

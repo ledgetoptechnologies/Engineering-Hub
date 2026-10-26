@@ -173,7 +173,10 @@ def make_job_readable(path, limit):
 
 class Service:
     def __init__(self, root, projects, backend, *, capacity_bytes=1024 * 1024 * 1024,
-                 free_floor_bytes=512 * 1024 * 1024):
+                 free_floor_bytes=512 * 1024 * 1024, scratch_slot=None):
+        from .scratch import ScratchSlot
+        ensure(scratch_slot is None or type(scratch_slot) is ScratchSlot, 'scratch_slot_type')
+        self.scratch_slot = scratch_slot
         capacity_bytes, free_floor_bytes = storage_limits(capacity_bytes, free_floor_bytes)
         self.root = Path(root).absolute()
         ensure(not self.root.is_symlink(), 'worker_root_symlink')
@@ -221,9 +224,25 @@ class Service:
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY, project TEXT NOT NULL, digest TEXT NOT NULL,
                 bytes INTEGER NOT NULL, inode INTEGER NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS scratch_leases (
+                command_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, capture TEXT NOT NULL, absence TEXT NOT NULL,
+                receipt TEXT NOT NULL);
         ''')
         self.db.execute("UPDATE operations SET state='held' WHERE state IN ('running','accepted')")
+        # Even a missing/disabled config cannot bypass an existing reservation.
+        self.db.execute("UPDATE operations SET state='held' WHERE command_id IN "
+                        "(SELECT command_id FROM scratch_leases WHERE state!='released')")
         self.db.commit()
+
+        self._scratch_lock = None
+        if scratch_slot is not None:
+            try:
+                self._scratch_lock = scratch_slot.acquire(self.root, self.db)
+            except Exception:
+                self.db.close()
+                self.process_lock.close()
+                raise
 
     def _capacity(self, extra):
         used = sum(item.stat().st_size for item in self.root.rglob('*') if item.is_file() and not item.is_symlink())
@@ -359,9 +378,18 @@ class Service:
             # The full incoming payload is already bound by `identity`. Retain
             # compact provenance/idempotency facts, not an inline archive forever.
             persisted = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
-            self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
-                            (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
-            self.db.commit()
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                ensure(not self.db.execute("SELECT 1 FROM scratch_leases WHERE state!='released'").fetchone(),
+                       'scratch_occupied', 409)
+                if self.scratch_slot is not None:
+                    self.scratch_slot.reserve(self.db, payload['command_id'], payload['job_id'], payload['resource_ids'])
+                self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
+                                (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
             self.active = payload['command_id']
             self.thread = threading.Thread(target=self._execute, args=(payload, raw), daemon=False)
             try:
@@ -373,10 +401,14 @@ class Service:
             return self.status(payload['job_id'])
 
     def _execute(self, payload, raw):
+        lease = None
         try:
             with self.lock:
                 self.db.execute("UPDATE operations SET state='running' WHERE command_id=?", (payload['command_id'],))
                 self.db.commit()
+                if self.scratch_slot is not None:
+                    lease = self.scratch_slot.lease(self.db, payload['command_id'])
+                    lease.materialize()
             paths = {}
             for kind, resource_id in payload['resource_ids'].items():
                 path = self.resources / resource_id
@@ -389,7 +421,11 @@ class Service:
             extract(raw, paths['workspace'])
             make_job_readable(paths['workspace'], MAX_EXPANDED)
             profile = self.projects[payload['project']][payload['recipe']]
-            result = self.backend.run(paths, profile, payload['command_id'])
+            if lease is None:
+                result = self.backend.run(paths, profile, payload['command_id'])
+            else:
+                result = self.backend.run(paths, profile, payload['command_id'], scratch_lease=lease)
+                ensure(lease.backend_absent, 'execution_uncertain', 409)
             for kind, path in paths.items():
                 limit = MAX_EXPANDED if kind == 'workspace' else profile['output_bytes']
                 manifest, size = tree_manifest(path, limit)
@@ -403,10 +439,25 @@ class Service:
         except Exception as exc:
             result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
             state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
+        if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
+            state = 'held'
+            result = {'error': 'scratch_cleanup_unproven'}
         with self.lock:
+            if lease is not None and lease.backend_absent:
+                self.db.execute('UPDATE scratch_leases SET absence=? WHERE command_id=?',
+                                (json.dumps(lease.absence_receipt(), sort_keys=True), payload['command_id']))
             self.db.execute('UPDATE operations SET state=?,result=? WHERE command_id=?',
                             (state, json.dumps(result), payload['command_id']))
-            self.db.commit(); self.active = None
+            self.db.commit()
+            if lease is not None and state in TERMINAL:
+                try:
+                    lease.release()
+                except Exception:
+                    self.db.rollback()
+                    self.db.execute("UPDATE operations SET state='held',result=? WHERE command_id=?",
+                                    ('{"error":"scratch_cleanup_uncertain"}', payload['command_id']))
+                    self.db.commit()
+            self.active = None
 
     def status(self, job_id):
         identifier(job_id)
@@ -505,3 +556,6 @@ class Service:
         self.wait()
         self.db.close()
         self.process_lock.close()
+        if self._scratch_lock is not None:
+            os.close(self._scratch_lock)
+            self._scratch_lock = None
