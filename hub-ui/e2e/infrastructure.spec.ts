@@ -197,6 +197,26 @@ test("the owner can add a device; the form catches mistakes before saving", asyn
       retired: false, expected_revision: 0 } });
 });
 
+test("a single network can't hold both IP families; a dual-stack device leaves it empty", async ({ page }) => {
+  const state = await fixture(page, { writes: [{ status: 200, body: devices()[0] }] });
+  await page.goto("/#/infrastructure");
+  await devicesPanel(page).getByRole("button", { name: "Add device" }).click();
+  const form = page.getByRole("form", { name: "Add device" });
+  await form.getByLabel("Device ID").fill("dual-pc");
+  await form.getByLabel("Name", { exact: true }).fill("Dual-stack PC");
+  await form.getByLabel("Role").fill("Testing");
+  await form.getByLabel(/IP addresses/).fill("198.51.100.20\n2001:db8::20");
+  await form.getByLabel(/Network/).fill("198.51.100.0/24");
+  await form.getByRole("button", { name: "Add device" }).click();
+  await expect(form.getByRole("alert")).toContainText("The network is IPv4, so it can't hold 2001:db8::20.");
+  await expect(form.getByRole("alert")).toContainText("Leave the network empty for a device with both IPv4 and IPv6 addresses.");
+  expect(state.writes).toHaveLength(0);
+  await form.getByLabel(/Network/).fill("");
+  await form.getByRole("button", { name: "Add device" }).click();
+  await expect.poll(() => state.writes.length).toBe(1);
+  expect(state.writes[0].body).toMatchObject({ addresses: ["198.51.100.20", "2001:db8::20"], network: null });
+});
+
 test("someone without edit rights sees no editing controls", async ({ page }) => {
   await fixture(page, { list: [list({ device_write: false, maintenance_write: false })] });
   await page.goto("/#/infrastructure");
