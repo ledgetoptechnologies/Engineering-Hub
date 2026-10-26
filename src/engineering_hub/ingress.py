@@ -49,14 +49,20 @@ def validate_agent_hosts(hosts):
 
 
 class HubIngressMiddleware:
-    def __init__(self, app, *, mode, agent_auth, cloudflare_config=None, legacy_bus_enabled=False):
+    def __init__(self, app, *, mode, agent_auth, cloudflare_config=None, legacy_bus_enabled=False,
+                 access_verifier=None):
+        if access_verifier is not None:
+            if (mode != 'browser' or type(access_verifier) is not CloudflareAccessVerifier
+                    or cloudflare_config is None or access_verifier.config != cloudflare_config):
+                raise ValueError('explicit_access_verifier_binding_required')
         self.app, self.mode, self.agent_auth = app, mode, agent_auth
         if type(legacy_bus_enabled) is not bool:
             raise ValueError('Explicit bus ingress enable flag required')
         self.legacy_bus_enabled = legacy_bus_enabled
         if mode not in {"agents", "browser"}:
             raise ValueError("Separated Hub ingress mode required")
-        self.checker = CloudflareAccessVerifier(cloudflare_config) if mode == "browser" else None
+        self.checker = (access_verifier if access_verifier is not None else
+                        CloudflareAccessVerifier(cloudflare_config)) if mode == "browser" else None
         self.cloudflare_config = cloudflare_config
 
     async def __call__(self, scope, receive, send):

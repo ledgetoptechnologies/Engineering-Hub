@@ -194,7 +194,8 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
 
             receiver = PrivateBrowserGateway(
                 pair.browser, agent_auth=pair.settings.agent_auth,
-                cloudflare_config=pair.settings.auth_config.cloudflare_config)
+                cloudflare_config=pair.settings.auth_config.cloudflare_config,
+                access_verifier=pair.access_verifier)
             async with pair.lifespan():
                 try:
                     await _serve_listeners((pair.agents, receiver), (agent, browser),

@@ -35,6 +35,7 @@ async def test_invalid_owned_verifier_refuses_before_owner_or_listener(setup, mo
 async def test_owned_factory_forwards_the_same_verifier_and_drains(setup, monkeypatch):
     state = setup
     monkeypatch.setattr('engineering_hub.cloudflare_access.CloudflareAccessVerifier', CloudflareAccessVerifier)
+    monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', CloudflareAccessVerifier)
     access = CloudflareAccessVerifier(state.settings.auth_config.cloudflare_config)
     captured = []
     original = state.service.create_app
@@ -47,6 +48,8 @@ async def test_owned_factory_forwards_the_same_verifier_and_drains(setup, monkey
     stop, task, _ = await start(state, access_verifier=access)
     try:
         assert captured == [access]
+        pair = state.core.state.hub_frontends
+        assert pair.access_verifier is access and pair.browser.ingress.checker is access
     finally:
         stop.set()
         await task

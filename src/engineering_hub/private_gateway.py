@@ -191,11 +191,12 @@ class PrivateBrowserGateway:
     Existing core lifecycle belongs to the caller. Never publish this receiver
     as an unprotected TCP listener; no socket or deployment is created here.
     """
-    def __init__(self, core, *, agent_auth, cloudflare_config):
+    def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None):
         if cloudflare_config is None:
             raise ValueError('Private browser gateway requires Cloudflare Access')
         self.ingress = HubIngressMiddleware(core, mode='browser', agent_auth=agent_auth,
-                                            cloudflare_config=cloudflare_config)
+                                            cloudflare_config=cloudflare_config,
+                                            access_verifier=access_verifier)
 
     async def __call__(self, scope, receive, send):
         if scope['type'] == 'websocket':
