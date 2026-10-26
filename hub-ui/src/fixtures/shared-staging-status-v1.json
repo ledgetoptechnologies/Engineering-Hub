@@ -1,0 +1,10 @@
+[
+  { "state": "not_started", "reason": null },
+  { "state": "pending", "reason": "operator_acceptance_required" },
+  { "state": "recovering", "reason": "original_operations_pending" },
+  { "state": "recovery_required", "reason": "original_operations_unverified" },
+  { "state": "active", "reason": null },
+  { "state": "stopping", "reason": null },
+  { "state": "stopped", "reason": null },
+  { "state": "shutdown_failed", "reason": "owned_drain_failed" }
+]

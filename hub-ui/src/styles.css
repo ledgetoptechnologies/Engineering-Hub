@@ -4084,3 +4084,8 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
 .runtime-source-line, .runtime-empty { margin: 0; font-size: 13px; }
 .runtime-source-line.amber { font-weight: 600; padding-left: 8px; border-left: 3px solid var(--amber); }
 .runtime-empty { color: var(--muted); }
+
+.shared-staging-state { display: grid; gap: 6px; justify-items: start; margin: 8px 0; }
+.shared-staging-line { margin: 0; }
+.shared-staging-line.amber { border-left: 3px solid var(--amber, #b7791f); padding-left: 8px; font-weight: 600; }
+.shared-staging .button-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
