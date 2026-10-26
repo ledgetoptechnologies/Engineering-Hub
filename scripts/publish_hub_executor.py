@@ -1,0 +1,188 @@
+"""Draft, explicit executor publication; disabled workflow awaits permission approval.
+
+Uses Docker's existing login; never reads tokens or operator configuration.
+An intent tag is a locator, not an atomic immutable registry reservation.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+import hub_executor_compatibility_ci as ci
+from hub_executor_image_smoke import smoke, verify_defaults
+from verify_hub_executor_wheel import verify_wheel
+
+PACKAGE = 'ghcr.io/ledgetoptechnologies/engineering-hub-control'
+RECEIPT = Path('executor-publication-receipt.json')
+DIGEST = re.compile(r'sha256:[a-f0-9]{64}\Z')
+
+
+def invocation(env):
+    values = ci.inputs(env)
+    for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
+        if not re.fullmatch(r'[1-9][0-9]{0,19}', env.get(key, '')):
+            raise ValueError('Exact workflow run identity required')
+    suffix = env['GITHUB_RUN_ID'] + '-' + env['GITHUB_RUN_ATTEMPT']
+    return values, 'engineering-hub-executor:build-compatibility-' + suffix, PACKAGE + ':staging-executor-' + suffix
+
+
+def run(*args, timeout=180):
+    return ci.run(*args, timeout=timeout)
+
+
+def absent(target):
+    """Only Docker's exact manifest-not-found result permits publication.
+
+    Authorization errors, timeouts, different CLI wording and transport errors
+    are unknown, never absence. This is not an atomic create-if-absent operation.
+    """
+    result = subprocess.run(['docker', 'manifest', 'inspect', target],
+                            capture_output=True, timeout=60)
+    if result.returncode == 0:
+        raise ValueError('Publication intent tag already exists')
+    if (result.returncode != 1 or result.stdout.strip()
+            or result.stderr.strip() != ('no such manifest: ' + target).encode()):
+        raise RuntimeError('Registry absence not established')
+
+
+def image(reference, expected=None):
+    info, = json.loads(run('docker', 'image', 'inspect', reference))
+    verify_defaults(info)
+    image_id = info.get('Id')
+    if (type(image_id) is not str or not DIGEST.fullmatch(image_id)
+            or info.get('Os') != 'linux' or info.get('Architecture') != 'amd64'
+            or type(info.get('Size')) is not int or not 0 < info['Size'] <= 2**63 - 1
+            or (expected is not None and image_id != expected)):
+        raise ValueError('Executor image identity mismatch')
+    return info
+
+
+def descriptor_size(row):
+    size = row.get('size')
+    if (type(size) is not int or not 0 < size <= 2**63 - 1
+            or type(row.get('digest')) is not str or not DIGEST.fullmatch(row['digest'])):
+        raise ValueError('Invalid registry descriptor')
+    return size
+
+
+def registry_manifest(reference, expected_config):
+    raw = run('docker', 'buildx', 'imagetools', 'inspect', reference, '--raw', timeout=60)
+    if not 0 < len(raw) <= 1024 * 1024:
+        raise ValueError('Registry manifest size invalid')
+    descriptor = json.loads(run('docker', 'buildx', 'imagetools', 'inspect', reference,
+                               '--format', '{{json .Manifest}}', timeout=60))
+    digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    manifest = json.loads(raw)
+    media = manifest.get('mediaType')
+    if (descriptor.get('digest') != digest or manifest.get('schemaVersion') != 2
+            or media not in ('application/vnd.oci.image.manifest.v1+json',
+                             'application/vnd.docker.distribution.manifest.v2+json')
+            or manifest.get('config', {}).get('digest') != expected_config
+            or not isinstance(manifest.get('layers'), list)):
+        raise ValueError('Registry manifest identity mismatch')
+    config_size = descriptor_size(manifest['config'])
+    layer_sizes = [descriptor_size(row) for row in manifest['layers']]
+    total = sum(layer_sizes)
+    if not layer_sizes or len(layer_sizes) > 1024 or total > 2**63 - 1:
+        raise ValueError('Invalid registry layer sizes')
+    return {'manifest_digest': digest, 'manifest_bytes': len(raw),
+            'compressed_layer_bytes': total, 'config_bytes': config_size}
+
+
+def persist(record):
+    # Fixed schema and sanitized values only; no raw CLI output or image config.
+    RECEIPT.write_text(json.dumps(record, sort_keys=True, indent=2) + '\n')
+
+
+def publish(values, local, target, record):
+    record['stage'] = 'compatibility_receipt'
+    compatibility = json.loads(Path('executor-compatibility-receipt.json').read_text())
+    if (compatibility.get('state') != 'passed' or compatibility.get('inputs') != values
+            or compatibility.get('image_published') is not False
+            or compatibility.get('compatibility', {}).get('core_config_digest') != 'sha256:' + values['CORE_CONFIG']
+            or compatibility.get('compatibility', {}).get('core_commit') != values['CORE_COMMIT']
+            or compatibility.get('compatibility', {}).get('installed_core_identity') != 'passed'):
+        raise ValueError('Exact compatibility receipt required')
+    expected = compatibility['compatibility']['executor_imports']['image_id']
+    if type(expected) is not str or not DIGEST.fullmatch(expected):
+        raise ValueError('Exact executor config required')
+    record['stage'] = 'wheel_reverify'
+    verify_wheel(wheel='compatibility-work/context/executor.whl', sha256=values['WHEEL_SHA256'],
+                 source_commit=values['SOURCE_COMMIT'], core_image=ci.PACKAGE + values['CORE_DIGEST'])
+    record['stage'] = 'local_image_reverify'
+    inspected = image(local, expected)
+    report = smoke(local, values['SOURCE_COMMIT'])
+    if report.get('image_id') != expected:
+        raise ValueError('Smoke image identity mismatch')
+    record['config_digest'] = expected
+    record['local_image_size_estimate_bytes'] = inspected['Size']
+    record['stage'] = 'intent_absence'
+    absent(target)
+    record['stage'] = 'local_intent_tag'
+    # Tag the exact verified config identity, never a potentially moved build tag.
+    run('docker', 'tag', expected, target)
+    image(target, expected)
+    record.update(stage='registry_push', state='push_outcome_unknown',
+                  publication_attempted=True, image_published=None)
+    # Write local evidence before push. Interrupted overwrites or runner loss
+    # before artifact upload can truncate/lose it; independently reconcile the
+    # original run/attempt tag after interruption. Never blindly rerun.
+    persist(record)
+    run('docker', 'push', target, timeout=600)
+    record['stage'] = 'registry_readback'
+    descriptor = registry_manifest(target, expected)
+    digest = descriptor['manifest_digest']
+    immutable = PACKAGE + '@' + digest
+    # Read by immutable digest as well; a racing tag writer cannot change it.
+    if registry_manifest(immutable, expected) != descriptor:
+        raise ValueError('Immutable registry readback mismatch')
+    record.update(manifest_digest=digest, immutable_reference=immutable,
+                  image_published=True, state='published_verification_pending')
+    record.update(descriptor)
+    persist(record)
+    record['stage'] = 'published_image_pull'
+    run('docker', 'pull', '--platform', 'linux/amd64', immutable)
+    pulled = image(immutable, expected)
+    if immutable not in pulled.get('RepoDigests', []):
+        raise ValueError('Pulled immutable reference mismatch')
+    # Existing smoke accepts only executor build aliases. Alias ONLY the verified
+    # digest-pulled image; its exact ID/defaults are checked again by the smoke.
+    alias = local.replace(':build-compatibility-', ':build-publication-verified-')
+    run('docker', 'tag', immutable, alias)
+    record['stage'] = 'published_import_smoke'
+    report = smoke(alias, values['SOURCE_COMMIT'])
+    if report.get('image_id') != expected:
+        raise ValueError('Published smoke identity mismatch')
+    record.update(stage='complete', state='published_verified',
+                  installed_imports='passed', staging_acceptance='not_tested')
+
+
+def main():
+    # Fail before registry access on every invalid invocation. Workflow is also
+    # disabled in source until explicit packages:write approval and review.
+    values, local, target = invocation(os.environ)
+    ci.git('merge-base', '--is-ancestor', values['SOURCE_COMMIT'], 'HEAD')
+    if RECEIPT.exists():
+        raise RuntimeError('Existing publication attempt evidence; refusing retry')
+    record = {'schema': 'engineering-hub.executor-publication.v1', 'inputs': values,
+              'intent_tag': target, 'state': 'preflight', 'stage': 'start',
+              'publication_attempted': False, 'image_published': False,
+              'staging_acceptance': 'not_tested'}
+    persist(record)
+    try:
+        publish(values, local, target, record)
+    except Exception as exc:
+        record['failure'] = ci.failure(exc, record['stage'])
+        if not record['publication_attempted']:
+            record['state'] = 'preflight_failed'
+        raise RuntimeError('Executor publication not verified; retain receipt, do not retry blindly') from None
+    finally:
+        persist(record)
+
+
+if __name__ == '__main__':
+    main()
