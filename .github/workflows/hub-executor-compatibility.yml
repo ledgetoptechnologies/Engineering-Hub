@@ -2,6 +2,11 @@ name: Verify disposable executor compatibility
 on:
   workflow_dispatch:
     inputs:
+      publish_staging:
+        description: Explicitly publish the reviewed staging executor (default stays read-only)
+        type: boolean
+        required: false
+        default: false
       source_commit:
         description: Reviewed executor source commit (must be on main)
         required: true
@@ -31,7 +36,7 @@ permissions:
   packages: read
 jobs:
   compatibility:
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !inputs.publish_staging && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -72,3 +77,16 @@ jobs:
           path: executor-compatibility-receipt.json
           if-no-files-found: warn
           retention-days: 14
+  publication:
+    if: ${{ inputs.publish_staging && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/hub-executor-publication.yml
+    with:
+      source_commit: ${{ inputs.source_commit }}
+      core_digest: ${{ inputs.core_digest }}
+      core_commit: ${{ inputs.core_commit }}
+      core_config: ${{ inputs.core_config }}
+      wheel_sha256: ${{ inputs.wheel_sha256 }}
+      source_date_epoch: ${{ inputs.source_date_epoch }}
