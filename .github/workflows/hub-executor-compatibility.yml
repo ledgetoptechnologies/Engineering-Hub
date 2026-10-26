@@ -1,0 +1,74 @@
+name: Verify disposable executor compatibility
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Reviewed executor source commit (must be on main)
+        required: true
+        default: 40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc
+      core_digest:
+        description: Immutable fixed Hub control package digest, without prefix
+        required: true
+        default: d78d1576ffa574d7913c92b6fad64728cc07f10c7dcf3cdb4f7e96d37a5d5aaa
+      core_commit:
+        description: Expected installed core commit and OCI revision
+        required: true
+        default: 40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc
+      core_config:
+        description: Expected linux/amd64 core image config digest, without prefix
+        required: true
+        default: c3ebafe50d4432a4a10dfd9999a353309a812ca29963ca07d912c270664efc06
+      wheel_sha256:
+        description: Independently reviewed exact executor wheel SHA256
+        required: true
+        default: 3a7a04cac68fb2663752e1d4e191b1a0712b8ed04a953a9e43b1c934edc48023
+      source_date_epoch:
+        description: Reviewed fixed wheel reproducibility timestamp
+        required: true
+        default: '1792972800'
+permissions:
+  contents: read
+  packages: read
+jobs:
+  compatibility:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      CORE_DIGEST: ${{ inputs.core_digest }}
+      CORE_COMMIT: ${{ inputs.core_commit }}
+      CORE_CONFIG: ${{ inputs.core_config }}
+      WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+      SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable inputs and main ancestry before registry access
+        run: python -B scripts/hub_executor_compatibility_ci.py validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.15'
+      - name: Build canonical wheel with exact hashed backend, no dependencies
+        run: python -B scripts/hub_executor_compatibility_ci.py wheel
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull only pinned core and pinned public Python runtime
+        run: |
+          timeout 180s docker pull --platform linux/amd64 "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CORE_DIGEST"
+          timeout 180s docker pull --platform linux/amd64 python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+      - name: Build disposable executor and verify inert installed imports
+        run: python -B scripts/hub_executor_compatibility_ci.py compatibility
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: executor-compatibility-public-receipt
+          path: executor-compatibility-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
