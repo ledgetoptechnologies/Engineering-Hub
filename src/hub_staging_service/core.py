@@ -171,9 +171,32 @@ def make_job_readable(path, limit):
             (Path(directory) / name).chmod(0o644)
 
 
+def terminal_receipt_config(value, worker_root):
+    """Static optional operator config; no source-controlled receipt paths."""
+    if value is None:
+        return None
+    ensure(type(value) is dict and set(value) == {'path', 'max_slots'}, 'terminal_receipt_config')
+    ensure(type(value['path']) is str and type(value['max_slots']) is int
+           and len(value['path']) <= 4096 and len(value['path'].encode('utf-8')) <= 4096
+           and 1 <= value['max_slots'] <= 256, 'terminal_receipt_config')
+    path, root = Path(value['path']), Path(worker_root).absolute()
+    ensure(path.is_absolute() and '..' not in path.parts and path.parent == root
+           and path.name not in ('resources', 'sources') and ',' not in str(path)
+           and '\x00' not in str(path), 'terminal_receipt_private_path')
+    return {'path': path, 'max_slots': value['max_slots']}
+
+
 class Service:
     def __init__(self, root, projects, backend, *, capacity_bytes=1024 * 1024 * 1024,
-                 free_floor_bytes=512 * 1024 * 1024):
+                 free_floor_bytes=512 * 1024 * 1024, scratch_slot=None, terminal_receipts=None):
+        from .scratch import ScratchSlot
+        ensure(scratch_slot is None or type(scratch_slot) is ScratchSlot, 'scratch_slot_type')
+        self.scratch_slot = scratch_slot
+        receipt_config = terminal_receipt_config(terminal_receipts, root)
+        self._receipt_config = receipt_config
+        self._receipt_fault = None
+        self._receipt_io_failed = set()
+        self._receipt_io_failed_overflow = False
         capacity_bytes, free_floor_bytes = storage_limits(capacity_bytes, free_floor_bytes)
         self.root = Path(root).absolute()
         ensure(not self.root.is_symlink(), 'worker_root_symlink')
@@ -221,9 +244,235 @@ class Service:
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY, project TEXT NOT NULL, digest TEXT NOT NULL,
                 bytes INTEGER NOT NULL, inode INTEGER NOT NULL, created REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS terminal_receipts (
+                command_id TEXT PRIMARY KEY, slot_id TEXT NOT NULL UNIQUE,
+                root TEXT NOT NULL, capture TEXT NOT NULL, binding TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS terminal_receipt_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS scratch_leases (
+                command_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, capture TEXT NOT NULL, absence TEXT NOT NULL,
+                receipt TEXT NOT NULL);
         ''')
         self.db.execute("UPDATE operations SET state='held' WHERE state IN ('running','accepted')")
+        # Even a missing/disabled config cannot bypass an existing reservation.
+        self.db.execute("UPDATE operations SET state='held' WHERE command_id IN "
+                        "(SELECT command_id FROM scratch_leases WHERE state!='released')")
         self.db.commit()
+
+        self._scratch_lock = None
+        if scratch_slot is not None:
+            try:
+                self._scratch_lock = scratch_slot.acquire(self.root, self.db)
+            except Exception:
+                self.db.close()
+                self.process_lock.close()
+                raise
+
+        try:
+            if receipt_config is not None:
+                ensure(os.name == 'posix', 'terminal_receipts_posix_required')
+                private = receipt_config['path']
+                ensure(not private.is_symlink(), 'terminal_receipt_private_path')
+                private.mkdir(mode=0o700, exist_ok=True)
+                info = private.stat(follow_symlinks=False)
+                ensure(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                       and stat.S_IMODE(info.st_mode) == 0o700
+                       and info.st_dev == self.root.stat().st_dev, 'terminal_receipt_private_path')
+                recorded = self.db.execute('SELECT config FROM terminal_receipt_settings WHERE id=1').fetchone()
+                wanted = json.dumps({'path': str(private), 'max_slots': receipt_config['max_slots']}, sort_keys=True)
+                if recorded is None:
+                    self.db.execute('INSERT INTO terminal_receipt_settings VALUES (1,?)', (wanted,))
+                    self.db.commit()  # Durable opt-in survives a later admission rollback.
+                else:
+                    ensure(recorded['config'] == wanted, 'terminal_receipt_configuration_changed')
+            self._receipt_inventory()
+            if self.db.execute("SELECT 1 FROM operations WHERE job_id IS NULL AND state='held' LIMIT 1").fetchone():
+                self._receipt_fault = 'cleanup_recovery_required'
+        except Exception:
+            self.db.close(); self.process_lock.close()
+            if self._scratch_lock is not None:
+                os.close(self._scratch_lock)
+            raise
+
+    @staticmethod
+    def _receipt_json(raw):
+        ensure(type(raw) is str and len(raw) <= 128 * 1024, 'terminal_receipt_journal_invalid')
+        ensure(len(raw.encode('utf-8')) <= 128 * 1024, 'terminal_receipt_journal_invalid')
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                ensure(key not in value, 'terminal_receipt_journal_invalid')
+                value[key] = item
+            return value
+        return json.loads(raw, object_pairs_hook=unique)
+
+    def _receipt_worker(self):
+        journal = (self.root / 'journal.sqlite3').stat(follow_symlinks=False)
+        root = self.root.stat(follow_symlinks=False)
+        worker = str(uuid.uuid5(uuid.NAMESPACE_URL, 'engineering-hub-worker:' +
+            json.dumps([[root.st_dev, root.st_ino], [journal.st_dev, journal.st_ino]])))
+        return worker, [journal.st_dev, journal.st_ino]
+
+    def _receipt_original(self, payload, identity):
+        worker, journal = self._receipt_worker()
+        lease = self.db.execute('SELECT capture FROM scratch_leases WHERE command_id=?',
+                                (payload['command_id'],)).fetchone()
+        return {'command_id': payload['command_id'], 'job_id': payload['job_id'],
+                'operation_identity': identity, 'worker_id': worker,
+                'journal_identity': journal,
+                'lease_identity': hashlib.sha256(lease['capture'].encode()).hexdigest() if lease else None}
+
+    def _cleanup_binding(self, payload, identity, items, root_identity):
+        worker, journal = self._receipt_worker()
+        return {'operation_kind': 'cleanup', 'command_id': payload['command_id'], 'job_id': None,
+                'operation_identity': identity, 'worker_id': worker, 'journal_identity': journal,
+                'lease_identity': None, 'resource_root_identity': list(root_identity),
+                'resources': [{'resource_id': item['id'], 'job_id': item['job_id'], 'kind': item['kind'],
+                    'revision': item['revision'], 'inode': item['inode'],
+                    'manifest_sha256': item['_observed_manifest_sha256']} for item in items]}
+
+    def _validate_cleanup_binding(self, binding, operation):
+        from .terminal_receipt import _binding
+        binding = _binding(binding)
+        payload = self._receipt_json(operation['payload'])
+        ensure(binding.get('operation_kind') == 'cleanup' and operation['job_id'] is None
+               and type(payload) is dict and set(payload) == {'command_id', 'idempotency_key', 'resources'}
+               and payload['command_id'] == operation['command_id'] == binding['command_id']
+               and binding['operation_identity'] == operation['identity']
+               and hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',', ':')).encode()).hexdigest() == operation['identity']
+               and type(payload['resources']) is list and len(payload['resources']) == len(binding['resources']),
+               'terminal_receipt_binding_changed')
+        parent = self.resources.stat(follow_symlinks=False)
+        worker, journal = self._receipt_worker()
+        ensure(binding['worker_id'] == worker and binding['journal_identity'] == journal
+               and binding['resource_root_identity'] == [parent.st_dev, parent.st_ino], 'terminal_receipt_binding_changed')
+        for wanted, captured in zip(payload['resources'], binding['resources']):
+            ensure(type(wanted) is dict and set(wanted) == {'resource_id', 'expected_revision'}
+                   and wanted['resource_id'] == captured['resource_id']
+                   and type(wanted['expected_revision']) is int and wanted['expected_revision'] == captured['revision'],
+                   'terminal_receipt_binding_changed')
+            row = self.db.execute('SELECT * FROM resources WHERE id=?', (captured['resource_id'],)).fetchone()
+            ensure(row is not None and row['job_id'] == captured['job_id'] and row['kind'] == captured['kind']
+                   and row['inode'] == captured['inode'], 'terminal_receipt_binding_changed')
+            if operation['state'] == 'succeeded':
+                ensure(row['state'] == 'deleted' and row['revision'] == captured['revision']+1
+                       and self._receipt_json(row['manifest']) == {} and row['bytes'] == 0
+                       and self._receipt_json(row['refs']) == []
+                       and not (self.resources / row['id']).exists() and not (self.resources / row['id']).is_symlink(),
+                       'terminal_receipt_cleanup_mismatch')
+        if operation['state'] == 'succeeded':
+            ensure(self._receipt_json(operation['result']) ==
+                   {'deleted_resource_ids': [item['resource_id'] for item in binding['resources']]},
+                   'terminal_receipt_cleanup_mismatch')
+
+    def _receipt_inventory(self):
+        """Only validate retained evidence. Never import, release or rerun it."""
+        from .terminal_receipt import TerminalReceipt
+        try:
+            count = self.db.execute('SELECT COUNT(*) FROM terminal_receipts').fetchone()[0]
+            if self._receipt_config is None:
+                ensure(not count and not self.db.execute('SELECT 1 FROM terminal_receipt_settings').fetchone(),
+                       'terminal_receipts_configuration_required')
+                return
+            root, maximum = self._receipt_config['path'], self._receipt_config['max_slots']
+            ensure(count <= maximum, 'terminal_receipt_slot_limit')
+            # Bound SQLite metadata before fetching it into Python, including
+            # UTF-8 expansion. Never truncate or ignore unknown history.
+            bounds = self.db.execute('''SELECT
+                MAX(length(CAST(capture AS BLOB))), MAX(length(CAST(binding AS BLOB))),
+                MAX(length(CAST(root AS BLOB))), MAX(length(command_id)), MAX(length(slot_id)),
+                SUM(length(CAST(capture AS BLOB))+length(CAST(binding AS BLOB))+length(CAST(root AS BLOB)))
+                FROM terminal_receipts''').fetchone()
+            if count:
+                ensure(all(type(value) is int for value in bounds) and
+                       bounds[0] <= 128*1024 and bounds[1] <= 128*1024 and bounds[2] <= 4096
+                       and bounds[3] <= 36 and bounds[4] <= 36 and bounds[5] <= 8*1024*1024,
+                       'terminal_receipt_journal_invalid')
+            rows = self.db.execute('SELECT * FROM terminal_receipts LIMIT 256').fetchall()
+            entries = []
+            with os.scandir(root) as found:
+                for item in found:
+                    ensure(len(entries) < maximum, 'terminal_receipt_slot_limit')
+                    entries.append(item.name)
+            ensure(set(entries) == {'receipt-' + row['slot_id'] + '.bin' for row in rows},
+                   'terminal_receipt_orphan_or_missing')
+            for row in rows:
+                ensure(row['root'] == str(root), 'terminal_receipt_root_changed')
+                binding = self._receipt_json(row['binding'])
+                operation = self.db.execute('SELECT * FROM operations WHERE command_id=?',
+                                            (row['command_id'],)).fetchone()
+                ensure(operation is not None and binding['command_id'] == row['command_id']
+                       and binding['operation_identity'] == operation['identity'], 'terminal_receipt_binding_changed')
+                if binding.get('operation_kind') == 'cleanup':
+                    self._validate_cleanup_binding(binding, operation)
+                else:
+                    ensure(operation['job_id'] is not None and binding['job_id'] == operation['job_id'],
+                           'terminal_receipt_binding_changed')
+                    # Original job intent predates materialization; never rebind.
+                    expected = self._receipt_original({'command_id': row['command_id'],
+                        'job_id': operation['job_id']}, operation['identity'])
+                    expected['lease_identity'] = binding['lease_identity']
+                    ensure(binding == expected, 'terminal_receipt_binding_changed')
+                receipt = TerminalReceipt(root, row['slot_id'], expected_capture=self._receipt_json(row['capture']))
+                evidence = receipt.evidence(binding)
+                ensure(evidence['state'] == 'observed' and operation['state'] in TERMINAL,
+                       'terminal_receipt_recovery_required')
+                observed = evidence['terminal']
+                ensure(observed['outcome'] == operation['state'] and
+                       json.dumps(observed['result'], sort_keys=True, separators=(',', ':')) ==
+                       json.dumps(self._receipt_json(operation['result']), sort_keys=True, separators=(',', ':')),
+                       'terminal_receipt_sql_mismatch')
+        except Exception:
+            self._receipt_fault = 'terminal_receipt_recovery_required'
+
+    def _prepare_receipt(self, payload, identity, *, binding=None):
+        from .terminal_receipt import TerminalReceipt, SLOT_BYTES
+        if self._receipt_config is None:
+            return
+        root = self._receipt_config['path']
+        ensure(self.db.execute('SELECT COUNT(*) FROM terminal_receipts').fetchone()[0] <
+               self._receipt_config['max_slots'], 'terminal_receipt_slot_limit', 409)
+        self._capacity(SLOT_BYTES)
+        receipt = TerminalReceipt.prepare(root, payload['command_id'])
+        binding = self._receipt_original(payload, identity) if binding is None else binding
+        receipt.bind(binding)
+        self.db.execute('INSERT INTO terminal_receipts VALUES (?,?,?,?,?)',
+            (payload['command_id'], receipt.slot_id, str(root), json.dumps(receipt.capture(),sort_keys=True),
+             json.dumps(binding,sort_keys=True)))
+
+    def _terminal_receipt(self, command_id, state, result):
+        from .terminal_receipt import TerminalReceipt
+        if self._receipt_config is None:
+            return
+        row = self.db.execute('SELECT * FROM terminal_receipts WHERE command_id=?', (command_id,)).fetchone()
+        ensure(row is not None and row['root'] == str(self._receipt_config['path']), 'terminal_receipt_missing')
+        try:
+            receipt = TerminalReceipt(row['root'], row['slot_id'], expected_capture=self._receipt_json(row['capture']))
+            # No retained, independently bound backend runtime observation exists
+            # here. Do not fabricate Engine/boot/invocation metadata.
+            receipt.record_terminal(self._receipt_json(row['binding']), outcome=state, result=result, runtime=None)
+        except Exception:
+            # Retain known write/fsync failure across new reader instances. A
+            # valid footer after a late fsync error is not durable success.
+            if len(self._receipt_io_failed) < self._receipt_config['max_slots']:
+                self._receipt_io_failed.add(command_id)
+            else:
+                self._receipt_io_failed_overflow = True
+            raise
+
+    def terminal_evidence(self, command_id):
+        """Private original-ID evidence; never SQL reconciliation authority."""
+        from .terminal_receipt import TerminalReceipt
+        identifier(command_id)
+        with self.lock:
+            row = self.db.execute('SELECT * FROM terminal_receipts WHERE command_id=?', (command_id,)).fetchone()
+            ensure(row is not None and self._receipt_config is not None and
+                   row['root'] == str(self._receipt_config['path']), 'terminal_receipt_unavailable', 409)
+            if command_id in self._receipt_io_failed or self._receipt_io_failed_overflow:
+                return {'state': 'uncertain', 'reason': 'receipt_persistence_failed'}
+            receipt = TerminalReceipt(row['root'], row['slot_id'], expected_capture=self._receipt_json(row['capture']))
+            return receipt.evidence(self._receipt_json(row['binding']))
 
     def _capacity(self, extra):
         used = sum(item.stat().st_size for item in self.root.rglob('*') if item.is_file() and not item.is_symlink())
@@ -245,6 +494,7 @@ class Service:
                 ensure(row['project'] == payload['project'] and row['digest'] == digest, 'source_identity_conflict', 409)
                 self._source(source_id, payload['project'], digest)
             else:
+                ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
                 self.cleanup_sources()
                 self._capacity(len(raw))
                 path = self.sources / (source_id + '.zip')
@@ -276,6 +526,7 @@ class Service:
         Called before new deposits; not part of recording a cleanup receipt.
         """
         with self.lock:
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
             references = {}
             for operation in self.db.execute('SELECT * FROM operations'):
                 payload = json.loads(operation['payload'])
@@ -350,33 +601,81 @@ class Service:
             extract(raw)
             ensure(self.active is None and not self.db.execute("SELECT 1 FROM operations WHERE state IN ('held','running','accepted')").fetchone(),
                    'worker_busy_or_held', 409)
+            self._receipt_inventory()
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
             ensure(not self.db.execute('SELECT 1 FROM operations WHERE job_id=?', (payload['job_id'],)).fetchone(), 'job_conflict', 409)
             for resource_id in ids:
                 ensure(not self.db.execute('SELECT 1 FROM resources WHERE id=?', (resource_id,)).fetchone()
                        and not (self.resources / resource_id).exists(), 'resource_conflict', 409)
             reservation = MAX_EXPANDED + 3 * profile['output_bytes'] + len(raw)
+            if self._receipt_config is not None:
+                from .terminal_receipt import SLOT_BYTES
+                reservation += SLOT_BYTES
             self._capacity(reservation)
             # The full incoming payload is already bound by `identity`. Retain
             # compact provenance/idempotency facts, not an inline archive forever.
             persisted = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
-            self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
-                            (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
-            self.db.commit()
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                ensure(not self.db.execute("SELECT 1 FROM scratch_leases WHERE state!='released'").fetchone(),
+                       'scratch_occupied', 409)
+                if self.scratch_slot is not None:
+                    self.scratch_slot.reserve(self.db, payload['command_id'], payload['job_id'], payload['resource_ids'])
+                self._prepare_receipt(payload, identity)
+                self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
+                                (payload['command_id'], identity, payload['job_id'], 'accepted', json.dumps(persisted), '{}'))
+                self.db.commit()
+            except Exception:
+                if self._receipt_config is not None:
+                    self._receipt_fault = 'terminal_receipt_persistence_failed'
+                self.db.rollback()
+                raise
             self.active = payload['command_id']
             self.thread = threading.Thread(target=self._execute, args=(payload, raw), daemon=False)
             try:
                 self.thread.start()
             except Exception:
-                self.db.execute("UPDATE operations SET state='held' WHERE command_id=?", (self.active,))
-                self.db.commit(); self.active = None
+                if self._receipt_config is not None:
+                    self._receipt_fault = 'terminal_receipt_recovery_required'
+                try:
+                    self.db.execute("UPDATE operations SET state='held' WHERE command_id=?", (self.active,))
+                    self.db.commit()
+                finally:
+                    self.active = None
+                    self.thread = None
                 raise Rejected('worker_start_failed', 503) from None
             return self.status(payload['job_id'])
 
     def _execute(self, payload, raw):
         try:
+            self._execute_operation(payload, raw)
+        except Exception:
+            # Preserve the original reservation even if SQLite cannot record
+            # failure. The sticky veto and startup accepted/running->held gate
+            # prevent another job; private receipt remains evidence only.
+            if self._receipt_config is not None:
+                self._receipt_fault = 'terminal_receipt_persistence_failed'
+            with self.lock:
+                try:
+                    self.db.rollback()
+                    self.db.execute("UPDATE operations SET state='held' WHERE command_id=?", (payload['command_id'],))
+                    self.db.commit()
+                except Exception:
+                    try: self.db.rollback()
+                    except Exception: pass
+        finally:
+            with self.lock:
+                self.active = None
+
+    def _execute_operation(self, payload, raw):
+        lease = None
+        try:
             with self.lock:
                 self.db.execute("UPDATE operations SET state='running' WHERE command_id=?", (payload['command_id'],))
                 self.db.commit()
+                if self.scratch_slot is not None:
+                    lease = self.scratch_slot.lease(self.db, payload['command_id'])
+                    lease.materialize()
             paths = {}
             for kind, resource_id in payload['resource_ids'].items():
                 path = self.resources / resource_id
@@ -389,7 +688,11 @@ class Service:
             extract(raw, paths['workspace'])
             make_job_readable(paths['workspace'], MAX_EXPANDED)
             profile = self.projects[payload['project']][payload['recipe']]
-            result = self.backend.run(paths, profile, payload['command_id'])
+            if lease is None:
+                result = self.backend.run(paths, profile, payload['command_id'])
+            else:
+                result = self.backend.run(paths, profile, payload['command_id'], scratch_lease=lease)
+                ensure(lease.backend_absent, 'execution_uncertain', 409)
             for kind, path in paths.items():
                 limit = MAX_EXPANDED if kind == 'workspace' else profile['output_bytes']
                 manifest, size = tree_manifest(path, limit)
@@ -401,12 +704,56 @@ class Service:
                           source_digest=payload['source_digest'], resource_ids=payload['resource_ids'])
             state = 'succeeded'
         except Exception as exc:
-            result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
-            state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
+            from .docker import DockerBackend, FrozenDiagnosticFailure
+            if type(exc) is FrozenDiagnosticFailure:
+                ensure(type(self.backend) is DockerBackend and exc.command_id == payload['command_id']
+                       and exc.resource_id == payload['resource_ids']['test_run']
+                       and exc.stage in ('build', 'test') and type(exc.engine_id) is str
+                       and re.fullmatch('[A-Za-z0-9:_-]{1,128}', exc.engine_id), 'execution_uncertain')
+                if self.scratch_slot is not None:
+                    ensure(lease is not None and lease.backend_absent, 'execution_uncertain')
+                path = paths['test_run']
+                manifest, size = tree_manifest(path, profile['output_bytes'])
+                ensure(manifest == exc.manifest and size == exc.size and bool(manifest), 'execution_uncertain')
+                with self.lock:
+                    row = self.db.execute('SELECT * FROM resources WHERE id=?', (exc.resource_id,)).fetchone()
+                    ensure(row is not None and row['job_id'] == payload['job_id'] and row['kind'] == 'test_run'
+                           and row['state'] == 'building' and not path.is_symlink()
+                           and path.stat().st_ino == row['inode'], 'execution_uncertain')
+                    self.db.execute("UPDATE resources SET state='ready',manifest=?,bytes=? WHERE id=?",
+                                    (json.dumps(manifest), size, exc.resource_id))
+                    self.db.commit()
+                result = {'error': exc.code, 'diagnostic': {'resource_id': exc.resource_id,
+                    'manifest_sha256': hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest(),
+                    'bytes': size, 'stage': exc.stage, 'scope': 'original_engine_owned_writers_exporters_volumes_absent'}}
+                state = 'failed'
+            else:
+                result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
+                state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
+            if self._receipt_config is not None and isinstance(exc, (sqlite3.Error, OSError)):
+                self._receipt_fault = 'terminal_receipt_persistence_failed'
+        if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
+            state = 'held'
+            result = {'error': 'scratch_cleanup_unproven'}
         with self.lock:
+            self._terminal_receipt(payload['command_id'], state, result)
+            if lease is not None and lease.backend_absent:
+                self.db.execute('UPDATE scratch_leases SET absence=? WHERE command_id=?',
+                                (json.dumps(lease.absence_receipt(), sort_keys=True), payload['command_id']))
             self.db.execute('UPDATE operations SET state=?,result=? WHERE command_id=?',
                             (state, json.dumps(result), payload['command_id']))
-            self.db.commit(); self.active = None
+            self.db.commit()
+            if lease is not None and state in TERMINAL:
+                try:
+                    lease.release()
+                except Exception:
+                    if self._receipt_config is not None:
+                        self._receipt_fault = 'terminal_receipt_recovery_required'
+                    self.db.rollback()
+                    self.db.execute("UPDATE operations SET state='held',result=? WHERE command_id=?",
+                                    ('{"error":"scratch_cleanup_uncertain"}', payload['command_id']))
+                    self.db.commit()
+            self.active = None
 
     def status(self, job_id):
         identifier(job_id)
@@ -447,6 +794,92 @@ class Service:
                    item['manifest'][name]['sha256'], 'artifact_changed', 409)
             return data
 
+    def diagnostic_file(self, resource_id, manifest_sha256, name):
+        """Only registered, terminal-failed test_run bytes; never inline HTML."""
+        identifier(resource_id); relative(name)
+        ensure(type(manifest_sha256) is str and re.fullmatch('[0-9a-f]{64}', manifest_sha256), 'diagnostic_binding_invalid')
+        ensure(os.name == 'posix', 'diagnostic_posix_required')
+        with self.lock:
+            item = self.metadata(resource_id)
+            ensure(item['kind'] == 'test_run' and item['state'] == 'ready', 'diagnostic_not_registered', 409)
+            row = self.db.execute('SELECT * FROM operations WHERE job_id=?', (item['job_id'],)).fetchone()
+            ensure(row is not None and row['state'] == 'failed', 'diagnostic_not_terminal', 409)
+            result = json.loads(row['result']); saved = result.get('diagnostic', {})
+            digest = hashlib.sha256(json.dumps(item['manifest'],sort_keys=True,separators=(',', ':')).encode()).hexdigest()
+            ensure(saved.get('resource_id') == resource_id and saved.get('manifest_sha256') == digest == manifest_sha256
+                   and saved.get('bytes') == item['bytes'] and name in item['manifest'], 'diagnostic_binding_invalid', 409)
+            entry = item['manifest'][name]
+            ensure(type(entry['bytes']) is int and 0 <= entry['bytes'] <= 8*1024**2, 'diagnostic_file_too_large', 409)
+            directory = os.open(self.resources, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = None
+            try:
+                current = os.open(resource_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory);directory=current
+                ensure(os.fstat(directory).st_ino == item['inode'], 'resource_identity_drift', 409)
+                parts = relative(name).parts
+                for part in parts[:-1]:
+                    current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                    os.close(directory);directory=current
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                before = os.fstat(fd)
+                ensure(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == entry['bytes'],
+                       'artifact_changed', 409)
+                with os.fdopen(fd, 'rb') as stream:
+                    fd = None; data = stream.read(entry['bytes']+1); after=os.fstat(stream.fileno())
+                ensure((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) ==
+                       (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+                       and len(data) == entry['bytes'] and hashlib.sha256(data).hexdigest() == entry['sha256'],
+                       'artifact_changed', 409)
+                return data
+            finally:
+                if fd is not None:os.close(fd)
+                os.close(directory)
+
+    def _cleanup_parent(self, expected):
+        info = self.resources.stat(follow_symlinks=False)
+        ensure(stat.S_ISDIR(info.st_mode) and [info.st_dev, info.st_ino] == expected
+               and not self.resources.is_symlink(), 'cleanup_scope_drift', 409)
+        if os.name != 'posix':
+            ensure(self._receipt_config is None, 'terminal_receipts_posix_required')
+            return None  # Legacy synthetic Windows service only; no receipt proof.
+        fd = os.open(self.resources, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            actual = os.fstat(fd)
+            ensure([actual.st_dev, actual.st_ino] == expected and actual.st_uid == os.getuid()
+                   and not stat.S_IMODE(actual.st_mode) & 0o077, 'cleanup_scope_drift', 409)
+            return fd
+        except BaseException:
+            os.close(fd); raise
+
+    def _delete_cleanup_resource(self, item, root_identity):
+        """Scoped ENOENT+parent fsync observation, not universal crash proof."""
+        parent = self._cleanup_parent(root_identity)
+        try:
+            path = self.resources / item['id']
+            actual = (os.stat(item['id'], dir_fd=parent, follow_symlinks=False) if parent is not None
+                      else path.stat(follow_symlinks=False))
+            ensure(stat.S_ISDIR(actual.st_mode) and actual.st_ino == item['inode']
+                   and actual.st_dev == root_identity[0], 'cleanup_scope_drift', 409)
+            manifest, _ = tree_manifest(path, MAX_EXPANDED)
+            ensure(hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest() ==
+                   item['_observed_manifest_sha256'], 'cleanup_scope_drift', 409)
+            if parent is None:
+                shutil.rmtree(path)
+                ensure(not path.exists() and not path.is_symlink(), 'cleanup_uncertain', 409)
+            else:
+                shutil.rmtree(item['id'], dir_fd=parent)
+                def absent():
+                    try: os.stat(item['id'], dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError: return
+                    raise Rejected('cleanup_uncertain', 409)
+                absent()
+                os.fsync(parent)
+                absent()
+                check = self._cleanup_parent(root_identity)
+                os.close(check)
+        finally:
+            if parent is not None: os.close(parent)
+
     def cleanup(self, payload):
         ensure(isinstance(payload, dict) and set(payload) == {'command_id', 'idempotency_key', 'resources'}, 'cleanup_schema')
         identifier(payload['command_id'])
@@ -456,8 +889,13 @@ class Service:
         with self.lock:
             identity, existing = self._operation(payload['command_id'], payload)
             if existing:
-                return existing
+                return existing  # Original-ID read, never a repeated delete.
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
             ensure(self.active is None, 'worker_busy', 409)
+            self._receipt_inventory()
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
+            root = self.resources.stat(follow_symlinks=False)
+            root_identity = [root.st_dev, root.st_ino]
             items = []
             for wanted in payload['resources']:
                 ensure(isinstance(wanted, dict) and set(wanted) == {'resource_id', 'expected_revision'}, 'cleanup_resource_schema')
@@ -467,35 +905,54 @@ class Service:
                 ensure(self.status(item['job_id'])['state'] in TERMINAL, 'resource_job_not_terminal', 409)
                 path = self.resources / item['id']
                 ensure(path.parent == self.resources and not path.is_symlink() and path.is_dir() and
-                       path.stat().st_ino == item['inode'], 'cleanup_scope_drift', 409)
-                tree_manifest(path, MAX_EXPANDED)
+                       path.stat().st_ino == item['inode'] and path.stat().st_dev == root.st_dev, 'cleanup_scope_drift', 409)
+                manifest, _ = tree_manifest(path, MAX_EXPANDED)
+                item['_observed_manifest_sha256'] = hashlib.sha256(
+                    json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
                 items.append(item)
             ensure(len({x['id'] for x in items}) == len(items), 'duplicate_cleanup_resource')
-            self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
-                            (payload['command_id'], identity, None, 'running', json.dumps(payload), '{}'))
-            self.db.commit()
-            for item in items:
-                try:
-                    path = self.resources / item['id']
-                    # Lock spans revalidation and deletion; never traverse unknown paths.
-                    ensure(not path.is_symlink() and path.stat().st_ino == item['inode'], 'cleanup_scope_drift', 409)
-                    tree_manifest(path, MAX_EXPANDED)
+            confirmed, current, terminal_attempted = [], None, False
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                binding = self._cleanup_binding(payload, identity, items, root_identity)
+                self._prepare_receipt(payload, identity, binding=binding)
+                self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
+                                (payload['command_id'], identity, None, 'running', json.dumps(payload), '{}'))
+                self.db.commit()  # Before the first deletion effect.
+                for item in items:
+                    current = item
                     self.db.execute("UPDATE resources SET state='deleting' WHERE id=?", (item['id'],))
                     self.db.commit()
-                    shutil.rmtree(path)
+                    self._delete_cleanup_resource(item, root_identity)
+                    confirmed.append(item['id'])
                     self.db.execute("UPDATE resources SET state='deleted',revision=revision+1,manifest='{}',bytes=0 WHERE id=?", (item['id'],))
                     self.db.commit()
-                except Exception:
-                    self.db.execute("UPDATE resources SET state='delete_failed' WHERE id=?", (item['id'],))
+                result = {'deleted_resource_ids': [x['id'] for x in items]}
+                terminal_attempted = True
+                self._terminal_receipt(payload['command_id'], 'succeeded', result)
+                self.db.execute("UPDATE operations SET state='succeeded',result=? WHERE command_id=?",
+                                (json.dumps(result), payload['command_id']))
+                self.db.commit()
+                return {'command_id': payload['command_id'], 'job_id': None, 'state': 'succeeded', 'result': result}
+            except Exception:
+                # Latch FIRST: both a fallback hold write and its commit may fail.
+                self._receipt_fault = 'cleanup_recovery_required'
+                result = {'error': 'cleanup_uncertain', 'deleted_resource_ids': confirmed}
+                try: self.db.rollback()
+                except Exception: pass
+                if not terminal_attempted:
+                    try: self._terminal_receipt(payload['command_id'], 'held', result)
+                    except Exception: pass  # Original slot remains uncertain/owned.
+                try:
+                    if current is not None:
+                        self.db.execute("UPDATE resources SET state='delete_failed' WHERE id=? AND state!='deleted'", (current['id'],))
                     self.db.execute("UPDATE operations SET state='held',result=? WHERE command_id=?",
-                                    ('{"error":"cleanup_uncertain"}', payload['command_id']))
+                                    (json.dumps(result), payload['command_id']))
                     self.db.commit()
-                    raise Rejected('cleanup_uncertain', 409) from None
-            result = {'deleted_resource_ids': [x['id'] for x in items]}
-            self.db.execute("UPDATE operations SET state='succeeded',result=? WHERE command_id=?",
-                            (json.dumps(result), payload['command_id']))
-            self.db.commit()
-            return {'command_id': payload['command_id'], 'job_id': None, 'state': 'succeeded', 'result': result}
+                except Exception:
+                    try: self.db.rollback()
+                    except Exception: pass
+                raise Rejected('cleanup_uncertain', 409) from None
 
     def wait(self):
         if self.thread:
@@ -505,3 +962,6 @@ class Service:
         self.wait()
         self.db.close()
         self.process_lock.close()
+        if self._scratch_lock is not None:
+            os.close(self._scratch_lock)
+            self._scratch_lock = None

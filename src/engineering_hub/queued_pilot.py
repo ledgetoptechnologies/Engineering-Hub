@@ -32,11 +32,19 @@ class QueuedContainerPilot:
     marker. Existing public/legacy pilot entrypoints subsequently fail closed.
     It does not start an event loop, listener, network call or background worker.
     """
-    def __init__(self, queue, workflow, *, action_key, machine_id, reconciliation):
+    def __init__(self, queue, workflow, *, action_key, machine_id, reconciliation,
+                 execution_policies=None, modular_controller=None):
         if (type(queue) is not WorkQueue or type(workflow) is not ContainerPilotWorkflow
                 or queue.repo is not workflow.repo or workflow.pilot_owner is None
                 or workflow.repo.execution_principal != 'executor:container-pilot'):
             raise HubError('queued_pilot_composition_required', 409)
+        if execution_policies is not None:
+            from .execution_policy import SharedExecutionPolicies
+            if (type(execution_policies) is not SharedExecutionPolicies
+                    or execution_policies.repo is not queue.repo or execution_policies.queue is not queue):
+                raise HubError('queued_pilot_policy_conflict', 409)
+        elif modular_controller is not None:
+            raise HubError('queued_pilot_policy_conflict', 409)
         workflow._assert_pilot_owner()
         action = queue.actions.get(action_key)
         target = workflow.targets.get('engineering-hub:staging')
@@ -65,6 +73,9 @@ class QueuedContainerPilot:
         self.reconciliation = reconciliation
         self.action_key, self.machine_id = action_key, machine_id
         self._action = action
+        self._shared_mode = execution_policies is not None
+        self._execution_policies = execution_policies
+        self._execution_binding = None
         self._additional_target_verifier = queue.target_verifier
         self.worker = WorkWorker('executor:container-pilot', self.owner.epoch)
         self._permit = ContextVar('queued-pilot-private-permit', default=None)
@@ -105,17 +116,32 @@ class QueuedContainerPilot:
                     'WHERE j.run_id=? OR (j.run_id IS NULL AND r.run_id=?)', (run['id'], run['id'])).fetchone()
                 if bound is None:
                     raise HubError('queued_pilot_unbound_run_present', 409)
-            for reservation in db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (machine_id,)):
+            for reservation in db.execute('SELECT machine_id,generation,job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (machine_id,)):
                 if db.execute('SELECT 1 FROM hub_queued_pilot_jobs WHERE job_id=?', (reservation['job_id'],)).fetchone() is None:
-                    raise HubError('queued_pilot_unbound_reservation_present', 409)
+                    # Only the explicitly composed modular controller can bind
+                    # a foreign reservation. This read-only match preserves the
+                    # original hold; it never gives this pilot its ownership.
+                    if not self._shared_mode or modular_controller is None:
+                        raise HubError('queued_pilot_unbound_reservation_present', 409)
+                    from .shared_hold_binding import modular_hold_matches
+                    if modular_hold_matches(db, repo=self.repo, queue=self.queue,
+                            policies=self._execution_policies, modular_controller=modular_controller,
+                            reservation=reservation) is not True:
+                        raise HubError('queued_pilot_unbound_reservation_present', 409)
             db.execute('INSERT OR IGNORE INTO hub_queued_pilot_policy VALUES(1,?,?,?,?)', expected)
         self.repo._queued_pilot = self
-        queue.target_verifier = self.target_verifier
-        queue.claim_verifier = self.claim_verifier
-        queue.completion_verifier = self.completion_verifier
-        queue.reconciliation_verifier = self.reconciliation_verifier
+        if self._shared_mode:
+            self._execution_binding = execution_policies.bind(
+                'pilot', {self.action_key: action}, worker=self.worker,
+                target=self.target_verifier, claim=self.claim_verifier,
+                completion=self.completion_verifier, reconciliation=self.reconciliation_verifier)
+        else:
+            queue.target_verifier = self.target_verifier
+            queue.claim_verifier = self.claim_verifier
+            queue.completion_verifier = self.completion_verifier
+            queue.reconciliation_verifier = self.reconciliation_verifier
 
-    def _guard(self):
+    def _guard(self, *, admission=False):
         self.owner.assert_active(self.repo.path)
         if (self.workflow.repo is not self.repo or self.queue.repo is not self.repo
                 or self.workflow.pilot_owner is not self.owner
@@ -123,7 +149,16 @@ class QueuedContainerPilot:
             raise HubError('queued_pilot_ownership_lost', 409)
         if self.queue.actions.get(self.action_key) != self._action:
             raise HubError('queued_pilot_policy_changed', 409)
-        if (self.queue.target_verifier != self.target_verifier
+        if self._shared_mode:
+            from .execution_policy import SharedExecutionPolicies
+            if (type(self._execution_policies) is not SharedExecutionPolicies
+                    or self._execution_binding is None
+                    or self._execution_policies.queue is not self.queue
+                    or self._execution_policies.repo is not self.repo
+                    or self._execution_binding.worker is not self.worker):
+                raise HubError('queued_pilot_policy_changed', 409)
+            self._execution_policies.assert_binding('pilot', self._execution_binding, admission=admission)
+        elif (self.queue.target_verifier != self.target_verifier
                 or self.queue.claim_verifier != self.claim_verifier
                 or self.queue.completion_verifier != self.completion_verifier
                 or self.queue.reconciliation_verifier != self.reconciliation_verifier):
@@ -244,7 +279,7 @@ class QueuedContainerPilot:
 
     def target_verifier(self, actor, action_key, environment, target):
         try:
-            self._guard()
+            self._guard(admission=True)
             if self.async_admission_required:
                 self._metadata_admission(pending=True)
             else:
@@ -263,7 +298,7 @@ class QueuedContainerPilot:
 
     def claim_verifier(self, worker, action_key, environment, machine_id, target):
         try:
-            self._guard()
+            self._guard(admission=True)
             self._runtime_admission()
             if self.async_admission_required and self._claim_preview.get() is not asyncio.current_task():
                 self._active_admission(kinds={'claim', 'command'})
@@ -342,7 +377,7 @@ class QueuedContainerPilot:
 
     def authorize(self, operation, *, db=None, **context):
         """Repository/workflow hook; only our task-local private scope may act."""
-        self._guard()
+        self._guard(admission=operation in {'create_run', 'advance', 'command'})
         if operation in {'create_run', 'advance', 'command'}:
             self._runtime_admission()
         permit = self._permit.get()
@@ -395,9 +430,10 @@ class QueuedContainerPilot:
         return True
 
     def _intent(self, job):
+        self._guard(admission=True)
         self.queue.live_claim(job_id=job['id'], worker=self.worker, fence=job['fence'])
         with self.repo._transaction() as db:
-            self._guard()
+            self._guard(admission=True)
             task = self._review(db, job['actor'], WorkTarget(**job['target']))
             if db.execute('SELECT 1 FROM hub_queued_pilot_jobs WHERE job_id=?', (job['id'],)).fetchone():
                 raise HubError('queued_pilot_requires_recovery', 409)
@@ -501,7 +537,7 @@ class QueuedContainerPilot:
         """Claim one eligible staging job; no worker loop or implicit retry."""
         if self.async_admission_required:
             return await self._run_once_async()
-        self._guard()
+        self._guard(admission=True)
         self._runtime_admission()
         job = self.queue.claim(worker=self.worker, lease_seconds=600, action_keys=(self.action_key,))
         if job is None:
@@ -525,7 +561,7 @@ class QueuedContainerPilot:
                 return self._hold(job)
 
     async def _run_once_async(self):
-        self._guard()
+        self._guard(admission=True)
         self._runtime_admission()
         preview = self._claim_preview.set(asyncio.current_task())
         try:
@@ -559,7 +595,7 @@ class QueuedContainerPilot:
         job = None
         try:
             with self._consume(prepared, subject):
-                self._guard()
+                self._guard(admission=True)
                 self._runtime_admission()
                 if claim_subject() != subject:
                     return None
@@ -615,7 +651,7 @@ class QueuedContainerPilot:
 
     def command_metadata(self, run_id, action):
         """Exact private caller binding, never permission to POST."""
-        self._guard()
+        self._guard(admission=True)
         self._runtime_admission()
         permit = self._permit.get()
         if (self._scope_task.get() is not asyncio.current_task() or permit is None or permit[1] != 'execute'):
@@ -633,6 +669,7 @@ class QueuedContainerPilot:
             job_id=job['id'], run_id=command.run_id, action=command.action, phase=command.action)
         prepared = await self.reconciliation.prepare_admission(owner=self.owner,
             subject=subject, deadline=self._preparation_deadline(job))
+        self._guard(admission=True)
         # The caller must enter this scope immediately, without yielding again.
         return prepared, subject
 

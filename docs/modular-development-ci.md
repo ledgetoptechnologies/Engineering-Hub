@@ -10,7 +10,9 @@ kernel limits and mounts before copying `/source` into writable `/workspace`
 and invoking configured commands. Source never chooses the image, bootstrap,
 host commands or network. Both stages verify all four exact committed dependency
 hashes against the image-owned `modular-cache.json` before running any source
-configuration, tests or package script. The bootstrap also checks its own hash.
+configuration, tests or package script. The v2 cache manifest also binds the
+bootstrap and both image-owned Python/Vitest reporter hashes. A v1 cache is not
+silently upgraded or accepted for the new command contract.
 No dependency installer runs in either stage.
 
 The two fixed recipe commands are:
@@ -32,8 +34,18 @@ Existing environment-based skips are reported as skips, not runtime acceptance.
 Playwright browser installation/e2e and image-release smoke checks are outside
 this recipe; it does not claim parity with every hosted release-workflow step.
 
-JUnit files, stage summaries and responsiveness artifacts go to `/test-output`;
-console output remains subject to the worker's log bound. A nonzero test exit
+Bounded JSON reports, stage summaries and responsiveness artifacts go to
+`/test-output`; unbounded JUnit output is no longer requested. The image-owned
+Python launcher loads installed pytest before source import paths, then passes
+the unchanged full-suite arguments to `pytest.main`. It records outcome counters,
+a summary capped at 64 KiB and failure details capped at 128 KiB total/4 KiB per
+entry. The Vitest reporter has a 512 KiB total detail cap and 64 KiB summary cap.
+Omitted/clipped details and incomplete outcome accounting are explicit. Child
+exit zero without a valid complete passing report fails the CI stage, and UI
+tests still run after a nonzero Python result. Atomic summary publication avoids
+empty final files on a write failure. This does not reserve physical capacity.
+
+Console output remains subject to the worker's log bound. A nonzero test exit
 fails the operation. Worker resource manifests bind exported files; these JSON
 reports do not add server-verified commit provenance. Source remains `declared`.
 Timeout/OOM/export overflow is a failed or held job, never a passing check.
@@ -55,11 +67,19 @@ resolution or performance.
    `/opt/eh-ci/dependencies.json`. The currently retained older cache mismatches
    current Python inputs and is not a valid base. Dependency acquisition, if
    needed, belongs to separately controlled image preparation, not a job.
+   The complete suite also requires a working Git executable. The cached Linux
+   diagnostic image was observed without it: packaging checks raised
+   `FileNotFoundError: git`. Candidate preparation now checks `git --version`
+   offline and refuses that cache; it does not install the missing tool. A newly
+   reviewed cache with Git remains necessary before full-suite acceptance.
+   A subsequent local offline cache diagnostic exercised Git object operations
+   and packaging tests successfully. That diagnostic does not enroll its image
+   on staging or prove the full suite fits the worker's resource envelope.
 3. The candidate `docker/Dockerfile.modular-development-ci` consumes that exact
    reviewed immutable base, the four committed lock inputs and this bootstrap.
    Its `--network=none` preparation step refuses mismatching inputs and emits
    `modular-cache.json`. It installs nothing. Build context should contain only
-   these named inputs. Supply the full immutable base reference,
+   these named inputs, including both reporter files. Supply the full immutable base reference,
    `PREPARED_SOURCE_COMMIT` and independently computed `BOOTSTRAP_SHA256`.
 4. Retain an attestation binding the actual final image ID/digest, base image,
    Python/Node/npm versions, dependency map/cache labels, preparation commit,
@@ -73,15 +93,25 @@ resolution or performance.
 
 ## Resource acceptance remains necessary
 
-A starting candidate is one CPU, 512 MiB memory/no swap, 64 PIDs, 128 MiB
-workspace, 16 MiB output, 512 KiB logs and the existing 64 MiB `/tmp`, with a
-900-second per-stage deadline. These are proposed bounds, not evidence that the
-entire suite fits. `/test-output` gets the existing output/4 bound. The worker,
+The previous measured candidate used one CPU, 512 MiB memory/no swap, 64 PIDs,
+128 MiB workspace, 16 MiB output, 512 KiB logs, 64 MiB `/tmp` and a 900-second
+per-stage deadline. The real full-suite run exhausted temporary and report space;
+this envelope is insufficient. Bounded reporting addresses report growth, not
+the separate need for quota-controlled disk-backed scratch, durable reservations
+or a physically reserved worker terminal receipt. No scratch mount or host quota
+is introduced by the reporter change. `/test-output` retains output/4. The worker,
 daemon, job and exporter stay within the existing 1 GiB aggregate; do not raise
 the parent limit to accommodate this profile. Exported output volumes and
 workspace tmpfs also consume bounded memory. A full-suite failure under `/tmp`
 noexec, tmpfs capacity or the memory ceiling must be diagnosed honestly; do not
 silently skip tests, disable kernel checks or reuse the old 2 GiB runner.
+
+The optional scratch implementation binds an operator-provisioned dedicated
+filesystem slot, verifies its actual capacity/mount identity and retains its lease
+across held/interrupted work. See [the scratch contract](modular-ci-scratch.md).
+A plain host directory or Docker volume is not a disk quota. Failed diagnostic
+registration/download and ENOSPC-safe worker receipt publication remain separate
+work; a source-visible JSON file supplies neither.
 
 Before image import, size the exact prepared artifact and retained layers against
 the TEST volume and underlying host free floor. No build, pull, image import,

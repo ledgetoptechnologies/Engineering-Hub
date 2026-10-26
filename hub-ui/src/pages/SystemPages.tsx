@@ -11,6 +11,7 @@ import { WorkQueuePanel } from "../WorkQueuePanel";
 import { StagingRuntimePanel } from "../StagingRuntimePanel";
 import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
+import { SharedStagingPanel } from "../SharedStagingPanel";
 import { StagingBadge } from "./WorkPages";
 
 function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolean }) {
@@ -234,6 +235,10 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
         </section>
         {(hub.demo || hub.session?.authenticated) && (
           <StagingRuntimePanel mode={hub.demo ? "demo" : "live"} onUnauthorized={hub.clearPrivateWorkspace} />
+        )}
+        {(hub.demo || hub.session?.authenticated) && (
+          <SharedStagingPanel mode={hub.demo ? "demo" : "live"} csrf={hub.session?.csrf_token ?? null}
+            writable={hub.writable} stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
         )}
         {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
           <SessionReconciliationPanel csrf={hub.session.csrf_token}

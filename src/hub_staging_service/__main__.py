@@ -101,6 +101,8 @@ def handler(service, token, peers, *, host_snapshot=None):
                         return self.respond(200, service.operation(parts[2]))
                     if len(parts) == 4 and parts[:2] == ['v1', 'resources'] and parts[3] == 'metadata':
                         return self.respond(200, service.metadata(parts[2]))
+                    if len(parts) >= 6 and parts[:2] == ['v1', 'resources'] and parts[3] == 'diagnostics':
+                        return self.respond(200, service.diagnostic_file(parts[2], parts[4], '/'.join(parts[5:])), 'application/octet-stream')
                     if len(parts) >= 5 and parts[:2] == ['v1', 'resources'] and parts[3] == 'files':
                         name = '/'.join(parts[4:])
                         return self.respond(200, service.file(parts[2], name), mimetypes.guess_type(name)[0] or 'application/octet-stream')
@@ -148,6 +150,12 @@ def main():
     port = config.get('port', 8780)
     ensure(type(port) is int and 1024 <= port <= 65535, 'invalid_port')
     backend = DockerBackend(config['docker_endpoint'])
+    scratch_slot = None
+    if config.get('scratch_slot') is not None:
+        from .scratch import ScratchSlot
+        scratch_slot = ScratchSlot.from_config(config['scratch_slot'])
+    from .core import terminal_receipt_config
+    terminal_receipt_config(config.get('terminal_receipts'), config['worker_root'])
     host_snapshot = config.get('host_snapshot')
     if host_snapshot is not None:
         ensure(type(host_snapshot) is str and Path(host_snapshot).is_absolute()
@@ -157,8 +165,12 @@ def main():
     if args.check_config:
         print(json.dumps({'valid': True, 'projects': sorted(projects), 'credentials_disclosed': False}))
         return
-    service = Service(config['worker_root'], projects, backend,
-                      capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
+    storage = dict(capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
+    if scratch_slot is not None:
+        storage['scratch_slot'] = scratch_slot
+    if config.get('terminal_receipts') is not None:
+        storage['terminal_receipts'] = config['terminal_receipts']
+    service = Service(config['worker_root'], projects, backend, **storage)
     server = BoundedServer((bind, port), handler(service, token, peers, host_snapshot=host_snapshot))
     server.daemon_threads = True
     server.timeout = 10

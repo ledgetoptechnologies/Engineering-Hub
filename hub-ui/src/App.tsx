@@ -11,6 +11,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
+import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
@@ -551,12 +552,17 @@ export function HubApp() {
     { route: { page: "projects" }, label: "Projects", icon: "folder" },
     { route: { page: "agents" }, label: "Agents", icon: "agents" },
     { route: { page: "staging" }, label: "Staging", icon: "staging" },
+    // Global, not per-project, so it appears only when the Hub grants this caller infrastructure access.
+    ...(demo || data?.capabilities.infrastructure === true
+      ? [{ route: { page: "infrastructure" } as Route, label: "Infrastructure", icon: "network" as IconKind }] : []),
   ];
   const isCurrent = (target: Route) => target.page === route.page
-    || (target.page === "projects" && (route.page === "project" || route.page === "labels" || route.page === "review"));
+    || (target.page === "projects" && (route.page === "project" || route.page === "labels" || route.page === "review"))
+    || (target.page === "infrastructure" && route.page === "device");
   const pageTitle = route.page === "project" ? projectName(route.id)
     : route.page === "labels" ? `${projectName(route.project)} labeling`
     : route.page === "review" ? `${projectName(route.project)} review`
+    : route.page === "device" ? "Infrastructure"
     : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
   const actions = (
     <>
@@ -704,7 +710,8 @@ export function HubApp() {
           <div className="page" key={route.page === "project" ? `project-${route.id}`
             : route.page === "labels" ? `labels-${route.project}-${route.set}`
             // A different review, project or signed-in person is a fresh page with no state carried over.
-            : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}` : route.page}>
+            : route.page === "review" ? `review-${route.project}-${route.id}-${session?.actor ?? ""}`
+            : route.page === "device" ? `device-${route.id}-${session?.actor ?? ""}` : route.page}>
             {route.page === "home" && <HomePage hub={hub} actions={actions} />}
             {route.page === "inbox" && <InboxPage hub={hub} actions={actions} />}
             {route.page === "work" && <WorkPage hub={hub} actions={actions} />}
@@ -728,6 +735,8 @@ export function HubApp() {
               </>
             )}
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
+            {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
+            {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
           </div>
         )}
         <footer className="page-footer">

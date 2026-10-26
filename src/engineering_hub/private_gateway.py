@@ -34,11 +34,13 @@ _GET = frozenset({
         'overview', 'projects', 'agents', 'tasks', 'decisions', 'runs', 'image-versions',
         'autonomy', 'events', 'events/status', 'work/status', 'work/jobs', 'notes', 'notes/document',
         'planning', 'planning/document', 'activity', 'label-sets', 'topics', 'interactive-reviews',
-        'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources')),
+        'staging/session-reconciliation', 'staging/status', 'staging/runtime', 'staging/resources',
+        'staging/shared/status')),
 })
 _POST = frozenset('/api/hub/v1/' + name for name in (
     'auth/bootstrap', 'auth/logout', 'tasks', 'decisions', 'pause', 'work/pause', 'notes', 'planning',
-    'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply'))
+    'staging/session-reconciliation', 'staging/cleanup/plan', 'staging/cleanup/apply',
+    'staging/shared/recover'))
 _REQUEST_HEADERS = frozenset({
     b'host', b'origin', b'cookie', b'cf-access-jwt-assertion', b'x-hub-csrf',
     b'content-type', b'accept', b'last-event-id', b'if-none-match',
@@ -49,13 +51,28 @@ _RESPONSE_HEADERS = frozenset({
     b'location', b'content-security-policy', b'x-content-type-options',
     b'referrer-policy', b'x-accel-buffering', b'etag', b'last-modified',
     b'vary', b'www-authenticate', b'content-range', b'accept-ranges',
+    b'content-disposition',
 })
+
+
+def _diagnostic_path(path, *, files_only=False):
+    match = re.fullmatch(r'/api/hub/v1/staging/diagnostics/' + _UUID + r'(?:/files/(.*))?', path)
+    if match is None:
+        return False
+    relative = match.group(1)
+    if relative is None:
+        return not files_only
+    return (len(relative) <= 512 and re.fullmatch(r'[A-Za-z0-9_@./-]+', relative) is not None
+            and all(part not in ('', '.', '..') for part in relative.split('/')))
 
 
 def browser_route_allowed(method, path):
     """Closed browser surface; new backend routes are not exposed implicitly."""
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
+                or path == '/api/hub/v1/infrastructure/devices'
+                or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
+                or method == 'GET' and _diagnostic_path(path)
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
@@ -69,12 +86,16 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + r'(?:/results|/items/' + _LABEL_ID + '/image)?', path) is not None
                 or re.fullmatch(r'/api/hub/v1/topics/' + _TOPIC + r'/(?:peers|preflight|events)', path) is not None)
     if method == 'PUT':
-        return (re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
+        return (re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
+                or re.fullmatch(r'/api/hub/v1/label-sets/' + _LABEL_ID + '/items/' + _LABEL_ID + '/label', path) is not None
                 or re.fullmatch(r'/api/hub/v1/staging/projects/' + _PROJECT_ID + '/policy', path) is not None)
     if method == 'PATCH':
         return (re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None)
-    return method == 'POST' and (path in _POST or re.fullmatch(
+    return method == 'POST' and (path in _POST
+        or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID + '/maintenance', path) is not None
+        or re.fullmatch(r'/api/hub/v1/infrastructure/maintenance/' + _UUID + '/resolve', path) is not None
+        or re.fullmatch(
         r'/api/hub/v1/interactive-reviews/' + _UUID + '/answers', path) is not None or re.fullmatch(
         r'/api/hub/v1/decisions/' + _UUID + '/answer', path) is not None
         or re.fullmatch(r'/api/hub/v1/(?:tasks|decisions)/' + _UUID + '/(?:context|withdraw)', path) is not None
@@ -308,7 +329,8 @@ class PublicBrowserGateway:
                 # the configured general response budget unchanged.
                 review_detail = re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID
                     + r'(?:/state|/answers)?', scope['path']) is not None
-                response_limit = 4 * 1024 * 1024 if review_detail else self.max_response_bytes
+                response_limit = (8 * 1024 * 1024 if _diagnostic_path(scope['path'], files_only=True)
+                                  else 4 * 1024 * 1024 if review_detail else self.max_response_bytes)
                 async with asyncio.timeout(self.request_timeout):
                     if response.is_stream_consumed:
                         content.extend(response.content)

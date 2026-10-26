@@ -12,7 +12,7 @@ export const pretty = (value: string) =>
   value.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
 
 export type IconKind =
-  | "grid" | "inbox" | "work" | "folder" | "notes" | "agents" | "staging"
+  | "grid" | "inbox" | "work" | "folder" | "notes" | "agents" | "staging" | "network"
   | "arrow" | "plus" | "refresh" | "search" | "chevron" | "check" | "pause" | "menu";
 
 const paths: Record<IconKind, string> = {
@@ -23,6 +23,7 @@ const paths: Record<IconKind, string> = {
   notes: "M6 3h9l4 4v14H6z M14 3v5h5 M9 12h7 M9 16h7",
   agents: "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-3a5 5 0 0 1 10 0v3 M17 5a3 3 0 0 1 0 6 M16 15a5 5 0 0 1 6 5",
   staging: "M4 4h16v6H4z M4 14h16v6H4z M8 7h.01 M8 17h.01",
+  network: "M9 3h6v5H9z M3 16h6v5H3z M15 16h6v5h-6z M12 8v4 M6 16v-4h12v4",
   arrow: "M5 12h14 M13 6l6 6-6 6",
   plus: "M12 4v16 M4 12h16",
   refresh: "M20 9a8 8 0 1 0 0 6 M20 3v6h-6",

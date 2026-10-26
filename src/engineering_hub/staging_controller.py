@@ -60,7 +60,8 @@ def compose_queue(repo, existing_queue, projects, machine_id):
 
 class StagingController:
     def __init__(self, repo, queue, client, *, resources, control_principal,
-                 actions, worker=None, poll_interval=1, max_poll_seconds=2700):
+                 actions, worker=None, poll_interval=1, max_poll_seconds=2700,
+                 execution_policies=None):
         _require(queue.repo is repo and resources.repo is repo and resources._control is control_principal,
                  'invalid_staging_configuration')
         _require(type(actions) is dict and bool(actions) and 0 < poll_interval <= 30 and
@@ -69,6 +70,16 @@ class StagingController:
         self.principal, self.actions = control_principal, dict(actions)
         self.worker = worker or WorkWorker(STAGING_SERVICE_EXECUTOR, str(uuid.uuid4()))
         _require(self.worker.agent == STAGING_SERVICE_EXECUTOR, 'invalid_staging_worker')
+        self.execution_policies = execution_policies
+        self._execution_policies = execution_policies
+        self._policy_binding = None
+        self._policy_actions = dict(self.actions)
+        self._policy_context = (repo, queue, client, resources, control_principal, self.worker)
+        if execution_policies is not None:
+            from .execution_policy import SharedExecutionPolicies
+            _require(type(execution_policies) is SharedExecutionPolicies and
+                     execution_policies.queue is queue and execution_policies.repo is repo,
+                     'invalid_staging_configuration')
         self.poll_interval, self.max_poll_seconds = poll_interval, max_poll_seconds
         self.lock, self.wake = asyncio.Lock(), asyncio.Event()
         self.background, self.stopping = None, False
@@ -84,6 +95,15 @@ class StagingController:
             db.execute("CREATE INDEX IF NOT EXISTS hub_staging_submission_job ON hub_staging_submissions(json_extract(data,'$.job_id'))")
             db.execute('CREATE TABLE IF NOT EXISTS hub_staging_dispatch_cleanup (id TEXT PRIMARY KEY,data TEXT NOT NULL)')
         self._install_verifiers()
+
+    def _shared_guard(self, *, admission=False):
+        if self._execution_policies is not None:
+            _require(self.execution_policies is self._execution_policies and
+                     self.actions == self._policy_actions and
+                     all(current is original for current, original in zip(
+                         (self.repo, self.queue, self.client, self.resources, self.principal, self.worker),
+                         self._policy_context)), 'staging_policy_changed', 409)
+            self._execution_policies.assert_binding('modular', self._policy_binding, admission=admission)
 
     def _read(self, identity=None, *, job_id=None):
         with self.repo._connection() as db:
@@ -126,6 +146,7 @@ class StagingController:
             if action not in owned:
                 return old_target(actor, action, environment, value) if old_target else False
             try:
+                self._shared_guard(admission=True)
                 item = self._read(value.task_id)
                 self._grants(item['actor'], item['project'])
                 return (actor == item['actor'] and environment == 'staging' and item['phase'] != 'depositing'
@@ -138,6 +159,7 @@ class StagingController:
         def claim(worker, action, environment, machine, value):
             if action not in owned:
                 return old_claim(worker, action, environment, machine, value) if old_claim else True
+            self._shared_guard(admission=True)
             if self._unknown_production(machine, old_target):
                 return False
             item = self._read(value.task_id)
@@ -149,6 +171,7 @@ class StagingController:
             if job['action_key'] not in owned:
                 return old_complete(job, evidence_id, outcome) if old_complete else False
             try:
+                self._shared_guard()
                 item = self._read(job_id=job['id'])
                 return item['phase'] == 'verified' and item['evidence_id'] == evidence_id and item['outcome'] == outcome
             except Exception:
@@ -158,8 +181,13 @@ class StagingController:
             if job['action_key'] not in owned:
                 return old_reconcile(job, evidence_id, outcome) if old_reconcile else False
             return proof(job, evidence_id, outcome)
-        queue.target_verifier, queue.claim_verifier = target, claim
-        queue.completion_verifier, queue.reconciliation_verifier = proof, reconciled
+        if self.execution_policies is None:
+            queue.target_verifier, queue.claim_verifier = target, claim
+            queue.completion_verifier, queue.reconciliation_verifier = proof, reconciled
+        else:
+            self._policy_binding = self.execution_policies.bind('modular',
+                {key: queue.actions[key] for key in owned}, worker=self.worker,
+                target=target, claim=claim, completion=proof, reconciliation=reconciled)
 
     def _unknown_production(self, machine, previous_target):
         # Called from claim admission as well as preflight. Unknown persisted
@@ -170,6 +198,7 @@ class StagingController:
                    row['action_key'] not in self.actions.values() and previous_target is None for row in rows)
 
     async def submit(self, actor, payload):
+        self._shared_guard(admission=True)
         _require(actor in AGENTS, 'staging_agent_required', 403)
         fields = {'request_id', 'project', 'recipe', 'source_commit', 'source_digest', 'source_zip_base64'}
         _require(type(payload) is dict and set(payload) in (fields, fields | {'topic'}))
@@ -203,12 +232,15 @@ class StagingController:
                     db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?,?)',
                                (item['id'], actor, payload['request_id'], fingerprint, _json(item)))
             if item['phase'] == 'depositing':
+                self._shared_guard(admission=True)
                 receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
                     'source_digest': item['source_digest'], 'source_zip_base64': encoded})
+                self._shared_guard()
                 _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project')),
                          'staging_source_receipt_mismatch', 502)
                 item['phase'] = 'deposited'; self._save(item)
             if item['job_id'] is None:
+                self._shared_guard(admission=True)
                 target = WorkTarget(item['id'], item['source_commit'], 'sha256:' + item['source_digest'])
                 job = self.queue.submit(actor=actor, request_id='staging:' + item['request_id'],
                     action_key=self.actions[(project, recipe)], environment='staging', target=target)
@@ -293,6 +325,7 @@ class StagingController:
 
     def _finish_no_effect(self, item, claim, proof, reason):
         """Local intent or authenticated rejection proves THIS command did not run."""
+        self._shared_guard()
         item.update(phase='verified', outcome='failed', dispatch_proof=proof,
                     rejection_reason=reason, evidence_id=item.get('evidence_id', str(uuid.uuid4())))
         if claim is not None:
@@ -312,6 +345,7 @@ class StagingController:
         return self._view(item)
 
     def _hold(self, item, claim=None):
+        self._shared_guard()
         if item['phase'] != 'held':
             item['phase'] = 'held'; self._save(item)
         job = self.resources.inspect_job(self.principal, item['job_id'])
@@ -343,6 +377,7 @@ class StagingController:
 
     async def _run_once(self):
         async with self.lock:
+            self._shared_guard(admission=True)
             claim = self.queue.claim(worker=self.worker, action_keys=tuple(sorted(self.actions.values())), lease_seconds=600)
             if claim is None:
                 return None
@@ -351,12 +386,14 @@ class StagingController:
                 _require(item['phase'] == 'queued', 'staging_dispatch_already_attempted', 409)
                 self._grants(item['actor'], item['project'])
                 self.queue.live_claim(job_id=claim['id'], worker=self.worker, fence=claim['fence'])
+                self._shared_guard(admission=True)
                 item['phase'], item['claim'] = 'dispatching', claim
                 self._save(item)  # Never retry POST after this durable boundary.
                 receipt = await self.client.submit({'job_id': item['job_id'], 'command_id': item['command_id'],
                     'idempotency_key': item['command_id'], 'project': item['project'], 'recipe': item['recipe'],
                     'source_commit': item['source_commit'], 'source_digest': item['source_digest'],
                     'source_id': item['source_id'], 'resource_ids': item['resource_ids']})
+                self._shared_guard()
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)
             except Exception as error:
@@ -374,6 +411,7 @@ class StagingController:
     async def _follow(self, item, receipt, claim):
         deadline = time.monotonic() + self.max_poll_seconds
         while True:
+            self._shared_guard()
             _require(receipt.get('job_id') == item['job_id'] and receipt.get('command_id') == item['command_id'],
                      'staging_worker_identity_mismatch', 502)
             if receipt['state'] in ('succeeded', 'failed'):
@@ -384,8 +422,10 @@ class StagingController:
                 self.queue.renew(job_id=item['job_id'], worker=self.worker, fence=claim['fence'], lease_seconds=600)
             await asyncio.sleep(self.poll_interval)
             receipt = await self.client.job(item['job_id'])
+            self._shared_guard()
 
     async def _finish(self, item, receipt, claim):
+        self._shared_guard()
         outcome = receipt['state']
         if outcome == 'succeeded':
             result = receipt['result']
@@ -398,10 +438,28 @@ class StagingController:
         for kind, identity in item['resource_ids'].items():
             if outcome == 'succeeded':
                 fact = await self.client.resource(identity)
+                self._shared_guard()
                 _require(fact.get('id') == identity and fact.get('kind') == kind and
                          fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready',
                          'staging_resource_proof_invalid', 502)
                 metadata[kind] = fact
+        if outcome == 'failed' and 'diagnostic' in receipt['result']:
+            diagnostic = receipt['result']['diagnostic']
+            identity = item['resource_ids']['test_run']
+            _require(type(diagnostic) is dict and set(diagnostic) ==
+                     {'resource_id', 'manifest_sha256', 'bytes', 'stage', 'scope'}
+                     and diagnostic['resource_id'] == identity and diagnostic['stage'] in ('build', 'test')
+                     and diagnostic['scope'] == 'original_engine_owned_writers_exporters_volumes_absent'
+                     and receipt['result'].get('error') == 'stage_' + diagnostic['stage'] + '_failed',
+                     'staging_diagnostic_proof_invalid', 502)
+            fact = await self.client.resource(identity)
+            self._shared_guard()
+            _require(fact.get('id') == identity and fact.get('kind') == 'test_run'
+                     and fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready'
+                     and fact.get('bytes') == diagnostic['bytes'] and bool(fact.get('manifest'))
+                     and hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() == diagnostic['manifest_sha256'],
+                     'staging_diagnostic_proof_invalid', 502)
+            metadata['test_run'] = fact
         for kind, identity in item['resource_ids'].items():
             resource = self.resources.inspect_resource(self.principal, identity)
             if resource['state'] != 'provisioning':
@@ -420,6 +478,7 @@ class StagingController:
             protected=protected)
         item.update(phase='verified', outcome=outcome, evidence_id=item.get('evidence_id', str(uuid.uuid4())))
         self._save(item)
+        self._shared_guard()
         current = self.queue.get_job(item['job_id'])
         if current['state'] == 'held' or current.get('requires_reconciliation'):
             self.queue.reconcile(job_id=item['job_id'], evidence_id=item['evidence_id'], outcome=outcome)
@@ -441,6 +500,7 @@ class StagingController:
 
     async def reconcile(self, identity):
         async with self._short_lock():
+            self._shared_guard()
             item = self._read(job_id=_id(identity))
             current = self.queue.get_job(identity)
             if (item['phase'] in ('queued', 'deposited') and
@@ -459,6 +519,7 @@ class StagingController:
 
     async def cleanup_apply(self, actor, plan_id, digest):
         async with self._short_lock():
+            self._shared_guard()
             begun = self.resources.cleanup_begin(actor, plan_id, digest)
             result = {'removed': [], 'failed': [], 'skipped_changed': [entry['id'] for entry in begun['skipped']]}
             for operation in begun['operations']:
@@ -499,11 +560,14 @@ class StagingController:
                     result['failed'].append({'id': identity, 'code': code})
                     continue
                 try:
+                    self._shared_guard(admission=True)
                     fact = await self.client.resource(identity)
+                    self._shared_guard()
                     _require(fact['id'] == identity and fact['job_id'] == operation['job_id'] and fact['kind'] == operation['kind'] and
                              fact['state'] in ('ready', 'building') and not fact['refs'], 'staging_cleanup_scope_changed', 409)
                     payload = {'command_id': command, 'idempotency_key': command,
                                'resources': [{'resource_id': identity, 'expected_revision': fact['revision']}]}
+                    self._shared_guard(admission=True)
                     with self.repo._transaction() as db:
                         local = self.resources._resource(db, identity)
                         self.repo._cas(local, operation['expected_revision'])
@@ -515,6 +579,7 @@ class StagingController:
                         db.execute('UPDATE hub_staging_dispatch_cleanup SET data=? WHERE id=?', (_json(saved), command))
                     try:
                         receipt = await self.client.cleanup(payload)
+                        self._shared_guard()
                     except StagingNotAccepted as rejected:
                         # Only the first original POST reaches this branch.
                         # Persist the typed rejection before restoring metadata;
@@ -559,12 +624,14 @@ class StagingController:
             return 'reconciliation_required'
 
     async def _cleanup_receipt(self, plan_id, operation, payload, receipt):
+        self._shared_guard()
         identity, command = operation['id'], operation['operation_id']
         _require(receipt.get('command_id') == command and receipt.get('job_id') is None and
                  receipt.get('state') == 'succeeded' and
                  receipt.get('result', {}).get('deleted_resource_ids') == [identity],
                  'staging_cleanup_receipt_invalid', 502)
         tombstone = await self.client.resource(identity)
+        self._shared_guard()
         _require(tombstone['id'] == identity and tombstone['job_id'] == operation['job_id'] and
                  tombstone['kind'] == operation['kind'] and tombstone['state'] == 'deleted' and
                  tombstone['revision'] == payload['resources'][0]['expected_revision'] + 1 and
@@ -574,16 +641,19 @@ class StagingController:
             absent=True, receipt_id=command)
 
     async def preview_file(self, identity, path):
+        self._shared_guard()
         resource = self.resources.inspect_resource(self.principal, _id(identity))
         _require(resource['kind'] == 'preview' and resource['state'] == 'ready' and
                  resource['artifact_digest'] is not None, 'staging_preview_unavailable', 409)
         fact = await self.client.resource(identity)
+        self._shared_guard()
         _require(fact.get('id') == identity and fact.get('job_id') == resource['job_id'] and
                  fact.get('kind') == 'preview' and fact.get('state') == 'ready' and
                  'sha256:' + hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() == resource['artifact_digest'],
                  'staging_preview_binding_changed', 409)
         _require(type(path) is str and path in fact['manifest'], 'not_found', 404)
         received = await self.client.file(identity, path)
+        self._shared_guard()
         _require(type(received) is tuple and len(received) == 2, 'staging_preview_response_invalid', 502)
         data, media_type = received
         expected = fact['manifest'][path]
@@ -603,8 +673,14 @@ class StagingController:
         while not self.stopping:
             self.wake.clear()
             await self._recover_pending()
-            while not self.stopping and await self.run_once() is not None:
-                pass
+            try:
+                while not self.stopping and await self.run_once() is not None:
+                    pass
+            except HubError as error:
+                if not (self.stopping and error.code in {
+                        'staging_controller_closing', 'execution_policy_admission_closed'}):
+                    raise
+                break
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=5)
             except TimeoutError:
@@ -637,15 +713,25 @@ class StagingController:
             finally:
                 self.recheck_backoff[item['job_id']] = (time.monotonic() + delay, min(delay * 2, 300))
 
-    async def close(self):
+    def close_admission(self):
+        """Veto new work synchronously, retaining the client for original drain."""
         self.stopping = True
         self.wake.set()
+
+    async def drain(self):
+        """Drain the original background/in-flight tasks without closing transport."""
+        _require(self.stopping, 'staging_admission_still_open', 409)
+        from .owned_tasks import finish_owned
+        tasks = ([self.background] if self.background is not None else []) + list(self.inflight)
+        if tasks:
+            results = await finish_owned(asyncio.gather(*tasks, return_exceptions=True))
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def close(self):
+        self.close_admission()
         try:
-            if self.background:
-                await self.background  # Drain accepted work, never cancel it.
+            await self.drain()
         finally:
-            try:
-                if self.inflight:
-                    await asyncio.gather(*tuple(self.inflight))
-            finally:
-                await self.client.aclose()
+            await self.client.aclose()

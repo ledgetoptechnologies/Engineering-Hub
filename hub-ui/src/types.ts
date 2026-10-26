@@ -135,6 +135,8 @@ export interface Capabilities {
   fixture_dispatch: boolean;
   container_pilot_dispatch: boolean;
   merge_gate_strength: string;
+  /** Per caller. Only an explicit true shows Infrastructure; the server enforces access either way. */
+  infrastructure?: boolean;
 }
 export interface Overview {
   paused: boolean;

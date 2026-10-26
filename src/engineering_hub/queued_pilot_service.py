@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from pathlib import Path
 
 from .app import Settings, create_app
 from .auth import AuthConfig
@@ -27,6 +28,8 @@ from .split_server import _owned_service, serve_private_coordinator
 from .startup_reconciliation import StartupReconciliation
 from .session_acceptance import SessionAcceptanceBroker
 from .work_queue import WorkAction, WorkQueue, _key
+from .staging_module import prepare_shared_staging, SharedStagingPreparationError
+from .shared_staging_lifecycle import SharedStagingLifecycle
 
 
 class QueuedPilotServiceError(RuntimeError):
@@ -86,6 +89,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         raise ValueError('explicit owned queued pilot configuration required') from None
 
     owner = client = reconciliation = acceptance_broker = None
+    shared = staging_draft = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     constructed = False
@@ -103,7 +107,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, acceptance_broker, constructed
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -117,14 +121,30 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
         workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
-        queue = WorkQueue(repo, {action_key: action}, target_verifier=additional_veto)
+        try:
+            staging_draft = prepare_shared_staging(repo,
+                path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
+                machine_id=machine_id, pilot_actions={action_key: action}, target_verifier=additional_veto)
+        except SharedStagingPreparationError as error:
+            staging_draft = error.draft
+            raise
+        queue = (staging_draft.queue if staging_draft is not None else
+                 WorkQueue(repo, {action_key: action}, target_verifier=additional_veto))
+        if staging_draft is not None and settings.staging_machine_id != machine_id:
+            raise QueuedPilotServiceError()
         bridge = QueuedContainerPilot(queue, workflow,
                                       action_key=action_key, machine_id=machine_id,
-                                      reconciliation=reconciliation)
+                                      reconciliation=reconciliation,
+                                      execution_policies=staging_draft.policies if staging_draft else None,
+                                      modular_controller=staging_draft.module.controller if staging_draft else None)
+        if staging_draft is not None:
+            staging_draft.policies.install()
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
+        if staging_draft is not None:
+            shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime)
+                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
@@ -132,12 +152,17 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
 
     async def cleanup():
         failed = False
+        release_owner = shared is None
         try:
             if rejected_reconciliation_tasks:
                 try:
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
+            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            failed = shared_failed or failed
+            if not release_owner:
+                raise QueuedPilotServiceError()
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()
@@ -154,7 +179,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 except BaseException:
                     failed = True
         finally:
-            if owner is not None:
+            if owner is not None and release_owner:
                 try:
                     owner.close()
                 except BaseException:
@@ -179,6 +204,26 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         await _owned_service(operation, stop)
     except Exception:
         raise QueuedPilotServiceError() from None
+
+
+async def _cleanup_shared_staging(shared, draft):
+    """Close accepted shared resources before the outer client/owner release."""
+    failed = False
+    if shared is not None:
+        try:
+            await shared.close()
+        except BaseException:
+            failed = True
+        return shared.is_drained is True, failed
+    if draft is not None:
+        try:
+            if draft.module.controller is not None:
+                await draft.module.controller.close()
+            elif draft.module.client is not None:
+                await draft.module.client.aclose()
+        except BaseException:
+            failed = True
+    return True, failed
 
 
 def _reconciliation(factory, owner, target, rejected_local_tasks, lifecycle_task):

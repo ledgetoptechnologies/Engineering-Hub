@@ -11,6 +11,7 @@ import asyncio
 from contextlib import ExitStack
 import inspect
 import ipaddress
+from pathlib import Path
 
 from .app import Settings, create_app
 from .auth import AuthConfig
@@ -24,12 +25,15 @@ from .pilot_service import (REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS,
                             _TRANSFER_LOCK, _TRANSFERRED_OWNERS)
 from .queued_pilot import QueuedContainerPilot
 from .queued_pilot_runtime import QueuedPilotRuntime, _canonical_uuid
-from .queued_pilot_service import QueuedPilotServiceError, _synchronous, _reconciliation, _session_acceptance
+from .queued_pilot_service import (QueuedPilotServiceError, _synchronous, _reconciliation,
+                                    _session_acceptance, _cleanup_shared_staging)
 from .repository import HubRepository
 from .server import _bind, _signal_stop
 from .split_server import _options, _owned_service, _serve_listeners
 from .unified_app import _create_unified_bus
 from .work_queue import WorkAction, WorkQueue, _key
+from .staging_module import prepare_shared_staging, SharedStagingPreparationError
+from .shared_staging_lifecycle import SharedStagingLifecycle
 
 
 async def _reject_async_generation_result(result):
@@ -108,6 +112,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         raise ValueError('Explicit pre-enrolled unified queued pilot configuration required') from None
 
     client = reconciliation = acceptance_broker = None
+    shared = staging_draft = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     generation_drain = None
@@ -124,7 +129,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         return result is True
 
     def pair_factory():
-        nonlocal client, reconciliation, transferred, constructed, generation_drain, acceptance_broker
+        nonlocal client, reconciliation, transferred, constructed, generation_drain, acceptance_broker, shared, staging_draft
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
@@ -143,16 +148,32 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
         workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
-        queue = WorkQueue(repo, {action_key: action}, target_verifier=additional_veto)
+        try:
+            staging_draft = prepare_shared_staging(repo,
+                path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',
+                machine_id=machine_id, pilot_actions={action_key: action}, target_verifier=additional_veto)
+        except SharedStagingPreparationError as error:
+            staging_draft = error.draft
+            raise
+        queue = (staging_draft.queue if staging_draft is not None else
+                 WorkQueue(repo, {action_key: action}, target_verifier=additional_veto))
+        if staging_draft is not None and settings.staging_machine_id != machine_id:
+            raise QueuedPilotServiceError()
         bridge = QueuedContainerPilot(queue, workflow, action_key=action_key, machine_id=machine_id,
-                                      reconciliation=reconciliation)
+                                      reconciliation=reconciliation,
+                                      execution_policies=staging_draft.policies if staging_draft else None,
+                                      modular_controller=staging_draft.module.controller if staging_draft else None)
+        if staging_draft is not None:
+            staging_draft.policies.install()
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
+        if staging_draft is not None:
+            shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         if generation_id is not None:
             generation_drain = runtime.bind_generation_drain(owner, generation_id)
         bus = _create_unified_bus(settings, bus_paths=bus_paths)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus)
+                          work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus, shared_staging=shared)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
@@ -160,12 +181,17 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
 
     async def cleanup():
         failed = False
+        release_owner = shared is None
         try:
             if rejected_reconciliation_tasks:
                 try:
                     await finish_owned(asyncio.gather(*rejected_reconciliation_tasks, return_exceptions=True))
                 except BaseException:
                     failed = True
+            release_owner, shared_failed = await _cleanup_shared_staging(shared, staging_draft)
+            failed = shared_failed or failed
+            if not release_owner:
+                raise QueuedPilotServiceError()
             if acceptance_broker is not None:
                 try:
                     acceptance_broker.close()
@@ -187,7 +213,7 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                 except BaseException:
                     failed = True
         finally:
-            if transferred:
+            if transferred and release_owner:
                 try:
                     owner.close()
                 except BaseException:
@@ -217,7 +243,10 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                         # Sticky veto before listener drain, never force-cancel
                         # an accepted remote mutation or close its bus beneath it.
                         try:
-                            pair.core.state.queued_pilot_runtime.close_admission()
+                            if shared is not None:
+                                shared.close_admission()
+                            else:
+                                pair.core.state.queued_pilot_runtime.close_admission()
                         finally:
                             pair.close_admission()
                     async def generation_ready(*addresses):
