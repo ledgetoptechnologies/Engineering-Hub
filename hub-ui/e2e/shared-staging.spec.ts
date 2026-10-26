@@ -79,10 +79,39 @@ test("a retry with no answer says it may still be running, never that it failed"
   await expect(panel(page).getByRole("alert")).not.toContainText("failed");
   await page.waitForTimeout(500);
   expect(state.posts).toBe(1);  // Never retried on its own.
+  // The local snapshot is uncertain now, so retrying waits for a fresh read.
+  await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toBeDisabled();
+  await expect(panel(page)).toContainText("Use Refresh first to see the current state.");
   await panel(page).getByRole("button", { name: "Refresh" }).click();
   await expect(panel(page)).toContainText("Checking earlier work");
   await expect(panel(page).getByRole("alert")).toHaveCount(0);
+  await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toHaveCount(0);
   expect(state.posts).toBe(1);
+});
+
+test("after a refused retry, only a successful Refresh allows another, and a failed Refresh keeps it blocked", async ({ page }) => {
+  const state = await fixture(page, [ok("recovery_required", "original_operations_unverified"),
+    { status: 502, body: { detail: { code: "bad_gateway" } } }, ok("recovery_required", "original_operations_unverified")],
+    [{ status: 409, body: { detail: { code: "shared_staging_recovery_required" } } }]);
+  await page.goto("/#/staging");
+  const retry = panel(page).getByRole("button", { name: "Retry checking earlier work" });
+  await retry.click();
+  await expect(panel(page).getByRole("alert")).toContainText("Recovery didn't confirm all the earlier work.");
+  await expect(retry).toBeDisabled();
+  await panel(page).getByRole("button", { name: "Refresh" }).click();
+  await expect(panel(page).getByRole("alert")).toContainText("couldn't be read");
+  await expect(retry).toBeDisabled();
+  await panel(page).getByRole("button", { name: "Refresh" }).click();
+  await expect(panel(page).getByRole("alert")).toHaveCount(0);
+  await expect(retry).toBeEnabled();
+  expect(state.posts).toBe(1);
+});
+
+test("a failed first read never offers a retry on what it can't see", async ({ page }) => {
+  await fixture(page, [{ status: 502, body: { detail: { code: "bad_gateway" } } }]);
+  await page.goto("/#/staging");
+  await expect(panel(page).getByRole("alert")).toContainText("couldn't be read");
+  await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toHaveCount(0);
 });
 
 test("a retry the Hub refuses says to refresh and keeps the earlier state marked", async ({ page }) => {
@@ -93,6 +122,7 @@ test("a retry the Hub refuses says to refresh and keeps the earlier state marked
   await expect(panel(page).getByRole("alert")).toContainText("setup changed or is stopping. Use Refresh to see the current state; don't assume how far the check got.");
   await expect(panel(page).getByRole("alert")).not.toContainText("nothing was");
   await expect(panel(page).getByRole("alert")).toContainText("may be out of date");
+  await expect(panel(page).getByRole("button", { name: "Retry checking earlier work" })).toBeDisabled();
 });
 
 test("steps aside where shared staging isn't set up, for non-owners and on older Hubs", async ({ page }) => {

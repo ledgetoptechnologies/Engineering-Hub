@@ -27,11 +27,13 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
   const [status, setStatus] = useState<SharedStagingStatus | null>(null);
   const [notice, setNotice] = useState("");
   const [retrying, setRetrying] = useState(false);
+  // After a retry without a clear answer, only a fresh, successful read may allow another one.
+  const [needsRefresh, setNeedsRefresh] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const reader = useRef(read); reader.current = read;
   const unauthorized = useRef(onUnauthorized); unauthorized.current = onUnauthorized;
-  const mounted = useRef(true);
-  useEffect(() => () => { mounted.current = false; }, []);
+  const mounted = useRef(false);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   function signedOut() { setStatus(null); setLoad("hidden"); unauthorized.current(); }
 
@@ -40,7 +42,7 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
     setLoad("loading");
     reader.current(controller.signal).then(value => {
       if (controller.signal.aborted) return;
-      setStatus(value); setNotice(""); setLoad("loaded");
+      setStatus(value); setNotice(""); setNeedsRefresh(false); setLoad("loaded");
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) return signedOut();
@@ -62,6 +64,7 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
       if (!mounted.current) return;
       if (error instanceof HubApiError && error.status === 401) return signedOut();
       if (hides(error)) { setStatus(null); setLoad("hidden"); return; }
+      setNeedsRefresh(true);
       setNotice(recoverFailureText(error));
     } finally {
       if (mounted.current) setRetrying(false);
@@ -71,7 +74,8 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
   if (load === "hidden") return null;
   const text = status ? stateText[status.state] : null;
   const canRetry = status?.state === "recovery_required" && mode !== "demo";
-  const retryBlocked = !csrf || !writable || stale;
+  const unsure = needsRefresh || load !== "loaded";
+  const retryBlocked = unsure || !csrf || !writable || stale;
   return <section className="panel shared-staging" id="shared-staging" aria-label="Shared staging queue">
     <div className="panel-title"><h2>Shared staging queue</h2>
       <span className="panel-action">
@@ -91,7 +95,8 @@ export function SharedStagingPanel({ mode, csrf, writable, stale, onUnauthorized
     {retrying && <p role="status">Rechecking earlier work. This can take several minutes; it carries on even if you leave this page.</p>}
     {canRetry && <div className="button-row">
       <button type="button" disabled={retrying || retryBlocked} onClick={() => void retry()}>Retry checking earlier work</button>
-      {retryBlocked && <small>{stale ? "Hub observations are out of date. Refresh the Hub first." : "Retrying needs a signed-in, writable Hub session."}</small>}
+      {retryBlocked && !retrying && <small>{unsure ? "Use Refresh first to see the current state."
+        : stale ? "Hub observations are out of date. Refresh the Hub first." : "Retrying needs a signed-in, writable Hub session."}</small>}
     </div>}
   </section>;
 }
