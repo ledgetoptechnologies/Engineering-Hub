@@ -96,6 +96,31 @@ Invalid optional settings leave the rest of Hub running with infrastructure unav
 
 Five MCP tools expose list/get, maintenance open/resolve and probe record under the
 authenticated agent's capabilities. Probe recording accepts actual observation and
-expiry times and performs no network probe. There is no collector, arbitrary target URL,
+expiry times and performs no network probe. There is no arbitrary target URL,
 power control or automatic shutdown. Reconcile Hermes's historical device facts before
 import; old manual status labels are not current observations.
+
+An optional `prometheus` object in the same settings file adds an on-demand
+`hub_infrastructure_refresh` tool for agents with `probe_write` and `read`:
+
+```json
+{"address":"192.0.2.80","port":30104,"mappings":[
+  {"job":"example-node","instance":"192.0.2.1:9100","device_id":"example-pc","probe_id":"prometheus-node"}
+]}
+```
+
+These are documentation addresses; supply reviewed real facts privately. The PC must
+already exist with the mapped literal address. Exact job/instance mappings keep probes
+separate. Configuration starts no fetch or background task; an authorized agent invokes
+the refresh tool when it needs fresh observations. The browser reads the resulting
+shared registry, and labels old observations stale normally. There is no automatic
+continuous-monitoring claim.
+
+The collector reads only `/api/v1/targets?state=active` at that fixed origin, ignores
+proxy environment variables, rejects redirects/compression and limits response bytes
+and target count. It never follows returned scrape URLs. The asynchronous fetch has a
+10-second deadline; subsequent synchronous SQLite work uses cooperative deadline checks,
+not a hard filesystem/DB wall-clock guarantee. Source `lastScrape` determines observation
+time and expiry (three scrape intervals, at most one hour). Missing, invalid, duplicate
+or older/replayed observations cannot refresh health. Authorization and current device
+addresses are checked before network I/O and again before writes.

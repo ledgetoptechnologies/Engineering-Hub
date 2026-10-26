@@ -8,8 +8,9 @@ Operator-owned schema1 settings example (no implicit owner or agent grant)::
       {"kind":"agent","identity":"hermes",
        "capabilities":["read","maintenance_write","probe_write"]}]}
 
-Only the fixed state_root/infrastructure/inventory.sqlite3 is used. No setting
-can select a database, URL, probe, collector or listener. Missing/disabled
+Only the fixed state_root/infrastructure/inventory.sqlite3 is used. Optional
+Prometheus settings select one literal IP/port and explicit target mappings for
+an authenticated on-demand refresh tool; never a caller URL, scheduler or listener. Missing/disabled
 settings cause no database/directory writes. Existing inventory schemas must
 match this standalone implementation; migrations require explicit review.
 Operators must not rename live state paths. SQLite's Unix VFS may canonicalize
@@ -88,7 +89,8 @@ def _settings(path):
     finally:os.close(fd)
     value=json.loads(raw,object_pairs_hook=_unique,
                      parse_constant=lambda value:(_ for _ in ()).throw(ValueError()))
-    _need(type(value) is dict and set(value)=={'schema_version','enabled','principals'})
+    required={'schema_version','enabled','principals'}
+    _need(type(value) is dict and required<=set(value)<=required|{'prometheus'})
     _need(type(value['schema_version']) is int and value['schema_version']==1 and type(value['enabled']) is bool)
     _need(type(value['principals']) is list and len(value['principals'])<=128)
     grants={}
@@ -105,7 +107,24 @@ def _settings(path):
         principal=InfrastructurePrincipal(item['kind'],item['identity'])
         _need(principal not in grants)
         grants[principal]=frozenset(actions)
-    return value['enabled'],grants
+    prometheus=None
+    if 'prometheus' in value:
+        from .infrastructure_prometheus import PrometheusOrigin, TargetMapping, MAX_TARGETS
+        source=value['prometheus']
+        _need(type(source) is dict and set(source)=={'address','port','mappings'})
+        origin=PrometheusOrigin(source['address'],source['port'])
+        rows=source['mappings']
+        _need(type(rows) is list and 1<=len(rows)<=MAX_TARGETS)
+        mappings=[]
+        for row in rows:
+            keys={'job','instance','device_id','probe_id'}
+            _need(type(row) is dict and keys<=set(row)<=keys|{'source_label'})
+            mappings.append(TargetMapping(**row))
+        _need(len({(item.job,item.instance) for item in mappings})==len(mappings))
+        _need(len({(item.device_id,item.probe_id) for item in mappings})==len(mappings))
+        _need(all(sum(other.device_id==item.device_id for other in mappings)<=16 for item in mappings))
+        prometheus=(origin,tuple(mappings))
+    return value['enabled'],grants,prometheus
 
 
 def _schema(db):
@@ -127,6 +146,7 @@ def _file_info(info):
 @dataclass
 class InfrastructureModule:
     service: object = None
+    collector: object = None
     state: str = 'disabled'
     _directory_fd: object = None
     _registry: object = None
@@ -136,6 +156,7 @@ class InfrastructureModule:
         if self._closed:
             return
         self._closed=True
+        self.collector=None
         service,self.service=self.service,None
         registry,self._registry=self._registry,None
         try:
@@ -152,7 +173,7 @@ def compose_infrastructure(path,*,state_root,on_change=None):
     if path is None:
         return module
     try:
-        enabled,grants=_settings(path)
+        enabled,grants,prometheus=_settings(path)
     except FileNotFoundError:
         return module
     except Exception:
@@ -237,6 +258,9 @@ def compose_infrastructure(path,*,state_root,on_change=None):
         registry=InfrastructureRegistry(db,capabilities=grants,admission_guard=admission)
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         service=InfrastructureService(registry,on_change=on_change)
+        if prometheus is not None:
+            from .infrastructure_prometheus import PrometheusCollector
+            module.collector=PrometheusCollector(service,*prometheus)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
         root_fd=None;db=None

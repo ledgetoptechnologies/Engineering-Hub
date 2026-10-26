@@ -67,6 +67,24 @@ def test_duplicate_malformed_oversized_settings_are_inert(tmp_path,raw):
     assert module.state=='invalid' and module.service is None and not state.exists()
 
 
+@pytest.mark.parametrize('source',[
+    {'address':'example.test','port':30104,'mappings':[]},
+    {'address':'192.0.2.80','port':True,'mappings':[]},
+    {'address':'192.0.2.80','port':30104,'mappings':[], 'url':'http://untrusted.test'},
+    {'address':'192.0.2.80','port':30104,'mappings':[{'job':'Fixture','instance':'host.test:9100',
+        'device_id':'fixture','probe_id':'node'}]},
+    {'address':'192.0.2.80','port':30104,'mappings':[{'job':'Fixture','instance':'192.0.2.1:9100',
+        'device_id':'fixture','probe_id':'node','unexpected':True}]},
+    {'address':'192.0.2.80','port':30104,'mappings':[{'job':'Fixture','instance':'192.0.2.1:9100',
+        'device_id':'fixture','probe_id':'node'}]*2},
+])
+def test_invalid_collector_config_never_creates_inventory(tmp_path,source):
+    value=config();value['prometheus']=source
+    module=compose_infrastructure(write(tmp_path/'settings.json',value),state_root=tmp_path)
+    assert module.state=='invalid' and module.service is None and module.collector is None
+    assert not (tmp_path/'infrastructure').exists()
+
+
 @POSIX
 def test_enabled_private_owned_storage_service_callback_and_durable_reopen(tmp_path):
     settings=write(tmp_path/'settings.json',config());changes=[]

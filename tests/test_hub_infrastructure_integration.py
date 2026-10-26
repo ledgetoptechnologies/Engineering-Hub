@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 import pytest
@@ -16,14 +17,19 @@ BASE = '/api/hub/v1/infrastructure'
 OWNER = 'human:42'
 
 
-def settings(tmp_path, *, configured=True):
+def settings(tmp_path, *, configured=True, prometheus=False):
     config = tmp_path / 'infrastructure.json'
     if configured:
-        config.write_text(json.dumps({'schema_version': 1, 'enabled': True, 'principals': [
+        value = {'schema_version': 1, 'enabled': True, 'principals': [
             {'kind': 'human', 'identity': OWNER,
              'capabilities': ['read', 'device_write', 'maintenance_write']},
             {'kind': 'agent', 'identity': 'hermes',
-             'capabilities': ['read', 'maintenance_write', 'probe_write']}]}))
+             'capabilities': ['read', 'maintenance_write', 'probe_write']}]}
+        if prometheus:
+            value['prometheus'] = {'address': '192.0.2.80', 'port': 30104, 'mappings': [
+                {'job': 'Fixture', 'instance': '192.0.2.1:9100',
+                 'device_id': 'synthetic-pc', 'probe_id': 'prometheus-node'}]}
+        config.write_text(json.dumps(value))
         config.chmod(0o600)
     ui = tmp_path / 'ui'
     ui.mkdir()
@@ -134,6 +140,44 @@ def test_real_mcp_uses_authenticated_agent_capabilities(tmp_path):
             'device_id': 'synthetic-pc', 'payload': {'reason': 'Fixture agent maintenance',
             'expected_end': None, 'client_request_id': 'mcp-maintenance'}}}, 'test-hermes')
         assert result['structuredContent']['opened_by'] == {'kind': 'agent', 'identity': 'hermes'}
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Real inventory owner composition')
+def test_configured_mcp_refresh_checks_grants_and_current_mapping_before_fetch(tmp_path, monkeypatch):
+    from engineering_hub.infrastructure_prometheus import PrometheusCollector
+    calls = []
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    async def fetch(collector):
+        calls.append(collector.origin.address)
+        return json.dumps({'status': 'success', 'data': {'activeTargets': [{
+            'labels': {'job': 'Fixture', 'instance': '192.0.2.1:9100'},
+            'health': 'up', 'lastScrape': stamp, 'scrapeInterval': '1m'}]}}).encode()
+    monkeypatch.setattr(PrometheusCollector, '_fetch', fetch)
+    config = settings(tmp_path, prometheus=True)
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        assert app.state.infrastructure.collector is not None
+        assert calls == []  # Configuring/starting Hub must not fetch or start a collector loop.
+        headers = login(client, app, config)
+        assert client.put(BASE + '/devices/synthetic-pc', headers=headers, json=draft()).status_code == 200
+        def refresh(token):
+            response = client.post('/mcp/', headers={'Authorization': 'Bearer ' + token,
+                'Accept': 'application/json, text/event-stream', 'MCP-Protocol-Version': '2025-06-18'},
+                json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                      'params': {'name': 'hub_infrastructure_refresh', 'arguments': {}}})
+            assert response.status_code == 200
+            result = response.json()['result']
+            return result if result.get('isError') else json.loads(result['content'][0]['text'])
+        assert refresh('test-codex')['isError'] is True and calls == []
+        assert refresh('test-hermes')['recorded'] == 1
+        assert refresh('test-hermes')['unchanged'] == 1
+        assert calls == ['192.0.2.80', '192.0.2.80']
+        device = client.get(BASE + '/devices/synthetic-pc').json()['device']
+        assert device['observations'][0]['state'] == 'ok'
+        changed = {**draft(), 'addresses': ['192.0.2.2'], 'expected_revision': 1}
+        assert client.put(BASE + '/devices/synthetic-pc', headers=headers, json=changed).status_code == 200
+        assert refresh('test-hermes')['isError'] is True
+        assert len(calls) == 2
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='Real inventory owner lock')

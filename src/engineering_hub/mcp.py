@@ -42,7 +42,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
                   planning_repository=None, label_sets=None, entity_images=None, project_registry=None,
                   staging_controller=None, component_registry=None, interactive_reviews=None,
-                  infrastructure_service=None) -> FastMCP:
+                  infrastructure_service=None, infrastructure_collector=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -317,7 +317,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
     if infrastructure_service is not None:
         from .infrastructure_tools import register_infrastructure_tools
-        register_infrastructure_tools(mcp, service=infrastructure_service, identity=identity, invoke=invoke)
+        register_infrastructure_tools(mcp, service=infrastructure_service, identity=identity, invoke=invoke,
+                                      collector=infrastructure_collector)
     if interactive_reviews is not None:
         from .interactive_reviews_api import register_interactive_review_tools
         register_interactive_review_tools(mcp, repository=interactive_reviews, identity=identity, invoke=invoke)

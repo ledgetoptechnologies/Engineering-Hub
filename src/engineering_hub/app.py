@@ -472,6 +472,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           component_registry=component_registry,
                           interactive_reviews=interactive_reviews,
                           infrastructure_service=infrastructure.service,
+                          infrastructure_collector=infrastructure.collector,
                           staging_controller=staging_module.controller,
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))

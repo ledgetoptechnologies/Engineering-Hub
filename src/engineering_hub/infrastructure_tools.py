@@ -12,10 +12,14 @@ def _validated(model,payload):
         raise HubError('invalid_infrastructure_input') from None
 
 
-def register_infrastructure_tools(mcp,*,service,identity,invoke):
+def register_infrastructure_tools(mcp,*,service,identity,invoke,collector=None):
     from mcp.server.fastmcp import Context
     if service is not None and type(service) is not InfrastructureService:
         raise TypeError('Explicit InfrastructureService required')
+    if collector is not None:
+        from .infrastructure_prometheus import PrometheusCollector
+        if type(collector) is not PrometheusCollector or collector.service is not service:
+            raise TypeError('Collector must belong to this inventory service')
 
     def authorized(ctx,action='read'):
         actor=identity(ctx)
@@ -54,3 +58,16 @@ def register_infrastructure_tools(mcp,*,service,identity,invoke):
         """Record actual source probe timestamps under probe_write; performs no probe."""
         actor=authorized(ctx,'probe_write')
         return invoke(lambda:service.record_probe(actor,device_id,**_validated(ProbeInput,payload)))
+
+    if collector is not None:
+        @mcp.tool()
+        async def hub_infrastructure_refresh(ctx:Context)->dict:
+            """Fetch owner-configured Prometheus checks once; probe_write required. No power/readiness claim."""
+            from mcp.server.fastmcp.exceptions import ToolError
+            try:
+                actor=authorized(ctx,'probe_write')
+                return await collector.collect(actor)
+            except HubError as error:
+                raise ToolError(error.code) from None
+            except Exception:
+                raise ToolError('infrastructure_refresh_unavailable') from None
