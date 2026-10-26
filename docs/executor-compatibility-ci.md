@@ -31,3 +31,16 @@ runner; nothing is pushed, promoted, exported, enrolled or deployed. Successful
 compatibility does not establish registry availability of an executor image,
 staging acceptance, private connectivity or a real staging workflow. A pull
 failure remains a failure, with no mutable-tag fallback.
+
+Failure receipts retain a fixed substage and failure class, plus a bounded CLI
+exit code when available. They never include exception text, argv, stderr, URLs
+or private paths. Python/pip versions, canonical archive hash, observed backend
+hash and observed wheel hash/size are recorded as each becomes available, before
+checking the independently expected wheel hash. A mismatched wheel is still
+rejected and never copied into the build context. Missing observations mean the
+job did not reach that observation; they do not identify the underlying cause.
+
+The first run (40371204689, workflow source 653832f) failed in the wheel phase
+before registry login, pulls or image builds. Its original receipt only said
+`wheel_failed`; it cannot establish a hash mismatch or any more specific cause.
+That historical failure is preserved rather than relabelled by later diagnostics.

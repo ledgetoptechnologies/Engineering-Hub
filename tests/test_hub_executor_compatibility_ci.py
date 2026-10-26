@@ -93,3 +93,82 @@ def test_nonancestor_stops_before_source_preparation(monkeypatch, tmp_path):
         CI.prepare(CI.inputs(environment()), tmp_path)
     assert calls == [('merge-base', '--is-ancestor', SOURCE, 'HEAD')]
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('exc,kind,code', [
+    (CI.CommandFailure(2), 'command_failed', 2),
+    (CI.CommandFailure(999999), 'command_failed', None),
+    (subprocess.TimeoutExpired(['private-argv'], 1, output=b'secret'), 'command_timeout', None),
+    (ValueError('secret'), 'validation_failed', None),
+    (OSError('private-path'), 'io_failed', None),
+])
+def test_failure_codes_are_bounded_and_do_not_copy_exception_text(exc, kind, code):
+    assert CI.failure(exc, 'wheel_build') == {'stage': 'wheel_build', 'kind': kind, 'exit_code': code}
+
+
+def test_source_diagnostics_survive_preparation_failure(monkeypatch, tmp_path):
+    def reject(*args, **kwargs):
+        raise ValueError('private source path')
+
+    monkeypatch.setattr(CI, 'prepare_archive', reject)
+    evidence = {}
+    with pytest.raises(ValueError):
+        CI.prepare(CI.inputs(environment()), tmp_path, evidence)
+    assert evidence['stage'] == 'source_prepare'
+    assert evidence['source_archive_sha256'] == '07306b40c628191d4d57802b18d5575e0feb8676571aa487a2eda3190784b8f0'
+    assert evidence['source_archive_bytes'] == 10168320
+
+
+def test_observed_wheel_preserved_before_expected_verification(monkeypatch, tmp_path):
+    source, context = tmp_path / 'source', tmp_path / 'context'
+    context.mkdir()
+    monkeypatch.setattr(CI, 'prepare', lambda *args: (source, context))
+    monkeypatch.setattr(CI.importlib.metadata, 'version', lambda name: '25.0.1')
+    backend = b'fixed-backend-fixture'
+    import hashlib
+    monkeypatch.setattr(CI, 'BACKEND_SHA', hashlib.sha256(backend).hexdigest())
+    wheel_bytes = b'observed-wheel-fixture'
+
+    def fake_run(*args, **kwargs):
+        if 'download' in args:
+            (tmp_path / 'backend/setuptools-84.0.0-py3-none-any.whl').write_bytes(backend)
+        elif 'wheel' in args:
+            (tmp_path / 'wheels').mkdir()
+            (tmp_path / 'wheels/fixture.whl').write_bytes(wheel_bytes)
+        return b''
+
+    def reject(**kwargs):
+        raise ValueError('expected hash mismatch')
+
+    monkeypatch.setattr(CI, 'run', fake_run)
+    monkeypatch.setattr(CI, 'verify_wheel', reject)
+    evidence = {}
+    with pytest.raises(ValueError):
+        CI.wheel(CI.inputs(environment()), tmp_path, evidence)
+    assert evidence['stage'] == 'wheel_verify'
+    assert evidence['observed_wheel_sha256'] == hashlib.sha256(wheel_bytes).hexdigest()
+    assert evidence['observed_wheel_bytes'] == len(wheel_bytes)
+    assert evidence['observed_backend_sha256'] == hashlib.sha256(backend).hexdigest()
+    assert evidence['pip_version'] == '25.0.1'
+    assert not (context / 'executor.whl').exists()
+
+
+def test_main_writes_substage_and_exit_code_on_failure(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for key, value in environment().items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, 'argv', ['compatibility-fixture', 'wheel'])
+
+    def reject(values, directory, evidence):
+        evidence.update(stage='backend_download', python_version='3.12.15', pip_version='25.0.1')
+        raise CI.CommandFailure(2)
+
+    monkeypatch.setattr(CI, 'wheel', reject)
+    with pytest.raises(RuntimeError, match='no deployment attempted'):
+        CI.main()
+    receipt = json.loads((tmp_path / 'executor-compatibility-receipt.json').read_text())
+    assert receipt['state'] == 'wheel_failed'
+    assert receipt['failure'] == {'stage': 'backend_download', 'kind': 'command_failed', 'exit_code': 2}
+    assert receipt['wheel_evidence']['python_version'] == '3.12.15'
+    assert receipt['inputs']['WHEEL_SHA256'] == 'c' * 64
+    assert receipt['image_published'] is False
