@@ -47,14 +47,38 @@ def _pair(value):
 
 
 def _binding(value):
-    ensure(type(value) is dict and set(value) == {'command_id', 'job_id', 'operation_identity',
-           'worker_id', 'journal_identity', 'lease_identity'}, 'receipt_binding_invalid')
-    for key in ('command_id', 'job_id', 'worker_id'):
+    common = {'command_id', 'job_id', 'operation_identity', 'worker_id', 'journal_identity', 'lease_identity'}
+    ensure(type(value) is dict, 'receipt_binding_invalid')
+    cleanup = value.get('operation_kind') == 'cleanup'
+    ensure(set(value) == (common | {'operation_kind', 'resource_root_identity', 'resources'} if cleanup else common),
+           'receipt_binding_invalid')
+    for key in ('command_id', 'worker_id'):
         _id(value[key])
     _sha(value['operation_identity']); _pair(value['journal_identity'])
-    if value['lease_identity'] is not None:
-        _sha(value['lease_identity'])
+    if cleanup:
+        ensure(value['job_id'] is None and value['lease_identity'] is None
+               and type(value['resources']) is list and 1 <= len(value['resources']) <= 4,
+               'receipt_binding_invalid')
+        _pair(value['resource_root_identity'])
+        identities = []
+        for item in value['resources']:
+            ensure(type(item) is dict and set(item) == {'resource_id', 'job_id', 'kind', 'revision', 'inode', 'manifest_sha256'},
+                   'receipt_binding_invalid')
+            identities.append(_id(item['resource_id'])); _id(item['job_id']); _sha(item['manifest_sha256'])
+            ensure(item['kind'] in ('workspace', 'build', 'test_run', 'preview')
+                   and type(item['revision']) is int and item['revision'] >= 1
+                   and type(item['inode']) is int and item['inode'] > 0, 'receipt_binding_invalid')
+        ensure(len(set(identities)) == len(identities), 'receipt_binding_invalid')
+    else:
+        _id(value['job_id'])
+        if value['lease_identity'] is not None:
+            _sha(value['lease_identity'])
     return json.loads(_json(value))
+
+
+def _binding_schema(original):
+    return ('engineering-hub.terminal-receipt-binding.v2' if original.get('operation_kind') == 'cleanup'
+            else 'engineering-hub.terminal-receipt-binding.v1')
 
 
 def _runtime(value):
@@ -287,7 +311,7 @@ class TerminalReceipt:
     def bind(self, original):
         ensure(not self._io_failed, 'receipt_persistence_uncertain')
         original = _binding(original)
-        value = {'schema': 'engineering-hub.terminal-receipt-binding.v1', 'sequence': 1,
+        value = {'schema': _binding_schema(original), 'sequence': 1,
                  'slot': self.capture(), 'original': original}
         fd = self._open()
         try:
@@ -321,7 +345,7 @@ class TerminalReceipt:
 
     def _validate_binding(self, value, original):
         ensure(type(value) is dict and type(value.get('sequence')) is int and
-               value == {'schema': 'engineering-hub.terminal-receipt-binding.v1', 'sequence': 1,
+               value == {'schema': _binding_schema(original), 'sequence': 1,
                'slot': self.capture(), 'original': original}, 'receipt_binding_conflict')
 
     def evidence(self, original):
