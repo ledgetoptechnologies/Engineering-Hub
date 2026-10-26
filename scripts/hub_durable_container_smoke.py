@@ -16,7 +16,7 @@ PROBE = r'''
 import json, os, re, stat, sys, time, urllib.error, urllib.request
 from pathlib import Path
 mode, commit = sys.argv[1:3]
-assert os.getuid() == os.getgid() == 10001
+assert os.getuid() == os.getgid() == 568
 assert stat.S_IMODE(Path('/var/lib/hub').stat().st_mode) == 0o700
 base = 'http://127.0.0.1:8770'
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -90,7 +90,7 @@ RESTORE = r'''
 import hashlib, json, os, shutil, sqlite3, stat
 from pathlib import Path
 root = Path('/var/lib/hub')
-assert os.getuid() == os.getgid() == 10001
+assert os.getuid() == os.getgid() == 568
 assert stat.S_IMODE(root.stat().st_mode) == 0o700
 destination = root / 'hub.sqlite3'
 fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -141,7 +141,7 @@ def _container(name, owner, *, missing_ok=False):
 
 def _options(name, owner, volume):
     return ['create', '--pull', 'never', '--name', name, '--label', LABEL + '=' + owner,
-        '--network', 'none', '--cgroupns', 'private', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
+        '--network', 'none', '--cgroupns', 'private', '--user', '568:568', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
         '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
         '--mount', 'type=volume,source=' + volume + ',target=/var/lib/hub',
@@ -163,7 +163,7 @@ def _profile(identity, expected_volumes):
         '"pids_limit":{{json .HostConfig.PidsLimit}},'
         '"security":{{json .HostConfig.SecurityOpt}},"mounts":{{json .Mounts}}}')
     value = json.loads(_docker(['container', 'inspect', '--format', template, identity], timeout=15).stdout)
-    if (value.get('user') != '10001:10001' or value.get('network') != 'none'
+    if (value.get('user') != '568:568' or value.get('network') != 'none'
             or value.get('cgroupns') != 'private'
             or value.get('readonly') is not True or value.get('privileged') is not False
             or value.get('cap_drop') != ['ALL'] or value.get('cap_add') not in (None, [])

@@ -78,7 +78,7 @@ class Docker:
 
 
 def profile(mounts):
-    return {'user': '10001:10001', 'network': 'none', 'cgroupns': 'private', 'readonly': True, 'privileged': False,
+    return {'user': '568:568', 'network': 'none', 'cgroupns': 'private', 'readonly': True, 'privileged': False,
             'cap_drop': ['ALL'], 'cap_add': None, 'ports': {}, 'binds': None, 'devices': [],
             'tmpfs': {'/tmp': 'rw,noexec,nosuid,size=32m'}, 'security': ['no-new-privileges'],
             'memory': 512 * 1024 ** 2, 'nano_cpus': 1_000_000_000, 'pids_limit': 64,
@@ -100,7 +100,7 @@ def test_isolated_restart_backup_restore_and_exact_cleanup(monkeypatch):
     for args in creates:
         assert args[args.index('--network') + 1] == 'none'
         assert args[args.index('--cgroupns') + 1] == 'private'
-        assert args[args.index('--user') + 1] == '10001:10001'
+        assert args[args.index('--user') + 1] == '568:568'
         assert args[args.index('--pull') + 1] == 'never'
         assert '--read-only' in args and '--cap-drop' in args
         assert IMAGE in args
