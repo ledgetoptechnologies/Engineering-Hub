@@ -152,6 +152,8 @@ def main():
     if config.get('scratch_slot') is not None:
         from .scratch import ScratchSlot
         scratch_slot = ScratchSlot.from_config(config['scratch_slot'])
+    from .core import terminal_receipt_config
+    terminal_receipt_config(config.get('terminal_receipts'), config['worker_root'])
     host_snapshot = config.get('host_snapshot')
     if host_snapshot is not None:
         ensure(type(host_snapshot) is str and Path(host_snapshot).is_absolute()
@@ -164,6 +166,8 @@ def main():
     storage = dict(capacity_bytes=capacity_bytes, free_floor_bytes=free_floor_bytes)
     if scratch_slot is not None:
         storage['scratch_slot'] = scratch_slot
+    if config.get('terminal_receipts') is not None:
+        storage['terminal_receipts'] = config['terminal_receipts']
     service = Service(config['worker_root'], projects, backend, **storage)
     server = BoundedServer((bind, port), handler(service, token, peers, host_snapshot=host_snapshot))
     server.daemon_threads = True
