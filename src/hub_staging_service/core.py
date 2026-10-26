@@ -287,6 +287,8 @@ class Service:
                 else:
                     ensure(recorded['config'] == wanted, 'terminal_receipt_configuration_changed')
             self._receipt_inventory()
+            if self.db.execute("SELECT 1 FROM operations WHERE job_id IS NULL AND state='held' LIMIT 1").fetchone():
+                self._receipt_fault = 'cleanup_recovery_required'
         except Exception:
             self.db.close(); self.process_lock.close()
             if self._scratch_lock is not None:
@@ -305,17 +307,64 @@ class Service:
             return value
         return json.loads(raw, object_pairs_hook=unique)
 
-    def _receipt_original(self, payload, identity):
+    def _receipt_worker(self):
         journal = (self.root / 'journal.sqlite3').stat(follow_symlinks=False)
         root = self.root.stat(follow_symlinks=False)
         worker = str(uuid.uuid5(uuid.NAMESPACE_URL, 'engineering-hub-worker:' +
             json.dumps([[root.st_dev, root.st_ino], [journal.st_dev, journal.st_ino]])))
+        return worker, [journal.st_dev, journal.st_ino]
+
+    def _receipt_original(self, payload, identity):
+        worker, journal = self._receipt_worker()
         lease = self.db.execute('SELECT capture FROM scratch_leases WHERE command_id=?',
                                 (payload['command_id'],)).fetchone()
         return {'command_id': payload['command_id'], 'job_id': payload['job_id'],
                 'operation_identity': identity, 'worker_id': worker,
-                'journal_identity': [journal.st_dev, journal.st_ino],
+                'journal_identity': journal,
                 'lease_identity': hashlib.sha256(lease['capture'].encode()).hexdigest() if lease else None}
+
+    def _cleanup_binding(self, payload, identity, items, root_identity):
+        worker, journal = self._receipt_worker()
+        return {'operation_kind': 'cleanup', 'command_id': payload['command_id'], 'job_id': None,
+                'operation_identity': identity, 'worker_id': worker, 'journal_identity': journal,
+                'lease_identity': None, 'resource_root_identity': list(root_identity),
+                'resources': [{'resource_id': item['id'], 'job_id': item['job_id'], 'kind': item['kind'],
+                    'revision': item['revision'], 'inode': item['inode'],
+                    'manifest_sha256': item['_observed_manifest_sha256']} for item in items]}
+
+    def _validate_cleanup_binding(self, binding, operation):
+        from .terminal_receipt import _binding
+        binding = _binding(binding)
+        payload = self._receipt_json(operation['payload'])
+        ensure(binding.get('operation_kind') == 'cleanup' and operation['job_id'] is None
+               and type(payload) is dict and set(payload) == {'command_id', 'idempotency_key', 'resources'}
+               and payload['command_id'] == operation['command_id'] == binding['command_id']
+               and binding['operation_identity'] == operation['identity']
+               and hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',', ':')).encode()).hexdigest() == operation['identity']
+               and type(payload['resources']) is list and len(payload['resources']) == len(binding['resources']),
+               'terminal_receipt_binding_changed')
+        parent = self.resources.stat(follow_symlinks=False)
+        worker, journal = self._receipt_worker()
+        ensure(binding['worker_id'] == worker and binding['journal_identity'] == journal
+               and binding['resource_root_identity'] == [parent.st_dev, parent.st_ino], 'terminal_receipt_binding_changed')
+        for wanted, captured in zip(payload['resources'], binding['resources']):
+            ensure(type(wanted) is dict and set(wanted) == {'resource_id', 'expected_revision'}
+                   and wanted['resource_id'] == captured['resource_id']
+                   and type(wanted['expected_revision']) is int and wanted['expected_revision'] == captured['revision'],
+                   'terminal_receipt_binding_changed')
+            row = self.db.execute('SELECT * FROM resources WHERE id=?', (captured['resource_id'],)).fetchone()
+            ensure(row is not None and row['job_id'] == captured['job_id'] and row['kind'] == captured['kind']
+                   and row['inode'] == captured['inode'], 'terminal_receipt_binding_changed')
+            if operation['state'] == 'succeeded':
+                ensure(row['state'] == 'deleted' and row['revision'] == captured['revision']+1
+                       and self._receipt_json(row['manifest']) == {} and row['bytes'] == 0
+                       and self._receipt_json(row['refs']) == []
+                       and not (self.resources / row['id']).exists() and not (self.resources / row['id']).is_symlink(),
+                       'terminal_receipt_cleanup_mismatch')
+        if operation['state'] == 'succeeded':
+            ensure(self._receipt_json(operation['result']) ==
+                   {'deleted_resource_ids': [item['resource_id'] for item in binding['resources']]},
+                   'terminal_receipt_cleanup_mismatch')
 
     def _receipt_inventory(self):
         """Only validate retained evidence. Never import, release or rerun it."""
@@ -353,15 +402,18 @@ class Service:
                 binding = self._receipt_json(row['binding'])
                 operation = self.db.execute('SELECT * FROM operations WHERE command_id=?',
                                             (row['command_id'],)).fetchone()
-                ensure(operation is not None and operation['job_id'] is not None and
-                       binding['command_id'] == row['command_id'] and binding['job_id'] == operation['job_id']
+                ensure(operation is not None and binding['command_id'] == row['command_id']
                        and binding['operation_identity'] == operation['identity'], 'terminal_receipt_binding_changed')
-                # The original lease intent predates directory materialization;
-                # retain its digest, do not recompute it from the later capture.
-                expected = self._receipt_original({'command_id': row['command_id'],
-                    'job_id': operation['job_id']}, operation['identity'])
-                expected['lease_identity'] = binding['lease_identity']
-                ensure(binding == expected, 'terminal_receipt_binding_changed')
+                if binding.get('operation_kind') == 'cleanup':
+                    self._validate_cleanup_binding(binding, operation)
+                else:
+                    ensure(operation['job_id'] is not None and binding['job_id'] == operation['job_id'],
+                           'terminal_receipt_binding_changed')
+                    # Original job intent predates materialization; never rebind.
+                    expected = self._receipt_original({'command_id': row['command_id'],
+                        'job_id': operation['job_id']}, operation['identity'])
+                    expected['lease_identity'] = binding['lease_identity']
+                    ensure(binding == expected, 'terminal_receipt_binding_changed')
                 receipt = TerminalReceipt(root, row['slot_id'], expected_capture=self._receipt_json(row['capture']))
                 evidence = receipt.evidence(binding)
                 ensure(evidence['state'] == 'observed' and operation['state'] in TERMINAL,
@@ -374,7 +426,7 @@ class Service:
         except Exception:
             self._receipt_fault = 'terminal_receipt_recovery_required'
 
-    def _prepare_receipt(self, payload, identity):
+    def _prepare_receipt(self, payload, identity, *, binding=None):
         from .terminal_receipt import TerminalReceipt, SLOT_BYTES
         if self._receipt_config is None:
             return
@@ -383,7 +435,7 @@ class Service:
                self._receipt_config['max_slots'], 'terminal_receipt_slot_limit', 409)
         self._capacity(SLOT_BYTES)
         receipt = TerminalReceipt.prepare(root, payload['command_id'])
-        binding = self._receipt_original(payload, identity)
+        binding = self._receipt_original(payload, identity) if binding is None else binding
         receipt.bind(binding)
         self.db.execute('INSERT INTO terminal_receipts VALUES (?,?,?,?,?)',
             (payload['command_id'], receipt.slot_id, str(root), json.dumps(receipt.capture(),sort_keys=True),
@@ -783,10 +835,52 @@ class Service:
                 if fd is not None:os.close(fd)
                 os.close(directory)
 
+    def _cleanup_parent(self, expected):
+        info = self.resources.stat(follow_symlinks=False)
+        ensure(stat.S_ISDIR(info.st_mode) and [info.st_dev, info.st_ino] == expected
+               and not self.resources.is_symlink(), 'cleanup_scope_drift', 409)
+        if os.name != 'posix':
+            ensure(self._receipt_config is None, 'terminal_receipts_posix_required')
+            return None  # Legacy synthetic Windows service only; no receipt proof.
+        fd = os.open(self.resources, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            actual = os.fstat(fd)
+            ensure([actual.st_dev, actual.st_ino] == expected and actual.st_uid == os.getuid()
+                   and not stat.S_IMODE(actual.st_mode) & 0o077, 'cleanup_scope_drift', 409)
+            return fd
+        except BaseException:
+            os.close(fd); raise
+
+    def _delete_cleanup_resource(self, item, root_identity):
+        """Scoped ENOENT+parent fsync observation, not universal crash proof."""
+        parent = self._cleanup_parent(root_identity)
+        try:
+            path = self.resources / item['id']
+            actual = (os.stat(item['id'], dir_fd=parent, follow_symlinks=False) if parent is not None
+                      else path.stat(follow_symlinks=False))
+            ensure(stat.S_ISDIR(actual.st_mode) and actual.st_ino == item['inode']
+                   and actual.st_dev == root_identity[0], 'cleanup_scope_drift', 409)
+            manifest, _ = tree_manifest(path, MAX_EXPANDED)
+            ensure(hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest() ==
+                   item['_observed_manifest_sha256'], 'cleanup_scope_drift', 409)
+            if parent is None:
+                shutil.rmtree(path)
+                ensure(not path.exists() and not path.is_symlink(), 'cleanup_uncertain', 409)
+            else:
+                shutil.rmtree(item['id'], dir_fd=parent)
+                def absent():
+                    try: os.stat(item['id'], dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError: return
+                    raise Rejected('cleanup_uncertain', 409)
+                absent()
+                os.fsync(parent)
+                absent()
+                check = self._cleanup_parent(root_identity)
+                os.close(check)
+        finally:
+            if parent is not None: os.close(parent)
+
     def cleanup(self, payload):
-        # Job receipts do not cover cleanup commands. Their existing SQL/CAS
-        # authority remains separate; a known persistence fault vetoes all NEW
-        # cleanup effects rather than pretending the job receipt covers them.
         ensure(isinstance(payload, dict) and set(payload) == {'command_id', 'idempotency_key', 'resources'}, 'cleanup_schema')
         identifier(payload['command_id'])
         ensure(isinstance(payload['idempotency_key'], str) and 0 < len(payload['idempotency_key']) <= 128,
@@ -795,9 +889,13 @@ class Service:
         with self.lock:
             identity, existing = self._operation(payload['command_id'], payload)
             if existing:
-                return existing
+                return existing  # Original-ID read, never a repeated delete.
             ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
             ensure(self.active is None, 'worker_busy', 409)
+            self._receipt_inventory()
+            ensure(self._receipt_fault is None, 'terminal_receipt_recovery_required', 409)
+            root = self.resources.stat(follow_symlinks=False)
+            root_identity = [root.st_dev, root.st_ino]
             items = []
             for wanted in payload['resources']:
                 ensure(isinstance(wanted, dict) and set(wanted) == {'resource_id', 'expected_revision'}, 'cleanup_resource_schema')
@@ -807,35 +905,54 @@ class Service:
                 ensure(self.status(item['job_id'])['state'] in TERMINAL, 'resource_job_not_terminal', 409)
                 path = self.resources / item['id']
                 ensure(path.parent == self.resources and not path.is_symlink() and path.is_dir() and
-                       path.stat().st_ino == item['inode'], 'cleanup_scope_drift', 409)
-                tree_manifest(path, MAX_EXPANDED)
+                       path.stat().st_ino == item['inode'] and path.stat().st_dev == root.st_dev, 'cleanup_scope_drift', 409)
+                manifest, _ = tree_manifest(path, MAX_EXPANDED)
+                item['_observed_manifest_sha256'] = hashlib.sha256(
+                    json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
                 items.append(item)
             ensure(len({x['id'] for x in items}) == len(items), 'duplicate_cleanup_resource')
-            self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
-                            (payload['command_id'], identity, None, 'running', json.dumps(payload), '{}'))
-            self.db.commit()
-            for item in items:
-                try:
-                    path = self.resources / item['id']
-                    # Lock spans revalidation and deletion; never traverse unknown paths.
-                    ensure(not path.is_symlink() and path.stat().st_ino == item['inode'], 'cleanup_scope_drift', 409)
-                    tree_manifest(path, MAX_EXPANDED)
+            confirmed, current, terminal_attempted = [], None, False
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                binding = self._cleanup_binding(payload, identity, items, root_identity)
+                self._prepare_receipt(payload, identity, binding=binding)
+                self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
+                                (payload['command_id'], identity, None, 'running', json.dumps(payload), '{}'))
+                self.db.commit()  # Before the first deletion effect.
+                for item in items:
+                    current = item
                     self.db.execute("UPDATE resources SET state='deleting' WHERE id=?", (item['id'],))
                     self.db.commit()
-                    shutil.rmtree(path)
+                    self._delete_cleanup_resource(item, root_identity)
+                    confirmed.append(item['id'])
                     self.db.execute("UPDATE resources SET state='deleted',revision=revision+1,manifest='{}',bytes=0 WHERE id=?", (item['id'],))
                     self.db.commit()
-                except Exception:
-                    self.db.execute("UPDATE resources SET state='delete_failed' WHERE id=?", (item['id'],))
+                result = {'deleted_resource_ids': [x['id'] for x in items]}
+                terminal_attempted = True
+                self._terminal_receipt(payload['command_id'], 'succeeded', result)
+                self.db.execute("UPDATE operations SET state='succeeded',result=? WHERE command_id=?",
+                                (json.dumps(result), payload['command_id']))
+                self.db.commit()
+                return {'command_id': payload['command_id'], 'job_id': None, 'state': 'succeeded', 'result': result}
+            except Exception:
+                # Latch FIRST: both a fallback hold write and its commit may fail.
+                self._receipt_fault = 'cleanup_recovery_required'
+                result = {'error': 'cleanup_uncertain', 'deleted_resource_ids': confirmed}
+                try: self.db.rollback()
+                except Exception: pass
+                if not terminal_attempted:
+                    try: self._terminal_receipt(payload['command_id'], 'held', result)
+                    except Exception: pass  # Original slot remains uncertain/owned.
+                try:
+                    if current is not None:
+                        self.db.execute("UPDATE resources SET state='delete_failed' WHERE id=? AND state!='deleted'", (current['id'],))
                     self.db.execute("UPDATE operations SET state='held',result=? WHERE command_id=?",
-                                    ('{"error":"cleanup_uncertain"}', payload['command_id']))
+                                    (json.dumps(result), payload['command_id']))
                     self.db.commit()
-                    raise Rejected('cleanup_uncertain', 409) from None
-            result = {'deleted_resource_ids': [x['id'] for x in items]}
-            self.db.execute("UPDATE operations SET state='succeeded',result=? WHERE command_id=?",
-                            (json.dumps(result), payload['command_id']))
-            self.db.commit()
-            return {'command_id': payload['command_id'], 'job_id': None, 'state': 'succeeded', 'result': result}
+                except Exception:
+                    try: self.db.rollback()
+                    except Exception: pass
+                raise Rejected('cleanup_uncertain', 409) from None
 
     def wait(self):
         if self.thread:
