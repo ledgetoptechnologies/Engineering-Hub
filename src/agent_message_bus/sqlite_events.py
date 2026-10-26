@@ -34,6 +34,41 @@ class WatcherFailed(RuntimeError):
     """The native event source or SQLite consistency barrier failed closed."""
 
 
+_SQLITE_ERROR_BASES = (
+    'SQLITE_ERROR', 'SQLITE_INTERNAL', 'SQLITE_PERM', 'SQLITE_ABORT',
+    'SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_NOMEM', 'SQLITE_READONLY',
+    'SQLITE_INTERRUPT', 'SQLITE_IOERR', 'SQLITE_CORRUPT', 'SQLITE_NOTFOUND',
+    'SQLITE_FULL', 'SQLITE_CANTOPEN', 'SQLITE_PROTOCOL', 'SQLITE_EMPTY',
+    'SQLITE_SCHEMA', 'SQLITE_TOOBIG', 'SQLITE_CONSTRAINT', 'SQLITE_MISMATCH',
+    'SQLITE_MISUSE', 'SQLITE_NOLFS', 'SQLITE_AUTH', 'SQLITE_FORMAT',
+    'SQLITE_RANGE', 'SQLITE_NOTADB', 'SQLITE_NOTICE', 'SQLITE_WARNING',
+)
+_SQLITE_ERROR_NAMES = frozenset(
+    name for name in dir(sqlite3)
+    if any(name == base or name.startswith(base + '_') for base in _SQLITE_ERROR_BASES)
+)
+
+
+def _sqlite_error_details(exc: BaseException) -> dict[str, int | str]:
+    """Return only SQLite's bounded code and matching known constant name.
+
+    Exception text, SQL, file paths and arbitrary error attributes are never
+    included. OperationalError alone cannot distinguish a busy writer from
+    read-only storage, I/O errors or other failures.
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return {}
+    code = getattr(exc, 'sqlite_errorcode', None)
+    if type(code) is not int or not 0 <= code <= 2**31 - 1:
+        return {}
+    result: dict[str, int | str] = {'sqlite_errorcode': code}
+    name = getattr(exc, 'sqlite_errorname', None)
+    if (type(name) is str and name in _SQLITE_ERROR_NAMES
+            and getattr(sqlite3, name) == code):
+        result['sqlite_errorname'] = name
+    return result
+
+
 class MessageCursorReader:
     """Page cursor rows while retaining only distinct recipient names.
 
@@ -222,7 +257,11 @@ class SQLiteEventSource:
             "deliveries": 0,
             "startup_catchups": 0,
             "watcher_stopped": False,
+            "failure_stage": None,
+            "sqlite_errorcode": None,
+            "sqlite_errorname": None,
         }
+        self._stage = "created"
         self._failure: BaseException | None = None
         self._inotify_fd: int | None = None
         self._event_fd: int | None = None
@@ -364,6 +403,7 @@ class SQLiteEventSource:
         return wd
 
     def _setup(self) -> None:
+        self._stage = "setup_native_watches"
         self._inotify_fd = self._inotify_init()
         self._directory_wd = self._add_watch(self.db_path.parent, _DIR_MASK, "directory")
         self._db_wd = self._add_watch(self.db_path, _FILE_MASK, "database")
@@ -375,6 +415,7 @@ class SQLiteEventSource:
         self._epoll.register(self._inotify_fd, select.EPOLLIN)
         self._epoll.register(self._event_fd, select.EPOLLIN)
 
+        self._stage = "setup_sqlite_connections"
         timeout = self.busy_timeout_ms / 1000
         self._reader = sqlite3.connect(str(self.db_path), timeout=timeout, isolation_level=None)
         self._reader.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
@@ -397,10 +438,12 @@ class SQLiteEventSource:
             ready_signaled = True
             assert self._epoll is not None and self._inotify_fd is not None and self._event_fd is not None
             while True:
+                self._stage = "wait_native_event"
                 ready = self._epoll.poll(-1)
                 should_stop = False
                 for fd, _mask in ready:
                     if fd == self._inotify_fd:
+                        self._stage = "read_native_event"
                         data = self._read_once()
                         if data:
                             self._process_data(data)
@@ -429,6 +472,7 @@ class SQLiteEventSource:
                     done.set()
 
     def _run_commands(self) -> bool:
+        self._stage = "control_command"
         stop = False
         while True:
             try:
@@ -461,6 +505,7 @@ class SQLiteEventSource:
                 return b""
 
     def _flush_inotify_queue(self) -> None:
+        self._stage = "flush_native_events"
         assert self._inotify_fd is not None
         if fcntl is None or _FIONREAD is None:
             raise RuntimeError("inotify flush requires Linux fcntl support")
@@ -485,6 +530,7 @@ class SQLiteEventSource:
                 self._process_data(data)
 
     def _process_data(self, data: bytes) -> None:
+        self._stage = "process_native_events"
         dirty = False
         relevant = 0
         offset = 0
@@ -547,9 +593,12 @@ class SQLiteEventSource:
         assert self._barrier is not None and self._reader is not None
         began = False
         try:
+            self._stage = "acquire_write_barrier"
             self._barrier.execute("BEGIN IMMEDIATE")
             began = True
+            self._stage = "read_committed_cursor"
             recipients, next_cursor = self.read_after(self._reader, self._cursor)
+            self._stage = "validate_cursor"
             selected = tuple(recipients)
             if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor < 0:
                 raise WatcherFailed("message cursor adapter returned an invalid high-water mark")
@@ -561,11 +610,13 @@ class SQLiteEventSource:
             elif selected and next_cursor <= self._cursor:
                 raise WatcherFailed("recipient rows did not advance the message cursor")
             self._add_stat("snapshot_reads")
+            self._stage = "release_write_barrier"
             self._barrier.execute("ROLLBACK")
             began = False
             self._cursor = next_cursor
             self._set_stat("cursor", next_cursor)
             if selected:
+                self._stage = "publish_invalidation"
                 self.deliver(selected, next_cursor)
                 self._add_stat("deliveries")
         except BaseException:
@@ -583,6 +634,8 @@ class SQLiteEventSource:
                 self._failure = exc
                 self._stats["healthy"] = False
                 self._stats["failure"] = f"{type(exc).__name__}: {exc}"
+                self._stats["failure_stage"] = self._stage
+                self._stats.update(_sqlite_error_details(exc))
                 self._condition.notify_all()
         if first_failure and self.on_error is not None:
             try:

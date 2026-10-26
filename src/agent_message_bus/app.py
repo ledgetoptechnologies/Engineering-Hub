@@ -266,6 +266,11 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
         if event_source is not None:
             event_stats = event_source.stats
             push_health["cursor"] = event_stats["cursor"]
+            # Safe fixed-stage and canonical SQLite diagnostics, never the
+            # source's exception text (which can contain SQL or file paths).
+            for key in ("failure_stage", "sqlite_errorcode", "sqlite_errorname"):
+                if event_stats.get(key) is not None:
+                    push_health[key] = event_stats[key]
             if not event_source.healthy:
                 push_health["state"] = "failed"
         return StarletteJSONResponse({"ok": db_status == "ok" and push_health["state"] != "failed",
