@@ -52,7 +52,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None):
+                                 session_acceptance_factory=None, access_verifier=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -87,6 +87,12 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                             project='engineering-hub', requires_execution_proof=True)
     except Exception:
         raise ValueError('explicit owned queued pilot configuration required') from None
+
+    if access_verifier is not None:
+        from .cloudflare_access import CloudflareAccessVerifier
+        if (type(access_verifier) is not CloudflareAccessVerifier
+                or access_verifier.config != settings.auth_config.cloudflare_config):
+            raise ValueError('explicit_access_verifier_binding_required')
 
     owner = client = reconciliation = acceptance_broker = None
     shared = staging_draft = None
@@ -144,7 +150,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         if staging_draft is not None:
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared)
+                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
