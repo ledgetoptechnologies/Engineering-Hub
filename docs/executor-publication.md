@@ -1,11 +1,12 @@
-# Draft executor publication route — approval pending
+# Approved staging executor publication route
 
-This source prepares a route; it has not published an image. The workflow job
-is explicitly disabled with `if: false`. Its proposed `packages: write` permission
-is a new publication grant requiring direct human approval and a separately
-reviewed activation change. Existing compatibility CI remains read-only.
+Beau approved staging-only publication directly in this chat on October 26,
+2026. The workflow permits manual dispatch from main with job-level
+`packages: write`. This approval does not activate a staging runtime or change
+production. Existing compatibility CI remains read-only. Publication success
+must still be established by the actual run and verified registry receipt.
 
-After approval, one manual main dispatch would rebuild the exact reviewed tuple
+One manual main dispatch rebuilds the exact reviewed tuple
 using the existing canonical wheel and compatibility helpers, then reinspect
 the exact smoke-verified image ID, fixed defaults, source provenance and wheel.
 Docker uses the existing Actions login. Only the publication step also receives
@@ -38,7 +39,7 @@ immutable reference is pulled and the installed import smoke runs with no
 network, host mounts, operator configuration or launcher construction. Success
 does not establish a staging pilot or authorize live execution.
 
-The draft now pairs executor source `40d3d2f` and reviewed wheel `e9db6a97...`
+The route pairs executor source `40d3d2f` and reviewed wheel `e9db6a97...`
 with published core `66021ca0495c25d0e349b391c4cf624d4c6d7429`, manifest
 `sha256:b75a9a69738926cc9a1533d46ff28728a76ab2cf1b5eb43746951e70bcd07839`
 and config

@@ -1,4 +1,4 @@
-name: Draft executor publication (approval pending)
+name: Publish verified staging executor
 on:
   workflow_dispatch:
     inputs:
@@ -33,9 +33,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   publication:
-    # Intentionally disabled. Enabling this new packages:write route requires
-    # direct human approval and a separate reviewed source change.
-    if: ${{ false && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    # Beau approved staging-only publication in this chat on 2026-10-26.
+    # Manual main dispatch only; no production or staging runtime activation.
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
     permissions:
       contents: read
       packages: write

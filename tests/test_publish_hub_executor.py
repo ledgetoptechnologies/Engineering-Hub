@@ -440,9 +440,10 @@ def test_existing_attempt_receipt_refuses_retry_before_publish(monkeypatch, tmp_
         P.main()
 
 
-def test_workflow_remains_disabled_and_artifacts_are_json_only():
+def test_approved_workflow_is_manual_main_only_and_artifacts_are_json_only():
     source = (ROOT / '.github/workflows/hub-executor-publication.yml').read_text()
-    assert "if: ${{ false && github.ref == 'refs/heads/main'" in source
+    assert "if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}" in source
+    assert '\n  push:' not in source and '\n  pull_request:' not in source
     assert 'packages: write' in source
     assert 'executor-compatibility-receipt.json' in source
     assert 'executor-publication-receipt.json' in source

@@ -1,4 +1,4 @@
-"""Draft, explicit executor publication; disabled workflow awaits permission approval.
+"""Explicit staging-only executor publication approved by Beau on 2026-10-26.
 
 Uses Docker's existing login and the job's existing GH_TOKEN for one fixed
 package metadata read; never reads operator credentials or configuration.
@@ -265,7 +265,7 @@ def publish(values, local, target, record):
 
 def main():
     # Fail before registry access on every invalid invocation. Workflow is also
-    # disabled in source until explicit packages:write approval and review.
+    # restricted to the approved manual main publication route.
     values, local, target = invocation(os.environ)
     ci.git('merge-base', '--is-ancestor', values['SOURCE_COMMIT'], 'HEAD')
     if RECEIPT.exists():
