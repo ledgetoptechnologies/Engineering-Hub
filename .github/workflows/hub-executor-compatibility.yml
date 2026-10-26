@@ -21,7 +21,7 @@ on:
       wheel_sha256:
         description: Independently reviewed exact executor wheel SHA256
         required: true
-        default: 3a7a04cac68fb2663752e1d4e191b1a0712b8ed04a953a9e43b1c934edc48023
+        default: e9db6a97b34e723acbf681308dfcc167dc37e2c798063799ab25d150f3940d29
       source_date_epoch:
         description: Reviewed fixed wheel reproducibility timestamp
         required: true

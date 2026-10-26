@@ -14,7 +14,10 @@ and fixed `SOURCE_DATE_EPOCH=1792972800`. Python is pinned to 3.12.15. The prior
 local toolchain used pip 25.0.1; CI records its actual pip version. Any wheel
 byte difference fails the expected hash check; it does not silently accept or
 replace the reviewed hash. The default wheel is 126151 bytes, SHA256
-`3a7a04cac68fb2663752e1d4e191b1a0712b8ed04a953a9e43b1c934edc48023`.
+`e9db6a97b34e723acbf681308dfcc167dc37e2c798063799ab25d150f3940d29`.
+Prepared source files, including generated provenance, have mode `0644`.
+Prepare and build inside Linux; copying a Windows-prepared tree into a Linux
+builder can change POSIX file modes and therefore ZIP bytes.
 
 Only the fixed Hub control package and pinned Python runtime are pulled. The
 core config digest, OCI revision, installed build identity and runtime user are
@@ -44,3 +47,13 @@ The first run (40371204689, workflow source 653832f) failed in the wheel phase
 before registry login, pulls or image builds. Its original receipt only said
 `wheel_failed`; it cannot establish a hash mismatch or any more specific cause.
 That historical failure is preserved rather than relabelled by later diagnostics.
+
+Run 40372414295 identified a wheel hash mismatch. Its canonical archive and
+hashed backend matched; the resulting 126151-byte wheel had SHA256 `e9db6a97...`.
+Independent byte comparison reproduced that exact hash by changing only the
+ZIP mode of `_executor_source.json` from `0777` to `0644` in the original local
+wheel (`3a7a04ca...`). Every uncompressed member remained identical; one ZIP
+attribute byte changed. A fresh offline Linux rebuild with normalized source
+modes reproduced the CI hash. The corrected default pin names those reviewed
+bytes, rather than accepting arbitrary build output or bypassing verification.
+The original artifact and both failed CI receipts remain historical evidence.
