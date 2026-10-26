@@ -51,7 +51,19 @@ _RESPONSE_HEADERS = frozenset({
     b'location', b'content-security-policy', b'x-content-type-options',
     b'referrer-policy', b'x-accel-buffering', b'etag', b'last-modified',
     b'vary', b'www-authenticate', b'content-range', b'accept-ranges',
+    b'content-disposition',
 })
+
+
+def _diagnostic_path(path, *, files_only=False):
+    match = re.fullmatch(r'/api/hub/v1/staging/diagnostics/' + _UUID + r'(?:/files/(.*))?', path)
+    if match is None:
+        return False
+    relative = match.group(1)
+    if relative is None:
+        return not files_only
+    return (len(relative) <= 512 and re.fullmatch(r'[A-Za-z0-9_@./-]+', relative) is not None
+            and all(part not in ('', '.', '..') for part in relative.split('/')))
 
 
 def browser_route_allowed(method, path):
@@ -60,6 +72,7 @@ def browser_route_allowed(method, path):
         return (path in _GET or client_page_allowed(method, path)
                 or path == '/api/hub/v1/infrastructure/devices'
                 or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
+                or method == 'GET' and _diagnostic_path(path)
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
@@ -316,7 +329,8 @@ class PublicBrowserGateway:
                 # the configured general response budget unchanged.
                 review_detail = re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID
                     + r'(?:/state|/answers)?', scope['path']) is not None
-                response_limit = 4 * 1024 * 1024 if review_detail else self.max_response_bytes
+                response_limit = (8 * 1024 * 1024 if _diagnostic_path(scope['path'], files_only=True)
+                                  else 4 * 1024 * 1024 if review_detail else self.max_response_bytes)
                 async with asyncio.timeout(self.request_timeout):
                     if response.is_stream_consumed:
                         content.extend(response.content)

@@ -96,7 +96,7 @@ async def _payload(request, model, *, maximum=65536):
 
 
 def attach_staging_routes(app, controller, actor, human, preview_broker=None, preview_session=None,
-                          module_status=None):
+                          module_status=None, diagnostic_session=None):
     """Compose existing authenticated callbacks; attaching starts no work."""
     def configured():
         if controller is None:
@@ -159,6 +159,30 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
     def resource(resource_id: Identity, request: Request):
         principal = authenticated(request)
         return configured().resources.get_resource(principal, resource_id)
+
+    def diagnostic_context(request):
+        principal = authenticated(request, human_only=True)
+        service = configured()
+        if not callable(diagnostic_session):
+            raise HubError('staging_diagnostic_unavailable', 503)
+        alive = diagnostic_session(request, principal)
+        if not callable(alive):
+            raise HubError('staging_diagnostic_unavailable', 503)
+        return service, principal, alive
+
+    @app.get('/api/hub/v1/staging/diagnostics/{resource_id}')
+    async def diagnostic_files(resource_id: Identity, request: Request):
+        from .staging_diagnostics import diagnostic_manifest
+        service, principal, alive = diagnostic_context(request)
+        return await diagnostic_manifest(service.resources, service.client, principal, resource_id,
+                                         session_alive=alive)
+
+    @app.get('/api/hub/v1/staging/diagnostics/{resource_id}/files/{relative_path:path}')
+    async def diagnostic_file(resource_id: Identity, relative_path: str, request: Request):
+        from .staging_diagnostics import diagnostic_download
+        service, principal, alive = diagnostic_context(request)
+        return await diagnostic_download(service.resources, service.client, principal, resource_id,
+                                         relative_path, session_alive=alive)
 
     @app.post('/api/hub/v1/staging/resources/{resource_id}/keep')
     async def keep(resource_id: Identity, request: Request):

@@ -698,10 +698,25 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             raise HubError('preview_unavailable', 403)
         return binding
 
+    def diagnostic_session(request: Request, principal):
+        # Read-only: bind the original human cookie, never require CSRF or
+        # substitute another session belonging to the same human after await.
+        binding = sessions.preview_session_binding(
+            principal, request.cookies.get(settings.auth_config.cookie_name))
+        if binding is None:
+            raise HubError('staging_diagnostic_unavailable', 403)
+        def alive():
+            try:
+                return (human(request) == principal and sessions.clock() < binding[1]
+                        and sessions.preview_session_alive(principal, binding[0]) is True)
+            except (HTTPException, HubError):
+                return False
+        return alive
+
     from .staging_api import attach_staging_routes
     attach_staging_routes(app, staging_module.controller, actor, human,
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
-        module_status=staging_module.status)
+        module_status=staging_module.status, diagnostic_session=diagnostic_session)
     from .shared_staging_api import attach_shared_staging_routes
     attach_shared_staging_routes(app, shared_staging, human)
 

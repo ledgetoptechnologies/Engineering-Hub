@@ -652,10 +652,34 @@ class Service:
                           source_digest=payload['source_digest'], resource_ids=payload['resource_ids'])
             state = 'succeeded'
         except Exception as exc:
+            from .docker import DockerBackend, FrozenDiagnosticFailure
+            if type(exc) is FrozenDiagnosticFailure:
+                ensure(type(self.backend) is DockerBackend and exc.command_id == payload['command_id']
+                       and exc.resource_id == payload['resource_ids']['test_run']
+                       and exc.stage in ('build', 'test') and type(exc.engine_id) is str
+                       and re.fullmatch('[A-Za-z0-9:_-]{1,128}', exc.engine_id), 'execution_uncertain')
+                if self.scratch_slot is not None:
+                    ensure(lease is not None and lease.backend_absent, 'execution_uncertain')
+                path = paths['test_run']
+                manifest, size = tree_manifest(path, profile['output_bytes'])
+                ensure(manifest == exc.manifest and size == exc.size and bool(manifest), 'execution_uncertain')
+                with self.lock:
+                    row = self.db.execute('SELECT * FROM resources WHERE id=?', (exc.resource_id,)).fetchone()
+                    ensure(row is not None and row['job_id'] == payload['job_id'] and row['kind'] == 'test_run'
+                           and row['state'] == 'building' and not path.is_symlink()
+                           and path.stat().st_ino == row['inode'], 'execution_uncertain')
+                    self.db.execute("UPDATE resources SET state='ready',manifest=?,bytes=? WHERE id=?",
+                                    (json.dumps(manifest), size, exc.resource_id))
+                    self.db.commit()
+                result = {'error': exc.code, 'diagnostic': {'resource_id': exc.resource_id,
+                    'manifest_sha256': hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',', ':')).encode()).hexdigest(),
+                    'bytes': size, 'stage': exc.stage, 'scope': 'original_engine_owned_writers_exporters_volumes_absent'}}
+                state = 'failed'
+            else:
+                result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
+                state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
             if self._receipt_config is not None and isinstance(exc, (sqlite3.Error, OSError)):
                 self._receipt_fault = 'terminal_receipt_persistence_failed'
-            result = {'error': exc.code if isinstance(exc, Rejected) else 'execution_uncertain'}
-            state = 'held' if result['error'] == 'execution_uncertain' else 'failed'
         if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
             state = 'held'
             result = {'error': 'scratch_cleanup_unproven'}
@@ -717,6 +741,47 @@ class Service:
             ensure(len(data) == item['manifest'][name]['bytes'] and hashlib.sha256(data).hexdigest() ==
                    item['manifest'][name]['sha256'], 'artifact_changed', 409)
             return data
+
+    def diagnostic_file(self, resource_id, manifest_sha256, name):
+        """Only registered, terminal-failed test_run bytes; never inline HTML."""
+        identifier(resource_id); relative(name)
+        ensure(type(manifest_sha256) is str and re.fullmatch('[0-9a-f]{64}', manifest_sha256), 'diagnostic_binding_invalid')
+        ensure(os.name == 'posix', 'diagnostic_posix_required')
+        with self.lock:
+            item = self.metadata(resource_id)
+            ensure(item['kind'] == 'test_run' and item['state'] == 'ready', 'diagnostic_not_registered', 409)
+            row = self.db.execute('SELECT * FROM operations WHERE job_id=?', (item['job_id'],)).fetchone()
+            ensure(row is not None and row['state'] == 'failed', 'diagnostic_not_terminal', 409)
+            result = json.loads(row['result']); saved = result.get('diagnostic', {})
+            digest = hashlib.sha256(json.dumps(item['manifest'],sort_keys=True,separators=(',', ':')).encode()).hexdigest()
+            ensure(saved.get('resource_id') == resource_id and saved.get('manifest_sha256') == digest == manifest_sha256
+                   and saved.get('bytes') == item['bytes'] and name in item['manifest'], 'diagnostic_binding_invalid', 409)
+            entry = item['manifest'][name]
+            ensure(type(entry['bytes']) is int and 0 <= entry['bytes'] <= 8*1024**2, 'diagnostic_file_too_large', 409)
+            directory = os.open(self.resources, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = None
+            try:
+                current = os.open(resource_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory);directory=current
+                ensure(os.fstat(directory).st_ino == item['inode'], 'resource_identity_drift', 409)
+                parts = relative(name).parts
+                for part in parts[:-1]:
+                    current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                    os.close(directory);directory=current
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                before = os.fstat(fd)
+                ensure(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == entry['bytes'],
+                       'artifact_changed', 409)
+                with os.fdopen(fd, 'rb') as stream:
+                    fd = None; data = stream.read(entry['bytes']+1); after=os.fstat(stream.fileno())
+                ensure((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) ==
+                       (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+                       and len(data) == entry['bytes'] and hashlib.sha256(data).hexdigest() == entry['sha256'],
+                       'artifact_changed', 409)
+                return data
+            finally:
+                if fd is not None:os.close(fd)
+                os.close(directory)
 
     def cleanup(self, payload):
         # Job receipts do not cover cleanup commands. Their existing SQL/CAS

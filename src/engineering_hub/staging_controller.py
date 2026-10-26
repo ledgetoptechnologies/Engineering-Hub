@@ -443,6 +443,23 @@ class StagingController:
                          fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready',
                          'staging_resource_proof_invalid', 502)
                 metadata[kind] = fact
+        if outcome == 'failed' and 'diagnostic' in receipt['result']:
+            diagnostic = receipt['result']['diagnostic']
+            identity = item['resource_ids']['test_run']
+            _require(type(diagnostic) is dict and set(diagnostic) ==
+                     {'resource_id', 'manifest_sha256', 'bytes', 'stage', 'scope'}
+                     and diagnostic['resource_id'] == identity and diagnostic['stage'] in ('build', 'test')
+                     and diagnostic['scope'] == 'original_engine_owned_writers_exporters_volumes_absent'
+                     and receipt['result'].get('error') == 'stage_' + diagnostic['stage'] + '_failed',
+                     'staging_diagnostic_proof_invalid', 502)
+            fact = await self.client.resource(identity)
+            self._shared_guard()
+            _require(fact.get('id') == identity and fact.get('kind') == 'test_run'
+                     and fact.get('job_id') == item['job_id'] and fact.get('state') == 'ready'
+                     and fact.get('bytes') == diagnostic['bytes'] and bool(fact.get('manifest'))
+                     and hashlib.sha256(_json(fact['manifest']).encode()).hexdigest() == diagnostic['manifest_sha256'],
+                     'staging_diagnostic_proof_invalid', 502)
+            metadata['test_run'] = fact
         for kind, identity in item['resource_ids'].items():
             resource = self.resources.inspect_resource(self.principal, identity)
             if resource['state'] != 'provisioning':

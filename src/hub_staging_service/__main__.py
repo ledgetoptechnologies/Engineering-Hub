@@ -101,6 +101,8 @@ def handler(service, token, peers, *, host_snapshot=None):
                         return self.respond(200, service.operation(parts[2]))
                     if len(parts) == 4 and parts[:2] == ['v1', 'resources'] and parts[3] == 'metadata':
                         return self.respond(200, service.metadata(parts[2]))
+                    if len(parts) >= 6 and parts[:2] == ['v1', 'resources'] and parts[3] == 'diagnostics':
+                        return self.respond(200, service.diagnostic_file(parts[2], parts[4], '/'.join(parts[5:])), 'application/octet-stream')
                     if len(parts) >= 5 and parts[:2] == ['v1', 'resources'] and parts[3] == 'files':
                         name = '/'.join(parts[4:])
                         return self.respond(200, service.file(parts[2], name), mimetypes.guess_type(name)[0] or 'application/octet-stream')
