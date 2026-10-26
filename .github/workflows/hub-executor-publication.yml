@@ -1,0 +1,87 @@
+name: Publish verified staging executor
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Reviewed executor source commit on main
+        required: true
+        default: 40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc
+      core_digest:
+        description: Reviewed fixed Hub control package manifest digest
+        required: true
+        default: b75a9a69738926cc9a1533d46ff28728a76ab2cf1b5eb43746951e70bcd07839
+      core_commit:
+        description: Reviewed installed core revision
+        required: true
+        default: 66021ca0495c25d0e349b391c4cf624d4c6d7429
+      core_config:
+        description: Reviewed linux/amd64 core config digest
+        required: true
+        default: d8513fb7ad909b5a676a47e93854c5d1d8218e92ba7149409d388ed165456f60
+      wheel_sha256:
+        description: Reviewed exact executor wheel SHA256
+        required: true
+        default: e9db6a97b34e723acbf681308dfcc167dc37e2c798063799ab25d150f3940d29
+      source_date_epoch:
+        description: Fixed reviewed reproducibility epoch
+        required: true
+        default: '1792972800'
+permissions:
+  contents: read
+concurrency:
+  group: hub-executor-publication
+  cancel-in-progress: false
+jobs:
+  publication:
+    # Beau approved staging-only publication in this chat on 2026-10-26.
+    # Manual main dispatch only; no production or staging runtime activation.
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      CORE_DIGEST: ${{ inputs.core_digest }}
+      CORE_COMMIT: ${{ inputs.core_commit }}
+      CORE_CONFIG: ${{ inputs.core_config }}
+      WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+      SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate manual main ancestry before registry access
+        run: python -B scripts/hub_executor_compatibility_ci.py validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.15'
+      - name: Build and verify canonical wheel
+        run: python -B scripts/hub_executor_compatibility_ci.py wheel
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull only reviewed immutable dependencies
+        run: |
+          timeout 180s docker pull --platform linux/amd64 "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CORE_DIGEST"
+          timeout 180s docker pull --platform linux/amd64 python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+      - name: Build and smoke exact executor candidate
+        run: python -B scripts/hub_executor_compatibility_ci.py compatibility
+      - name: Publish unique intent and verify immutable registry bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -B scripts/publish_hub_executor.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: executor-publication-sanitized-receipts
+          path: |
+            executor-compatibility-receipt.json
+            executor-publication-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
