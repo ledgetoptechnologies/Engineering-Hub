@@ -1,0 +1,86 @@
+name: Verify immutable Hub rollback
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_digest:
+        description: Baseline engineering-hub-control sha256 digest (without prefix)
+        required: true
+        default: f6935ec95ccd45c1250e39ce2d85a08087a43a54863a117946335e2b41842122
+      baseline_commit:
+        description: Exact baseline Git commit
+        required: true
+        default: 70c4c13addaffdf54b6ec35a79c3f3eba1e436bb
+      candidate_digest:
+        description: Candidate engineering-hub-control sha256 digest (without prefix)
+        required: true
+        default: 9c1aec00623c316d668679841f0ff480f32f909825d74545f8f3fa5c5817d770
+      candidate_commit:
+        description: Exact candidate Git commit
+        required: true
+        default: 60f8900955b8e1f9e669a0446f1c8afa58bab2b1
+      rollback_mode:
+        description: Direct preserves candidate writes; backup-restore discards them
+        required: true
+        type: choice
+        options: [direct, backup-restore]
+        default: direct
+permissions:
+  contents: read
+  packages: read
+jobs:
+  verify-rollback:
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate fixed package inputs before registry access
+        env:
+          BASELINE_DIGEST: ${{ inputs.baseline_digest }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          BASELINE_COMMIT: ${{ inputs.baseline_commit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          ROLLBACK_MODE: ${{ inputs.rollback_mode }}
+        run: |
+          [[ "$BASELINE_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$CANDIDATE_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$BASELINE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CANDIDATE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$ROLLBACK_MODE" = direct || "$ROLLBACK_MODE" = backup-restore ]]
+          test "$BASELINE_DIGEST" != "$CANDIDATE_DIGEST"
+          test "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull only the two immutable Hub control images
+        env:
+          BASELINE_DIGEST: ${{ inputs.baseline_digest }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+        run: |
+          timeout 180s docker pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$BASELINE_DIGEST"
+          timeout 180s docker pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CANDIDATE_DIGEST"
+      - name: Verify disposable rollback (no network or host ports)
+        env:
+          BASELINE_DIGEST: ${{ inputs.baseline_digest }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          BASELINE_COMMIT: ${{ inputs.baseline_commit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          ROLLBACK_MODE: ${{ inputs.rollback_mode }}
+        run: |
+          python -B scripts/hub_rollback_container_smoke.py \
+            --baseline-image "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$BASELINE_DIGEST" \
+            --baseline-commit "$BASELINE_COMMIT" \
+            --candidate-image "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CANDIDATE_DIGEST" \
+            --candidate-commit "$CANDIDATE_COMMIT" \
+            --rollback-mode "$ROLLBACK_MODE" > rollback-receipt.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hub-rollback-public-receipt
+          path: rollback-receipt.json
+          if-no-files-found: warn
+          retention-days: 14
