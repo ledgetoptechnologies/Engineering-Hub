@@ -9,15 +9,15 @@ on:
       core_digest:
         description: Reviewed fixed Hub control package manifest digest
         required: true
-        default: d78d1576ffa574d7913c92b6fad64728cc07f10c7dcf3cdb4f7e96d37a5d5aaa
+        default: b75a9a69738926cc9a1533d46ff28728a76ab2cf1b5eb43746951e70bcd07839
       core_commit:
         description: Reviewed installed core revision
         required: true
-        default: 40d3d2fa126b8c0fb78f6f48a47c25aae38d38bc
+        default: 66021ca0495c25d0e349b391c4cf624d4c6d7429
       core_config:
         description: Reviewed linux/amd64 core config digest
         required: true
-        default: c3ebafe50d4432a4a10dfd9999a353309a812ca29963ca07d912c270664efc06
+        default: d8513fb7ad909b5a676a47e93854c5d1d8218e92ba7149409d388ed165456f60
       wheel_sha256:
         description: Reviewed exact executor wheel SHA256
         required: true
@@ -73,6 +73,8 @@ jobs:
       - name: Build and smoke exact executor candidate
         run: python -B scripts/hub_executor_compatibility_ci.py compatibility
       - name: Publish unique intent and verify immutable registry bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python -B scripts/publish_hub_executor.py
       - uses: actions/upload-artifact@v4
         if: always()

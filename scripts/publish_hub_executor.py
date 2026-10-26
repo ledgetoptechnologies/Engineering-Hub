@@ -1,6 +1,7 @@
 """Draft, explicit executor publication; disabled workflow awaits permission approval.
 
-Uses Docker's existing login; never reads tokens or operator configuration.
+Uses Docker's existing login and the job's existing GH_TOKEN for one fixed
+package metadata read; never reads operator credentials or configuration.
 An intent tag is a locator, not an atomic immutable registry reservation.
 """
 from __future__ import annotations
@@ -11,14 +12,109 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import urllib.request
+import uuid
 
 import hub_executor_compatibility_ci as ci
-from hub_executor_image_smoke import smoke, verify_defaults
+from hub_executor_image_smoke import OWNER, remove_owned, smoke, verify_defaults
 from verify_hub_executor_wheel import verify_wheel
 
 PACKAGE = 'ghcr.io/ledgetoptechnologies/engineering-hub-control'
 RECEIPT = Path('executor-publication-receipt.json')
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}\Z')
+PACKAGE_API = 'https://api.github.com/orgs/ledgetoptechnologies/packages/container/engineering-hub-control'
+INGRESS_PROBE = r'''
+import inspect, os, sys
+from engineering_hub.build_info import read_build_commit
+from engineering_hub.frontends import HubFrontends
+from engineering_hub.ingress import HubIngressMiddleware
+from engineering_hub.private_gateway import PrivateBrowserGateway
+from engineering_hub.queued_pilot_service import serve_owned_queued_pilot
+assert os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 10001
+assert os.getpid() == 1 and sys.flags.isolated and sys.flags.dont_write_bytecode
+assert read_build_commit() == sys.argv[1]
+for obj in (HubFrontends, HubIngressMiddleware, PrivateBrowserGateway, serve_owned_queued_pilot):
+    parameter = inspect.signature(obj).parameters['access_verifier']
+    assert parameter.kind == inspect.Parameter.KEYWORD_ONLY and parameter.default is None
+print('installed-ingress-seam-passed')
+'''
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def private_package():
+    """One fixed, authenticated, bounded package read; no policy modifications."""
+    try:
+        token = os.environ.get('GH_TOKEN', '')
+        if not 0 < len(token) <= 4096 or '\r' in token or '\n' in token:
+            raise ValueError('Missing job token')
+        request = urllib.request.Request(PACKAGE_API, headers={
+            'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(request, timeout=20) as response:
+            if response.status != 200 or response.geturl() != PACKAGE_API:
+                raise ValueError('Unexpected package response')
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            raise ValueError('Package response too large')
+        package = json.loads(raw)
+        if (package.get('visibility') != 'private'
+                or package.get('name') != 'engineering-hub-control'
+                or package.get('package_type') != 'container'
+                or package.get('owner', {}).get('login', '').casefold() != 'ledgetoptechnologies'):
+            raise ValueError('Wrong existing private package')
+    except Exception:
+        raise RuntimeError('Existing private Hub package not verified; refusing upload') from None
+
+
+def installed_ingress(expected, core_commit, evidence=None):
+    evidence = evidence if evidence is not None else {}
+    image(expected, expected)
+    owner = uuid.uuid4().hex
+    name = 'hub-executor-ingress-' + owner
+    evidence.update(ingress_probe_container=name, ingress_probe_owner=owner,
+                    ingress_probe_cleanup='pending')
+    try:
+        run('docker', 'container', 'create', '--pull', 'never', '--name', name,
+            '--label', OWNER + '=' + owner, '--network', 'none',
+            '--read-only', '--user', '10001:10001', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges:true', '--cpus', '1',
+            '--memory', '256m', '--memory-swap', '256m', '--pids-limit', '64',
+            '--entrypoint', '/opt/venv/bin/python', expected, '-I', '-B', '-c',
+            INGRESS_PROBE, core_commit, timeout=60)
+        output = run('docker', 'container', 'start', '--attach', name, timeout=60)
+        if output != b'installed-ingress-seam-passed\n':
+            raise ValueError('Installed ingress seam not verified')
+        inspected, = json.loads(run('docker', 'container', 'inspect', name, timeout=60))
+        host = inspected.get('HostConfig', {})
+        if (inspected['Config']['Labels'].get(OWNER) != owner
+                or inspected['Config'].get('User') != '10001:10001'
+                or inspected.get('Image') != expected or inspected.get('Mounts')
+                or inspected['State']['Running'] or inspected['State']['ExitCode'] != 0
+                or host.get('NetworkMode') != 'none' or host.get('ReadonlyRootfs') is not True
+                or host.get('CapDrop') != ['ALL'] or host.get('CapAdd')
+                or host.get('SecurityOpt') != ['no-new-privileges:true']
+                or host.get('Privileged') or host.get('PidMode') not in ('', None)
+                or host.get('Memory') != 256 * 1024**2
+                or host.get('MemorySwap') != 256 * 1024**2
+                or host.get('NanoCpus') != 1_000_000_000 or host.get('PidsLimit') != 64
+                or host.get('Binds') or host.get('Tmpfs') or host.get('PortBindings')
+                or host.get('PublishAllPorts')):
+            raise ValueError('Installed ingress probe identity or limits mismatch')
+    finally:
+        try:
+            # Existing CI fixture cleanup verifies the exact owner label before
+            # removing only this unique inert local container. Never prune.
+            remove_owned(name, owner)
+            evidence['ingress_probe_cleanup'] = 'removed'
+        except Exception:
+            evidence['ingress_probe_cleanup'] = 'held'
+            raise RuntimeError('Ingress probe cleanup not verified; retain owned locator') from None
+    image(expected, expected)
 
 
 def invocation(env):
@@ -120,6 +216,12 @@ def publish(values, local, target, record):
         raise ValueError('Smoke image identity mismatch')
     record['config_digest'] = expected
     record['local_image_size_estimate_bytes'] = inspected['Size']
+    record['stage'] = 'installed_ingress_seam'
+    installed_ingress(expected, values['CORE_COMMIT'], record)
+    record['installed_ingress_seam'] = 'passed'
+    record['stage'] = 'private_package_verify'
+    private_package()
+    record['private_package_verified'] = True
     record['stage'] = 'intent_absence'
     absent(target)
     record['stage'] = 'local_intent_tag'

@@ -5,15 +5,21 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import types
+import builtins
+import inspect
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+import hub_executor_image_smoke as SMOKE
 SPEC = importlib.util.spec_from_file_location('executor_publication', ROOT / 'scripts/publish_hub_executor.py')
 P = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(P)
 CONFIG = 'sha256:' + 'd' * 64
+PRIVATE_PACKAGE_CHECK = P.private_package
+INSTALLED_INGRESS_CHECK = P.installed_ingress
 
 
 def environment():
@@ -93,6 +99,181 @@ def test_local_identity_or_size_mismatch_rejected(monkeypatch, field, value):
         P.image('fixture', CONFIG)
 
 
+@pytest.mark.parametrize('change', [{'visibility': 'public'}, {'name': 'other'},
+    {'owner': {'login': 'other'}}, {'package_type': 'npm'}, {'owner': {}}, {}])
+def test_private_package_metadata_fails_closed(monkeypatch, change):
+    package = {'visibility': 'private', 'name': 'engineering-hub-control',
+               'package_type': 'container', 'owner': {'login': 'LedgeTopTechnologies'}}
+    package.update(change)
+    if not change:
+        package = {}
+    package_response(monkeypatch, json.dumps(package).encode())
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.private_package()
+
+
+def package_response(monkeypatch, raw, *, url=P.PACKAGE_API, status=200):
+    monkeypatch.setenv('GH_TOKEN', 'job-token-fixture')
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def geturl(self):
+            return url
+        def read(self, limit):
+            assert limit == 65537
+            return raw
+    Response.status = status
+    class Opener:
+        def open(self, request, timeout):
+            assert request.full_url == P.PACKAGE_API and timeout == 20
+            assert request.get_header('Authorization') == 'Bearer job-token-fixture'
+            return Response()
+    def build(*handlers):
+        assert isinstance(handlers[1], P.NoRedirect)
+        assert handlers[1].redirect_request(None, None, 302, None, None, 'https://other.invalid') is None
+        assert handlers[0].proxies == {}
+        return Opener()
+    monkeypatch.setattr(P.urllib.request, 'build_opener', build)
+
+
+def test_private_package_exact_bounded_read(monkeypatch):
+    package_response(monkeypatch, json.dumps({'visibility': 'private', 'name': 'engineering-hub-control',
+                     'package_type': 'container', 'owner': {'login': 'LedgeTopTechnologies'}}).encode())
+    P.private_package()
+
+
+@pytest.mark.parametrize('raw,url,status', [(b'not-json-secret', P.PACKAGE_API, 200),
+    (b'x' * 65537, P.PACKAGE_API, 200), (b'{}', 'https://other.invalid', 200),
+    (b'{}', P.PACKAGE_API, 404)], ids=['invalid-json', 'oversize', 'redirect', 'missing'])
+def test_private_package_unknown_or_redirect_does_not_leak(monkeypatch, raw, url, status):
+    package_response(monkeypatch, raw, url=url, status=status)
+    with pytest.raises(RuntimeError) as failure:
+        P.private_package()
+    assert 'secret' not in str(failure.value) and 'job-token-fixture' not in str(failure.value)
+
+
+def execute_ingress_probe(expected, *, actual=None, seam=True):
+    def supported(*, access_verifier=None):
+        pass
+    def missing():
+        pass
+    modules = {'inspect': inspect,
+        'os': types.SimpleNamespace(getuid=lambda: 10001, geteuid=lambda: 10001,
+                                    getgid=lambda: 10001, getegid=lambda: 10001, getpid=lambda: 1),
+        'sys': types.SimpleNamespace(argv=['probe', expected], flags=types.SimpleNamespace(isolated=True, dont_write_bytecode=True)),
+        'engineering_hub.build_info': types.SimpleNamespace(read_build_commit=lambda: actual or expected),
+        'engineering_hub.frontends': types.SimpleNamespace(HubFrontends=supported if seam else missing),
+        'engineering_hub.ingress': types.SimpleNamespace(HubIngressMiddleware=supported),
+        'engineering_hub.private_gateway': types.SimpleNamespace(PrivateBrowserGateway=supported),
+        'engineering_hub.queued_pilot_service': types.SimpleNamespace(serve_owned_queued_pilot=supported)}
+    emitted = []
+    scope = dict(vars(builtins))
+    scope.update(__import__=lambda name, *args, **kwargs: modules[name], print=lambda value: emitted.append(value))
+    exec(P.INGRESS_PROBE, {'__builtins__': scope})
+    assert emitted == ['installed-ingress-seam-passed']
+
+
+@pytest.mark.parametrize('actual,seam', [('b' * 40, True), (None, False)])
+def test_actual_probe_body_rejects_wrong_commit_or_missing_seam(actual, seam):
+    with pytest.raises((AssertionError, KeyError)):
+        execute_ingress_probe('a' * 40, actual=actual, seam=seam)
+
+
+def test_actual_probe_body_checks_signatures_without_construction():
+    execute_ingress_probe('a' * 40)
+
+
+def terminal_probe(owner='f' * 32):
+    return {'Config': {'Labels': {P.OWNER: owner}, 'User': '10001:10001'},
+            'Image': CONFIG, 'Mounts': [], 'State': {'Running': False, 'ExitCode': 0},
+            'HostConfig': {'NetworkMode': 'none', 'ReadonlyRootfs': True, 'CapDrop': ['ALL'],
+                'SecurityOpt': ['no-new-privileges:true'], 'Memory': 256 * 1024**2,
+                'MemorySwap': 256 * 1024**2, 'NanoCpus': 1_000_000_000, 'PidsLimit': 64}}
+
+
+def probe_commands(monkeypatch, info=None):
+    calls, removed = [], []
+    monkeypatch.setattr(P.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='f' * 32))
+    monkeypatch.setattr(P, 'remove_owned', lambda *a: removed.append(a))
+    def command(*args, **kwargs):
+        calls.append((args, kwargs))
+        if args[2] == 'start':
+            return b'installed-ingress-seam-passed\n'
+        if args[2] == 'inspect':
+            return json.dumps([info or terminal_probe()]).encode()
+        return b'created'
+    monkeypatch.setattr(P, 'run', command)
+    return calls, removed
+
+
+def test_installed_probe_exact_id_bounded_and_rechecked(monkeypatch):
+    inspections, calls = [], []
+    monkeypatch.setattr(P, 'image', lambda *a: inspections.append(a))
+    calls, removed = probe_commands(monkeypatch)
+    evidence = {}
+    P.installed_ingress(CONFIG, 'a' * 40, evidence)
+    assert inspections == [(CONFIG, CONFIG), (CONFIG, CONFIG)]
+    command, kwargs = calls[0]
+    for flag, value in [('--network', 'none'), ('--user', '10001:10001'), ('--cpus', '1'),
+                        ('--memory', '256m'), ('--memory-swap', '256m'), ('--pids-limit', '64'),
+                        ('--cap-drop', 'ALL'), ('--security-opt', 'no-new-privileges:true')]:
+        assert command[command.index(flag) + 1] == value
+    assert '--read-only' in command and command[:3] == ('docker', 'container', 'create')
+    assert command[-6:] == (CONFIG, '-I', '-B', '-c', P.INGRESS_PROBE, 'a' * 40)
+    assert kwargs == {'timeout': 60}
+    assert removed == [('hub-executor-ingress-' + 'f' * 32, 'f' * 32)]
+    assert evidence['ingress_probe_cleanup'] == 'removed'
+
+
+def test_installed_probe_nonexact_output_rejected(monkeypatch):
+    monkeypatch.setattr(P, 'image', lambda *a: {})
+    monkeypatch.setattr(P, 'remove_owned', lambda *a: None)
+    monkeypatch.setattr(P, 'run', lambda *a, **k: b'private output')
+    with pytest.raises(ValueError, match='not verified'):
+        P.installed_ingress(CONFIG, 'a' * 40)
+
+
+@pytest.mark.parametrize('field,value', [('Image', 'sha256:' + '0' * 64),
+    ('Memory', 0), ('NetworkMode', 'host'), ('Privileged', True), ('PidsLimit', -1)])
+def test_terminal_probe_identity_and_resource_mismatch_rejected(monkeypatch, field, value):
+    info = terminal_probe()
+    if field == 'Image':
+        info[field] = value
+    else:
+        info['HostConfig'][field] = value
+    monkeypatch.setattr(P, 'image', lambda *a: {})
+    _, removed = probe_commands(monkeypatch, info)
+    evidence = {}
+    with pytest.raises(ValueError, match='identity or limits'):
+        P.installed_ingress(CONFIG, 'a' * 40, evidence)
+    assert len(removed) == 1 and evidence['ingress_probe_cleanup'] == 'removed'
+
+
+@pytest.mark.parametrize('wrong_owner', [False, True])
+def test_attach_timeout_cleans_only_verified_owned_locator(monkeypatch, wrong_owner):
+    calls, cleaned = [], []
+    monkeypatch.setattr(P.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='f' * 32))
+    monkeypatch.setattr(P, 'image', lambda *a: {})
+    def command(*args, **kwargs):
+        calls.append(args)
+        if args[2] == 'start':
+            raise subprocess.TimeoutExpired(['private argv'], 60, output=b'private')
+        return b'created'
+    monkeypatch.setattr(P, 'run', command)
+    monkeypatch.setattr(SMOKE.subprocess, 'run', lambda *a, **k:
+        subprocess.CompletedProcess(a, 0, json.dumps([terminal_probe('wrong' if wrong_owner else 'f' * 32)]), ''))
+    monkeypatch.setattr(SMOKE, 'run', lambda *a, **k: cleaned.append(a))
+    evidence = {}
+    with pytest.raises(RuntimeError if wrong_owner else subprocess.TimeoutExpired):
+        P.installed_ingress(CONFIG, 'a' * 40, evidence)
+    assert [a[2] for a in calls] == ['create', 'start']
+    assert evidence['ingress_probe_container'] == 'hub-executor-ingress-' + 'f' * 32
+    assert evidence['ingress_probe_cleanup'] == ('held' if wrong_owner else 'removed')
+    assert cleaned == ([] if wrong_owner else [('docker', 'container', 'rm', '-f', 'hub-executor-ingress-' + 'f' * 32)])
+
+
 @pytest.fixture
 def candidate(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -106,6 +287,8 @@ def candidate(monkeypatch, tmp_path):
     monkeypatch.setattr(P, 'verify_wheel', lambda **k: {})
     monkeypatch.setattr(P, 'image', lambda *a: {'Id': CONFIG, 'Size': 999, 'RepoDigests': []})
     monkeypatch.setattr(P, 'smoke', lambda *a: {'image_id': CONFIG})
+    monkeypatch.setattr(P, 'installed_ingress', lambda *a: None)
+    monkeypatch.setattr(P, 'private_package', lambda: None)
     return values, local, target, {'stage': 'start', 'publication_attempted': False, 'image_published': False}
 
 
@@ -173,6 +356,65 @@ def test_success_binds_receipt_to_exact_pulled_config_and_digest(monkeypatch, ca
     assert record['config_digest'] == CONFIG and record['manifest_digest'] == digest
     assert record['image_published'] is True and record['staging_acceptance'] == 'not_tested'
     assert record['local_image_size_estimate_bytes'] == 999
+    assert record['private_package_verified'] is True and record['installed_ingress_seam'] == 'passed'
+
+
+@pytest.mark.parametrize('guard', ['private_package', 'installed_ingress'])
+def test_guard_failure_stops_before_any_upload_and_no_success_fact(monkeypatch, candidate, guard):
+    calls = []
+    def reject(*args):
+        raise RuntimeError('private diagnostic')
+    monkeypatch.setattr(P, guard, reject)
+    monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a))
+    with pytest.raises(RuntimeError):
+        P.publish(*candidate)
+    assert calls == []
+    assert candidate[-1]['publication_attempted'] is False
+    assert ('private_package_verified' if guard == 'private_package' else 'installed_ingress_seam') not in candidate[-1]
+
+
+@pytest.mark.parametrize('package', [{'visibility': 'public'}, {},
+    {'name': 'wrong-package'}, None], ids=['public', 'missing', 'wrong', 'unknown'])
+def test_real_metadata_guard_stops_before_push(monkeypatch, candidate, package):
+    calls = []
+    monkeypatch.setattr(P, 'private_package', PRIVATE_PACKAGE_CHECK)
+    package_response(monkeypatch, json.dumps(package).encode())
+    monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a))
+    with pytest.raises(RuntimeError, match='refusing upload'):
+        P.publish(*candidate)
+    assert calls == [] and candidate[-1]['publication_attempted'] is False
+    assert 'private_package_verified' not in candidate[-1]
+
+
+@pytest.mark.parametrize('actual,seam', [('b' * 40, True), (None, False)])
+def test_actual_probe_validation_blocks_publication(monkeypatch, candidate, actual, seam):
+    calls = []
+    monkeypatch.setattr(P, 'installed_ingress', lambda expected, commit, evidence:
+                        execute_ingress_probe(commit, actual=actual, seam=seam))
+    monkeypatch.setattr(P, 'run', lambda *a, **k: calls.append(a))
+    with pytest.raises((AssertionError, KeyError)):
+        P.publish(*candidate)
+    assert calls == [] and candidate[-1]['publication_attempted'] is False
+    assert 'installed_ingress_seam' not in candidate[-1]
+
+
+def test_attach_timeout_cleans_and_blocks_publication(monkeypatch, candidate):
+    calls, cleaned = [], []
+    monkeypatch.setattr(P, 'installed_ingress', INSTALLED_INGRESS_CHECK)
+    monkeypatch.setattr(P.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='f' * 32))
+    def command(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ('docker', 'container', 'start'):
+            raise subprocess.TimeoutExpired(['private argv'], 60)
+        return b'created'
+    monkeypatch.setattr(P, 'run', command)
+    monkeypatch.setattr(P, 'remove_owned', lambda *a: cleaned.append(a))
+    with pytest.raises(subprocess.TimeoutExpired):
+        P.publish(*candidate)
+    assert all(args[:2] != ('docker', 'push') for args in calls)
+    assert cleaned == [('hub-executor-ingress-' + 'f' * 32, 'f' * 32)]
+    assert candidate[-1]['ingress_probe_cleanup'] == 'removed'
+    assert candidate[-1]['publication_attempted'] is False
 
 
 def test_readback_failure_retains_unknown_outcome(monkeypatch, candidate):

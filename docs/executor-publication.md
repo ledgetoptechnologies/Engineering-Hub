@@ -8,8 +8,12 @@ reviewed activation change. Existing compatibility CI remains read-only.
 After approval, one manual main dispatch would rebuild the exact reviewed tuple
 using the existing canonical wheel and compatibility helpers, then reinspect
 the exact smoke-verified image ID, fixed defaults, source provenance and wheel.
-Docker uses the existing Actions login; no additional token, package visibility,
-package access, host enrollment or deployment change is included.
+Docker uses the existing Actions login. Only the publication step also receives
+that same job token as `GH_TOKEN` for one bounded, fixed GitHub package metadata
+read with redirects disabled. The exact existing organization/package must be
+private before upload; missing, public, wrong or unavailable metadata stops.
+No additional secret, visibility, access, host enrollment or deployment change
+is included.
 
 The only destination is the existing private package
 `ghcr.io/ledgetoptechnologies/engineering-hub-control`, with locator
@@ -34,16 +38,30 @@ immutable reference is pulled and the installed import smoke runs with no
 network, host mounts, operator configuration or launcher construction. Success
 does not establish a staging pilot or authorize live execution.
 
-The draft defaults retain the existing compatibility tuple with core `40d3d2f`;
-that core lacks the later private-ingress verifier forwarding required by the
-real pilot. Publishing this fixture tuple would not make the pilot ready. Before
-any campaign, select and independently review the actual required newer core
-manifest/config/commit tuple and check its installed verifier seam. Executor
+The draft now pairs executor source `40d3d2f` and reviewed wheel `e9db6a97...`
+with published core `66021ca0495c25d0e349b391c4cf624d4c6d7429`, manifest
+`sha256:b75a9a69738926cc9a1533d46ff28728a76ab2cf1b5eb43746951e70bcd07839`
+and config
+`sha256:d8513fb7ad909b5a676a47e93854c5d1d8218e92ba7149409d388ed165456f60`.
+The older core `40d3d2f` lacks required private-ingress verifier forwarding and
+fails the mandatory pre-upload installed-seam probe. The probe still checks
+actual installed build identity and explicit `access_verifier`
+support on the frontend, ingress middleware, private gateway and owned pilot
+function without constructing resources, launchers, issuers or configuration.
+It runs by exact image ID, nonroot, read-only, with no network, host mounts or
+capabilities and bounded CPU/memory/PIDs; image identity is checked before and
+afterward. The unique inert container has an owner label and explicit create,
+attach and terminal identity/resource inspection. A CLI timeout triggers cleanup
+through the existing CI owner-check helper. Uncertain ownership refuses removal
+and retains the sanitized unique locator with cleanup marked held; there is no
+prune or blind retry. Before any campaign, independently verify this tuple's
+installed verifier seam; publication and a real pilot remain unverified. Executor
 source and core commits may intentionally differ; neither is inferred from a tag.
 
 Only sanitized JSON receipts are uploaded: source/core/wheel identity, immutable
 manifest/config digests, fixed stage/status, compressed layer total, config size
 and Docker image size estimate. No wheel, image archive, raw manifest, private
-files or credentials are exported. Compressed size and image size do not prove
+files or credentials are exported. Private-package and installed-ingress facts
+appear only after their respective checks pass. Compressed size and image size do not prove
 staging import peak/quota headroom. Staging ingestion, space acceptance and
 runtime workflow checks remain separate work, with no volume changes here.
