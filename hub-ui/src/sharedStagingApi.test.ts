@@ -63,7 +63,9 @@ describe("wording", () => {
       const { title, line } = stateText[state];
       expect(`${title} ${line}`).not.toMatch(/\b(ready|approved|authori[sz]ed)\b/i);
     }
-    expect(stateText.active.line).toContain("doesn't mean any app is deployed or healthy");
+    expect(stateText.active.line).toContain("New staging jobs can be admitted. That doesn't mean they run on their own");
+    expect(stateText.active.line).toContain("nothing here means an app is deployed or healthy");
+    expect(stateText.active.line).not.toMatch(/\btaking\b/i);
   });
   it("never says a failed or unanswered retry means the work failed", () => {
     for (const error of [new HubApiError(0, "network_unavailable"), new HubApiError(409, "shared_staging_recovery_required"),
@@ -73,5 +75,7 @@ describe("wording", () => {
       expect(text).not.toMatch(/\bfailed\b/i);
     }
     expect(recoverFailureText(new HubApiError(0, "network_unavailable"))).toContain("may still be running");
+    // The guard can trip after recovery reads began, so it never claims nothing happened.
+    expect(recoverFailureText(new HubApiError(409, "shared_staging_lifecycle_changed"))).not.toMatch(/nothing was/i);
   });
 });

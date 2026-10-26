@@ -39,7 +39,7 @@ test("before the session check, it says what's needed and offers nothing to pres
   const state = await fixture(page, [ok("pending", "operator_acceptance_required")]);
   await page.goto("/#/staging");
   await expect(panel(page)).toContainText("Waiting for the session check");
-  await expect(panel(page)).toContainText("Nothing is taken until you accept the staging session check.");
+  await expect(panel(page)).toContainText("Nothing new is admitted until you accept the staging session check.");
   await expect(panel(page)).toContainText("“Review staging session” on this page");
   await expect(panel(page).getByRole("button")).toHaveText(["Refresh"]);
   await expect(panel(page).getByText(/\b(ready|approved)\b/i)).toHaveCount(0);
@@ -52,7 +52,8 @@ test("an open queue is never worded as deployed or approved", async ({ page }) =
   await fixture(page, [ok("active")]);
   await page.goto("/#/staging");
   await expect(panel(page)).toContainText("Open");
-  await expect(panel(page)).toContainText("doesn't mean any app is deployed or healthy");
+  await expect(panel(page)).toContainText("New staging jobs can be admitted. That doesn't mean they run on their own");
+  await expect(panel(page)).toContainText("nothing here means an app is deployed or healthy");
   await expect(panel(page)).toContainText("It doesn't approve any job or deployment.");
 });
 
@@ -89,7 +90,8 @@ test("a retry the Hub refuses says to refresh and keeps the earlier state marked
     [{ status: 409, body: { detail: { code: "shared_staging_lifecycle_changed" } } }]);
   await page.goto("/#/staging");
   await panel(page).getByRole("button", { name: "Retry checking earlier work" }).click();
-  await expect(panel(page).getByRole("alert")).toContainText("setup changed or is stopping, so nothing was retried");
+  await expect(panel(page).getByRole("alert")).toContainText("setup changed or is stopping. Use Refresh to see the current state; don't assume how far the check got.");
+  await expect(panel(page).getByRole("alert")).not.toContainText("nothing was");
   await expect(panel(page).getByRole("alert")).toContainText("may be out of date");
 });
 

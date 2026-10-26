@@ -71,23 +71,23 @@ export function recoverSharedStaging(csrf: string, fetchImpl: typeof fetch = glo
     headers: { Accept: "application/json", "Content-Type": "application/json", "X-Hub-CSRF": csrf } }, fetchImpl);
 }
 
-/** Plain wording per state. "Open" means jobs may be taken, never that anything is deployed, healthy or approved. */
+/** Plain wording per state. "Open" means new jobs may be admitted, never that anything is deployed, healthy or approved. */
 export const stateText: Record<SharedState, { title: string; line: string; tone: "forest" | "amber" | "neutral" }> = {
   not_started: { title: "Not started", tone: "neutral",
-    line: "The shared staging queue hasn't started yet, so no staging jobs or deployments are being taken." },
+    line: "The shared staging queue hasn't started yet, so no new staging jobs or deployments are admitted." },
   pending: { title: "Waiting for the session check", tone: "amber",
-    line: "Nothing is taken until you accept the staging session check. Accepting it then rechecks any work that was under way before the Hub restarted." },
+    line: "Nothing new is admitted until you accept the staging session check. Accepting it then rechecks any work that was under way before the Hub restarted." },
   recovering: { title: "Checking earlier work", tone: "amber",
     line: "Checking the work that was under way before the Hub restarted. New jobs wait until that's done." },
   recovery_required: { title: "Earlier work not confirmed", tone: "amber",
     line: "Some work from before the restart couldn't be confirmed, so new jobs stay stopped. Retrying checks only that same work again; it never starts it again." },
   active: { title: "Open", tone: "forest",
-    line: "The queue is taking staging jobs and deployments, one at a time on the staging PC. This doesn't mean any app is deployed or healthy." },
+    line: "New staging jobs can be admitted. That doesn't mean they run on their own: each still needs its review and checks, and nothing here means an app is deployed or healthy." },
   stopping: { title: "Stopping", tone: "amber",
-    line: "No new jobs are taken. Work already under way is being allowed to finish." },
-  stopped: { title: "Stopped", tone: "neutral", line: "The shared staging queue has stopped. No jobs are being taken." },
+    line: "No new jobs are admitted. Work already under way is being allowed to finish." },
+  stopped: { title: "Stopped", tone: "neutral", line: "The shared staging queue has stopped. No new jobs are admitted." },
   shutdown_failed: { title: "Didn't stop cleanly", tone: "amber",
-    line: "The queue stopped taking jobs, but work that was under way couldn't be confirmed as finished. Check it before the next start." },
+    line: "The queue stopped admitting new jobs, but work that was under way couldn't be confirmed as finished. Check it before the next start." },
 };
 
 /** Wording for a recovery request that didn't return a status. Never claims the work failed or ran. */
@@ -101,6 +101,6 @@ export function recoverFailureText(error: unknown): string {
   if (code === "shared_staging_recovery_already_attempted")
     return "Recovery has already run for this start. Use Refresh to see the current state.";
   if (code === "shared_staging_lifecycle_changed")
-    return "The Hub's staging setup changed or is stopping, so nothing was retried. Use Refresh to see the current state.";
+    return "The Hub's staging setup changed or is stopping. Use Refresh to see the current state; don't assume how far the check got.";
   return "The retry couldn't be confirmed. Use Refresh to see the current state before trying again.";
 }
