@@ -54,11 +54,22 @@ first page is the whole backlog.
 
 ## Human UI
 
-`#/planning` → **Plans & ideas** provides topic selection and a separate
-**Engineering Hub improvements** selector. Create, read and edit records;
-conflicts preserve your unsaved draft and require reviewing the latest version.
-The existing Cloudflare session/CSRF protection applies, with no extra login.
-Content renders as text, not executable HTML. Demo mode does not write live data.
+A project's **Notes & plans → Plans & ideas** tab shows that project's records
+directly. It finds the project's topics from record paths (a bounded read of
+paths, never content), shows every topic newest first, and offers a **Topic**
+filter with readable names (`agent-link-…` routes read as "Agent chat
+<first 8 characters>"; the full id is in the tooltip). The **Engineering Hub
+improvements** backlog is offered only for the Engineering Hub project. The
+cross-project `#/planning` page keeps a **Project** picker for deliberate
+browsing. New records get an id made from the title plus a short random suffix,
+fixed once saved; a new record can start a new topic.
+
+Create, read and edit records; conflicts preserve your unsaved draft and
+require reviewing the latest version. The existing Cloudflare session/CSRF
+protection applies, with no extra login. Content is rendered by the same safe
+Markdown renderer as notes (never executable HTML), with a plain-text view.
+Planning records are hidden from the Notes list so their JSON envelopes don't
+show as notes. Demo mode does not write live data.
 
 REST: GET/POST `/api/hub/v1/planning`, GET
 `/api/hub/v1/planning/document`; same address fields and CAS payload as above.

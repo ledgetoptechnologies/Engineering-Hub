@@ -207,7 +207,7 @@ test("notes render as inert text with metadata, counts and truncation", async ({
   state.truncated = true;
   await page.goto("/#/notes");
   const panel = panelOf(page);
-  await expect(panel.getByText("1 note in engineering-hub.", { exact: false })).toBeVisible();
+  await expect(panel.getByText("1 note in Engineering Hub.", { exact: false })).toBeVisible();
   await expect(panel.getByText("More notes below the list.", { exact: false })).toBeVisible();
   await expect(panel.getByRole("button", { name: "Show more notes" })).toBeVisible();
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
@@ -245,7 +245,7 @@ test("create then edit; a concurrent save shows both versions and replaces only 
   await expect(panel.getByText('Saved "Pilot handoff" as version 1.', { exact: true })).toBeVisible();
   expect(state.posts[0]).toEqual({ csrf: "fixture-csrf", body: { project: "engineering-hub", path: "handoffs/pilot.md",
     title: "Pilot handoff", content: "Waiting on run authorization.", expected_version: 0 } });
-  await expect(panel.getByText("2 notes in engineering-hub.", { exact: false })).toBeVisible();
+  await expect(panel.getByText("2 notes in Engineering Hub.", { exact: false })).toBeVisible();
 
   await panel.getByRole("article", { name: "Pilot handoff" }).getByRole("button", { name: "Edit" }).click();
   const edit = panel.getByRole("form", { name: "Edit note" });
@@ -299,7 +299,7 @@ test("a slow list for the previous project never replaces the current project's 
   const state = await fixture(page);
   await page.goto("/#/notes");
   const panel = panelOf(page);
-  await expect(panel.getByText("1 note in engineering-hub.", { exact: false })).toBeVisible();
+  await expect(panel.getByText("1 note in Engineering Hub.", { exact: false })).toBeVisible();
   state.slowProject = "engineering-hub";
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect(panel.getByText("Reading notes…", { exact: true })).toBeVisible();
@@ -308,7 +308,7 @@ test("a slow list for the previous project never replaces the current project's 
   state.release?.();
   await page.waitForTimeout(300);
   await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toHaveCount(0);
-  await expect(panel.getByText("1 note in treedar.", { exact: false })).toBeVisible();
+  await expect(panel.getByText("1 note in TreeDar.", { exact: false })).toBeVisible();
 });
 
 test("an older server without notes says so instead of showing an empty list", async ({ page }) => {
@@ -418,12 +418,12 @@ test("Refresh and re-opening the open note both re-read its current version", as
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
-  await expect(view.locator(".item-overline")).toContainText("v1");
+  await expect(view.locator(".item-overline")).toContainText("version 1");
   bump(state, "runbooks/shared-notes.md", "Saved by an agent as v2");
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect(view.locator(".note-content")).toHaveText("Saved by an agent as v2");
-  await expect(view.locator(".item-overline")).toContainText("v2");
-  await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toContainText("v2");
+  await expect(view.locator(".item-overline")).toContainText("version 2");
+  await expect(panel.getByRole("button", { name: /Shared notes runbook/ })).toHaveAttribute("title", /version 2$/);
   bump(state, "runbooks/shared-notes.md", "Saved again as v3");
   const reads = state.docReads;
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
@@ -477,11 +477,11 @@ test("a failed re-read keeps the note but says it may be out of date", async ({ 
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
-  await expect(view.locator(".item-overline")).toContainText("v1");
+  await expect(view.locator(".item-overline")).toContainText("version 1");
   state.docStatus = 503;
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect(panel.getByText("The note shown may be out of date.", { exact: false })).toBeVisible();
-  await expect(view.locator(".item-overline")).toContainText("v1");
+  await expect(view.locator(".item-overline")).toContainText("version 1");
 });
 
 test("a successful re-read clears only the out-of-date warning", async ({ page }) => {
@@ -490,7 +490,7 @@ test("a successful re-read clears only the out-of-date warning", async ({ page }
   const panel = panelOf(page);
   await panel.getByRole("button", { name: /Shared notes runbook/ }).click();
   const view = panel.getByRole("article", { name: "Shared notes runbook" });
-  await expect(view.locator(".item-overline")).toContainText("v1");
+  await expect(view.locator(".item-overline")).toContainText("version 1");
   state.docStatus = 503;
   await panel.getByRole("button", { name: "Refresh" }).click();
   const warning = panel.getByText("The note shown may be out of date.", { exact: false });
@@ -601,4 +601,20 @@ test("a failed Show more page says so and can be retried", async ({ page }) => {
   await expect(titles).toHaveText(["Plan 0", "Plan 1"]);
   await panel.getByRole("button", { name: "Show more notes" }).click();
   await expect(titles).toHaveText(["Plan 0", "Plan 1", "Plan 2"]);
+});
+
+test("a project's notes skip plan records and need no project picker", async ({ page }) => {
+  const state = await fixture(page);
+  state.notes.push({ project: "treedar", path: "planning/topics/treedar-milestone-1/plan/milestone-one.json",
+    title: "Milestone one plan", content: "{\"title\":\"raw json\"}", version: 1, updated_by: "codex" });
+  await page.goto("/#/projects/treedar/notes");
+  const panel = panelOf(page);
+  await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toBeVisible();
+  await expect(panel.getByRole("button", { name: /Milestone one plan/ })).toHaveCount(0);
+  await expect(panel.getByText("1 note in TreeDar. Plans and ideas are listed under Plans & ideas.")).toBeVisible();
+  await expect(panel.getByLabel("Project")).toHaveCount(0);
+  // Agents are named and the folder is a place, not a raw path line.
+  await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).toContainText("Claude");
+  await expect(panel.getByRole("button", { name: /Benchmark handoff/ })).not.toContainText("handoffs/benchmark.md");
+  await expect(panel.locator(".note-folder summary")).toHaveText(["handoffs1"]);
 });

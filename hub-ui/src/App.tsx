@@ -761,8 +761,8 @@ export function HubApp() {
             {route.page === "planning" && (
               <>
                 <PageHeader eyebrow="PLANNING" title="Plans & ideas"
-                  subtitle="Topic proposals and a separate Engineering Hub improvement backlog. Never execution approval.">{actions}</PageHeader>
-                <PlanningPanel {...notesProps} selectedProject="engineering-hub" topic={topic} />
+                  subtitle="Plans and ideas across projects, plus the Engineering Hub improvement backlog. Never execution approval.">{actions}</PageHeader>
+                <PlanningPanel {...notesProps} selectedProject="all" topic={topic} />
               </>
             )}
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}

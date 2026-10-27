@@ -6,6 +6,8 @@ import {
   NoteConflictError, noteRequestBytes, readNote, saveNote, type NoteDocument, type NoteList,
 } from "./notesApi";
 import { Markdown } from "./markdown";
+import { isPlanningRecordPath } from "./planningApi";
+import { names } from "./ui";
 
 export interface NotesPanelProps {
   mode: HubMode;
@@ -65,9 +67,10 @@ function age(value: string): string {
 function when(value: string): string {
   return `${new Date(value).toLocaleString()} (${age(value)})`;
 }
-/** Cloudflare humans are "human:cf:<64 hex>"; show a short, stable label and keep the full id in a tooltip. */
+/** Agents show by name; Cloudflare humans are "human:cf:<64 hex>"; show a short, stable label and keep the full id in a tooltip. */
 export function actorLabel(actor: string, viewer?: string | null): string {
   if (viewer && actor === viewer) return "You";
+  if (names[actor]) return names[actor];
   const human = /^human:cf:([a-f0-9]{8})[a-f0-9]{56}$/.exec(actor);
   return human ? `Person ${human[1]}` : actor;
 }
@@ -321,13 +324,19 @@ ${latest.path}`;
     setSelected(latest.path); setDoc(latest); setDocState("loaded"); setListRevision(value => value + 1);
   }
 
+  // Plan records share this store but are read on Plans & ideas, so they never show as raw JSON here.
+  const shown = list ? list.items.filter(item => !isPlanningRecordPath(item.path)) : [];
+  const hiddenPlans = list ? list.items.length - shown.length : 0;
   const pathValid = draft ? isNotePath(draft.path) : true;
-  const folders = list ? groupByFolder(list.items).map(group => group.folder).filter(Boolean) : [];
+  const folders = list ? groupByFolder(shown).map(group => group.folder).filter(Boolean) : [];
   const bytes = draft ? noteRequestBytes({ project, path: draft.path, title: draft.title, content: draft.content,
     expected_version: draft.expected }) : 0;
   const draftValid = !!draft && pathValid && draft.title.trim() !== "" && bytes <= MAX_NOTE_REQUEST_BYTES;
   const pathLocked = !!draft && (draft.base !== null || conflict !== null || draft.expected > 0);
   const canWrite = writable && !!csrf && mode === "live";
+  // A project page is already about one project; only the cross-project page offers a picker.
+  const scoped = selectedProject !== "all";
+  const projectName = knownProjects.find(item => item.id === project)?.name ?? project;
   const listMessages: Record<string, string> = {
     loading: "Reading notes…", demo: "Demo: notes are not loaded in demo mode.",
     unsupported: "This server does not have shared notes yet. Update the Hub to enable them.",
@@ -346,14 +355,14 @@ ${latest.path}`;
     <p className="panel-description">Durable project notes shared with the agents. Notes are context only. They do not approve
       tasks, answer decisions or authorize runs.</p>
     <div className="notes-controls">
-      <div className="notes-project">
+      {!scoped && <div className="notes-project">
         <label htmlFor="notes-project">Project</label>
         {/* A real dropdown: a type-to-filter list hid the other projects until the box was cleared. */}
         <select id="notes-project" value={project} onChange={event => switchProject(event.target.value)}>
           {(knownProjects.some(item => item.id === project) ? knownProjects : [{ id: project, name: project }, ...knownProjects])
             .map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
-      </div>
+      </div>}
       <form className="notes-search" role="search" onSubmit={event => { event.preventDefault(); setSearch({ ...searchDraft }); }}>
         <label htmlFor="notes-search-kind" className="sr-only">Search by</label>
         <select id="notes-search-kind" value={searchDraft.kind}
@@ -370,24 +379,24 @@ ${latest.path}`;
     </div>
     {notice && <p role={notice.kind} className={notice.kind === "alert" ? "notice error" : "notice"}>{notice.text}</p>}
     <div className="notes-layout">
-      <div className="notes-list" aria-label={`Notes in ${project}`}>
+      <div className="notes-list" aria-label={`Notes in ${projectName}`}>
         {listState !== "loaded" && <p role={listState === "failed" ? "alert" : "status"}>{listMessages[listState]}</p>}
         {list && <>
-          <p className="panel-footnote">{list.items.length === 0
-            ? search.text ? "No notes match this search." : `No notes in ${project} yet.`
-            : `${list.items.length} note${list.items.length === 1 ? "" : "s"}${search.text ? " matching" : ""} in ${project}.`}
+          <p className="panel-footnote">{shown.length === 0
+            ? search.text ? "No notes match this search." : `No notes in ${projectName} yet.`
+            : `${shown.length} note${shown.length === 1 ? "" : "s"}${search.text ? " matching" : ""} in ${projectName}.`}
             {list.truncated && (search.text.trim() && search.kind === "query"
               ? ` Showing the first ${list.items.length}. Narrow the search to see the rest.`
-              : " More notes below the list.")}</p>
-          {groupByFolder(list.items).map(group => <details key={group.folder} className="note-folder" open>
-            <summary><span className="folder-icon" aria-hidden="true" />{group.folder || project}
+              : " More notes below the list.")}
+            {hiddenPlans > 0 && ` Plans and ideas are listed under Plans & ideas.`}</p>
+          {groupByFolder(shown).map(group => <details key={group.folder} className="note-folder" open>
+            <summary><span className="folder-icon" aria-hidden="true" />{group.folder || "Top level"}
               <span className="tab-count">{group.items.length}</span></summary>
             <ul>{group.items.map(item => <li key={item.path}>
               <button type="button" className={item.path === selected ? "note-link current" : "note-link"}
-                aria-current={item.path === selected ? "true" : undefined} onClick={() => open(item.path)}>
+                aria-current={item.path === selected ? "true" : undefined} title={`${item.path} · version ${item.version}`} onClick={() => open(item.path)}>
                 <strong>{item.title}</strong>
-                <span>{item.path}</span>
-                <span>v{item.version} · <Actor id={item.updated_by} viewer={viewerActor} /> · <time dateTime={item.updated_at} title={new Date(item.updated_at).toLocaleString()}>{age(item.updated_at)}</time></span>
+                <span><Actor id={item.updated_by} viewer={viewerActor} /> · <time dateTime={item.updated_at} title={new Date(item.updated_at).toLocaleString()}>{age(item.updated_at)}</time></span>
               </button></li>)}</ul>
           </details>)}
           {list.truncated && !(search.text.trim() && search.kind === "query") && (
@@ -398,7 +407,7 @@ ${latest.path}`;
       </div>
       <div className="notes-detail" ref={detailRef}>
         {draft ? <form className="note-editor" onSubmit={event => void submit(event)} aria-label={draft.base ? "Edit note" : "New note"}>
-          <h3>{draft.base ? `Editing ${draft.base.path}` : `New note in ${project}`}</h3>
+          <h3>{draft.base ? `Editing ${draft.base.title}` : `New note in ${projectName}`}</h3>
           {draft.base && <p className="panel-footnote">Based on version {draft.base.version}. If someone saves first, you will
             be asked before anything is replaced.</p>}
           <fieldset disabled={saving}>
@@ -474,13 +483,14 @@ ${latest.path}`;
         : selected === null ? <p className="panel-footnote">Select a note to read it{canWrite ? ", or create a new one" : ""}.</p>
         : docState === "loading" ? <p role="status">Reading note…</p>
         : doc ? <article className="note-view" aria-label={doc.title}>
-          <div className="item-overline">{doc.project}<span>v{doc.version}</span></div>
+          <div className="item-overline">{knownProjects.find(item => item.id === doc.project)?.name ?? doc.project}<span>version {doc.version}</span></div>
           <div className="note-view-head"><h3>{doc.title}</h3>
             <div className="segmented" role="group" aria-label="Note view">
               <button type="button" aria-pressed={!plain} onClick={() => setPlain(false)}>Formatted</button>
               <button type="button" aria-pressed={plain} onClick={() => setPlain(true)}>Plain text</button>
             </div></div>
-          <p className="panel-footnote">{doc.path} · Updated by <Actor id={doc.updated_by} viewer={viewerActor} />, {when(doc.updated_at)} · Created by <Actor id={doc.created_by} viewer={viewerActor} />, {when(doc.created_at)}</p>
+          <p className="panel-footnote">Updated by <Actor id={doc.updated_by} viewer={viewerActor} />, {when(doc.updated_at)} · Created
+            by <Actor id={doc.created_by} viewer={viewerActor} />, {when(doc.created_at)} · <code>{doc.path}</code></p>
           {plain ? <pre className="note-content">{doc.content}</pre> : <div className="note-content formatted"><Markdown source={doc.content} /></div>}
           {canWrite && <div className="note-actions"><button className="secondary" type="button" onClick={startEdit}>Edit</button></div>}
         </article>
