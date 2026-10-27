@@ -25,6 +25,7 @@ export function untilText(value: string | null, now: number): string {
   return minutes < 60 ? `in ${minutes} min` : minutes < 2880 ? `in ${Math.round(minutes / 60)} h` : `in ${Math.round(minutes / 1440)} days`;
 }
 const exact = (value: string) => new Date(value).toLocaleString();
+const nameFits = (value: string) => value.trim() !== "" && [...value.trim()].length <= NAME_MAX;
 /** Who did it, in words: the viewer, an installation by its name, or the recorded id as a last resort. */
 export function actorName(actor: string, items: Installation[], viewer?: string | null): string {
   if (viewer && actor === viewer) return "You";
@@ -52,8 +53,17 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const [sessions, setSessions] = useState<Record<string, { state: "loading" | "loaded" | "failed"; items: Session[] }>>(() =>
     demo ? Object.fromEntries(Object.entries(demoAgentConnections().sessions).map(([key, value]) => [key, { state: "loaded" as const, items: value }])) : {});
   const generation = useRef(0), mounted = useRef(true);
+  // One counter per installation's session list: a newer read, a refresh or a confirmed change retires older reads.
+  const sessionReads = useRef<Record<string, number>>({});
   const csrf = hub.session?.csrf_token ?? "";
   const canChange = !demo && hub.writable && !!csrf && capabilities?.owner === true;
+  // Read again at submit time: a dialog opened while allowed must not act after sign-in, CSRF or ownership is lost.
+  const allowed = useRef({ canChange, csrf });
+  allowed.current = { canChange, csrf };
+  function retireSessionReads(installationId?: string) {
+    for (const key of installationId ? [installationId] : Object.keys(sessionReads.current))
+      sessionReads.current[key] = (sessionReads.current[key] ?? 0) + 1;
+  }
 
   // Ages and pairing deadlines move with this browser's clock; nothing is re-read from the server.
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 15_000); return () => window.clearInterval(timer); }, []);
@@ -79,7 +89,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       if (current !== generation.current || !mounted.current) return;
       setItems(nextItems); setAudit(nextAudit); setReadAt(Date.now()); setNow(Date.now()); setLoad("loaded");
       // Session lists are re-read only when someone opens them again.
-      if (!keepSessions) { setSessions({}); setOpen(null); }
+      if (!keepSessions) { retireSessionReads(); setSessions({}); setOpen(null); }
     } catch (error) {
       if (current !== generation.current || !mounted.current || denied(error)) return;
       if (error instanceof HubApiError && error.status === 404 && error.code === "agent_connections_unavailable") { setLoad("unavailable"); return; }
@@ -99,22 +109,30 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
     if (open === installation.id) { setOpen(null); return; }
     setOpen(installation.id);
     if (demo || sessions[installation.id]?.state === "loaded") return;
+    const current = sessionReads.current[installation.id] = (sessionReads.current[installation.id] ?? 0) + 1;
+    const latest = () => mounted.current && sessionReads.current[installation.id] === current;
     setSessions(previous => ({ ...previous, [installation.id]: { state: "loading", items: [] } }));
     try {
       const found = await client.sessions(installation.id, AbortSignal.timeout(15_000));
-      if (mounted.current) setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded", items: found } }));
+      if (latest()) setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded", items: found } }));
     } catch (error) {
-      if (!mounted.current || denied(error)) return;
+      if (!latest() || denied(error)) return;
       setSessions(previous => ({ ...previous, [installation.id]: { state: "failed", items: [] } }));
     }
   }
   /** One change at a time; the shown record changes only to what the server returned. */
-  async function change(key: string, run: () => Promise<void>, done: string, keepSessions = false) {
+  async function change(key: string, run: (csrf: string) => Promise<void>, done: string, keepSessions = false) {
     if (busy) return;
+    const { canChange: may, csrf: token } = allowed.current;
+    if (!may || !token) {
+      setNotice({ error: true, for: key, text: "Changes aren't available right now: sign in again or Refresh, then try again. Nothing was sent." });
+      return;
+    }
     setBusy(key); setNotice(null);
     try {
-      await run();
+      await run(token);
       if (!mounted.current) return;
+      retireSessionReads();
       setDialog(null); setRenaming(null); setNotice({ error: false, text: done, for: key });
       void refresh(keepSessions);
     } catch (error) {
@@ -123,14 +141,15 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
     } finally { if (mounted.current) setBusy(null); }
   }
   const replace = (next: Installation) => setItems(previous => previous.map(item => item.id === next.id ? next : item));
-  const approve = (item: Installation) => change(`approve:${item.id}`, async () => replace(await client.approve(item.id, item.revision, csrf)),
+  const approve = (item: Installation) => change(`approve:${item.id}`, async token => replace(await client.approve(item.id, item.revision, token)),
     `Approved ${item.name}. It can now start sessions.`);
-  const revoke = (item: Installation) => change(`revoke:${item.id}`, async () => replace(await client.revokeInstallation(item.id, item.revision, csrf)),
+  const revoke = (item: Installation) => change(`revoke:${item.id}`, async token => replace(await client.revokeInstallation(item.id, item.revision, token)),
     item.state === "pending" ? `Declined the pairing request from ${item.name}.` : `Revoked ${item.name}. The Hub refuses its sessions from now on.`);
-  const rename = (item: Installation, name: string) => change(`rename:${item.id}`, async () => replace(await client.rename(item.id, item.revision, name, csrf)),
+  const rename = (item: Installation, name: string) => change(`rename:${item.id}`, async token => replace(await client.rename(item.id, item.revision, name, token)),
     "Name saved.");
-  const revokeSession = (session: Session, installation: Installation) => change(`session:${session.id}`, async () => {
-    const next = await client.revokeSession(session.id, session.revision, csrf);
+  const revokeSession = (session: Session, installation: Installation) => change(`session:${session.id}`, async token => {
+    const next = await client.revokeSession(session.id, session.revision, token);
+    retireSessionReads(installation.id);
     setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded",
       items: (previous[installation.id]?.items ?? []).map(item => item.id === next.id ? next : item) } }));
   }, "Session revoked. The installation's other sessions keep working.", true);
@@ -169,9 +188,9 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                   {renaming?.id === item.id ? <form className="installation-rename" onSubmit={event => {
                     event.preventDefault(); void rename(item, renaming.name); }}>
                     <label className="sr-only" htmlFor={`rename-${item.id}`}>Name</label>
-                    <input id={`rename-${item.id}`} value={renaming.name} maxLength={NAME_MAX} autoFocus
+                    <input id={`rename-${item.id}`} value={renaming.name} autoFocus
                       onChange={event => setRenaming({ id: item.id, name: event.target.value })} />
-                    <button className="primary small" disabled={!renaming.name.trim() || busy !== null}>{busy === `rename:${item.id}` ? "Saving…" : "Save"}</button>
+                    <button className="primary small" disabled={!canChange || !nameFits(renaming.name) || busy !== null}>{busy === `rename:${item.id}` ? "Saving…" : "Save"}</button>
                     <button type="button" className="secondary small" onClick={() => setRenaming(null)}>Cancel</button>
                   </form> : <strong>{item.name}</strong>}
                   <span className="installation-meta">Says it runs on <code>{item.host_label}</code> · added {relativeAge(item.created_at)}
@@ -226,7 +245,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
         listening, ready, or doing work. Revoking stops the Hub accepting that install or session; it can't stop a program already running on
         that computer.</p>
 
-      {dialog?.kind === "approve" && <ApproveDialog item={dialog.item} now={now} busy={busy === `approve:${dialog.item.id}`}
+      {dialog?.kind === "approve" && <ApproveDialog item={dialog.item} now={now} busy={busy === `approve:${dialog.item.id}`} canChange={canChange}
         error={notice?.error && notice.for === `approve:${dialog.item.id}` ? notice.text : ""}
         onApprove={() => void approve(dialog.item)} onClose={() => setDialog(null)} />}
       {dialog?.kind === "revoke" && <Modal title={dialog.item.state === "pending" ? `Decline ${dialog.item.name}?` : `Revoke ${dialog.item.name}?`}
@@ -238,7 +257,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
         <p className="panel-footnote">This can't be undone here: to use that computer again, pair it again. It doesn't stop a program already running there.</p>
         {notice?.error && notice.for === `revoke:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
         <div className="note-actions">
-          <button type="button" className="primary danger" disabled={busy !== null} onClick={() => void revoke(dialog.item)}>
+          <button type="button" className="primary danger" disabled={!canChange || busy !== null} onClick={() => void revoke(dialog.item)}>
             {busy === `revoke:${dialog.item.id}` ? (dialog.item.state === "pending" ? "Declining…" : "Revoking…")
               : dialog.item.state === "pending" ? "Decline request" : "Revoke installation"}</button>
           <button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button>
@@ -249,7 +268,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
           other sessions keep working.</p>
         {notice?.error && notice.for === `session:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
         <div className="note-actions">
-          <button type="button" className="primary danger" disabled={busy !== null} onClick={() => void revokeSession(dialog.item, dialog.installation)}>
+          <button type="button" className="primary danger" disabled={!canChange || busy !== null} onClick={() => void revokeSession(dialog.item, dialog.installation)}>
             {busy === `session:${dialog.item.id}` ? "Revoking…" : "Revoke session"}</button>
           <button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button>
         </div>
@@ -258,8 +277,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   );
 }
 
-function ApproveDialog({ item, now, busy, error, onApprove, onClose }: {
-  item: Installation; now: number; busy: boolean; error: string; onApprove: () => void; onClose: () => void;
+function ApproveDialog({ item, now, busy, canChange, error, onApprove, onClose }: {
+  item: Installation; now: number; busy: boolean; canChange: boolean; error: string; onApprove: () => void; onClose: () => void;
 }) {
   const [checked, setChecked] = useState(false);
   const lapsed = !!item.expires_at && Date.parse(item.expires_at) <= now;
@@ -276,7 +295,7 @@ function ApproveDialog({ item, now, busy, error, onApprove, onClose }: {
     {lapsed && <p role="alert" className="notice error">This request ran out. Start pairing again on that computer.</p>}
     {error && <p role="alert" className="notice error">{error}</p>}
     <div className="note-actions">
-      <button type="button" className="primary" disabled={!checked || busy || lapsed} onClick={onApprove}>{busy ? "Approving…" : "Approve"}</button>
+      <button type="button" className="primary" disabled={!canChange || !checked || busy || lapsed} onClick={onApprove}>{busy ? "Approving…" : "Approve"}</button>
       <button type="button" className="secondary" onClick={onClose}>Cancel</button>
     </div>
   </Modal>;

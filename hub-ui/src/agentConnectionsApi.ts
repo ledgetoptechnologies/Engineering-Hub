@@ -53,9 +53,9 @@ const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const codePattern = /^[a-z][a-z0-9_]{0,63}$/;
 function id(value: unknown): string { return typeof value === "string" && idPattern.test(value) ? value : invalid(); }
 function nullable<T>(value: unknown, parse: (value: unknown) => T): T | null { return value === null ? null : parse(value); }
-/** One line of printable text, no control characters. */
+/** One line of printable text, no control characters. Length is in Unicode characters, as the backend counts it. */
 function line(max: number, allowEmpty = false) {
-  return (value: unknown): string => typeof value === "string" && value.length <= max && (allowEmpty || value.trim() !== "")
+  return (value: unknown): string => typeof value === "string" && value.length <= 2 * max && [...value].length <= max && (allowEmpty || value.trim() !== "")
     && !/[\u0000-\u001f\u007f]/.test(value) ? value : invalid();
 }
 /** Public pairing values: a six-digit code, and the first 16 hex digits of the credential's SHA-256 (not a secret). */

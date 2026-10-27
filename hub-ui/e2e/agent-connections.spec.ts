@@ -25,14 +25,14 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
         last_used_at: null, state: "active", revision: 1 },
     ] as Session[],
     posts: [] as { path: string; method: string; body: Record<string, unknown>; csrf?: string }[],
-    reads: [] as string[], auth: true, listStatus: 200, writeStatus: 200 as number, writeCode: "", hold: false,
-    release: null as (() => void) | null,
+    reads: [] as string[], auth: true, csrf: "fixture-csrf" as string | null, listStatus: 200, writeStatus: 200 as number, writeCode: "",
+    hold: false, release: null as (() => void) | null, holdSessions: false, sessionReleases: [] as (() => void)[],
   };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const respond = (body: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     if (path.endsWith("/auth/me")) return respond({ authenticated: state.auth, actor: state.auth ? human : null, github_id: null,
-      auth_provider: "cloudflare_access", email: "operator@example.test", csrf_token: state.auth ? "fixture-csrf" : null });
+      auth_provider: "cloudflare_access", email: "operator@example.test", csrf_token: state.auth ? state.csrf : null });
     if (path.endsWith("/overview")) return respond(createDemoOverview());
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
@@ -49,7 +49,12 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
       if (rest === "/audit") return respond({ events: [{ id: 1, at: iso(-60_000), actor: "claude", action: "enrollment.requested",
         installation_id: "inst_desk", session_id: null, message_id: null }] });
       const sessions = /^\/installations\/([^/]+)\/sessions$/.exec(rest);
-      if (sessions) return respond({ sessions: state.sessions.filter(item => item.installation_id === sessions[1]) });
+      if (sessions) {
+        // The answer is what the server had when asked; a held read returns that older view later.
+        const body = { sessions: structuredClone(state.sessions.filter(item => item.installation_id === sessions[1])) };
+        if (state.holdSessions) { state.holdSessions = false; await new Promise<void>(resolve => state.sessionReleases.push(resolve)); }
+        return respond(body);
+      }
       return respond({}, 404);
     }
     const body = request.postDataJSON() as Record<string, unknown>;
@@ -209,4 +214,54 @@ test("an unclear capability answer keeps the panel hidden instead of showing an 
   await expect(page.getByRole("region", { name: "Hub stream observations" })).toBeVisible();
   await expect(panelOf(page)).toHaveCount(0);
   await expect(page.locator("#agents").getByRole("alert")).toHaveCount(0);
+});
+
+test("an older session read that answers late never replaces a newer one", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/agents");
+  const laptop = panelOf(page).locator(".installation-row", { hasText: "Claude on the laptop" });
+  state.holdSessions = true;
+  await laptop.getByRole("button", { name: "Sessions" }).click();
+  await expect.poll(() => state.sessionReleases.length).toBe(1);
+  await laptop.getByRole("button", { name: "Hide sessions" }).click();
+  // Someone revokes the session elsewhere; the second read sees it.
+  Object.assign(state.sessions[0], { state: "revoked", revision: 2 });
+  await laptop.getByRole("button", { name: "Sessions" }).click();
+  const table = laptop.getByRole("table", { name: "Sessions for Claude on the laptop" });
+  await expect(table.locator("tr", { hasText: "main chat" })).toContainText("Revoked");
+  state.sessionReleases[0]();
+  await page.waitForTimeout(300);
+  await expect(table.locator("tr", { hasText: "main chat" })).toContainText("Revoked");
+  await expect(table.locator("tr", { hasText: "main chat" }).getByRole("button", { name: "Revoke…" })).toHaveCount(0);
+});
+
+test("losing the right to change things disables an already-open form and sends nothing", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/agents");
+  // Found by its computer, since the name becomes an input while renaming.
+  const row = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
+  await row.getByRole("button", { name: "Rename" }).click();
+  await row.getByLabel("Name").fill("Renamed laptop");
+  await expect(row.getByRole("button", { name: "Save" })).toBeEnabled();
+  // The workspace re-reads the session and this sign-in no longer carries a CSRF token.
+  state.csrf = null;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(row.getByRole("button", { name: "Save" })).toBeDisabled();
+  await row.getByLabel("Name").press("Enter");
+  await page.waitForTimeout(200);
+  expect(state.posts).toEqual([]);
+});
+
+test("a long Unicode name that the backend accepts is shown and can be saved", async ({ page }) => {
+  const state = await fixture(page);
+  state.installations[0].name = "🌲".repeat(60);
+  await page.goto("/#/agents");
+  await expect(panelOf(page)).toContainText("🌲".repeat(60));
+  const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
+  await laptop.getByRole("button", { name: "Rename" }).click();
+  await laptop.getByLabel("Name").fill("🌳".repeat(90));
+  await laptop.getByRole("button", { name: "Save" }).click();
+  await expect(panelOf(page).getByRole("status")).toContainText("Name saved.");
+  expect(state.posts[0].body).toMatchObject({ name: "🌳".repeat(90), expected_revision: 2 });
+  await expect(laptop).toContainText("🌳".repeat(90));
 });

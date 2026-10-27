@@ -176,3 +176,14 @@ describe("session history bound", () => {
     expect(() => parseSessions(many(257), base.installation_id)).toThrow(HubApiError);
   });
 });
+
+describe("lengths count Unicode characters like the backend", () => {
+  it("accepts a valid 60-emoji name and rejects 101 characters", () => {
+    const item = parseInstallations(backend.pending)[0];
+    const raw = backend.pending.installations[0];
+    expect(parseInstallation({ ...raw, name: "🌲".repeat(60) }).name).toBe("🌲".repeat(60));
+    expect(parseInstallation({ ...raw, name: "🌲".repeat(100) }).name).toHaveLength(200);
+    expect(() => parseInstallation({ ...raw, name: "🌲".repeat(101) })).toThrow(HubApiError);
+    expect(item.name).toBe("Synthetic processing PC");
+  });
+});
