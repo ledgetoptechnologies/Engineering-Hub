@@ -8,6 +8,20 @@ const response = (body: unknown, status = 200) =>
   });
 
 describe("live human API boundary", () => {
+  it.each([
+    [403, "gateway_route_forbidden"],
+    [400, "gateway_invalid_path"],
+    [404, "not_found"],
+  ])("keeps missing agent-route responses distinct from authentication loss (%s)", async (status, code) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code } }, status));
+    await expect(new HubClient({ mode: "live", fetchImpl }).getAgents()).rejects
+      .toMatchObject({ status, code: "agent_observations_unavailable" });
+  });
+  it("does not trust an arbitrary server code to suppress agent authorization loss", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code: "agent_observations_unavailable" } }, 403));
+    await expect(new HubClient({ mode: "live", fetchImpl }).getAgents()).rejects
+      .toMatchObject({ status: 403, code: "forbidden" });
+  });
   it("reads only agent connection observations with a bounded same-origin GET", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ items: [{ id: "codex", transport: "online", chat_readiness: "ready", reason: "optimistic" }] }));
     expect(await new HubClient({ mode: "live", fetchImpl }).getAgents()).toEqual([{ id: "codex" }]);

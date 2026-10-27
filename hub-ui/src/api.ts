@@ -138,6 +138,10 @@ export class HubClient {
       throw new HubApiError(0, "network_unavailable");
     }
     if (!response.ok) {
+      // This optional read may be absent behind an older strict gateway. Keep
+      // its route refusal distinct from an authorization/session refusal.
+      if (path === "/agents" && await isMissingRoute(response))
+        throw new HubApiError(response.status, "agent_observations_unavailable");
       let code = fallbackCode(response.status);
       if (response.headers.get("content-type")?.includes("application/json")) {
         try {

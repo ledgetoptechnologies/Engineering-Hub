@@ -11,7 +11,8 @@ const connection = (now: number, state = "connected", ttl = 30_000) => ({
 async function fixture(page: Page, events = false) {
   await page.clock.install({ time: new Date(NOW) });
   const state = { reads: [] as string[], status: 200, hold: false, releases: [] as (() => void)[],
-    csrf: "session-one", signedIn: true, connectionState: "connected", ttl: 30_000, overviewConnected: true };
+    csrf: "session-one", signedIn: true, connectionState: "connected", ttl: 30_000, overviewConnected: true,
+    errorCode: null as string | null };
   if (events) await page.addInitScript(() => {
     class Stream {
       onopen: (() => void) | null = null; onmessage: ((event: { data: string }) => void) | null = null;
@@ -39,8 +40,9 @@ async function fixture(page: Page, events = false) {
       expect(route.request().headers()["authorization"]).toBeUndefined();
       expect(route.request().headers()["x-hub-csrf"]).toBeUndefined();
       const status = state.status;
-      const body = { items: ["codex", "claude", "hermes"].map(id => ({ id, connection: connection(now, state.connectionState, state.ttl),
-        transport: "online", chat_readiness: "ready", reason: "must not promote" })) };
+      const body = state.errorCode ? { detail: { code: state.errorCode } }
+        : { items: ["codex", "claude", "hermes"].map(id => ({ id, connection: connection(now, state.connectionState, state.ttl),
+          transport: "online", chat_readiness: "ready", reason: "must not promote" })) };
       if (state.hold) await new Promise<void>(resolve => state.releases.push(resolve));
       await respond(body, status).catch(() => {}); return;
     }
@@ -125,6 +127,41 @@ test("a short returned TTL expires locally; ordinary failure cannot retain a pos
   s.status = 404; await page.clock.runFor(13_900); await expect.poll(() => count(s)).toBe(2);
   await expect(rows(page).getByText("Hub connection unknown", { exact: true })).toHaveCount(3);
   await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+});
+
+test("an older gateway missing the agent route cannot sign the workspace out", async ({ page }) => {
+  const s = await fixture(page); await page.goto("/#/agents"); await expect(rows(page)).toHaveCount(3);
+  s.status = 403; s.errorCode = "gateway_route_forbidden";
+  await page.clock.runFor(15_000); await expect.poll(() => count(s)).toBe(1);
+  await expect(rows(page).getByText("Hub connection unknown", { exact: true })).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "New task", exact: true })).toBeEnabled();
+  await expect(page.getByRole("link", { name: /^Work / })).toBeVisible();
+  expect(s.reads.some(path => path.endsWith("/auth/bootstrap"))).toBe(false);
+});
+
+test("expiry survives a deadline crossing between rendering and passive-effect scheduling", async ({ page }) => {
+  const s = await fixture(page); await page.goto("/#/agents");
+  await expect(rows(page).getByText("Hub stream observed", { exact: true })).toHaveCount(3);
+  s.ttl = 1000;
+  await page.evaluate(() => {
+    const observed = () => [...document.querySelectorAll(".hub-connection-row small")]
+      .find(node => node.textContent?.startsWith("Snapshot observed:"))?.textContent;
+    const before = observed(), clock = Date.now;
+    const observer = new MutationObserver(() => {
+      if (observed() === before) return;
+      // A commit is visible before React's passive effects. Model elapsed wall
+      // time at that boundary, without changing app code or its timer callbacks.
+      Date.now = () => clock() + 1100;
+      (window as any).__expiryBoundaryReached = true;
+      observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  });
+  await page.clock.runFor(15_000); await expect.poll(() => count(s)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as any).__expiryBoundaryReached)).toBe(true);
+  await page.clock.runFor(10);
+  await expect(rows(page).getByText("Hub connection snapshot expired", { exact: true })).toHaveCount(3);
+  expect(count(s)).toBe(1);
 });
 test("late success cannot overwrite a newer overview and sign-out clears a held read", async ({ page }) => {
   const s = await fixture(page); await page.goto("/#/agents"); await expect(rows(page)).toHaveCount(3);
