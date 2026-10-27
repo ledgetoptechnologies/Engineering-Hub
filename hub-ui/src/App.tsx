@@ -78,7 +78,7 @@ export function HubApp() {
   const [noticeError, setNoticeError] = useState(false);
   const [connection, setConnection] = useState(demo ? "demo" : "checking");
   const [stale, setStale] = useState(false);
-  const [expiryTick, expire] = useState(0);
+  const [, expire] = useState(0);
   const [newTask, setNewTask] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
   const [taskProject, setTaskProject] = useState<ProjectId>("engineering-hub");
@@ -215,7 +215,8 @@ export function HubApp() {
       read: signal => client.getAgents(signal),
       accept: items => setAgents(previous => applyAgentObservations(previous, items)),
       failed: error => {
-        if (error instanceof HubApiError && [401, 403].includes(error.status)) clearPrivateWorkspace();
+        if (error instanceof HubApiError && [401, 403].includes(error.status)
+            && error.code !== "agent_observations_unavailable") clearPrivateWorkspace();
         else setAgents(previous => applyAgentObservations(previous, []));
       },
     });
@@ -378,27 +379,31 @@ export function HubApp() {
     });
   }, [client, demo, session?.authenticated, topic, registryEpoch, registryRetry, clearPrivateWorkspace]);
 
-  useEffect(() => {
-    const topicDeadlines = (peers?.items ?? [])
+  // Pick the next deadline during rendering, when the labels also read this
+  // clock. A passive effect can run after it passes; it must still repaint.
+  const renderedAt = Date.now();
+  const topicDeadlines = (peers?.items ?? [])
       .filter(
         (peer) =>
           ["reachable", "busy_queued"].includes(peer.status) &&
           peer.valid_until,
       )
       .map((peer) => Date.parse(peer.valid_until!))
-      .filter((time) => time > Date.now());
-    const deadlines = [...topicDeadlines, ...agents
+      .filter((time) => time > renderedAt);
+  const deadlines = [...topicDeadlines, ...agents
       .map((agent) => Math.min(Date.parse(agent.connection?.valid_until ?? ""),
         Date.parse(agent.connection?.observed_at ?? "") + 30_000))
-      .filter((time) => Number.isFinite(time) && time > Date.now())];
-    if (!deadlines.length) return;
+      .filter((time) => Number.isFinite(time) && time > renderedAt)];
+  const nextExpiry = deadlines.length ? Math.min(...deadlines) : null;
+  useEffect(() => {
+    if (nextExpiry === null) return;
     // Local expiry only: no HTTP, inbox, model, or status polling.
     const timer = setTimeout(
       () => expire((value) => value + 1),
-      Math.min(...deadlines) - Date.now() + 10,
+      Math.max(1, nextExpiry - Date.now() + 10),
     );
     return () => clearTimeout(timer);
-  }, [peers, agents, expiryTick]);
+  }, [nextExpiry]);
 
   async function mutate(operation: () => Promise<unknown>, success: string) {
     setWorking(true);
