@@ -41,6 +41,7 @@ HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_
  'hub_label_set_create','hub_label_set_put_image','hub_label_set_results',
  'hub_label_set_list','hub_entity_put_image','hub_entity_images','hub_entity_withdraw',
  'hub_project_list','hub_project_get','hub_component_list','hub_component_get',
+ 'hub_component_create','hub_component_update','hub_component_retire',
  'hub_interactive_review_create','hub_interactive_review_get','hub_interactive_review_list'}
 
 def snapshot():
@@ -193,7 +194,7 @@ async def main():
     # host-side graceful stop. Save a new baseline for recreation checks.
     saved['snapshot'] = snapshot()
     manifest.write_text(json.dumps(saved,sort_keys=True))
-    print(json.dumps({'stage':stage,'preservation':'passed','tools':24 if stage=='seed' else 46,
+    print(json.dumps({'stage':stage,'preservation':'passed','tools':len(BUS if stage=='seed' else BUS | HUB),
                       'agent_ports':[8770] if stage=='seed' else [8770,8765],
                       'shared_session_across_agent_ports':'not_applicable' if stage=='seed' else 'passed',
                       'native_notification_route':'not_applicable' if stage=='seed' else 'alias_to_primary',

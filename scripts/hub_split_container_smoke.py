@@ -71,6 +71,7 @@ expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_ca
                   'hub_label_set_create', 'hub_label_set_put_image', 'hub_label_set_results',
                   'hub_label_set_list', 'hub_entity_put_image', 'hub_entity_images', 'hub_entity_withdraw',
                   'hub_project_list', 'hub_project_get', 'hub_component_list', 'hub_component_get',
+                  'hub_component_create', 'hub_component_update', 'hub_component_retire',
                   'hub_interactive_review_create', 'hub_interactive_review_get', 'hub_interactive_review_list'}
 def rpc(method, params, token):
     headers = {'Accept': 'application/json, text/event-stream', 'Content-Type': 'application/json',
@@ -261,7 +262,7 @@ def smoke(image, commit):
             _verify_profile(name, volume)
             report = json.loads(run("docker", "exec", name, "python", "-c", PROBE, commit, timeout=110))
             assert report["split_image_smoke"] == "passed" and report["build_commit"] == commit
-            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 27
+            assert report["authenticated_agents"] == 3 and report["mcp_tools"] == 30
             assert report["agent_bind"] == "0.0.0.0:8770" and report["browser_bind"] == "127.0.0.1:8771"
             if iteration == 0:
                 run("docker", "exec", name, "python", "-c", SEED_RECORDS)
