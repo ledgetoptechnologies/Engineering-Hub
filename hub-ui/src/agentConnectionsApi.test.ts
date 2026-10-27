@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { HubApiError } from "./api";
 import {
-  demoAgentConnections, httpAgentConnections, parseAudit, parseCapabilities, parseInstallation, parseInstallations, parseSessions, writeFailureText,
+  demoAgentConnections, httpAgentConnections, MAX_SESSION_HISTORY, parseAudit, parseCapabilities, parseInstallation, parseInstallations, parseSessions, writeFailureText,
 } from "./agentConnectionsApi";
 import { actorName, untilText } from "./AgentConnectionsPanel";
 import backend from "./fixtures/agent-connections-wire-v1.json";
@@ -162,5 +162,17 @@ describe("actorName", () => {
     expect(actorName(backend.approved.id, items)).toBe("Synthetic processing PC");
     expect(actorName("human:7", items, "human:42")).toBe("A person");
     expect(actorName("claude", items)).toBe("Claude");
+  });
+});
+
+describe("session history bound", () => {
+  it("accepts the full retained history the backend keeps, and rejects more", () => {
+    const base = backend.sessions.sessions[0];
+    const many = (count: number) => ({ sessions: Array.from({ length: count }, (_, index) =>
+      ({ ...base, id: `sess-${index}`, state: index < 16 ? "active" : "expired" })) });
+    expect(MAX_SESSION_HISTORY).toBe(256);
+    expect(parseSessions(many(65), base.installation_id)).toHaveLength(65);
+    expect(parseSessions(many(256), base.installation_id)).toHaveLength(256);
+    expect(() => parseSessions(many(257), base.installation_id)).toThrow(HubApiError);
   });
 });

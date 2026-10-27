@@ -15,6 +15,8 @@ export type SessionState = typeof SESSION_STATES[number];
 /** Approved installations start with one day; the contract bounds this server side. */
 export const APPROVAL_LIFETIME_SECONDS = 86400;
 export const NAME_MAX = 100;
+/** Retained session history per installation (active sessions are capped separately at 16). */
+export const MAX_SESSION_HISTORY = 256;
 
 export interface Capabilities { enabled: true; environment: "staging"; owner: boolean }
 export interface Installation {
@@ -115,7 +117,7 @@ function list<T>(value: unknown, key: string, parse: (value: unknown) => T, max:
 }
 export const parseInstallations = (value: unknown) => list(value, "installations", parseInstallation, 500, item => item.id);
 export const parseSessions = (value: unknown, installationId: string) => {
-  const sessions = list(value, "sessions", parseSession, 64, item => item.id);
+  const sessions = list(value, "sessions", parseSession, MAX_SESSION_HISTORY, item => item.id);
   return sessions.some(item => item.installation_id !== installationId) ? invalid() : sessions;
 };
 export const parseAudit = (value: unknown) => list(value, "events", parseAuditEvent, 100, item => String(item.id));
