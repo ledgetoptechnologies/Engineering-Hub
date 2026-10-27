@@ -8,6 +8,29 @@ const response = (body: unknown, status = 200) =>
   });
 
 describe("live human API boundary", () => {
+  it("reads only agent connection observations with a bounded same-origin GET", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ items: [{ id: "codex", transport: "online", chat_readiness: "ready", reason: "optimistic" }] }));
+    expect(await new HubClient({ mode: "live", fetchImpl }).getAgents()).toEqual([{ id: "codex" }]);
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("/api/hub/v1/agents");
+    expect(init).toMatchObject({ method: "GET", credentials: "same-origin", redirect: "error" });
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect(init?.headers).toEqual({ Accept: "application/json" });
+  });
+  it("rejects malformed agent envelopes and never bootstraps on agent auth loss", async () => {
+    for (const body of [null, {}, { items: [{ id: "other" }] }, { items: [{ id: "codex" }, { id: "codex" }] },
+      { items: [{ id: "codex", connection: { state: "connected", source: "other" } }] }]) {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response(body));
+      await expect(new HubClient({ mode: "live", fetchImpl }).getAgents()).rejects.toMatchObject({ code: "invalid_response" });
+    }
+    for (const status of [401, 403, 404]) {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({}, status));
+      await expect(new HubClient({ mode: "live", fetchImpl }).getAgents()).rejects.toMatchObject({ status });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
+    const fetchImpl = vi.fn<typeof fetch>();
+    await new HubClient({ mode: "demo", fetchImpl }).getAgents(); expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it("automatically bootstraps only a missing Cloudflare session using same-origin POST", async () => {
     const authenticated = { authenticated: true, actor: "human:cf:fixture", csrf_token: "csrf", github_id: null, auth_provider: "cloudflare_access" };
     const fetchImpl = vi.fn<typeof fetch>()

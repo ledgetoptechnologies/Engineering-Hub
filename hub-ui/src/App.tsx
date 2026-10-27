@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { HubApiError, HubClient } from "./api";
+import { applyAgentObservations } from "./agentObservations";
+import { watchAgentObservations } from "./nativeAgentRefresh";
 import { TopicRefreshBudgetExhausted, watchTopicRegistry } from "./topicEvents";
 import { NotesPanel } from "./NotesPanel";
 import { PlanningPanel } from "./PlanningPanel";
@@ -17,6 +19,7 @@ import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
 import type {
   Decision,
+  AgentSummary,
   EventsStatus,
   Overview,
   ProjectId,
@@ -60,6 +63,7 @@ export function HubApp() {
   );
   const [session, setSession] = useState<Session | null>(null);
   const [data, setData] = useState<Overview | null>(null);
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [peers, setPeers] = useState<TopicSnapshot | null>(null);
   const [topicError, setTopicError] = useState("");
   const [topicStale, setTopicStale] = useState(false);
@@ -89,15 +93,18 @@ export function HubApp() {
     answer: string;
   } | null>(null);
   const requests = useRef(0);
+  const agentReader = useRef<ReturnType<typeof watchAgentObservations> | null>(null);
   const topicReads = useRef(0);
   const taskRequest = useRef<{ payload: string; key: string } | null>(null);
 
   const clearPrivateWorkspace = useCallback(() => {
     // Also fence late reads from a request whose identity is no longer valid.
     requests.current++;
+    agentReader.current?.pause();
     topicReads.current++;
     setSession(null);
     setData(null);
+    setAgents([]);
     setPeers(null);
     setRegistryEpoch(null);
     setEvents(null);
@@ -120,6 +127,8 @@ export function HubApp() {
   const refresh = useCallback(
     async (canVerify: () => boolean = () => true) => {
       const request = ++requests.current;
+      // Fence the old session synchronously, including same-actor session renewal.
+      agentReader.current?.pause();
       setLoading(true);
       try {
         const nextSession = await client.getSession();
@@ -177,6 +186,8 @@ export function HubApp() {
         ]);
         if (request !== requests.current) return false;
         setData(overview);
+        setAgents(overview.agents);
+        agentReader.current?.seed();
         setEvents(status);
         setStale(!canVerify());
         if (!status.available && canVerify())
@@ -197,6 +208,21 @@ export function HubApp() {
     },
     [client, topic, demo, clearPrivateWorkspace],
   );
+  useEffect(() => {
+    if (demo) return;
+    const reader = watchAgentObservations({
+      document, generation: () => requests.current,
+      read: signal => client.getAgents(signal),
+      accept: items => setAgents(previous => applyAgentObservations(previous, items)),
+      failed: error => {
+        if (error instanceof HubApiError && [401, 403].includes(error.status)) clearPrivateWorkspace();
+        else setAgents(previous => applyAgentObservations(previous, []));
+      },
+    });
+    agentReader.current = reader;
+    return () => { reader.stop(); agentReader.current = null; };
+  }, [client, demo, clearPrivateWorkspace]);
+
   useEffect(() => {
     void refresh();
     return () => {
@@ -361,7 +387,7 @@ export function HubApp() {
       )
       .map((peer) => Date.parse(peer.valid_until!))
       .filter((time) => time > Date.now());
-    const deadlines = [...topicDeadlines, ...(data?.agents ?? [])
+    const deadlines = [...topicDeadlines, ...agents
       .map((agent) => Math.min(Date.parse(agent.connection?.valid_until ?? ""),
         Date.parse(agent.connection?.observed_at ?? "") + 30_000))
       .filter((time) => Number.isFinite(time) && time > Date.now())];
@@ -372,7 +398,7 @@ export function HubApp() {
       Math.min(...deadlines) - Date.now() + 10,
     );
     return () => clearTimeout(timer);
-  }, [peers, data, expiryTick]);
+  }, [peers, agents, expiryTick]);
 
   async function mutate(operation: () => Promise<unknown>, success: string) {
     setWorking(true);
@@ -533,7 +559,7 @@ export function HubApp() {
   const [menuOpen, setMenuOpen] = useState(false);
   useEffect(() => setMenuOpen(false), [route]);
   const hub: Hub | null = data ? {
-    demo, session, data, stale, loading, writable, connection, projectName, decisionChoices,
+    demo, session, data, agents, stale, loading, writable, connection, projectName, decisionChoices,
     chooseAnswer: (decision: Decision, answer: string) =>
       setDecisionChoices((previous) => ({ ...previous, [decision.id]: { revision: decision.revision, answer } })),
     recordDecision: (event: FormEvent<HTMLFormElement>, decision: Decision) => void recordDecision(event, decision),
@@ -662,7 +688,7 @@ export function HubApp() {
             </span>
             <Badge tone={demo ? "amber" : "forest"}>{demo ? "DEMO" : "PRIVATE"}</Badge>
             {session?.authenticated && !demo && (
-              <button className="text-button" onClick={() => void mutate(() => client.logout(session.csrf_token!), "Signed out.")}>
+              <button className="text-button" onClick={() => { agentReader.current?.pause(); void mutate(() => client.logout(session.csrf_token!), "Signed out."); }}>
                 Sign out
               </button>
             )}

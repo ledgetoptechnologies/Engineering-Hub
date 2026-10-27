@@ -17,7 +17,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   const projects = hub.data.projects.filter((item) => !item.archived);
   const tasks = hub.data.tasks;
   const active = tasks.filter((task) => task.status !== "verified");
-  const connected = hub.data.agents.filter((agent) => connectionView(agent, !hub.demo && hub.stale).connected);
+  const connected = hub.agents.filter((agent) => connectionView(agent, !hub.demo && hub.stale).connected);
   const targets = projects.filter((item) => item.executor_enabled).length;
   return (
     <>
@@ -36,7 +36,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         </a>
         <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
-          <strong>{connected.length}<span className="kpi-of">/{hub.data.agents.length}</span></strong>
+          <strong>{connected.length}<span className="kpi-of">/{hub.agents.length}</span></strong>
           <span className="kpi-note">{hub.stale && !hub.demo ? "Not verified right now" : "Transport only · not listening proof"}</span>
         </a>
         <a className="kpi" href={link("/staging")}>
@@ -122,7 +122,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
             <span className="panel-action"><a className="text-link" href={link("/agents")}>Details →</a></span>
           </div>
           <ul className="agent-mini">
-            {hub.data.agents.map((agent) => {
+            {hub.agents.map((agent) => {
               const view = connectionView(agent, !hub.demo && hub.stale);
               return (
                 <li key={agent.id}>
