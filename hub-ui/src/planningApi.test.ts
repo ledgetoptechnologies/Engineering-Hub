@@ -135,11 +135,11 @@ describe("planning topics and record paths", () => {
     expect(planningItemId("x".repeat(80), "a1b2c3")).toMatch(/^x{48}-a1b2c3$/);
   });
   it("reads topic paths a bounded number of pages and says when it stopped early", async () => {
-    const calls: (string | undefined)[] = [];
+    const calls: (string | undefined)[] = [], prefixes: (string | undefined)[] = [];
     const page = (n: number) => ({ project: "p", path: `planning/topics/t${n}/idea/i.json`, title: "t", version: 1, sha256: "c".repeat(64),
       created_by: "codex", updated_by: "codex", created_at: "2026-10-27T00:00:00Z", updated_at: "2026-10-27T00:00:00Z" });
-    const list = vi.fn(async (request: { after?: string }) => {
-      calls.push(request.after);
+    const list = vi.fn(async (request: { after?: string; path_prefix?: string }) => {
+      calls.push(request.after); prefixes.push(request.path_prefix);
       return { items: [page(calls.length)], truncated: true };
     });
     const result = await discoverPlanningTopics("p", new AbortController().signal, list as never);
@@ -147,5 +147,7 @@ describe("planning topics and record paths", () => {
     expect(calls[1]).toBe("planning/topics/t1/idea/i.json");
     expect(result.complete).toBe(false);
     expect(result.topics).toHaveLength(TOPIC_DISCOVERY_PAGES);
+    // The server's path validation rejects a trailing slash (empty final part) with 422.
+    expect(new Set(prefixes)).toEqual(new Set(["planning/topics"]));
   });
 });

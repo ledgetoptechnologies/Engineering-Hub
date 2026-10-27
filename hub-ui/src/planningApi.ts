@@ -166,7 +166,8 @@ export async function discoverPlanningTopics(project: string, signal: AbortSigna
   const seen: { path: string; updated_at: string }[] = [];
   let after: string | undefined;
   for (let page = 0; page < TOPIC_DISCOVERY_PAGES; page++) {
-    const next = await list({ project, path_prefix: "planning/topics/", ...(after ? { after } : {}) }, signal);
+    // No trailing slash: the server rejects empty path parts and adds the "/" itself.
+    const next = await list({ project, path_prefix: "planning/topics", ...(after ? { after } : {}) }, signal);
     seen.push(...next.items);
     if (!next.truncated || !next.items.length) return { topics: topicsFromPaths(seen), complete: true };
     after = next.items[next.items.length - 1].path;

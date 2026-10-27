@@ -29,8 +29,12 @@ async function fixture(page: Page) {
     // Topic discovery reads note paths only: planning records live in the project's note store.
     if (path === "/api/hub/v1/notes" && request.method() === "GET") {
       if (state.listStatus !== 200) return respond({ detail: { code: "notes_unavailable" } }, state.listStatus);
-      const project = url.searchParams.get("project"), prefix = url.searchParams.get("path_prefix") ?? "";
-      return respond({ items: state.items.filter(item => item.project === project && item.path.startsWith(prefix))
+      const project = url.searchParams.get("project"), prefix = url.searchParams.get("path_prefix");
+      // Like KnowledgeRepository.validate_path and list(): no empty parts, and the server matches the subtree itself.
+      if (prefix !== null && (prefix === "" || prefix.split("/").some(part => ["", ".", ".."].includes(part))))
+        return respond({ detail: { code: "invalid_note" } }, 422);
+      return respond({ items: state.items.filter(item => item.project === project
+        && (prefix === null || item.path === prefix || item.path.startsWith(prefix + "/")))
         .map(({ project, path, title, version, sha256, created_by, updated_by, created_at, updated_at }) =>
           ({ project, path, title, version, sha256, created_by, updated_by, created_at, updated_at })), truncated: false });
     }
