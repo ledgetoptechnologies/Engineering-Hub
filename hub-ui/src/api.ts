@@ -1,5 +1,6 @@
 import { createDemoOverview, createDemoTopic, DEMO_SESSION } from "./mocks";
 import { canWithdrawDecision, canWithdrawTask, splitWithdrawn } from "./withdrawn";
+import { parseAgentObservations, type AgentObservation } from "./agentObservations";
 import type {
   Agent,
   Decision,
@@ -187,6 +188,14 @@ export class HubClient {
   async getImageVersions(): Promise<ImageVersionsSummary | null> {
     if (this.mode === "demo") return null;
     return this.request("/image-versions", undefined, undefined, AbortSignal.timeout(10_000));
+  }
+  async getAgents(signal?: AbortSignal): Promise<AgentObservation[]> {
+    if (this.mode === "demo") return structuredClone(this.demo.agents).map(({ id, connection }) => ({ id, connection }));
+    const bounded = AbortSignal.timeout(10_000);
+    const body = await this.request<unknown>("/agents", undefined, undefined,
+      signal ? AbortSignal.any([signal, bounded]) : bounded);
+    try { return parseAgentObservations(body); }
+    catch { throw new HubApiError(200, "invalid_response"); }
   }
   async getTopic(topic: string): Promise<TopicSnapshot> {
     const path = topicPath(topic);

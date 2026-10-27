@@ -39,7 +39,7 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   await expect(page.getByText("may still accept writes after the agent stops listening.", { exact: false })).toBeVisible();
 });
 
-test("Hub connection observations expire locally without polling", async ({ page }) => {
+test("retained Hub observations expire without overview or topic polling", async ({ page }) => {
   await page.clock.install({ time: NOW });
   const mock = await mockLive(page, { tracking: "not_configured" });
   mock.overview.agents[0].connection = hubConnection();
@@ -284,6 +284,7 @@ async function mockLive(
       overviewReads++;
       return respond(overview);
     }
+    if (path.endsWith("/agents")) return respond({ items: overview.agents });
     if (path.endsWith("/events/status"))
       return respond({
         available: events,

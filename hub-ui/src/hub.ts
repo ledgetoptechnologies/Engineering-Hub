@@ -1,6 +1,6 @@
 /** The view of Hub state that pages read. All mutation still goes through HubApp. */
 import type { FormEvent } from "react";
-import type { Decision, Overview, PublicReachability, Session, Task, TopicSnapshot } from "./types";
+import type { AgentSummary, Decision, Overview, PublicReachability, Session, Task, TopicSnapshot } from "./types";
 
 export interface DecisionChoice { revision: number; answer: string }
 
@@ -8,6 +8,8 @@ export interface Hub {
   demo: boolean;
   session: Session | null;
   data: Overview;
+  /** Independently refreshed transport observations; never topic readiness. */
+  agents: AgentSummary[];
   stale: boolean;
   loading: boolean;
   writable: boolean;

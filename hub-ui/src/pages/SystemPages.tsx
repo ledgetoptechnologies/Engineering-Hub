@@ -61,7 +61,7 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
   const topics: TopicEntry[] = serverTopics ?? remembered.map((topic) => ({ topic, last_activity_at: null, peer_count: null, source: "device" }));
   if (!topics.some((entry) => entry.topic === hub.topic))
     topics.unshift({ topic: hub.topic, last_activity_at: null, peer_count: null, source: "device" });
-  const connected = hub.data.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
+  const connected = hub.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
   return (
     <>
       <PageHeader eyebrow="AGENTS" title="Agents"
@@ -71,10 +71,10 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
       <div id="agents" className="agents-page">
       <h2 className="agent-section-title">Hub stream observations</h2>
       <section className="agent-cards" aria-label="Hub stream observations">
-        {hub.data.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
+        {hub.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
       </section>
       <p className="panel-footnote">
-        {connected} of {hub.data.agents.length} with a Hub stream observed. Stream observed means the Hub recently wrote to a
+        {connected} of {hub.agents.length} with a Hub stream observed. Stream observed means the Hub recently wrote to a
         retained stream. An upstream connection may still accept writes after the agent stops listening. This does not prove
         client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
         offline. Topic readiness is checked separately.
