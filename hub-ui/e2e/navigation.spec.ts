@@ -92,7 +92,9 @@ test("a project page shows only that project's questions, work and notes", async
   await expect(page.locator("details.task-row")).toHaveCount(1);
   await expect(page.getByText("Count tree crowns in audit plot A1", { exact: true })).toBeVisible();
   await tabs.getByRole("link", { name: "Notes & plans" }).click();
-  await expect(page.getByLabel("Project", { exact: true })).toHaveValue("treedar");
+  // The tab is about this project only: its notes, with no picker to wander to another project.
+  await expect(page.getByLabel("Notes in TreeDar", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Project", { exact: true })).toHaveCount(0);
   // Browser Back returns to the previous tab.
   await page.goBack();
   await expect(page).toHaveURL(/\/projects\/treedar\/work$/);
