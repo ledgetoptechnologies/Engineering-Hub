@@ -18,7 +18,7 @@ import httpx
 
 from .lifecycle import finish_owned
 from .private_browser_socket import private_browser_socket
-from .private_gateway import PrivateBrowserGateway, PublicBrowserGateway
+from .private_gateway import PrivateBrowserGateway, PublicBrowserGateway, _preview_host
 from .server import _bind, _listener, _signal_stop
 from .stream_shutdown import StreamDisconnect as _StreamDisconnect
 
@@ -195,7 +195,9 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
             receiver = PrivateBrowserGateway(
                 pair.browser, agent_auth=pair.settings.agent_auth,
                 cloudflare_config=pair.settings.auth_config.cloudflare_config,
-                access_verifier=pair.access_verifier)
+                access_verifier=pair.access_verifier,
+                preview_origin=getattr(pair.core.state, 'preview_origin', None),
+                preview_app=pair.browser if getattr(pair.core.state, 'preview_app', None) is not None else None)
             async with pair.lifespan():
                 try:
                     await _serve_listeners((pair.agents, receiver), (agent, browser),
@@ -214,7 +216,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
 
 async def serve_public_browser(client_factory, *, browser_port=8771,
                                stop_event=None, on_ready=None,
-                               install_signals=True):
+                               install_signals=True, preview_origin=None):
     """Bind only literal loopback, then accept one dedicated private UDS client.
 
     ``on_ready(browser_sockname)`` runs only after listener startup. The factory
@@ -224,6 +226,7 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
     returning remains responsible for its unaccepted resources. The accepted
     client closes only after requests drain, even on repeated cancellation.
     """
+    _preview_host(preview_origin)  # Reject invalid opt-in before binding or accepting a client.
     _options(client_factory, (browser_port,), stop_event, on_ready, install_signals)
     stop = stop_event if stop_event is not None else asyncio.Event()
 
@@ -238,7 +241,7 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
             if type(client) is not httpx.AsyncClient:
                 raise SplitServerError()
             try:
-                gateway = PublicBrowserGateway(client)
+                gateway = PublicBrowserGateway(client, preview_origin=preview_origin)
                 await _serve_listeners((gateway,), (browser,), stop, on_ready,
                                        (browser.getsockname(),))
             finally:
