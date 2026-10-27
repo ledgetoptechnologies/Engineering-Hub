@@ -148,3 +148,21 @@ def test_private_compatibility_export_is_the_same_cleanup_function():
     from engineering_hub.lifecycle import finish_owned
     from engineering_hub.owned_tasks import finish_owned as compatibility_export
     assert finish_owned is compatibility_export
+
+
+@pytest.mark.parametrize('origin', ['http://preview.example', 'https://preview.example/path',
+                                  'https://user:secret@preview.example', 'https://PREVIEW.example'])
+def test_preview_option_rejects_invalid_origin_before_runtime(monkeypatch, origin):
+    monkeypatch.setitem(sys.modules, 'engineering_hub.split_server', SimpleNamespace())
+    with pytest.raises(ValueError):
+        asyncio.run(module.run('/socket/browser.sock', preview_origin=origin))
+
+
+def test_preview_option_is_explicit_and_delegated_without_environment(monkeypatch):
+    calls = []
+    async def serve(factory, *, browser_port, preview_origin):
+        calls.append((browser_port, preview_origin))
+    monkeypatch.setitem(sys.modules, 'engineering_hub.split_server',
+                        SimpleNamespace(serve_public_browser=serve))
+    asyncio.run(module.run('/socket/browser.sock', preview_origin='https://preview.example'))
+    assert calls == [(8771, 'https://preview.example')]

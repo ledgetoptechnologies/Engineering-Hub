@@ -13,6 +13,7 @@ import asyncio
 import math
 import os
 import re
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -53,6 +54,35 @@ _RESPONSE_HEADERS = frozenset({
     b'vary', b'www-authenticate', b'content-range', b'accept-ranges',
     b'content-disposition',
 })
+_PREVIEW_RESPONSE_HEADERS = frozenset({
+    b'content-type', b'content-length', b'cache-control', b'content-security-policy',
+    b'x-content-type-options', b'referrer-policy', b'access-control-allow-origin',
+})
+
+
+def _preview_host(origin):
+    if origin is None:
+        return None
+    from .preview_protocol import _origin
+    canonical = _origin(origin)
+    if canonical != origin:
+        raise ValueError('Canonical separate HTTPS preview origin required')
+    return urlsplit(canonical).netloc.encode('ascii')
+
+
+def _is_preview(scope, host):
+    return host is not None and [v for k, v in scope.get('headers', []) if k == b'host'] == [host]
+
+
+def _preview_path(scope):
+    from .preview_protocol import _PATH, _MIME
+    match = re.fullmatch(r'/p/[A-Za-z0-9_-]{43}/(.+)', scope.get('path', ''))
+    if match is None or scope.get('method') not in {'GET', 'HEAD'} or scope.get('query_string', b''):
+        return False
+    relative = match.group(1)
+    return (_PATH.fullmatch(relative) is not None
+            and all(p not in {'', '.', '..'} for p in relative.split('/'))
+            and relative.rsplit('.', 1)[-1].lower() in _MIME)
 
 
 def _diagnostic_path(path, *, files_only=False):
@@ -122,7 +152,7 @@ async def _deny(scope, receive, send, code, status):
                        headers={'Cache-Control': 'no-store'})(scope, receive, send)
 
 
-def _scope_headers(scope):
+def _scope_headers(scope, *, preview_host=None):
     path = scope.get('path', '')
     try:
         canonical = path.encode('ascii')
@@ -135,7 +165,8 @@ def _scope_headers(scope):
     query = scope.get('query_string', b'')
     if type(query) is not bytes or len(query) > 4096 or any(c < 32 or c == 127 for c in query):
         raise _Denied('gateway_invalid_query', 400)
-    if not browser_route_allowed(scope.get('method'), path):
+    preview = _is_preview(scope, preview_host)
+    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path)):
         raise _Denied('gateway_route_forbidden', 403)
     headers = scope.get('headers', [])
     if len(headers) > 64 or sum(len(k) + len(v) for k, v in headers) > 32768:
@@ -147,14 +178,15 @@ def _scope_headers(scope):
                 or any(c < 32 or c == 127 for c in value)):
             raise _Denied('gateway_invalid_headers', 400)
         counts[name] = counts.get(name, 0) + 1
-        if name == b'authorization' or (name.startswith(b'x-hub-') and name != b'x-hub-csrf'):
+        if not preview and (name == b'authorization' or (name.startswith(b'x-hub-') and name != b'x-hub-csrf')):
             raise _Denied('browser_credentials_required', 403)
         if name in {b'transfer-encoding', b'content-encoding'}:
             raise _Denied('gateway_invalid_framing', 400)
-        if name in _REQUEST_HEADERS:
+        if name in _REQUEST_HEADERS and (not preview or name in {b'host', b'accept'}):
             selected.append((name, value))
-    if counts.get(b'host') != 1 or any(counts.get(name, 0) > 1 for name in (
-            b'content-length', b'origin', b'cookie', b'x-hub-csrf', b'range')):
+    if (counts.get(b'host') != 1 or preview and any(n > 1 for n in counts.values())
+            or any(counts.get(name, 0) > 1 for name in (
+                b'content-length', b'origin', b'cookie', b'x-hub-csrf', b'range'))):
         raise _Denied('gateway_invalid_headers', 400)
     lengths = [value for name, value in headers if name == b'content-length']
     if lengths and re.fullmatch(rb'(?:0|[1-9][0-9]{0,9})', lengths[0]) is None:
@@ -191,12 +223,17 @@ class PrivateBrowserGateway:
     Existing core lifecycle belongs to the caller. Never publish this receiver
     as an unprotected TCP listener; no socket or deployment is created here.
     """
-    def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None):
+    def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None,
+                 preview_origin=None, preview_app=None):
         if cloudflare_config is None:
             raise ValueError('Private browser gateway requires Cloudflare Access')
         self.ingress = HubIngressMiddleware(core, mode='browser', agent_auth=agent_auth,
                                             cloudflare_config=cloudflare_config,
                                             access_verifier=access_verifier)
+        if ((preview_origin is None) != (preview_app is None)
+                or preview_app is not None and not callable(preview_app)):
+            raise ValueError('Explicit preview origin and dispatch must be bound together')
+        self.preview_host, self.preview_app = _preview_host(preview_origin), preview_app
 
     async def __call__(self, scope, receive, send):
         if scope['type'] == 'websocket':
@@ -205,8 +242,9 @@ class PrivateBrowserGateway:
         if scope['type'] != 'http':
             raise RuntimeError('Private browser gateway has no independent lifespan')
         try:
-            _, length = _scope_headers(scope)
-            body = await _bounded_body(scope, receive, length, maximum=65536, timeout=15.0)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            preview = _is_preview(scope, self.preview_host)
+            body = await _bounded_body(scope, receive, length, maximum=0 if preview else 65536, timeout=15.0)
         except _Denied as error:
             await _deny(scope, receive, send, error.code, error.status)
             return
@@ -220,7 +258,18 @@ class PrivateBrowserGateway:
                 delivered = True
                 return {'type': 'http.request', 'body': body, 'more_body': False}
             return await receive()
-        await self.ingress(scope, replay, send)
+        if preview:
+            # Capability-only separate origin, deliberately before the extra
+            # dashboard Access layer. The real broker owns session revocation.
+            clean_scope = dict(scope, headers=headers)
+            async def preview_send(message):
+                if message['type'] == 'http.response.start':
+                    message = dict(message, headers=[(k, v) for k, v in message.get('headers', [])
+                        if k.lower() in _PREVIEW_RESPONSE_HEADERS])
+                await send(message)
+            await self.preview_app(clean_scope, replay, preview_send)
+        else:
+            await self.ingress(scope, replay, send)
 
 
 class PublicBrowserGateway:
@@ -231,7 +280,7 @@ class PublicBrowserGateway:
     domain's recovery mechanism. SSE is streamed without buffering a full body.
     """
     def __init__(self, client, *, max_body_bytes=65536, max_response_bytes=2097152,
-                 max_concurrency=16, request_timeout=15.0):
+                 max_concurrency=16, request_timeout=15.0, preview_origin=None):
         if type(client) is not httpx.AsyncClient:
             raise ValueError('Explicit caller-owned AsyncClient required')
         for value, maximum in ((max_body_bytes, 1048576), (max_response_bytes, 16777216),
@@ -244,6 +293,7 @@ class PublicBrowserGateway:
         if client.event_hooks.get('request') or client.event_hooks.get('response'):
             raise ValueError('Gateway client must not install request/response hooks')
         self.client = client
+        self.preview_host = _preview_host(preview_origin)
         self.max_body_bytes, self.max_response_bytes = max_body_bytes, max_response_bytes
         self.max_concurrency, self.request_timeout = max_concurrency, request_timeout
         self._active, self._loop = 0, None
@@ -268,7 +318,8 @@ class PublicBrowserGateway:
                 started = True
             await send(message)
         try:
-            headers, length = _scope_headers(scope)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            preview = _is_preview(scope, self.preview_host)
             if length is not None and length > self.max_body_bytes:
                 raise _Denied('gateway_body_too_large', 413)
             loop = asyncio.get_running_loop()
@@ -278,7 +329,8 @@ class PublicBrowserGateway:
                 raise _Denied('gateway_capacity', 503)
             self._active += 1
             admitted = True
-            body = await self._body(scope, receive, length)
+            body = (await _bounded_body(scope, receive, length, maximum=0, timeout=self.request_timeout)
+                    if preview else await self._body(scope, receive, length))
             raw_path = scope['path'].encode('ascii')
             if scope.get('query_string'):
                 raw_path += b'?' + scope['query_string']
@@ -298,7 +350,8 @@ class PublicBrowserGateway:
             if (len(raw_headers) > 64 or sum(len(k) + len(v) for k, v in raw_headers) > 32768
                     or response.headers.get('content-encoding', 'identity') != 'identity'):
                 raise _Denied('gateway_invalid_upstream', 502)
-            outgoing = [(k.lower(), v) for k, v in raw_headers if k.lower() in _RESPONSE_HEADERS]
+            allowed_headers = _PREVIEW_RESPONSE_HEADERS if preview else _RESPONSE_HEADERS
+            outgoing = [(k.lower(), v) for k, v in raw_headers if k.lower() in allowed_headers]
             if asset_stream and response.status_code in (200, 206):
                 length = response.headers.get('content-length', '')
                 if not length.isdigit() or not 0 < int(length) <= 8 * 1024 * 1024:
@@ -330,7 +383,7 @@ class PublicBrowserGateway:
                 # the configured general response budget unchanged.
                 review_detail = re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID
                     + r'(?:/state|/answers)?', scope['path']) is not None
-                response_limit = (8 * 1024 * 1024 if _diagnostic_path(scope['path'], files_only=True)
+                response_limit = (8 * 1024 * 1024 if preview or _diagnostic_path(scope['path'], files_only=True)
                                   else 4 * 1024 * 1024 if review_detail else self.max_response_bytes)
                 async with asyncio.timeout(self.request_timeout):
                     if response.is_stream_consumed:

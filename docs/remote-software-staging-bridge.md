@@ -312,6 +312,23 @@ records before deciding on another action. HTTPX manual streaming requires
 explicit response closure; the gateway drains that cleanup on cancellation.
 See the [HTTPX async streaming contract](https://www.python-httpx.org/async/).
 
+Static workload previews use a separate, explicit origin. The public gateway's
+optional `preview_origin` (CLI `--preview-origin https://preview.example`) defaults
+to disabled; the private coordinator binds its dispatch to the existing core's
+configured preview broker. Only exact-Host, canonical GET/HEAD capability asset
+paths pass this seam. The dashboard route allowlist is unchanged: its Host cannot
+serve preview capabilities, and the preview Host cannot call Hub APIs.
+
+Preview requests deliberately reach the existing capability broker before the
+additional dashboard Access layer. Both hops discard cookies, Access assertions,
+agent credentials and CSRF headers; preview responses cannot set cookies. The
+broker still checks the original human session, resource/grant revisions and
+expiry before and after each artifact read, and retains its sandbox/CSP. Its
+8MiB asset bound does not increase ordinary Hub response limits. This serves
+static assets only, not arbitrary service POSTs or WebSockets. Enabling a public
+preview hostname or changing host/Cloudflare policy requires a separate reviewed
+operator decision; this optional source API creates no route or deployment.
+
 Future operator acceptance must prove that only the loopback tunnel frontend
 is public-facing, the private socket directory/socket admit only intended
 process identities, no public process has the DB or adapter credential, original
