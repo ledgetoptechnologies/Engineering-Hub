@@ -1,6 +1,6 @@
 /** Planning records are shared context, never task approval or execution authority. */
 import { HubApiError } from "./api";
-import { isNoteProject } from "./notesApi";
+import { isNoteProject, listNotes } from "./notesApi";
 
 export const PLANNING_KINDS = ["plan", "feature", "idea", "improvement"] as const;
 export const PLANNING_STATUSES = ["proposed", "planned", "in_progress", "done", "declined"] as const;
@@ -26,6 +26,31 @@ export const isPlanningId = (value: string) => /^[a-z0-9][a-z0-9_-]{0,63}$/.exec
 export function validPlanningSelection(value: PlanningSelection): boolean {
   return isNoteProject(value.project) && (value.scope === "topic" ? typeof value.topic === "string" && isPlanningTopic(value.topic)
     : value.scope === "hub_improvements" && value.project === "engineering-hub" && value.topic === null);
+}
+/** Planning records live in the project's note store; the Notes list hides them and Plans shows them. */
+const RECORD_PATH = /^planning\/(?:topics\/([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})|hub-improvements)\/(?:plan|feature|idea|improvement)\/[a-z0-9][a-z0-9_-]{0,63}\.json$/;
+export const isPlanningRecordPath = (path: string) => RECORD_PATH.test(path);
+/** Topics with planning records, most recently updated first. */
+export function topicsFromPaths(items: { path: string; updated_at: string }[]): string[] {
+  const latest = new Map<string, number>();
+  for (const item of items) {
+    const topic = RECORD_PATH.exec(item.path)?.[1];
+    if (topic) latest.set(topic, Math.max(latest.get(topic) ?? 0, Date.parse(item.updated_at) || 0));
+  }
+  return [...latest].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).map(([topic]) => topic);
+}
+/** A readable name for a topic id; the id itself stays in the tooltip. */
+export function topicLabel(topic: string): string {
+  const link = /^agent-link-([a-f0-9]{8})[a-f0-9-]*$/.exec(topic);
+  if (link) return `Agent chat ${link[1]}`;
+  const words = topic.replace(/[-_.:]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+/** A stable record id made from the title, with a short random suffix so two similar titles never collide. */
+export function planningItemId(title: string, suffix: string): string {
+  const base = title.toLowerCase().normalize("NFKD").replace(/\p{M}/gu, "").replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 48).replace(/-+$/, "");
+  return base ? `${base}-${suffix}` : `item-${suffix}`;
 }
 export function planningPath(value: PlanningKey): string {
   return value.scope === "topic" ? `planning/topics/${value.topic}/${value.kind}/${value.item_id}.json`
@@ -133,4 +158,18 @@ export async function savePlanning(draft: PlanningDraft, csrf: string, fetchImpl
   const item = parsePlanningItem(await responseJson(response), draft);
   if (item.version !== draft.expected_version + 1) return invalid();
   return item;
+}
+export const TOPIC_DISCOVERY_PAGES = 4;
+/** Which topics hold this project's plans, read from note paths (bounded pages; never content). */
+export async function discoverPlanningTopics(project: string, signal: AbortSignal,
+  list: typeof listNotes = listNotes): Promise<{ topics: string[]; complete: boolean }> {
+  const seen: { path: string; updated_at: string }[] = [];
+  let after: string | undefined;
+  for (let page = 0; page < TOPIC_DISCOVERY_PAGES; page++) {
+    const next = await list({ project, path_prefix: "planning/topics/", ...(after ? { after } : {}) }, signal);
+    seen.push(...next.items);
+    if (!next.truncated || !next.items.length) return { topics: topicsFromPaths(seen), complete: true };
+    after = next.items[next.items.length - 1].path;
+  }
+  return { topics: topicsFromPaths(seen), complete: false };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { isPlanningId, isPlanningTopic, listPlanning, parsePlanningItem, parsePlanningList, PlanningConflictError,
-  planningPath, planningRequestBytes, readPlanning, savePlanning, validPlanningSelection, type PlanningDraft, type PlanningSelection } from "./planningApi";
+  discoverPlanningTopics, isPlanningRecordPath, planningItemId, planningPath, planningRequestBytes, TOPIC_DISCOVERY_PAGES, topicLabel, topicsFromPaths, readPlanning, savePlanning, validPlanningSelection, type PlanningDraft, type PlanningSelection } from "./planningApi";
 
 const topic: PlanningSelection = { scope: "topic", project: "treedar", topic: "TreeDAR-v1" };
 const hub: PlanningSelection = { scope: "hub_improvements", project: "engineering-hub", topic: null };
@@ -106,5 +106,46 @@ describe("planning client", () => {
     const other = vi.fn<typeof fetch>().mockResolvedValue(response({ detail: { code: "other_conflict", current_version: 4 } }, 409));
     const error = await savePlanning(draft, "c", other).catch(value => value);
     expect(error).not.toBeInstanceOf(PlanningConflictError);
+  });
+});
+
+describe("planning topics and record paths", () => {
+  const row = (path: string, updated_at: string) => ({ path, updated_at });
+  it("recognises only planning record paths, so ordinary notes under planning/ stay notes", () => {
+    expect(isPlanningRecordPath("planning/topics/treedar-milestone-1/plan/treedar-milestone-1.json")).toBe(true);
+    expect(isPlanningRecordPath("planning/hub-improvements/improvement/search.json")).toBe(true);
+    expect(isPlanningRecordPath("planning/roadmap.md")).toBe(false);
+    expect(isPlanningRecordPath("planning/topics/x/unknown/item.json")).toBe(false);
+  });
+  it("lists each topic once, newest first", () => {
+    expect(topicsFromPaths([
+      row("planning/topics/old/idea/a.json", "2026-10-20T00:00:00Z"),
+      row("planning/topics/new/plan/b.json", "2026-10-27T00:00:00Z"),
+      row("planning/topics/old/feature/c.json", "2026-10-21T00:00:00Z"),
+      row("notes/other.md", "2026-10-28T00:00:00Z"),
+    ])).toEqual(["new", "old"]);
+  });
+  it("names topics for people and keeps agent chats recognisable", () => {
+    expect(topicLabel("agent-link-5b9b51f9-d5af-45a8-88dd-9f1835029e9e")).toBe("Agent chat 5b9b51f9");
+    expect(topicLabel("treedar-milestone-1")).toBe("Treedar milestone 1");
+  });
+  it("makes a valid, stable id from the title", () => {
+    expect(planningItemId("Gaussian splat processing!", "a1b2c3")).toBe("gaussian-splat-processing-a1b2c3");
+    expect(planningItemId("   ", "a1b2c3")).toBe("item-a1b2c3");
+    expect(planningItemId("x".repeat(80), "a1b2c3")).toMatch(/^x{48}-a1b2c3$/);
+  });
+  it("reads topic paths a bounded number of pages and says when it stopped early", async () => {
+    const calls: (string | undefined)[] = [];
+    const page = (n: number) => ({ project: "p", path: `planning/topics/t${n}/idea/i.json`, title: "t", version: 1, sha256: "c".repeat(64),
+      created_by: "codex", updated_by: "codex", created_at: "2026-10-27T00:00:00Z", updated_at: "2026-10-27T00:00:00Z" });
+    const list = vi.fn(async (request: { after?: string }) => {
+      calls.push(request.after);
+      return { items: [page(calls.length)], truncated: true };
+    });
+    const result = await discoverPlanningTopics("p", new AbortController().signal, list as never);
+    expect(calls).toHaveLength(TOPIC_DISCOVERY_PAGES);
+    expect(calls[1]).toBe("planning/topics/t1/idea/i.json");
+    expect(result.complete).toBe(false);
+    expect(result.topics).toHaveLength(TOPIC_DISCOVERY_PAGES);
   });
 });

@@ -1070,6 +1070,12 @@ dialog::backdrop {
   align-items: center;
   min-width: 0;
 }
+.planning-controls label {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
 .notes-controls input,
 .notes-controls select,
 .note-editor .field input {
