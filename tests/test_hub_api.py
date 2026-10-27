@@ -308,7 +308,8 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
             "hub_label_set_create", "hub_label_set_put_image", "hub_label_set_results", "hub_label_set_list",
             "hub_entity_put_image", "hub_entity_images", "hub_entity_withdraw",
             "hub_project_list", "hub_project_get",
-            "hub_component_list", "hub_component_get", "hub_interactive_review_create",
+            "hub_component_list", "hub_component_get", "hub_component_create",
+            "hub_component_update", "hub_component_retire", "hub_interactive_review_create",
             "hub_interactive_review_get", "hub_interactive_review_list",
         }
     assert client.get(BASE + "/overview", headers=agent_headers()).status_code == 200
