@@ -25,6 +25,14 @@ export function untilText(value: string | null, now: number): string {
   return minutes < 60 ? `in ${minutes} min` : minutes < 2880 ? `in ${Math.round(minutes / 60)} h` : `in ${Math.round(minutes / 1440)} days`;
 }
 const exact = (value: string) => new Date(value).toLocaleString();
+/** Who did it, in words: the viewer, an installation by its name, or the recorded id as a last resort. */
+export function actorName(actor: string, items: Installation[], viewer?: string | null): string {
+  if (viewer && actor === viewer) return "You";
+  const installation = items.find(item => item.id === actor);
+  if (installation) return installation.name;
+  if (actor.startsWith("human:")) return "A person";
+  return FAMILY_NAME[actor as keyof typeof FAMILY_NAME] ?? actor;
+}
 
 export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client?: AgentConnectionsClient }) {
   const client = useRef(given ?? httpAgentConnections()).current;
@@ -167,7 +175,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                     <button type="button" className="secondary small" onClick={() => setRenaming(null)}>Cancel</button>
                   </form> : <strong>{item.name}</strong>}
                   <span className="installation-meta">Says it runs on <code>{item.host_label}</code> · added {relativeAge(item.created_at)}
-                    {item.approved_by && <> · approved by {item.approved_by}</>}</span>
+                    {item.approved_by && <> · approved by {actorName(item.approved_by, items, hub.session?.actor)}</>}</span>
                   {item.state === "pending" && <div className="pairing" aria-label="Pairing check">
                     <span>Pairing code <code>{item.pairing_code}</code></span>
                     <span>Fingerprint <code>{item.key_fingerprint}</code></span>
@@ -177,7 +185,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                   {item.state === "active" && item.expires_at && <span className="installation-meta">Approval ends {untilText(item.expires_at, now)}
                     <span title={exact(item.expires_at)}> ({exact(item.expires_at)})</span></span>}
                   {item.reason && <span className="installation-meta">{reasonText(item.reason)}</span>}
-                  {item.revoked_at && <span className="installation-meta">Revoked {relativeAge(item.revoked_at)}{item.revoked_by ? ` by ${item.revoked_by}` : ""}.</span>}
+                  {item.revoked_at && <span className="installation-meta">Revoked {relativeAge(item.revoked_at)}{item.revoked_by ? ` by ${actorName(item.revoked_by, items, hub.session?.actor)}` : ""}.</span>}
                 </div>
                 <div className="installation-side">
                   <Badge tone={lapsed ? "neutral" : STATE_TONE[item.state]}>{lapsed ? "Request ran out" : STATE_LABEL[item.state]}</Badge>
@@ -207,7 +215,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
           {[...audit].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).map(event => {
             const target = items.find(item => item.id === event.installation_id);
             return <li key={event.id}><span className="timeline-dot kind-task" aria-hidden="true" />
-              <div><strong>{event.actor} {actionText(event.action)}</strong>
+              <div><strong>{actorName(event.actor, items, hub.session?.actor)} {actionText(event.action)}</strong>
                 <span className="timeline-meta">{target ? target.name : event.installation_id ?? "Hub"}{event.session_id ? ` · session ${event.session_id}` : ""}
                   {event.message_id ? ` · message ${event.message_id}` : ""}</span></div>
               <time dateTime={event.at} title={exact(event.at)}>{relativeAge(event.at)}</time></li>;

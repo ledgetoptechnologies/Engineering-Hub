@@ -3,7 +3,8 @@ import { HubApiError } from "./api";
 import {
   demoAgentConnections, httpAgentConnections, parseAudit, parseCapabilities, parseInstallation, parseInstallations, parseSessions, writeFailureText,
 } from "./agentConnectionsApi";
-import { untilText } from "./AgentConnectionsPanel";
+import { actorName, untilText } from "./AgentConnectionsPanel";
+import backend from "./fixtures/agent-connections-wire-v1.json";
 
 /** UI-side samples in the frozen DTO shapes; the backend-generated wire fixture is added separately. */
 const at = (value: string) => value;
@@ -133,5 +134,33 @@ describe("frozen length limits", () => {
     expect(parseInstallation(item).name).toHaveLength(100);
     expect(() => parseInstallation({ ...item, name: "n".repeat(101) })).toThrow(HubApiError);
     expect(() => parseInstallation({ ...item, host_label: "h".repeat(101) })).toThrow(HubApiError);
+  });
+});
+
+describe("backend wire fixture (agent-connections-wire-v1, exported by the composed owner API test)", () => {
+  it("parses every owner response the backend produced", () => {
+    expect(backend.schema).toBe("agent-connections-wire-v1");
+    expect(parseCapabilities(backend.capabilities).owner).toBe(true);
+    const [pendingItem] = parseInstallations(backend.pending);
+    expect(pendingItem).toMatchObject({ state: "pending", pairing_code: "377995", key_fingerprint: "18fab9cd3f43991e" });
+    expect(parseInstallation(backend.approved)).toMatchObject({ state: "active", pairing_code: null, key_fingerprint: pendingItem.key_fingerprint });
+    expect(parseSessions(backend.sessions, backend.approved.id)).toHaveLength(1);
+    expect(parseSessions({ sessions: [backend.revoked_session] }, backend.approved.id)[0].state).toBe("revoked");
+    expect(parseAudit(backend.audit).map(event => event.action))
+      .toEqual(["session.revoked", "session.issued", "installation.approved", "enrollment.requested"]);
+    expect(writeFailureText(new HubApiError(409, backend.revision_conflict.detail.code))).toContain("changed since you loaded it");
+  });
+  it("carries no credential-shaped value", () => {
+    expect(JSON.stringify(backend)).not.toMatch(/eh[isc]_|token|secret|bearer/i);
+  });
+});
+
+describe("actorName", () => {
+  it("names the viewer, installations and agents, and never invents a person's name", () => {
+    const items = parseInstallations(backend.pending);
+    expect(actorName("human:42", items, "human:42")).toBe("You");
+    expect(actorName(backend.approved.id, items)).toBe("Synthetic processing PC");
+    expect(actorName("human:7", items, "human:42")).toBe("A person");
+    expect(actorName("claude", items)).toBe("Claude");
   });
 });
