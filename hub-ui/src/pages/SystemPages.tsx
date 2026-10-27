@@ -1,3 +1,4 @@
+import { AgentConnectionsPanel } from "../AgentConnectionsPanel";
 import { useEffect, useState } from "react";
 import { HubApiError } from "../api";
 import { relativeAge } from "../dashboardText";
@@ -79,6 +80,7 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
         client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
         offline. Topic readiness is checked separately.
       </p>
+      <AgentConnectionsPanel hub={hub} />
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
         <div className="topics-layout">
