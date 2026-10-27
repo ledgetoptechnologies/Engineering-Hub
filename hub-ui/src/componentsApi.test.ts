@@ -21,7 +21,7 @@ describe("component wire contract", () => {
   it("maps the fixture's error codes to honest states", async () => {
     const call = (entry: { status: number; body: unknown }) => readComponent(id, vi.fn<typeof fetch>().mockResolvedValue(json(entry.body, entry.status)));
     await expect(call(wire.conflict)).rejects.toMatchObject({ status: 409, code: "component_conflict" });
-    await expect(call(wire.forbidden)).rejects.toMatchObject({ status: 403, code: "human_session_required" });
+    await expect(call(wire.forbidden)).rejects.toMatchObject({ status: 403, code: "forbidden" });
     await expect(call(wire.validation)).rejects.toMatchObject({ status: 422, code: "invalid_component" });
   });
   it("rejects rows from another project, bad ids and unsafe links", () => {

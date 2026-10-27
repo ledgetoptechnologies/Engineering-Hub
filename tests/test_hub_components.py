@@ -61,15 +61,51 @@ def test_project_scoped_slug_and_actor_request_key_idempotency(env):
 
 
 @pytest.mark.parametrize('agent', ['codex', 'claude', 'hermes'])
-def test_agent_mutations_denied(env, agent):
+def test_authenticated_agents_manage_components_with_audit_but_not_projects(env, agent):
+    store, projects, repo = env
+    before = projects.list_projects()
+    item = store.create_component(agent, 'ledge-top-ops', 'agent-owned', 'Agent component', 'agent')
+    assert item['created_by'] == agent and item['revision'] == 1
+    assert store.create_component(agent, 'ledge-top-ops', 'agent-owned', 'Agent component', 'agent') == item
+    with pytest.raises(HubError, match='idempotency_conflict'):
+        store.create_component(agent, 'ledge-top-ops', 'agent-owned', 'Changed', 'agent')
+    changed = store.update_component(agent, item['id'], 1, name='Changed')
+    with pytest.raises(HubError, match='revision_conflict'):
+        store.retire_component(agent, item['id'], 1)
+    retired = store.retire_component(agent, item['id'], changed['revision'])
+    assert retired['status'] == 'retired' and retired['revision'] == 3
+    restored = store.update_component(agent, item['id'], 3, status='active')
+    assert restored['id'] == item['id'] and restored['slug'] == item['slug']
+    assert restored['revision'] == 4 and restored['created_by'] == agent
+    with repo._connection() as db:
+        audit = db.execute('SELECT actor,action,revision FROM hub_audit WHERE entity_id=? ORDER BY sequence', (item['id'],)).fetchall()
+        assert [tuple(row) for row in audit] == [(agent, action, revision) for action, revision in [
+            ('component.created', 1), ('component.updated', 2), ('component.retired', 3), ('component.updated', 4)]]
+    for operation in (lambda: projects.create_project(agent, 'agent-project', 'Agent project', 'agent'),
+                      lambda: projects.archive_project(agent, 'ledge-top-ops', 1)):
+        with pytest.raises(HubError, match='forbidden'):
+            operation()
+    assert projects.list_projects() == before and repo._list('task') == []
+
+
+@pytest.mark.parametrize('actor', ['unknown', 'admin', 'executor:ci', 'human:fake'])
+def test_unknown_principals_cannot_mutate_components(env, actor):
     store = env[0]
     item = create(env)
-    with pytest.raises(HubError, match='forbidden'):
-        store.create_component(agent, 'ledge-top-ops', 'agent-owned', 'agent', 'agent')
-    with pytest.raises(HubError, match='forbidden'):
-        store.update_component(agent, item['id'], item['revision'], name='Changed')
-    with pytest.raises(HubError, match='forbidden'):
-        store.retire_component(agent, item['id'], item['revision'])
+    for operation in (lambda: store.create_component(actor, item['project'], 'unknown', 'Unknown', 'unknown'),
+                      lambda: store.update_component(actor, item['id'], 1, name='Changed'),
+                      lambda: store.retire_component(actor, item['id'], 1)):
+        with pytest.raises(HubError, match='forbidden'):
+            operation()
+    assert store.get_component(item['id']) == item
+
+
+def test_agent_request_keys_are_scoped_to_authenticated_actor(env):
+    store = env[0]
+    items = [store.create_component(agent, 'ledge-top-ops', agent, agent, 'shared-key')
+             for agent in ('codex', 'claude', 'hermes')]
+    assert len({item['id'] for item in items}) == 3
+    assert {item['created_by'] for item in items} == {'codex', 'claude', 'hermes'}
 
 
 def test_cas_retirement_reserved_slug_restoration_and_audit(env):
@@ -93,15 +129,16 @@ def test_cas_retirement_reserved_slug_restoration_and_audit(env):
             ('component.created', 1), ('component.updated', 2), ('component.retired', 3), ('component.updated', 4)]
 
 
-def test_archived_project_is_readable_but_no_mutations_or_late_retries(env):
+@pytest.mark.parametrize('actor', [HUMAN, 'codex', 'claude', 'hermes'])
+def test_archived_project_is_readable_but_no_mutations_or_late_retries(env, actor):
     store, projects, _ = env
-    item = create(env, project='processing', legacy_project_id='3d-viewer')
+    item = store.create_component(actor, 'processing', 'viewer', 'Viewer', 'create', legacy_project_id='3d-viewer')
     projects.archive_project(HUMAN, 'processing', 1)
     assert store.get_component(item['id']) == item
     assert store.list_components('processing')['items'] == [item]
-    for invoke in (lambda: create(env, project='processing', legacy_project_id='3d-viewer'),
-                   lambda: store.update_component(HUMAN, item['id'], 1, name='changed'),
-                   lambda: store.retire_component(HUMAN, item['id'], 1)):
+    for invoke in (lambda: store.create_component(actor, 'processing', 'viewer', 'Viewer', 'create', legacy_project_id='3d-viewer'),
+                   lambda: store.update_component(actor, item['id'], 1, name='changed'),
+                   lambda: store.retire_component(actor, item['id'], 1)):
         with pytest.raises(HubError, match='project_archived'):
             invoke()
 
