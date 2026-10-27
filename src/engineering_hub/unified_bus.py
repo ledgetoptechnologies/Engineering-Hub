@@ -11,11 +11,12 @@ BUS_API_PREFIXES = (
     '/api/files', '/api/feedback',
 )
 BUS_ADMIN_PATH = '/api/admin/cleanup'
+AGENT_SESSION_PREFIX = '/api/agent-sessions/v1'
 
 
 def is_bus_api(path):
     return any(path == prefix or path.startswith(prefix + '/')
-               for prefix in BUS_API_PREFIXES)
+               for prefix in (*BUS_API_PREFIXES, AGENT_SESSION_PREFIX))
 
 
 def attach_bus_routes(app, bus_app):
@@ -38,7 +39,10 @@ def attach_bus_routes(app, bus_app):
     alias = MCPAlias()
     for path in ('/mcp', '/mcp/'):
         app.router.routes.append(Route(path, endpoint=alias, methods=methods))
-    for prefix in BUS_API_PREFIXES:
+    prefixes = BUS_API_PREFIXES
+    if getattr(bus_app.state, 'agent_sessions', None) is not None:
+        prefixes = (*prefixes, AGENT_SESSION_PREFIX)
+    for prefix in prefixes:
         app.router.routes.append(Route(prefix, endpoint=bus_app, methods=methods))
         app.router.routes.append(Route(prefix + '/{path:path}', endpoint=bus_app, methods=methods))
     app.router.routes.append(Route(BUS_ADMIN_PATH, endpoint=bus_app, methods=methods))

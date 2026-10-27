@@ -253,6 +253,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     bus_mcp = None
     bus_health = None
     notes_repository = None
+    connection_service = None
+    connection_config = None
     if bus_app is not None:
         if (not isinstance(bus_app, Starlette)
                 or settings.ingress_mode == 'browser'
@@ -276,6 +278,21 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if (type(notes_repository) is not KnowledgeRepository
                 or notes_repository.db_path.resolve() != Path(service.repository.path).resolve()):
             raise ValueError('Unified bus requires its exact shared knowledge writer')
+        connection_service = getattr(bus_app.state, 'agent_sessions', None)
+        connection_config = getattr(bus_app.state, 'agent_sessions_config', None)
+        if connection_service is not None or connection_config is not None:
+            from agent_message_bus.agent_sessions import AgentSessionRepository
+            from agent_message_bus.agent_sessions_config import AgentSessionsConfig
+            if (type(connection_service) is not AgentSessionRepository
+                    or type(connection_config) is not AgentSessionsConfig
+                    or connection_config.environment != 'staging'
+                    or connection_config.origin != settings.auth_config.origin
+                    or connection_service.owner != connection_config.owner
+                    or Path(connection_service.path).resolve() != connection_config.database.resolve()
+                    or connection_config.database.resolve() == settings.database.resolve()
+                    or (settings.database.exists()
+                        and settings.database.samefile(connection_config.database))):
+                raise ValueError('staging_agent_connections_origin_and_storage_binding_required')
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -665,6 +682,18 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if request.headers.get("authorization"):
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
+
+    # The optional staging service stays the bus's exact single owner. It does
+    # not turn installation/session credentials into existing Hub principals.
+    if connection_service is not None:
+        from agent_message_bus.agent_sessions import AgentSessionError
+        from agent_message_bus.agent_sessions_api import attach_owner_routes
+        @app.exception_handler(AgentSessionError)
+        async def connection_error(request, error):
+            return JSONResponse({'detail': {'code': error.code}}, status_code=error.status,
+                                headers={'Cache-Control': 'no-store'})
+
+        attach_owner_routes(app, connection_service, human)
 
     from .notes_api import attach_notes_routes
     attach_notes_routes(app, repository=notes_repository, actor=actor)
@@ -1058,5 +1087,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         app.add_middleware(HubIngressMiddleware, mode=settings.ingress_mode,
                            agent_auth=settings.agent_auth,
                            cloudflare_config=settings.auth_config.cloudflare_config,
-                           legacy_bus_enabled=bus_app is not None)
+                           legacy_bus_enabled=bus_app is not None,
+                           agent_sessions=connection_service,
+                           agent_sessions_config=connection_config)
+    if connection_service is not None:
+        from agent_message_bus.agent_sessions_transport import AgentSessionResponseGuardMiddleware
+        # Own actual MCP response writes outside all buffering middleware. The
+        # exact-repository scope marker prevents duplicate front-door/bus guards.
+        app.add_middleware(AgentSessionResponseGuardMiddleware,
+                           auth=settings.agent_auth, repository=connection_service)
     return app

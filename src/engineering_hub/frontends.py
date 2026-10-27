@@ -18,11 +18,14 @@ class _FrontDoor:
     def __init__(self, pair, mode):
         self.pair = pair
         self.mode = mode
+        bus = getattr(pair.core.state, 'embedded_bus', None)
         self.ingress = HubIngressMiddleware(
             pair.core, mode=mode, agent_auth=pair.settings.agent_auth,
             cloudflare_config=pair.settings.auth_config.cloudflare_config,
             legacy_bus_enabled=getattr(pair.core.state, 'embedded_bus', None) is not None,
             access_verifier=pair.access_verifier if mode == 'browser' else None,
+            agent_sessions=getattr(bus.state, 'agent_sessions', None) if bus is not None else None,
+            agent_sessions_config=getattr(bus.state, 'agent_sessions_config', None) if bus is not None else None,
         )
 
     async def __call__(self, scope, receive, send):
