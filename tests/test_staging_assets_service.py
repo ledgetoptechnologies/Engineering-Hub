@@ -334,9 +334,10 @@ def test_four_request_threads_bound_slow_clients(tmp_path):
             for _ in range(4):
                 connections.append(socket.create_connection(server.server_address, timeout=3))
             deadline = time.monotonic() + 3
-            while len(server._threads) < 4 and time.monotonic() < deadline:
+            # ThreadingMixIn keeps a _NoThreads sentinel until its first accepted request.
+            while (not isinstance(server._threads, list) or len(server._threads) < 4) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert len(server._threads) == 4
+            assert isinstance(server._threads, list) and len(server._threads) == 4
             fifth = socket.create_connection(server.server_address, timeout=3)
             try:
                 assert fifth.recv(1) == b''
