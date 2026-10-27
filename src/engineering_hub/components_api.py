@@ -1,4 +1,4 @@
-"""Authenticated component catalog routes and read-only agent tools."""
+"""Authenticated component catalog routes and tools; inert metadata only."""
 from typing import Annotated, Literal
 
 from fastapi import Path, Query, Request
@@ -42,10 +42,22 @@ class ComponentRevision(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class ComponentCreate(ComponentInput):
+    project: str = Field(pattern=r'^[a-z0-9][a-z0-9-]{0,63}$')
+
+
+class ComponentUpdate(ComponentEdit):
+    component_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+
+
+class ComponentRetirement(ComponentRevision):
+    component_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+
+
 def attach_component_routes(app, repository, actor, human):
     def identity(request, *, mutation=False):
         _authorization(request)
-        return human(request, mutation=True) if mutation else actor(request)
+        return actor(request, mutation=mutation)
 
     @app.get('/api/hub/v1/projects/{project}/components')
     def list_components(project: str, request: Request, include_retired: bool = False,
@@ -91,6 +103,40 @@ def register_component_tools(mcp, *, repository, identity, invoke):
 
     @mcp.tool()
     def hub_component_get(component_id: str, ctx: Context) -> dict:
-        """Read one component by its stable UUID. No catalog mutation is exposed."""
+        """Read one component by its stable UUID; metadata confers no execution or access grant."""
         identity(ctx)
         return invoke(lambda: repository.get_component(component_id))
+
+    def mutation_actor(ctx):
+        principal = identity(ctx)
+        # Apply the same duplicate/malformed bearer guard as the HTTP routes.
+        _authorization(ctx.request_context.request)
+        return principal
+
+    @mcp.tool()
+    def hub_component_create(payload: ComponentCreate, ctx: Context) -> dict:
+        """Create component metadata within an active existing project; no execution or access grant.
+
+        Actor comes from authentication. Reuse a request key only for the same
+        actor and payload. This cannot create, archive or delete a project.
+        """
+        principal = mutation_actor(ctx)
+        return invoke(lambda: repository.create_component(principal, **payload.model_dump()))
+
+    @mcp.tool()
+    def hub_component_update(payload: ComponentUpdate, ctx: Context) -> dict:
+        """Edit component metadata using its current revision; status edits can restore retired rows.
+
+        Project, slug, UUID and provenance stay immutable. No execution or access grant.
+        """
+        principal = mutation_actor(ctx)
+        fields = payload.model_dump(exclude_unset=True)
+        component_id = fields.pop('component_id')
+        revision = fields.pop('expected_revision')
+        return invoke(lambda: repository.update_component(principal, component_id, revision, **fields))
+
+    @mcp.tool()
+    def hub_component_retire(payload: ComponentRetirement, ctx: Context) -> dict:
+        """Retire component metadata using its current revision; preserve the row, slug and history."""
+        principal = mutation_actor(ctx)
+        return invoke(lambda: repository.retire_component(principal, payload.component_id, payload.expected_revision))

@@ -9,9 +9,7 @@
   },
   "forbidden": {
     "body": {
-      "detail": {
-        "code": "human_session_required"
-      }
+      "detail": "Request verification failed"
     },
     "status": 403
   },

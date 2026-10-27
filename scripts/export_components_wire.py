@@ -66,8 +66,8 @@ def fixture_document():
             'single': (200, client.get(single_path)),
             'conflict': (409, client.patch(single_path, headers=human,
                 json={'expected_revision': 2, 'name': 'Stale revision'})),
-            'forbidden': (403, client.post(path,
-                headers={'Authorization': 'Bearer synthetic-codex'}, json=payload)),
+            # Humans still need CSRF; authenticated agent catalog writes are allowed.
+            'forbidden': (403, client.post(path, json=payload)),
             'validation': (422, client.post(path, headers=human,
                 json={**payload, 'kind': 'unregistered-runtime'})),
         }

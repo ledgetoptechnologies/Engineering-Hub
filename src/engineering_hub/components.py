@@ -1,4 +1,4 @@
-"""Dynamic human-owned project component catalog; inert metadata, not authority.
+"""Dynamic project component catalog; inert metadata, not authority.
 
 Components describe products/packages inside a project. They are not tasks,
 subprojects, execution targets, access grants or deployment configuration.
@@ -98,7 +98,7 @@ class ProjectComponentRepository:
     def create_component(self, actor, project, slug, name, client_request_id, *,
                          description='', kind='other', status='planned',
                          repository_url=None, package_url=None, legacy_project_id=None):
-        self.repo._actor(actor, human=True)
+        self.repo._actor(actor)
         self._slug(slug)
         key = self.repo._text(client_request_id, 128)
         fields = self._fields(name, description, kind, status, repository_url, package_url, legacy_project_id)
@@ -158,7 +158,7 @@ class ProjectComponentRepository:
     def update_component(self, actor, identity, expected_revision, *, name=_UNSET,
                          description=_UNSET, kind=_UNSET, status=_UNSET,
                          repository_url=_UNSET, package_url=_UNSET, legacy_project_id=_UNSET):
-        self.repo._actor(actor, human=True)
+        self.repo._actor(actor)
         self._identity(identity)
         changes = dict(name=name, description=description, kind=kind, status=status,
                        repository_url=repository_url, package_url=package_url, legacy_project_id=legacy_project_id)
