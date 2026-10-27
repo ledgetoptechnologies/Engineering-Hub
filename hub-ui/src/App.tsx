@@ -397,7 +397,8 @@ export function HubApp() {
   const nextExpiry = deadlines.length ? Math.min(...deadlines) : null;
   useEffect(() => {
     if (nextExpiry === null) return;
-    // Local expiry only: no HTTP, inbox, model, or status polling.
+    // This timer only repaints local expiry; it makes no HTTP requests.
+    // watchAgentObservations separately renews visible-page /agents metadata.
     const timer = setTimeout(
       () => expire((value) => value + 1),
       Math.max(1, nextExpiry - Date.now() + 10),
