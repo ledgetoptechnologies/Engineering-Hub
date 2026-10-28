@@ -249,11 +249,11 @@ jobs:
           load: true
           push: false
           build-args: VCS_REF=${{ inputs.candidate_commit }}
-          tags: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+          tags: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ inputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Run all five isolated UID 568 control-image smoke checks
         working-directory: candidate
         env:
-          IMAGE: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+          IMAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ inputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
           SOURCE_COMMIT: ${{ inputs.candidate_commit }}
         run: |
           python scripts/hub_release_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-startup.json
@@ -263,7 +263,7 @@ jobs:
           python scripts/hub_protected_container_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-protected-startup.json
       - name: Export image tar and checksummed source/image receipt
         env:
-          IMAGE: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+          IMAGE: ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ inputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
           SOURCE_COMMIT: ${{ inputs.candidate_commit }}
           SOURCE_TREE: ${{ inputs.candidate_tree }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
