@@ -26,7 +26,7 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
     ] as Session[],
     posts: [] as { path: string; method: string; body: Record<string, unknown>; csrf?: string }[],
     failSessions: false, emptyInstallations: false, stallInstallations: false,
-    failInstallations: false, stallAudit: false, stallCatalog: false, stallSessions: false,
+    failInstallations: false, stallAudit: false, stallCatalog: false, stallSessions: false, lateSessionStatus: 0,
     actor: human, owner: options.owner ?? true,
     reads: [] as string[], auth: true, csrf: "fixture-csrf" as string | null, listStatus: 200, writeStatus: 200 as number, writeCode: "",
     hold: false, release: null as (() => void) | null, holdSessions: false, sessionReleases: [] as (() => void)[],
@@ -65,6 +65,7 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
         // The answer is what the server had when asked; a held read returns that older view later.
         const body = { sessions: structuredClone(state.sessions.filter(item => item.installation_id === sessions[1])) };
         if (state.holdSessions) { state.holdSessions = false; await new Promise<void>(resolve => state.sessionReleases.push(resolve)); }
+        if (state.lateSessionStatus) return respond({ detail: { code: "human_session_required" } }, state.lateSessionStatus);
         return respond(body);
       }
       return respond({}, 404);
@@ -440,4 +441,26 @@ test("someone without the owner's Hub sign-in gets a way to sign in, without pro
   await expect(panelOf(page)).toContainText("Managing installations needs the configured owner's own Hub sign-in on this Hub.");
   await expect(panelOf(page)).toContainText("then come back to Agents");
   await expect(panelOf(page)).not.toContainText("@");
+});
+
+for (const variant of ["hangs", "fails"] as const) test(`a Refresh that ${variant} cancels an open session read, and its late answer or 401 never lands`, async ({ page }) => {
+  const state = await fixture(page);
+  const sessions = cancelledReads(page, "/sessions");
+  await page.goto("/#/agents");
+  const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
+  state.holdSessions = true;
+  await laptop.getByRole("button", { name: "Show sessions" }).click();
+  await expect.poll(() => state.sessionReleases.length).toBe(1);
+  // The next refresh never gets as far as re-reading sessions.
+  if (variant === "hangs") state.stallInstallations = true; else state.failInstallations = true;
+  await panelOf(page).getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect.poll(() => sessions.length).toBe(1);
+  await expect(laptop.getByRole("status").filter({ hasText: "Reading sessions…" })).toHaveCount(0);
+  // The cancelled read answers late with a 401; it must neither fill the list nor sign anyone out.
+  state.lateSessionStatus = 401;
+  state.sessionReleases[0]();
+  await page.waitForTimeout(300);
+  await expect(page.getByRole("link", { name: /Sign in securely/ })).toHaveCount(0);
+  await expect(laptop.getByRole("table")).toHaveCount(0);
+  await expect(panelOf(page).locator(".installation-row")).toHaveCount(3);
 });
