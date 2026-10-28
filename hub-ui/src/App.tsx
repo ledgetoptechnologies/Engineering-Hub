@@ -97,12 +97,13 @@ export function HubApp() {
   const topicReads = useRef(0);
   const taskRequest = useRef<{ payload: string; key: string } | null>(null);
 
-  const clearPrivateWorkspace = useCallback(() => {
-    // Also fence late reads from a request whose identity is no longer valid.
-    requests.current++;
+  // The actor whose records are on screen; a different validated actor must never see them.
+  const shownActor = useRef<string | null>(null);
+  /** Drop every private record, cached snapshot, dialog and pending action, and fence late topic/agent reads. */
+  const resetWorkspace = useCallback(() => {
     agentReader.current?.pause();
     topicReads.current++;
-    setSession(null);
+    shownActor.current = null;
     setData(null);
     setAgents([]);
     setPeers(null);
@@ -123,6 +124,12 @@ export function HubApp() {
     // would trigger another refresh and could immediately undo fail-closed UI.
     setTopicDraft("");
   }, []);
+  const clearPrivateWorkspace = useCallback(() => {
+    // Also fence late reads from a request whose identity is no longer valid.
+    requests.current++;
+    setSession(null);
+    resetWorkspace();
+  }, [resetWorkspace]);
 
   const refresh = useCallback(
     async (canVerify: () => boolean = () => true) => {
@@ -133,6 +140,12 @@ export function HubApp() {
       try {
         const nextSession = await client.getSession();
         if (request !== requests.current) return false;
+        // A different person: clear the previous actor's workspace now, before waiting for the new overview.
+        // This keeps this refresh's own generation, so the new overview can still land; older reads stay fenced.
+        if (nextSession.authenticated && shownActor.current !== null && shownActor.current !== nextSession.actor) {
+          resetWorkspace();
+          setLoading(true);
+        }
         setSession(nextSession);
         if (!nextSession.authenticated) {
           clearPrivateWorkspace();
@@ -185,6 +198,7 @@ export function HubApp() {
           client.getEventsStatus(),
         ]);
         if (request !== requests.current) return false;
+        shownActor.current = nextSession.actor ?? null;
         setData(overview);
         setAgents(overview.agents);
         agentReader.current?.seed();
@@ -206,7 +220,7 @@ export function HubApp() {
         if (request === requests.current) setLoading(false);
       }
     },
-    [client, topic, demo, clearPrivateWorkspace],
+    [client, topic, demo, clearPrivateWorkspace, resetWorkspace],
   );
   useEffect(() => {
     if (demo) return;
