@@ -1,10 +1,13 @@
 # Revocable agent connections: staging pilot
 
 This optional identity foundation gives each approved agent installation its own
-credential and short-lived sessions. It is disabled by default. It does not yet
-move existing Hub tasks, project permissions, agent seats or automatic chat wake
-onto those identities. Existing family tokens and tools keep their existing
-behavior; new session credentials cannot use those legacy tools.
+credential and short-lived sessions. It is disabled by default. Existing family
+tokens and tools keep their existing behavior; session credentials cannot use
+generic legacy tools. The separate, default-disabled [session Hub authorization
+bridge](session-hub-authorization-bridge.md) can grant an installation a finite
+set of Hub metadata capabilities for explicitly selected projects. Connection
+approval alone grants no Hub rights. Execution, generic legacy access and
+automatic chat wake remain separate and unavailable through that bridge.
 
 ## Operator setup
 
@@ -52,10 +55,11 @@ to an interactive login page: the helper intentionally refuses redirects.
 
 On the PC running the agent, choose a private profile directory. An installation
 running Codex and one running Claude use separate profiles, even on the same PC.
-Run the installed staging helper locally, for example:
+Run the staging helper locally, for example using an absolute path to the
+reviewed `agent_session_client.py` file and an installed Python interpreter:
 
 ```powershell
-python -m agent_message_bus.agent_session_client --profile-dir "$env:LOCALAPPDATA/EH-Staging/Codex" enroll --origin https://STAGING-HUB --family codex --name "Codex on processing PC" --host-label processing-pc
+& 'C:/Example/Python/python.exe' 'C:/Example/Engineering-Hub/src/agent_message_bus/agent_session_client.py' --profile-dir 'C:/Example/EH-Staging/Codex' enroll --origin https://STAGING-HUB --family codex --name "Codex on processing PC" --host-label processing-pc
 ```
 
 The helper creates the installation secret locally and sends only its SHA-256
@@ -84,7 +88,7 @@ Windows acceptance check; Linux fixture success does not prove it.
 After approval, create a named local session:
 
 ```powershell
-python -m agent_message_bus.agent_session_client --profile-dir "$env:LOCALAPPDATA/EH-Staging/Codex" connect --session treedar-test --label "TreeDAR staging test"
+& 'C:/Example/Python/python.exe' 'C:/Example/Engineering-Hub/src/agent_message_bus/agent_session_client.py' --profile-dir 'C:/Example/EH-Staging/Codex' connect --session treedar-test --label "TreeDAR staging test"
 ```
 
 This stores the short-lived session credential privately and prints only session
@@ -93,22 +97,59 @@ the app's private credential-helper pipe to invoke the helper's `headers` comman
 with this same profile and session name. Its stdout contains the bearer header
 for the connector; do not paste or record that output in a chat or review.
 
-For a new locally connected Codex HTTP MCP entry, the documented setting is
-`http_headers_helper`: a local command returning a JSON header map. Configure
-the new entry with the staging MCP URL and an absolute interpreter/helper path.
+The following paths, names and origin are illustrative placeholders, not accepted
+installation paths. Replace them with the actual absolute paths, staging origin,
+profile and session on that PC. These examples use paths without spaces; verify
+quoting with the installed client if actual paths contain spaces. Add only a new
+staging entry and preserve existing live entries. Do not run `headers` in a
+terminal or log its stdout: it contains the bearer credential and is intended
+only for the client's private helper pipe.
+
+For a locally connected Codex HTTP MCP entry, the documented
+`http_headers_helper` is a command returning a JSON header map:
+
+```toml
+[mcp_servers.engineering_hub_staging]
+url = "https://STAGING-HUB/mcp"
+http_headers_helper = "C:/Example/Python/python.exe C:/Example/Engineering-Hub/src/agent_message_bus/agent_session_client.py --profile-dir C:/Example/EH-Staging/Codex headers --session treedar-test"
+```
+
 Do not copy explicit bearer or stored OAuth credentials from a production entry:
 those take precedence over a helper's Authorization header. Codex caches headers
-per connection; this helper deliberately does not renew a revoked session.
-See the [official MCP configuration documentation](https://learn.chatgpt.com/docs/extend/mcp).
-Verify support in the installed client and Windows DPAPI before claiming real-PC
-acceptance. The existing legacy notification connector does not yet consume
-these installation mailboxes.
+per connection. See the [official MCP configuration documentation](https://learn.chatgpt.com/docs/extend/mcp).
+
+For Claude Code, use a separate Claude profile and session: enroll that profile
+with `--family claude`, then run `connect` with the same profile directory.
+Its documented HTTP `headersHelper` accepts the same JSON
+header map. This example shows a new entry in an MCP configuration JSON object:
+
+```json
+{
+  "mcpServers": {
+    "engineering-hub-staging": {
+      "type": "http",
+      "url": "https://STAGING-HUB/mcp",
+      "headersHelper": "C:/Example/Python/python.exe C:/Example/Engineering-Hub/src/agent_message_bus/agent_session_client.py --profile-dir C:/Example/EH-Staging/Claude headers --session treedar-test"
+    }
+  }
+}
+```
+
+Claude Code runs this command in a shell, subject to its configuration scope and
+trust rules, and invokes it again on reconnect or an authentication retry. See
+the [official Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+Neither example establishes installed-client support or Windows current-user
+DPAPI acceptance; both require real-PC verification. The existing legacy
+notification connector does not yet consume these installation mailboxes.
 
 The header helper does not silently exchange a new session after expiry or
-revocation. Reconnect explicitly with a new local session name when intended.
+revocation. Sessions last at most fifteen minutes; this is not a permanent
+sign-in. Connect explicitly with a new local session name, update that entry's
+helper command to use it, and reconnect the client when intended.
 The new `session_*` MCP tools provide identity, peer discovery and isolated
-installation mailboxes. They do not grant existing Hub tool, execution or project
-access. Native automatic wake into a desktop chat is a separate integration.
+installation mailboxes. The optional bridge grants only its explicitly selected
+Hub metadata capabilities and projects; it does not grant execution or generic
+legacy tools. Native automatic wake into a desktop chat is a separate integration.
 
 ## Revocation test
 
