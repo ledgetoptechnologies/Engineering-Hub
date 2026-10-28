@@ -1,0 +1,886 @@
+{
+  "absent_grant": {
+    "approved_at": null,
+    "approved_by": null,
+    "capabilities": [],
+    "effective": {
+      "capabilities": [],
+      "expires_at": null,
+      "projects": [],
+      "reason": "grant_absent",
+      "state": "absent"
+    },
+    "expires_at": null,
+    "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+    "projects": [],
+    "revision": 0,
+    "state": "absent"
+  },
+  "active_claims": {
+    "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+    "items": [
+      {
+        "claim_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+        "claim_state": "active",
+        "recovery": {
+          "reason": "claim_session_active",
+          "state": "blocked",
+          "target_session_ids": []
+        },
+        "task": {
+          "candidate_commit": null,
+          "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+          "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+          "owner_family": "codex",
+          "owner_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+          "project": "engineering-hub",
+          "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+          "proposed_family": "codex",
+          "repair_count": 0,
+          "review": null,
+          "revision": 2,
+          "scope": "staging",
+          "status": "claimed",
+          "title": "Transport task",
+          "updated_at": "2026-10-28T00:54:59.109439+00:00"
+        }
+      }
+    ],
+    "next_after": null
+  },
+  "active_grant": {
+    "approved_at": "2023-11-14T22:13:20Z",
+    "approved_by": "human:42",
+    "capabilities": [
+      "component.read",
+      "component.write",
+      "decision.request",
+      "entity.withdraw",
+      "planning.read",
+      "planning.write",
+      "project.read",
+      "task.candidate",
+      "task.claim",
+      "task.propose",
+      "task.read",
+      "task.review"
+    ],
+    "effective": {
+      "capabilities": [
+        "component.read",
+        "component.write",
+        "decision.request",
+        "entity.withdraw",
+        "planning.read",
+        "planning.write",
+        "project.read",
+        "task.candidate",
+        "task.claim",
+        "task.propose",
+        "task.read",
+        "task.review"
+      ],
+      "expires_at": "2023-11-15T22:13:20Z",
+      "projects": [
+        "engineering-hub"
+      ],
+      "reason": "authorized",
+      "state": "active"
+    },
+    "expires_at": "2023-11-15T22:13:20Z",
+    "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+    "projects": [
+      "engineering-hub"
+    ],
+    "revision": 1,
+    "state": "active"
+  },
+  "active_projects": {
+    "items": [
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "3d-viewer",
+        "lead_agent": null,
+        "name": "3D Viewer",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "engineering-hub",
+        "lead_agent": null,
+        "name": "Engineering Hub",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "ledge-top-ops",
+        "lead_agent": null,
+        "name": "LedgeTop Ops",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "project-alpha",
+        "lead_agent": null,
+        "name": "Project Alpha",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "treedar",
+        "lead_agent": null,
+        "name": "TreeDar",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      }
+    ]
+  },
+  "audit": {
+    "events": [
+      {
+        "action": "hub_grant.revoked",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 11,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "session.revoked",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 10,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f"
+      },
+      {
+        "action": "session.issued",
+        "actor": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 9,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": "8c4d5738-906e-4851-8419-f389367f9ed0"
+      },
+      {
+        "action": "hub_grant.updated",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 8,
+        "installation_id": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "session.issued",
+        "actor": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 7,
+        "installation_id": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "message_id": null,
+        "session_id": "f5f63d81-7a1c-4ca6-b0f2-fc2cebe5a135"
+      },
+      {
+        "action": "installation.approved",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 6,
+        "installation_id": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "enrollment.requested",
+        "actor": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 5,
+        "installation_id": "7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "hub_grant.updated",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 4,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "session.issued",
+        "actor": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 3,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f"
+      },
+      {
+        "action": "installation.approved",
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 2,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "enrollment.requested",
+        "actor": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "at": "2023-11-14T22:13:20Z",
+        "id": 1,
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "message_id": null,
+        "session_id": null
+      }
+    ]
+  },
+  "candidate": {
+    "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_family": "codex",
+    "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+    "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "owner_family": "codex",
+    "owner_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+    "project": "engineering-hub",
+    "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "proposed_family": "codex",
+    "repair_count": 0,
+    "review": null,
+    "revision": 3,
+    "scope": "staging",
+    "status": "in_review",
+    "title": "Transport task",
+    "updated_at": "2026-10-28T00:54:59.156391+00:00"
+  },
+  "catalog": {
+    "capabilities": [
+      "component.read",
+      "component.write",
+      "decision.request",
+      "entity.withdraw",
+      "planning.read",
+      "planning.write",
+      "project.read",
+      "task.candidate",
+      "task.claim",
+      "task.propose",
+      "task.read",
+      "task.review"
+    ],
+    "enabled": true,
+    "features": {
+      "task_recovery": true
+    }
+  },
+  "gateway": {
+    "absent_grant": {
+      "approved_at": null,
+      "approved_by": null,
+      "capabilities": [],
+      "effective": {
+        "capabilities": [],
+        "expires_at": null,
+        "projects": [],
+        "reason": "grant_absent",
+        "state": "absent"
+      },
+      "expires_at": null,
+      "installation_id": "594c53ec-14ac-4523-930e-9d7b05536786",
+      "projects": [],
+      "revision": 0,
+      "state": "absent"
+    },
+    "active_grant": {
+      "approved_at": "2023-11-14T22:13:20Z",
+      "approved_by": "human:42",
+      "capabilities": [
+        "project.read"
+      ],
+      "effective": {
+        "capabilities": [
+          "project.read"
+        ],
+        "expires_at": "2023-11-14T22:14:20Z",
+        "projects": [
+          "engineering-hub"
+        ],
+        "reason": "authorized",
+        "state": "active"
+      },
+      "expires_at": "2023-11-14T22:14:20Z",
+      "installation_id": "594c53ec-14ac-4523-930e-9d7b05536786",
+      "projects": [
+        "engineering-hub"
+      ],
+      "revision": 1,
+      "state": "active"
+    },
+    "catalog": {
+      "capabilities": [
+        "component.read",
+        "component.write",
+        "decision.request",
+        "entity.withdraw",
+        "planning.read",
+        "planning.write",
+        "project.read",
+        "task.candidate",
+        "task.claim",
+        "task.propose",
+        "task.read",
+        "task.review"
+      ],
+      "enabled": true,
+      "features": {
+        "task_recovery": true
+      }
+    },
+    "scope": "in_process_public_private_gateway_synthetic_Access_verifier"
+  },
+  "installation_review": {
+    "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_family": "codex",
+    "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+    "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "owner_family": "codex",
+    "owner_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+    "project": "engineering-hub",
+    "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "proposed_family": "codex",
+    "repair_count": 0,
+    "review": {
+      "actor": "installation:7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "family": "claude",
+      "verdict": "approve"
+    },
+    "revision": 4,
+    "scope": "staging",
+    "status": "verified",
+    "title": "Transport task",
+    "updated_at": "2026-10-28T00:54:59.167673+00:00"
+  },
+  "mcp_component": {
+    "created_at": "2026-10-28T00:54:59.113922+00:00",
+    "created_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "description": "",
+    "id": "0275c5c0-f2e5-4f26-ab01-837583357f5c",
+    "kind": "other",
+    "legacy_project_id": null,
+    "name": "Transport",
+    "package_url": null,
+    "project": "engineering-hub",
+    "repository_url": null,
+    "revision": 1,
+    "slug": "transport",
+    "status": "planned",
+    "updated_at": "2026-10-28T00:54:59.113931+00:00"
+  },
+  "mcp_planning": {
+    "advisory": true,
+    "content": "Synthetic",
+    "created_at": "2026-10-28T00:54:59.117802Z",
+    "created_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "execution_authorization": false,
+    "item_id": "item",
+    "kind": "plan",
+    "path": "planning/topics/synthetic/plan/item.json",
+    "project": "engineering-hub",
+    "scope": "topic",
+    "sha256": "c4e051ac817d3c11037018ffb2cd179a6af4d749b3cb23f8a399ec0083be892d",
+    "status": "proposed",
+    "title": "Plan",
+    "topic": "synthetic",
+    "updated_at": "2026-10-28T00:54:59.117802Z",
+    "updated_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "version": 1
+  },
+  "mcp_project_list": {
+    "items": [
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "engineering-hub",
+        "lead_agent": null,
+        "name": "Engineering Hub",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      }
+    ]
+  },
+  "mcp_withdrawn_decision": {
+    "answer": null,
+    "execution_authorization": false,
+    "id": "58f9bcf4-3af3-49de-8a53-d7443c481940",
+    "options": [
+      "A",
+      "B"
+    ],
+    "project": "engineering-hub",
+    "protected": false,
+    "revision": 2,
+    "status": "withdrawn",
+    "superseded_by": null,
+    "title": "Synthetic decision",
+    "updated_at": "2026-10-28T00:54:59.149928+00:00",
+    "withdrawn_at": "2026-10-28T00:54:59.149921+00:00",
+    "withdrawn_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+    "withdrawn_family": "codex",
+    "withdrawn_reason": "Synthetic withdrawal",
+    "withdrawn_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f"
+  },
+  "overview": {
+    "agents": [
+      {
+        "chat_readiness": "unverified",
+        "connection": {
+          "active_streams": 0,
+          "inbox_subscriptions": 0,
+          "last_stream_write_at": null,
+          "native_push_available": false,
+          "observed_at": "2026-10-28T00:54:59.135023Z",
+          "scope": "this_server_process",
+          "source": "embedded_bus",
+          "stale_streams": 0,
+          "state": "not_observed",
+          "subscribed": false,
+          "valid_until": "2026-10-28T00:55:29.135023Z"
+        },
+        "id": "hermes",
+        "reason": "live_presence_adapter_not_configured",
+        "transport": "unknown"
+      },
+      {
+        "chat_readiness": "unverified",
+        "connection": {
+          "active_streams": 0,
+          "inbox_subscriptions": 0,
+          "last_stream_write_at": null,
+          "native_push_available": false,
+          "observed_at": "2026-10-28T00:54:59.135023Z",
+          "scope": "this_server_process",
+          "source": "embedded_bus",
+          "stale_streams": 0,
+          "state": "not_observed",
+          "subscribed": false,
+          "valid_until": "2026-10-28T00:55:29.135023Z"
+        },
+        "id": "codex",
+        "reason": "live_presence_adapter_not_configured",
+        "transport": "unknown"
+      },
+      {
+        "chat_readiness": "unverified",
+        "connection": {
+          "active_streams": 0,
+          "inbox_subscriptions": 0,
+          "last_stream_write_at": null,
+          "native_push_available": false,
+          "observed_at": "2026-10-28T00:54:59.135023Z",
+          "scope": "this_server_process",
+          "source": "embedded_bus",
+          "stale_streams": 0,
+          "state": "not_observed",
+          "subscribed": false,
+          "valid_until": "2026-10-28T00:55:29.135023Z"
+        },
+        "id": "claude",
+        "reason": "live_presence_adapter_not_configured",
+        "transport": "unknown"
+      }
+    ],
+    "autonomy": {
+      "configured": false,
+      "receipts": [],
+      "running": false,
+      "state": "disabled"
+    },
+    "capabilities": {
+      "container_pilot_dispatch": false,
+      "fixture_dispatch": false,
+      "github_merge": false,
+      "host_dispatch": false,
+      "infrastructure": false,
+      "merge_gate_strength": "not_enforced",
+      "processing": false,
+      "production": false
+    },
+    "decisions": [],
+    "image_versions": {
+      "advisory_only": true,
+      "configured": false,
+      "items": [],
+      "reason": "not_configured",
+      "report_updated_at": null,
+      "reported_by": null,
+      "source": "agent_observation_report"
+    },
+    "paused": false,
+    "projects": [
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "3d-viewer",
+        "lead_agent": null,
+        "name": "3D Viewer",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "engineering-hub",
+        "lead_agent": null,
+        "name": "Engineering Hub",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "ledge-top-ops",
+        "lead_agent": null,
+        "name": "LedgeTop Ops",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "project-alpha",
+        "lead_agent": null,
+        "name": "Project Alpha",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      },
+      {
+        "archived": false,
+        "created_at": "2026-10-28T00:54:59.010887+00:00",
+        "description": "",
+        "environment": "staging",
+        "executor_enabled": false,
+        "health": "unknown",
+        "id": "treedar",
+        "lead_agent": null,
+        "name": "TreeDar",
+        "parent_project": null,
+        "reason": "inventory_and_acceptance_required",
+        "repository_url": null,
+        "revision": 1,
+        "status": "on_track",
+        "updated_at": "2026-10-28T00:54:59.010887+00:00"
+      }
+    ],
+    "runs": [],
+    "tasks": [
+      {
+        "candidate_commit": null,
+        "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+        "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+        "owner_family": "codex",
+        "owner_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+        "project": "engineering-hub",
+        "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+        "proposed_family": "codex",
+        "repair_count": 0,
+        "review": null,
+        "revision": 2,
+        "scope": "staging",
+        "state_since": "2026-10-28T00:54:59.109439+00:00",
+        "status": "claimed",
+        "title": "Transport task",
+        "updated_at": "2026-10-28T00:54:59.109439+00:00"
+      }
+    ]
+  },
+  "recoverable_claims": {
+    "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+    "items": [
+      {
+        "claim_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+        "claim_state": "revoked",
+        "recovery": {
+          "reason": "ready",
+          "state": "recoverable",
+          "target_session_ids": [
+            "8c4d5738-906e-4851-8419-f389367f9ed0"
+          ]
+        },
+        "task": {
+          "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "candidate_family": "codex",
+          "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+          "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+          "owner_family": "codex",
+          "owner_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+          "project": "engineering-hub",
+          "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+          "proposed_family": "codex",
+          "repair_count": 0,
+          "review": {
+            "actor": "installation:7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+            "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "family": "claude",
+            "verdict": "approve"
+          },
+          "revision": 4,
+          "scope": "staging",
+          "status": "verified",
+          "title": "Transport task",
+          "updated_at": "2026-10-28T00:54:59.167673+00:00"
+        }
+      }
+    ],
+    "next_after": null
+  },
+  "recovery": {
+    "recovery": {
+      "actor": "human:42",
+      "at": "2023-11-14T22:13:20Z",
+      "family": "codex",
+      "id": "1a4cf967-1f0f-4b88-ae61-a12393467469",
+      "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+      "prior_candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "prior_review": {
+        "actor": "installation:7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "family": "claude",
+        "verdict": "approve"
+      },
+      "prior_revision": 4,
+      "prior_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+      "reason": "Synthetic owner recovery",
+      "resulting_revision": 5,
+      "target_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+      "task_id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c"
+    },
+    "replayed": false,
+    "task": {
+      "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_family": "codex",
+      "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+      "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "owner_family": "codex",
+      "owner_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+      "project": "engineering-hub",
+      "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "proposed_family": "codex",
+      "repair_count": 0,
+      "review": null,
+      "revision": 5,
+      "scope": "staging",
+      "status": "claimed",
+      "title": "Transport task",
+      "updated_at": "2026-10-28T00:54:59.182969+00:00"
+    }
+  },
+  "recovery_history": {
+    "recoveries": [
+      {
+        "actor": "human:42",
+        "at": "2023-11-14T22:13:20Z",
+        "family": "codex",
+        "id": "1a4cf967-1f0f-4b88-ae61-a12393467469",
+        "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+        "prior_candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "prior_review": {
+          "actor": "installation:7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "family": "claude",
+          "verdict": "approve"
+        },
+        "prior_revision": 4,
+        "prior_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+        "reason": "Synthetic owner recovery",
+        "resulting_revision": 5,
+        "target_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+        "task_id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c"
+      }
+    ],
+    "task": {
+      "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_family": "codex",
+      "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+      "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "owner_family": "codex",
+      "owner_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+      "project": "engineering-hub",
+      "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "proposed_family": "codex",
+      "repair_count": 0,
+      "review": null,
+      "revision": 5,
+      "scope": "staging",
+      "status": "claimed",
+      "title": "Transport task",
+      "updated_at": "2026-10-28T00:54:59.182969+00:00"
+    }
+  },
+  "recovery_replay": {
+    "recovery": {
+      "actor": "human:42",
+      "at": "2023-11-14T22:13:20Z",
+      "family": "codex",
+      "id": "1a4cf967-1f0f-4b88-ae61-a12393467469",
+      "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+      "prior_candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "prior_review": {
+        "actor": "installation:7a207d88-1538-4f43-a93c-dd17b78d7c2a",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "family": "claude",
+        "verdict": "approve"
+      },
+      "prior_revision": 4,
+      "prior_session_id": "0419ff81-b14c-412f-99a5-25cbe4e8923f",
+      "reason": "Synthetic owner recovery",
+      "resulting_revision": 5,
+      "target_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+      "task_id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c"
+    },
+    "replayed": true,
+    "task": {
+      "candidate_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_family": "codex",
+      "id": "0b502438-7dfe-40eb-a5e1-dcfd561e458c",
+      "owner": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "owner_family": "codex",
+      "owner_session_id": "8c4d5738-906e-4851-8419-f389367f9ed0",
+      "project": "engineering-hub",
+      "proposed_by": "installation:88736abd-2738-408e-809e-d96677dc9b2e",
+      "proposed_family": "codex",
+      "repair_count": 0,
+      "review": null,
+      "revision": 5,
+      "scope": "staging",
+      "status": "claimed",
+      "title": "Transport task",
+      "updated_at": "2026-10-28T00:54:59.182969+00:00"
+    }
+  },
+  "revoked_grant": {
+    "approved_at": "2023-11-14T22:13:20Z",
+    "approved_by": "human:42",
+    "capabilities": [
+      "component.read",
+      "component.write",
+      "decision.request",
+      "entity.withdraw",
+      "planning.read",
+      "planning.write",
+      "project.read",
+      "task.candidate",
+      "task.claim",
+      "task.propose",
+      "task.read",
+      "task.review"
+    ],
+    "effective": {
+      "capabilities": [],
+      "expires_at": null,
+      "projects": [],
+      "reason": "owner_revoked",
+      "state": "revoked"
+    },
+    "expires_at": "2023-11-15T22:13:20Z",
+    "installation_id": "88736abd-2738-408e-809e-d96677dc9b2e",
+    "projects": [
+      "engineering-hub"
+    ],
+    "revision": 2,
+    "state": "revoked"
+  },
+  "schema": "session-hub-bridge-wire-v1"
+}

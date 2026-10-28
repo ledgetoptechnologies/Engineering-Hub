@@ -1,0 +1,115 @@
+{
+  "approved": {
+    "approved_at": "2026-10-27T23:00:00Z",
+    "approved_by": "human:42",
+    "created_at": "2026-10-27T23:00:00Z",
+    "expires_at": "2026-10-28T23:00:00Z",
+    "family": "codex",
+    "host_label": "fixture",
+    "id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+    "key_fingerprint": "18fab9cd3f43991e",
+    "name": "Synthetic processing PC",
+    "pairing_code": null,
+    "reason": null,
+    "revision": 2,
+    "revoked_at": null,
+    "revoked_by": null,
+    "state": "active"
+  },
+  "audit": {
+    "events": [
+      {
+        "action": "session.revoked",
+        "actor": "human:42",
+        "at": "2026-10-27T23:00:00Z",
+        "id": 4,
+        "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "message_id": null,
+        "session_id": "e93435b5-8776-4ff8-ba6c-8f099e8b7bd6"
+      },
+      {
+        "action": "session.issued",
+        "actor": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "at": "2026-10-27T23:00:00Z",
+        "id": 3,
+        "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "message_id": null,
+        "session_id": "e93435b5-8776-4ff8-ba6c-8f099e8b7bd6"
+      },
+      {
+        "action": "installation.approved",
+        "actor": "human:42",
+        "at": "2026-10-27T23:00:00Z",
+        "id": 2,
+        "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "message_id": null,
+        "session_id": null
+      },
+      {
+        "action": "enrollment.requested",
+        "actor": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "at": "2026-10-27T23:00:00Z",
+        "id": 1,
+        "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "message_id": null,
+        "session_id": null
+      }
+    ]
+  },
+  "capabilities": {
+    "enabled": true,
+    "environment": "staging",
+    "owner": true
+  },
+  "pending": {
+    "installations": [
+      {
+        "approved_at": null,
+        "approved_by": null,
+        "created_at": "2026-10-27T23:00:00Z",
+        "expires_at": "2026-10-27T23:10:00Z",
+        "family": "codex",
+        "host_label": "fixture",
+        "id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "key_fingerprint": "18fab9cd3f43991e",
+        "name": "Synthetic processing PC",
+        "pairing_code": "377995",
+        "reason": "awaiting_owner_approval",
+        "revision": 1,
+        "revoked_at": null,
+        "revoked_by": null,
+        "state": "pending"
+      }
+    ]
+  },
+  "revision_conflict": {
+    "detail": {
+      "code": "revision_conflict"
+    }
+  },
+  "revoked_session": {
+    "expires_at": "2026-10-27T23:15:00Z",
+    "id": "e93435b5-8776-4ff8-ba6c-8f099e8b7bd6",
+    "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+    "issued_at": "2026-10-27T23:00:00Z",
+    "label": "fixture session",
+    "last_used_at": null,
+    "revision": 2,
+    "state": "revoked"
+  },
+  "schema": "agent-connections-wire-v1",
+  "sessions": {
+    "sessions": [
+      {
+        "expires_at": "2026-10-27T23:15:00Z",
+        "id": "e93435b5-8776-4ff8-ba6c-8f099e8b7bd6",
+        "installation_id": "daa918b6-1f11-46d1-8211-6d6b483d4d6d",
+        "issued_at": "2026-10-27T23:00:00Z",
+        "label": "fixture session",
+        "last_used_at": null,
+        "revision": 1,
+        "state": "active"
+      }
+    ]
+  }
+}

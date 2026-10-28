@@ -2,6 +2,7 @@
  * What the staging PC is keeping for EH jobs, how long, and a two-step cleanup.
  * Removal only ever happens through a reviewed plan; protected and pinned items are never offered for removal.
  */
+import { actorName } from "./actors";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { HubApiError, type HubMode } from "./api";
 import {
@@ -76,13 +77,16 @@ const describe = (error: unknown) => error instanceof HubApiError
 // Only a lost sign-in clears the panel; a refusal of one action (not the owner, not allowed on this project) is explained instead.
 const refusals = new Set(["csrf_required", "staging_forbidden", "staging_admin_required", "staging_resource_not_owned"]);
 const isAuthLoss = (error: unknown) => error instanceof HubApiError && [401, 403].includes(error.status) && !refusals.has(error.code);
-const who = (actor: string) => names[actor as keyof typeof names] ?? (actor.startsWith("human:") ? "You" : actor);
+/** Who made a resource: "You" only for the signed-in person. */
+export const resourceMaker = (actor: string, viewer?: string | null) => actorName(actor, { viewer });
 
 export interface StagingResourcesPanelProps {
   mode: HubMode; source?: ResourceSource; csrf: string | null; writable: boolean; stale: boolean; refreshToken: unknown;
   projects: { id: string; name: string }[]; onUnauthorized: () => void; now?: () => Date;
+  /** The signed-in actor, so only their own resources read "You". */
+  viewerActor?: string | null;
 }
-export function StagingResourcesPanel({ mode, source: given, csrf, writable, stale, refreshToken, projects, onUnauthorized, now = () => new Date() }:
+export function StagingResourcesPanel({ mode, source: given, csrf, writable, stale, refreshToken, projects, onUnauthorized, now = () => new Date(), viewerActor }:
   StagingResourcesPanelProps) {
   const source = useMemo(() => given ?? (mode === "demo" ? demoSource() : csrf ? liveSource(csrf) : null), [given, mode, csrf]);
   const [project, setProject] = useState("");
@@ -220,7 +224,7 @@ export function StagingResourcesPanel({ mode, source: given, csrf, writable, sta
     {state !== "loaded" && <p role={state === "unknown" || state === "unavailable" ? "alert" : "status"}>{messages[state]}</p>}
     {state === "loaded" && visible.length === 0 && <p>Nothing is being kept{project ? ` for ${projectName(project)}` : ""}.</p>}
     {state === "loaded" && visible.length > 0 && <ul className="resource-list" aria-label="Kept items">
-      {visible.map(resource => <ResourceRow key={resource.id} resource={resource} now={now()} projectName={projectName(resource.project)}
+      {visible.map(resource => <ResourceRow key={resource.id} resource={resource} now={now()} viewer={viewerActor} projectName={projectName(resource.project)}
         disabled={!canWrite || busy !== null} busy={busy === resource.id}
         onExtend={() => void keep(resource, { mode: "until", until: extendedUntil(resource, now()), reason: "Kept 7 more days" },
           `${kindLabel(resource.kind)[0].toUpperCase()}${kindLabel(resource.kind).slice(1)} kept 7 more days.`)}
@@ -305,8 +309,8 @@ function StatusLine({ status }: { status: StagingStatus | "unknown" | "unsupport
   </div>;
 }
 
-function ResourceRow({ resource, now, projectName, disabled, busy, onExtend, onPin, onPreview, onRelease }: {
-  resource: StagingResource; now: Date; projectName: string; disabled: boolean; busy: boolean;
+function ResourceRow({ resource, now, projectName, disabled, busy, viewer, onExtend, onPin, onPreview, onRelease }: {
+  resource: StagingResource; now: Date; projectName: string; disabled: boolean; busy: boolean; viewer?: string | null;
   onExtend: () => void; onPin: () => void; onPreview: () => void; onRelease: () => void;
 }) {
   const previewable = resource.kind === "preview" && resource.state === "ready";
@@ -315,7 +319,7 @@ function ResourceRow({ resource, now, projectName, disabled, busy, onExtend, onP
   return <li className="resource-row" aria-label={`${label} for ${projectName}`}>
     <div className="resource-main">
       <strong>{label[0].toUpperCase() + label.slice(1)}</strong>
-      <small>{projectName} · made by {who(resource.created_by)} · {formatBytes(resource.size_bytes)}
+      <small>{projectName} · made by {resourceMaker(resource.created_by, viewer)} · {formatBytes(resource.size_bytes)}
         {resource.state !== "ready" ? ` · ${resource.state.replaceAll("_", " ")}` : ""}</small>
       {resource.protected.length > 0 && <small>Kept automatically: {resource.protected.map(item =>
         protectedLabel(item.reason) + (item.ref ? ` (${item.ref})` : "")).join(", ")}.</small>}

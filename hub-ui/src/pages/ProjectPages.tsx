@@ -1,3 +1,4 @@
+import { actorAvatar, actorFamily, actorName as nameOf, isInstallationActor } from "../actors";
 import { useEffect, useRef, useState } from "react";
 import { HubApiError } from "../api";
 import { describeVerb, readActivity, type ActivityItem } from "../activityApi";
@@ -36,7 +37,10 @@ export function projectStats(hub: Hub, id: string): ProjectStats {
   const times = [...tasks.map((task) => task.updated_at), ...hub.data.decisions.filter((d) => d.project === id).map((d) => d.updated_at)]
     .filter((value) => Number.isFinite(Date.parse(value)));
   const lastActivity = times.length ? times.reduce((a, b) => (Date.parse(a) > Date.parse(b) ? a : b)) : null;
-  const agents = [...new Set(tasks.flatMap((task) => [task.owner, task.proposed_by, task.review?.actor]).filter((a): a is NonNullable<typeof a> => !!a))];
+  // One avatar per agent family; an installation with no recorded family keeps its own entry.
+  const agents = [...new Set(tasks.flatMap((task) => [actorFamily(task.owner, task.owner_family) ?? task.owner,
+    actorFamily(task.proposed_by, task.proposed_family) ?? task.proposed_by, task.review ? actorFamily(task.review.actor) ?? task.review.actor : null])
+    .filter((a): a is string => !!a))];
   return { waiting, tasks, byStatus, lastActivity, agents, active: tasks.length - byStatus.verified };
 }
 
@@ -51,8 +55,9 @@ export function derivedStatus(stats: ProjectStats): { label: string; tone: strin
 function AgentStack({ agents }: { agents: string[] }) {
   if (!agents.length) return <span className="muted">—</span>;
   return (
-    <span className="agent-stack" title={agents.map((a) => names[a] ?? a).join(", ")}>
-      {agents.map((agent) => <span key={agent} className={`agent-avatar ${agent}`}>{(names[agent] ?? agent).charAt(0)}</span>)}
+    <span className="agent-stack" title={agents.map((a) => nameOf(a)).join(", ")}>
+      {agents.map((agent) => { const avatar = actorAvatar(agent);
+        return <span key={agent} className={`agent-avatar ${avatar.className}`}>{avatar.letter}</span>; })}
     </span>
   );
 }
@@ -147,11 +152,11 @@ function WorkBoard({ hub, tasks }: { hub: Hub; tasks: Task[] }) {
               {column.map((task) => (
                 <article key={task.id} className="board-card">
                   <strong>{task.title}</strong>
-                  <p>{waitingOn(task, (id) => names[id] ?? id)}</p>
+                  <p>{waitingOn(task, (id, family) => nameOf(id, { family, viewer: hub.session?.actor }))}</p>
                   <footer>
                     <span className="owner">
-                      <span className={`agent-avatar ${task.owner ?? ""}`}>{task.owner ? (names[task.owner] ?? "?").charAt(0) : "–"}</span>
-                      {task.owner ? names[task.owner] : "Unclaimed"}
+                      <span className={`agent-avatar ${actorAvatar(task.owner, task.owner_family).className}`}>{actorAvatar(task.owner, task.owner_family).letter}</span>
+                      {task.owner ? nameOf(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
                     </span>
                     <span className="muted" title={stateAge(task)}>{relativeAge(task.state_since) ?? ""}</span>
                   </footer>
@@ -262,7 +267,7 @@ function ActivityFeed({ hub, project, fallback }: { hub: Hub; project: string; f
 }
 
 const actorName = (actor: string, viewer?: string | null) =>
-  viewer && actor === viewer ? "You" : (names as Record<string, string>)[actor] ?? actorLabel(actor);
+  viewer && actor === viewer ? "You" : isInstallationActor(actor) ? nameOf(actor) : (names as Record<string, string>)[actor] ?? actorLabel(actor);
 
 export function ProjectPage({ hub, id, tab, actions, notesProps }: {
   hub: Hub; id: string; tab: ProjectTab; actions: React.ReactNode;

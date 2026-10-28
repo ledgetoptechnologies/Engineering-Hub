@@ -3,7 +3,8 @@ import { link } from "../router";
 import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
-import { Badge, names, pretty } from "../ui";
+import { actorAvatar, actorName } from "../actors";
+import { Badge, pretty } from "../ui";
 import { DetailsBlock } from "../DetailsBlock";
 import { canWithdrawTask } from "../withdrawn";
 import { WithdrawDialog } from "./Withdraw";
@@ -28,13 +29,13 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
         <span>
           <strong>{task.title}</strong>
           <small><a className="project-chip" href={link(`/projects/${task.project}`)}>{hub.projectName(task.project)}</a></small>
-          {task.scope === "staging" && task.proposed_by && <small>Staging proposal · {names[task.proposed_by]}</small>}
-          <small className="task-waiting">{waitingOn(task, (id) => names[id] ?? id)}</small>
+          {task.scope === "staging" && task.proposed_by && <small>Staging proposal · {actorName(task.proposed_by, { family: task.proposed_family, viewer: hub.session?.actor })}</small>}
+          <small className="task-waiting">{waitingOn(task, (id, family) => actorName(id, { family, viewer: hub.session?.actor }))}</small>
           <small title={task.state_since ?? undefined}>{stateAge(task)}</small>
         </span>
         <span className="owner">
-          <span className="mini-avatar">{task.owner?.charAt(0).toUpperCase() ?? "–"}</span>
-          {task.owner ? names[task.owner] : "Unclaimed"}
+          <span className="mini-avatar">{actorAvatar(task.owner, task.owner_family).letter}</span>
+          {task.owner ? actorName(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
         </span>
         <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
       </summary>
@@ -44,7 +45,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
         <p>
           Independent reviewer:{" "}
           <strong>
-            {task.review ? names[task.review.actor] : task.status === "in_review" ? "None assigned yet" : "Not requested yet"}
+            {task.review ? actorName(task.review.actor, { family: task.review.family, viewer: hub.session?.actor }) : task.status === "in_review" ? "None assigned yet" : "Not requested yet"}
           </strong>{" "}
           · Repairs used: {task.repair_count}/3
         </p>

@@ -1,4 +1,5 @@
 /** Withdrawing a superseded task or question, and the list of what was withdrawn. */
+import { actorName } from "../actors";
 import { useState, type FormEvent } from "react";
 import { link } from "../router";
 import type { Hub } from "../hub";
@@ -73,7 +74,7 @@ export function WithdrawnList({ hub, kind, project }: { hub: Hub; kind: "task" |
       <ul aria-label={`Withdrawn ${kind === "task" ? "tasks" : "questions"}`}>
         {items.map((item) => {
           const replacement = item.superseded_by ? lookup(item.superseded_by) : undefined;
-          const by = item.withdrawn_by ? names[item.withdrawn_by as keyof typeof names] ?? "You" : "Unknown";
+          const by = item.withdrawn_by ? actorName(item.withdrawn_by, { family: item.withdrawn_family, viewer: hub.session?.actor }) : "Unknown";
           return (
             <li key={item.id}>
               <strong>{item.title}</strong>
