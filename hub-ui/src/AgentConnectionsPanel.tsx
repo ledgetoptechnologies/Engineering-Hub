@@ -54,6 +54,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   // The Hub-access bridge is optional: absent or unclear, its section simply isn't offered.
   const [catalog, setCatalog] = useState<HubCatalog | null>(null);
   const [access, setAccess] = useState<string | null>(null);
+  const [accessEpoch, setAccessEpoch] = useState(0);
   const csrf = hub.session?.csrf_token ?? "";
   const canChange = !demo && hub.writable && !!csrf && capabilities?.owner === true;
   // Read again at submit time: a dialog opened while allowed must not act after sign-in, CSRF or ownership is lost.
@@ -75,7 +76,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   async function refresh(keepSessions = false) {
     if (demo) return;
     const current = ++generation.current, controller = new AbortController();
-    setFailure("");
+    setFailure(""); setAccessEpoch(value => value + 1);
     let probing = capabilities === null;
     try {
       const found = capabilities ?? await client.capabilities(controller.signal);
@@ -171,8 +172,10 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       <p className="panel-description">Each agent install on each computer has its own connection. A new install pairs by showing a code on
         that computer; you approve it here only if the code and fingerprint match. Revoking an install ends all its sessions; revoking one
         session leaves the install working. No passwords or tokens are shown on this page.</p>
-      <p className="notice">Staging only: this is the identity and messaging foundation. A connection approved here can send and receive its own
-        messages, but it can't use Hub tasks or reviews, and it doesn't wake an agent's chat automatically.</p>
+      {catalog ? <p className="notice">Staging only. A connection approved here can send and receive its own messages. It can use Hub tasks,
+        reviews and other project operations only where you grant them under Hub access. Running work and waking an agent's chat stay separate.</p>
+        : <p className="notice">Staging only: this is the identity and messaging foundation. A connection approved here can send and receive its own
+        messages, but it can't use Hub tasks or reviews, and it doesn't wake an agent's chat automatically.</p>}
       {demo && <p className="notice">Demo: these installations are examples. Nothing can be approved or revoked.</p>}
       {failure && <p role="alert" className="notice error">{failure}</p>}
       {notice && !dialog && <p role={notice.error ? "alert" : "status"} className={notice.error ? "notice error" : "notice"}>{notice.text}</p>}
@@ -223,7 +226,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                       onClick={() => setAccess(previous => previous === item.id ? null : item.id)}>{access === item.id ? "Hide Hub access" : "Hub access"}</button>}
                   </div>
                 </div>
-                {access === item.id && catalog && <InstallationHubAccess hub={hub} installation={item} catalog={catalog} client={grants}
+                {access === item.id && catalog && <InstallationHubAccess key={`${item.id}:${accessEpoch}`} hub={hub} installation={item} catalog={catalog} client={grants}
                   allowed={() => allowed.current} sessions={sessions[item.id]?.items} onDenied={denied} />}
                 {open === item.id && <SessionList installation={item} entry={sessions[item.id]} now={now}
                   canChange={canChange && item.state === "active"} busy={busy}

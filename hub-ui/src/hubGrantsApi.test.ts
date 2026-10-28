@@ -6,6 +6,7 @@ import wire from "./fixtures/agent-hub-bridge-wire-v1.json";
 import {
   grantFailureText, httpHubGrants, parseBridgeTask, parseCatalog, parseClaims, parseGrant, parseHistory, parseRecoveryResult,
 } from "./hubGrantsApi";
+import { resourceMaker } from "./StagingResourcesPanel";
 import type { Task } from "./types";
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -127,5 +128,48 @@ describe("installation reviews and withdrawals (fixture v2 provenance)", () => {
     expect(waitingOn(task, name)).toBe("Review passed by Claude on install 7a207d88. Running it is separate and needs its own authorization.");
     const decision = wire.mcp_withdrawn_decision;
     expect(actorName(decision.withdrawn_by, { family: decision.withdrawn_family, viewer: "human:42" })).toBe("Codex on install 88736abd");
+  });
+});
+
+describe("real task shapes beyond the fixture's happy path", () => {
+  const raw = wire.recoverable_claims.items[0];
+  const required = { id: raw.task.id, project: "engineering-hub", title: "Human-made task", status: "claimed", owner: raw.task.owner,
+    revision: 3, candidate_commit: null, review: null, repair_count: 0, updated_at: raw.task.updated_at };
+  it("accepts a human-created task later claimed by an installation, with no proposal or scope fields", () => {
+    const task = parseBridgeTask({ ...required, owner_family: "codex", owner_session_id: raw.claim_session_id });
+    expect(task).toMatchObject({ proposed_by: null, proposed_family: null, scope: null, owner_family: "codex" });
+  });
+  it("accepts a legacy-proposed task, rich context and a withdrawn record", () => {
+    expect(parseBridgeTask({ ...required, owner: "codex", proposed_by: "codex", scope: "staging" }).proposed_by).toBe("codex");
+    expect(() => parseBridgeTask({ ...required, details: "## Context\nLong notes", links: [{ label: "Spec", url: "https://example.test/spec" }],
+      state_since: raw.task.updated_at })).not.toThrow();
+    expect(parseBridgeTask({ ...required, status: "withdrawn", withdrawn_reason: "Superseded", superseded_by: null,
+      withdrawn_by: raw.task.owner, withdrawn_at: raw.task.updated_at, withdrawn_family: "codex", withdrawn_session_id: raw.claim_session_id }))
+      .toMatchObject({ withdrawn_by: raw.task.owner, withdrawn_family: "codex" });
+  });
+  it("still rejects fields the backend never sends", () => {
+    expect(() => parseBridgeTask({ ...required, owner_token: "x" })).toThrow(HubApiError);
+  });
+  it("shows a claim whose session can't be identified as blocked, never recoverable", () => {
+    const unknown = { task: { ...required }, claim_session_id: null, claim_state: "unknown",
+      recovery: { state: "blocked", reason: "invalid_claim_provenance", target_session_ids: [] } };
+    const page = parseClaims({ installation_id: installation, items: [unknown], next_after: null }, installation);
+    expect(page.items[0]).toMatchObject({ claim_session_id: null, claim_state: "unknown", recovery: { state: "blocked" } });
+    expect(() => parseClaims({ installation_id: installation, items: [{ ...unknown, recovery: { state: "recoverable", reason: "ready",
+      target_session_ids: [raw.recovery.target_session_ids[0]] } }], next_after: null }, installation)).toThrow(HubApiError);
+  });
+  it("parses recovery and history whose task has the minimal shape", () => {
+    const task = { ...required, id: taskId, owner_family: "codex", owner_session_id: wire.recovery.recovery.target_session_id };
+    expect(parseRecoveryResult({ ...wire.recovery, task }, taskId).task.title).toBe("Human-made task");
+    expect(parseHistory({ ...wire.recovery_history, task }, taskId).recoveries).toHaveLength(1);
+  });
+});
+
+describe("staging resource maker", () => {
+  it("only says You for the viewer", () => {
+    expect(resourceMaker("human:42", "human:42")).toBe("You");
+    expect(resourceMaker("human:7", "human:42")).toBe("A person");
+    expect(resourceMaker(`installation:${installation}`, "human:42")).not.toBe("You");
+    expect(resourceMaker("codex", "human:42")).toBe("Codex");
   });
 });

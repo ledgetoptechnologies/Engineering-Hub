@@ -252,7 +252,7 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
         <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
           csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
           projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
-          onUnauthorized={hub.clearPrivateWorkspace} />
+          viewerActor={hub.session?.actor ?? null} onUnauthorized={hub.clearPrivateWorkspace} />
       </div>
     </>
   );

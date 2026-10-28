@@ -32,9 +32,11 @@ export interface BridgeTask {
   owner: string | null; owner_family: Agent | null; owner_session_id: string | null; revision: number;
   candidate_commit: string | null; candidate_family: Agent | null; review: BridgeReview | null; repair_count: number;
   scope: "staging" | null; proposed_by: string | null; proposed_family: Agent | null; updated_at: string;
+  withdrawn_by: string | null; withdrawn_family: Agent | null;
 }
 export interface Claim {
-  task: BridgeTask; claim_session_id: string; claim_state: "active" | "revoked" | "expired";
+  /** null with claim_state "unknown": the claim's session can't be identified, so it is shown read-only. */
+  task: BridgeTask; claim_session_id: string | null; claim_state: "active" | "revoked" | "expired" | "unknown";
   recovery: { state: "recoverable" | "blocked"; reason: string; target_session_ids: string[] };
 }
 export interface ClaimsPage { installation_id: string; items: Claim[]; next_after: string | null }
@@ -114,29 +116,41 @@ function parseReview(value: unknown): BridgeReview {
   return { actor: str(actorPattern)(row.actor), commit: str(commit)(row.commit), verdict: oneOf(["approve", "reject"] as const)(row.verdict),
     family: optional(row, "family", family) };
 }
-const TASK_KEYS = ["id", "project", "title", "status", "owner", "owner_family", "owner_session_id", "revision", "candidate_commit",
-  "review", "repair_count", "scope", "proposed_by", "proposed_family", "updated_at"] as const;
+/** Always present on a task (TaskDTO's required fields). */
+const TASK_KEYS = ["id", "project", "title", "status", "owner", "revision", "candidate_commit", "review", "repair_count", "updated_at"] as const;
+/** Present only on some tasks: proposals, installation provenance, context and withdrawal records. */
+const TASK_OPTIONAL = ["scope", "proposed_by", "proposed_family", "owner_session_id", "owner_family", "candidate_family", "state_since",
+  "details", "links", "withdrawn_reason", "superseded_by", "withdrawn_by", "withdrawn_at", "withdrawn_family", "withdrawn_session_id"] as const;
+function parseLinks(value: unknown): { label: string; url: string }[] {
+  return list(value, item => { const row = record(item, ["label", "url"]); return { label: text(200)(row.label), url: text(2048)(row.url) }; }, 20, false);
+}
 export function parseBridgeTask(value: unknown): BridgeTask {
-  const row = record(value, TASK_KEYS, ["candidate_family", "state_since"]);
+  const row = record(value, TASK_KEYS, TASK_OPTIONAL);
+  // Context fields are checked for shape but not kept: this page doesn't show them.
+  optional(row, "details", text(20000)); optional(row, "links", parseLinks); optional(row, "state_since", time);
+  optional(row, "withdrawn_reason", text(500)); optional(row, "superseded_by", str(uuid)); optional(row, "withdrawn_at", time);
+  optional(row, "withdrawn_session_id", str(uuid));
   return { id: str(uuid)(row.id), project: str(projectId)(row.project), title: text(200)(row.title),
     status: oneOf(["assigned", "claimed", "in_review", "verified", "withdrawn"] as const)(row.status),
-    owner: nullable(row.owner, str(actorPattern)), owner_family: nullable(row.owner_family, family),
-    owner_session_id: nullable(row.owner_session_id, str(uuid)), revision: count(1)(row.revision),
+    owner: nullable(row.owner, str(actorPattern)), owner_family: optional(row, "owner_family", family),
+    owner_session_id: optional(row, "owner_session_id", str(uuid)), revision: count(1)(row.revision),
     candidate_commit: nullable(row.candidate_commit, str(commit)), candidate_family: optional(row, "candidate_family", family),
     review: nullable(row.review, parseReview), repair_count: count(0)(row.repair_count),
-    scope: nullable(row.scope, oneOf(["staging"] as const)), proposed_by: nullable(row.proposed_by, str(actorPattern)),
-    proposed_family: nullable(row.proposed_family, family), updated_at: time(row.updated_at) };
+    scope: optional(row, "scope", oneOf(["staging"] as const)), proposed_by: optional(row, "proposed_by", str(actorPattern)),
+    proposed_family: optional(row, "proposed_family", family), updated_at: time(row.updated_at),
+    withdrawn_by: optional(row, "withdrawn_by", str(actorPattern)), withdrawn_family: optional(row, "withdrawn_family", family) };
 }
 function parseClaim(value: unknown): Claim {
   const row = record(value, ["task", "claim_session_id", "claim_state", "recovery"]);
   const recovery = record(row.recovery, ["state", "reason", "target_session_ids"]);
-  const claim: Claim = { task: parseBridgeTask(row.task), claim_session_id: str(uuid)(row.claim_session_id),
-    claim_state: oneOf(["active", "revoked", "expired"] as const)(row.claim_state),
+  const claim: Claim = { task: parseBridgeTask(row.task), claim_session_id: nullable(row.claim_session_id, str(uuid)),
+    claim_state: oneOf(["active", "revoked", "expired", "unknown"] as const)(row.claim_state),
     recovery: { state: oneOf(["recoverable", "blocked"] as const)(recovery.state), reason: str(/^[a-z][a-z0-9_]{0,63}$/)(recovery.reason),
       target_session_ids: list(recovery.target_session_ids, str(uuid), 16) } };
   // A target is offered only when recovery is allowed, and never the session that holds the claim.
   if ((claim.recovery.state === "recoverable") !== (claim.recovery.target_session_ids.length > 0)
-      || claim.recovery.target_session_ids.includes(claim.claim_session_id)) return invalid();
+      || (claim.claim_session_id !== null && claim.recovery.target_session_ids.includes(claim.claim_session_id))
+      || (claim.recovery.state === "recoverable" && (claim.claim_session_id === null || claim.claim_state === "unknown"))) return invalid();
   return claim;
 }
 export function parseClaims(value: unknown, installationId: string): ClaimsPage {
@@ -216,6 +230,10 @@ const RECOVERY_BLOCK: Record<string, string> = {
   no_live_session: "This installation has no live session to hand it to.",
   hub_grant_required: "This installation needs Hub access to claim tasks in this project first.",
   hub_capability_forbidden: "This installation needs the Claim tasks right for this project first.",
+  invalid_claim_provenance: "Who holds this claim can't be confirmed, so it can't be handed over here.",
+  task_state_ineligible: "This task isn't in a state that can be handed over.",
+  no_authorized_target: "No live session of this installation has Hub access to claim tasks in this project.",
+  recovery_history_full: "This task has reached its limit of recorded hand-overs.",
 };
 export const recoveryBlockText = (reason: string) => RECOVERY_BLOCK[reason] ?? `Can't be handed over right now (${reason.replaceAll("_", " ")}).`;
 

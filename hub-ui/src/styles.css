@@ -4192,3 +4192,4 @@ button.primary.danger { color: #fff; background: #a3402f; border-color: #a3402f;
   .hub-access-rights ul { columns: 1; }
   .hub-claim-list > li { grid-template-columns: 1fr; }
 }
+.recovery-ids code { font-size: 11px; overflow-wrap: anywhere; }

@@ -44,7 +44,8 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
   const projectName = (id: string) => hub.data.projects.find(project => project.id === id)?.name ?? id;
   const activeProjects = hub.data.projects.filter(project => !project.archived);
   const viewer = hub.session?.actor;
-  const sessionName = (id: string) => {
+  const sessionName = (id: string | null) => {
+    if (id === null) return "an unknown session";
     const session = sessions?.find(item => item.id === id);
     return session?.label ? `${session.label} (${short(id)})` : `Session ${short(id)}`;
   };
@@ -156,9 +157,11 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
       {editing && <form className="hub-access-form" aria-label="Hub access choices" onSubmit={event => { event.preventDefault(); void save(); }}>
         <fieldset disabled={busy}>
           <legend>Projects it may work in</legend>
-          {activeProjects.slice(0, MAX_GRANT_PROJECTS).map(project => <label key={project.id} className="checkbox-field">
-            <input type="checkbox" checked={editing.projects.includes(project.id)}
-              onChange={() => setEditing({ ...editing, projects: toggle(editing.projects, project.id) })} />{project.name}</label>)}
+          {editing.projects.length >= MAX_GRANT_PROJECTS && <p className="panel-footnote">At most {MAX_GRANT_PROJECTS} projects per grant.</p>}
+          {activeProjects.map(project => { const chosen = editing.projects.includes(project.id);
+            return <label key={project.id} className="checkbox-field">
+              <input type="checkbox" checked={chosen} disabled={!chosen && editing.projects.length >= MAX_GRANT_PROJECTS}
+                onChange={() => setEditing({ ...editing, projects: toggle(editing.projects, project.id) })} />{project.name}</label>; })}
         </fieldset>
         <fieldset disabled={busy}>
           <legend>What it may do there</legend>
@@ -174,7 +177,8 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
         <p className="panel-footnote">It never lasts past the connection's own approval{installation.expires_at ? `, which ends ${exact(installation.expires_at)}` : ""}.
           This lets it act only through the rights above; it still can't run work, create projects or approve anything.</p>
         <div className="note-actions">
-          <button className="primary small" disabled={!canChange || busy || !editing.projects.length || !editing.capabilities.length}>
+          <button className="primary small" disabled={!canChange || busy || !editing.projects.length || !editing.capabilities.length
+            || editing.projects.length > MAX_GRANT_PROJECTS}>
             {busy ? "Saving…" : "Save access"}</button>
           <button type="button" className="secondary small" disabled={busy} onClick={() => setEditing(null)}>Cancel</button>
         </div>
@@ -189,7 +193,7 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
       {claims.length > 0 && <ul className="hub-claim-list">{claims.map(claim => <li key={claim.task.id}>
         <div className="hub-claim-main"><strong>{claim.task.title}</strong>
           <span className="installation-meta">{projectName(claim.task.project)} · {claim.task.status.replace("_", " ")} · held by {sessionName(claim.claim_session_id)}
-            {" "}({claim.claim_state === "active" ? "live" : claim.claim_state})</span>
+            {" "}({claim.claim_state === "active" ? "live" : claim.claim_state === "unknown" ? "can't be confirmed" : claim.claim_state})</span>
           {claim.recovery.state === "blocked" && <span className="installation-meta">{recoveryBlockText(claim.recovery.reason)}</span>}</div>
         <div className="note-actions">
           {claim.recovery.state === "recoverable" && <button type="button" className="secondary small" disabled={!canChange || busy}
@@ -230,7 +234,7 @@ export function InstallationHubAccess({ hub, installation, catalog, client, allo
 
 function RecoverDialog({ claim, installation, canChange, busy, error, sessionName, viewer, onSubmit, onClose }: {
   claim: Claim; installation: Installation; canChange: boolean; busy: boolean; error: string; viewer?: string | null;
-  sessionName: (id: string) => string; onSubmit: (body: { expected_revision: number; target_session_id: string; reason: string; client_request_id: string }) => void;
+  sessionName: (id: string | null) => string; onSubmit: (body: { expected_revision: number; target_session_id: string; reason: string; client_request_id: string }) => void;
   onClose: () => void;
 }) {
   const [target, setTarget] = useState(claim.recovery.target_session_ids[0] ?? "");
@@ -248,10 +252,12 @@ function RecoverDialog({ claim, installation, canChange, busy, error, sessionNam
   return <Modal title={`Hand over “${claim.task.title}”?`} onClose={onClose}>
     <p>The session that claimed it has {claim.claim_state === "revoked" ? "been revoked" : "ended"}. This gives the task to another live
       session of the same installation, <strong>{installation.name}</strong>. It can't go to another computer or another agent.</p>
-    <dl className="properties">
-      <div><dt>From</dt><dd>{sessionName(claim.claim_session_id)} ({claim.claim_state})</dd></div>
-      <div><dt>To</dt><dd><select aria-label="Hand over to" value={target} onChange={event => setTarget(event.target.value)}>
-        {claim.recovery.target_session_ids.map(id => <option key={id} value={id}>{sessionName(id)}</option>)}</select></dd></div>
+    <dl className="properties recovery-ids">
+      <div><dt>Installation</dt><dd>{installation.name} <code aria-label="Installation id">{installation.id}</code></dd></div>
+      <div><dt>From</dt><dd>{sessionName(claim.claim_session_id)} ({claim.claim_state}) <code aria-label="From session id">{claim.claim_session_id}</code></dd></div>
+      <div><dt>To</dt><dd><select aria-label="Hand over to" value={target} onChange={event => { setTarget(event.target.value); setChecked(false); }}>
+        {claim.recovery.target_session_ids.map(id => <option key={id} value={id}>{sessionName(id)}</option>)}</select>
+        {" "}<code aria-label="To session id">{target}</code></dd></div>
       <div><dt>Candidate</dt><dd>{claim.task.candidate_commit ? <>Kept: <code>{claim.task.candidate_commit.slice(0, 12)}</code></> : "None submitted"}</dd></div>
       <div><dt>Review</dt><dd>{review ? `The current review (${review.verdict === "approve" ? "approved" : "rejected"} by ${actorName(review.actor, { family: review.family, viewer })}) is cleared and kept in the task's history.`
         : "No current review."}</dd></div>
@@ -272,7 +278,7 @@ function RecoverDialog({ claim, installation, canChange, busy, error, sessionNam
 }
 
 function RecoveryHistoryList({ entry, sessionName, viewer }: {
-  entry: { state: "loading" | "loaded" | "failed"; items: Recovery[] }; sessionName: (id: string) => string; viewer?: string | null;
+  entry: { state: "loading" | "loaded" | "failed"; items: Recovery[] }; sessionName: (id: string | null) => string; viewer?: string | null;
 }) {
   if (entry.state === "loading") return <p role="status">Reading history…</p>;
   if (entry.state === "failed") return <p role="alert" className="notice error">History couldn't be read. Open it again to retry.</p>;

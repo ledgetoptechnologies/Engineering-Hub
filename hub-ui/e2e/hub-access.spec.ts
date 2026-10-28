@@ -17,6 +17,7 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     failNext: null as null | { status: number; code: string } | "abort",
     recovered: false,
     extraTasks: [] as Record<string, unknown>[],
+    extraProjects: 0, holdGrant: false, grantReleases: [] as (() => void)[],
   };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
@@ -26,6 +27,8 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     if (path.endsWith("/overview")) {
       const overview = createDemoOverview();
       overview.tasks.push(...(state.extraTasks as never[]));
+      for (let index = 1; index <= state.extraProjects; index++)
+        overview.projects.push({ ...overview.projects[0], id: `extra-project-${index}`, name: `Extra project ${index}` });
       return respond(overview);
     }
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
@@ -44,7 +47,12 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
       if (rest === `/installations/${INSTALL}/sessions`) return respond({ sessions: [
         { id: OLD_SESSION, installation_id: INSTALL, label: "old chat", issued_at: iso(-900_000), expires_at: iso(-60_000), last_used_at: null, state: "revoked", revision: 2 },
         { id: NEW_SESSION, installation_id: INSTALL, label: "new chat", issued_at: iso(-60_000), expires_at: iso(600_000), last_used_at: null, state: "active", revision: 1 }] });
-      if (rest === `/installations/${INSTALL}/hub-grant`) return respond(state.grant);
+      if (rest === `/installations/${INSTALL}/hub-grant`) {
+        // What the server had when asked; a held read answers later with that older view.
+        const body = structuredClone(state.grant);
+        if (state.holdGrant) { state.holdGrant = false; await new Promise<void>(resolve => state.grantReleases.push(resolve)); }
+        return respond(body);
+      }
       if (rest === `/installations/${INSTALL}/task-claims`) return respond(state.claims);
       if (rest === `/tasks/${TASK}/claim-recoveries`) return respond(state.recovered ? wire.recovery_history : { task: wire.recoverable_claims.items[0].task, recoveries: [] });
       return respond({}, 404);
@@ -57,8 +65,9 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
       return respond({ detail: { code: failure.code } }, failure.status);
     }
     if (rest === `/installations/${INSTALL}/hub-grant`) {
+      if (body.expected_revision !== state.grant.revision) return respond({ detail: { code: "grant_revision_conflict" } }, 409);
       const expires = iso(Number(body.lifetime_seconds) * 1000);
-      state.grant = { ...structuredClone(wire.active_grant), projects: body.projects, capabilities: body.capabilities, expires_at: expires,
+      state.grant = { ...structuredClone(wire.active_grant), revision: Number(state.grant.revision) + 1, projects: body.projects, capabilities: body.capabilities, expires_at: expires,
         effective: { ...wire.active_grant.effective, projects: body.projects, capabilities: body.capabilities, expires_at: expires } };
       return respond(state.grant);
     }
@@ -226,4 +235,99 @@ test("access that has run out by this browser's clock never shows as in effect",
   await expect(access(page)).toContainText("No Hub access: it ran out. (by this browser's clock; Refresh to confirm)");
   await expect(access(page).locator(".hub-access-rights")).toHaveCount(0);
   await expect(access(page)).toContainText("Earlier choices (not in effect): Engineering Hub");
+});
+
+const refresh = (page: Page) => panel(page).getByRole("button", { name: "Refresh", exact: true }).click();
+const future = () => ({ ...structuredClone(wire.active_grant), expires_at: iso(3_600_000),
+  effective: { ...wire.active_grant.effective, expires_at: iso(3_600_000) } });
+
+test("after someone else changes access, Refresh loads the new version and the next save uses it", async ({ page }) => {
+  const state = await fixture(page);
+  state.grant = future();
+  await openAccess(page);
+  await expect(access(page)).toContainText("version 1");
+  // Changed elsewhere after this page read it.
+  state.grant = { ...future(), revision: 2 };
+  await access(page).getByRole("button", { name: "Change access…" }).click();
+  await access(page).getByRole("button", { name: "Save access" }).click();
+  await expect(access(page).getByRole("alert")).toContainText("changed since you loaded it");
+  await refresh(page);
+  await expect(access(page)).toContainText("version 2");
+  await access(page).getByRole("button", { name: "Change access…" }).click();
+  await access(page).getByRole("button", { name: "Save access" }).click();
+  await expect(access(page).getByRole("status")).toContainText("Hub access saved.");
+  expect(state.posts.map(post => post.body.expected_revision)).toEqual([1, 2]);
+});
+
+test("Refresh re-reads which claims can be handed over", async ({ page }) => {
+  const state = await fixture(page);
+  await openAccess(page);
+  await expect(access(page).getByRole("button", { name: "Hand over…" })).toBeVisible();
+  state.claims = structuredClone(wire.active_claims);
+  await refresh(page);
+  await expect(access(page)).toContainText("The session holding it is still live");
+  await expect(access(page).getByRole("button", { name: "Hand over…" })).toHaveCount(0);
+});
+
+test("an older access read that answers after a Refresh never brings back the old state", async ({ page }) => {
+  const state = await fixture(page);
+  state.grant = future();
+  state.holdGrant = true;
+  await page.goto("/#/agents");
+  const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
+  await row.getByRole("button", { name: "Hub access" }).click();
+  await expect.poll(() => state.grantReleases.length).toBe(1);
+  state.grant = structuredClone(wire.revoked_grant);
+  await refresh(page);
+  await expect(access(page)).toContainText("No Hub access: you removed it.");
+  state.grantReleases[0]();
+  await page.waitForTimeout(300);
+  await expect(access(page)).toContainText("No Hub access: you removed it.");
+  await expect(access(page).locator(".hub-access-rights")).toHaveCount(0);
+});
+
+test("every active project can be chosen, up to 32 per grant", async ({ page }) => {
+  const state = await fixture(page);
+  state.extraProjects = 40;
+  await openAccess(page);
+  await access(page).getByRole("button", { name: "Grant access…" }).click();
+  const form = access(page).getByRole("form", { name: "Hub access choices" });
+  await expect(form.getByLabel("Extra project 40", { exact: true })).toBeEnabled();
+  for (let index = 1; index <= 32; index++) await form.getByLabel(`Extra project ${index}`, { exact: true }).check();
+  await expect(form).toContainText("At most 32 projects per grant.");
+  await expect(form.getByLabel("Extra project 33", { exact: true })).toBeDisabled();
+  await expect(form.getByLabel("Extra project 1", { exact: true })).toBeEnabled();
+  await form.getByLabel("Read tasks").check();
+  await form.getByRole("button", { name: "Save access" }).click();
+  await expect(access(page).getByRole("status")).toContainText("Hub access saved.");
+  expect((state.posts[0].body.projects as string[]).length).toBe(32);
+});
+
+test("the hand-over confirmation shows exact ids, and changing the target asks for confirmation again", async ({ page }) => {
+  const state = await fixture(page);
+  const second = "9d7a1c2e-0000-4000-8000-00000000abcd";
+  state.claims.items[0].recovery.target_session_ids = [NEW_SESSION, second];
+  await openAccess(page);
+  await access(page).getByRole("button", { name: "Hand over…" }).click();
+  const dialog = page.getByRole("dialog", { name: /Hand over/ });
+  await expect(dialog.getByLabel("Installation id")).toHaveText(INSTALL);
+  await expect(dialog.getByLabel("From session id")).toHaveText(OLD_SESSION);
+  await expect(dialog.getByLabel("To session id")).toHaveText(NEW_SESSION);
+  await dialog.getByLabel("I understand the review is cleared").check();
+  await dialog.getByLabel("Hand over to").selectOption(second);
+  await expect(dialog.getByLabel("To session id")).toHaveText(second);
+  await expect(dialog.getByLabel("I understand the review is cleared")).not.toBeChecked();
+});
+
+test("with Hub access available, the staging note says tasks and reviews need a grant", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/#/agents");
+  await expect(panel(page)).toContainText("only where you grant them under Hub access");
+  await expect(panel(page)).not.toContainText("can't use Hub tasks or reviews");
+});
+
+test("without Hub access, the staging note keeps the foundation-only wording", async ({ page }) => {
+  await fixture(page, { catalog: false });
+  await page.goto("/#/agents");
+  await expect(panel(page)).toContainText("can't use Hub tasks or reviews");
 });
