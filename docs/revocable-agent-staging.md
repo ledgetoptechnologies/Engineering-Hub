@@ -35,6 +35,11 @@ and obtain only the `actor` field from its authenticated
 enabling the feature. Do not copy the response's CSRF token or browser cookie
 into configuration, logs or a chat. The database retains its original owner;
 changing an environment label cannot transfer ownership.
+In a fresh browser, open the explicit `/api/hub/v1/auth/login` path and sign in
+as that owner before opening a deep link such as `/agents`. Hub sign-out clears
+the Hub's local session; it does not sign out the browser's global Cloudflare
+Access identity. Verify the actual signed-in account rather than assuming a
+deep link or Hub sign-out switched it; do not clear unrelated Access sessions.
 Approval, rename and revocation require that exact owner plus CSRF verification.
 Other allowlisted humans and every agent bearer are refused owner actions.
 Use HTTPS for access from another PC. Plain HTTP is accepted only on loopback.
@@ -52,6 +57,28 @@ supported by this pilot configuration. Enrollment and exchange must not redirect
 to an interactive login page: the helper intentionally refuses redirects.
 
 ## Pair each installation
+
+With the session module enabled, the agent listener provides two read-only
+bootstrap downloads without a bearer: `GET`/`HEAD`
+`/api/agent-sessions/v1/client/manifest` and
+`/api/agent-sessions/v1/client/agent_session_client.py`. These exact routes retain
+canonical Host, actual source-IP and path checks; all other session APIs retain
+their existing authorization. Disabled instances return 404. The manifest gives
+`schema_version`, `helper_version`, `bytes`, `sha256` and the same-origin relative
+`url` of the fixed packaged helper. Downloads do not create an installation,
+session or grant, and never include credentials or configuration.
+
+An agent can use an already installed Python interpreter: fetch the manifest and
+helper over the approved HTTPS staging origin with a descriptive application
+User-Agent, verified TLS and no redirects, save to a new local file, and compare
+its byte length and SHA-256 with the manifest **before** running it. Do not
+download-and-execute a shell pipeline, follow an interactive login redirect, or
+overwrite an existing helper/profile. A checksum from that HTTPS origin binds
+the fetched bytes to its manifest; it is not an independent release signature.
+The helper uses Python's standard library, so this path needs no package-registry
+installation. Downloading is self-service; installation approval below is still
+the human owner's separate action. This does not configure an MCP client,
+enable native wake or establish actual Windows/second-PC acceptance.
 
 On the PC running the agent, choose a private profile directory. An installation
 running Codex and one running Claude use separate profiles, even on the same PC.

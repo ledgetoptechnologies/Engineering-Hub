@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from starlette.responses import JSONResponse
 
 from .agent_sessions import AgentSessionError
+from .agent_sessions_api import CLIENT_DOWNLOAD_PATHS
 
 PREFIX = '/api/agent-sessions/v1'
 MAX_NEW_TRANSPORTS = 1024  # Process-lifetime cap also bounds SDK-created transports.
@@ -124,7 +125,11 @@ class AgentSessionsBoundaryMiddleware:
                     or any(part in {'.', '..'} for part in path.split('/'))):
                 return await denied(scope, receive, send, 'forbidden', 403)
             try:
-                if path == PREFIX + '/enrollments' and scope['method'] == 'POST':
+                if path in CLIENT_DOWNLOAD_PATHS and scope['method'] in {'GET', 'HEAD'}:
+                    # Only fixed public bootstrap bytes; Host/IP/raw-path guards
+                    # above still apply. No principal or enrollment is created.
+                    pass
+                elif path == PREFIX + '/enrollments' and scope['method'] == 'POST':
                     if values:
                         raise HTTPException(401)
                 elif path == PREFIX + '/exchange' and scope['method'] == 'POST':

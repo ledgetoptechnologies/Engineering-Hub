@@ -1,12 +1,41 @@
 """Versioned staging connections. Bearers never become legacy family actors."""
 from typing import Literal
+import hashlib
+from importlib.resources import files
+import json
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import Response
 
 
 AGENT_SESSION_PREFIX = "/api/agent-sessions/v1"
 OWNER_CONNECTION_PREFIX = "/api/hub/v1/agent-connections"
+CLIENT_MANIFEST_PATH = AGENT_SESSION_PREFIX + "/client/manifest"
+CLIENT_HELPER_PATH = AGENT_SESSION_PREFIX + "/client/agent_session_client.py"
+CLIENT_DOWNLOAD_PATHS = frozenset({CLIENT_MANIFEST_PATH, CLIENT_HELPER_PATH})
+CLIENT_HELPER_VERSION = "0.6"
+
+
+def _client_bytes():
+    # Fixed installed package file only: no caller-controlled path or source execution.
+    try:
+        with files("agent_message_bus").joinpath("agent_session_client.py").open("rb") as source:
+            body = source.read(65537)
+        if not body or len(body) > 65536:
+            raise ValueError()
+        return body
+    except (OSError, ValueError):
+        raise HTTPException(503, detail={"code": "agent_client_unavailable"},
+                            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}) from None
+
+
+def _client_response(request, body, media_type, *, attachment=False):
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+               "Content-Length": str(len(body))}
+    if attachment:
+        headers["Content-Disposition"] = 'attachment; filename="agent_session_client.py"'
+    return Response(b"" if request.method == "HEAD" else body, media_type=media_type, headers=headers)
 
 
 def bearer(request: Request) -> str:
@@ -67,6 +96,19 @@ class ClaimRenew(ClaimFinish):
 
 def session_router(repository):
     router = APIRouter(prefix=AGENT_SESSION_PREFIX)
+
+    @router.api_route("/client/manifest", methods=["GET", "HEAD"])
+    def client_manifest(request: Request):
+        body = _client_bytes()
+        manifest = {"schema_version": 1, "helper_version": CLIENT_HELPER_VERSION,
+                    "url": CLIENT_HELPER_PATH, "bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest()}
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return _client_response(request, encoded, "application/json")
+
+    @router.api_route("/client/agent_session_client.py", methods=["GET", "HEAD"])
+    def client_helper(request: Request):
+        return _client_response(request, _client_bytes(), "application/octet-stream", attachment=True)
 
     @router.post("/enrollments")
     def enroll(data: Enrollment):
