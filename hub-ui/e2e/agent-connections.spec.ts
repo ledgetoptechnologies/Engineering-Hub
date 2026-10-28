@@ -26,6 +26,7 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
     ] as Session[],
     posts: [] as { path: string; method: string; body: Record<string, unknown>; csrf?: string }[],
     failSessions: false, emptyInstallations: false, stallInstallations: false,
+    failInstallations: false, stallAudit: false, stallCatalog: false, stallSessions: false,
     actor: human, owner: options.owner ?? true,
     reads: [] as string[], auth: true, csrf: "fixture-csrf" as string | null, listStatus: 200, writeStatus: 200 as number, writeCode: "",
     hold: false, release: null as (() => void) | null, holdSessions: false, sessionReleases: [] as (() => void)[],
@@ -50,11 +51,15 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
       if (rest === "/installations") {
         // A stalled read never answers; the page must give up on it by itself.
         if (state.stallInstallations) { await new Promise(() => {}); }
+        if (state.failInstallations) return respond({ detail: { code: "agent_connections_request_failed" } }, 503);
         return respond({ installations: state.emptyInstallations ? [] : state.installations });
       }
+      if (rest === "/hub-capabilities" && state.stallCatalog) { await new Promise(() => {}); }
+      if (rest === "/audit" && state.stallAudit) { await new Promise(() => {}); }
       if (rest === "/audit") return respond({ events: [{ id: 1, at: iso(-60_000), actor: "claude", action: "enrollment.requested",
         installation_id: "inst_desk", session_id: null, message_id: null }] });
       const sessions = /^\/installations\/([^/]+)\/sessions$/.exec(rest);
+      if (sessions && state.stallSessions) { await new Promise(() => {}); }
       if (sessions && state.failSessions) return respond({ detail: { code: "agent_connections_request_failed" } }, 503);
       if (sessions) {
         // The answer is what the server had when asked; a held read returns that older view later.
@@ -386,4 +391,53 @@ test("leaving the page cancels a read that is still open", async ({ page }) => {
   await page.getByRole("navigation", { name: "Workspace" }).getByRole("link", { name: /^Work/ }).click();
   await expect(panelOf(page)).toHaveCount(0);
   await expect.poll(() => cancelled.length).toBe(1);
+});
+
+const cancelledReads = (page: Page, suffix: string) => {
+  const urls: string[] = [];
+  page.on("requestfailed", request => { if (new URL(request.url()).pathname.endsWith(suffix)) urls.push(request.url()); });
+  return urls;
+};
+
+test("when one of the paired reads fails early, the other one that is still open is cancelled", async ({ page }) => {
+  const state = await fixture(page);
+  state.failInstallations = true; state.stallAudit = true;
+  const audit = cancelledReads(page, "/agent-connections/audit");
+  await page.goto("/#/agents");
+  await expect(panelOf(page).getByRole("alert")).toContainText("Agent connections couldn't be read");
+  await expect.poll(() => audit.length).toBe(1);
+});
+
+test("a newer refresh cancels the previous Hub-access catalog check", async ({ page }) => {
+  const state = await fixture(page);
+  state.stallCatalog = true;
+  const catalog = cancelledReads(page, "/agent-connections/hub-capabilities");
+  await page.goto("/#/agents");
+  await expect(panelOf(page).locator(".installation-row")).toHaveCount(3);
+  expect(catalog).toHaveLength(0);
+  await panelOf(page).getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect.poll(() => catalog.length).toBe(1);
+});
+
+test("leaving the page cancels a session list that is still loading", async ({ page }) => {
+  const state = await fixture(page);
+  state.stallSessions = true;
+  const sessions = cancelledReads(page, "/sessions");
+  await page.goto("/#/agents");
+  const laptop = panelOf(page).locator(".installation-row", { hasText: "beau-laptop" });
+  await laptop.getByRole("button", { name: "Show sessions" }).click();
+  await expect(laptop.getByRole("status")).toContainText("Reading sessions…");
+  await page.getByRole("navigation", { name: "Workspace" }).getByRole("link", { name: /^Work/ }).click();
+  await expect(panelOf(page)).toHaveCount(0);
+  await expect.poll(() => sessions.length).toBe(1);
+});
+
+test("someone without the owner's Hub sign-in gets a way to sign in, without promising ownership", async ({ page }) => {
+  await fixture(page, { owner: false });
+  await page.goto("/#/agents");
+  const link = panelOf(page).getByRole("link", { name: "sign in to this Hub" });
+  await expect(link).toHaveAttribute("href", "/api/hub/v1/auth/login");
+  await expect(panelOf(page)).toContainText("Managing installations needs the configured owner's own Hub sign-in on this Hub.");
+  await expect(panelOf(page)).toContainText("then come back to Agents");
+  await expect(panelOf(page)).not.toContainText("@");
 });
