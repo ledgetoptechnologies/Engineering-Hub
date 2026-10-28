@@ -51,7 +51,7 @@ async def denied(scope, receive, send, code='unauthorized', status=401):
         headers={'Cache-Control': 'no-store', **({'WWW-Authenticate': 'Bearer'} if status == 401 else {})})(scope, receive, send)
 
 
-async def session_post(scope, receive, send):
+async def session_post(scope, receive, send, bridge_tools=()):
     """Bound and gate new-principal MCP methods without changing SDK handlers."""
     body = bytearray()
     while True:
@@ -78,7 +78,7 @@ async def session_post(scope, receive, send):
                'notifications/progress', 'ping', 'tools/list', 'tools/call'}
     tools = {'session_identity', 'session_peers', 'session_message_send', 'session_messages',
              'session_message_get', 'session_message_claim', 'session_message_renew',
-             'session_message_acknowledge'}
+             'session_message_acknowledge'} | set(bridge_tools)
     if method not in allowed:
         await JSONResponse({'jsonrpc': '2.0', 'id': value.get('id'),
             'error': {'code': -32601, 'message': 'session_method_not_available'}},
@@ -217,7 +217,8 @@ class MCPAuthMiddleware:
         if (sid and self.session_owners.get(sid) != owner) or (not sid and scope['method'] in {'GET', 'DELETE'}):
             return await denied(scope, receive, send, 'session_not_found', 404)
         if new and scope['method'] == 'POST':
-            replay = await session_post(scope, receive, send)
+            replay = await session_post(scope, receive, send,
+                getattr(self.agent_sessions, '_hub_bridge_tools', ()))
             if replay is None:
                 return
             receive = replay

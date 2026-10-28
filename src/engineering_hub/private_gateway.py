@@ -98,6 +98,22 @@ def _diagnostic_path(path, *, files_only=False):
 
 def browser_route_allowed(method, path):
     """Closed browser surface; new backend routes are not exposed implicitly."""
+    owner = '/api/hub/v1/agent-connections'
+    installation = owner + '/installations/' + _UUID
+    if method in {'GET', 'HEAD'} and (
+            path in {owner + '/capabilities', owner + '/hub-capabilities', owner + '/installations', owner + '/audit'}
+            or re.fullmatch(installation + r'/(?:sessions|hub-grant|task-claims)', path) is not None
+            or re.fullmatch(owner + '/tasks/' + _UUID + '/claim-recoveries', path) is not None):
+        return True
+    if method == 'PUT' and re.fullmatch(installation + '/hub-grant', path) is not None:
+        return True
+    if method == 'PATCH' and re.fullmatch(installation, path) is not None:
+        return True
+    if method == 'POST' and (
+            re.fullmatch(installation + r'/(?:approve|revoke|hub-grant/revoke)', path) is not None
+            or re.fullmatch(owner + '/sessions/' + _UUID + '/revoke', path) is not None
+            or re.fullmatch(owner + '/tasks/' + _UUID + '/recover-claim', path) is not None):
+        return True
     if method in {'GET', 'HEAD'}:
         return (path in _GET or client_page_allowed(method, path)
                 or path == '/api/hub/v1/infrastructure/devices'

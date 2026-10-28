@@ -12,8 +12,11 @@ class AgentSessionsConfig:
     owner: str
     origin: str
     environment: str = "staging"
+    hub_bridge: bool = False
 
     def __post_init__(self):
+        if type(self.hub_bridge) is not bool:
+            raise ValueError("explicit_hub_bridge_mode_required")
         if self.environment != "staging" or not isinstance(self.database, Path):
             raise ValueError("explicit_staging_agent_sessions_required")
         if not self.database.is_absolute() or not re.fullmatch(r"human:(?:[1-9][0-9]{0,19}|cf:[a-f0-9]{64})", self.owner):
@@ -31,7 +34,12 @@ class AgentSessionsConfig:
     @classmethod
     def from_env(cls):
         mode = os.environ.get("HUB_AGENT_SESSIONS_MODE", "disabled")
+        bridge = os.environ.get("HUB_AGENT_SESSIONS_HUB_BRIDGE", "disabled")
+        if bridge not in {"disabled", "enabled"}:
+            raise ValueError("invalid_hub_bridge_mode")
         if mode == "disabled":
+            if bridge != "disabled":
+                raise ValueError("hub_bridge_requires_staging_sessions")
             return None
         if mode != "staging":
             raise ValueError("HUB_AGENT_SESSIONS_MODE must be disabled or staging")
@@ -39,4 +47,4 @@ class AgentSessionsConfig:
             "HUB_AGENT_SESSIONS_DB", "HUB_AGENT_SESSIONS_OWNER", "HUB_AGENT_SESSIONS_ORIGIN")]
         if not all(required):
             raise ValueError("explicit_staging_agent_sessions_configuration_required")
-        return cls(Path(required[0]), required[1], required[2])
+        return cls(Path(required[0]), required[1], required[2], hub_bridge=bridge == "enabled")

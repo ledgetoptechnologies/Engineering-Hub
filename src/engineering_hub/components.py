@@ -10,6 +10,7 @@ import json
 import re
 import uuid
 
+from agent_message_bus import session_hub_context as session_context
 from .entity_context import _url
 from .repository import HubError, HubRepository, _json
 
@@ -92,6 +93,7 @@ class ProjectComponentRepository:
                    (item['id'], item['project'], item['slug'], _json(item)))
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
+        session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
         self.repo._emit(db, action, item)
         return item
 

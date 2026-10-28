@@ -8,6 +8,7 @@ import re
 import sqlite3
 import uuid
 
+from agent_message_bus import session_hub_context as session_context
 from .pilot_ownership import PilotOwner
 from .image_state_boundary import ImageStateBoundaryError, require_image_state_mount
 from .entity_context import bounded_text, validated_context
@@ -17,7 +18,7 @@ PROJECTS = frozenset({'engineering-hub', '3d-viewer', 'project-alpha', 'ledge-to
 AGENTS = frozenset({'hermes', 'codex', 'claude'})
 # Audit actions that set a task's status. Run bookkeeping saves the task without
 # changing it, so those actions must not reset how long a task has been waiting.
-TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.candidate', 'task.reviewed',
+TASK_STATUS_ACTIONS = ('task.created', 'task.proposed', 'task.claimed', 'task.claim_recovered', 'task.candidate', 'task.reviewed',
                        'task.context_invalidated', 'task.withdrawn')
 # Audit actions that record who created a task or decision. Withdrawal by an agent
 # is limited to the agent named here, read from the audit log, never from the record.
@@ -159,6 +160,7 @@ class HubRepository:
                 self._assert_pilot_owner(db)
                 yield db
                 self._assert_pilot_owner(db)
+                session_context.before_commit(self.path, db)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -189,6 +191,11 @@ class HubRepository:
 
     @staticmethod
     def _actor(actor, human=False, agent=False):
+        installation = session_context.actor_allowed(actor)
+        if installation and human:
+            raise HubError('forbidden', 403)
+        if installation:
+            return
         valid_human = isinstance(actor, str) and re.fullmatch(r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', actor) is not None
         if not (actor in AGENTS or valid_human) or (human and not valid_human) or (agent and actor not in AGENTS):
             raise HubError('forbidden', 403)
@@ -201,6 +208,7 @@ class HubRepository:
 
     def _project(self, project, db=None, *, require_active=True):
         """Validate metadata scope, never an execution target or permission grant."""
+        session_context.check_project(project)
         if type(project) is not str or re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', project) is None:
             raise HubError('invalid_project')
         if db is None:
@@ -235,6 +243,7 @@ class HubRepository:
                    (item['id'], kind, _json(item)))
         db.execute('INSERT INTO hub_audit(actor,action,entity_id,revision,created_at) VALUES(?,?,?,?,?)',
                    (actor, action, item['id'], item['revision'], item['updated_at']))
+        session_context.provenance(db, db.execute("SELECT last_insert_rowid()").fetchone()[0])
         self._emit(db, action, item)
         return item
 
@@ -326,7 +335,7 @@ class HubRepository:
             item = self._save(db, actor, 'task.proposed', 'task', dict(
                 id=str(uuid.uuid4()), project=project, title=title, status='assigned',
                 owner=None, candidate_commit=None, review=None, repair_count=0,
-                scope='staging', proposed_by=actor, **context), new=True)
+                scope='staging', proposed_by=actor, **({'proposed_family': session_context.family(actor)} if session_context.actor_allowed(actor) else {}), **context), new=True)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
             return item
 
@@ -352,7 +361,7 @@ class HubRepository:
         if 'scope' not in task and 'proposed_by' not in task:
             return True
         return (task.get('scope') == 'staging' and type(task.get('proposed_by')) is str
-                and task['proposed_by'] in AGENTS
+                and (task['proposed_by'] in AGENTS or (str(task['proposed_by']).startswith('installation:') and task.get('proposed_family') in AGENTS))
                 and environment == 'staging')
 
     def get_task(self, identity):
@@ -366,7 +375,7 @@ class HubRepository:
             self._cas(item, expected_revision)
             if item['status'] != 'assigned':
                 raise HubError('already_claimed', 409)
-            item.update(owner=actor, status='claimed')
+            item.update(owner=actor, status='claimed', **session_context.claim_fields(actor))
             return self._save(db, actor, 'task.claimed', 'task', item)
 
     @staticmethod
@@ -384,12 +393,13 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
-            if item['owner'] != actor:
+            if item['owner'] != actor or not session_context.continuation_allowed(item, actor):
                 raise HubError('forbidden', 403)
             if item['status'] == 'withdrawn':
                 raise HubError('withdrawn', 409)
             self._no_active_run(db, identity)
-            item.update(candidate_commit=commit, review=None, status='in_review')
+            item.update(candidate_commit=commit, review=None, status='in_review',
+                        **({'candidate_family': item['owner_family']} if 'owner_family' in item else {}))
             return self._save(db, actor, 'task.candidate', 'task', item)
 
     def review_task(self, actor, identity, expected_revision, commit, verdict):
@@ -400,12 +410,14 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
-            if item['owner'] == actor:
+            if (item['owner'] == actor
+                    or session_context.family(actor) == item.get('candidate_family', item.get('owner_family', item['owner']))):
                 raise HubError('independent_review_required', 403)
             if item['status'] != 'in_review' or not commit or item['candidate_commit'] != commit:
                 raise HubError('stale_review', 409)
             item.update(status='verified' if verdict == 'approve' else 'claimed',
-                        review=dict(actor=actor, commit=commit, verdict=verdict) if verdict == 'approve' else None)
+                        review=dict(actor=actor, commit=commit, verdict=verdict,
+                            **({'family': session_context.family(actor)} if session_context.actor_allowed(actor) else {})) if verdict == 'approve' else None)
             return self._save(db, actor, 'task.reviewed', 'task', item)
 
     def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
@@ -498,11 +510,17 @@ class HubRepository:
             item = self._get(db, identity, kind)
             # Archived projects keep their records; retiring a stale one there is allowed.
             self._project(item['project'], db, require_active=False)
-            if actor in AGENTS and self._creator(db, kind, identity) != actor:
+            if (actor in AGENTS or session_context.actor_allowed(actor)) and self._creator(db, kind, identity) != actor:
+                raise HubError('forbidden', 403)
+            if (session_context.actor_allowed(actor) and item.get('owner') == actor
+                    and not session_context.continuation_allowed(item, actor)):
                 raise HubError('forbidden', 403)
             if item['status'] == 'withdrawn':
                 if (item.get('withdrawn_by') == actor and item.get('withdrawn_reason') == reason
                         and item.get('superseded_by') == superseded_by):
+                    if session_context.actor_allowed(actor) and superseded_by is not None:
+                        replacement = self._get(db, superseded_by, kind)
+                        self._project(replacement['project'], db)
                     return item
                 raise HubError('withdrawn', 409)
             self._cas(item, expected_revision)
@@ -524,6 +542,9 @@ class HubRepository:
                 if replacement['status'] == 'withdrawn':
                     raise HubError('invalid_replacement')
                 self._project(replacement['project'], db)
+            if session_context.actor_allowed(actor):
+                principal = session_context.current.get().principal
+                item.update(withdrawn_family=principal.family, withdrawn_session_id=principal.session_id)
             item.update(status='withdrawn', withdrawn_reason=reason, superseded_by=superseded_by,
                         withdrawn_by=actor, withdrawn_at=datetime.now(timezone.utc).isoformat())
             return self._save(db, actor, kind + '.withdrawn', kind, item)
@@ -548,6 +569,8 @@ class HubRepository:
             return self._save(db, actor, 'decision.answered', 'decision', item)
 
     def create_run(self, actor, task_id, expected_revision, artifact_digest, target, *, execution_manifest_digest=None, client_request_id=None):
+        if actor not in AGENTS:
+            raise HubError('forbidden', 403)
         self._actor(actor, agent=True)
         if not isinstance(artifact_digest, str) or not re.fullmatch('sha256:[0-9a-f]{64}', artifact_digest):
             raise HubError('invalid_digest')
