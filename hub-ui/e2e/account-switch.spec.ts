@@ -7,6 +7,7 @@ const PRIVATE_A = "Private task of person A", PRIVATE_B = "Private task of perso
 async function fixture(page: Page) {
   const state = {
     actor: A, holdNext: false, held: [] as (() => void)[], overviewStatus: 200, holdPeers: false, peerReleases: [] as (() => void)[],
+    writeReleases: [] as ((status: number) => void)[], writes: 0,
     overviews: [] as string[],
   };
   await page.route("**/api/hub/v1/**", async route => {
@@ -33,6 +34,12 @@ async function fixture(page: Page) {
       return respond(who === A ? snapshot : { ...snapshot, items: [] });
     }
     if (path.endsWith("/work/status")) return respond({}, 423);
+    if (route.request().method() === "POST" && path.includes("/decisions/")) {
+      // A's write is held until the test decides how it ends.
+      state.writes++;
+      const status = await new Promise<number>(resolve => state.writeReleases.push(resolve));
+      return respond({ detail: { code: status === 401 ? "human_session_required" : "forbidden" } }, status);
+    }
     return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
   });
   return state;
@@ -108,4 +115,25 @@ test("a refresh by the same person keeps their workspace on screen while it relo
   await expect(page.getByText("Opening your workspace…")).toHaveCount(0);
   state.held[0]();
   await expect(page.getByText(PRIVATE_A)).toBeVisible();
+});
+
+for (const status of [401, 403]) test(`a write the previous person started that ends in ${status} after the switch leaves the new person signed in`, async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const form = page.locator("form").filter({ hasText: "Choose the initial scratch-storage benchmark" }).first();
+  await form.getByLabel("NAS-backed small fixture").check();
+  await form.getByRole("button", { name: /Record decision/ }).click();
+  await expect.poll(() => state.writes).toBe(1);
+  // While A's write is still out, B signs in and the workspace refreshes to B.
+  state.actor = B;
+  await refresh(page);
+  const nav = page.getByRole("navigation", { name: "Workspace" });
+  await nav.getByRole("link", { name: /^Work/ }).click();
+  await expect(page.getByText(PRIVATE_B)).toBeVisible();
+  state.writeReleases[0](status);
+  await page.waitForTimeout(300);
+  // A's late refusal doesn't sign B out or clear B's records, and isn't shown to B.
+  await expect(page.getByRole("link", { name: /Sign in securely/ })).toHaveCount(0);
+  await expect(page.getByText(PRIVATE_B)).toBeVisible();
+  await expect(page.getByRole("button", { name: "New task" })).toBeEnabled();
 });

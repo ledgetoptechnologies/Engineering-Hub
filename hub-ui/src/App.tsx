@@ -99,11 +99,16 @@ export function HubApp() {
 
   // The actor whose records are on screen; a different validated actor must never see them.
   const shownActor = useRef<string | null>(null);
+  // Bumped whenever a workspace is reset: an operation started in an earlier workspace must not touch the next one.
+  const workspaceEpoch = useRef(0);
   /** Drop every private record, cached snapshot, dialog and pending action, and fence late topic/agent reads. */
   const resetWorkspace = useCallback(() => {
     agentReader.current?.pause();
     topicReads.current++;
+    workspaceEpoch.current++;
     shownActor.current = null;
+    // An earlier workspace's operation no longer holds this one busy; its late result is ignored (see mutate).
+    setWorking(false);
     setData(null);
     setAgents([]);
     setPeers(null);
@@ -421,15 +426,21 @@ export function HubApp() {
   }, [nextExpiry]);
 
   async function mutate(operation: () => Promise<unknown>, success: string) {
+    // Its result belongs to the workspace it started in. If that was reset for a different person meanwhile, the
+    // result is ignored here (the server may still have applied it); it can't announce, refresh or clear anything.
+    const epoch = workspaceEpoch.current;
+    const current = () => epoch === workspaceEpoch.current;
     setWorking(true);
     setNotice("");
     try {
       await operation();
+      if (!current()) return false;
       setNotice(demo ? `${success} Demo only; no server changed.` : success);
       setNoticeError(false);
       await refresh();
       return true;
     } catch (error) {
+      if (!current()) return false;
       setNotice(errorText(error));
       setNoticeError(true);
       if (
@@ -443,7 +454,7 @@ export function HubApp() {
       }
       return false;
     } finally {
-      setWorking(false);
+      if (current()) setWorking(false);
     }
   }
   const writable = Boolean(
