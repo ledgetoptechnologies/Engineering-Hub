@@ -1,4 +1,5 @@
 /** Plain-language dashboard wording derived only from recorded Hub state. */
+import { actorFamily } from "./actors";
 import type { Task } from "./types";
 
 export function relativeAge(value: string | null | undefined, now = Date.now()): string | null {
@@ -22,19 +23,22 @@ export function answeredBy(answeredByActor: string | null | undefined, viewerAct
 }
 
 /** Who or what a task is waiting on, derived only from its recorded status and review. */
-export function waitingOn(task: Task, agentName: (id: string) => string): string {
+export function waitingOn(task: Task, agentName: (id: string, family?: string | null) => string): string {
+  const owner = task.owner ? agentName(task.owner, task.owner_family) : "";
+  const ownerFamily = task.owner ? actorFamily(task.owner, task.owner_family) : null;
   if (task.status === "assigned") return "Waiting for an agent to claim it.";
   if (task.status === "claimed")
     return task.owner
       ? task.repair_count > 0
-        ? `${agentName(task.owner)} is repairing it (${task.repair_count}/3 repairs used).`
-        : `${agentName(task.owner)} is working on it.`
+        ? `${owner} is repairing it (${task.repair_count}/3 repairs used).`
+        : `${owner} is working on it.`
       : "Claimed, but no owner is recorded.";
   if (task.status === "in_review")
     return task.review
-      ? `Review recorded by ${agentName(task.review.actor)}.`
-      : `Waiting for an independent review. No reviewer assigned${task.owner ? `; any agent except ${agentName(task.owner)} can review` : ""}.`;
+      ? `Review recorded by ${agentName(task.review.actor, task.review.family)}.`
+      : `Waiting for an independent review. No reviewer assigned${task.owner
+        ? `; any agent except ${ownerFamily ? `${agentName(ownerFamily)}${ownerFamily !== task.owner ? " (on any computer)" : ""}` : owner} can review` : ""}.`;
   return task.review
-    ? `Review passed by ${agentName(task.review.actor)}. Running it is separate and needs its own authorization.`
+    ? `Review passed by ${agentName(task.review.actor, task.review.family)}. Running it is separate and needs its own authorization.`
     : "Review passed. Running it is separate and needs its own authorization.";
 }

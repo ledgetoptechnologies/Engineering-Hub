@@ -7,23 +7,18 @@ import { useEffect, useRef, useState } from "react";
 import { HubApiError } from "./api";
 import {
   actionText, demoAgentConnections, FAMILIES, FAMILY_NAME, httpAgentConnections, NAME_MAX, reasonText, STATE_LABEL, STATE_TONE,
-  writeFailureText, type AgentConnectionsClient, type AuditEvent, type Capabilities, type Installation, type Session,
+  untilText, writeFailureText, type AgentConnectionsClient, type AuditEvent, type Capabilities, type Installation, type Session,
 } from "./agentConnectionsApi";
 import { relativeAge } from "./dashboardText";
+import { httpHubGrants, type HubCatalog, type HubGrantsClient } from "./hubGrantsApi";
+import { InstallationHubAccess } from "./InstallationHubAccess";
+export { untilText };
 import type { Hub } from "./hub";
 import { Badge, Modal } from "./ui";
 
 type Load = "checking" | "unavailable" | "not_owner" | "loading" | "loaded" | "failed";
 type Dialog = { kind: "approve" | "revoke"; item: Installation } | { kind: "revoke-session"; item: Session; installation: Installation };
 
-/** How long until a time, in words; past times read as "ended". Clock is this browser's. */
-export function untilText(value: string | null, now: number): string {
-  if (!value) return "";
-  const ms = Date.parse(value) - now;
-  if (ms <= 0) return "ended";
-  const minutes = Math.ceil(ms / 60_000);
-  return minutes < 60 ? `in ${minutes} min` : minutes < 2880 ? `in ${Math.round(minutes / 60)} h` : `in ${Math.round(minutes / 1440)} days`;
-}
 const exact = (value: string) => new Date(value).toLocaleString();
 const nameFits = (value: string) => value.trim() !== "" && [...value.trim()].length <= NAME_MAX;
 /** Who did it, in words: the viewer, an installation by its name, or the recorded id as a last resort. */
@@ -55,6 +50,10 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const generation = useRef(0), mounted = useRef(true);
   // One counter per installation's session list: a newer read, a refresh or a confirmed change retires older reads.
   const sessionReads = useRef<Record<string, number>>({});
+  const grants = useRef<HubGrantsClient>(httpHubGrants()).current;
+  // The Hub-access bridge is optional: absent or unclear, its section simply isn't offered.
+  const [catalog, setCatalog] = useState<HubCatalog | null>(null);
+  const [access, setAccess] = useState<string | null>(null);
   const csrf = hub.session?.csrf_token ?? "";
   const canChange = !demo && hub.writable && !!csrf && capabilities?.owner === true;
   // Read again at submit time: a dialog opened while allowed must not act after sign-in, CSRF or ownership is lost.
@@ -84,6 +83,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       if (current !== generation.current || !mounted.current) return;
       setCapabilities(found);
       if (!found.owner) { setLoad("not_owner"); return; }
+      if (!catalog) void grants.catalog(controller.signal).then(next => { if (mounted.current) setCatalog(next); })
+        .catch(error => { if (mounted.current) denied(error); });
       setLoad(previous => previous === "loaded" ? "loaded" : "loading");
       const [nextItems, nextAudit] = await Promise.all([client.installations(controller.signal), client.audit(controller.signal)]);
       if (current !== generation.current || !mounted.current) return;
@@ -218,8 +219,12 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                       {item.state === "pending" ? "Decline…" : "Revoke…"}</button>}
                     {item.state !== "pending" && <button type="button" className="text-button" aria-expanded={open === item.id}
                       onClick={() => void readSessions(item)}>{open === item.id ? "Hide sessions" : "Sessions"}</button>}
+                    {catalog && item.state !== "pending" && <button type="button" className="text-button" aria-expanded={access === item.id}
+                      onClick={() => setAccess(previous => previous === item.id ? null : item.id)}>{access === item.id ? "Hide Hub access" : "Hub access"}</button>}
                   </div>
                 </div>
+                {access === item.id && catalog && <InstallationHubAccess hub={hub} installation={item} catalog={catalog} client={grants}
+                  allowed={() => allowed.current} sessions={sessions[item.id]?.items} onDenied={denied} />}
                 {open === item.id && <SessionList installation={item} entry={sessions[item.id]} now={now}
                   canChange={canChange && item.state === "active"} busy={busy}
                   onRevoke={session => { setNotice(null); setDialog({ kind: "revoke-session", item: session, installation: item }); }} />}

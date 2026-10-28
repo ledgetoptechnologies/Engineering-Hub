@@ -2,6 +2,7 @@
  * Reviews an agent has asked a person to answer, and the page for answering one.
  * Questions are shown as plain text with native controls; nothing from the review is run or rendered as HTML.
  */
+import { actorName } from "./actors";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiError } from "./api";
 import { PointCloudReview } from "./components/PointCloudReview";
@@ -188,7 +189,7 @@ export function ReviewPage({ hub, project, id, actions, source: given }: {
   const pages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const pageNow = Math.min(pageIndex, pages - 1);
   const shown = visible.slice(pageNow * PAGE_SIZE, (pageNow + 1) * PAGE_SIZE);
-  const who = (actor: string) => actor === hub.session?.actor ? "you" : names[actor] ?? (actor.startsWith("human:") ? "a person" : actor);
+  const who = (actor: string) => actor === hub.session?.actor ? "you" : actor.startsWith("human:") ? "a person" : actorName(actor);
 
   async function save(finish: boolean) {
     if (!review || busy) return;

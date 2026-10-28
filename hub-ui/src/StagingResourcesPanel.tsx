@@ -2,6 +2,7 @@
  * What the staging PC is keeping for EH jobs, how long, and a two-step cleanup.
  * Removal only ever happens through a reviewed plan; protected and pinned items are never offered for removal.
  */
+import { actorName } from "./actors";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { HubApiError, type HubMode } from "./api";
 import {
@@ -76,7 +77,7 @@ const describe = (error: unknown) => error instanceof HubApiError
 // Only a lost sign-in clears the panel; a refusal of one action (not the owner, not allowed on this project) is explained instead.
 const refusals = new Set(["csrf_required", "staging_forbidden", "staging_admin_required", "staging_resource_not_owned"]);
 const isAuthLoss = (error: unknown) => error instanceof HubApiError && [401, 403].includes(error.status) && !refusals.has(error.code);
-const who = (actor: string) => names[actor as keyof typeof names] ?? (actor.startsWith("human:") ? "You" : actor);
+const who = (actor: string) => actor.startsWith("human:") ? "You" : actorName(actor);
 
 export interface StagingResourcesPanelProps {
   mode: HubMode; source?: ResourceSource; csrf: string | null; writable: boolean; stale: boolean; refreshToken: unknown;

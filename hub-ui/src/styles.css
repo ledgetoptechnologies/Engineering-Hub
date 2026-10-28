@@ -4172,3 +4172,23 @@ button.primary.danger { color: #fff; background: #a3402f; border-color: #a3402f;
   .installation-side .note-actions { justify-content: flex-start; }
   .installation-sessions { display: block; overflow-x: auto; }
 }
+
+/* Per-installation Hub access (staging owner view). */
+.hub-access { grid-column: 1 / -1; border-top: 1px solid #e6e9f0; padding-top: 10px; margin-top: 4px; display: grid; gap: 8px; }
+.hub-access h4 { margin: 0; font-size: 13px; }
+.hub-access-effective { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; }
+.hub-access-rights ul { margin: 0; padding-left: 18px; columns: 2; column-gap: 24px; }
+.hub-access-form fieldset { border: 1px solid #e1e5ee; border-radius: 6px; padding: 8px 12px; margin: 0 0 8px; display: flex; flex-wrap: wrap; gap: 0 18px; }
+.hub-access-form legend { font-weight: 600; font-size: 12px; padding: 0 4px; }
+.hub-access-form .checkbox-field { margin: 4px 0; }
+.hub-access-form fieldset > .panel-footnote { flex-basis: 100%; margin: 0 0 4px; }
+.hub-claims h4 { margin: 6px 0; }
+.hub-claim-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.hub-claim-list > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; border: 1px solid #e6e9f0; border-radius: 6px; padding: 8px 10px; }
+.hub-claim-list > li > .timeline, .hub-claim-list > li > p { grid-column: 1 / -1; }
+.hub-claim-main { display: grid; gap: 2px; min-width: 0; }
+.hub-claim-list .note-actions { margin: 0; align-self: start; }
+@media (max-width: 760px) {
+  .hub-access-rights ul { columns: 1; }
+  .hub-claim-list > li { grid-template-columns: 1fr; }
+}

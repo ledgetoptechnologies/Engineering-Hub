@@ -122,7 +122,12 @@ export const parseSessions = (value: unknown, installationId: string) => {
 };
 export const parseAudit = (value: unknown) => list(value, "events", parseAuditEvent, 100, item => String(item.id));
 
-async function call(path: string, init: RequestInit, fetchImpl: typeof fetch): Promise<unknown> {
+/**
+ * Agent-credential failures. On these owner routes they describe the installation or a target
+ * session, never the signed-in person, so they must not read as a lost sign-in.
+ */
+const AGENT_CREDENTIAL_CODES = new Set(["installation_inactive", "invalid_session", "invalid_credential"]);
+export async function ownerCall(path: string, init: RequestInit, fetchImpl: typeof fetch): Promise<unknown> {
   let response: Response;
   try {
     response = await fetchImpl.call(globalThis, base + path, { credentials: "same-origin", redirect: "error", cache: "no-store", ...init });
@@ -140,32 +145,32 @@ async function call(path: string, init: RequestInit, fetchImpl: typeof fetch): P
         if (typeof detail?.code === "string" && codePattern.test(detail.code)) failure = detail.code;
       } catch { /* Never reflect raw server text. */ }
     }
-    throw new HubApiError(response.status, failure);
+    throw new HubApiError(response.status === 401 && AGENT_CREDENTIAL_CODES.has(failure) ? 409 : response.status, failure);
   }
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
   try { return await response.json(); } catch { return invalid(); }
 }
-function write(method: string, body: unknown, csrf: string): RequestInit {
+export function write(method: string, body: unknown, csrf: string): RequestInit {
   if (!csrf) throw new HubApiError(403, "csrf_required");
   return { method, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
     headers: { Accept: "application/json", "Content-Type": "application/json", "X-Hub-CSRF": csrf } };
 }
-const read = (signal: AbortSignal): RequestInit => ({ method: "GET", headers: { Accept: "application/json" }, signal });
-const at = (value: string) => encodeURIComponent(id(value));
+export const read = (signal: AbortSignal): RequestInit => ({ method: "GET", headers: { Accept: "application/json" }, signal });
+export const at = (value: string) => encodeURIComponent(id(value));
 
 export function httpAgentConnections(fetchImpl: typeof fetch = globalThis.fetch): AgentConnectionsClient {
   return {
-    capabilities: async signal => parseCapabilities(await call("/capabilities", read(signal), fetchImpl)),
-    installations: async signal => parseInstallations(await call("/installations", read(signal), fetchImpl)),
-    sessions: async (installationId, signal) => parseSessions(await call(`/installations/${at(installationId)}/sessions`, read(signal), fetchImpl), installationId),
-    audit: async signal => parseAudit(await call("/audit", read(signal), fetchImpl)),
-    approve: async (installationId, expected_revision, csrf) => parseInstallation(await call(`/installations/${at(installationId)}/approve`,
+    capabilities: async signal => parseCapabilities(await ownerCall("/capabilities", read(signal), fetchImpl)),
+    installations: async signal => parseInstallations(await ownerCall("/installations", read(signal), fetchImpl)),
+    sessions: async (installationId, signal) => parseSessions(await ownerCall(`/installations/${at(installationId)}/sessions`, read(signal), fetchImpl), installationId),
+    audit: async signal => parseAudit(await ownerCall("/audit", read(signal), fetchImpl)),
+    approve: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/approve`,
       write("POST", { expected_revision, lifetime_seconds: APPROVAL_LIFETIME_SECONDS }, csrf), fetchImpl)),
-    rename: async (installationId, expected_revision, name, csrf) => parseInstallation(await call(`/installations/${at(installationId)}`,
+    rename: async (installationId, expected_revision, name, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}`,
       write("PATCH", { expected_revision, name: line(NAME_MAX)(name.trim()) }, csrf), fetchImpl)),
-    revokeInstallation: async (installationId, expected_revision, csrf) => parseInstallation(await call(`/installations/${at(installationId)}/revoke`,
+    revokeInstallation: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/revoke`,
       write("POST", { expected_revision }, csrf), fetchImpl)),
-    revokeSession: async (sessionId, expected_revision, csrf) => parseSession(await call(`/sessions/${at(sessionId)}/revoke`,
+    revokeSession: async (sessionId, expected_revision, csrf) => parseSession(await ownerCall(`/sessions/${at(sessionId)}/revoke`,
       write("POST", { expected_revision }, csrf), fetchImpl)),
   };
 }
@@ -231,4 +236,13 @@ export function demoAgentConnections(now = Date.now()): { installations: Install
       { id: 1, at: iso(-300_000), actor: "claude", action: "session.issued", installation_id: "demo-claude-laptop", session_id: "demo-session-1", message_id: null },
     ],
   };
+}
+
+/** How long until a time, in words; past times read as "ended". Clock is this browser's. */
+export function untilText(value: string | null, now: number): string {
+  if (!value) return "";
+  const ms = Date.parse(value) - now;
+  if (ms <= 0) return "ended";
+  const minutes = Math.ceil(ms / 60_000);
+  return minutes < 60 ? `in ${minutes} min` : minutes < 2880 ? `in ${Math.round(minutes / 60)} h` : `in ${Math.round(minutes / 1440)} days`;
 }
