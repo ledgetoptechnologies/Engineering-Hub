@@ -4635,7 +4635,19 @@
             "anyOf": [
               {
                 "type": "string",
-                "pattern": "^(?:hermes|codex|claude|human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64}))$"
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
               },
               {
                 "type": "null"
@@ -4653,6 +4665,34 @@
               }
             ],
             "title": "Withdrawn At"
+          },
+          "withdrawn_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Family"
+          },
+          "withdrawn_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Session Id"
           }
         },
         "additionalProperties": false,
@@ -6423,11 +6463,19 @@
       "ReviewDTO": {
         "properties": {
           "actor": {
-            "type": "string",
-            "enum": [
-              "hermes",
-              "codex",
-              "claude"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              }
             ],
             "title": "Actor"
           },
@@ -6440,6 +6488,22 @@
             "type": "string",
             "const": "approve",
             "title": "Verdict"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family"
           }
         },
         "additionalProperties": false,
@@ -6510,7 +6574,7 @@
             "title": "Policy Revision"
           },
           "review": {
-            "$ref": "#/components/schemas/ReviewDTO"
+            "$ref": "#/components/schemas/RunReviewDTO"
           },
           "status": {
             "type": "string",
@@ -6689,6 +6753,38 @@
         ],
         "title": "RunListDTO"
       },
+      "RunReviewDTO": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Actor"
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Commit"
+          },
+          "verdict": {
+            "type": "string",
+            "const": "approve",
+            "title": "Verdict"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "actor",
+          "commit",
+          "verdict"
+        ],
+        "title": "RunReviewDTO",
+        "description": "Execution remains on the legacy contract; sessions cannot create runs."
+      },
       "SharedLifecycleStatus": {
         "properties": {
           "state": {
@@ -6807,6 +6903,10 @@
                 ]
               },
               {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -6863,10 +6963,74 @@
                 ]
               },
               {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
                 "type": "null"
               }
             ],
             "title": "Proposed By"
+          },
+          "owner_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Session Id"
+          },
+          "owner_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Family"
+          },
+          "candidate_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Family"
+          },
+          "proposed_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposed Family"
           },
           "state_since": {
             "anyOf": [
@@ -6930,7 +7094,19 @@
             "anyOf": [
               {
                 "type": "string",
-                "pattern": "^(?:hermes|codex|claude|human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64}))$"
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "string",
+                "pattern": "^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$"
               },
               {
                 "type": "null"
@@ -6948,6 +7124,34 @@
               }
             ],
             "title": "Withdrawn At"
+          },
+          "withdrawn_family": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "hermes",
+                  "codex",
+                  "claude"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Family"
+          },
+          "withdrawn_session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Withdrawn Session Id"
           }
         },
         "additionalProperties": false,
