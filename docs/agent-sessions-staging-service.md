@@ -2,7 +2,7 @@
 
 **Not deploy-ready.** This template is source packaging for a proposed first
 isolated Hub, not a running or accepted deployment. It does not provide a
-fresh-instance bootstrap, router, Access policy, credentials, published image,
+automatic initialization, router, Access policy, credentials, published image,
 matching UI, or acceptance evidence. No host operation is authorized by this
 file. Review the exact source revision and the deployment plan before any
 separate operator approval.
@@ -66,10 +66,30 @@ Compose interpolation inputs through a protected operator mechanism. Compose
 The state must already contain a newly initialized and owner-enrolled
 `hub.sqlite3` and existing `agent-message-bus/messages.sqlite3`, `audit.jsonl`,
 and `files/`. The existing CLI requires these and refuses to create or adopt an
-unenrolled ledger. The existing enrollment utility is not a complete fresh
-bootstrap. An accepted, reviewed fresh-state initialization and enrollment
-procedure is still required; do not invent one, copy live state, or use empty
-fallbacks. Preserve state and audit on failure; do not reset them for a retry.
+unenrolled ledger. The cold-ledger enrollment utility is not the fresh-state
+path. The separately reviewed initializer creates and enrolls a brand-new tree
+using the existing owner and repository APIs:
+
+```text
+python -m engineering_hub.staging_state_init --new-state-dir ABSOLUTE_NEW_ROOT
+```
+
+This command creates state and must run only after approval of the exact new
+location and image. It requires an existing private, owned, mode-0700 parent on
+a supported local Linux filesystem and refuses an existing target, even an
+empty directory. In a separate bootstrap container, mount only the approved
+parent and choose a nonexistent child; an already mounted `/state` directory
+is not a valid new target. Use the Hub control image's UID/GID 568 and verify
+the resulting child is the later service's state mount. The initializer creates
+no settings, tokens, sessions, listeners or workers. It preserves partial state
+on failure; do not reset or retry that target. Never copy live state or use an
+empty fallback to bypass enrollment.
+
+The initializer and existing owned-inactive service tests passed 35 tests in
+the cached isolated Linux validation image. Those tests used the explicit
+ephemeral-filesystem test seam and UID 10001. They do not prove the deployment
+image's UID 568, actual host filesystem, bind mappings or service startup. Prove
+those selected-path conditions before activating the service.
 
 The service has a dedicated Compose bridge network, no host network or Docker
 socket, a read-only root, bounded `/tmp`, UID/GID 568, one CPU, 512 MiB
@@ -103,8 +123,9 @@ operation after approval and lifecycle review.
 
 ## Gates before activation
 
-- Accept a fresh isolated bootstrap and enrollment procedure, private state
-  paths and ownership, and protected synthetic credentials.
+- Accept the initializer on the selected image and actual private filesystem,
+  with the approved new state path and UID 568 ownership, and separately
+  provision protected synthetic credentials.
 - Approve a private same-origin HTTPS router and Access policy. Route `/mcp`
   and `/api/agent-sessions/v1` to the agent listener without interactive
   redirects; route browser UI and `/api/hub/v1` to the browser listener with
