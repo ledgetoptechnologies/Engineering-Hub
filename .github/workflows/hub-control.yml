@@ -309,6 +309,17 @@ jobs:
           }
           if receipt['image_revision_label'] != receipt['source_commit']:
               raise SystemExit('image revision label differs from candidate commit')
+          def reject_json_constant(_):
+              raise ValueError()
+          for smoke_path in receipt['smoke_outputs']:
+              try:
+                  with open(smoke_path, 'rb') as smoke_file:
+                      smoke_bytes = smoke_file.read(1024 * 1024 + 1)
+                  if not smoke_bytes or len(smoke_bytes) > 1024 * 1024:
+                      raise ValueError()
+                  json.loads(smoke_bytes, parse_constant=reject_json_constant)
+              except Exception:
+                  raise SystemExit('required smoke evidence unavailable or invalid') from None
           with open('hub-control-candidate-receipt.json', 'w', encoding='utf-8') as f:
               json.dump(receipt, f, sort_keys=True, separators=(',', ':'))
               f.write('\n')
@@ -323,6 +334,7 @@ jobs:
             hub-control-candidate-receipt.json
             hub-image-inspect-before.json
             hub-image-inspect-after.json
+            candidate/hub-artifact-startup.json
             candidate/hub-artifact-*-startup.json
           if-no-files-found: error
           retention-days: 14
