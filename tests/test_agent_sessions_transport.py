@@ -561,3 +561,177 @@ def test_legacy_raw_token_partition_and_length_remain_compatible(tmp_path, enabl
         assert called.status_code == 200 and not called.json()['result'].get('isError')
         assert client.get('/api/messages', headers={'Authorization': 'Bearer not-configured'}).status_code == 401
         assert client.post('/mcp', headers=[*headers(token).items(), ('Authorization', 'Bearer other')], json={}).status_code == 401
+
+
+# Direct ASGI barriers isolate response completion from downstream task completion.
+@asynccontextmanager
+async def _response_guard_harness(tmp_path):
+    from agent_message_bus.agent_sessions_transport import AgentSessionResponseGuardMiddleware
+
+    app = bus(tmp_path)
+    repo = app.state.agent_sessions
+    issued = repo.exchange(credential(repo))
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Queue()
+    entered = asyncio.Queue()
+    tasks = []
+
+    async def downstream(scope, receive, send):
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        if scope['method'] == 'POST' or scope.get('test_get_final'):
+            await send({'type': 'http.response.body', 'body': b'', 'more_body': False})
+        await entered.put(scope['method'])
+        if scope.get('test_hold_cancellation'):
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await cancellation_seen.put(True)
+        else:
+            await release.wait()
+
+    guard = AgentSessionResponseGuardMiddleware(downstream, auth=AUTH, repository=repo)
+
+    def scope(method):
+        return {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1',
+                'scheme': 'http', 'method': method, 'path': '/mcp', 'raw_path': b'/mcp',
+                'query_string': b'', 'root_path': '', 'headers': [
+                    (k.lower().encode('ascii'), v.encode('ascii'))
+                    for k, v in headers(issued['token']).items()],
+                'client': ('127.0.0.1', 12345), 'server': ('127.0.0.1', 80), 'state': {}}
+
+    async def receive():
+        return {'type': 'http.request', 'body': b'', 'more_body': False}
+
+    async def send(message):
+        pass
+
+    def start(method, sender=send, *, get_final=False, hold_cancellation=False):
+        request_scope = scope(method)
+        request_scope['test_get_final'] = get_final
+        request_scope['test_hold_cancellation'] = hold_cancellation
+        task = asyncio.create_task(guard(request_scope, receive, sender))
+        tasks.append(task)
+        return task
+
+    async def denial(method):
+        response = []
+        async def capture(message):
+            response.append(message)
+        await asyncio.wait_for(guard(scope(method), receive, capture), 2)
+        assert response[0]['status'] == 429
+        assert json.loads(response[1]['body'])['detail']['code'] == 'session_transport_limit'
+
+    try:
+        yield guard, repo, issued, entered, start, denial, cancellation_seen
+    finally:
+        release.set()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
+        assert guard._total == 0 and not guard._active and not getattr(guard, '_completed_posts', {})
+        assert not repo._listeners
+
+
+@pytest.mark.asyncio
+async def test_response_guard_completed_post_allowance_is_bounded(tmp_path):
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        first = start('GET')
+        assert await asyncio.wait_for(entered.get(), 2) == 'GET'
+        second = start('POST')
+        assert await asyncio.wait_for(entered.get(), 2) == 'POST'
+        assert not second.done() and guard._total == 2
+        third_status = asyncio.Future()
+        async def third_send(message):
+            if message['type'] == 'http.response.start':
+                third_status.set_result(message['status'])
+        third = start('POST', third_send)
+        assert await asyncio.wait_for(third_status, 2) == 200
+        assert await asyncio.wait_for(entered.get(), 2) == 'POST'
+        assert not first.done() and not third.done() and guard._total == 3
+        assert list(guard._completed_posts.values()) == [1]
+        assert list(guard._active.values()) == [2]
+        await denial('POST')
+
+
+@pytest.mark.asyncio
+async def test_response_guard_completed_post_still_counts_global(tmp_path, monkeypatch):
+    monkeypatch.setattr('agent_message_bus.agent_sessions_transport.MAX_NEW_STREAMS', 2)
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        start('GET')
+        assert await asyncio.wait_for(entered.get(), 2) == 'GET'
+        start('POST')
+        assert await asyncio.wait_for(entered.get(), 2) == 'POST'
+        assert guard._total == 2 and list(guard._completed_posts.values()) == [1]
+        await denial('POST')
+
+
+@pytest.mark.asyncio
+async def test_response_guard_failed_final_send_never_promotes(tmp_path):
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        reached = asyncio.Event()
+        proceed = asyncio.Event()
+        async def failed_send(message):
+            if message['type'] == 'http.response.body':
+                reached.set()
+                await proceed.wait()
+                raise RuntimeError('synthetic_send_failure')
+        start('GET')
+        assert await asyncio.wait_for(entered.get(), 2) == 'GET'
+        task = start('POST', failed_send)
+        await asyncio.wait_for(reached.wait(), 2)
+        assert not guard._completed_posts and guard._total == 2
+        await denial('POST')
+        proceed.set()
+        with pytest.raises(RuntimeError, match='synthetic_send_failure'):
+            await asyncio.wait_for(task, 2)
+        assert guard._total == 1 and not guard._completed_posts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('ending', ['revoke', 'expiry', 'cancel'])
+async def test_response_guard_completed_post_retains_cancellation_ownership(tmp_path, monkeypatch, ending):
+    if ending == 'expiry':
+        monkeypatch.setattr('agent_message_bus.agent_sessions.SESSION_SECONDS', 1)
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        task = start('POST')
+        assert await asyncio.wait_for(entered.get(), 2) == 'POST'
+        assert guard._total == 1 and list(guard._completed_posts.values()) == [1]
+        if ending == 'revoke':
+            repo.revoke_session(OWNER, issued['session']['id'], 1)
+        elif ending == 'cancel':
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
+        assert guard._total == 0 and not guard._active and not getattr(guard, '_completed_posts', {})
+        assert not repo._listeners
+
+
+@pytest.mark.asyncio
+async def test_response_guard_completed_get_does_not_use_post_allowance(tmp_path):
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        start('GET', get_final=True)
+        assert await asyncio.wait_for(entered.get(), 2) == 'GET'
+        start('GET')
+        assert await asyncio.wait_for(entered.get(), 2) == 'GET'
+        assert guard._total == 2 and not guard._completed_posts
+        await denial('POST')
+
+
+@pytest.mark.asyncio
+async def test_response_guard_repeated_caller_cancel_retains_live_task(tmp_path):
+    async with _response_guard_harness(tmp_path) as (guard, repo, issued, entered, start, denial, cancellation_seen):
+        task = start('POST', hold_cancellation=True)
+        assert await asyncio.wait_for(entered.get(), 2) == 'POST'
+        task.cancel()
+        await asyncio.wait_for(cancellation_seen.get(), 2)
+        assert not task.done() and guard._total == 1
+        assert list(guard._completed_posts.values()) == [1] and repo._listeners
+        task.cancel()
+        await asyncio.wait_for(cancellation_seen.get(), 2)
+        assert not task.done() and guard._total == 1
+        assert list(guard._completed_posts.values()) == [1] and repo._listeners
