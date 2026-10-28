@@ -109,7 +109,10 @@ access. Native automatic wake into a desktop chat is a separate integration.
 ## Revocation test
 
 Create two same-family installations, A and B, and two sessions under A. Verify
-that their mailboxes and claims are distinct, and that B cannot finish A's claim.
+that A and B have separate installation mailboxes. Sessions within A share its
+mailbox, but each claim belongs to the exact claiming session: A's sibling
+session and B must both be unable to finish that claim. This foundation does not
+route installation messages to a particular desktop chat.
 Revoke one A session in the owner UI: it must lose access while A's sibling and B
 remain usable. Then revoke installation A: all its sessions and future exchanges
 must be refused while B continues working. Existing authenticated streams must
