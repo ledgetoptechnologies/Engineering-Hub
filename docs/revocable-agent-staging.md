@@ -66,8 +66,12 @@ self-described metadata, not proof of machine identity. Pending requests expire
 after ten minutes. The initial approval lasts 24 hours.
 Expired requests that were never approved are reclaimed during subsequent
 enrollment so abandoned requests cannot permanently fill the pairing table.
-Retrying an expired credential starts a fresh pending request and requires a new
-owner approval. Approved identities, session history and audit are retained.
+Retrying an expired, never-approved request with its saved credential starts a
+fresh pending request and requires owner approval. Approved identities, session
+history and audit are retained. This pilot has no renewal action for an expired
+previously approved identity: use an explicitly chosen new private profile and
+fresh owner approval, preserving the old profile and history. Revoked identities
+remain revoked; the helper does not automatically reenroll or rotate credentials.
 
 The helper retains the original private identity across a failed enrollment
 request; retry the same command instead of generating another credential.
