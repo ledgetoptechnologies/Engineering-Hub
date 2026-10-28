@@ -61,8 +61,12 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const allowed = useRef({ canChange, csrf });
   allowed.current = { canChange, csrf };
   function retireSessionReads(installationId?: string) {
-    for (const key of installationId ? [installationId] : Object.keys(sessionReads.current))
+    for (const key of installationId ? [installationId] : Object.keys(sessionReads.current)) {
       sessionReads.current[key] = (sessionReads.current[key] ?? 0) + 1;
+      // A retired read is cancelled too, not just ignored when it answers.
+      sessionCalls.current[key]?.abort();
+      delete sessionCalls.current[key];
+    }
   }
 
   // Ages and pairing deadlines move with this browser's clock; nothing is re-read from the server.
@@ -70,6 +74,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   // Every panel read has a deadline, and leaving the page cancels whatever is still open.
   const inflight = useRef(new Set<AbortController>());
   const refreshCall = useRef<AbortController | null>(null);
+  const catalogCall = useRef<AbortController | null>(null);
+  const sessionCalls = useRef<Record<string, AbortController>>({});
   function bounded() {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), REFRESH_DEADLINE_MS);
@@ -102,9 +108,13 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       setCapabilities(found);
       if (!found.owner) { setLoad("not_owner"); return; }
       if (!catalog) {
+        // Only the newest refresh's catalog probe stays open.
+        catalogCall.current?.abort();
         const probe = bounded();
+        catalogCall.current = probe.controller;
         void grants.catalog(probe.controller.signal).then(next => { if (mounted.current && current === generation.current) setCatalog(next); })
-          .catch(error => { if (mounted.current && current === generation.current) denied(error); }).finally(probe.done);
+          .catch(error => { if (mounted.current && current === generation.current) denied(error); })
+          .finally(() => { probe.done(); if (catalogCall.current === probe.controller) catalogCall.current = null; });
       }
       setLoad(previous => previous === "loaded" ? "loaded" : "loading");
       const [nextItems, nextAudit] = await Promise.all([client.installations(controller.signal), client.audit(controller.signal)]);
@@ -125,6 +135,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
         : controller.signal.aborted ? "The Hub didn't answer in time, so nothing new is shown. Refresh to retry."
         : "Agent connections couldn't be read. Refresh to retry.");
     } finally {
+      // If one of the paired reads failed early, the other is cancelled rather than left open.
+      controller.abort();
       call.done();
       if (refreshCall.current === controller) refreshCall.current = null;
     }
@@ -135,17 +147,24 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
     if (open === installation.id) { setOpen(null); return; }
     setOpen(installation.id);
     if (demo || sessions[installation.id]?.state === "loaded") return;
+    retireSessionReads(installation.id);
     const current = sessionReads.current[installation.id] = (sessionReads.current[installation.id] ?? 0) + 1;
     const latest = () => mounted.current && sessionReads.current[installation.id] === current;
+    // Same deadline as before, now owned: a newer read, a refresh or leaving the page cancels it.
+    const probe = bounded();
+    sessionCalls.current[installation.id] = probe.controller;
     setSessions(previous => ({ ...previous, [installation.id]: { state: "loading", items: [] } }));
     try {
-      const found = await client.sessions(installation.id, AbortSignal.timeout(15_000));
+      const found = await client.sessions(installation.id, probe.controller.signal);
       if (latest()) setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded", items: found } }));
     } catch (error) {
       if (!latest()) return;
       // Never left on "Reading sessions…": a refused read shows as failed even while sign-in is being cleared.
       setSessions(previous => ({ ...previous, [installation.id]: { state: "failed", items: [] } }));
       denied(error);
+    } finally {
+      probe.done();
+      if (sessionCalls.current[installation.id] === probe.controller) delete sessionCalls.current[installation.id];
     }
   }
   /** One change at a time; the shown record changes only to what the server returned. */
@@ -190,7 +209,9 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       <button type="button" className="secondary small" disabled={demo || load === "loading"} onClick={() => void refresh()}>Refresh</button>
     </span></div>;
   if (load === "not_owner") return <section className="panel installations" aria-label="Installations">{header}
-    <p className="panel-description">Only the staging owner can see and manage agent installations.</p></section>;
+    <p className="panel-description">Only the staging owner can see and manage agent installations.</p>
+    <p className="panel-footnote">Managing installations needs the configured owner's own Hub sign-in on this Hub. If that's you, <a
+      className="text-link" href="/api/hub/v1/auth/login">sign in to this Hub</a>, then come back to Agents.</p></section>;
 
   const pendingAt = (item: Installation) => item.state === "pending" && !!item.expires_at && Date.parse(item.expires_at) <= now;
   return (
