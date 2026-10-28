@@ -180,13 +180,13 @@ describe("context text follows the backend's bounded_text rule", () => {
     owner_family: "codex", owner_session_id: raw.claim_session_id, revision: 3, candidate_commit: null, review: null, repair_count: 0,
     updated_at: raw.task.updated_at };
   it("accepts control characters other than NUL in details, link labels and reasons", () => {
-    expect(() => parseBridgeTask({ ...base, details: "AB" })).not.toThrow();
-    expect(() => parseBridgeTask({ ...base, links: [{ label: "AB", url: "https://example.test/a" }] })).not.toThrow();
-    expect(() => parseBridgeTask({ ...base, status: "withdrawn", withdrawn_reason: "AB" })).not.toThrow();
-    expect(parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "AB" } }, taskId).recovery.reason).toBe("AB");
+    expect(() => parseBridgeTask({ ...base, details: "A\u0001B" })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "A\u0001B", url: "https://example.test/a" }] })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, status: "withdrawn", withdrawn_reason: "A\u0001B" })).not.toThrow();
+    expect(parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "A\u0001B" } }, taskId).recovery.reason).toBe("A\u0001B");
   });
   it("rejects NUL, oversize context and malformed links", () => {
-    expect(() => parseBridgeTask({ ...base, details: "A B" })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, details: "A\u0000B" })).toThrow(HubApiError);
     expect(() => parseBridgeTask({ ...base, details: "x".repeat(4096) })).not.toThrow();
     expect(() => parseBridgeTask({ ...base, details: "x".repeat(4097) })).toThrow(HubApiError);
     expect(() => parseBridgeTask({ ...base, links: [{ label: "x".repeat(101), url: "https://example.test/a" }] })).toThrow(HubApiError);
@@ -195,6 +195,23 @@ describe("context text follows the backend's bounded_text rule", () => {
     expect(() => parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "x".repeat(501) } }, taskId)).toThrow(HubApiError);
   });
   it("keeps the stricter rule for titles", () => {
-    expect(() => parseBridgeTask({ ...base, title: "AB" })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, title: "A\u0001B" })).toThrow(HubApiError);
+  });
+  it("judges blank text by Python's whitespace, not JavaScript's", () => {
+    // U+FEFF is content to Python's strip(), though JavaScript's trim() removes it.
+    expect(() => parseBridgeTask({ ...base, details: "\ufeff" })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "\ufeff", url: "https://example.test/a" }] })).not.toThrow();
+    for (const blank of [" \t\n", "\u001c\u001f", "\u0085\u00a0", "\u1680\u2000\u200a", "\u2028\u2029\u202f\u205f\u3000"])
+      expect(() => parseBridgeTask({ ...base, details: blank })).toThrow(HubApiError);
+  });
+  it("rejects text the backend can't encode as UTF-8", () => {
+    expect(() => parseBridgeTask({ ...base, details: "A\ud800B" })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, details: "A\udc00" })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, details: "A🌲" })).not.toThrow();
+  });
+  it("counts astral characters once, like Python's len", () => {
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "🌲".repeat(100), url: "https://example.test/a" }] })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "🌲".repeat(101), url: "https://example.test/a" }] })).toThrow(HubApiError);
+    expect(() => parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "🌲".repeat(500) } }, taskId)).not.toThrow();
   });
 });
