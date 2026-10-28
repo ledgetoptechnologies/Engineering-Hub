@@ -97,6 +97,14 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
     const current = ++generation.current;
     // A newer refresh retires the older one's requests instead of leaving them open.
     refreshCall.current?.abort();
+    // Session reads still open are cancelled and fenced now, before this refresh can hang or fail, so a late
+    // answer (or a late 401) from them can't land. Lists that already loaded stay as they are.
+    const unfinished = Object.keys(sessionCalls.current);
+    if (unfinished.length) {
+      for (const key of unfinished) retireSessionReads(key);
+      setSessions(previous => Object.fromEntries(Object.entries(previous).filter(([key, entry]) => !(unfinished.includes(key) && entry.state === "loading"))));
+      setOpen(previous => previous !== null && unfinished.includes(previous) ? null : previous);
+    }
     const call = bounded(), controller = call.controller;
     refreshCall.current = controller;
     setFailure(""); setAccessEpoch(value => value + 1);
