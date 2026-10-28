@@ -97,12 +97,18 @@ export function HubApp() {
   const topicReads = useRef(0);
   const taskRequest = useRef<{ payload: string; key: string } | null>(null);
 
-  const clearPrivateWorkspace = useCallback(() => {
-    // Also fence late reads from a request whose identity is no longer valid.
-    requests.current++;
+  // The actor whose records are on screen; a different validated actor must never see them.
+  const shownActor = useRef<string | null>(null);
+  // Bumped whenever a workspace is reset: an operation started in an earlier workspace must not touch the next one.
+  const workspaceEpoch = useRef(0);
+  /** Drop every private record, cached snapshot, dialog and pending action, and fence late topic/agent reads. */
+  const resetWorkspace = useCallback(() => {
     agentReader.current?.pause();
     topicReads.current++;
-    setSession(null);
+    workspaceEpoch.current++;
+    shownActor.current = null;
+    // An earlier workspace's operation no longer holds this one busy; its late result is ignored (see mutate).
+    setWorking(false);
     setData(null);
     setAgents([]);
     setPeers(null);
@@ -123,6 +129,12 @@ export function HubApp() {
     // would trigger another refresh and could immediately undo fail-closed UI.
     setTopicDraft("");
   }, []);
+  const clearPrivateWorkspace = useCallback(() => {
+    // Also fence late reads from a request whose identity is no longer valid.
+    requests.current++;
+    setSession(null);
+    resetWorkspace();
+  }, [resetWorkspace]);
 
   const refresh = useCallback(
     async (canVerify: () => boolean = () => true) => {
@@ -133,6 +145,12 @@ export function HubApp() {
       try {
         const nextSession = await client.getSession();
         if (request !== requests.current) return false;
+        // A different person: clear the previous actor's workspace now, before waiting for the new overview.
+        // This keeps this refresh's own generation, so the new overview can still land; older reads stay fenced.
+        if (nextSession.authenticated && shownActor.current !== null && shownActor.current !== nextSession.actor) {
+          resetWorkspace();
+          setLoading(true);
+        }
         setSession(nextSession);
         if (!nextSession.authenticated) {
           clearPrivateWorkspace();
@@ -185,6 +203,7 @@ export function HubApp() {
           client.getEventsStatus(),
         ]);
         if (request !== requests.current) return false;
+        shownActor.current = nextSession.actor ?? null;
         setData(overview);
         setAgents(overview.agents);
         agentReader.current?.seed();
@@ -206,7 +225,7 @@ export function HubApp() {
         if (request === requests.current) setLoading(false);
       }
     },
-    [client, topic, demo, clearPrivateWorkspace],
+    [client, topic, demo, clearPrivateWorkspace, resetWorkspace],
   );
   useEffect(() => {
     if (demo) return;
@@ -397,7 +416,8 @@ export function HubApp() {
   const nextExpiry = deadlines.length ? Math.min(...deadlines) : null;
   useEffect(() => {
     if (nextExpiry === null) return;
-    // Local expiry only: no HTTP, inbox, model, or status polling.
+    // This timer only repaints local expiry; it makes no HTTP requests.
+    // watchAgentObservations separately renews visible-page /agents metadata.
     const timer = setTimeout(
       () => expire((value) => value + 1),
       Math.max(1, nextExpiry - Date.now() + 10),
@@ -406,15 +426,21 @@ export function HubApp() {
   }, [nextExpiry]);
 
   async function mutate(operation: () => Promise<unknown>, success: string) {
+    // Its result belongs to the workspace it started in. If that was reset for a different person meanwhile, the
+    // result is ignored here (the server may still have applied it); it can't announce, refresh or clear anything.
+    const epoch = workspaceEpoch.current;
+    const current = () => epoch === workspaceEpoch.current;
     setWorking(true);
     setNotice("");
     try {
       await operation();
+      if (!current()) return false;
       setNotice(demo ? `${success} Demo only; no server changed.` : success);
       setNoticeError(false);
       await refresh();
       return true;
     } catch (error) {
+      if (!current()) return false;
       setNotice(errorText(error));
       setNoticeError(true);
       if (
@@ -428,7 +454,7 @@ export function HubApp() {
       }
       return false;
     } finally {
-      setWorking(false);
+      if (current()) setWorking(false);
     }
   }
   const writable = Boolean(

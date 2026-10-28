@@ -4193,3 +4193,11 @@ button.primary.danger { color: #fff; background: #a3402f; border-color: #a3402f;
   .hub-claim-list > li { grid-template-columns: 1fr; }
 }
 .recovery-ids code { font-size: 11px; overflow-wrap: anywhere; }
+
+/* Installation-wide action, kept apart from everyday session actions. */
+.installation-disconnect { grid-column: 1 / -1; display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+  border-top: 1px dashed #e3e6ee; padding-top: 6px; font-size: 12px; }
+button.text-button.danger { color: #a3402f; }
+.pairing-guide { border: 1px solid #dfe3ec; border-radius: 8px; padding: 8px 12px; margin: 10px 0; background: #fbfcfe; }
+.pairing-guide summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.pairing-guide ol { margin: 8px 0 4px; padding-left: 20px; display: grid; gap: 6px; font-size: 13px; }

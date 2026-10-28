@@ -1,5 +1,29 @@
 # Engineering Hub staging coordination: agent quickstart
 
+## Current source path — 2026-10-28
+
+The dated deployment observations below are historical. For the actual installed
+build, host status and accepted operator scope, read the canonical Hub note
+`engineering-hub / runbooks/current-staging-readiness-20261022.md` before acting.
+Publication, configuration validation and an ordinary Hub update do not activate
+staging execution.
+
+The unified job composition and its explicit startup selector already exist;
+do not implement another queue or service to connect them. See
+[unified queued-pilot composition](unified-queued-pilot.md) and the
+[fixed trusted-session selector](trusted-manual-staging-startup.md).
+The existing path connects the Hub queue and native event runtime to the
+immutable candidate/rollback workflow through a protected executor transport.
+Ordinary startup leaves it inactive. Actual NAS-to-staging configuration,
+operator reconciliation and runtime acceptance remain separate work; consult
+[live operator gates](live-staging-operator-gates.md).
+
+For connecting another agent PC, use
+[revocable agent connections](revocable-agent-staging.md), including the
+same-origin helper download, local private profile and owner approval. This
+identity path is separate from running staging jobs. Installation approval alone
+does not grant project access, execution or automatic desktop-chat wake.
+
 ## Verified deployment checkpoint — 2026-10-20
 
 The unified Hub is now reachable on TrueNAS at `192.168.50.80:8770` and
@@ -84,7 +108,7 @@ ordinary `create_app()`. It does **not** select
 bridge this gap. `docker/hub-container-pilot-acceptance.py` is intentionally
 disabled, not an acceptance command to run repeatedly until it succeeds.
 
-Before implementing an installable private composition, collect these inputs
+Before selecting the existing opt-in composition, collect these inputs
 through separately authorized work, without putting credentials in this document:
 
 | Required input | Existing source contract | Evidence needed |
@@ -104,12 +128,14 @@ proves only the stated runner observation, **not** driver identity, image/profil
 deployment or rollback. Do not invent pins from a synthetic fixture to satisfy it.
 
 After the inputs and host boundary are independently reviewed, prepare the
-explicit installation/entry-point wiring and obtain separate execution approval.
-The first real pilot must target a separate disposable Hub instance, not replace
+configuration for the existing explicit selector and obtain separate execution
+approval. A bounded pilot must target a separate disposable Hub instance, not replace
 its controller, Viewer/PA, the live MCP or production. Record actual immutable
 candidate deployment, health evidence, a deliberate failed candidate and verified
 rollback, durable held handling and installed restart behavior. Keep container
-fixture results separate from host/reboot acceptance. Stop at any missing input;
+fixture results separate from host/reboot acceptance. The current readiness note
+retains credit for the completed historical isolated pilot; it is not proof of
+current NAS-to-staging acceptance. Stop at any missing input;
 do not substitute a permissive callback or edit held SQL to make the pilot pass.
 
 1. Beau creates a Hub task, or an authenticated agent creates an unclaimed

@@ -230,10 +230,16 @@ container even if the startup response was interrupted; it removes only the
 verified owned container ID and reports ambiguous cleanup instead of guessing.
 Its disposable tmpfs deliberately does **not** establish storage/reboot acceptance.
 
-Browser connection indicators expire locally without HTTP status polling. Native
-SSE invalidations are coalesced; disconnects invalidate readiness and block writes
-until reconciled. Topic readiness remains advisory, separate from durable mail,
-claiming work, executing work and completing it.
+Browser connection indicators expire through a local repaint timer that makes no
+HTTP requests. Separately, after an authenticated workspace read, the visible
+page renews connection metadata with `GET /agents` no more often than once every
+15 seconds. This reader manages one request at a time with a 10-second timeout;
+hiding the page cancels its read and timer, and returning to the page resumes
+renewal when due.
+Neither metadata renewal nor local expiry proves chat readiness or wakes agents.
+Native SSE invalidations are coalesced; disconnects invalidate readiness and block
+writes until reconciled. Topic readiness remains advisory, separate from durable
+mail, claiming work, executing work and completing it.
 
 Local verification on 2026-10-17: production Vite/TypeScript build, eight API-client
 unit tests, twenty real-Edge Playwright tests, and the network-disabled container
