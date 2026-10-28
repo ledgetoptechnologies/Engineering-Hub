@@ -86,7 +86,7 @@ async function openAccess(page: Page) {
   await page.goto("/#/agents");
   const row = panel(page).locator(".installation-row", { hasText: "desk-pc" });
   // Session labels help name the claim's sessions.
-  await row.getByRole("button", { name: "Sessions" }).click();
+  await row.getByRole("button", { name: "Show sessions" }).click();
   await expect(row.getByRole("table")).toBeVisible();
   await row.getByRole("button", { name: "Hub access" }).click();
   await expect(access(page)).toBeVisible();

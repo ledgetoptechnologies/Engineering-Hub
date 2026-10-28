@@ -67,7 +67,20 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
 
   // Ages and pairing deadlines move with this browser's clock; nothing is re-read from the server.
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 15_000); return () => window.clearInterval(timer); }, []);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; }; }, []);
+  // Every panel read has a deadline, and leaving the page cancels whatever is still open.
+  const inflight = useRef(new Set<AbortController>());
+  const refreshCall = useRef<AbortController | null>(null);
+  function bounded() {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), REFRESH_DEADLINE_MS);
+    inflight.current.add(controller);
+    return { controller, done: () => { window.clearTimeout(timer); inflight.current.delete(controller); } };
+  }
+  useEffect(() => { mounted.current = true; return () => {
+    mounted.current = false; generation.current++;
+    for (const controller of inflight.current) controller.abort();
+    inflight.current.clear();
+  }; }, []);
 
   function denied(error: unknown): boolean {
     if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return true; }
@@ -75,7 +88,11 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   }
   async function refresh(keepSessions = false) {
     if (demo) return;
-    const current = ++generation.current, controller = new AbortController();
+    const current = ++generation.current;
+    // A newer refresh retires the older one's requests instead of leaving them open.
+    refreshCall.current?.abort();
+    const call = bounded(), controller = call.controller;
+    refreshCall.current = controller;
     setFailure(""); setAccessEpoch(value => value + 1);
     let probing = capabilities === null;
     try {
@@ -84,8 +101,11 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       if (current !== generation.current || !mounted.current) return;
       setCapabilities(found);
       if (!found.owner) { setLoad("not_owner"); return; }
-      if (!catalog) void grants.catalog(controller.signal).then(next => { if (mounted.current) setCatalog(next); })
-        .catch(error => { if (mounted.current) denied(error); });
+      if (!catalog) {
+        const probe = bounded();
+        void grants.catalog(probe.controller.signal).then(next => { if (mounted.current && current === generation.current) setCatalog(next); })
+          .catch(error => { if (mounted.current && current === generation.current) denied(error); }).finally(probe.done);
+      }
       setLoad(previous => previous === "loaded" ? "loaded" : "loading");
       const [nextItems, nextAudit] = await Promise.all([client.installations(controller.signal), client.audit(controller.signal)]);
       if (current !== generation.current || !mounted.current) return;
@@ -102,7 +122,11 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       setLoad(previous => previous === "loaded" ? "loaded" : "failed");
       setFailure(error instanceof HubApiError && error.code === "invalid_agent_connections_response"
         ? "The Hub answered in a shape this page doesn't accept, so nothing new is shown. Tell an agent; Refresh to retry."
+        : controller.signal.aborted ? "The Hub didn't answer in time, so nothing new is shown. Refresh to retry."
         : "Agent connections couldn't be read. Refresh to retry.");
+    } finally {
+      call.done();
+      if (refreshCall.current === controller) refreshCall.current = null;
     }
   }
   useEffect(() => { void refresh(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -118,8 +142,10 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       const found = await client.sessions(installation.id, AbortSignal.timeout(15_000));
       if (latest()) setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded", items: found } }));
     } catch (error) {
-      if (!latest() || denied(error)) return;
+      if (!latest()) return;
+      // Never left on "Reading sessions…": a refused read shows as failed even while sign-in is being cleared.
       setSessions(previous => ({ ...previous, [installation.id]: { state: "failed", items: [] } }));
+      denied(error);
     }
   }
   /** One change at a time; the shown record changes only to what the server returned. */
@@ -146,7 +172,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const approve = (item: Installation) => change(`approve:${item.id}`, async token => replace(await client.approve(item.id, item.revision, token)),
     `Approved ${item.name}. It can now start sessions.`);
   const revoke = (item: Installation) => change(`revoke:${item.id}`, async token => replace(await client.revokeInstallation(item.id, item.revision, token)),
-    item.state === "pending" ? `Declined the pairing request from ${item.name}.` : `Revoked ${item.name}. The Hub refuses its sessions from now on.`);
+    item.state === "pending" ? `Declined the pairing request from ${item.name}.`
+      : `Disconnected ${item.name}. Its sessions have ended; other installations keep working.`);
   const rename = (item: Installation, name: string) => change(`rename:${item.id}`, async token => replace(await client.rename(item.id, item.revision, name, token)),
     "Name saved.");
   const revokeSession = (session: Session, installation: Installation) => change(`session:${session.id}`, async token => {
@@ -154,7 +181,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
     retireSessionReads(installation.id);
     setSessions(previous => ({ ...previous, [installation.id]: { state: "loaded",
       items: (previous[installation.id]?.items ?? []).map(item => item.id === next.id ? next : item) } }));
-  }, "Session revoked. The installation's other sessions keep working.", true);
+  }, "Session ended. The installation and its other sessions keep working.", true);
 
   if (load === "unavailable" || load === "checking") return null;
   const header = <div className="panel-title"><h2>Installations</h2><Badge tone="amber">STAGING</Badge>
@@ -169,9 +196,10 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   return (
     <section className="panel installations" aria-label="Installations">
       {header}
-      <p className="panel-description">Each agent install on each computer has its own connection. A new install pairs by showing a code on
-        that computer; you approve it here only if the code and fingerprint match. Revoking an install ends all its sessions; revoking one
-        session leaves the install working. No passwords or tokens are shown on this page.</p>
+      <p className="panel-description">Each agent installation has its own connection, so one computer can have separate Codex and Claude
+        installations. Ending a session stops just that session. Disconnecting an installation ends all of its sessions and needs a fresh,
+        approved pairing to use again; other installations, even on the same computer, keep working. No passwords or tokens are shown here.</p>
+      <PairingGuide open={load === "loaded" && items.length === 0} />
       {catalog ? <p className="notice">Staging only. A connection approved here can send and receive its own messages. It can use Hub tasks,
         reviews and other project operations only where you grant them under Hub access. Running work and waking an agent's chat stay separate.</p>
         : <p className="notice">Staging only: this is the identity and messaging foundation. A connection approved here can send and receive its own
@@ -217,11 +245,10 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                       onClick={() => { setNotice(null); setDialog({ kind: "approve", item }); }}>Check and approve…</button>}
                     {(item.state === "active" || item.state === "pending") && <button type="button" className="secondary small" disabled={!canChange || busy !== null}
                       onClick={() => setRenaming({ id: item.id, name: item.name })}>Rename</button>}
-                    {(item.state === "active" || (item.state === "pending" && !lapsed)) && <button type="button" className="secondary small danger"
-                      disabled={!canChange || busy !== null} onClick={() => { setNotice(null); setDialog({ kind: "revoke", item }); }}>
-                      {item.state === "pending" ? "Decline…" : "Revoke…"}</button>}
+                    {item.state === "pending" && !lapsed && <button type="button" className="secondary small danger"
+                      disabled={!canChange || busy !== null} onClick={() => { setNotice(null); setDialog({ kind: "revoke", item }); }}>Decline…</button>}
                     {item.state !== "pending" && <button type="button" className="text-button" aria-expanded={open === item.id}
-                      onClick={() => void readSessions(item)}>{open === item.id ? "Hide sessions" : "Sessions"}</button>}
+                      onClick={() => void readSessions(item)}>{open === item.id ? "Hide sessions" : "Show sessions"}</button>}
                     {catalog && item.state !== "pending" && <button type="button" className="text-button" aria-expanded={access === item.id}
                       onClick={() => setAccess(previous => previous === item.id ? null : item.id)}>{access === item.id ? "Hide Hub access" : "Hub access"}</button>}
                   </div>
@@ -231,6 +258,11 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                 {open === item.id && <SessionList installation={item} entry={sessions[item.id]} now={now}
                   canChange={canChange && item.state === "active"} busy={busy}
                   onRevoke={session => { setNotice(null); setDialog({ kind: "revoke-session", item: session, installation: item }); }} />}
+                {item.state === "active" && <div className="installation-disconnect">
+                  <span className="muted">Whole installation</span>
+                  <button type="button" className="text-button danger" disabled={!canChange || busy !== null}
+                    onClick={() => { setNotice(null); setDialog({ kind: "revoke", item }); }}>Disconnect this installation…</button>
+                </div>}
               </li>;
             })}
           </ul>}
@@ -250,34 +282,33 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
         </ol>}
       </details>
       <p className="panel-footnote">"Last used" is when a session last called the Hub. It's a transport observation: it doesn't prove the agent is
-        listening, ready, or doing work. Revoking stops the Hub accepting that install or session; it can't stop a program already running on
-        that computer.</p>
+        listening, ready, or doing work. Ending a session or disconnecting an installation stops the Hub accepting it; it can't stop a program
+        already running on that computer.</p>
 
       {dialog?.kind === "approve" && <ApproveDialog item={dialog.item} now={now} busy={busy === `approve:${dialog.item.id}`} canChange={canChange}
         error={notice?.error && notice.for === `approve:${dialog.item.id}` ? notice.text : ""}
         onApprove={() => void approve(dialog.item)} onClose={() => setDialog(null)} />}
-      {dialog?.kind === "revoke" && <Modal title={dialog.item.state === "pending" ? `Decline ${dialog.item.name}?` : `Revoke ${dialog.item.name}?`}
-        onClose={() => setDialog(null)}>
-        {dialog.item.state === "pending"
-          ? <p>This pairing request is refused and can't be approved later. Nothing else changes.</p>
-          : <p>The Hub will refuse every session from this installation, and it can't start new ones. Other installations, including other
-            {" "}{FAMILY_NAME[dialog.item.family]} installs, keep working.</p>}
-        <p className="panel-footnote">This can't be undone here: to use that computer again, pair it again. It doesn't stop a program already running there.</p>
+      {dialog?.kind === "revoke" && dialog.item.state === "pending" && <Modal title={`Decline ${dialog.item.name}?`} onClose={() => setDialog(null)}>
+        <p>This pairing request is refused and can't be approved later. Nothing else changes.</p>
         {notice?.error && notice.for === `revoke:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
         <div className="note-actions">
           <button type="button" className="primary danger" disabled={!canChange || busy !== null} onClick={() => void revoke(dialog.item)}>
-            {busy === `revoke:${dialog.item.id}` ? (dialog.item.state === "pending" ? "Declining…" : "Revoking…")
-              : dialog.item.state === "pending" ? "Decline request" : "Revoke installation"}</button>
+            {busy === `revoke:${dialog.item.id}` ? "Declining…" : "Decline request"}</button>
           <button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button>
         </div>
       </Modal>}
-      {dialog?.kind === "revoke-session" && <Modal title="Revoke this session?" onClose={() => setDialog(null)}>
-        <p>The Hub will refuse this one session{dialog.item.label ? ` (${dialog.item.label})` : ""}. {dialog.installation.name} stays approved and its
-          other sessions keep working.</p>
+      {dialog?.kind === "revoke" && dialog.item.state !== "pending" && <DisconnectDialog item={dialog.item} entry={sessions[dialog.item.id]} now={now}
+        others={items.filter(other => other.id !== dialog.item.id && other.host_label === dialog.item.host_label && other.state === "active").length}
+        canChange={canChange} busy={busy === `revoke:${dialog.item.id}`}
+        error={notice?.error && notice.for === `revoke:${dialog.item.id}` ? notice.text : ""}
+        onConfirm={() => void revoke(dialog.item)} onClose={() => setDialog(null)} />}
+      {dialog?.kind === "revoke-session" && <Modal title={dialog.item.label ? `End session “${dialog.item.label}”?` : "End this session?"} onClose={() => setDialog(null)}>
+        <p>Only this session ends. <strong>{dialog.installation.name}</strong> stays approved, and its other sessions keep working. The agent can
+          start a new session from that computer whenever it needs one.</p>
         {notice?.error && notice.for === `session:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
         <div className="note-actions">
           <button type="button" className="primary danger" disabled={!canChange || busy !== null} onClick={() => void revokeSession(dialog.item, dialog.installation)}>
-            {busy === `session:${dialog.item.id}` ? "Revoking…" : "Revoke session"}</button>
+            {busy === `session:${dialog.item.id}` ? "Ending…" : "End this session"}</button>
           <button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button>
         </div>
       </Modal>}
@@ -329,8 +360,62 @@ function SessionList({ installation, entry, now, canChange, busy, onRevoke }: {
         <td title={exact(session.expires_at)}>{untilText(session.expires_at, now)}</td>
         <td>{session.last_used_at ? <span title={exact(session.last_used_at)}>{relativeAge(session.last_used_at)}</span> : <span className="muted">Not yet</span>}</td>
         <td>{session.state === "active" && !ended && <button type="button" className="secondary small danger" disabled={!canChange || busy !== null}
-          onClick={() => onRevoke(session)}>Revoke…</button>}</td>
+          onClick={() => onRevoke(session)}>End session…</button>}</td>
       </tr>;
     })}</tbody>
   </table>;
+}
+
+/** How long any one panel read may take before it is cancelled and reported. */
+export const REFRESH_DEADLINE_MS = 15_000;
+
+/** How many of an installation's sessions are live, only when its session list has actually loaded. */
+export function liveSessionText(entry: { state: "loading" | "loaded" | "failed"; items: Session[] } | undefined, now: number): string {
+  if (!entry) return "Its sessions haven't been loaded on this page, so the count isn't shown. All of them end.";
+  if (entry.state === "loading") return "Its sessions are still loading, so the count isn't shown. All of them end.";
+  if (entry.state === "failed") return "Its sessions couldn't be read, so the count isn't shown. All of them end.";
+  const live = entry.items.filter(session => session.state === "active" && Date.parse(session.expires_at) > now).length;
+  return live === 0 ? "It has no live sessions right now." : `Its ${live} live session${live === 1 ? "" : "s"} end${live === 1 ? "s" : ""}.`;
+}
+
+function DisconnectDialog({ item, entry, now, others, canChange, busy, error, onConfirm, onClose }: {
+  item: Installation; entry: { state: "loading" | "loaded" | "failed"; items: Session[] } | undefined; now: number; others: number;
+  canChange: boolean; busy: boolean; error: string; onConfirm: () => void; onClose: () => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const matches = typed.trim() !== "" && typed.trim() === item.name.trim();
+  return <Modal title={`Disconnect ${FAMILY_NAME[item.family]} installation “${item.name}”?`} onClose={onClose}>
+    <p>This disconnects only this installation: <strong>{FAMILY_NAME[item.family]} · {item.name}</strong>, which says it runs on
+      {" "}<code>{item.host_label}</code>. {liveSessionText(entry, now)} It can't start new sessions.</p>
+    <p>Other installations keep working{others > 0 ? `, including ${others} other on ${item.host_label}` : ", including any other agent on the same computer"}.
+      {" "}To use this installation again, pair it again from that computer and approve the new request. Its history stays.</p>
+    <p className="panel-footnote">This can't be undone here, and it doesn't stop a program already running on that computer.</p>
+    <label className="field">Type the installation name to confirm: <strong>{item.name}</strong>
+      <input value={typed} autoComplete="off" spellCheck={false} onChange={event => setTyped(event.target.value)} /></label>
+    {error && <p role="alert" className="notice error">{error}</p>}
+    <div className="note-actions">
+      <button type="button" className="primary danger" disabled={!canChange || busy || !matches} onClick={onConfirm}>
+        {busy ? "Disconnecting…" : "Disconnect installation"}</button>
+      <button type="button" className="secondary" onClick={onClose}>Cancel</button>
+    </div>
+  </Modal>;
+}
+
+/** Short, accurate pairing steps with this Hub's own helper downloads. The full command reference lives with the helper. */
+function PairingGuide({ open }: { open: boolean }) {
+  return <details className="pairing-guide" open={open}>
+    <summary>Pair a new agent installation</summary>
+    <ol>
+      <li>On the computer that runs the agent, download the <a href="/api/agent-sessions/v1/client/agent_session_client.py" download>helper</a> and
+        its <a href="/api/agent-sessions/v1/client/manifest" download>manifest</a> from this Hub. Check the helper's size and SHA-256 against the
+        manifest before running it. It uses the computer's installed Python and never runs on its own.</li>
+      <li>Run the helper's <code>enroll</code> command with this Hub's address, the agent (Codex or Claude), a name and a host label. It prints a
+        six-digit pairing code and a fingerprint.</li>
+      <li>A request appears here. Approve it only if its code and fingerprint match what that computer shows.</li>
+      <li>Approval doesn't start anything: run the helper's <code>connect</code> command to start a session. Sessions last up to 15 minutes and
+        approval lasts a day; neither renews silently.</li>
+    </ol>
+    <p className="panel-footnote">The credential stays on that computer: protected for the current user on Windows, owner-only on Linux. It's never shown
+      or pasted here.</p>
+  </details>;
 }
