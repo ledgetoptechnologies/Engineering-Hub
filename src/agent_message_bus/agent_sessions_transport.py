@@ -13,6 +13,7 @@ PREFIX = '/api/agent-sessions/v1'
 MAX_NEW_TRANSPORTS = 1024  # Process-lifetime cap also bounds SDK-created transports.
 MAX_NEW_STREAMS = 128
 MAX_STREAMS_PER_TRANSPORT = 2
+MAX_COMPLETED_POSTS_PER_TRANSPORT = 1
 
 
 def within(path, prefix=PREFIX):
@@ -278,6 +279,7 @@ class AgentSessionResponseGuardMiddleware:
     def __init__(self, app, *, auth, repository=None):
         self.app, self.auth, self.repository = app, auth, repository
         self._active = {}
+        self._completed_posts = {}
         self._total = 0
 
     async def __call__(self, scope, receive, send):
@@ -306,6 +308,7 @@ class AgentSessionResponseGuardMiddleware:
         task = None
         invalidated = False
         started = complete = False
+        promoted = False
         def stop():
             nonlocal invalidated
             invalidated = True
@@ -326,7 +329,7 @@ class AgentSessionResponseGuardMiddleware:
         self._active[key] = self._active.get(key, 0) + 1
         state['_agent_session_response_guard'] = self.repository
         async def observed(message):
-            nonlocal started, complete
+            nonlocal started, complete, promoted
             if invalidated:
                 raise asyncio.CancelledError
             await send(message)
@@ -334,6 +337,16 @@ class AgentSessionResponseGuardMiddleware:
                 started = True
             elif message['type'] == 'http.response.body' and not message.get('more_body', False):
                 complete = True
+                # Retain the task and global slot while freeing one response slot.
+                if (scope['method'] == 'POST' and not promoted
+                        and self._completed_posts.get(key, 0) < MAX_COMPLETED_POSTS_PER_TRANSPORT):
+                    promoted = True
+                    remaining = self._active[key] - 1
+                    if remaining:
+                        self._active[key] = remaining
+                    else:
+                        self._active.pop(key, None)
+                    self._completed_posts[key] = self._completed_posts.get(key, 0) + 1
         try:
             task = asyncio.create_task(self.app(scope, receive, observed))
             await task
@@ -341,19 +354,30 @@ class AgentSessionResponseGuardMiddleware:
             if not invalidated:
                 raise
         finally:
-            timer.cancel()
-            unsubscribe()
-            self._total -= 1
-            remaining = self._active[key] - 1
-            if remaining:
-                self._active[key] = remaining
-            else:
-                self._active.pop(key, None)
-            if state.get('_agent_session_response_guard') is self.repository:
-                state.pop('_agent_session_response_guard', None)
+            def release(_task=None):
+                timer.cancel()
+                unsubscribe()
+                self._total -= 1
+                counts = self._completed_posts if promoted else self._active
+                remaining = counts[key] - 1
+                if remaining:
+                    counts[key] = remaining
+                else:
+                    counts.pop(key, None)
+                if state.get('_agent_session_response_guard') is self.repository:
+                    state.pop('_agent_session_response_guard', None)
             if task is not None and not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                try:
+                    await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    if task.done():
+                        release()
+                    else:
+                        # Repeated cancellation cannot release a live task.
+                        task.add_done_callback(release)
+            else:
+                release()
         if invalidated and not complete:
             if started:
                 await send({'type': 'http.response.body', 'body': b'', 'more_body': False})
