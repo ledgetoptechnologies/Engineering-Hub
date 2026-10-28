@@ -80,7 +80,8 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
         client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
         offline. Topic readiness is checked separately.
       </p>
-      <AgentConnectionsPanel hub={hub} />
+      {/* Keyed on the signed-in actor: a different person gets a fresh panel, with nothing of the previous owner's kept or late-filled. */}
+      <AgentConnectionsPanel key={hub.session?.actor ?? "signed-out"} hub={hub} />
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
         <div className="topics-layout">
