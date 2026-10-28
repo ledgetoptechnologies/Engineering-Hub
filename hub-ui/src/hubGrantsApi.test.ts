@@ -173,3 +173,28 @@ describe("staging resource maker", () => {
     expect(resourceMaker("codex", "human:42")).toBe("Codex");
   });
 });
+
+describe("context text follows the backend's bounded_text rule", () => {
+  const raw = wire.recoverable_claims.items[0];
+  const base = { id: raw.task.id, project: "engineering-hub", title: "Task", status: "claimed", owner: raw.task.owner,
+    owner_family: "codex", owner_session_id: raw.claim_session_id, revision: 3, candidate_commit: null, review: null, repair_count: 0,
+    updated_at: raw.task.updated_at };
+  it("accepts control characters other than NUL in details, link labels and reasons", () => {
+    expect(() => parseBridgeTask({ ...base, details: "AB" })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "AB", url: "https://example.test/a" }] })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, status: "withdrawn", withdrawn_reason: "AB" })).not.toThrow();
+    expect(parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "AB" } }, taskId).recovery.reason).toBe("AB");
+  });
+  it("rejects NUL, oversize context and malformed links", () => {
+    expect(() => parseBridgeTask({ ...base, details: "A B" })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, details: "x".repeat(4096) })).not.toThrow();
+    expect(() => parseBridgeTask({ ...base, details: "x".repeat(4097) })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "x".repeat(101), url: "https://example.test/a" }] })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, links: Array.from({ length: 9 }, () => ({ label: "a", url: "https://example.test/a" })) })).toThrow(HubApiError);
+    expect(() => parseBridgeTask({ ...base, links: [{ label: "a", url: "https://example.test/a b" }] })).toThrow(HubApiError);
+    expect(() => parseRecoveryResult({ ...wire.recovery, recovery: { ...wire.recovery.recovery, reason: "x".repeat(501) } }, taskId)).toThrow(HubApiError);
+  });
+  it("keeps the stricter rule for titles", () => {
+    expect(() => parseBridgeTask({ ...base, title: "AB" })).toThrow(HubApiError);
+  });
+});
