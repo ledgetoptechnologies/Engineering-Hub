@@ -3,6 +3,19 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      reviewed_workflow_sha:
+        description: Exact workflow commit approved out of band for this run.
+        required: true
+        type: string
+      candidate_commit:
+        description: Exact product source commit to build.
+        required: true
+        type: string
+      candidate_tree:
+        description: Expected full Git tree for candidate_commit.
+        required: true
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -160,3 +173,157 @@ jobs:
             hub-*-startup.json
             hub-*-manifest.json
             hub-release.txt
+  artifact_only_staging:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/codex/hub-control-staging-artifact-only' &&
+      github.workflow_sha == inputs.reviewed_workflow_sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed workflow and typed source identities
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          REVIEWED_WORKFLOW_SHA: ${{ inputs.reviewed_workflow_sha }}
+          SOURCE_COMMIT: ${{ inputs.candidate_commit }}
+          SOURCE_TREE: ${{ inputs.candidate_tree }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import os, re
+          for name in ('WORKFLOW_SHA', 'REVIEWED_WORKFLOW_SHA', 'SOURCE_COMMIT', 'SOURCE_TREE'):
+              if not re.fullmatch(r'[0-9a-f]{40}', os.environ[name]):
+                  raise SystemExit(f'{name} must be a lowercase 40-character Git SHA')
+          if os.environ['WORKFLOW_REF'] != 'refs/heads/codex/hub-control-staging-artifact-only':
+              raise SystemExit('workflow must run from the dedicated staging review ref')
+          if os.environ['WORKFLOW_SHA'] != os.environ['REVIEWED_WORKFLOW_SHA']:
+              raise SystemExit('workflow commit does not match operator-reviewed pin')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify exact candidate commit and complete tree
+        working-directory: candidate
+        env:
+          EXPECTED_COMMIT: ${{ inputs.candidate_commit }}
+          EXPECTED_TREE: ${{ inputs.candidate_tree }}
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          if git('rev-parse', 'HEAD') != os.environ['EXPECTED_COMMIT']:
+              raise SystemExit('checked-out commit differs from candidate_commit')
+          if git('rev-parse', 'HEAD^{tree}') != os.environ['EXPECTED_TREE']:
+              raise SystemExit('checked-out tree differs from candidate_tree')
+          PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.17'
+          python-version: '3.12'
+      - name: Run locked backend and dashboard test suites
+        working-directory: candidate
+        run: |
+          uv sync --locked
+          uv run --locked python -W default -m pytest -q
+          cd hub-ui
+          npm ci --ignore-scripts
+          npm test
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the exact control image locally without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: candidate
+          file: candidate/docker/Dockerfile.hub-control
+          load: true
+          push: false
+          build-args: VCS_REF=${{ inputs.candidate_commit }}
+          tags: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+      - name: Run all five isolated UID 568 control-image smoke checks
+        working-directory: candidate
+        env:
+          IMAGE: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+          SOURCE_COMMIT: ${{ inputs.candidate_commit }}
+        run: |
+          python scripts/hub_release_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-startup.json
+          python scripts/hub_split_container_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-split-startup.json
+          python scripts/hub_unified_container_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-unified-startup.json
+          python scripts/hub_settings_container_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-settings-startup.json
+          python scripts/hub_protected_container_smoke.py --image "$IMAGE" --commit "$SOURCE_COMMIT" > hub-artifact-protected-startup.json
+      - name: Export image tar and checksummed source/image receipt
+        env:
+          IMAGE: engineering-hub-control:candidate-${{ inputs.candidate_commit }}
+          SOURCE_COMMIT: ${{ inputs.candidate_commit }}
+          SOURCE_TREE: ${{ inputs.candidate_tree }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -eu
+          docker image inspect "$IMAGE" > hub-image-inspect-before.json
+          docker save --output hub-control-candidate.tar "$IMAGE"
+          docker image inspect "$IMAGE" > hub-image-inspect-after.json
+          python - <<'PY'
+          import hashlib, json, os
+          def sha256_file(path):
+              digest = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      digest.update(block)
+              return digest.hexdigest()
+          before = json.load(open('hub-image-inspect-before.json', encoding='utf-8'))[0]
+          after = json.load(open('hub-image-inspect-after.json', encoding='utf-8'))[0]
+          revision = 'org.opencontainers.image.revision'
+          if before['Id'] != after['Id'] or before['Config']['Labels'].get(revision) != after['Config']['Labels'].get(revision):
+              raise SystemExit('image identity or revision label changed during export')
+          receipt = {
+              'schema_version': 1,
+              'source_commit': os.environ['SOURCE_COMMIT'],
+              'source_tree': os.environ['SOURCE_TREE'],
+              'workflow_commit': os.environ['WORKFLOW_SHA'],
+              'run_id': os.environ['RUN_ID'],
+              'run_attempt': os.environ['RUN_ATTEMPT'],
+              'image_id': after['Id'],
+              'image_revision_label': after['Config']['Labels'].get(revision),
+              'image_tar_bytes': os.path.getsize('hub-control-candidate.tar'),
+              'image_tar_sha256': sha256_file('hub-control-candidate.tar'),
+              'smoke_outputs': [
+                  'candidate/hub-artifact-startup.json',
+                  'candidate/hub-artifact-split-startup.json',
+                  'candidate/hub-artifact-unified-startup.json',
+                  'candidate/hub-artifact-settings-startup.json',
+                  'candidate/hub-artifact-protected-startup.json',
+              ],
+              'runtime_activated': False,
+          }
+          if receipt['image_revision_label'] != receipt['source_commit']:
+              raise SystemExit('image revision label differs from candidate commit')
+          with open('hub-control-candidate-receipt.json', 'w', encoding='utf-8') as f:
+              json.dump(receipt, f, sort_keys=True, separators=(',', ':'))
+              f.write('\n')
+          PY
+      - name: Upload image, receipt, and smoke evidence for 14 days
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-control-candidate-${{ inputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            hub-control-candidate.tar
+            hub-control-candidate-receipt.json
+            hub-image-inspect-before.json
+            hub-image-inspect-after.json
+            candidate/hub-artifact-*-startup.json
+          if-no-files-found: error
+          retention-days: 14
+

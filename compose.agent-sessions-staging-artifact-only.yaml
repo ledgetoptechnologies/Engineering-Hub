@@ -1,0 +1,59 @@
+# Source template only. Read docs/agent-sessions-staging-service.md before use.
+services:
+  agent-sessions-staging:
+    image: "${STAGING_IMAGE_ID:?Set the verified local sha256 image ID}"
+    pull_policy: never
+    entrypoint: ["/opt/venv/bin/python", "-m", "engineering_hub.owned_inactive_hub"]
+    command: ["--config", "/state/settings.json"]
+    user: "568:568"
+    restart: "no"
+    stop_grace_period: 1200s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Disabled pending selected-path readiness validation.
+    healthcheck:
+      disable: true
+    env_file:
+      - path: "${STAGING_ENV_FILE:?Set the protected staging environment file}"
+        required: true
+    environment:
+      HUB_INGRESS_MODE: combined
+      HUB_WORK_QUEUE_ENABLED: "0"
+      HUB_BUS_STARTUP_CLEANUP: "0"
+      HUB_REGISTRY_ENABLED: "0"
+      HUB_REGISTRY_EVENTS_ENABLED: "0"
+      HUB_AGENT_SESSIONS_MODE: "${STAGING_SESSIONS_MODE:-disabled}"
+      HUB_AGENT_SESSIONS_HUB_BRIDGE: "${STAGING_SESSIONS_BRIDGE:-disabled}"
+      HUB_AGENT_SESSIONS_DB: /state/agent-sessions.sqlite3
+      HUB_AGENT_SESSIONS_OWNER: "${STAGING_SESSIONS_OWNER:-}"
+      HUB_AGENT_SESSIONS_ORIGIN: "${STAGING_SESSIONS_ORIGIN:-}"
+    volumes:
+      - type: bind
+        source: "${STAGING_STATE_DIR:?Set the new isolated state directory}"
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${STAGING_CONFIG_FILE:?Set the new staging settings file}"
+        target: /state/settings.json
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${STAGING_AGENT_PORT:?Set an unused local agent port}:8770"
+      - "127.0.0.1:${STAGING_BROWSER_PORT:?Set a distinct unused local browser port}:8771"
+    networks:
+      - staging
+
+networks:
+  staging:
+    driver: bridge
