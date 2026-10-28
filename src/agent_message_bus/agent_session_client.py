@@ -124,7 +124,8 @@ def _profile_lock(directory):
 
 
 def _request(origin, path, payload, token=None):
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
+               'User-Agent': 'Engineering-Hub-Agent-Client/0.6'}
     if token is not None:
         headers['Authorization'] = 'Bearer ' + token
     request = Request(origin + '/api/agent-sessions/v1' + path,
