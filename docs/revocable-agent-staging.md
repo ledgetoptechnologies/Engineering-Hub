@@ -78,7 +78,7 @@ the fetched bytes to its manifest; it is not an independent release signature.
 The helper uses Python's standard library, so this path needs no package-registry
 installation. Downloading is self-service; installation approval below is still
 the human owner's separate action. This does not configure an MCP client,
-enable native wake or establish actual Windows/second-PC acceptance.
+enable native wake. The verified Windows and two-PC scope is described below.
 
 On the PC running the agent, choose a private profile directory. An installation
 running Codex and one running Claude use separate profiles, even on the same PC.
@@ -107,8 +107,8 @@ remain revoked; the helper does not automatically reenroll or rotate credentials
 The helper retains the original private identity across a failed enrollment
 request; retry the same command instead of generating another credential.
 On Windows, private profiles use current-user DPAPI. On other platforms, files
-are owner-only mode0600. Windows private-storage behavior still requires a real
-Windows acceptance check; Linux fixture success does not prove it.
+are owner-only mode0600. A real Windows helper and MCP SDK check verified
+current-user DPAPI decryption and private header delivery for that test profile.
 
 ## Connect a chat session
 
@@ -165,9 +165,11 @@ header map. This example shows a new entry in an MCP configuration JSON object:
 Claude Code runs this command in a shell, subject to its configuration scope and
 trust rules, and invokes it again on reconnect or an authentication retry. See
 the [official Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
-Neither example establishes installed-client support or Windows current-user
-DPAPI acceptance; both require real-PC verification. The existing legacy
-notification connector does not yet consume these installation mailboxes.
+An isolated installed Codex 0.165.0-alpha.1.2 app-server test used
+`http_headers_helper` and verified `session_identity`. It did not run a model
+turn, change the current desktop configuration, or verify native wake. Claude
+Code native-client acceptance remains unverified. The existing legacy notification
+connector does not yet consume these installation mailboxes.
 
 The header helper does not silently exchange a new session after expiry or
 revocation. Sessions last at most fifteen minutes; this is not a permanent
@@ -177,6 +179,16 @@ The new `session_*` MCP tools provide identity, peer discovery and isolated
 installation mailboxes. The optional bridge grants only its explicitly selected
 Hub metadata capabilities and projects; it does not grant execution or generic
 legacy tools. Native automatic wake into a desktop chat is a separate integration.
+
+## Verified staging scope
+
+A physical Windows and Linux test exchanged messages in both directions and
+verified installation mailbox and session claim isolation. It also verified
+whole-installation revocation while the Linux installation remained usable,
+followed by an owner-approved Windows replacement installation. These results
+are limited to that staging test; they do not establish native desktop wake or
+project grants. Session-only revocation and closure of an existing stream on
+revocation or expiry remain unverified on the real clients.
 
 ## Revocation test
 
@@ -195,5 +207,5 @@ a process or accepted job on the remote computer. Claims are not automatically
 reassigned; an explicit reclaim can occur after their lease expires. Distinct PCs,
 credentials or sessions alone do not establish independent reviewer authority.
 
-Keep actual staging-PC rollout, correct-host desktop wake, phone access, restart
-and live admission evidence separate from the isolated synthetic test receipt.
+Keep correct-host desktop wake, phone access, restart and live admission evidence
+separate from the verified staging-PC and isolated synthetic test results.
