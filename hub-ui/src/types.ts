@@ -16,7 +16,10 @@ export interface Versioned {
   updated_at: string;
 }
 export interface Review {
-  actor: Agent;
+  /** A legacy family, or "installation:<uuid>" for a paired installation. */
+  actor: string;
+  /** Trusted family behind an installation reviewer (absent on legacy reviews). */
+  family?: Agent | null;
   commit: string;
   verdict: "approve" | "reject";
 }
@@ -24,21 +27,29 @@ export interface Task extends Versioned {
   project: ProjectId;
   title: string;
   status: "assigned" | "claimed" | "in_review" | "verified" | "withdrawn";
-  owner: Agent | null;
+  /** A legacy family, or "installation:<uuid>"; the installation's family is in owner_family. */
+  owner: string | null;
+  owner_family?: Agent | null;
+  owner_session_id?: string | null;
   candidate_commit: string | null;
+  candidate_family?: Agent | null;
   review: Review | null;
   repair_count: number;
   /** Optional agent context; parsed defensively by details.ts. */
   details?: string | null;
   links?: { label: string; url: string }[] | null;
   scope?: "staging" | null;
-  proposed_by?: Agent | null;
+  proposed_by?: string | null;
+  proposed_family?: Agent | null;
   /** Audited time the task entered its current status; null when not recorded. */
   state_since?: string | null;
   /** Present on withdrawn records only: superseded work kept for history. */
   withdrawn_reason?: string | null;
   superseded_by?: string | null;
   withdrawn_by?: string | null;
+  /** Family and session behind an installation withdrawer. */
+  withdrawn_family?: Agent | null;
+  withdrawn_session_id?: string | null;
   withdrawn_at?: string | null;
 }
 export interface Decision extends Versioned {
@@ -55,6 +66,9 @@ export interface Decision extends Versioned {
   withdrawn_reason?: string | null;
   superseded_by?: string | null;
   withdrawn_by?: string | null;
+  /** Family and session behind an installation withdrawer. */
+  withdrawn_family?: Agent | null;
+  withdrawn_session_id?: string | null;
   withdrawn_at?: string | null;
   details?: string | null;
   links?: { label: string; url: string }[] | null;

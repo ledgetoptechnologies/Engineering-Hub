@@ -16,6 +16,8 @@ from .work_queue import WorkWorker
 from .work_queue_api import (WorkList, WorkGet, WorkSubmission, WorkClaim,
                              WorkJobRenew, WorkJobComplete, submit_reviewed_work)
 import inspect
+from agent_message_bus import session_hub_context
+from agent_message_bus.agent_sessions import AgentSessionError
 
 
 class HubMCPAuthMiddleware:
@@ -42,7 +44,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                   work_queue=None, mcp=None, agent_status=None, image_versions=None,
                   planning_repository=None, label_sets=None, entity_images=None, project_registry=None,
                   staging_controller=None, component_registry=None, interactive_reviews=None,
-                  infrastructure_service=None, infrastructure_collector=None) -> FastMCP:
+                  infrastructure_service=None, infrastructure_collector=None, session_bridge=None) -> FastMCP:
     """Call streamable_http_app once, mount its auth wrapper, run session_manager."""
     if mcp is None:
         mcp = FastMCP("Engineering Hub", stateless_http=True, streamable_http_path="/", json_response=True)
@@ -52,10 +54,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     if planning_repository is not None and type(planning_repository) is not KnowledgeRepository:
         raise ValueError('Explicit shared knowledge repository required')
 
+    registration = mcp if session_bridge is None else session_bridge.registration(mcp)
+
     def identity(ctx):
         request = ctx.request_context.request
         if request is None:
             raise ToolError("unauthorized")
+        operation = session_hub_context.current.get()
+        if operation is not None and operation.bridge is session_bridge:
+            return operation.principal.actor
         try:
             return auth.agent(request)
         except HTTPException:
@@ -64,7 +71,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     def invoke(operation, *args):
         try:
             return operation(*args)
-        except HubError as error:
+        except (HubError, AgentSessionError) as error:
             # Repository codes are fixed internal identifiers, never peer titles.
             raise ToolError(error.code) from None
         except ToolError:
@@ -85,12 +92,14 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('planning_item_not_found') from None
         except KnowledgeIntegrityError:
             raise ToolError('planning_integrity_failure') from None
+        except (HubError, AgentSessionError) as error:
+            raise ToolError(error.code) from None
         except (KnowledgeError, ValidationError):
             raise ToolError('invalid_planning_item') from None
         except Exception:
             raise ToolError('planning_unavailable') from None
 
-    @mcp.tool()
+    @registration.tool()
     def hub_planning_list(scope: Scope, project: str, ctx: Context,
                           topic: str | None = None, kind: Kind | None = None,
                           limit: StrictInt = 50) -> dict:
@@ -104,7 +113,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return planning_invoke(lambda store: planning.list_items(store, scope=scope,
             project=project, topic=topic, kind=kind, limit=limit))
 
-    @mcp.tool()
+    @registration.tool()
     def hub_planning_get(scope: Scope, project: str, kind: Kind, item_id: str,
                          ctx: Context, topic: str | None = None) -> dict:
         """Read one complete advisory plan/idea, including its CAS version."""
@@ -112,7 +121,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return planning_invoke(lambda store: planning.get_item(store, scope=scope,
             project=project, topic=topic, kind=kind, item_id=item_id))
 
-    @mcp.tool()
+    @registration.tool()
     def hub_planning_put(payload: PlanningWrite, ctx: Context) -> dict:
         """Create/update an advisory plan, feature, idea or EH improvement.
 
@@ -133,12 +142,12 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             result = operation(*args, principal=principal,
                                bearer=bearer if scheme.lower() == 'bearer' else None)
             return await result if inspect.isawaitable(result) else result
-        except HubError as error:
+        except (HubError, AgentSessionError) as error:
             raise ToolError(error.code) from None
         except Exception:
             raise ToolError('reachability_source_unavailable') from None
 
-    @mcp.tool()
+    @registration.tool()
     async def hub_overview(ctx: Context) -> dict:
         """Read shared tasks, decisions, runs and the emergency-pause state."""
         identity(ctx)
@@ -152,7 +161,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             result['image_versions'] = invoke(image_versions)
         return result
 
-    @mcp.tool()
+    @registration.tool()
     def hub_staging_task_propose(project: str, title: str, client_request_id: str, ctx: Context,
                                  details: str | None = None, links: list[dict[str, str]] | None = None) -> dict:
         """Create an unclaimed staging-only task, not approval or execution.
@@ -164,28 +173,28 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(lambda: repo.propose_staging_task(principal, project, title, client_request_id,
                                                        details=details, links=links))
 
-    @mcp.tool()
+    @registration.tool()
     def hub_task_get(task_id: str, ctx: Context) -> dict:
         """Read an assigned Hub task."""
         identity(ctx)
         return invoke(repo.get_task, task_id)
 
-    @mcp.tool()
+    @registration.tool()
     def hub_task_claim(task_id: str, expected_revision: int, ctx: Context) -> dict:
         """Claim an explicitly assigned task as the authenticated agent."""
         return invoke(repo.claim_task, identity(ctx), task_id, expected_revision)
 
-    @mcp.tool()
+    @registration.tool()
     def hub_task_candidate(task_id: str, expected_revision: int, commit: str, ctx: Context) -> dict:
         """Record an exact candidate commit for an owned task."""
         return invoke(repo.set_candidate, identity(ctx), task_id, expected_revision, commit)
 
-    @mcp.tool()
+    @registration.tool()
     def hub_task_review(task_id: str, expected_revision: int, commit: str, verdict: str, ctx: Context) -> dict:
         """Review another agent's exact candidate; self-review is forbidden."""
         return invoke(repo.review_task, identity(ctx), task_id, expected_revision, commit, verdict)
 
-    @mcp.tool()
+    @registration.tool()
     def hub_decision_request(project: str, title: str, options: list[str], ctx: Context, protected: bool = False,
                               details: str | None = None, links: list[dict[str, str]] | None = None,
                               allow_text: bool = False) -> dict:
@@ -194,7 +203,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         return invoke(lambda: repo.create_decision(principal, project, title, options, protected,
                                                   details=details, links=links, allow_text=allow_text))
 
-    @mcp.tool()
+    @registration.tool()
     def hub_entity_withdraw(kind: str, entity_id: str, expected_revision: int, reason: str, ctx: Context,
                             superseded_by: str | None = None) -> dict:
         """Withdraw a task or decision you created that is no longer needed; nothing is deleted.
@@ -205,13 +214,13 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         """
         return invoke(repo.withdraw, identity(ctx), kind, entity_id, expected_revision, reason, superseded_by)
 
-    @mcp.tool()
+    @registration.tool()
     def hub_run_list(ctx: Context) -> dict:
         """Read execution records without dispatching work."""
         identity(ctx)
         return {"items": invoke(repo.list_runs)}
 
-    @mcp.tool()
+    @registration.tool()
     async def hub_topic_peers(topic: str, ctx: Context) -> dict:
         """Read exact-topic peer evidence; this is not a delivery guarantee."""
         identity(ctx)
@@ -219,7 +228,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('reachability_source_unavailable')
         return await invoke_topic(topic_peers, ctx, topic)
 
-    @mcp.tool()
+    @registration.tool()
     async def hub_topic_preflight(topic: str, recipient: str, ctx: Context) -> dict:
         """Check exact-topic presence/send guidance; queue offline mail durably.
 
@@ -305,11 +314,11 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         register_image_tools(mcp, repository=entity_images, identity=identity, invoke=invoke)
     if project_registry is not None:
         from .projects_api import register_project_tools
-        register_project_tools(mcp, repository=project_registry, identity=identity, invoke=invoke)
+        register_project_tools(registration, repository=project_registry, identity=identity, invoke=invoke)
 
     if component_registry is not None:
         from .components_api import register_component_tools
-        register_component_tools(mcp, repository=component_registry, identity=identity, invoke=invoke)
+        register_component_tools(registration, repository=component_registry, identity=identity, invoke=invoke)
 
     if staging_controller is not None:
         from .staging_tools import register_staging_tools

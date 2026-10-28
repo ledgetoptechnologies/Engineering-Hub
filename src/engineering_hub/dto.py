@@ -13,13 +13,15 @@ from .image_version_reports import ImageVersionsSummary
 
 AgentId = Literal['hermes', 'codex', 'claude']
 NullableAgentId = AgentId | None
+InstallationActor = Annotated[str, Field(pattern=r'^installation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
+AgentActor = AgentId | InstallationActor
+SessionId = Annotated[str, Field(pattern=r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
 ProjectId = Annotated[str, Field(pattern=r'^[a-z0-9][a-z0-9-]{0,63}$')]
 Commit = Annotated[str, Field(pattern=r'^[0-9a-f]{40}$')]
 Digest = Annotated[str, Field(pattern=r'^sha256:[0-9a-f]{64}$')]
 ExecutorId = Annotated[str, Field(pattern=r'^executor:[a-z][a-z0-9-]{0,63}$')]
 HumanId = Annotated[str, Field(pattern=r'^human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})$')]
-# One pattern, not a Literal union, so the published schema is stable across typing-cache resets.
-WithdrawnBy = Annotated[str, Field(pattern=r'^(?:hermes|codex|claude|human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64}))$')]
+WithdrawnBy = AgentActor | HumanId
 RunState = Literal['pending', 'running', 'succeeded', 'failed', 'rolled_back', 'held']
 RunEventState = Literal['running', 'succeeded', 'failed', 'rolled_back', 'held']
 
@@ -35,9 +37,16 @@ class EntityDTO(ResponseDTO):
 
 
 class ReviewDTO(ResponseDTO):
-    actor: AgentId
+    actor: AgentActor
     commit: Commit
     verdict: Literal['approve']
+    family: AgentId | None = None
+
+    @model_validator(mode='after')
+    def installation_family_required(self):
+        if self.actor.startswith('installation:') and self.family is None:
+            raise ValueError('Installation review family required')
+        return self
 
 
 class ContextLinkDTO(ResponseDTO):
@@ -49,12 +58,16 @@ class TaskDTO(EntityDTO):
     project: ProjectId
     title: str
     status: Literal['assigned', 'claimed', 'in_review', 'verified', 'withdrawn']
-    owner: NullableAgentId
+    owner: AgentActor | None
     candidate_commit: Commit | None
     review: ReviewDTO | None
     repair_count: int = Field(ge=0, le=3)
     scope: Literal['staging'] | None = None
-    proposed_by: NullableAgentId = None
+    proposed_by: AgentActor | None = None
+    owner_session_id: SessionId | None = None
+    owner_family: AgentId | None = None
+    candidate_family: AgentId | None = None
+    proposed_family: AgentId | None = None
     # Audited time the task entered its current status; derived, never stored.
     state_since: str | None = None
     details: str | None = None
@@ -64,6 +77,22 @@ class TaskDTO(EntityDTO):
     superseded_by: str | None = None
     withdrawn_by: WithdrawnBy | None = None
     withdrawn_at: str | None = None
+    withdrawn_family: AgentId | None = None
+    withdrawn_session_id: SessionId | None = None
+
+    @model_validator(mode='after')
+    def installation_provenance_required(self):
+        if self.owner is not None and self.owner.startswith('installation:'):
+            if self.owner_family is None or self.owner_session_id is None:
+                raise ValueError('Installation claim provenance required')
+            if self.candidate_commit is not None and self.candidate_family != self.owner_family:
+                raise ValueError('Installation candidate family required')
+        if self.proposed_by is not None and self.proposed_by.startswith('installation:') and self.proposed_family is None:
+            raise ValueError('Installation proposal family required')
+        if self.withdrawn_by is not None and self.withdrawn_by.startswith('installation:'):
+            if self.withdrawn_family is None or self.withdrawn_session_id is None:
+                raise ValueError('Installation withdrawal provenance required')
+        return self
 
 
 class DecisionDTO(EntityDTO):
@@ -83,6 +112,15 @@ class DecisionDTO(EntityDTO):
     superseded_by: str | None = None
     withdrawn_by: WithdrawnBy | None = None
     withdrawn_at: str | None = None
+    withdrawn_family: AgentId | None = None
+    withdrawn_session_id: SessionId | None = None
+
+    @model_validator(mode='after')
+    def installation_withdrawal_required(self):
+        if self.withdrawn_by is not None and self.withdrawn_by.startswith('installation:'):
+            if self.withdrawn_family is None or self.withdrawn_session_id is None:
+                raise ValueError('Installation withdrawal provenance required')
+        return self
 
 
 class RunEventDTO(ResponseDTO):
@@ -109,6 +147,13 @@ class RunEventDTO(ResponseDTO):
         return value
 
 
+class RunReviewDTO(ResponseDTO):
+    """Execution remains on the legacy contract; sessions cannot create runs."""
+    actor: AgentId
+    commit: Commit
+    verdict: Literal['approve']
+
+
 class RunDTO(EntityDTO):
     task_id: str
     project: ProjectId
@@ -116,7 +161,7 @@ class RunDTO(EntityDTO):
     commit: Commit
     artifact_digest: Digest
     policy_revision: int = Field(ge=1)
-    review: ReviewDTO
+    review: RunReviewDTO
     status: RunState
     command_id: str | None
     fencing_generation: int = Field(ge=1)

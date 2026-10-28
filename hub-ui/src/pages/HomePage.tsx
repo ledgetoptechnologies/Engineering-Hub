@@ -1,3 +1,4 @@
+import { actorName } from "../actors";
 import { link } from "../router";
 import { connectionView } from "../agentStatus";
 import { ImageVersionsPanel } from "../ImageVersionsPanel";
@@ -98,7 +99,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                   <a href={link(`/projects/${task.project}/work`)}>
                     <span className="preview-title">{task.title}</span>
                     <span className="preview-meta">
-                      {hub.projectName(task.project)} · {task.owner ? names[task.owner] : "Unclaimed"}
+                      {hub.projectName(task.project)} · {task.owner ? actorName(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
                     </span>
                   </a>
                   <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>

@@ -253,6 +253,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     bus_mcp = None
     bus_health = None
     notes_repository = None
+    connection_service = None
+    connection_config = None
     if bus_app is not None:
         if (not isinstance(bus_app, Starlette)
                 or settings.ingress_mode == 'browser'
@@ -276,6 +278,21 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if (type(notes_repository) is not KnowledgeRepository
                 or notes_repository.db_path.resolve() != Path(service.repository.path).resolve()):
             raise ValueError('Unified bus requires its exact shared knowledge writer')
+        connection_service = getattr(bus_app.state, 'agent_sessions', None)
+        connection_config = getattr(bus_app.state, 'agent_sessions_config', None)
+        if connection_service is not None or connection_config is not None:
+            from agent_message_bus.agent_sessions import AgentSessionRepository
+            from agent_message_bus.agent_sessions_config import AgentSessionsConfig
+            if (type(connection_service) is not AgentSessionRepository
+                    or type(connection_config) is not AgentSessionsConfig
+                    or connection_config.environment != 'staging'
+                    or connection_config.origin != settings.auth_config.origin
+                    or connection_service.owner != connection_config.owner
+                    or Path(connection_service.path).resolve() != connection_config.database.resolve()
+                    or connection_config.database.resolve() == settings.database.resolve()
+                    or (settings.database.exists()
+                        and settings.database.samefile(connection_config.database))):
+                raise ValueError('staging_agent_connections_origin_and_storage_binding_required')
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -468,6 +485,10 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     infrastructure = compose_infrastructure(
         settings.infrastructure_config_path or Path(settings.database).parent / 'infrastructure.json',
         state_root=Path(settings.database).parent, on_change=infrastructure_changed)
+    session_bridge = None
+    if connection_config is not None and connection_config.hub_bridge:
+        from .session_hub_bridge import SessionHubBridge
+        session_bridge = SessionHubBridge(connection_service, repo, project_registry, component_registry, notes_repository)
     try:
         hub_mcp = build_hub_mcp(repo, settings.agent_auth, topic_peers=peers_for,
                           topic_preflight=preflight_for, autonomy_status=autonomy_for,
@@ -478,6 +499,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           entity_images=entity_images,
                           project_registry=project_registry,
                           component_registry=component_registry,
+                          session_bridge=session_bridge,
                           interactive_reviews=interactive_reviews,
                           infrastructure_service=infrastructure.service,
                           infrastructure_collector=infrastructure.collector,
@@ -503,6 +525,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     or set(actual.allowed_origins or ()) != set(transport_security.allowed_origins or ())):
                 raise ValueError('Unified transport policy must be installed before bus construction')
     except BaseException:
+        if session_bridge is not None:
+            session_bridge.close()
         infrastructure.close()
         raise
 
@@ -529,6 +553,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                         try:
                             await stop_existing_components()
                         finally:
+                            if session_bridge is not None:
+                                session_bridge.close()
                             infrastructure.close()
             await finish_owned(stop_all())
 
@@ -589,6 +615,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                   redoc_url=None, lifespan=lifespan)
     app.state.repository, app.state.sessions, app.state.settings = repo, sessions, settings
     app.state.mcp = hub_mcp
+    app.state.session_hub_bridge = session_bridge
     app.state.modular_staging = staging_module
     app.state.interactive_service = interactive_service
     app.state.interactive_reviews = interactive_reviews
@@ -665,6 +692,20 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         if request.headers.get("authorization"):
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
+
+    # The optional staging service stays the bus's exact single owner. It does
+    # not turn installation/session credentials into existing Hub principals.
+    if connection_service is not None:
+        from agent_message_bus.agent_sessions import AgentSessionError
+        from agent_message_bus.agent_sessions_api import attach_owner_routes
+        @app.exception_handler(AgentSessionError)
+        async def connection_error(request, error):
+            return JSONResponse({'detail': {'code': error.code}}, status_code=error.status,
+                                headers={'Cache-Control': 'no-store'})
+
+        attach_owner_routes(app, connection_service, human)
+        if session_bridge is not None:
+            session_bridge.attach_routes(app, human)
 
     from .notes_api import attach_notes_routes
     attach_notes_routes(app, repository=notes_repository, actor=actor)
@@ -1058,5 +1099,13 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         app.add_middleware(HubIngressMiddleware, mode=settings.ingress_mode,
                            agent_auth=settings.agent_auth,
                            cloudflare_config=settings.auth_config.cloudflare_config,
-                           legacy_bus_enabled=bus_app is not None)
+                           legacy_bus_enabled=bus_app is not None,
+                           agent_sessions=connection_service,
+                           agent_sessions_config=connection_config)
+    if connection_service is not None:
+        from agent_message_bus.agent_sessions_transport import AgentSessionResponseGuardMiddleware
+        # Own actual MCP response writes outside all buffering middleware. The
+        # exact-repository scope marker prevents duplicate front-door/bus guards.
+        app.add_middleware(AgentSessionResponseGuardMiddleware,
+                           auth=settings.agent_auth, repository=connection_service)
     return app

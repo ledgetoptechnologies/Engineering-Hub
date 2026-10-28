@@ -213,6 +213,8 @@ class KnowledgeRepository:
                      updated_at=excluded.updated_at""",
                 (project, path, title, content, version, digest, created_by, author, created_at, timestamp),
             )
+            from . import session_hub_context
+            session_hub_context.before_commit(self.db_path, conn, project=project, path=path, version=version)
             conn.commit()
             return self.get(project, path)
 
