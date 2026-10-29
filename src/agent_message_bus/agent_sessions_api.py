@@ -14,7 +14,7 @@ OWNER_CONNECTION_PREFIX = "/api/hub/v1/agent-connections"
 CLIENT_MANIFEST_PATH = AGENT_SESSION_PREFIX + "/client/manifest"
 CLIENT_HELPER_PATH = AGENT_SESSION_PREFIX + "/client/agent_session_client.py"
 CLIENT_DOWNLOAD_PATHS = frozenset({CLIENT_MANIFEST_PATH, CLIENT_HELPER_PATH})
-CLIENT_HELPER_VERSION = "0.6"
+CLIENT_HELPER_VERSION = "0.7"
 
 
 def _client_bytes():

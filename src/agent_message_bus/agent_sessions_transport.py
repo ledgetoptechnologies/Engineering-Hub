@@ -45,7 +45,7 @@ def source_allowed(request, auth):
 
 
 def session_origin_allowed(request, config):
-    return request.headers.getlist('host') == [urlsplit(config.origin).netloc]
+    return request.headers.getlist('host') == [urlsplit(config.transport_origin).netloc]
 
 
 async def denied(scope, receive, send, code='unauthorized', status=401):
@@ -143,8 +143,15 @@ class AgentSessionsBoundaryMiddleware:
                     scope.setdefault('state', {})['agent_session_principal'] = principal
             except (HTTPException, AgentSessionError):
                 return await denied(scope, receive, send)
-        elif is_new and path.rstrip('/') != '/mcp':
-            return await denied(scope, receive, send)
+        elif is_new:
+            if path.rstrip('/') != '/mcp':
+                return await denied(scope, receive, send)
+            # MCP session credentials use the selected private transport Host
+            # too; otherwise the same bearer can fall back to the public owner
+            # hostname even when the helper was enrolled for VPN-only access.
+            if (self.config is None or not session_origin_allowed(request, self.config)
+                    or not source_allowed(request, self.auth)):
+                return await denied(scope, receive, send, 'forbidden', 403)
         await self.app(scope, receive, send)
 
 

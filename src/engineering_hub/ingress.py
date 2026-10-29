@@ -12,7 +12,7 @@ from starlette.responses import JSONResponse
 
 from .cloudflare_access import AccessDenied, CloudflareAccessVerifier, _record_verified_access
 from .unified_bus import is_bus_api, BUS_ADMIN_PATH, AGENT_SESSION_PREFIX
-from agent_message_bus.agent_sessions_transport import (AgentSessionsBoundaryMiddleware, AgentSessionResponseGuardMiddleware, bearer, transport_bearer, source_allowed, within)
+from agent_message_bus.agent_sessions_transport import (AgentSessionsBoundaryMiddleware, AgentSessionResponseGuardMiddleware, bearer, transport_bearer, session_origin_allowed, source_allowed, within)
 from agent_message_bus.agent_sessions import AgentSessionError
 
 
@@ -127,7 +127,8 @@ class HubIngressMiddleware:
                     token = bearer(request)
                     if path.rstrip('/') != '/mcp' or self.agent_sessions is None:
                         raise HTTPException(401)
-                    if not source_allowed(request, self.agent_auth):
+                    if (not session_origin_allowed(request, self.agent_sessions_config)
+                            or not source_allowed(request, self.agent_auth)):
                         raise HTTPException(403)
                     principal = self.agent_sessions.authenticate_session(token)
                     scope.setdefault('state', {})['agent_session_principal'] = principal
