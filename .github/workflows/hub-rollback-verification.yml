@@ -29,7 +29,7 @@ permissions:
   packages: read
 jobs:
   verify-rollback:
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
