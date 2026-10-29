@@ -142,8 +142,12 @@ origin: the targets list plus a fixed set of instant queries for the mapped expo
 kinds (`src/engineering_hub/infrastructure_metrics.py` `QUERIES`). Queries contain no
 interpolated labels; results are filtered in process to the exact mapped job/instance
 pairs, so unmapped targets never appear. One read has a 10-second aggregate deadline, a
-4 MiB aggregate response budget (1 MiB per response) and per-result series limits; it
-stores, schedules and caches nothing. A source outage returns `source.status:
+2 MiB aggregate response budget (1 MiB per response) and per-result series limits; it
+stores, schedules and caches nothing. At most 2 MiB of bodies is retained: the chunk that
+would pass it aborts every request of the read together, so bytes consumed exceed it only
+by chunks already in flight. Freshness describes each target's last scrape, not the age
+of individual values. Inconsistent or out-of-range values (more memory available than
+installed, sizes of 2^53 bytes or more) are dropped, never shown as zero. A source outage returns `source.status:
 "unreachable"` with `up: null` and `state: "unknown"`, never down; a failed query gives
 `partial` and its values `null`, never zero. `last_scrape` comes only from the targets
 list. Windows targets also report the 10 programs using the most memory (name, copy

@@ -21,6 +21,7 @@ describe("machine metrics", () => {
     ["an unknown label", (v: any) => { v.devices[0].labels.secret = "x"; }],
     ["a non-finite-looking ratio", (v: any) => { v.devices[0].cpu_busy_ratio = 1.5; }],
     ["a fractional byte count", (v: any) => { v.devices[0].mem_total_bytes = 1.5; }],
+    ["more memory available than installed", (v: any) => { v.devices[0].mem_available_bytes = v.devices[0].mem_total_bytes + 1; }],
     ["free space larger than the disk", (v: any) => { v.devices[0].disks[0].free_bytes = 5e12; }],
     ["an unknown exporter", (v: any) => { v.devices[0].exporter = "snmp"; }],
     ["a fresh state without a scrape time", (v: any) => { v.devices[0].last_scrape = null; }],

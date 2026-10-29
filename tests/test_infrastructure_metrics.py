@@ -4,6 +4,8 @@ from datetime import datetime,timedelta,timezone
 import json
 from pathlib import Path
 import sqlite3
+import sys
+from types import MappingProxyType
 from urllib.parse import parse_qs,urlsplit
 
 from fastapi import FastAPI
@@ -152,7 +154,9 @@ async def test_one_failed_query_is_partial_and_null_never_zero(service):
     result=await reader(service,handler_for(fail=('mem_total','process_count'))).read('human:1')
     assert result['source']=={'status':'partial'}
     desk=result['devices'][0]
-    assert desk['mem_total_bytes'] is None and desk['mem_available_bytes']==25769803776
+    # Available memory alone can't be judged, so it is withheld with its missing total.
+    assert desk['mem_total_bytes'] is None and desk['mem_available_bytes'] is None
+    assert desk['cpu_busy_ratio']==0.25 and desk['disks']
     assert [row['count'] for row in desk['top_processes']]==[None,None]
 
 
@@ -168,14 +172,106 @@ async def test_aggregate_deadline_bounds_every_request(service,monkeypatch):
     assert result['source']=={'status':'unreachable'}
 
 
+class Stream(httpx.AsyncByteStream):
+    """Endless body in fixed chunks; records how much was read and whether it was closed."""
+    def __init__(self,log,chunk=1024):self.log,self.chunk=log,chunk
+    async def __aiter__(self):
+        while True:
+            self.log['read']+=self.chunk
+            yield b' '*self.chunk
+            await asyncio.sleep(0)
+    async def aclose(self):self.log['closed']+=1
+
+
 @pytest.mark.asyncio
-async def test_aggregate_byte_budget_across_queries(service,monkeypatch):
-    monkeypatch.setattr(module,'MAX_TOTAL_BYTES',3000)
-    result=await reader(service,handler_for()).read('human:1')
-    assert result['source']['status'] in ('partial','unreachable')
+async def test_budget_exhaustion_aborts_every_stream_together(service,monkeypatch):
+    monkeypatch.setattr(module,'MAX_TOTAL_BYTES',64*1024)
+    log={'read':0,'closed':0};streams=[]
+    def handler(request):
+        stream=Stream(log);streams.append(stream)
+        return httpx.Response(200,headers={'content-type':'application/json'},stream=stream)
+    result=await reader(service,handler).read('human:1')
+    assert result['source']=={'status':'unreachable'}
+    assert all(item['up'] is None and item['state']=='unknown' for item in result['devices'])
+    # Retained bytes never pass the budget; consumption exceeds it by at most one chunk per open stream.
+    assert log['read']<=64*1024+1024*len(streams)
+    assert log['closed']==len(streams)==1+len(QUERIES)
+
+
+def test_budget_retains_nothing_past_the_limit(monkeypatch):
+    monkeypatch.setattr(module,'MAX_TOTAL_BYTES',10)
+    budget=module._Budget();budget.take(10)
+    with pytest.raises(module._Exhausted):budget.take(1)
+    assert budget.used==10
+
+
+@pytest.mark.asyncio
+async def test_per_response_limit_rejects_only_that_response(service,monkeypatch):
     monkeypatch.setattr(module,'MAX_QUERY_BYTES',10)
     result=await reader(service,handler_for()).read('human:1')
     assert result['source']=={'status':'unreachable'}
+
+
+@pytest.mark.asyncio
+async def test_freshness_is_judged_when_readings_arrive(service):
+    # One clock reading, taken after the network: a second call would raise StopIteration.
+    times=iter([NOW+timedelta(seconds=5)])
+    def handler(request):
+        if request.url.raw_path.decode()==TARGET_PATH:
+            # Scraped two seconds after the read began: not in the future by completion time.
+            later=[{**TARGETS[0],'lastScrape':(NOW+timedelta(seconds=2)).isoformat().replace('+00:00','Z')}]
+            return respond({'status':'success','data':{'activeTargets':later}})
+        return handler_for()(request)
+    result=await MetricsReader(service,PrometheusOrigin('192.0.2.1',9090),[MAPPINGS[0]],
+        test_transport=httpx.MockTransport(handler),clock=lambda:next(times)).read('human:1')
+    desk=result['devices'][0]
+    assert desk['state']=='fresh' and desk['last_scrape']=='2026-10-29T17:00:02Z'
+    assert result['generated_at']=='2026-10-29T17:00:05Z'
+
+
+@pytest.mark.asyncio
+async def test_huge_and_inconsistent_values_are_dropped_not_crashing(service,monkeypatch):
+    huge=str(2**60)
+    series={**SERIES,'disk_size':[sample(huge,**W,volume='C:'),sample('100',**W,volume='D:')],
+            'disk_free':[sample('50',**W,volume='C:'),sample(huge,**W,volume='D:')],
+            'process_memory':[sample(huge,**W,process='giant'),sample('5',**W,process='small')],
+            'mem_total':[sample('100',**W)],'mem_available':[sample('200',**W)]}
+    monkeypatch.setattr(sys.modules[__name__],'SERIES',series)
+    result=await reader(service,handler_for(),[MAPPINGS[0]]).read('human:1')
+    desk=result['devices'][0]
+    assert desk['disks']==[{'mount':'D:','size_bytes':100,'free_bytes':None}]
+    assert desk['top_processes']==[{'name':'small','count':None,'working_set_bytes':5}]
+    assert desk['mem_total_bytes']==100 and desk['mem_available_bytes'] is None
+
+
+@pytest.mark.asyncio
+async def test_capability_revoked_during_read_returns_nothing(service):
+    principal=InfrastructurePrincipal('human','human:1')
+    base=handler_for()
+    def handler(request):
+        # Policy replaced mid-read (as a reload would): metrics_read is gone.
+        service.registry.capabilities=MappingProxyType({principal:frozenset({'read'})})
+        return base(request)
+    with pytest.raises(HubError) as error:
+        await reader(service,handler).read('human:1')
+    assert error.value.status==403
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_closes_requests_and_propagates(service):
+    log={'read':0,'closed':0};started=asyncio.Event()
+    class Slow(Stream):
+        async def __aiter__(self):
+            started.set()
+            await asyncio.sleep(30)
+            yield b''
+    def handler(request):
+        return httpx.Response(200,headers={'content-type':'application/json'},stream=Slow(log))
+    task=asyncio.create_task(reader(service,handler).read('human:1'))
+    await asyncio.wait_for(started.wait(),5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert log['closed']>=1
 
 
 @pytest.mark.asyncio

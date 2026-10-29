@@ -85,11 +85,13 @@ function target(value: unknown): MachineTarget {
   const last = row.last_scrape === null ? null : time(row.last_scrape);
   // Fresh and stale are judged from a real scrape time; unknown may lack one.
   if (state !== "unknown" && last === null) return invalid();
+  const total = bytes(row.mem_total_bytes), available = bytes(row.mem_available_bytes);
+  if (available !== null && (total === null || available > total)) return invalid();
   return {
     device_id: row.device_id, probe_id: row.probe_id, job: plain(row.job, 128), instance: plain(row.instance, 64),
     exporter: row.exporter === null ? null : oneOf(row.exporter, EXPORTERS), labels, up: row.up as boolean | null, last_scrape: last, state,
-    cpu_busy_ratio: number(row.cpu_busy_ratio, { max: 1 }), mem_total_bytes: bytes(row.mem_total_bytes),
-    mem_available_bytes: bytes(row.mem_available_bytes), uptime_seconds: number(row.uptime_seconds, { integer: true }),
+    cpu_busy_ratio: number(row.cpu_busy_ratio, { max: 1 }), mem_total_bytes: total,
+    mem_available_bytes: available, uptime_seconds: number(row.uptime_seconds, { integer: true }),
     disks: list(row.disks, MAX_DISKS).map(disk), gpus: list(row.gpus, MAX_GPUS).map(gpu),
     top_processes: list(row.top_processes, MAX_PROCESSES).map(processRow),
   };
