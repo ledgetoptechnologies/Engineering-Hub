@@ -348,3 +348,25 @@ def test_http_route_owner_read_without_csrf_and_closed_errors(service):
         assert client.get(PATH,headers={'Authorization':'Bearer hermes-token'}).status_code==403
     other=InfrastructureService(InfrastructureRegistry(sqlite3.connect(':memory:'),capabilities={}))
     with pytest.raises(TypeError):attach_infrastructure_routes(FastAPI(),other,lambda request:None,metrics=reader(service,handler_for()))
+
+
+@pytest.mark.asyncio
+async def test_oversized_process_count_keeps_the_process_with_unknown_count(service,monkeypatch):
+    series={**SERIES,'process_memory':[sample('4000000000',**W,process='msedge')],
+            'process_count':[sample(str(2**53),**W,process='msedge')]}
+    monkeypatch.setattr(sys.modules[__name__],'SERIES',series)
+    result=await reader(service,handler_for(),[MAPPINGS[0]]).read('human:1')
+    assert result['devices'][0]['top_processes']==[{'name':'msedge','count':None,'working_set_bytes':4000000000}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('health',[[],{},None,7,'UP','unknown'])
+async def test_malformed_health_on_a_matching_target_is_unknown(service,health):
+    def handler(request):
+        if request.url.raw_path.decode()==TARGET_PATH:
+            return respond({'status':'success','data':{'activeTargets':[{**TARGETS[0],'health':health}]}})
+        return handler_for()(request)
+    result=await reader(service,handler,[MAPPINGS[0]]).read('human:1')
+    desk=result['devices'][0]
+    # Scrape time is still real, so freshness is reported; up is unknown, never false.
+    assert desk['up'] is None and desk['state']=='fresh' and result['source']=={'status':'ok'}
