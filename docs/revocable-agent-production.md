@@ -145,7 +145,15 @@ Older images treat these records as expired, so rollback fails closed for those
 devices until the newer image is restored. Never run mixed versions against the
 same session database. No records are silently extended during upgrade.
 
-Session-history quotas remain bounded (256 retained sessions per installation,
-4096 globally); persistent approval does not remove those limits. Exhaustion
-needs a separately reviewed retention/recovery solution, not re-pairing or
-blind deletion of old sessions referenced by claims.
+The existing 16-active-session limit remains. Quotas count active sessions and
+those ended in the last 24 hours: 256 per installation and 4096 globally. A
+continuous device can reconnect beyond the old all-time history limit without
+another pairing. A burst still receives a limit response until its window ends.
+The owner session list uses that same window and the existing response shape.
+
+Historical session and audit rows are not deleted or rewritten, so old claim
+provenance and recovery remain intact. These stored rows grow over time; the
+quota bounds recent activity, not total database size. An operator-reviewed
+archive/size-monitoring policy remains a separate maintenance decision. An old
+image counts all rows and may refuse new sessions or fail to display more than
+256 historical rows after rollback; restoring the newer image preserves state.

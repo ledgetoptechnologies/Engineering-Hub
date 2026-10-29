@@ -11,7 +11,8 @@ import pytest
 
 from agent_message_bus.agent_sessions import (
     AgentSessionError, AgentSessionRepository, MAX_ACTIVE_SESSIONS, MAX_BODY_BYTES,
-    MAX_PENDING, MAX_SUBSCRIPTIONS, SessionPrincipal,
+    MAX_ALL_SESSIONS, MAX_PENDING, MAX_SESSION_HISTORY, MAX_SUBSCRIPTIONS,
+    SESSION_HISTORY_WINDOW_SECONDS, SessionPrincipal,
 )
 
 
@@ -329,6 +330,97 @@ def test_expiry_boundaries_and_session_quota(env):
     denied('installation_inactive', lambda: repo.exchange(secret))
     check(repo.list_installations(OWNER)['installations'][0]['state'] == 'expired', 'installation expires_at boundary admitted')
     check(all(s['state'] == 'expired' for s in repo.list_sessions(OWNER, row['id'])['sessions']), 'expired sessions shown active')
+
+
+def _seed_session(db, installation_id, suffix, issued_at, expires_at, revoked_at=None):
+    token_hash = hashlib.sha256(('synthetic-session:' + suffix).encode()).hexdigest()
+    db.execute('INSERT INTO agent_sessions VALUES(?,?,?,?,?,?,NULL,?,1)',
+               ('synthetic-' + suffix, installation_id, token_hash, 'Synthetic', issued_at, expires_at, revoked_at))
+
+
+def test_persistent_approval_reconnects_beyond_historical_session_cap(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'many-reconnects', approve=False)
+    approved = repo.approve(OWNER, row['id'], row['revision'], until_revoked=True)
+    for _ in range(1000):
+        issued = repo.exchange(secret)
+        check(issued['session']['expires_at'] is not None, 'session was not finite')
+        clock.advance(901)
+    current = repo.list_installations(OWNER)['installations'][0]
+    check(current['id'] == row['id'] and current['revision'] == approved['revision']
+          and current['expires_at'] is None and current['state'] == 'active',
+          'reconnect changed persistent approval')
+    recent = repo.list_sessions(OWNER, row['id'])
+    check(set(recent) == {'sessions'} and len(recent['sessions']) <= MAX_SESSION_HISTORY,
+          'owner session history response shape or bound changed')
+    with sqlite3.connect(repo.path) as db:
+        check(db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=?', (row['id'],)).fetchone()[0] == 1000,
+              'historical sessions were deleted')
+
+
+def test_active_session_burst_cap_recovers_after_finite_sessions_expire(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'active-burst', approve=False)
+    repo.approve(OWNER, row['id'], row['revision'], until_revoked=True)
+    sessions = [repo.exchange(secret) for _ in range(MAX_ACTIVE_SESSIONS)]
+    denied('session_limit', lambda: repo.exchange(secret))
+    clock.advance(900)
+    fresh = repo.exchange(secret)
+    check(fresh['session']['state'] == 'active' and len(sessions) == MAX_ACTIVE_SESSIONS,
+          'active-session burst cap did not recover after finite expiry')
+
+
+def test_session_history_quota_counts_recent_effective_end_and_recovers(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'window-quota', lifetime=604800)
+    now = clock.value
+    with repo._transaction() as db:
+        for i in range(MAX_SESSION_HISTORY - 1):
+            _seed_session(db, row['id'], 'install-' + str(i), now - 20, now - 1, now - 1)
+        # A revoked session whose expiry was older than the window remains old;
+        # an early revocation ends a session even when its original expiry is future.
+        _seed_session(db, row['id'], 'ancient-expiry', now - 3 * SESSION_HISTORY_WINDOW_SECONDS,
+                      now - SESSION_HISTORY_WINDOW_SECONDS - 1, now)
+        _seed_session(db, row['id'], 'early-revoke', now - 2, now + 3600,
+                      now - SESSION_HISTORY_WINDOW_SECONDS - 1)
+        # Late revocation remains in the window, while an end exactly at cutoff does not.
+        _seed_session(db, row['id'], 'late-revoke', now - 10, now + 3600, now - 10)
+        _seed_session(db, row['id'], 'exact-cutoff', now - 2 * SESSION_HISTORY_WINDOW_SECONDS,
+                      now + 3600, now - SESSION_HISTORY_WINDOW_SECONDS)
+    denied('session_limit', lambda: repo.exchange(secret))
+    listed = repo.list_sessions(OWNER, row['id'])
+    ids = {session['id'] for session in listed['sessions']}
+    check(len(listed['sessions']) == MAX_SESSION_HISTORY and 'synthetic-late-revoke' in ids,
+          'recent bounded owner history omitted an in-window ending')
+    check(listed['sessions'][0]['id'] == 'synthetic-late-revoke',
+          'owner history is not newest-first')
+    check(not {'synthetic-ancient-expiry', 'synthetic-early-revoke', 'synthetic-exact-cutoff'} & ids,
+          'owner history used an incorrect effective-end boundary')
+    clock.advance(SESSION_HISTORY_WINDOW_SECONDS + 1)
+    fresh = repo.exchange(secret)
+    check(fresh['session']['state'] == 'active', 'per-installation quota did not recover after its window')
+
+
+def test_global_recent_session_quota_recovers_without_pruning(env):
+    repo, clock = env
+    rows = [installation(repo, 'global-quota-' + str(i))[0] for i in range(16)]
+    target, secret, _ = installation(repo, 'global-quota-target', lifetime=604800)
+    now = clock.value
+    with repo._transaction() as db:
+        for row in rows:
+            for i in range(MAX_SESSION_HISTORY):
+                _seed_session(db, row['id'], 'global-' + row['id'] + '-' + str(i),
+                              now - 20, now - 1, now - 1)
+    with sqlite3.connect(repo.path) as db:
+        check(db.execute('SELECT count(*) FROM agent_sessions').fetchone()[0] == MAX_ALL_SESSIONS,
+              'synthetic global quota setup was not exact')
+    denied('session_limit', lambda: repo.exchange(secret))
+    clock.advance(SESSION_HISTORY_WINDOW_SECONDS + 1)
+    fresh = repo.exchange(secret)
+    check(fresh['session']['state'] == 'active', 'global quota did not recover after its window')
+    with sqlite3.connect(repo.path) as db:
+        check(db.execute('SELECT count(*) FROM agent_sessions').fetchone()[0] == MAX_ALL_SESSIONS + 1,
+              'historical session rows were deleted')
 
 
 def test_session_expiry_blocks_all_operations_and_exchange_can_continue(env):

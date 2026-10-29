@@ -30,6 +30,7 @@ MAX_ENROLLMENTS_PER_MINUTE = 20
 MAX_ACTIVE_SESSIONS = 16
 MAX_SESSION_HISTORY = 256
 MAX_ALL_SESSIONS = 4096
+SESSION_HISTORY_WINDOW_SECONDS = 86400
 MAX_MESSAGES = 10000
 MAX_MAILBOX = 1000
 MAX_SUBSCRIPTIONS = 32
@@ -126,6 +127,8 @@ class AgentSessionRepository:
                     installation_id TEXT, session_id TEXT, message_id TEXT, created_at REAL NOT NULL)''',
                 'CREATE INDEX IF NOT EXISTS session_inbox ON session_messages(recipient,seq)',
                 'CREATE INDEX IF NOT EXISTS session_installation_sessions ON agent_sessions(installation_id)',
+                'CREATE INDEX IF NOT EXISTS session_history_expiry ON agent_sessions(expires_at,revoked_at)',
+                'CREATE INDEX IF NOT EXISTS session_installation_history_expiry ON agent_sessions(installation_id,expires_at,revoked_at)',
             )
             for statement in statements:
                 db.execute(statement)
@@ -336,9 +339,12 @@ class AgentSessionRepository:
             if installation is None:
                 raise AgentSessionError('invalid_credential', 401)
             self._active_installation(installation, now)
+            cutoff = now - SESSION_HISTORY_WINDOW_SECONDS
+            recent = 'expires_at>? AND (revoked_at IS NULL OR revoked_at>?)'
             if (db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=? AND revoked_at IS NULL AND expires_at>?', (installation['id'], now)).fetchone()[0] >= MAX_ACTIVE_SESSIONS
-                    or db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=?', (installation['id'],)).fetchone()[0] >= MAX_SESSION_HISTORY
-                    or db.execute('SELECT count(*) FROM agent_sessions').fetchone()[0] >= MAX_ALL_SESSIONS):
+                    or db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=? AND ' + recent,
+                                  (installation['id'], cutoff, cutoff)).fetchone()[0] >= MAX_SESSION_HISTORY
+                    or db.execute('SELECT count(*) FROM agent_sessions WHERE ' + recent, (cutoff, cutoff)).fetchone()[0] >= MAX_ALL_SESSIONS):
                 raise AgentSessionError('session_limit', 429)
             token, identity = 'ehs_' + secrets.token_urlsafe(32), str(uuid.uuid4())
             db.execute('INSERT INTO agent_sessions VALUES(?,?,?,?,?,?,NULL,NULL,1)',
@@ -355,9 +361,12 @@ class AgentSessionRepository:
     def list_sessions(self, actor, installation_id):
         self._owner(actor)
         with self._transaction() as db:
-            now = self._now(); installation = self._installation(db, installation_id)
+            now = self._now(); cutoff = now - SESSION_HISTORY_WINDOW_SECONDS
+            installation = self._installation(db, installation_id)
             return {'sessions': [self._public_session(row, installation, now) for row in db.execute(
-                'SELECT * FROM agent_sessions WHERE installation_id=? ORDER BY issued_at DESC,id', (installation_id,))]}
+                'SELECT * FROM agent_sessions WHERE installation_id=? AND expires_at>? '
+                'AND (revoked_at IS NULL OR revoked_at>?) ORDER BY issued_at DESC,id LIMIT ?',
+                (installation_id, cutoff, cutoff, MAX_SESSION_HISTORY))]}
 
     def revoke_session(self, actor, id, expected_revision):
         self._owner(actor)

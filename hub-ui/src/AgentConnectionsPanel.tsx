@@ -394,8 +394,9 @@ function SessionList({ installation, entry, now, canChange, busy, onRevoke }: {
 }) {
   if (!entry || entry.state === "loading") return <p role="status" className="installation-sessions">Reading sessions…</p>;
   if (entry.state === "failed") return <p role="alert" className="notice error installation-sessions">Sessions couldn't be read. Open them again to retry.</p>;
-  if (!entry.items.length) return <p className="panel-footnote installation-sessions">{installation.name} has no sessions.</p>;
+  if (!entry.items.length) return <p className="panel-footnote installation-sessions">{installation.name} has no active sessions or sessions ended in the last 24 hours.</p>;
   return <table className="data-table installation-sessions" aria-label={`Sessions for ${installation.name}`}>
+    <caption>Active sessions and those ended in the last 24 hours. Older records are retained for audit and claim recovery.</caption>
     <thead><tr><th scope="col">Session</th><th scope="col">State</th><th scope="col">Started</th><th scope="col">Ends</th>
       <th scope="col">Last used</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
     <tbody>{entry.items.map(session => {
