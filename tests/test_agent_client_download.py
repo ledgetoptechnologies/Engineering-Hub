@@ -39,7 +39,7 @@ def test_public_manifest_download_and_head_match_packaged_bytes_without_enrollme
     with TestClient(app, base_url='http://127.0.0.1') as client:
         manifest = client.get(MANIFEST)
         assert manifest.status_code == 200
-        assert manifest.json() == {'schema_version': 1, 'helper_version': '0.6', 'url': HELPER,
+        assert manifest.json() == {'schema_version': 1, 'helper_version': '0.7', 'url': HELPER,
                                    'bytes': len(expected), 'sha256': hashlib.sha256(expected).hexdigest()}
         download = client.get(manifest.json()['url'])
         assert download.status_code == 200 and download.content == expected

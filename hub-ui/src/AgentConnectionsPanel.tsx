@@ -230,7 +230,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       <p className="panel-description">Each agent installation has its own connection, so one computer can have separate Codex and Claude
         installations. Ending a session stops just that session. Disconnecting an installation ends all of its sessions and needs a fresh,
         approved pairing to use again; other installations, even on the same computer, keep working. No passwords or tokens are shown here.</p>
-      <PairingGuide open={load === "loaded" && items.length === 0} />
+      <PairingGuide open={load === "loaded" && items.length === 0} environment={environment} />
       {catalog ? <p className="notice">A {environmentLabel} connection approved here can send and receive its own messages. It can use Hub tasks,
         reviews and other project operations only where you grant them under Hub access. Running work and waking an agent's chat stay separate.</p>
         : <p className="notice">This is the {environmentLabel} identity and messaging foundation. A connection approved here can send and receive its own
@@ -432,11 +432,21 @@ function DisconnectDialog({ item, entry, now, others, canChange, busy, error, on
   </Modal>;
 }
 
-/** Short, accurate pairing steps with this Hub's own helper downloads. The full command reference lives with the helper. */
-function PairingGuide({ open }: { open: boolean }) {
+/** Staging uses same-origin helper downloads; production laptop profiles use only the explicit private agent origin. */
+function PairingGuide({ open, environment }: { open: boolean; environment: Capabilities["environment"] | null }) {
   return <details className="pairing-guide" open={open}>
     <summary>Pair a new agent installation</summary>
-    <ol>
+    {environment === "production" ? <ol>
+      <li>Keep this browser on the HTTPS Hub origin. On the agent computer, connect the VPN first and fetch the helper and manifest from the private
+        agent origin at <code>/api/agent-sessions/v1/client/agent_session_client.py</code> and <code>/api/agent-sessions/v1/client/manifest</code>.
+        Check the helper's size and SHA-256 against the manifest before running it. It uses the computer's installed Python and never runs on its own.</li>
+      <li>Run <code>enroll --origin &lt;canonical-HTTPS-Hub-origin&gt; --private-vpn --private-origin &lt;private-agent-origin&gt;</code> with the
+        agent (Codex or Claude), a name and a host label. The private agent origin must be the VPN-reachable HTTP listener origin. The helper prints a
+        six-digit pairing code and a fingerprint.</li>
+      <li>A request appears here. Approve it only if its code and fingerprint match what that computer shows.</li>
+      <li>Run <code>connect --session &lt;name&gt; --private-vpn</code> on the agent computer. Configure only the private MCP URL printed by the helper;
+        never use the browser origin for agent traffic. Sessions last up to 15 minutes and approval lasts a day; neither renews silently.</li>
+    </ol> : environment === "staging" ? <ol>
       <li>On the computer that runs the agent, download the <a href="/api/agent-sessions/v1/client/agent_session_client.py" download>helper</a> and
         its <a href="/api/agent-sessions/v1/client/manifest" download>manifest</a> from this Hub. Check the helper's size and SHA-256 against the
         manifest before running it. It uses the computer's installed Python and never runs on its own.</li>
@@ -445,7 +455,7 @@ function PairingGuide({ open }: { open: boolean }) {
       <li>A request appears here. Approve it only if its code and fingerprint match what that computer shows.</li>
       <li>Approval doesn't start anything: run the helper's <code>connect</code> command to start a session. Sessions last up to 15 minutes and
         approval lasts a day; neither renews silently.</li>
-    </ol>
+    </ol> : <p className="panel-footnote">Pairing guidance is unavailable until this Hub confirms its environment.</p>}
     <p className="panel-footnote">The credential stays on that computer: protected for the current user on Windows, owner-only on Linux. It's never shown
       or pasted here.</p>
   </details>;

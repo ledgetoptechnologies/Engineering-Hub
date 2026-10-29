@@ -519,10 +519,14 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                           image_versions=lambda: ImageVersionsSummary.model_validate(
                               image_versions_for(notes_repository)).model_dump(mode='json'))
         origin = urlsplit(settings.auth_config.origin)
+        allowed_hosts = [origin.netloc]
+        if connection_config is not None and connection_config.private_origin is not None:
+            allowed_hosts.append(urlsplit(connection_config.transport_origin).netloc)
+        if settings.ingress_mode != "browser":
+            allowed_hosts.extend(settings.agent_allowed_hosts)
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=list(dict.fromkeys([origin.netloc] + (
-                list(settings.agent_allowed_hosts) if settings.ingress_mode != "browser" else []))),
+            allowed_hosts=list(dict.fromkeys(allowed_hosts)),
             allowed_origins=[settings.auth_config.origin],
         )
         if bus_app is None:

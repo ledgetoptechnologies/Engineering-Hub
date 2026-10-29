@@ -8,6 +8,7 @@ import base64
 import ctypes
 from contextlib import contextmanager
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -26,13 +27,22 @@ class ClientError(Exception):
     pass
 
 
+_RFC1918_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+    '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
 
 def _origin(value):
-    parsed = urlsplit(value)
+    if type(value) is not str:
+        raise ClientError('invalid_origin')
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise ClientError('invalid_origin') from None
     if (parsed.scheme not in {'https', 'http'} or not parsed.hostname
             or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment
             or (parsed.scheme == 'http' and parsed.hostname not in {'127.0.0.1', 'localhost', '::1'})):
@@ -41,6 +51,24 @@ def _origin(value):
         parsed.port
     except ValueError:
         raise ClientError('invalid_origin') from None
+    return value
+
+
+def _private_origin(value):
+    if type(value) is not str or not value or '%' in value:
+        raise ClientError('invalid_private_vpn_origin')
+    try:
+        parsed = urlsplit(value)
+        address = ipaddress.ip_address(parsed.hostname or '')
+        port = parsed.port
+    except ValueError:
+        raise ClientError('invalid_private_vpn_origin') from None
+    if (parsed.scheme != 'http' or type(address) is not ipaddress.IPv4Address
+            or port is None or not 1 <= port <= 65535
+            or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment
+            or not any(address in network for network in _RFC1918_NETWORKS)
+            or value != f'http://{address}:{port}'):
+        raise ClientError('invalid_private_vpn_origin')
     return value
 
 
@@ -125,7 +153,7 @@ def _profile_lock(directory):
 
 def _request(origin, path, payload, token=None):
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
-               'User-Agent': 'Engineering-Hub-Agent-Client/0.6'}
+               'User-Agent': 'Engineering-Hub-Agent-Client/0.7'}
     if token is not None:
         headers['Authorization'] = 'Bearer ' + token
     request = Request(origin + '/api/agent-sessions/v1' + path,
@@ -148,17 +176,20 @@ def _request(origin, path, payload, token=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Pair an isolated staging agent installation.')
+    parser = argparse.ArgumentParser(description='Pair an isolated agent installation.')
     parser.add_argument('--profile-dir', type=Path, required=True)
     commands = parser.add_subparsers(dest='command', required=True)
     enroll = commands.add_parser('enroll')
     enroll.add_argument('--origin', required=True)
+    enroll.add_argument('--private-vpn', action='store_true')
+    enroll.add_argument('--private-origin')
     enroll.add_argument('--family', choices=('codex', 'claude', 'hermes'), required=True)
     enroll.add_argument('--name', required=True)
     enroll.add_argument('--host-label', required=True)
     connect = commands.add_parser('connect')
     connect.add_argument('--session', required=True)
     connect.add_argument('--label', default='')
+    connect.add_argument('--private-vpn', action='store_true')
     headers = commands.add_parser('headers', help='Private connector pipe only; do not run in chat/terminal logs.')
     headers.add_argument('--session', required=True)
     args = parser.parse_args(argv)
@@ -178,16 +209,29 @@ def main(argv=None):
     with _profile_lock(directory):
         if args.command == 'enroll':
             origin = _origin(args.origin)
+            if args.private_vpn:
+                if urlsplit(origin).scheme != 'https':
+                    raise ClientError('private_vpn_requires_https_owner_origin')
+                private_origin = _private_origin(args.private_origin)
+            else:
+                if args.private_origin is not None:
+                    raise ClientError('private_origin_requires_private_vpn_flag')
+                private_origin = None
             if installation_path.exists():
                 profile = _read(installation_path)
-                if profile.get('origin') != origin or profile.get('family') != args.family:
+                selected_private = profile.get('private_vpn', False)
+                if (type(selected_private) is not bool
+                        or profile.get('origin') != origin or profile.get('family') != args.family
+                        or selected_private != args.private_vpn
+                        or profile.get('private_origin') != private_origin):
                     raise ClientError('existing_profile_binding_mismatch')
             else:
-                profile = {'origin': origin, 'family': args.family,
+                profile = {'origin': origin, 'family': args.family, 'private_vpn': args.private_vpn,
+                           'private_origin': private_origin,
                            'secret': 'ehi_' + secrets.token_urlsafe(32)}
                 # Save before the request: a lost response must not generate a new identity.
                 _write(installation_path, profile)
-            result = _request(origin, '/enrollments', {
+            result = _request(private_origin or origin, '/enrollments', {
                 'family': args.family, 'name': args.name, 'host_label': args.host_label,
                 'credential_sha256': hashlib.sha256(profile['secret'].encode()).hexdigest()})
             profile['installation_id'] = result['id']
@@ -196,17 +240,33 @@ def main(argv=None):
                               ('id', 'family', 'state', 'pairing_code', 'key_fingerprint', 'expires_at')}))
             return 0
         profile = _read(installation_path)
+        selected_private = profile.get('private_vpn', False)
+        if type(selected_private) is not bool:
+            raise ClientError('invalid_private_profile')
+        if selected_private:
+            if not args.private_vpn:
+                raise ClientError('private_vpn_flag_required')
+            owner_origin = _origin(profile.get('origin'))
+            if urlsplit(owner_origin).scheme != 'https':
+                raise ClientError('invalid_private_profile')
+            transport_origin = _private_origin(profile.get('private_origin'))
+        else:
+            if args.private_vpn:
+                raise ClientError('private_vpn_profile_required')
+            if profile.get('private_origin') is not None:
+                raise ClientError('invalid_private_profile')
+            transport_origin = _origin(profile.get('origin'))
         session_path = directory / (args.session + '.session.private')
         if session_path.exists():
             raise ClientError('session_profile_exists_choose_a_new_name')
-        result = _request(_origin(profile['origin']), '/exchange', {'label': args.label}, profile['secret'])
+        result = _request(transport_origin, '/exchange', {'label': args.label}, profile['secret'])
         from datetime import datetime
         issued = result['session']
         expiry = datetime.fromisoformat(issued['expires_at'].replace('Z', '+00:00')).timestamp()
         _write(session_path, {'token': result['token'], 'expires_at': expiry,
                               'installation_id': profile['installation_id'], 'session_id': issued['id']})
         print(json.dumps({'installation_id': profile['installation_id'], 'session_id': issued['id'],
-                          'expires_at': issued['expires_at'], 'mcp_url': profile['origin'] + '/mcp'}))
+                          'expires_at': issued['expires_at'], 'mcp_url': transport_origin + '/mcp'}))
         return 0
 
 

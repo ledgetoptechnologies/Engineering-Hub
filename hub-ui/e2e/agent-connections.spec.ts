@@ -8,7 +8,9 @@ function installation(fields: Partial<Installation> & Pick<Installation, "id" | 
   return { host_label: "desk-pc", reason: null, created_at: iso(-60_000), approved_at: null, approved_by: null, revoked_at: null,
     revoked_by: null, expires_at: null, revision: 1, pairing_code: null, key_fingerprint: "3f9a1c7e5b2d8f40", ...fields };
 }
-async function fixture(page: Page, options: { owner?: boolean; capability?: "present" | "missing" } = {}) {
+async function fixture(page: Page, options: {
+  owner?: boolean; capability?: "present" | "missing"; environment?: "staging" | "production";
+} = {}) {
   const state = {
     installations: [
       installation({ id: "inst_laptop", family: "claude", name: "Claude on the laptop", host_label: "beau-laptop", state: "active",
@@ -46,7 +48,7 @@ async function fixture(page: Page, options: { owner?: boolean; capability?: "pre
     state.reads.push(`${request.method()} ${rest}`);
     if (options.capability === "missing") return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
     if (request.method() === "GET") {
-      if (rest === "/capabilities") return respond({ enabled: true, environment: "staging", owner: state.owner });
+      if (rest === "/capabilities") return respond({ enabled: true, environment: options.environment ?? "staging", owner: state.owner });
       if (state.listStatus !== 200) return respond({ detail: { code: "human_session_required" } }, state.listStatus);
       if (rest === "/installations") {
         // A stalled read never answers; the page must give up on it by itself.
@@ -187,10 +189,10 @@ test("ending one session keeps the installation and its other session, and never
   expect(state.posts).toEqual([{ path: "/sessions/sess_main/revoke", method: "POST", body: { expected_revision: 1 }, csrf: "fixture-csrf" }]);
 });
 
-test("someone who isn't the staging owner sees no installations", async ({ page }) => {
+test("someone who isn't the configured Hub owner sees no installations", async ({ page }) => {
   const state = await fixture(page, { owner: false });
   await page.goto("/#/agents");
-  await expect(panelOf(page)).toContainText("Only the staging owner can see and manage agent installations.");
+  await expect(panelOf(page)).toContainText("Only the configured Hub owner can see and manage agent installations.");
   await expect(panelOf(page).locator(".installation-row")).toHaveCount(0);
   expect(state.reads).toEqual(["GET /capabilities"]);
 });
@@ -229,14 +231,22 @@ test("a pending request can be declined without approving anything", async ({ pa
   expect(state.posts).toEqual([{ path: "/installations/inst_desk/revoke", method: "POST", body: { expected_revision: 1 }, csrf: "fixture-csrf" }]);
 });
 
-test("an unclear capability answer keeps the panel hidden instead of showing an error", async ({ page }) => {
+test("an unsupported capability environment keeps the panel hidden instead of showing an error", async ({ page }) => {
   await fixture(page);
   await page.route("**/api/hub/v1/agent-connections/capabilities", route =>
-    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, environment: "production", owner: true }) }));
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ enabled: true, environment: "preview", owner: true }) }));
   await page.goto("/#/agents");
   await expect(page.getByRole("region", { name: "Hub stream observations" })).toBeVisible();
   await expect(panelOf(page)).toHaveCount(0);
   await expect(page.locator("#agents").getByRole("alert")).toHaveCount(0);
+});
+
+test("production capability keeps the owner installation panel available and identifies the environment", async ({ page }) => {
+  await fixture(page, { environment: "production" });
+  await page.goto("/#/agents");
+  const panel = panelOf(page);
+  await expect(panel.getByText("PRODUCTION", { exact: true })).toBeVisible();
+  await expect(panel.locator(".installation-row")).toHaveCount(3);
 });
 
 test("an older session read that answers late never replaces a newer one", async ({ page }) => {
@@ -299,7 +309,7 @@ test("when a different person signs in on the open page, the previous owner's in
   // Someone else signs in; the Hub workspace re-reads its session without a reload.
   state.actor = "human:cf:" + "f".repeat(64); state.owner = false;
   await page.getByRole("button", { name: "Refresh workspace" }).click();
-  await expect(panelOf(page)).toContainText("Only the staging owner can see and manage agent installations.");
+  await expect(panelOf(page)).toContainText("Only the configured Hub owner can see and manage agent installations.");
   await expect(panelOf(page).locator(".installation-row")).toHaveCount(0);
   // The old owner's held session read answers late and must not bring anything back.
   state.sessionReleases[0]();
@@ -364,6 +374,22 @@ test("pairing guidance points at this Hub's own helper downloads and opens when 
   await expect(guide.getByRole("link", { name: "manifest" })).toHaveAttribute("href", "/api/agent-sessions/v1/client/manifest");
   await expect(guide).toContainText("Approval doesn't start anything: run the helper's connect command to start a session.");
   await expect(guide).toContainText("It's never shown or pasted here.");
+});
+
+test("production pairing guidance uses private VPN paths without browser-origin download links", async ({ page }) => {
+  const state = await fixture(page, { environment: "production" });
+  state.emptyInstallations = true;
+  await page.goto("/#/agents");
+  const guide = panelOf(page).locator("details.pairing-guide");
+  await expect(guide).toHaveAttribute("open", "");
+  await expect(guide.getByRole("link", { name: "helper" })).toHaveCount(0);
+  await expect(guide.getByRole("link", { name: "manifest" })).toHaveCount(0);
+  await expect(guide).toContainText("connect the VPN first");
+  await expect(guide).toContainText("/api/agent-sessions/v1/client/agent_session_client.py");
+  await expect(guide).toContainText("/api/agent-sessions/v1/client/manifest");
+  await expect(guide).toContainText("enroll --origin <canonical-HTTPS-Hub-origin> --private-vpn --private-origin <private-agent-origin>");
+  await expect(guide).toContainText("connect --session <name> --private-vpn");
+  await expect(guide).toContainText("never use the browser origin for agent traffic");
 });
 
 test("a read that never answers is cancelled at the deadline and reported, without retrying", async ({ page }) => {

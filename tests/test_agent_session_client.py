@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import time
+from urllib.error import HTTPError
 
 import pytest
 
@@ -97,6 +98,125 @@ def test_live_profile_binding_is_not_reused_for_another_origin(tmp_path):
     with pytest.raises(client.ClientError, match='binding_mismatch'):
         client.main(['--profile-dir', str(tmp_path), 'enroll', '--origin', 'https://other.example.test',
                      '--family', 'codex', '--name', 'fixture', '--host-label', 'fixture'])
+
+
+def test_private_vpn_enrollment_persists_mode_and_uses_only_private_origin(tmp_path, monkeypatch, capsys):
+    owner_origin = 'https://hub.example.test'
+    private_origin = 'http://192.168.50.80:8770'
+    response = {'id': '00000000-0000-0000-0000-000000000001', 'family': 'codex',
+                'state': 'pending', 'pairing_code': '123456',
+                'key_fingerprint': '0' * 16, 'expires_at': '2030-01-01T00:00:00Z'}
+    requests = []
+    monkeypatch.setattr(client, '_request', lambda origin, path, payload, token=None:
+        (requests.append((origin, path, payload, token)) or response))
+    assert client.main(['--profile-dir', str(tmp_path), 'enroll', '--origin', owner_origin,
+        '--private-vpn', '--private-origin', private_origin, '--family', 'codex',
+        '--name', 'Synthetic laptop', '--host-label', 'vpn-laptop']) == 0
+    profile = client._read(tmp_path / 'installation.private')
+    assert profile['origin'] == owner_origin
+    assert profile['private_vpn'] is True
+    assert profile['private_origin'] == private_origin
+    assert requests[0][0:2] == (private_origin, '/enrollments')
+    assert profile['secret'] not in capsys.readouterr().out
+
+
+def test_private_vpn_connect_requires_flag_and_emits_private_mcp_url(tmp_path, monkeypatch, capsys):
+    owner_origin = 'https://hub.example.test'
+    private_origin = 'http://192.168.50.80:8770'
+    install = 'ehi_' + 'a' * 43
+    session = 'ehs_' + 'b' * 43
+    client._write(tmp_path / 'installation.private', {
+        'origin': owner_origin, 'private_vpn': True, 'private_origin': private_origin,
+        'family': 'codex', 'secret': install,
+        'installation_id': '00000000-0000-0000-0000-000000000001'})
+    calls = []
+    monkeypatch.setattr(client, '_request', lambda origin, path, payload, token=None:
+        (calls.append((origin, path, token)) or {
+            'token': session, 'session': {'id': 'session-id', 'expires_at': '2030-01-01T00:00:00Z'}}))
+    with pytest.raises(client.ClientError, match='private_vpn_flag_required'):
+        client.main(['--profile-dir', str(tmp_path), 'connect', '--session', 'vpn-session'])
+    assert calls == []
+    assert client.main(['--profile-dir', str(tmp_path), 'connect', '--session', 'vpn-session',
+                        '--private-vpn']) == 0
+    assert calls == [(private_origin, '/exchange', install)]
+    output = json.loads(capsys.readouterr().out)
+    assert output['mcp_url'] == private_origin + '/mcp'
+    assert install not in json.dumps(output) and session not in json.dumps(output)
+
+
+@pytest.mark.parametrize('origin', [
+    'https://192.168.50.80:8770', 'http://8.8.8.8:8770', 'http://hub.example.test:8770',
+    'http://[fd00::80]:8770', 'http://127.0.0.1:8770', 'http://169.254.1.10:8770',
+    'http://100.64.0.1:8770', 'http://192.0.2.1:8770', 'http://198.18.0.1:8770',
+    'http://224.0.0.1:8770', 'http://192.168.50.80', 'http://192.168.50.80:0',
+    'http://192.168.50.80:65536', 'http://192.168.50.80:08770',
+    'http://192.168.050.80:8770', 'http://user@192.168.50.80:8770',
+    'http://192.168.50.80:8770/path', 'http://192.168.50.80:8770?x=1',
+    'http://192.168.50.80:8770#frag', 'http://192.168.50.80:8770%2Fignored',
+])
+def test_private_vpn_origin_requires_canonical_rfc1918_http_literal(origin):
+    with pytest.raises(client.ClientError, match='invalid_private_vpn_origin'):
+        client._private_origin(origin)
+
+
+def test_private_origin_requires_explicit_enroll_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(client, '_request', lambda *args, **kwargs: pytest.fail('must not send request'))
+    with pytest.raises(client.ClientError, match='private_origin_requires_private_vpn_flag'):
+        client.main(['--profile-dir', str(tmp_path), 'enroll', '--origin', 'https://hub.example.test',
+            '--private-origin', 'http://192.168.50.80:8770', '--family', 'codex',
+            '--name', 'fixture', '--host-label', 'fixture'])
+
+
+def test_private_vpn_enrollment_requires_https_owner_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(client, '_request', lambda *args, **kwargs: pytest.fail('must not send request'))
+    with pytest.raises(client.ClientError, match='private_vpn_requires_https_owner_origin'):
+        client.main(['--profile-dir', str(tmp_path), 'enroll', '--origin', 'http://127.0.0.1:9911',
+            '--private-vpn', '--private-origin', 'http://192.168.50.80:8770', '--family', 'codex',
+            '--name', 'fixture', '--host-label', 'fixture'])
+
+
+def test_private_vpn_connect_revalidates_profile_origin_without_fallback(tmp_path, monkeypatch):
+    client._write(tmp_path / 'installation.private', {
+        'origin': 'https://hub.example.test', 'private_vpn': True,
+        'private_origin': 'http://8.8.8.8:8770', 'family': 'codex',
+        'secret': 'synthetic', 'installation_id': '00000000-0000-0000-0000-000000000001'})
+    monkeypatch.setattr(client, '_request', lambda *args, **kwargs: pytest.fail('must not send request'))
+    with pytest.raises(client.ClientError, match='invalid_private_vpn_origin'):
+        client.main(['--profile-dir', str(tmp_path), 'connect', '--session', 'vpn-session', '--private-vpn'])
+
+
+def test_private_vpn_flag_cannot_select_private_transport_for_legacy_profile(tmp_path, monkeypatch):
+    client._write(tmp_path / 'installation.private', {
+        'origin': 'https://hub.example.test', 'family': 'codex', 'secret': 'synthetic',
+        'installation_id': '00000000-0000-0000-0000-000000000001'})
+    monkeypatch.setattr(client, '_request', lambda *args, **kwargs: pytest.fail('must not send request'))
+    with pytest.raises(client.ClientError, match='private_vpn_profile_required'):
+        client.main(['--profile-dir', str(tmp_path), 'connect', '--session', 'vpn-session', '--private-vpn'])
+
+
+def test_private_vpn_requests_do_not_use_proxy_or_follow_public_redirect(monkeypatch):
+    seen = {'calls': 0, 'url': None, 'userAgent': None, 'handlers': None}
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            seen['calls'] += 1
+            seen['url'] = request.full_url
+            seen['userAgent'] = request.get_header('User-agent')
+            raise HTTPError(request.full_url, 302, 'redirect', {}, None)
+
+    def build_opener(*handlers):
+        seen['handlers'] = handlers
+        return RedirectingOpener()
+
+    monkeypatch.setattr(client, 'build_opener', build_opener)
+    with pytest.raises(client.ClientError, match='server_request_denied_302'):
+        client._request('http://192.168.50.80:8770', '/exchange', {'label': ''}, 'synthetic')
+    assert seen['calls'] == 1
+    assert seen['url'] == 'http://192.168.50.80:8770/api/agent-sessions/v1/exchange'
+    assert seen['userAgent'] == 'Engineering-Hub-Agent-Client/0.7'
+    proxy_handlers = [handler for handler in seen['handlers'] if isinstance(handler, client.ProxyHandler)]
+    assert len(proxy_handlers) == 1 and proxy_handlers[0].proxies == {}
+    assert any(isinstance(handler, client.NoRedirect) for handler in seen['handlers'])
 
 
 def test_profile_lock_does_not_overwrite_an_existing_operation(tmp_path):

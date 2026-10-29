@@ -51,10 +51,15 @@ def _create_unified_bus(settings, *, bus_paths=None):
                 and settings.database.samefile(paths['AGENT_BUS_DB']))):
         raise ValueError('Existing separate bus and Hub state required')
     origin = settings.auth_config.origin
+    from agent_message_bus.agent_sessions_config import AgentSessionsConfig
+    session_config = AgentSessionsConfig.from_env()
+    allowed_hosts = [urlsplit(origin).netloc]
+    if session_config is not None and session_config.private_origin is not None:
+        allowed_hosts.append(urlsplit(session_config.transport_origin).netloc)
+    allowed_hosts.extend(settings.agent_allowed_hosts)
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=list(dict.fromkeys([urlsplit(origin).netloc,
-                                         *settings.agent_allowed_hosts])),
+        allowed_hosts=list(dict.fromkeys(allowed_hosts)),
         allowed_origins=[origin],
     )
     # Factory import is inert; only this explicit operation may construct it.
@@ -68,4 +73,5 @@ def _create_unified_bus(settings, *, bus_paths=None):
                          # After verification the operator may restore the old
                          # startup-retention behavior explicitly with value 1.
                          startup_cleanup=cleanup_flag == '1',
+                         agent_sessions_config=session_config,
                          transport_security_settings=security)

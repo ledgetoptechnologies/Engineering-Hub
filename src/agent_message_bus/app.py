@@ -10,6 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from importlib.metadata import version
 
@@ -153,6 +154,16 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     if agent_sessions is not None:
         from .agent_sessions_mcp import install_session_tools
         install_session_tools(mcp, agent_sessions)
+    if agent_sessions_config is not None and agent_sessions_config.private_origin is not None:
+        selected_security = transport_security_settings or mcp.settings.transport_security
+        if type(selected_security) is not TransportSecuritySettings:
+            raise ValueError("private_agent_session_transport_policy_required")
+        private_host = urlsplit(agent_sessions_config.transport_origin).netloc
+        transport_security_settings = TransportSecuritySettings(
+            enable_dns_rebinding_protection=selected_security.enable_dns_rebinding_protection,
+            allowed_hosts=list(dict.fromkeys([*(selected_security.allowed_hosts or []), private_host])),
+            allowed_origins=list(selected_security.allowed_origins or []),
+        )
     if transport_security_settings is not None:
         # Must precede streamable_http_app(): FastMCP copies these settings into
         # its session manager when it creates the HTTP app.
