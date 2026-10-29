@@ -1,4 +1,4 @@
-"""Explicit staging-only installation grants for a finite set of Hub tools.
+"""Explicit installation grants for a finite set of Hub tools.
 
 Lock order: session writer, Hub writer, knowledge writer. No network/await is
 permitted inside admission. An OS lock refuses a second bridge process; the

@@ -3,8 +3,10 @@
 This is an optional source feature. It does not apply grants, recover actual
 tasks, deploy a build, replace credentials, or configure a listener. Foundation
 sessions remain disabled by default. `HUB_AGENT_SESSIONS_HUB_BRIDGE=enabled`
-additionally requires the explicitly configured staging session foundation;
-the default is `disabled`. Existing approved installations have no Hub rights.
+additionally requires the explicitly configured session foundation in either
+staging or production mode; the default is `disabled`. Existing approved
+installations have no Hub rights. Production configuration and onboarding are
+covered separately in [revocable-agent-production.md](revocable-agent-production.md).
 
 Connection approval and Hub authorization are separate. Only the configured
 connection owner, using the normal human browser session, Origin and CSRF

@@ -18,7 +18,8 @@ export const NAME_MAX = 100;
 /** Retained session history per installation (active sessions are capped separately at 16). */
 export const MAX_SESSION_HISTORY = 256;
 
-export interface Capabilities { enabled: true; environment: "staging"; owner: boolean }
+export type AgentConnectionsEnvironment = "staging" | "production";
+export interface Capabilities { enabled: true; environment: AgentConnectionsEnvironment; owner: boolean }
 export interface Installation {
   id: string; family: Family; name: string; host_label: string; state: InstallationState; reason: string | null;
   created_at: string; approved_at: string | null; approved_by: string | null; revoked_at: string | null; revoked_by: string | null;
@@ -73,9 +74,10 @@ const code = (value: unknown): string => typeof value === "string" && codePatter
 
 export function parseCapabilities(value: unknown): Capabilities {
   const row = record(value, ["enabled", "environment", "owner"]);
-  // Anything but an enabled staging service reads as unavailable, never as a live one.
-  if (row.enabled !== true || row.environment !== "staging" || typeof row.owner !== "boolean") return invalid();
-  return { enabled: true, environment: "staging", owner: row.owner };
+  // An explicit environment is required; unknown modes are never treated as live.
+  if (row.enabled !== true || !["staging", "production"].includes(row.environment as string)
+      || typeof row.owner !== "boolean") return invalid();
+  return { enabled: true, environment: row.environment as AgentConnectionsEnvironment, owner: row.owner };
 }
 const INSTALLATION_KEYS = ["id", "family", "name", "host_label", "state", "reason", "created_at", "approved_at", "approved_by",
   "revoked_at", "revoked_by", "expires_at", "revision", "pairing_code", "key_fingerprint"] as const;
@@ -206,7 +208,7 @@ export function writeFailureText(error: unknown): string {
   if (failure === "revision_conflict" || status === 409) return "This changed since you loaded it. Refresh to see the latest, then try again.";
   if (status === 404) return "The Hub no longer has this record. Refresh to see the current list.";
   if (failure.startsWith("invalid_") || status === 422) return "The Hub didn't accept this. Check the details and try again.";
-  if (status === 403) return "Only the staging owner can change agent connections.";
+  if (status === 403) return "Only the configured Hub owner can change agent connections.";
   return "The change couldn't be confirmed. Refresh to check before trying again.";
 }
 

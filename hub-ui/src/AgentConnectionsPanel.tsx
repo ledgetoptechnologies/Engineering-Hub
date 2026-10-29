@@ -43,6 +43,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const environment = capabilities?.environment ?? null;
+  const environmentLabel = environment ?? "configured";
   const [notice, setNotice] = useState<{ error: boolean; text: string; for: string } | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Record<string, { state: "loading" | "loaded" | "failed"; items: Session[] }>>(() =>
@@ -211,13 +213,13 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   }, "Session ended. The installation and its other sessions keep working.", true);
 
   if (load === "unavailable" || load === "checking") return null;
-  const header = <div className="panel-title"><h2>Installations</h2><Badge tone="amber">STAGING</Badge>
+  const header = <div className="panel-title"><h2>Installations</h2><Badge tone={environment === "production" ? "forest" : environment === "staging" ? "amber" : "neutral"}>{environment?.toUpperCase() ?? "UNKNOWN"}</Badge>
     <span className="panel-action">
       {readAt && <span className="muted">Read {relativeAge(new Date(readAt).toISOString()) ?? "just now"}</span>}
       <button type="button" className="secondary small" disabled={demo || load === "loading"} onClick={() => void refresh()}>Refresh</button>
     </span></div>;
   if (load === "not_owner") return <section className="panel installations" aria-label="Installations">{header}
-    <p className="panel-description">Only the staging owner can see and manage agent installations.</p>
+    <p className="panel-description">Only the configured Hub owner can see and manage agent installations.</p>
     <p className="panel-footnote">Managing installations needs the configured owner's own Hub sign-in on this Hub. If that's you, <a
       className="text-link" href="/api/hub/v1/auth/login">sign in to this Hub</a>, then come back to Agents.</p></section>;
 
@@ -229,9 +231,9 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
         installations. Ending a session stops just that session. Disconnecting an installation ends all of its sessions and needs a fresh,
         approved pairing to use again; other installations, even on the same computer, keep working. No passwords or tokens are shown here.</p>
       <PairingGuide open={load === "loaded" && items.length === 0} />
-      {catalog ? <p className="notice">Staging only. A connection approved here can send and receive its own messages. It can use Hub tasks,
+      {catalog ? <p className="notice">A {environmentLabel} connection approved here can send and receive its own messages. It can use Hub tasks,
         reviews and other project operations only where you grant them under Hub access. Running work and waking an agent's chat stay separate.</p>
-        : <p className="notice">Staging only: this is the identity and messaging foundation. A connection approved here can send and receive its own
+        : <p className="notice">This is the {environmentLabel} identity and messaging foundation. A connection approved here can send and receive its own
         messages, but it can't use Hub tasks or reviews, and it doesn't wake an agent's chat automatically.</p>}
       {demo && <p className="notice">Demo: these installations are examples. Nothing can be approved or revoked.</p>}
       {failure && <p role="alert" className="notice error">{failure}</p>}
