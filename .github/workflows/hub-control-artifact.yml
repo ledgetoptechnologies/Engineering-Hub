@@ -1,12 +1,13 @@
 name: Hub control preparation artifact
 on:
   push:
-    branches: [work/hub-control-artifact-hermes]
+    branches: [main]
 permissions:
   contents: read
   packages: write
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       SOURCE: 4f3e15d6cbd2aa64d6d907d72ec2fcdf1645779d
