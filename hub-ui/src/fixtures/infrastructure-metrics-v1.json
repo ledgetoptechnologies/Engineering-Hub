@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-29T17:00:00Z",
+  "source": {
+    "status": "ok"
+  },
+  "devices": [
+    {
+      "device_id": "desk-pc",
+      "probe_id": "windows-scrape",
+      "job": "windows",
+      "instance": "192.0.2.51:9182",
+      "exporter": "windows",
+      "labels": {
+        "host": "desk",
+        "role": "workstation",
+        "env": "personal"
+      },
+      "up": true,
+      "last_scrape": "2026-10-29T16:59:50.123456Z",
+      "state": "fresh",
+      "cpu_busy_ratio": 0.25,
+      "mem_total_bytes": 68719476736,
+      "mem_available_bytes": 25769803776,
+      "uptime_seconds": 86400,
+      "disks": [
+        {
+          "mount": "C:",
+          "size_bytes": 4000000000000,
+          "free_bytes": 353000000000
+        }
+      ],
+      "gpus": [],
+      "top_processes": [
+        {
+          "name": "msedge",
+          "count": 57,
+          "working_set_bytes": 4000000000
+        },
+        {
+          "name": "node",
+          "count": 22,
+          "working_set_bytes": 2500000000
+        }
+      ]
+    },
+    {
+      "device_id": "field-pi",
+      "probe_id": "node-scrape",
+      "job": "node",
+      "instance": "192.0.2.86:9100",
+      "exporter": "node",
+      "labels": {},
+      "up": false,
+      "last_scrape": "2026-10-29T16:50:00.123456Z",
+      "state": "stale",
+      "cpu_busy_ratio": null,
+      "mem_total_bytes": null,
+      "mem_available_bytes": null,
+      "uptime_seconds": null,
+      "disks": [],
+      "gpus": [],
+      "top_processes": []
+    },
+    {
+      "device_id": "gpu-box",
+      "probe_id": "gpu-scrape",
+      "job": "nvidia-gpu",
+      "instance": "192.0.2.88:9400",
+      "exporter": "nvidia",
+      "labels": {
+        "host": "gpu-box",
+        "role": "processing",
+        "env": "production"
+      },
+      "up": true,
+      "last_scrape": "2026-10-29T16:59:50.123456Z",
+      "state": "fresh",
+      "cpu_busy_ratio": null,
+      "mem_total_bytes": null,
+      "mem_available_bytes": null,
+      "uptime_seconds": null,
+      "disks": [],
+      "gpus": [
+        {
+          "index": 0,
+          "model": "Synthetic GPU A",
+          "util_ratio": 0.35,
+          "mem_used_bytes": 4294967296,
+          "mem_total_bytes": 17179869184,
+          "temperature_c": 61.0
+        },
+        {
+          "index": 1,
+          "model": "Synthetic GPU B",
+          "util_ratio": 0.0,
+          "mem_used_bytes": null,
+          "mem_total_bytes": null,
+          "temperature_c": null
+        }
+      ],
+      "top_processes": []
+    },
+    {
+      "device_id": "gpu-box",
+      "probe_id": "node-scrape",
+      "job": "node",
+      "instance": "192.0.2.88:9100",
+      "exporter": "node",
+      "labels": {
+        "host": "gpu-box",
+        "role": "processing",
+        "env": "production"
+      },
+      "up": true,
+      "last_scrape": "2026-10-29T16:59:50.123456Z",
+      "state": "fresh",
+      "cpu_busy_ratio": 0.5,
+      "mem_total_bytes": 34359738368,
+      "mem_available_bytes": null,
+      "uptime_seconds": 3600,
+      "disks": [
+        {
+          "mount": "/",
+          "size_bytes": 500000000000,
+          "free_bytes": 125000000000
+        }
+      ],
+      "gpus": [],
+      "top_processes": []
+    },
+    {
+      "device_id": "old-box",
+      "probe_id": "legacy-scrape",
+      "job": "legacy",
+      "instance": "192.0.2.90:9100",
+      "exporter": null,
+      "labels": {},
+      "up": null,
+      "last_scrape": null,
+      "state": "unknown",
+      "cpu_busy_ratio": null,
+      "mem_total_bytes": null,
+      "mem_available_bytes": null,
+      "uptime_seconds": null,
+      "disks": [],
+      "gpus": [],
+      "top_processes": []
+    }
+  ]
+}

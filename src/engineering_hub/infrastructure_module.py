@@ -25,7 +25,7 @@ from pathlib import Path
 import sqlite3
 import stat
 
-from .infrastructure import CAPABILITIES, InfrastructurePrincipal, InfrastructureRegistry
+from .infrastructure import CAPABILITIES, HUMAN_ONLY, InfrastructurePrincipal, InfrastructureRegistry
 from .infrastructure_service import InfrastructureService
 from .repository import AGENTS, HubRepository
 
@@ -100,10 +100,10 @@ def _settings(path):
         HubRepository._actor(item['identity'])
         _need((item['identity'] in AGENTS)==(item['kind']=='agent'))
         actions=item['capabilities']
-        _need(type(actions) is list and len(actions)<=4 and all(type(action) is str for action in actions))
+        _need(type(actions) is list and len(actions)<=len(CAPABILITIES) and all(type(action) is str for action in actions))
         _need(len(set(actions))==len(actions) and set(actions)<=CAPABILITIES)
         _need(not (set(actions)-{'read'}) or 'read' in actions)
-        _need(item['kind']=='human' or 'device_write' not in actions)
+        _need(item['kind']=='human' or not set(actions)&HUMAN_ONLY)
         principal=InfrastructurePrincipal(item['kind'],item['identity'])
         _need(principal not in grants)
         grants[principal]=frozenset(actions)
@@ -118,7 +118,7 @@ def _settings(path):
         mappings=[]
         for row in rows:
             keys={'job','instance','device_id','probe_id'}
-            _need(type(row) is dict and keys<=set(row)<=keys|{'source_label'})
+            _need(type(row) is dict and keys<=set(row)<=keys|{'source_label','exporter'})
             mappings.append(TargetMapping(**row))
         _need(len({(item.job,item.instance) for item in mappings})==len(mappings))
         _need(len({(item.device_id,item.probe_id) for item in mappings})==len(mappings))
@@ -147,6 +147,7 @@ def _file_info(info):
 class InfrastructureModule:
     service: object = None
     collector: object = None
+    metrics: object = None
     state: str = 'disabled'
     _directory_fd: object = None
     _registry: object = None
@@ -157,6 +158,7 @@ class InfrastructureModule:
             return
         self._closed=True
         self.collector=None
+        self.metrics=None
         service,self.service=self.service,None
         registry,self._registry=self._registry,None
         try:
@@ -260,7 +262,9 @@ def compose_infrastructure(path,*,state_root,on_change=None):
         service=InfrastructureService(registry,on_change=on_change)
         if prometheus is not None:
             from .infrastructure_prometheus import PrometheusCollector
+            from .infrastructure_metrics import MetricsReader
             module.collector=PrometheusCollector(service,*prometheus)
+            module.metrics=MetricsReader(service,*prometheus)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
         root_fd=None;db=None
