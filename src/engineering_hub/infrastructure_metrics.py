@@ -213,7 +213,9 @@ class MetricsReader:
         target=found[0] if len(found)==1 else None
         up=None;last=None;state='unknown';labels={}
         if target is not None:
-            up={'up':True,'down':False}.get(target.get('health'))
+            health=target.get('health')
+            # Malformed health (a list, object or unknown word) is unknown, never a crash or "down".
+            up={'up':True,'down':False}.get(health) if type(health) is str else None
             last=_scrape_time(target.get('lastScrape'),now)
             try:interval=_interval(target.get('scrapeInterval'))
             except (ValueError,TypeError):interval=None
@@ -259,7 +261,7 @@ class MetricsReader:
         counts={}
         for labels,value in self._samples(results,mapping,'process_count') or []:
             name=labels.get('process')
-            if _plain(name,128) and value is not None and value>=1 and value==int(value):
+            if _plain(name,128) and value is not None and 1<=value<2**53 and value==int(value):
                 counts[name]=None if name in counts else int(value)
         top={}
         for labels,value in self._samples(results,mapping,'process_memory') or []:
