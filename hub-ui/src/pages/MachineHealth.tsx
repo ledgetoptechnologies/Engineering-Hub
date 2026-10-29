@@ -23,8 +23,9 @@ const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as c
 function statusBadge(item: MachineTarget, now: Date) {
   const seen = item.last_scrape ? ` · ${ago(item.last_scrape, now)}` : "";
   if (item.state === "unknown" || item.up === null) return <Badge tone="neutral">Unknown</Badge>;
-  if (!item.up) return <Badge tone="amber">Scrape failing{seen}</Badge>;
+  // An old result, failed or not, says nothing about now.
   if (item.state === "stale") return <Badge tone="amber">Out of date{seen}</Badge>;
+  if (!item.up) return <Badge tone="amber">Scrape failing{seen}</Badge>;
   return <Badge tone="forest">Reporting{seen}</Badge>;
 }
 function ago(value: string, now: Date): string {
@@ -44,7 +45,8 @@ function Meter({ label, ratio, detail }: { label: string; ratio: number | null; 
 }
 
 function TargetBody({ item }: { item: MachineTarget }) {
-  const used = item.mem_total_bytes !== null && item.mem_available_bytes !== null ? item.mem_total_bytes - item.mem_available_bytes : null;
+  const used = item.mem_total_bytes !== null && item.mem_available_bytes !== null && item.mem_available_bytes <= item.mem_total_bytes
+    ? item.mem_total_bytes - item.mem_available_bytes : null;
   return <div className="machine-target">
     {item.exporter !== "nvidia" && item.exporter !== null && <>
       <Meter label="CPU" ratio={item.cpu_busy_ratio} detail={percent(item.cpu_busy_ratio)} />
@@ -62,7 +64,7 @@ function TargetBody({ item }: { item: MachineTarget }) {
         detail={gpu.mem_used_bytes !== null && gpu.mem_total_bytes !== null ? `${formatBytes(gpu.mem_used_bytes)} of ${formatBytes(gpu.mem_total_bytes)}` : formatBytes(null)} />
       <p className="machine-footnote">Temperature {gpu.temperature_c === null ? "not reported" : `${Math.round(gpu.temperature_c)} °C`}</p>
     </div>)}
-    {item.exporter === "nvidia" && item.gpus.length === 0 && <p className="infra-empty">No GPUs reported.</p>}
+    {item.exporter === "nvidia" && item.gpus.length === 0 && <p className="infra-empty">No GPU readings came back.</p>}
     {item.top_processes.length > 0 && <table className="machine-processes">
       <caption>Most memory by program</caption>
       <thead><tr><th scope="col">Program</th><th scope="col">Copies</th><th scope="col">Memory</th></tr></thead>

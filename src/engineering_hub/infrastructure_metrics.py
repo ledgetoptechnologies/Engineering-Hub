@@ -7,6 +7,14 @@ the browser or from Prometheus selects what is read. One read issues the
 targets request plus at most len(QUERIES) queries, all within one aggregate
 deadline and one aggregate byte budget. Nothing is stored, scheduled or cached.
 Missing or malformed samples are reported as null, never as zero.
+
+Byte budget: at most MAX_TOTAL_BYTES of response bodies are ever retained. The
+first chunk that would exceed it aborts every request of the read together
+(TaskGroup cancellation closes each stream); network bytes consumed can exceed
+the budget only by chunks already in flight or buffered by the transport.
+
+Freshness ('state', 'last_scrape') describes the target's last scrape, not the
+age of each individual metric value.
 """
 import asyncio
 from datetime import datetime,timezone
@@ -27,7 +35,7 @@ from .repository import HubError
 SCHEMA_VERSION=1
 DEADLINE_SECONDS=10
 MAX_QUERY_BYTES=1024*1024
-MAX_TOTAL_BYTES=4*1024*1024
+MAX_TOTAL_BYTES=2*1024*1024
 MAX_SERIES=4096
 MAX_DISKS=16
 MAX_GPUS=8
@@ -91,12 +99,17 @@ def _vector(raw):
     return samples
 
 
+class _Exhausted(Exception):
+    """Aggregate budget spent; deliberately not caught by per-request handlers."""
+
+
 class _Budget:
     def __init__(self):self.used=0
 
     def take(self,size):
+        if self.used+size>MAX_TOTAL_BYTES:
+            raise _Exhausted()
         self.used+=size
-        _need(self.used<=MAX_TOTAL_BYTES)
 
 
 class MetricsReader:
@@ -141,7 +154,7 @@ class MetricsReader:
 
     async def read(self,actor):
         self._admit(actor)
-        budget=_Budget();now=self._clock()
+        budget=_Budget()
         queries=[item for item in QUERIES if item[0] in self._kinds]
         targets=None;results={}
         try:
@@ -152,13 +165,22 @@ class MetricsReader:
                     async def fetch_targets():
                         try:return _targets(await self._get(client,TARGET_PATH,budget))
                         except (httpx.HTTPError,ValueError,TypeError,RecursionError,UnicodeError):return None
-                    gathered=await asyncio.gather(fetch_targets(),*(self._query(client,q,budget) for _,_,q in queries))
-            targets=gathered[0]
-            results={(kind,key):value for (kind,key,_),value in zip(queries,gathered[1:])}
+                    exhausted=False
+                    try:
+                        async with asyncio.TaskGroup() as group:
+                            pending=[group.create_task(fetch_targets())]+[
+                                group.create_task(self._query(client,q,budget)) for _,_,q in queries]
+                    except* _Exhausted:
+                        exhausted=True
+            if not exhausted:
+                targets=pending[0].result()
+                results={(kind,key):task.result() for (kind,key,_),task in zip(queries,pending[1:])}
         except TimeoutError:
             targets=None;results={}
         # Recheck after the network: a revoked capability gets nothing back.
         self._admit(actor)
+        # Judge freshness when the readings arrived, so a scrape during the read isn't "future".
+        now=self._clock()
         if targets is None:
             status='unreachable'
         elif all(value is not None for value in results.values()) and len(results)==len(queries):
@@ -206,8 +228,11 @@ class MetricsReader:
         if mapping.exporter in ('node','windows'):
             cpu=self._single(results,mapping,'cpu',-0.05,1.05)
             item['cpu_busy_ratio']=None if cpu is None else min(max(cpu,0.0),1.0)
-            item['mem_total_bytes']=_bytes(self._single(results,mapping,'mem_total'))
-            item['mem_available_bytes']=_bytes(self._single(results,mapping,'mem_available'))
+            total=_bytes(self._single(results,mapping,'mem_total'))
+            available=_bytes(self._single(results,mapping,'mem_available'))
+            # An inconsistent pair would show negative use; report the available side as missing.
+            item['mem_total_bytes']=total
+            item['mem_available_bytes']=None if total is None or available is None or available>total else available
             item['uptime_seconds']=_whole(self._single(results,mapping,'uptime'))
             item['disks']=self._disks(results,mapping)
         if mapping.exporter=='windows':
@@ -222,12 +247,11 @@ class MetricsReader:
             values={}
             for labels,value in self._samples(results,mapping,key) or []:
                 name=labels.get(label)
-                if _plain(name,128) and value is not None and value>=0:
-                    values.setdefault(name,[]).append(value)
-            return {name:found[0] for name,found in values.items() if len(found)==1}
+                if _plain(name,128) and value is not None:
+                    values.setdefault(name,[]).append(_bytes(value))
+            return {name:found[0] for name,found in values.items() if len(found)==1 and found[0] is not None}
         sizes,free=by('disk_size'),by('disk_free')
-        disks=[{'mount':name,'size_bytes':_bytes(size),'free_bytes':_bytes(free.get(name))}
-               for name,size in sizes.items() if size>0]
+        disks=[{'mount':name,'size_bytes':size,'free_bytes':free.get(name)} for name,size in sizes.items() if size>0]
         disks=[disk for disk in disks if disk['free_bytes'] is None or disk['free_bytes']<=disk['size_bytes']]
         return sorted(disks,key=lambda disk:disk['mount'])[:MAX_DISKS]
 
@@ -240,9 +264,9 @@ class MetricsReader:
         top={}
         for labels,value in self._samples(results,mapping,'process_memory') or []:
             name=labels.get('process')
-            if _plain(name,128) and value is not None and value>=0:
-                top[name]=None if name in top else value
-        rows=[{'name':name,'count':counts.get(name),'working_set_bytes':_bytes(value)}
+            if _plain(name,128) and value is not None:
+                top[name]=None if name in top else _bytes(value)
+        rows=[{'name':name,'count':counts.get(name),'working_set_bytes':value}
               for name,value in top.items() if value is not None]
         return sorted(rows,key=lambda row:(-row['working_set_bytes'],row['name']))[:MAX_PROCESSES]
 
@@ -251,7 +275,7 @@ class MetricsReader:
             values={}
             for labels,value in self._samples(results,mapping,key) or []:
                 gpu=labels.get('gpu')
-                if type(gpu) is str and re.fullmatch(r'[0-9]{1,2}',gpu) and value is not None and value>=0:
+                if type(gpu) is str and re.fullmatch(r'[0-9]{1,2}',gpu) and value is not None and 0<=value<2**53:
                     values.setdefault(gpu,[]).append((labels,value))
             return {gpu:found[0] for gpu,found in values.items() if len(found)==1}
         util,used,free,temp=by('gpu_util'),by('gpu_used'),by('gpu_free'),by('gpu_temp')

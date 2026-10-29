@@ -270,7 +270,7 @@ test("machine health groups each machine's exporters, says what's missing and re
   const desk = panel.getByRole("listitem").filter({ hasText: "desk" });
   await expect(desk.getByRole("row", { name: /msedge/ })).toContainText("57");
   await expect(desk).toContainText("329 GB free of 3.6 TB");
-  await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Scrape failing");
+  await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Out of date");
   await expect(panel.getByRole("listitem").filter({ hasText: "old-box" })).toContainText("Only scrape status is configured");
   expect(state.metrics).toBe(1);
   await panel.getByRole("button", { name: "Refresh" }).click();
@@ -306,4 +306,15 @@ test("a device page shows only that device's machine health", async ({ page }) =
   const panel = healthPanel(page);
   await expect(panel).toContainText("desk");
   await expect(panel).not.toContainText("gpu-box");
+});
+
+test("a current failed scrape says so; an old one is only out of date", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => {
+    Object.assign(value.devices[1], { state: "fresh", last_scrape: new Date(Date.now() - 20_000).toISOString() });
+    value.devices[2].gpus = [];
+  })] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Scrape failing");
+  await expect(panel.getByRole("listitem").filter({ hasText: "gpu-box" })).toContainText("No GPU readings came back.");
 });
