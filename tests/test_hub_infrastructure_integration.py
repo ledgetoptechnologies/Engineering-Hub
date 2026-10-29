@@ -208,6 +208,9 @@ def test_transport_construction_failure_releases_inventory_owner(tmp_path, monke
 @pytest.mark.parametrize('method,path,expected', [
     ('GET', '/infrastructure', True), ('HEAD', '/infrastructure/synthetic-pc', True),
     ('GET', BASE + '/devices', True), ('GET', BASE + '/devices/synthetic-pc', True),
+    ('GET', BASE + '/metrics', True), ('HEAD', BASE + '/metrics', True),
+    ('POST', BASE + '/metrics', False), ('PUT', BASE + '/metrics', False),
+    ('DELETE', BASE + '/metrics', False), ('GET', BASE + '/metrics/query', False),
     ('PUT', BASE + '/devices/synthetic-pc', True),
     ('POST', BASE + '/devices/synthetic-pc/maintenance', True),
     ('POST', BASE + '/maintenance/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/resolve', True),
