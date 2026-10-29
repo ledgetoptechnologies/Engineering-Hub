@@ -11,7 +11,7 @@ concurrency:
 jobs:
   verify:
     # A manual dispatch may select another ref; never execute it off main.
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -51,7 +51,7 @@ jobs:
         run: python scripts/hub_protected_container_smoke.py --image "ghcr.io/ledgetoptechnologies/engineering-hub-control:build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" --commit "$GITHUB_SHA"
   publish:
     needs: verify
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

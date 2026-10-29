@@ -3,7 +3,6 @@ name: Container CI and GHCR release
 on:
   push:
     branches: [main]
-
 permissions:
   contents: read
 
@@ -11,7 +10,7 @@ jobs:
   verify:
     name: Test and build container
     # Development branches and PRs are validated locally on staging.
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.ref == 'refs/heads/main' && github.event_name == 'push') }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -48,7 +47,7 @@ jobs:
     # The retired standalone bus is not republished by main-only Hub CI.
     # Retain its historical release steps for review, but never promote stable
     # accidentally after removing the tag trigger.
-    if: ${{ false }}
+    if: ${{ github.ref == 'refs/heads/main' && (false) }}
     needs: verify
     runs-on: ubuntu-latest
     permissions:
