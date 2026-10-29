@@ -1,16 +1,14 @@
 name: Container CI and GHCR release
 
 on:
-  pull_request:
   push:
     branches: [main]
-    tags: ["v*"]
-
 permissions:
   contents: read
 
 jobs:
   verify:
+    if: github.ref == 'refs/heads/main'
     name: Test and build container
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +43,7 @@ jobs:
 
   publish:
     name: Publish immutable release and commit tags
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
     needs: verify
     runs-on: ubuntu-latest
     permissions:
