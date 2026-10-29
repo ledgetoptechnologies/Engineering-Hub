@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
 import { audit, blocking } from "./audit";
+import metricsFixture from "../src/fixtures/infrastructure-metrics-v1.json" with { type: "json" };
 
 const human = "human:cf:" + "e".repeat(64);
 type Reply = { status: number; body: unknown } | "abort";
@@ -21,9 +22,9 @@ function devices(base = Date.now()) {
 }
 const list = (caps = { device_write: true, maintenance_write: true }, base = Date.now()) => ({ status: 200, body: { items: devices(base), capabilities: caps } });
 
-interface Options { capability?: boolean; list?: Reply[]; detail?: Reply[]; writes?: Reply[] }
+interface Options { capability?: boolean; list?: Reply[]; detail?: Reply[]; writes?: Reply[]; metrics?: Reply[] }
 async function fixture(page: Page, options: Options = {}) {
-  const state = { lists: 0, details: 0, writes: [] as { method: string; path: string; body: unknown; csrf: string | null }[] };
+  const state = { lists: 0, details: 0, metrics: 0, writes: [] as { method: string; path: string; body: unknown; csrf: string | null }[] };
   await page.route("**/api/hub/v1/**", async (route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const respond = (body: unknown, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(body) });
@@ -43,6 +44,10 @@ async function fixture(page: Page, options: Options = {}) {
         state.writes.push({ method: request.method(), path, body: JSON.parse(request.postData() ?? "null"), csrf: request.headers()["x-hub-csrf"] ?? null });
         const replies = options.writes ?? [{ status: 200, body: {} }];
         return play(replies[Math.min(state.writes.length - 1, replies.length - 1)]);
+      }
+      if (path === "/api/hub/v1/infrastructure/metrics") {
+        const replies = options.metrics ?? [{ status: 404, body: { detail: { code: "infrastructure_metrics_not_configured" } } }];
+        return play(replies[Math.min(state.metrics++, replies.length - 1)]);
       }
       if (path === "/api/hub/v1/infrastructure/devices") {
         const replies = options.list ?? [list()];
@@ -245,4 +250,60 @@ test("fits a phone screen, list and device page", async ({ page }) => {
   await page.goto("/#/infrastructure/build-pc");
   await expect(page.getByRole("region", { name: "Maintenance" })).toBeVisible();
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
+});
+
+const healthPanel = (page: Page) => page.getByRole("region", { name: "Machine health" });
+const metrics = (change: (value: any) => void = () => {}) => {
+  const value = JSON.parse(JSON.stringify(metricsFixture)); change(value); return { status: 200, body: value };
+};
+
+test("machine health groups each machine's exporters, says what's missing and reads only when asked", async ({ page }) => {
+  const state = await fixture(page, { metrics: [metrics()] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  const gpuBox = panel.getByRole("listitem").filter({ hasText: "gpu-box" });
+  await expect(gpuBox).toContainText("Linux");
+  await expect(gpuBox).toContainText("GPUs");
+  await expect(gpuBox).toContainText("GPU 0 · Synthetic GPU A");
+  await expect(gpuBox).toContainText("not reported");
+  await expect(gpuBox.getByRole("meter", { name: "CPU" })).toHaveAttribute("aria-valuenow", "50");
+  const desk = panel.getByRole("listitem").filter({ hasText: "desk" });
+  await expect(desk.getByRole("row", { name: /msedge/ })).toContainText("57");
+  await expect(desk).toContainText("329 GB free of 3.6 TB");
+  await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Scrape failing");
+  await expect(panel.getByRole("listitem").filter({ hasText: "old-box" })).toContainText("Only scrape status is configured");
+  expect(state.metrics).toBe(1);
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect.poll(() => state.metrics).toBe(2);
+  expect(state.writes).toEqual([]);
+});
+
+test("an unreachable source is unknown, never down, and shows no stale readings", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => {
+    value.source.status = "unreachable";
+    for (const item of value.devices) Object.assign(item, { up: null, state: "unknown", last_scrape: null });
+  })] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel).toContainText("Prometheus didn't answer");
+  await expect(panel.getByText("Unknown", { exact: true }).first()).toBeVisible();
+  await expect(panel.getByRole("meter")).toHaveCount(0);
+});
+
+test("machine health stays hidden without metrics access or when not set up", async ({ page }) => {
+  for (const reply of [{ status: 403, body: { detail: { code: "forbidden" } } }, { status: 404, body: { detail: { code: "infrastructure_metrics_not_configured" } } }]) {
+    await page.unrouteAll();
+    await fixture(page, { metrics: [reply] });
+    await page.goto("/#/infrastructure");
+    await expect(devicesPanel(page)).toContainText("Build PC");
+    await expect(healthPanel(page)).toHaveCount(0);
+  }
+});
+
+test("a device page shows only that device's machine health", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
+  await page.goto("/#/infrastructure/build-pc");
+  const panel = healthPanel(page);
+  await expect(panel).toContainText("desk");
+  await expect(panel).not.toContainText("gpu-box");
 });

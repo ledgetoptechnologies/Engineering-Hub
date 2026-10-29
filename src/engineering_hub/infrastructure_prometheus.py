@@ -32,6 +32,7 @@ MAX_TARGETS=200
 FETCH_DEADLINE_SECONDS=10
 MAX_INTERVAL_SECONDS=1200  # TTL is exactly3*interval, never more than1hour.
 TARGET_PATH='/api/v1/targets?state=active'
+EXPORTERS=('node','windows','nvidia')
 
 
 def _need(condition):
@@ -91,9 +92,12 @@ class TargetMapping:
     device_id:str
     probe_id:str
     source_label:str='Prometheus scrape'
+    # Selects the fixed metric query set; None means up/down only.
+    exporter:str|None=None
 
     def __post_init__(self):
         _plain(self.job,128);_instance(self.instance);_plain(self.source_label,100)
+        _need(self.exporter is None or self.exporter in EXPORTERS)
         for value in (self.device_id,self.probe_id):
             _need(type(value) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}',value))
 

@@ -72,13 +72,15 @@ async def _payload(request,model,maximum=16384):
         raise HubError('invalid_infrastructure_input') from None
 
 
-def attach_infrastructure_routes(app,service,actor):
+def attach_infrastructure_routes(app,service,actor,*,metrics=None):
     if service is not None and type(service) is not InfrastructureService:
         raise TypeError('Explicit InfrastructureService required')
+    if metrics is not None and (service is None or metrics.service is not service):
+        raise TypeError('Metrics must read through the attached InfrastructureService')
 
     def authorized(request,action='read'):
         _authorization(request)
-        identity=actor(request,mutation=True) if action!='read' else actor(request)
+        identity=actor(request,mutation=True) if action not in ('read','metrics_read') else actor(request)
         InfrastructureService.principal(identity)
         if service is None:
             raise HubError('infrastructure_not_configured',503)
@@ -92,6 +94,16 @@ def attach_infrastructure_routes(app,service,actor):
         if len(values)>1 or values and values[0] not in ('true','false') or set(request.query_params)-{'include_retired'}:
             raise HubError('invalid_infrastructure_filter')
         return service.list_devices(identity,include_retired=values==['true'])
+
+    @app.get('/api/hub/v1/infrastructure/metrics')
+    async def machine_metrics(request:Request):
+        # Same 503/403 order as other reads; then 404 while Prometheus metrics are unconfigured.
+        identity=authorized(request,'metrics_read')
+        if request.query_params:
+            raise HubError('invalid_infrastructure_filter')
+        if metrics is None:
+            raise HubError('infrastructure_metrics_not_configured',404)
+        return await metrics.read(identity)
 
     @app.get('/api/hub/v1/infrastructure/devices/{device_id}')
     def detail(device_id:str,request:Request):

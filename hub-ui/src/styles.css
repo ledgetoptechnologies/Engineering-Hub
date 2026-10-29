@@ -4123,6 +4123,27 @@ dialog.modal-full .modal-head h2 { font-size: 19px; line-height: 1.3; }
 .infra-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .infra-history { margin: 20px 0 8px; }
 .infra-journal { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.machine-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); }
+.machine-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); display: grid; gap: 12px; align-content: start; min-width: 0; }
+.machine-card-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.machine-card-head strong { margin-right: auto; }
+.machine-section { display: grid; gap: 8px; }
+.machine-section + .machine-section { border-top: 1px solid var(--line); padding-top: 10px; }
+.machine-section-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: center; font-weight: 600; }
+.machine-section-head small { font-weight: 400; color: var(--ink-3); }
+.machine-target, .machine-gpu { display: grid; gap: 8px; min-width: 0; }
+.machine-meter { display: grid; gap: 4px; }
+.machine-meter-label { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--ink-2); }
+.machine-meter-label span:last-child { text-align: right; overflow-wrap: anywhere; }
+.machine-meter-track { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.machine-meter-track span { display: block; height: 100%; background: var(--forest); }
+.machine-meter-track.warm span, .machine-meter-track.high span { background: var(--amber); }
+.machine-meter-track.high { outline: 1px solid var(--amber); }
+.machine-footnote { margin: 0; font-size: 12px; color: var(--ink-3); }
+.machine-processes { width: 100%; border-collapse: collapse; font-size: 13px; }
+.machine-processes caption { text-align: left; font-weight: 600; padding-bottom: 4px; }
+.machine-processes th, .machine-processes td { text-align: left; padding: 3px 4px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.machine-processes th:not(:first-child), .machine-processes td:not(:first-child) { text-align: right; white-space: nowrap; }
 .infra-journal li { border-left: 2px solid var(--line); padding-left: 12px; display: grid; gap: 4px; }
 .infra-journal-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; }
 .infra-journal p, .infra-resolution p { margin: 0; }
