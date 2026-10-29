@@ -143,9 +143,12 @@ kinds (`src/engineering_hub/infrastructure_metrics.py` `QUERIES`). Queries conta
 interpolated labels; results are filtered in process to the exact mapped job/instance
 pairs, so unmapped targets never appear. One read has a 10-second aggregate deadline, a
 2 MiB aggregate response budget (1 MiB per response) and per-result series limits; it
-stores, schedules and caches nothing. At most 2 MiB of bodies is retained: the chunk that
-would pass it aborts every request of the read together, so bytes consumed exceed it only
-by chunks already in flight. Freshness describes each target's last scrape, not the age
+stores, schedules and caches nothing. At most 2 MiB of response bodies is retained. Each
+yielded chunk is checked against the aggregate budget before the per-response limit;
+even chunks rejected for their response size count when they fit the aggregate budget.
+The first chunk exceeding the aggregate budget aborts the request group. That rejected
+chunk has already arrived, and transport buffering may hold more: this is not a strict
+network-byte or process-memory limit. Freshness describes each target's last scrape, not the age
 of individual values. Inconsistent or out-of-range values (more memory available than
 installed, sizes of 2^53 bytes or more) are dropped, never shown as zero. A source outage returns `source.status:
 "unreachable"` with `up: null` and `state: "unknown"`, never down; a failed query gives

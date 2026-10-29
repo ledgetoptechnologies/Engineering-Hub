@@ -8,11 +8,12 @@ targets request plus at most len(QUERIES) queries, all within one aggregate
 deadline and one aggregate byte budget. Nothing is stored, scheduled or cached.
 Missing or malformed samples are reported as null, never as zero.
 
-Byte budget: every body chunk received is charged before it is kept or
-rejected, so at most MAX_TOTAL_BYTES are ever received into the reader and
-retained responses are a subset of that. The first chunk that would exceed it
-aborts every request of the read together (TaskGroup cancellation closes each
-stream); bytes the transport already buffered or had in flight are not counted.
+Byte budget: every yielded body chunk is checked against the aggregate budget
+before the per-response limit. Chunks fitting that budget count even when their
+response is rejected; response bodies retained by the reader total at most
+MAX_TOTAL_BYTES. The first chunk exceeding the aggregate budget aborts the group
+and closes its streams. That rejected chunk has already been yielded by the
+transport, so this is not a strict bound on received or buffered network bytes.
 
 Freshness ('state', 'last_scrape') describes the target's last scrape, not the
 age of each individual metric value.
