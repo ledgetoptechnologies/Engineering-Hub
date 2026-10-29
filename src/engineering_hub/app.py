@@ -284,15 +284,27 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             from agent_message_bus.agent_sessions import AgentSessionRepository
             from agent_message_bus.agent_sessions_config import AgentSessionsConfig
             if (type(connection_service) is not AgentSessionRepository
-                    or type(connection_config) is not AgentSessionsConfig
-                    or connection_config.environment != 'staging'
+                    or type(connection_config) is not AgentSessionsConfig):
+                raise ValueError('agent_connections_origin_and_storage_binding_required')
+            session_database = connection_config.database.resolve()
+            hub_state_root = settings.database.resolve().parent
+            if (connection_config.environment not in {'staging', 'production'}
                     or connection_config.origin != settings.auth_config.origin
+                    or (connection_config.environment == 'production'
+                        and (not settings.auth_config.secure
+                             or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                             or not connection_config.owner.startswith('human:cf:')
+                             or not settings.agent_auth.allowed_ips
+                             or hub_state_root not in session_database.parents))
                     or connection_service.owner != connection_config.owner
-                    or Path(connection_service.path).resolve() != connection_config.database.resolve()
-                    or connection_config.database.resolve() == settings.database.resolve()
+                    or Path(connection_service.path).resolve() != session_database
+                    or session_database == settings.database.resolve()
                     or (settings.database.exists()
                         and settings.database.samefile(connection_config.database))):
-                raise ValueError('staging_agent_connections_origin_and_storage_binding_required')
+                error = ('staging_agent_connections_origin_and_storage_binding_required'
+                         if connection_config.environment == 'staging'
+                         else 'production_agent_connections_origin_and_storage_binding_required')
+                raise ValueError(error)
     if settings.registry_enabled:
         if registry_bridge is not None or reachability_provider is not None:
             raise ValueError('Choose one explicit registry configuration source')
@@ -693,7 +705,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
 
-    # The optional staging service stays the bus's exact single owner. It does
+    # The optional environment-bound service stays the bus's exact single owner. It does
     # not turn installation/session credentials into existing Hub principals.
     if connection_service is not None:
         from agent_message_bus.agent_sessions import AgentSessionError
@@ -703,7 +715,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             return JSONResponse({'detail': {'code': error.code}}, status_code=error.status,
                                 headers={'Cache-Control': 'no-store'})
 
-        attach_owner_routes(app, connection_service, human)
+        attach_owner_routes(app, connection_service, human,
+                            environment=connection_config.environment)
         if session_bridge is not None:
             session_bridge.attach_routes(app, human)
 

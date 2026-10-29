@@ -48,9 +48,11 @@ describe("agent connection parsers", () => {
     expect(parseSessions(wire.sessions.body, wire.sessions.installation_id)).toHaveLength(2);
     expect(parseAudit(wire.audit)).toHaveLength(3);
   });
-  it("only treats an enabled staging service as available", () => {
-    expect(() => parseCapabilities({ enabled: true, environment: "production", owner: true })).toThrow(HubApiError);
+  it("accepts only explicit staging or production environments", () => {
+    expect(parseCapabilities({ enabled: true, environment: "production", owner: true }))
+      .toEqual({ enabled: true, environment: "production", owner: true });
     expect(() => parseCapabilities({ enabled: false, environment: "staging", owner: true })).toThrow(HubApiError);
+    expect(() => parseCapabilities({ enabled: true, environment: "preview", owner: true })).toThrow(HubApiError);
   });
   it("rejects any extra field, so a credential can never ride along", () => {
     expect(() => parseInstallation({ ...pending, installation_secret: "ehi_x" })).toThrow(HubApiError);

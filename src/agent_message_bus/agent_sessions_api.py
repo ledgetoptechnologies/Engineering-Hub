@@ -1,4 +1,4 @@
-"""Versioned staging connections. Bearers never become legacy family actors."""
+"""Versioned environment-bound connections; bearers never become family actors."""
 from typing import Literal
 import hashlib
 from importlib.resources import files
@@ -155,7 +155,9 @@ def session_router(repository):
     return router
 
 
-def attach_owner_routes(app, repository, human):
+def attach_owner_routes(app, repository, human, *, environment="staging"):
+    if type(environment) is not str or environment not in {"staging", "production"}:
+        raise ValueError("invalid_agent_connections_environment")
     router = APIRouter(prefix=OWNER_CONNECTION_PREFIX)
 
     def owner(request, mutation=False):
@@ -169,7 +171,7 @@ def attach_owner_routes(app, repository, human):
     @router.get("/capabilities")
     def capabilities(request: Request):
         owner(request)
-        return {"enabled": True, "environment": "staging", "owner": True}
+        return {"enabled": True, "environment": environment, "owner": True}
 
     @router.get("/installations")
     def installations(request: Request):

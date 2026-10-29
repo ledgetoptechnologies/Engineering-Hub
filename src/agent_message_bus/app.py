@@ -107,6 +107,8 @@ def create_app(*, db_path: str | Path | None = None, audit_path: str | Path | No
     if agent_sessions_config is not None:
         if type(agent_sessions_config) is not AgentSessionsConfig:
             raise ValueError('explicit_staging_agent_sessions_required')
+        if agent_sessions_config.environment == 'production' and not auth.allowed_ips:
+            raise ValueError('production_agent_sessions_source_ip_allowlist_required')
         if any(value and value.lower().startswith(('ehs_', 'ehi_', 'ehc_')) for value in
                (auth.hermes_token, auth.codex_token, auth.claude_token, auth.admin_token)):
             raise ValueError('legacy_session_credential_prefix_collision')

@@ -9,6 +9,10 @@ set of Hub metadata capabilities for explicitly selected projects. Connection
 approval alone grants no Hub rights. Execution, generic legacy access and
 automatic chat wake remain separate and unavailable through that bridge.
 
+This document covers staging only. Production mode has separate owner, origin,
+database, network and onboarding requirements described in
+[revocable-agent-production.md](revocable-agent-production.md).
+
 ## Operator setup
 
 Use a new isolated Hub instance with new Hub, bus and session databases, synthetic
