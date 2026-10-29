@@ -537,6 +537,22 @@
         }
       }
     },
+    "/api/hub/v1/infrastructure/metrics": {
+      "get": {
+        "summary": "Machine Metrics",
+        "operationId": "machine_metrics_api_hub_v1_infrastructure_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/infrastructure/devices/{device_id}": {
       "get": {
         "summary": "Detail",
