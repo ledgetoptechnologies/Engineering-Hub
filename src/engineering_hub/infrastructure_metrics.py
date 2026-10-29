@@ -8,10 +8,11 @@ targets request plus at most len(QUERIES) queries, all within one aggregate
 deadline and one aggregate byte budget. Nothing is stored, scheduled or cached.
 Missing or malformed samples are reported as null, never as zero.
 
-Byte budget: at most MAX_TOTAL_BYTES of response bodies are ever retained. The
-first chunk that would exceed it aborts every request of the read together
-(TaskGroup cancellation closes each stream); network bytes consumed can exceed
-the budget only by chunks already in flight or buffered by the transport.
+Byte budget: every body chunk received is charged before it is kept or
+rejected, so at most MAX_TOTAL_BYTES are ever received into the reader and
+retained responses are a subset of that. The first chunk that would exceed it
+aborts every request of the read together (TaskGroup cancellation closes each
+stream); bytes the transport already buffered or had in flight are not counted.
 
 Freshness ('state', 'last_scrape') describes the target's last scrape, not the
 age of each individual metric value.
@@ -141,8 +142,10 @@ class MetricsReader:
                   and int(sizes[0])<=MAX_QUERY_BYTES))
             result=bytearray()
             async for part in response.aiter_raw():
-                _need(len(result)+len(part)<=MAX_QUERY_BYTES)
+                # Charge every received chunk first, so a response rejected for its own size
+                # still counts toward the aggregate budget.
                 budget.take(len(part))
+                _need(len(result)+len(part)<=MAX_QUERY_BYTES)
                 result.extend(part)
             return bytes(result)
 

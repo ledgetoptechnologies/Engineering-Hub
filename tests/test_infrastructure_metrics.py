@@ -258,20 +258,39 @@ async def test_capability_revoked_during_read_returns_nothing(service):
 
 
 @pytest.mark.asyncio
-async def test_external_cancellation_closes_requests_and_propagates(service):
-    log={'read':0,'closed':0};started=asyncio.Event()
+async def test_external_cancellation_closes_every_opened_stream_and_propagates(service):
+    log={'read':0,'closed':0};opened=[];expected=1+len(QUERIES);everyone=asyncio.Event()
     class Slow(Stream):
         async def __aiter__(self):
-            started.set()
+            opened.append(self)
+            if len(opened)==expected:everyone.set()
             await asyncio.sleep(30)
             yield b''
     def handler(request):
         return httpx.Response(200,headers={'content-type':'application/json'},stream=Slow(log))
     task=asyncio.create_task(reader(service,handler).read('human:1'))
-    await asyncio.wait_for(started.wait(),5)
+    await asyncio.wait_for(everyone.wait(),5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):await task
-    assert log['closed']>=1
+    assert len(opened)==expected and log['closed']==expected
+
+
+@pytest.mark.asyncio
+async def test_chunks_rejected_by_the_per_response_limit_are_still_charged(service,monkeypatch):
+    budgets=[]
+    class Spy(module._Budget):
+        def __init__(self):super().__init__();budgets.append(self)
+    monkeypatch.setattr(module,'_Budget',Spy)
+    monkeypatch.setattr(module,'MAX_QUERY_BYTES',1024)
+    log={'read':0,'closed':0}
+    def handler(request):
+        return httpx.Response(200,headers={'content-type':'application/json'},stream=Stream(log))
+    # Windows mapping: the targets request plus every windows query, each overflowing repeatedly.
+    result=await reader(service,handler,[MAPPINGS[0]]).read('human:1')
+    assert result['source']=={'status':'unreachable'}
+    # Each stream delivered one accepted chunk and one rejected chunk; both were charged.
+    streams=1+sum(kind=='windows' for kind,_,_ in QUERIES)
+    assert budgets[0].used==log['read']==2*1024*streams
 
 
 @pytest.mark.asyncio
