@@ -76,7 +76,7 @@ async function fixture(page: Page, options: {
     state.posts.push({ path: rest, method: request.method(), body, csrf: request.headers()["x-hub-csrf"] });
     if (state.hold) await new Promise<void>(resolve => { state.release = resolve; });
     if (state.writeStatus !== 200) return respond({ detail: { code: state.writeCode } }, state.writeStatus);
-    const target = /^\/(installations|sessions)\/([^/]+)(?:\/(approve|revoke))?$/.exec(rest)!;
+    const target = /^\/(installations|sessions)\/([^/]+)(?:\/(approve|keep-approved|revoke))?$/.exec(rest)!;
     if (target[1] === "sessions") {
       const item = state.sessions.find(session => session.id === target[2])!;
       Object.assign(item, { state: "revoked", revision: item.revision + 1 });
@@ -84,7 +84,8 @@ async function fixture(page: Page, options: {
     }
     const item = state.installations.find(entry => entry.id === target[2])!;
     if (target[3] === "approve") Object.assign(item, { state: "active", reason: null, approved_at: iso(0), approved_by: "Beau Koltz",
-      pairing_code: null, expires_at: iso(86_400_000) });
+      pairing_code: null, expires_at: null });
+    else if (target[3] === "keep-approved") Object.assign(item, { expires_at: null });
     else if (target[3] === "revoke") Object.assign(item, { state: "revoked", reason: "owner_revoked", pairing_code: null, revoked_at: iso(0), revoked_by: "Beau Koltz" });
     else Object.assign(item, { name: body.name });
     item.revision++;
@@ -127,7 +128,7 @@ test("approving needs an explicit match check and shows only what the server con
   await dialog.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(panel.getByRole("status")).toContainText("Approved Claude on the desk PC.");
   expect(state.posts).toEqual([{ path: "/installations/inst_desk/approve", method: "POST",
-    body: { expected_revision: 1, lifetime_seconds: 86400 }, csrf: "fixture-csrf" }]);
+    body: { expected_revision: 1, until_revoked: true }, csrf: "fixture-csrf" }]);
   const row = panel.locator(".installation-row", { hasText: "Claude on the desk PC" });
   await expect(row.getByText("Active", { exact: true })).toBeVisible();
   await expect(row.getByLabel("Pairing check")).toHaveCount(0);
@@ -143,6 +144,23 @@ test("a conflict keeps the dialog open and changes nothing", async ({ page }) =>
   await dialog.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("This changed since you loaded it");
   await expect(panelOf(page).locator(".installation-row", { hasText: "desk PC" }).getByText("Waiting for approval")).toBeVisible();
+});
+
+test("an existing timed approval changes only after explicit owner confirmation", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/agents");
+  const row = panelOf(page).locator(".installation-row", { hasText: "Claude on the laptop" });
+  await row.getByRole("button", { name: "Keep approved…", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Keep Claude on the laptop approved?" });
+  await expect(dialog).toContainText("15-minute sessions");
+  expect(state.posts).toEqual([]);
+  await expect(dialog.getByRole("button", { name: "Keep approved until revoked" })).toBeDisabled();
+  await dialog.getByLabel("I want this device approved until I disconnect it").check();
+  await dialog.getByRole("button", { name: "Keep approved until revoked" }).click();
+  expect(state.posts).toEqual([{ path: "/installations/inst_laptop/keep-approved", method: "POST",
+    body: { expected_revision: 2 }, csrf: "fixture-csrf" }]);
+  await expect(row).toContainText("Approved until you disconnect it.");
+  await expect(row.getByRole("button", { name: "Keep approved…", exact: true })).toHaveCount(0);
 });
 
 test("disconnecting an installation needs its name, waits for the server and leaves other installations working", async ({ page }) => {

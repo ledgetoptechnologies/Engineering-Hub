@@ -5,7 +5,7 @@ from importlib.resources import files
 import json
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.responses import Response
 
 
@@ -69,6 +69,13 @@ class Revision(Closed):
 
 class Approval(Revision):
     lifetime_seconds: int = Field(default=86400, ge=60, le=604800)
+    until_revoked: bool = False
+
+    @model_validator(mode="after")
+    def one_lifetime(self):
+        if self.until_revoked and 'lifetime_seconds' in self.model_fields_set:
+            raise ValueError('approval_lifetime_conflict')
+        return self
 
 
 class Rename(Revision):
@@ -184,6 +191,10 @@ def attach_owner_routes(app, repository, human, *, environment="staging"):
     @router.patch("/installations/{installation_id}")
     def rename(installation_id: str, data: Rename, request: Request):
         return repository.rename(owner(request, True), installation_id, **data.model_dump())
+
+    @router.post("/installations/{installation_id}/keep-approved")
+    def keep_approved(installation_id: str, data: Revision, request: Request):
+        return repository.keep_approved(owner(request, True), installation_id, **data.model_dump())
 
     @router.post("/installations/{installation_id}/revoke")
     def revoke_installation(installation_id: str, data: Revision, request: Request):

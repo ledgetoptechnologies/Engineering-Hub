@@ -68,6 +68,28 @@ def proposal(env, token, key='key'):
         env.repo.propose_staging_task(actor, PROJECT, 'Synthetic task', key))
 
 
+def test_persistent_installation_does_not_extend_sessions_or_hub_grants(env):
+    identity, _, secret = pair(env, caps=())
+    grant = env.bridge.grant_put(OWNER, identity, 0, [PROJECT], ['project.read'], lifetime_seconds=60)
+    converted = env.sessions.keep_approved(OWNER, identity, 2)
+    assert converted['expires_at'] is None
+    assert env.bridge.grant_get(OWNER, identity)['expires_at'] == grant['expires_at']
+    issued = env.sessions.exchange(secret)
+    call(env, issued['token'], 'hub_project_get', lambda _: None)
+    env.clock.value += 60
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, issued['token'], 'hub_project_get', lambda _: None)
+    env.clock.value += 8 * 86400
+    fresh = env.sessions.exchange(secret)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, fresh['token'], 'hub_project_get', lambda _: None)
+    renewed = env.bridge.grant_put(OWNER, identity, 1, [PROJECT], ['project.read'], lifetime_seconds=60)
+    assert renewed['state'] == 'active'
+    principal = env.sessions.authenticate_session(fresh['token'])
+    assert principal.expires_at == env.clock.value + 900
+    call(env, fresh['token'], 'hub_project_get', lambda _: None)
+
+
 def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
     installation, token, _ = pair(env, caps=())
     assert env.bridge.grant_get(OWNER, installation)['state'] == 'absent'

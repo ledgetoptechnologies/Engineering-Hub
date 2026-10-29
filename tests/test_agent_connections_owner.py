@@ -101,6 +101,34 @@ def test_owner_endpoints_reject_agent_cookie_fallback_and_bad_csrf(owner_app):
     assert bad.status_code == 422 and bad.json() == {'detail': {'code': 'invalid_input'}}
 
 
+def test_owner_persistent_approval_and_conversion_do_not_bypass_security(owner_app):
+    client, _, repository, headers = owner_app
+    _, record = pending(repository)
+    path = OWNER + '/installations/' + record['id']
+    assert client.post(path + '/approve', headers=headers, json={
+        'expected_revision': 1, 'until_revoked': True, 'lifetime_seconds': 86400}).status_code == 422
+    assert client.post(path + '/approve', headers=headers, json={
+        'expected_revision': 1, 'until_revoked': 'true'}).status_code == 422
+    approved = client.post(path + '/approve', headers=headers, json={'expected_revision': 1})
+    assert approved.status_code == 200 and approved.json()['expires_at'] is not None
+    conversion = path + '/keep-approved'
+    assert client.post(conversion, json={'expected_revision': 2}).status_code == 403
+    assert client.post(conversion, headers={**headers, 'Authorization': 'Bearer synthetic-codex'},
+                       json={'expected_revision': 2}).status_code == 403
+    assert client.post(conversion, headers=headers, json={'expected_revision': 1}).status_code == 409
+    result = client.post(conversion, headers=headers, json={'expected_revision': 2})
+    assert result.status_code == 200 and result.json()['expires_at'] is None
+
+
+def test_owner_explicit_until_revoked_approval(owner_app):
+    client, _, repository, headers = owner_app
+    _, record = pending(repository)
+    result = client.post(OWNER + '/installations/' + record['id'] + '/approve', headers=headers,
+                         json={'expected_revision': 1, 'until_revoked': True})
+    assert result.status_code == 200 and result.json()['state'] == 'active'
+    assert result.json()['expires_at'] is None
+
+
 def test_nonowner_allowlisted_human_is_not_connection_owner(tmp_path):
     # Owner binding is independent of the current singleton GitHub allowlist.
     origin = 'https://staging.test'

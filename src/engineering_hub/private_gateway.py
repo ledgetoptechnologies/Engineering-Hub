@@ -110,7 +110,7 @@ def browser_route_allowed(method, path):
     if method == 'PATCH' and re.fullmatch(installation, path) is not None:
         return True
     if method == 'POST' and (
-            re.fullmatch(installation + r'/(?:approve|revoke|hub-grant/revoke)', path) is not None
+            re.fullmatch(installation + r'/(?:approve|keep-approved|revoke|hub-grant/revoke)', path) is not None
             or re.fullmatch(owner + '/sessions/' + _UUID + '/revoke', path) is not None
             or re.fullmatch(owner + '/tasks/' + _UUID + '/recover-claim', path) is not None):
         return True

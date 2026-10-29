@@ -17,7 +17,7 @@ import type { Hub } from "./hub";
 import { Badge, Modal } from "./ui";
 
 type Load = "checking" | "unavailable" | "not_owner" | "loading" | "loaded" | "failed";
-type Dialog = { kind: "approve" | "revoke"; item: Installation } | { kind: "revoke-session"; item: Session; installation: Installation };
+type Dialog = { kind: "approve" | "keep-approved" | "revoke"; item: Installation } | { kind: "revoke-session"; item: Session; installation: Installation };
 
 const exact = (value: string) => new Date(value).toLocaleString();
 const nameFits = (value: string) => value.trim() !== "" && [...value.trim()].length <= NAME_MAX;
@@ -41,6 +41,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const [readAt, setReadAt] = useState<number | null>(demo ? Date.now() : null);
   const [now, setNow] = useState(Date.now());
   const [dialog, setDialog] = useState<Dialog | null>(null);
+  const [confirmedPersistent, setConfirmedPersistent] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const environment = capabilities?.environment ?? null;
@@ -200,6 +201,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   const replace = (next: Installation) => setItems(previous => previous.map(item => item.id === next.id ? next : item));
   const approve = (item: Installation) => change(`approve:${item.id}`, async token => replace(await client.approve(item.id, item.revision, token)),
     `Approved ${item.name}. It can now start sessions.`);
+  const keepApproved = (item: Installation) => change(`keep-approved:${item.id}`, async token => replace(await client.keepApproved(item.id, item.revision, token)),
+    `${item.name} stays approved until you disconnect it.`);
   const revoke = (item: Installation) => change(`revoke:${item.id}`, async token => replace(await client.revokeInstallation(item.id, item.revision, token)),
     item.state === "pending" ? `Declined the pairing request from ${item.name}.`
       : `Disconnected ${item.name}. Its sessions have ended; other installations keep working.`);
@@ -266,6 +269,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                   </div>}
                   {item.state === "active" && item.expires_at && <span className="installation-meta">Approval ends {untilText(item.expires_at, now)}
                     <span title={exact(item.expires_at)}> ({exact(item.expires_at)})</span></span>}
+                  {item.state === "active" && !item.expires_at && <span className="installation-meta">Approved until you disconnect it.</span>}
                   {item.reason && <span className="installation-meta">{reasonText(item.reason)}</span>}
                   {item.revoked_at && <span className="installation-meta">Revoked {relativeAge(item.revoked_at)}{item.revoked_by ? ` by ${actorName(item.revoked_by, items, hub.session?.actor)}` : ""}.</span>}
                 </div>
@@ -274,6 +278,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
                   <div className="note-actions">
                     {item.state === "pending" && !lapsed && <button type="button" className="primary small" disabled={!canChange || busy !== null}
                       onClick={() => { setNotice(null); setDialog({ kind: "approve", item }); }}>Check and approve…</button>}
+                    {item.state === "active" && item.expires_at && <button type="button" className="secondary small" disabled={!canChange || busy !== null}
+                      onClick={() => { setNotice(null); setConfirmedPersistent(false); setDialog({ kind: "keep-approved", item }); }}>Keep approved…</button>}
                     {(item.state === "active" || item.state === "pending") && <button type="button" className="secondary small" disabled={!canChange || busy !== null}
                       onClick={() => setRenaming({ id: item.id, name: item.name })}>Rename</button>}
                     {item.state === "pending" && !lapsed && <button type="button" className="secondary small danger"
@@ -319,6 +325,17 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
       {dialog?.kind === "approve" && <ApproveDialog item={dialog.item} now={now} busy={busy === `approve:${dialog.item.id}`} canChange={canChange}
         error={notice?.error && notice.for === `approve:${dialog.item.id}` ? notice.text : ""}
         onApprove={() => void approve(dialog.item)} onClose={() => setDialog(null)} />}
+      {dialog?.kind === "keep-approved" && <Modal title={`Keep ${dialog.item.name} approved?`} onClose={() => setDialog(null)}>
+        <p>This changes its current time limit. This device can start new 15-minute sessions until you disconnect it. Project access stays separate.</p>
+        <p>Computer: <code>{dialog.item.host_label}</code>. Fingerprint: <code>{dialog.item.key_fingerprint}</code>.</p>
+        <label className="checkbox-field"><input type="checkbox" checked={confirmedPersistent} onChange={event => setConfirmedPersistent(event.target.checked)} />
+          I want this device approved until I disconnect it</label>
+        {notice?.error && notice.for === `keep-approved:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
+        <div className="note-actions">
+          <button type="button" className="primary" disabled={!canChange || !confirmedPersistent || busy !== null} onClick={() => void keepApproved(dialog.item)}>Keep approved until revoked</button>
+          <button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button>
+        </div>
+      </Modal>}
       {dialog?.kind === "revoke" && dialog.item.state === "pending" && <Modal title={`Decline ${dialog.item.name}?`} onClose={() => setDialog(null)}>
         <p>This pairing request is refused and can't be approved later. Nothing else changes.</p>
         {notice?.error && notice.for === `revoke:${dialog.item.id}` && <p role="alert" className="notice error">{notice.text}</p>}
@@ -359,7 +376,7 @@ function ApproveDialog({ item, now, busy, canChange, error, onApprove, onClose }
       <div><dt>Fingerprint</dt><dd><code>{item.key_fingerprint}</code></dd></div>
     </dl>
     <p className="panel-footnote">Approve only if both match exactly. If they don't, or you didn't start this pairing, leave it: the request ends
-      {" "}{untilText(item.expires_at, now)} by itself. Approval lasts one day.</p>
+      {" "}{untilText(item.expires_at, now)} by itself. Approval lasts until you disconnect this installation. Sessions still expire after 15 minutes; project access is separate.</p>
     <label className="checkbox-field"><input type="checkbox" checked={checked} onChange={event => setChecked(event.target.checked)} />
       I checked that computer and both match</label>
     {lapsed && <p role="alert" className="notice error">This request ran out. Start pairing again on that computer.</p>}
@@ -445,7 +462,7 @@ function PairingGuide({ open, environment }: { open: boolean; environment: Capab
         six-digit pairing code and a fingerprint.</li>
       <li>A request appears here. Approve it only if its code and fingerprint match what that computer shows.</li>
       <li>Run <code>connect --session &lt;name&gt; --private-vpn</code> on the agent computer. Configure only the private MCP URL printed by the helper;
-        never use the browser origin for agent traffic. Sessions last up to 15 minutes and approval lasts a day; neither renews silently.</li>
+        never use the browser origin for agent traffic. Sessions last up to 15 minutes and reconnect explicitly. Device approval lasts until revoked.</li>
     </ol> : environment === "staging" ? <ol>
       <li>On the computer that runs the agent, download the <a href="/api/agent-sessions/v1/client/agent_session_client.py" download>helper</a> and
         its <a href="/api/agent-sessions/v1/client/manifest" download>manifest</a> from this Hub. Check the helper's size and SHA-256 against the
@@ -454,7 +471,7 @@ function PairingGuide({ open, environment }: { open: boolean; environment: Capab
         six-digit pairing code and a fingerprint.</li>
       <li>A request appears here. Approve it only if its code and fingerprint match what that computer shows.</li>
       <li>Approval doesn't start anything: run the helper's <code>connect</code> command to start a session. Sessions last up to 15 minutes and
-        approval lasts a day; neither renews silently.</li>
+        device approval lasts until revoked. Session reconnect is explicit.</li>
     </ol> : <p className="panel-footnote">Pairing guidance is unavailable until this Hub confirms its environment.</p>}
     <p className="panel-footnote">The credential stays on that computer: protected for the current user on Windows, owner-only on Linux. It's never shown
       or pasted here.</p>

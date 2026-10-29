@@ -98,7 +98,7 @@ fingerprint for approval. It prints the installation ID, public pairing code and
 fingerprint. In staging **Agents → Installations**, compare those values with
 the PC's output and approve the matching pending request. Host labels are
 self-described metadata, not proof of machine identity. Pending requests expire
-after ten minutes. The initial approval lasts 24 hours.
+after ten minutes. New UI device approvals last until revoked.
 Expired requests that were never approved are reclaimed during subsequent
 enrollment so abandoned requests cannot permanently fill the pairing table.
 Retrying an expired, never-approved request with its saved credential starts a
@@ -213,3 +213,32 @@ credentials or sessions alone do not establish independent reviewer authority.
 
 Keep correct-host desktop wake, phone access, restart and live admission evidence
 separate from the verified staging-PC and isolated synthetic test results.
+
+
+## Device approval lifetime
+
+New owner-UI approvals last until the owner disconnects/revokes that installation.
+Pairing requests still expire after ten minutes. Sessions still expire after
+15 minutes and reconnect explicitly; persistent device approval is not an
+unbounded bearer session or an automatic renewal service. Project grants remain
+separate and time-limited. Existing timed approvals keep their exact deadlines.
+For an active device, the owner can choose **Keep approved…**, verify the
+computer/fingerprint, and confirm **Keep approved until revoked** once. This
+never restores an expired or revoked installation.
+
+The explicit API option is `until_revoked: true` on owner approval; do not send
+`lifetime_seconds` with it. Older clients omitting this option retain their
+previous bounded approval semantics. Owner authentication, CSRF, revision
+checks, audit, and installation revocation still apply. No legacy key changes
+or NAS permission/storage changes are required.
+
+Storage uses `expires_at=0` only on already-approved persistent records, exposed
+as a null installation expiry. Sessions and Hub grant expiries remain finite.
+Older images treat these records as expired, so rollback fails closed for those
+devices until the newer image is restored. Never run mixed versions against the
+same session database. No records are silently extended during upgrade.
+
+Session-history quotas remain bounded (256 retained sessions per installation,
+4096 globally); persistent approval does not remove those limits. Exhaustion
+needs a separately reviewed retention/recovery solution, not re-pairing or
+blind deletion of old sessions referenced by claims.

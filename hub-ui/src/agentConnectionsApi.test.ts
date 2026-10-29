@@ -5,6 +5,7 @@ import {
 } from "./agentConnectionsApi";
 import { actorName, untilText } from "./AgentConnectionsPanel";
 import backend from "./fixtures/agent-connections-wire-v1.json";
+import persistentBackend from "./fixtures/agent-connections-persistent-wire-v1.json";
 
 /** UI-side samples in the frozen DTO shapes; the backend-generated wire fixture is added separately. */
 const at = (value: string) => value;
@@ -94,7 +95,7 @@ describe("agent connection client", () => {
     expect(url).toBe(`/api/hub/v1/agent-connections/installations/${pending.id}/approve`);
     expect(init?.method).toBe("POST");
     expect((init?.headers as Record<string, string>)["X-Hub-CSRF"]).toBe("csrf-token");
-    expect(JSON.parse(init?.body as string)).toEqual({ expected_revision: 1, lifetime_seconds: 86400 });
+    expect(JSON.parse(init?.body as string)).toEqual({ expected_revision: 1, until_revoked: true });
   });
   it("refuses to write without CSRF and to address a malformed id", async () => {
     const fetchImpl = vi.fn<typeof fetch>();
@@ -188,4 +189,10 @@ describe("lengths count Unicode characters like the backend", () => {
     expect(() => parseInstallation({ ...raw, name: "🌲".repeat(101) })).toThrow(HubApiError);
     expect(item.name).toBe("Synthetic processing PC");
   });
+});
+
+
+it("accepts the persistent installation wire without weakening pending expiry validation", () => {
+  expect(parseInstallation(persistentBackend.installation).expires_at).toBeNull();
+  expect(() => parseInstallation({ ...persistentBackend.installation, state: "pending", pairing_code: "123456" })).toThrow(HubApiError);
 });

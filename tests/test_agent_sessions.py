@@ -65,6 +65,72 @@ def pair(env):
     return repo, clock, a, b, asecret, bsecret, repo.exchange(asecret), repo.exchange(bsecret)
 
 
+def test_until_revoked_approval_survives_time_and_restart_but_sessions_expire(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'persistent', approve=False)
+    row = repo.approve(OWNER, row['id'], 1, until_revoked=True)
+    check(row['expires_at'] is None and row['state'] == 'active', 'persistent approval not represented')
+    check(any(e['action'] == 'installation.approved_until_revoked' for e in repo.audit(OWNER)['events']), 'persistent consent audit missing')
+    issued = repo.exchange(secret)
+    check(repo.authenticate_session(issued['token']).expires_at == clock.value + 900, 'session lost finite cap')
+    clock.advance(900)
+    denied('invalid_session', lambda: repo.authenticate_session(issued['token']))
+    clock.advance(10 * 86400)
+    reopened = AgentSessionRepository(repo.path, OWNER, clock)
+    check(reopened.list_installations(OWNER)['installations'][0]['state'] == 'active', 'approval expired after restart')
+    fresh = reopened.exchange(secret)
+    observed = []
+    principal, unsubscribe = reopened.subscribe_session(fresh['token'], lambda: observed.append(True))
+    check(principal.expires_at == clock.value + 900, 'reconnect issued unbounded session')
+    reopened.revoke_installation(OWNER, row['id'], row['revision'])
+    check(observed == [True], 'revocation did not invalidate listener')
+    denied('invalid_session', lambda: reopened.authenticate_session(fresh['token']))
+    denied('installation_inactive', lambda: reopened.exchange(secret))
+    unsubscribe()
+
+
+def test_owner_converts_only_active_bounded_approvals_with_cas_and_audit(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'convert', lifetime=60)
+    pending, _, _ = installation(repo, 'still-pending', approve=False)
+    denied('session_owner_required', lambda: repo.keep_approved('codex', row['id'], row['revision']))
+    denied('installation_inactive', lambda: repo.keep_approved(OWNER, pending['id'], 1))
+    denied('revision_conflict', lambda: repo.keep_approved(OWNER, row['id'], 1))
+    converted = repo.keep_approved(OWNER, row['id'], row['revision'])
+    check(converted['expires_at'] is None and converted['revision'] == row['revision'] + 1, 'conversion missing')
+    check(repo.keep_approved(OWNER, row['id'], converted['revision']) == converted, 'conversion retry changed record')
+    clock.advance(61)
+    repo.exchange(secret)
+    repo.revoke_installation(OWNER, row['id'], converted['revision'])
+    denied('installation_inactive', lambda: repo.keep_approved(OWNER, row['id'], converted['revision'] + 1))
+    expired, _, _ = installation(repo, 'expired-convert', lifetime=1)
+    clock.advance(1)
+    denied('installation_inactive', lambda: repo.keep_approved(OWNER, expired['id'], expired['revision']))
+    check(any(event['action'] == 'installation.kept_approved' for event in repo.audit(OWNER)['events']), 'conversion audit missing')
+
+
+def test_persistent_peers_and_pending_zero_sentinel_fail_closed(env):
+    repo, clock = env
+    row, _, _ = installation(repo, 'permanent-peer', approve=False)
+    repo.approve(OWNER, row['id'], 1, until_revoked=True)
+    _, secret, _ = installation(repo, 'observer', lifetime=604800)
+    check(row['id'] in [p['id'] for p in repo.peers(repo.exchange(secret)['token'])['installations']], 'persistent peer omitted')
+    pending, psecret, _ = installation(repo, 'zero-pending', approve=False)
+    with repo._transaction() as db:
+        db.execute('UPDATE session_installations SET expires_at=0 WHERE id=?', (pending['id'],))
+    denied('installation_inactive', lambda: repo.exchange(psecret))
+    denied('pairing_expired', lambda: repo.approve(OWNER, pending['id'], 1, until_revoked=True))
+
+
+def test_existing_bounded_approval_is_not_extended_on_reopen(env):
+    repo, clock = env
+    row, secret, _ = installation(repo, 'bounded-existing', lifetime=60)
+    reopened = AgentSessionRepository(repo.path, OWNER, clock)
+    check(reopened.list_installations(OWNER)['installations'][0]['expires_at'] == row['expires_at'], 'old grant extended')
+    clock.advance(60)
+    denied('installation_inactive', lambda: reopened.exchange(secret))
+
+
 def test_pairing_requires_owner_approval_and_cas(env):
     repo, clock = env
     row, secret, digest = installation(repo, 'pairing', approve=False)
