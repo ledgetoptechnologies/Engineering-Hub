@@ -30,6 +30,7 @@ MAX_ENROLLMENTS_PER_MINUTE = 20
 MAX_ACTIVE_SESSIONS = 16
 MAX_SESSION_HISTORY = 256
 MAX_ALL_SESSIONS = 4096
+SESSION_HISTORY_WINDOW_SECONDS = 86400
 MAX_MESSAGES = 10000
 MAX_MAILBOX = 1000
 MAX_SUBSCRIPTIONS = 32
@@ -126,6 +127,8 @@ class AgentSessionRepository:
                     installation_id TEXT, session_id TEXT, message_id TEXT, created_at REAL NOT NULL)''',
                 'CREATE INDEX IF NOT EXISTS session_inbox ON session_messages(recipient,seq)',
                 'CREATE INDEX IF NOT EXISTS session_installation_sessions ON agent_sessions(installation_id)',
+                'CREATE INDEX IF NOT EXISTS session_history_expiry ON agent_sessions(expires_at,revoked_at)',
+                'CREATE INDEX IF NOT EXISTS session_installation_history_expiry ON agent_sessions(installation_id,expires_at,revoked_at)',
             )
             for statement in statements:
                 db.execute(statement)
@@ -173,10 +176,20 @@ class AgentSessionRepository:
         return row
 
     @staticmethod
+    def _persistent(row):
+        # Approved-only sentinel preserves the existing NOT NULL schema. Older
+        # builds treat this as expired, so a rollback fails closed.
+        return row['approved_at'] is not None and row['expires_at'] == 0
+
+    @classmethod
+    def _cap_installation_deadline(cls, row, deadline):
+        return deadline if cls._persistent(row) else min(deadline, row['expires_at'])
+
+    @staticmethod
     def _state(row, now):
         if row['revoked_at'] is not None:
             return 'revoked', 'owner_revoked'
-        if now >= row['expires_at']:
+        if not AgentSessionRepository._persistent(row) and now >= row['expires_at']:
             return 'expired', 'pairing_expired' if row['approved_at'] is None else 'installation_expired'
         return ('pending', 'awaiting_owner_approval') if row['approved_at'] is None else ('active', None)
 
@@ -186,13 +199,13 @@ class AgentSessionRepository:
                     state=state, reason=reason, created_at=_iso(row['created_at']),
                     approved_at=_iso(row['approved_at']), approved_by=row['approved_by'],
                     revoked_at=_iso(row['revoked_at']), revoked_by=row['revoked_by'],
-                    expires_at=_iso(row['expires_at']), revision=row['revision'],
+                    expires_at=None if self._persistent(row) else _iso(row['expires_at']), revision=row['revision'],
                     pairing_code=row['pairing_code'] if state == 'pending' else None,
                     key_fingerprint=row['credential_hash'][:16])
 
     def _public_session(self, row, installation, now):
         state = ('revoked' if row['revoked_at'] is not None or installation['revoked_at'] is not None
-                 else 'expired' if now >= min(row['expires_at'], installation['expires_at']) else 'active')
+                 else 'expired' if now >= self._cap_installation_deadline(installation, row['expires_at']) else 'active')
         return dict(id=row['id'], installation_id=row['installation_id'], label=row['label'],
                     issued_at=_iso(row['issued_at']), expires_at=_iso(row['expires_at']),
                     last_used_at=_iso(row['last_used_at']), state=state, revision=row['revision'])
@@ -210,7 +223,7 @@ class AgentSessionRepository:
         self._active_installation(installation, now)
         db.execute('UPDATE agent_sessions SET last_used_at=? WHERE id=?', (now, row['id']))
         return SessionPrincipal(installation['id'], row['id'], installation['family'],
-                                min(row['expires_at'], installation['expires_at']))
+                                self._cap_installation_deadline(installation, row['expires_at']))
 
     @staticmethod
     def _audit(db, action, actor, now, installation_id=None, session_id=None, message_id=None):
@@ -259,9 +272,11 @@ class AgentSessionRepository:
             return {'installations': [self._public_installation(row, now) for row in
                     db.execute('SELECT * FROM session_installations ORDER BY created_at DESC,id')]}
 
-    def approve(self, actor, id, expected_revision, lifetime_seconds=86400):
+    def approve(self, actor, id, expected_revision, lifetime_seconds=86400, *, until_revoked=False):
         self._owner(actor)
         _number(lifetime_seconds, 1, 7 * 86400)
+        if type(until_revoked) is not bool:
+            raise AgentSessionError('invalid_input', 422)
         with self._transaction() as db:
             now = self._now(); row = self._installation(db, id); self._cas(row, expected_revision)
             if self._state(row, now)[1] == 'pairing_expired':
@@ -269,8 +284,19 @@ class AgentSessionRepository:
             if self._state(row, now)[0] != 'pending':
                 raise AgentSessionError('enrollment_not_pending', 409)
             db.execute('UPDATE session_installations SET approved_at=?,approved_by=?,expires_at=?,revision=revision+1 WHERE id=?',
-                       (now, actor, now + lifetime_seconds, id))
-            self._audit(db, 'installation.approved', actor, now, id)
+                       (now, actor, 0 if until_revoked else now + lifetime_seconds, id))
+            self._audit(db, 'installation.approved_until_revoked' if until_revoked else 'installation.approved', actor, now, id)
+            return self._public_installation(self._installation(db, id), now)
+
+    def keep_approved(self, actor, id, expected_revision):
+        """Explicit owner conversion; never revive an expired or revoked identity."""
+        self._owner(actor)
+        with self._transaction() as db:
+            now = self._now(); row = self._installation(db, id); self._cas(row, expected_revision)
+            self._active_installation(row, now)
+            if not self._persistent(row):
+                db.execute('UPDATE session_installations SET expires_at=0,revision=revision+1 WHERE id=?', (id,))
+                self._audit(db, 'installation.kept_approved', actor, now, id)
             return self._public_installation(self._installation(db, id), now)
 
     def rename(self, actor, id, expected_revision, name):
@@ -313,13 +339,16 @@ class AgentSessionRepository:
             if installation is None:
                 raise AgentSessionError('invalid_credential', 401)
             self._active_installation(installation, now)
+            cutoff = now - SESSION_HISTORY_WINDOW_SECONDS
+            recent = 'expires_at>? AND (revoked_at IS NULL OR revoked_at>?)'
             if (db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=? AND revoked_at IS NULL AND expires_at>?', (installation['id'], now)).fetchone()[0] >= MAX_ACTIVE_SESSIONS
-                    or db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=?', (installation['id'],)).fetchone()[0] >= MAX_SESSION_HISTORY
-                    or db.execute('SELECT count(*) FROM agent_sessions').fetchone()[0] >= MAX_ALL_SESSIONS):
+                    or db.execute('SELECT count(*) FROM agent_sessions WHERE installation_id=? AND ' + recent,
+                                  (installation['id'], cutoff, cutoff)).fetchone()[0] >= MAX_SESSION_HISTORY
+                    or db.execute('SELECT count(*) FROM agent_sessions WHERE ' + recent, (cutoff, cutoff)).fetchone()[0] >= MAX_ALL_SESSIONS):
                 raise AgentSessionError('session_limit', 429)
             token, identity = 'ehs_' + secrets.token_urlsafe(32), str(uuid.uuid4())
             db.execute('INSERT INTO agent_sessions VALUES(?,?,?,?,?,?,NULL,NULL,1)',
-                       (identity, installation['id'], _hash(token), label, now, min(now + SESSION_SECONDS, installation['expires_at'])))
+                       (identity, installation['id'], _hash(token), label, now, self._cap_installation_deadline(installation, now + SESSION_SECONDS)))
             self._audit(db, 'session.issued', installation['id'], now, installation['id'], identity)
             row = db.execute('SELECT * FROM agent_sessions WHERE id=?', (identity,)).fetchone()
             return {'session': self._public_session(row, installation, now), 'token': token,
@@ -332,9 +361,12 @@ class AgentSessionRepository:
     def list_sessions(self, actor, installation_id):
         self._owner(actor)
         with self._transaction() as db:
-            now = self._now(); installation = self._installation(db, installation_id)
+            now = self._now(); cutoff = now - SESSION_HISTORY_WINDOW_SECONDS
+            installation = self._installation(db, installation_id)
             return {'sessions': [self._public_session(row, installation, now) for row in db.execute(
-                'SELECT * FROM agent_sessions WHERE installation_id=? ORDER BY issued_at DESC,id', (installation_id,))]}
+                'SELECT * FROM agent_sessions WHERE installation_id=? AND expires_at>? '
+                'AND (revoked_at IS NULL OR revoked_at>?) ORDER BY issued_at DESC,id LIMIT ?',
+                (installation_id, cutoff, cutoff, MAX_SESSION_HISTORY))]}
 
     def revoke_session(self, actor, id, expected_revision):
         self._owner(actor)
@@ -375,7 +407,7 @@ class AgentSessionRepository:
         with self._transaction() as db:
             now = self._now(); principal = self._principal(db, session_secret, now)
             return {'installations': [self._public_installation(row, now) for row in db.execute(
-                'SELECT * FROM session_installations WHERE id!=? AND approved_at IS NOT NULL AND revoked_at IS NULL AND expires_at>? ORDER BY name,id',
+                'SELECT * FROM session_installations WHERE id!=? AND approved_at IS NOT NULL AND revoked_at IS NULL AND (expires_at=0 OR expires_at>?) ORDER BY name,id',
                 (principal.installation_id, now))]}
 
     @staticmethod

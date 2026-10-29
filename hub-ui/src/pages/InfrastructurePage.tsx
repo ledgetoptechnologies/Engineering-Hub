@@ -15,6 +15,7 @@ import {
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
+import { MachineHealth } from "./MachineHealth";
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
@@ -113,6 +114,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
         {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} />)}
       </ul>}
     </section>
+    <MachineHealth hub={hub} />
   </>;
 }
 
@@ -180,6 +182,7 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
               <Badge tone={view.tone}>{view.line}</Badge></li>; })}</ul>}
       </section>
+      <MachineHealth hub={hub} deviceId={device.id} />
       <MaintenanceSection client={client} csrf={csrf} detail={detail} now={now} self={self}
         canWrite={detail.capabilities.maintenance_write && writable && !device.retired} onChanged={refresh} />
     </div>}

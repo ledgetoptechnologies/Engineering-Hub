@@ -106,8 +106,8 @@ projects and capabilities required by a specific installation.
 
 ## Lifetime and revocation
 
-The existing defaults remain unchanged: pending enrollment requests expire
-after ten minutes, installation approval defaults to 24 hours, and a session
+Pending enrollment requests expire after ten minutes. New owner-UI approvals
+last until revoked; the legacy API approval default remains 24 hours. A session
 lasts at most 15 minutes. Sessions are not automatically exchanged or renewed.
 After session expiry, explicitly connect a new named session and reconnect the
 client. An expired approved installation has no renewal operation; it requires
@@ -120,3 +120,40 @@ Production readiness still requires review of the intended release, actual
 production browser/Cloudflare and agent-route configuration, the authenticated
 owner binding, private database placement, and a separately approved live
 onboarding and revocation check.
+
+
+## Device approval lifetime
+
+New owner-UI approvals last until the owner disconnects/revokes that installation.
+Pairing requests still expire after ten minutes. Sessions still expire after
+15 minutes and reconnect explicitly; persistent device approval is not an
+unbounded bearer session or an automatic renewal service. Project grants remain
+separate and time-limited. Existing timed approvals keep their exact deadlines.
+For an active device, the owner can choose **Keep approved…**, verify the
+computer/fingerprint, and confirm **Keep approved until revoked** once. This
+never restores an expired or revoked installation.
+
+The explicit API option is `until_revoked: true` on owner approval; do not send
+`lifetime_seconds` with it. Older clients omitting this option retain their
+previous bounded approval semantics. Owner authentication, CSRF, revision
+checks, audit, and installation revocation still apply. No legacy key changes
+or NAS permission/storage changes are required.
+
+Storage uses `expires_at=0` only on already-approved persistent records, exposed
+as a null installation expiry. Sessions and Hub grant expiries remain finite.
+Older images treat these records as expired, so rollback fails closed for those
+devices until the newer image is restored. Never run mixed versions against the
+same session database. No records are silently extended during upgrade.
+
+The existing 16-active-session limit remains. Quotas count active sessions and
+those ended in the last 24 hours: 256 per installation and 4096 globally. A
+continuous device can reconnect beyond the old all-time history limit without
+another pairing. A burst still receives a limit response until its window ends.
+The owner session list uses that same window and the existing response shape.
+
+Historical session and audit rows are not deleted or rewritten, so old claim
+provenance and recovery remain intact. These stored rows grow over time; the
+quota bounds recent activity, not total database size. An operator-reviewed
+archive/size-monitoring policy remains a separate maintenance decision. An old
+image counts all rows and may refuse new sessions or fail to display more than
+256 historical rows after rollback; restoring the newer image preserves state.

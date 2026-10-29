@@ -102,6 +102,55 @@ def test_missing_optional_settings_do_not_open_inventory(tmp_path):
         assert not (tmp_path / 'infrastructure').exists()
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='Actual private inventory and session composition')
+def test_composed_metrics_use_owner_session_and_reject_agents_before_fetch(tmp_path, monkeypatch):
+    from engineering_hub.infrastructure_metrics import MetricsReader, QUERIES
+    from engineering_hub.infrastructure_prometheus import TARGET_PATH
+    from urllib.parse import parse_qs, urlsplit
+
+    config = settings(tmp_path, prometheus=True)
+    operator = json.loads(config.infrastructure_config_path.read_text())
+    operator['principals'][0]['capabilities'].append('metrics_read')
+    operator['prometheus']['mappings'][0]['exporter'] = 'node'
+    config.infrastructure_config_path.write_text(json.dumps(operator))
+    calls = []
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    by_query = {query: key for kind, key, query in QUERIES if kind == 'node'}
+
+    async def fetch(reader, client, path, budget):
+        calls.append(path)
+        if path == TARGET_PATH:
+            return json.dumps({'status': 'success', 'data': {'activeTargets': [{
+                'labels': {'job': 'Fixture', 'instance': '192.0.2.1:9100'},
+                'health': 'up', 'lastScrape': stamp, 'scrapeInterval': '1m'}]}}).encode()
+        query = parse_qs(urlsplit(path).query)['query'][0]
+        value = {'cpu': '0.25', 'mem_total': '1024', 'mem_available': '256', 'uptime': '42'}.get(by_query[query])
+        series = [] if value is None else [{'metric': {'job': 'Fixture', 'instance': '192.0.2.1:9100'},
+                                          'value': [0, value]}]
+        return json.dumps({'status': 'success', 'data': {'resultType': 'vector', 'result': series}}).encode()
+
+    # Only synthetic transport is replaced: composition, session auth and capability checks are real.
+    monkeypatch.setattr(MetricsReader, '_get', fetch)
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        assert app.state.infrastructure.metrics is not None and calls == []
+        assert client.get(BASE + '/metrics').status_code == 401
+        assert client.get(BASE + '/metrics', headers={'Authorization': 'Bearer test-hermes'}).status_code == 403
+        assert calls == []
+        login(client, app, config)
+        response = client.get(BASE + '/metrics')
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result['source'] == {'status': 'ok'}
+        target = result['devices'][0]
+        assert target['cpu_busy_ratio'] == 0.25 and target['mem_total_bytes'] == 1024
+        assert target['mem_available_bytes'] == 256 and target['up'] is True
+        assert len(calls) == 1 + len(by_query)
+        before = len(calls)
+        assert client.get(BASE + '/metrics?query=up').status_code == 400
+        assert len(calls) == before
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='Real inventory owner composition')
 def test_real_mcp_uses_authenticated_agent_capabilities(tmp_path):
     config = settings(tmp_path)
@@ -208,6 +257,9 @@ def test_transport_construction_failure_releases_inventory_owner(tmp_path, monke
 @pytest.mark.parametrize('method,path,expected', [
     ('GET', '/infrastructure', True), ('HEAD', '/infrastructure/synthetic-pc', True),
     ('GET', BASE + '/devices', True), ('GET', BASE + '/devices/synthetic-pc', True),
+    ('GET', BASE + '/metrics', True), ('HEAD', BASE + '/metrics', True),
+    ('POST', BASE + '/metrics', False), ('PUT', BASE + '/metrics', False),
+    ('DELETE', BASE + '/metrics', False), ('GET', BASE + '/metrics/query', False),
     ('PUT', BASE + '/devices/synthetic-pc', True),
     ('POST', BASE + '/devices/synthetic-pc/maintenance', True),
     ('POST', BASE + '/maintenance/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/resolve', True),

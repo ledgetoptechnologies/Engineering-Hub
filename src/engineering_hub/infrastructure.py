@@ -20,7 +20,9 @@ import uuid
 from .repository import HubError
 
 
-CAPABILITIES = frozenset({'read', 'device_write', 'maintenance_write', 'probe_write'})
+CAPABILITIES = frozenset({'read', 'device_write', 'maintenance_write', 'probe_write', 'metrics_read'})
+# Owner-human-only: metrics summarize whole machines, not just declared probes.
+HUMAN_ONLY = frozenset({'device_write', 'metrics_read'})
 MAX_EVENTS_PER_DEVICE = 512
 MAX_MAINTENANCE_PER_DEVICE = 100
 MAX_PROBE_IDENTITIES = 16
@@ -143,7 +145,7 @@ class InfrastructureRegistry:
         self._principal(principal)
         allowed = self.capabilities.get(principal, frozenset())
         if ('read' not in allowed or action not in allowed
-                or (action == 'device_write' and principal.kind != 'human')):
+                or (action in HUMAN_ONLY and principal.kind != 'human')):
             raise HubError('forbidden', 403)
         self._assert_admission()
 

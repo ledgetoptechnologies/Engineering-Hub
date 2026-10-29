@@ -68,6 +68,28 @@ def proposal(env, token, key='key'):
         env.repo.propose_staging_task(actor, PROJECT, 'Synthetic task', key))
 
 
+def test_persistent_installation_does_not_extend_sessions_or_hub_grants(env):
+    identity, _, secret = pair(env, caps=())
+    grant = env.bridge.grant_put(OWNER, identity, 0, [PROJECT], ['project.read'], lifetime_seconds=60)
+    converted = env.sessions.keep_approved(OWNER, identity, 2)
+    assert converted['expires_at'] is None
+    assert env.bridge.grant_get(OWNER, identity)['expires_at'] == grant['expires_at']
+    issued = env.sessions.exchange(secret)
+    call(env, issued['token'], 'hub_project_get', lambda _: None)
+    env.clock.value += 60
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, issued['token'], 'hub_project_get', lambda _: None)
+    env.clock.value += 8 * 86400
+    fresh = env.sessions.exchange(secret)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        call(env, fresh['token'], 'hub_project_get', lambda _: None)
+    renewed = env.bridge.grant_put(OWNER, identity, 1, [PROJECT], ['project.read'], lifetime_seconds=60)
+    assert renewed['state'] == 'active'
+    principal = env.sessions.authenticate_session(fresh['token'])
+    assert principal.expires_at == env.clock.value + 900
+    call(env, fresh['token'], 'hub_project_get', lambda _: None)
+
+
 def test_explicit_grants_cas_scope_and_no_implicit_capabilities(env):
     installation, token, _ = pair(env, caps=())
     assert env.bridge.grant_get(OWNER, installation)['state'] == 'absent'
@@ -229,6 +251,30 @@ def test_owner_recovery_retains_candidate_review_and_exact_dedup(env):
         env.bridge.recover_claim(OWNER, task['id'], 4, target, 'Changed', 'recover')
     with pytest.raises(AgentSessionError):
         env.bridge.recover_claim('codex', task['id'], 4, target, 'Changed', 'recover')
+
+
+def test_owner_claim_recovery_survives_more_than_256_later_sessions(env):
+    installation, token, secret = pair(env)
+    approved = env.sessions.keep_approved(OWNER, installation, 2)
+    task = proposal(env, token)
+    task = call(env, token, 'hub_task_claim', lambda actor: env.repo.claim_task(actor, task['id'], 1))
+    prior_session = task['owner_session_id']
+    env.sessions.revoke_session(OWNER, prior_session, 1)
+    env.clock.value += 30 * 86400
+    target = None
+    for index in range(257):
+        if index:
+            env.clock.value += 901
+        target = env.sessions.exchange(secret)['session']['id']
+    assert env.sessions.list_installations(OWNER)['installations'][0]['revision'] == approved['revision']
+    assert all(item['id'] != prior_session
+               for item in env.sessions.list_sessions(OWNER, installation)['sessions'])
+    env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['task.claim'])
+    recovered = env.bridge.recover_claim(OWNER, task['id'], 2, target, 'Long-term recovery', 'after-window')
+    assert not recovered['replayed'] and recovered['task']['owner_session_id'] == target
+    assert recovered['recovery']['prior_session_id'] == prior_session
+    with env.sessions._transaction() as db:
+        assert db.execute('SELECT count(*) FROM agent_sessions WHERE id=?', (prior_session,)).fetchone()[0] == 1
 
 
 def test_cross_installation_recovery_and_execution_are_denied(env):

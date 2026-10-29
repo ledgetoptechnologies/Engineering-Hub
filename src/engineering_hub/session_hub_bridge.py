@@ -205,7 +205,7 @@ class SessionHubBridge:
                     'projects=excluded.projects,capabilities=excluded.capabilities,expires_at=excluded.expires_at, '
                     'approved_by=excluded.approved_by,approved_at=excluded.approved_at,revoked_at=NULL',
                     (installation_id, expected_revision + 1, json.dumps(sorted(projects)),
-                     json.dumps(sorted(capabilities)), min(now + lifetime_seconds, installation['expires_at']), actor, now))
+                     json.dumps(sorted(capabilities)), self.sessions._cap_installation_deadline(installation, now + lifetime_seconds), actor, now))
             self.sessions._audit(db, 'hub_grant.updated', actor, now, installation_id)
             return self._public(installation, self._grant(db, installation_id), now)
 
@@ -231,7 +231,7 @@ class SessionHubBridge:
             installation = self.sessions._installation(db, row['installation_id'])
             self.sessions._active_installation(installation, now)
             principal = SessionPrincipal(installation['id'], row['id'], installation['family'],
-                min(row['expires_at'], installation['expires_at']))
+                self.sessions._cap_installation_deadline(installation, row['expires_at']))
         grant = self._grant(db, principal.installation_id)
         if grant is None or grant['revoked_at'] is not None or grant['expires_at'] <= now:
             raise HubError('hub_grant_required', 403)
@@ -335,7 +335,7 @@ class SessionHubBridge:
                     task = json.loads(row['data'])
                     old = db.execute('SELECT * FROM agent_sessions WHERE id=?', (task.get('owner_session_id'),)).fetchone()
                     claim_state = ('unknown' if old is None else 'revoked' if old['revoked_at'] is not None
-                        or installation['revoked_at'] is not None else 'expired' if min(old['expires_at'], installation['expires_at']) <= now else 'active')
+                        or installation['revoked_at'] is not None else 'expired' if self.sessions._cap_installation_deadline(installation, old['expires_at']) <= now else 'active')
                     targets = live if (grant['effective']['state'] == 'active' and task['project'] in grant['effective']['projects']
                         and 'task.claim' in grant['effective']['capabilities']) else []
                     execution = False

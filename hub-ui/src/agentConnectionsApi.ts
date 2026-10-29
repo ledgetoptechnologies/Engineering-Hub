@@ -12,8 +12,6 @@ export const SESSION_STATES = ["active", "revoked", "expired"] as const;
 export type Family = typeof FAMILIES[number];
 export type InstallationState = typeof INSTALLATION_STATES[number];
 export type SessionState = typeof SESSION_STATES[number];
-/** Approved installations start with one day; the contract bounds this server side. */
-export const APPROVAL_LIFETIME_SECONDS = 86400;
 export const NAME_MAX = 100;
 /** Retained session history per installation (active sessions are capped separately at 16). */
 export const MAX_SESSION_HISTORY = 256;
@@ -38,6 +36,7 @@ export interface AgentConnectionsClient {
   sessions(installationId: string, signal: AbortSignal): Promise<Session[]>;
   audit(signal: AbortSignal): Promise<AuditEvent[]>;
   approve(id: string, expectedRevision: number, csrf: string): Promise<Installation>;
+  keepApproved(id: string, expectedRevision: number, csrf: string): Promise<Installation>;
   rename(id: string, expectedRevision: number, name: string, csrf: string): Promise<Installation>;
   revokeInstallation(id: string, expectedRevision: number, csrf: string): Promise<Installation>;
   revokeSession(id: string, expectedRevision: number, csrf: string): Promise<Session>;
@@ -167,7 +166,9 @@ export function httpAgentConnections(fetchImpl: typeof fetch = globalThis.fetch)
     sessions: async (installationId, signal) => parseSessions(await ownerCall(`/installations/${at(installationId)}/sessions`, read(signal), fetchImpl), installationId),
     audit: async signal => parseAudit(await ownerCall("/audit", read(signal), fetchImpl)),
     approve: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/approve`,
-      write("POST", { expected_revision, lifetime_seconds: APPROVAL_LIFETIME_SECONDS }, csrf), fetchImpl)),
+      write("POST", { expected_revision, until_revoked: true }, csrf), fetchImpl)),
+    keepApproved: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/keep-approved`,
+      write("POST", { expected_revision }, csrf), fetchImpl)),
     rename: async (installationId, expected_revision, name, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}`,
       write("PATCH", { expected_revision, name: line(NAME_MAX)(name.trim()) }, csrf), fetchImpl)),
     revokeInstallation: async (installationId, expected_revision, csrf) => parseInstallation(await ownerCall(`/installations/${at(installationId)}/revoke`,
@@ -191,6 +192,8 @@ export const reasonText = (reason: string | null) => reason === null ? "" : REAS
 const ACTION_TEXT: Record<string, string> = {
   "enrollment.requested": "asked to pair", "installation.approved": "approved the installation",
   "installation.renamed": "renamed the installation", "installation.revoked": "revoked the installation",
+  "installation.kept_approved": "kept the installation approved until revoked",
+  "installation.approved_until_revoked": "approved the installation until revoked",
   "session.issued": "started a session", "session.revoked": "revoked a session", "message.sent": "sent a message",
   "message.claimed": "claimed a message", "message.claim_renewed": "renewed a message claim", "message.acknowledged": "acknowledged a message",
 };
