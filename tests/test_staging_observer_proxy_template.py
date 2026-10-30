@@ -10,5 +10,6 @@ def test_proxy_example_is_inert_and_narrow():
     assert 'proxy_pass http://127.0.0.1:__OBSERVER_PORT__;' in source
     assert 'proxy_pass_request_headers off;' in source and 'proxy_pass_request_body off;' in source
     assert 'proxy_set_header Authorization $http_authorization;' in source
+    assert 'error_log /dev/null info;' in source
     assert 'proxy_next_upstream off;' in source and 'access_log off;' in source
     assert 'ssl_certificate_key __CERTIFICATE_KEY_PATH__;' in source

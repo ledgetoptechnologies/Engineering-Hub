@@ -85,3 +85,16 @@ tested duplicate-header rejection mechanism are required, along with a reviewed
 error-log policy. No complete mechanism has been validated here. Do not infer
 safety from the template or static test; a syntax check alone would not resolve
 these boundaries.
+
+A bounded isolated test of NGINX 1.26.3 with a dedicated main-context
+`error_log /dev/null info` and disabled access logs produced no request logs or
+stderr on normal startup, duplicate Authorization, malformed URI/query, or
+upstream failure. Discarding error logs sacrifices operational diagnostics;
+observe process health separately without collecting request headers or URIs.
+A missing-certificate startup failure still wrote its certificate path to stderr
+before the configured log destination took effect. Independently review service
+stderr handling and configuration/path contents: `/dev/null` does not prove
+startup failures or all versions and modules are safe. In the same isolated
+configuration duplicate Authorization produced 400; method, query, encoded and
+case variants produced 404; an unapproved loopback peer with a spoofed forwarded
+IP produced 403. These are version-specific tests, not production acceptance.
