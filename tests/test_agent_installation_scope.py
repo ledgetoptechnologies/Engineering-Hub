@@ -130,3 +130,30 @@ def test_bulk_is_one_owner_action_with_independent_revisions(environment):
     assert all(row['kind'] == 'internal' and row['revision'] == 1 for row in result['installations'])
     with pytest.raises(AgentSessionError, match='invalid_installation_scope'):
         scopes.set_many(OWNER, [{'installation_id': first['id'], 'expected_revision': 1}] * 2, 'internal')
+
+
+def test_historical_churn_does_not_disable_owner_list_or_hide_old_active_device(environment):
+    sessions, scopes, clock = environment
+    oldest, token = installation(sessions, 'old-active')
+    scopes.set(OWNER, oldest['id'], 0, 'internal')
+    retired = []
+    for index in range(256):
+        clock[0] += 1
+        row, _ = installation(sessions, f'retired-{index}')
+        scopes.set(OWNER, row['id'], 0, 'project_only')
+        sessions.revoke_installation(OWNER, row['id'], row['revision'])
+        retired.append(row['id'])
+        if index == 254:
+            assert scopes.list(OWNER)['truncated'] is False
+    result = scopes.list(OWNER)
+    assert result['truncated'] is True and len(result['installations']) == 256
+    ids = [row['installation_id'] for row in result['installations']]
+    assert ids[0] == oldest['id'] and ids[1] == retired[-1]
+    assert retired[0] not in ids
+    assert result['installations'][0]['kind'] == 'internal'
+    assert result['installations'][0]['internal_effective'] is True
+    assert scopes.require_internal(token).installation_id == oldest['id']
+    # History omitted from this bounded view remains individually owner-readable.
+    assert scopes.get(OWNER, retired[0])['kind'] == 'project_only'
+    with pytest.raises(AgentSessionError, match='session_owner_required'):
+        scopes.list('human:43')
