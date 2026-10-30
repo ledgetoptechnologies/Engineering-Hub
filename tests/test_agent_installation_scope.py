@@ -1,6 +1,7 @@
 """Private installation classification tests; synthetic credentials only."""
 import base64
 import hashlib
+import uuid
 
 import pytest
 
@@ -132,17 +133,24 @@ def test_bulk_is_one_owner_action_with_independent_revisions(environment):
         scopes.set_many(OWNER, [{'installation_id': first['id'], 'expected_revision': 1}] * 2, 'internal')
 
 
-def test_historical_churn_does_not_disable_owner_list_or_hide_old_active_device(environment):
+def test_oversized_retained_history_does_not_disable_owner_list_or_hide_active_device(environment):
     sessions, scopes, clock = environment
     oldest, token = installation(sessions, 'old-active')
     scopes.set(OWNER, oldest['id'], 0, 'internal')
     retired = []
     for index in range(256):
         clock[0] += 1
-        row, _ = installation(sessions, f'retired-{index}')
-        scopes.set(OWNER, row['id'], 0, 'project_only')
-        sessions.revoke_installation(OWNER, row['id'], row['revision'])
-        retired.append(row['id'])
+        identity = str(uuid.uuid5(uuid.NAMESPACE_URL, f'synthetic-history:{index}'))
+        # Explicit legacy-history fixture, beyond the current enrollment cap.
+        # This does not relax enrollment/rate limits or invent owner actions.
+        with sessions._transaction() as db:
+            db.execute('INSERT INTO session_installations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (identity, 'codex', f'retired-{index}', 'synthetic-host',
+                 hashlib.sha256(identity.encode()).hexdigest(), '000000', clock[0],
+                 clock[0], OWNER, clock[0], OWNER, 0, 2))
+            db.execute('INSERT INTO session_installation_scopes VALUES(?,?,?,?,?)',
+                       (identity, 'project_only', 1, OWNER, clock[0]))
+        retired.append(identity)
         if index == 254:
             assert scopes.list(OWNER)['truncated'] is False
     result = scopes.list(OWNER)
