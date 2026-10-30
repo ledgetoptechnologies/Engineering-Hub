@@ -91,6 +91,73 @@ async def test_lost_terminal_response_recovers_original_wire_commands_without_re
             assert repo.get_task(task['id'])['status'] == 'verified'
 
 
+class LoseDeployResponse(httpx.AsyncBaseTransport):
+    def __init__(self, app):
+        self.transport = httpx.ASGITransport(app=app)
+        self.lost = False
+        self.posts = []
+        self.gets = []
+
+    async def handle_async_request(self, request):
+        if request.method == 'POST':
+            payload = json.loads(await request.aread())
+            self.posts.append((payload['action'], payload['command_id']))
+        elif request.method == 'GET':
+            self.gets.append(request.url.path)
+        response = await self.transport.handle_async_request(request)
+        if request.method == 'POST' and not self.lost:
+            if payload['action'] == 'deploy_container':
+                self.lost = True
+                await response.aclose()
+                raise httpx.ReadError('synthetic deploy response lost after acceptance', request=request)
+        return response
+
+    async def aclose(self):
+        await self.transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lost_deploy_response_keeps_machine_held_without_replaying_or_advancing(tmp_path):
+    private = tmp_path / 'private'
+    private.mkdir(mode=0o700)
+    host = SyntheticHost()
+    transport = LoseDeployResponse(PilotASGI(host, 'synthetic-private-host-token'))
+    async with ContainerPilotClient('http://127.0.0.1', 'synthetic-private-host-token',
+                                    transport=transport) as client:
+        with PilotOwner(private / 'hub.sqlite3', allow_ephemeral_test_storage=True) as owner:
+            repo = HubRepository(private / 'hub.sqlite3',
+                                 execution_principal=PRINCIPAL, pilot_owner=owner)
+            workflow = ContainerPilotWorkflow(repo, client,
+                [ContainerPilotTarget.from_manifest(pilot_manifest())], pilot_owner=owner)
+            queue = WorkQueue(repo, {'engineering-hub.pilot': WorkAction('staging-pc',
+                project='engineering-hub')})
+            bridge = QueuedContainerPilot(queue, workflow,
+                action_key='engineering-hub.pilot', machine_id='staging-pc',
+                reconciliation=synthetic_workflow_reconciliation(workflow))
+            task = reviewed_task(repo)
+            job = queue.submit(actor='codex', request_id=str(uuid.uuid4()),
+                action_key='engineering-hub.pilot', environment='staging',
+                target=WorkTarget(task['id'], COMMIT, IMAGE))
+            assert (await bridge.run_once())['state'] == 'held'
+            assert transport.lost and len(host.commands) == 1
+            original_ids = set(host.commands)
+            command_id, = original_ids
+            assert transport.posts == [('deploy_container', command_id)]
+            assert (await bridge.recover(job['id']))['state'] == 'held'
+            assert queue.get_job(job['id'])['state'] == 'held'
+            assert transport.posts == [('deploy_container', command_id)]
+            assert len(transport.gets) == 1 and transport.gets[0].endswith('/' + command_id)
+            assert set(host.commands) == original_ids
+            assert host.inspected == [command_id]
+            with repo._connection() as db:
+                reservation = db.execute(
+                    'SELECT job_id FROM hub_work_machines WHERE machine_id=?',
+                    ('staging-pc',)).fetchone()
+            assert reservation['job_id'] == job['id']
+            assert len(repo.list_runs()) == 1
+            assert await bridge.run_once() is None
+
+
 @pytest.mark.asyncio
 async def test_public_routes_cannot_bypass_enrolled_queue_or_select_private_worker(rig):
     from agent_message_bus.auth import AuthSettings
