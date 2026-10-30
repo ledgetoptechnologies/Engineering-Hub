@@ -1,23 +1,42 @@
 /**
- * Machine health from the Hub's configured Prometheus: CPU, memory, disks, GPUs and the busiest
- * processes per machine. Read on open and on Refresh only; never polled. Hidden entirely when this
- * Hub has no metrics or this person can't read them.
+ * Machine health from the Hub's Prometheus: CPU, memory, disks, GPUs and the busiest processes for
+ * every machine it scrapes, recorded as a device or not. Read on open and on Refresh only; never
+ * polled. Hidden entirely when this person can't read metrics; says so when Prometheus isn't set up.
  */
 import { useEffect, useState } from "react";
 import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import {
-  formatBytes, formatUptime, groupMachines, percent, readMetrics, type MachineMetrics, type MachineTarget,
+  formatBytes, formatUptime, groupMachines, percent, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
+import { href } from "../router";
 import { Badge, PanelTitle } from "../ui";
 
 type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "loaded"; value: MachineMetrics };
 
 const SOURCE_TEXT = {
   ok: null,
+  not_configured: "This Hub isn't connected to Prometheus yet, so there's nothing to show.",
   partial: "Some readings didn't come back from Prometheus, so a few values are missing.",
-  unreachable: "Prometheus didn't answer, so nothing below is current. Machines aren't known to be down.",
+  unreachable: "Prometheus didn't answer, so there are no current readings. Machines aren't known to be down.",
 } as const;
+function omittedText(metrics: MachineMetrics): string | null {
+  const { truncated, omitted_count: omitted, warnings } = metrics.source;
+  const parts: string[] = [];
+  if (truncated) parts.push(omitted ? `${omitted} more ${omitted === 1 ? "target isn't" : "targets aren't"} shown.` : "Some targets aren't shown.");
+  if (warnings.includes("invalid_target")) parts.push("Prometheus reported targets the Hub couldn't read; they're left out.");
+  if (warnings.includes("series_truncated")) parts.push("Some machines reported more disks, GPUs or programs than are listed.");
+  return parts.length ? parts.join(" ") : null;
+}
+function MachineHead({ group, link }: { group: MachineGroup; link: boolean }) {
+  return <div className="machine-card-head">
+    <strong>{link && group.device_id ? <a href={href({ page: "device", id: group.device_id })}>{group.title}</a> : group.title}</strong>
+    {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
+    {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
+    {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
+    {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+  </div>;
+}
 const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as const;
 
 function statusBadge(item: MachineTarget, now: Date) {
@@ -71,7 +90,7 @@ function TargetBody({ item }: { item: MachineTarget }) {
       <tbody>{item.top_processes.map(row => <tr key={row.name}>
         <td>{row.name}</td><td>{row.count ?? "?"}</td><td>{formatBytes(row.working_set_bytes)}</td></tr>)}</tbody>
     </table>}
-    {item.exporter === null && <p className="infra-empty">Only scrape status is configured for this target.</p>}
+    {item.exporter === null && <p className="infra-empty">Not a recognized exporter, so only whether it's being scraped is shown.</p>}
   </div>;
 }
 
@@ -99,7 +118,8 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
   const targets = metrics ? metrics.targets.filter(item => deviceId === undefined || item.device_id === deviceId) : [];
   if (metrics && deviceId !== undefined && targets.length === 0) return null;
   const groups = groupMachines(targets);
-  const notice = metrics ? SOURCE_TEXT[metrics.source] : null;
+  const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
+  const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
   return <section className="panel" aria-label="Machine health">
     <PanelTitle title="Machine health" count={metrics && deviceId === undefined ? groups.length : undefined}>
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={() => setAttempt(value => value + 1)}>
@@ -109,19 +129,17 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
-    {metrics && targets.length === 0 && <p className="infra-empty">No Prometheus targets are mapped to devices yet.</p>}
+    {omitted && <p className="notice" role="status">{omitted}</p>}
+    {metrics && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
+      <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card">
-      <div className="machine-card-head">
-        <strong>{group.title}</strong>
-        {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
-        {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
-      </div>
+      <MachineHead group={group} link={deviceId === undefined} />
       {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
         <div className="machine-section-head">
           <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
           {statusBadge(item, now)}
         </div>
-        {metrics?.source !== "unreachable" && <TargetBody item={item} />}
+        {metrics?.source.status !== "unreachable" && <TargetBody item={item} />}
       </div>)}
     </li>)}</ul>}
   </section>;
