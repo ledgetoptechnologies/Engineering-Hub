@@ -334,6 +334,20 @@ test("an unreachable discovery source shows no machines and no zeros", async ({ 
   await expect(panel.getByRole("meter")).toHaveCount(0);
 });
 
+test("machine health shows even when the device list is refused, and stays hidden when metrics are too", async ({ page }) => {
+  const refused = { status: 403, body: { detail: { code: "infrastructure_forbidden" } } };
+  await fixture(page, { list: [refused], metrics: [discovered("discovered")] });
+  await page.goto("/#/infrastructure");
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await expect(healthPanel(page)).toContainText("demo-workstation");
+  await page.unrouteAll();
+  await fixture(page, { list: [refused], metrics: [{ status: 403, body: { detail: { code: "forbidden" } } }] });
+  await page.reload();
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await expect(healthPanel(page)).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("192.0.2.");
+});
+
 test("machine health stays hidden without metrics access or when not set up", async ({ page }) => {
   for (const reply of [{ status: 403, body: { detail: { code: "forbidden" } } }, { status: 404, body: { detail: { code: "infrastructure_metrics_not_configured" } } }]) {
     await page.unrouteAll();
