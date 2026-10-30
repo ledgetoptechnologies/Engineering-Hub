@@ -60,10 +60,13 @@ class Settings:
     require_owned_ledger: bool = False
     staging_config_path: Path | None = None
     infrastructure_config_path: Path | None = None
+    infrastructure_default_path: Path | None = None
 
     def __post_init__(self):
         if type(self.require_owned_ledger) is not bool:
             raise ValueError('Explicit owned-ledger flag required')
+        if self.infrastructure_default_path is not None and not isinstance(self.infrastructure_default_path, Path):
+            raise ValueError('Infrastructure default path must be a Path')
         if self.require_owned_ledger:
             from .protected_layout import database_path
             if self.database != database_path():
@@ -139,6 +142,8 @@ class Settings:
                    staging_config_path=(deployment.state_root / 'staging-service.json'
                                         if deployment is not None else path.parent / 'staging-service.json'),
                    infrastructure_config_path=(deployment.state_root / 'infrastructure.json'
+                                        if deployment is not None else path.parent / 'infrastructure.json'),
+                   infrastructure_default_path=(deployment.state_root / 'infrastructure.json'
                                         if deployment is not None else path.parent / 'infrastructure.json'))
 
 
@@ -501,7 +506,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     infrastructure = compose_infrastructure(
         settings.infrastructure_config_path or Path(settings.database).parent / 'infrastructure.json',
         state_root=Path(settings.database).parent, on_change=infrastructure_changed,
-        default_owner=metrics_owner if settings.infrastructure_config_path is None else None)
+        default_owner=metrics_owner if (settings.infrastructure_config_path is None
+                                        or settings.infrastructure_config_path == settings.infrastructure_default_path) else None)
     metrics_access = None
 
     def clear_metrics_transport():

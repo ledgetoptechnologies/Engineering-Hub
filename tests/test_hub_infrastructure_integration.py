@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -50,6 +51,33 @@ def draft():
     return {'name': 'Synthetic PC', 'hostname': 'pc.example.test', 'addresses': ['192.0.2.1'],
             'network': '192.0.2.0/24', 'vlan': None, 'role': 'Fixture',
             'retired': False, 'expected_revision': 0}
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Real private SQLite/file owner composition')
+def test_environment_default_path_uses_owner_and_respects_operator_disable(tmp_path, monkeypatch):
+    monkeypatch.setenv('HUB_DB', str(tmp_path / 'hub.sqlite3'))
+    monkeypatch.setenv('HUB_BASE_URL', 'https://hub.test')
+    monkeypatch.setenv('HUB_BEAU_GITHUB_ID', '42')
+    monkeypatch.setenv('HERMES_TOKEN', 'test-hermes')
+    monkeypatch.setenv('CODEX_TOKEN', 'test-codex')
+    monkeypatch.delenv('AGENT_BUS_DB', raising=False)
+    config = Settings.from_env()
+    assert config.infrastructure_config_path == tmp_path / 'infrastructure.json'
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        login(client, app, config)
+        assert app.state.infrastructure.state == 'ready'
+        assert client.get('/api/hub/v1/overview').json()['capabilities']['infrastructure'] is True
+        assert app.state.infrastructure.prometheus_origin.url == 'http://192.168.50.80:30104'
+    config.infrastructure_config_path.write_text(json.dumps({'schema_version': 1, 'enabled': False, 'principals': []}))
+    config.infrastructure_config_path.chmod(0o600)
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin):
+        assert app.state.infrastructure.state == 'disabled'
+    custom = replace(config, infrastructure_config_path=tmp_path / 'custom-missing.json')
+    app = create_app(custom)
+    with TestClient(app, base_url=custom.auth_config.origin):
+        assert app.state.infrastructure.state == 'disabled'
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='Real private SQLite/file owner composition')

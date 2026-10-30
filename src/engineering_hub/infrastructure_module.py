@@ -183,6 +183,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
     module=InfrastructureModule()
     if path is None:
         return module
+    used_default = False
     try:
         enabled,grants,prometheus=_settings(path)
     except FileNotFoundError:
@@ -194,6 +195,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
                 r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', default_owner) is None):
             module.state='invalid';return module
         enabled, prometheus = True, None
+        used_default = True
         grants = {InfrastructurePrincipal('human', default_owner): CAPABILITIES}
         grants.update({InfrastructurePrincipal('agent', agent): frozenset({'read'}) for agent in AGENTS})
     except Exception:
@@ -287,7 +289,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             if prometheus[1]:
                 module.collector=PrometheusCollector(service,*prometheus)
                 module.metrics=MetricsReader(service,*prometheus)
-        elif default_owner is not None:
+        elif used_default:
             from .infrastructure_prometheus import PrometheusOrigin
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
