@@ -87,7 +87,7 @@ def headers(actor='codex', *, csrf=False):
     return result
 
 
-def application(controller, *, broker=None, session=None):
+def application(controller, *, broker=None, session=None, observer=None):
     app = FastAPI()
     calls = []
 
@@ -115,7 +115,7 @@ def application(controller, *, broker=None, session=None):
         HubRepository._actor(principal, human=True)
         return principal
 
-    attach_staging_routes(app, controller, actor, human, broker, session)
+    attach_staging_routes(app, controller, actor, human, broker, session, observer=observer)
     return TestClient(app), calls
 
 
@@ -317,3 +317,29 @@ def test_duplicate_bearer_does_not_fall_back_to_human(env):
     response = client.get(PREFIX + '/status', headers=[('Authorization', 'Bearer codex'),
         ('Authorization', 'Bearer claude'), ('X-Test-Human', ADMIN)])
     assert response.status_code == 401
+
+
+def test_observer_is_independent_and_human_admin_only():
+    class Observer:
+        admin_actors = frozenset({ADMIN})
+        calls = []
+        async def runtime(self, actor):
+            self.calls.append(actor)
+            return {'configured': True, 'state': 'unavailable', 'snapshot': None}
+    observer = Observer()
+    client, _ = application(None, observer=observer)
+    for principal in (None, 'codex', 'human:2'):
+        result = client.get(PREFIX + '/runtime', headers={} if principal is None else headers(principal))
+        assert result.status_code == (401 if principal is None else 403)
+    assert observer.calls == []
+    result = client.get(PREFIX + '/runtime', headers=headers(ADMIN))
+    assert result.json() == {'configured': True, 'state': 'unavailable', 'snapshot': None}
+    assert observer.calls == [ADMIN]
+
+
+def test_disabled_or_invalid_observer_never_falls_back_to_worker(env):
+    client, _ = application(env[3], observer=False)
+    for identity in (ADMIN, 'human:2'):
+        response = client.get(PREFIX + '/runtime', headers=headers(identity))
+        assert response.status_code == 503
+    assert env[3].calls == []

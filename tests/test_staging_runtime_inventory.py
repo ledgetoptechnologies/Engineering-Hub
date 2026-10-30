@@ -346,10 +346,23 @@ def test_unsafe_snapshot_files_are_rejected(kind):
 
 
 def test_collector_script_has_no_endpoint_or_arbitrary_command_options():
-    source = Path('scripts/collect_staging_runtime.py').read_text()
+    source = Path('src/hub_staging_service/collector.py').read_text()
     assert "add_argument('--output'" in source
     assert "add_argument('--once'" in source
     assert "sleep(30)" in source
     assert 'Popen' not in source
     assert 'shell=True' not in source
 
+
+
+def test_collector_wheel_entrypoint_uses_single_packaged_implementation():
+    import tomllib
+    from hub_staging_service import collector
+
+    package = tomllib.loads(Path('services/staging/pyproject.toml').read_text())
+    assert package['project']['scripts']['hub-staging-runtime-collector'] == 'hub_staging_service.collector:main'
+    assert 'hub_staging_service' in package['tool']['setuptools']['packages']
+    assert callable(collector.main)
+    launcher = Path('scripts/collect_staging_runtime.py').read_text()
+    assert 'from hub_staging_service.collector import main' in launcher
+    assert 'collect_host' not in launcher and 'publish_host' not in launcher
