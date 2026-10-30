@@ -46,8 +46,8 @@ identity before enrollment.
 
 ## Inert private proxy example
 
-`deployment/staging-observer/nginx-http.conf` is a non-installing NGINX http
-context example, not a validated or running configuration. Independently review
+`deployment/staging-observer/nginx-http.conf` is a BLOCKED, non-installing
+NGINX http context draft. It must not be deployed. Independently review
 and replace every placeholder with a verified bind address, distinct free ports,
 certificate paths and actual NAS source. It accepts only the original exact
 `GET:/v1/runtime` including absence of a query string; the dedicated bearer is
@@ -73,3 +73,15 @@ under bounded connection load; upstream unavailable/stale; and resource limits.
 Then test the actual NAS-to-staging route and rollback of only the newly owned
 proxy and firewall rule. Static checks and a successful syntax test do not prove
 firewall enforcement, TLS peer identity, resource limits, or live readiness.
+
+Independent review identified three unresolved proxy trust boundaries. NGINX
+may normalize duplicate Authorization headers before forwarding `$http_authorization`,
+so the observer may see only one header and cannot enforce its duplicate-header
+rejection on the original request. NGINX error logs may include request URIs,
+even with access logs disabled. Finally, source filtering depends on actual TCP
+peer addresses; inherited real-IP rewriting or forwarded headers could change the
+meaning of `allow`. A dedicated configuration without real-IP rewriting and a
+tested duplicate-header rejection mechanism are required, along with a reviewed
+error-log policy. No complete mechanism has been validated here. Do not infer
+safety from the template or static test; a syntax check alone would not resolve
+these boundaries.
