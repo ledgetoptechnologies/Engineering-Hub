@@ -76,7 +76,9 @@ def test_owner_routes_caps_csrf_invalidation_and_lifetime(tmp_path):
         with app.state.repository._connection() as db:
             assert db.execute("SELECT count(*) FROM hub_outbox WHERE action='views.invalidated'").fetchone()[0] == 2
         denied = {'Authorization': 'Bearer test-codex'}
-        assert client.get('/api/hub/v1/overview', headers=denied).json()['capabilities']['infrastructure'] is False
+        # Internal metrics admission exposes navigation independently of registry
+        # read/write grants, which remain denied below.
+        assert client.get('/api/hub/v1/overview', headers=denied).json()['capabilities']['infrastructure'] is True
         for suffix in ('/devices', '/devices/synthetic-pc', '/devices/missing'):
             assert client.get(BASE + suffix, headers=denied).status_code == 403
         assert client.put(BASE + '/devices/anything', headers=denied, content='not-json').status_code == 403
