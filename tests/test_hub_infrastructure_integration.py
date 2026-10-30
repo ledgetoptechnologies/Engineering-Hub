@@ -102,6 +102,20 @@ def test_missing_optional_settings_do_not_open_inventory(tmp_path):
         assert not (tmp_path / 'infrastructure').exists()
 
 
+def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path):
+    config = settings(tmp_path)
+    operator = json.loads(config.infrastructure_config_path.read_text())
+    operator['principals'] = []
+    config.infrastructure_config_path.write_text(json.dumps(operator))
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        login(client, app, config)
+        assert client.get(BASE + '/devices').status_code == 403
+        assert client.get('/api/hub/v1/overview').json()['capabilities']['infrastructure']
+        response = client.get(BASE + '/metrics')
+        assert response.status_code == 200 and response.json()['source']['status'] == 'not_configured'
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='Actual private inventory and session composition')
 def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tmp_path, monkeypatch):
     from engineering_hub.infrastructure_metrics import MetricsReader, QUERIES
