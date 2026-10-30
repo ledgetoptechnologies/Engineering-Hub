@@ -103,7 +103,9 @@ test("select all active skips revoked installations and can be set back to not s
   await review.getByLabel("Mark selected as").selectOption("unclassified");
   await review.getByRole("checkbox", { name: /Thomas's Claude/ }).check();
   await review.getByRole("button", { name: "Mark 1 as not set…" }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "Confirm" }).click();
+  const confirmation = page.getByRole("dialog");
+  await confirmation.getByRole("button", { name: "Confirm" }).click();
+  await expect(confirmation).toBeHidden();
   await expect(review.getByRole("listitem").filter({ hasText: "Thomas's Claude" })).toContainText("Not set");
   expect(state.puts[1].body).toEqual({ kind: "unclassified", installations: [{ installation_id: "inst_guest", expected_revision: 1 }] });
 });
