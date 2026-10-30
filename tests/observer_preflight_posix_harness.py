@@ -65,9 +65,10 @@ hardlink = root / 'hardlink'
 os.link(token, hardlink)
 expect(cred='unavailable')
 hardlink.unlink()
-link = root / 'link'
-link.symlink_to(token.name)
-token.rename(root / 'real-token')
-link.rename(token)
+real_token = root / 'real-token'
+token.rename(real_token)
+token.symlink_to(real_token.name)
+assert token.is_symlink() and real_token.is_file()
+assert token.resolve(strict=True) == real_token
 expect(cred='unavailable')
 print('POSIX preflight integration: 10 cases passed')
