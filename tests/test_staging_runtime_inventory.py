@@ -451,3 +451,47 @@ def test_collector_main_publishes_real_fail_closed_snapshot(monkeypatch, capsys)
         assert snapshot['sources'] == [inventory._source('host', 'unavailable')]
         assert snapshot['containers'] == snapshot['services'] == []
         assert secret not in output.err + path.read_text()
+
+@pytest.mark.parametrize('kind', ['spawn', 'timeout', 'overflow', 'reader', 'exit'])
+def test_capture_failure_subcodes_are_fixed_and_snapshot_stays_unavailable(monkeypatch, kind):
+    secret = 'SECRET-command-output-and-path'
+    child = CapturedProcess(b'x' * 5 if kind == 'overflow' else b'', running=kind == 'timeout')
+    if kind == 'exit':
+        child.returncode = 17
+    if kind == 'reader':
+        class BrokenStream(io.BytesIO):
+            def read(self, size):
+                raise OSError(secret)
+        child.stdout = BrokenStream()
+    def start(*args, **kwargs):
+        if kind == 'spawn':
+            raise OSError(secret)
+        return child
+    monkeypatch.setattr(subprocess, 'Popen', start)
+    if kind == 'timeout':
+        ticks = iter([0, 9])
+        monkeypatch.setattr(inventory.time, 'monotonic', lambda: next(ticks))
+    messages = []
+    def capture(command):
+        return inventory.capture_fixed(command, maximum=4)
+    result = inventory.collect_host(now=NOW, capture=capture, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_' + kind]
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert result['containers'] == result['services'] == []
+    assert secret not in str(messages) + json.dumps(result)
+
+
+def test_capture_failure_service_subcode_and_untrusted_error_fallback():
+    messages = []
+    def capture(command):
+        if command == inventory.HOST_DOCKER_COMMAND:
+            return b''
+        raise inventory._CaptureFailure('exit')
+    result = inventory.collect_host(now=NOW, capture=capture, diagnostic=messages.append)
+    assert messages == ['staging_runtime_service_capture_failed_exit']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    messages.clear()
+    def untrusted(command):
+        raise RuntimeError('SECRET')
+    inventory.collect_host(now=NOW, capture=untrusted, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed']

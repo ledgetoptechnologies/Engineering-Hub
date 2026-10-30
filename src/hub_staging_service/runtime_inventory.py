@@ -106,18 +106,31 @@ def parse_services(raw):
     return sorted(result, key=lambda item: item['name'])
 
 
+class _CaptureFailure(ValueError):
+    def __init__(self, reason):
+        super().__init__('inventory_unavailable')
+        self.reason = reason
+
+
+class _CaptureSpawnFailure(OSError):
+    reason = 'spawn'
+
+
 def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
     """Capture a fixed trusted child with a bounded reader and monotonic deadline."""
     if tuple(command) not in {HOST_DOCKER_COMMAND, HOST_SERVICES_COMMAND}:
         raise ValueError('fixed_inventory_command_required')
-    output, failed, overflow = bytearray(), threading.Event(), threading.Event()
+    output, failed, overflow, reader_failed = bytearray(), threading.Event(), threading.Event(), threading.Event()
     reader, started, expired = None, False, False
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL,
                                env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
                                     'DOCKER_CONFIG': '/nonexistent/eh-observer-no-config',
                                     'SYSTEMD_COLORS': '0', 'SYSTEMD_PAGER': 'cat'},
                                start_new_session=True)
+    except Exception as exc:
+        raise _CaptureSpawnFailure('inventory_unavailable') from exc
     def drain():
         try:
             while chunk := process.stdout.read(4096):
@@ -126,6 +139,7 @@ def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
                 if len(chunk) > available:
                     overflow.set()
         except Exception:
+            reader_failed.set()
             failed.set()
         finally:
             process.stdout.close()
@@ -137,7 +151,7 @@ def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
         deadline = time.monotonic() + timeout
         while process.poll() is None:
             if overflow.is_set() or failed.is_set() or time.monotonic() >= deadline:
-                expired = True
+                expired = not overflow.is_set() and not failed.is_set()
                 process.kill()  # Only the child created above.
                 break
             time.sleep(0.01)
@@ -165,7 +179,10 @@ def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
                 process.stdout.close()
     if (expired or overflow.is_set() or failed.is_set() or not started
             or reader.is_alive() or process.returncode):
-        raise ValueError('inventory_unavailable')
+        reason = ('overflow' if overflow.is_set() else 'reader' if reader_failed.is_set()
+                  else 'internal' if failed.is_set() or not started or reader.is_alive()
+                  else 'timeout' if expired else 'exit')
+        raise _CaptureFailure(reason)
     return bytes(output)
 
 
@@ -192,7 +209,11 @@ def collect_host(*, now=None, capture=capture_fixed, diagnostic=None):
         stage = 'staging_runtime_snapshot_size_failed'
         if len(json.dumps(result, separators=(',', ':')).encode()) > MAX_BYTES:
             raise ValueError('inventory_size')
-    except Exception:
+    except Exception as exc:
+        if (type(exc) in {_CaptureFailure, _CaptureSpawnFailure} and stage in {
+                'staging_runtime_docker_capture_failed', 'staging_runtime_service_capture_failed'}
+                and exc.reason in {'spawn', 'timeout', 'overflow', 'reader', 'internal', 'exit'}):
+            stage = stage + '_' + exc.reason
         result = _empty(now)
         result['sources'] = [_source('host', 'unavailable')]
         if diagnostic is not None:
