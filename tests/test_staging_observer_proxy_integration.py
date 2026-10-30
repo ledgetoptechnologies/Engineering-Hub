@@ -3,6 +3,8 @@ import base64
 import os
 from pathlib import Path
 import shutil
+import re
+import sys
 import subprocess
 import uuid
 
@@ -80,20 +82,40 @@ def test_isolated_nginx_observer_proxy():
     if docker is None:
         pytest.skip('Docker CLI unavailable')
     try:
-        inspect = subprocess.run([docker, 'image', 'inspect', IMAGE], capture_output=True, timeout=10)
+        inspect = subprocess.run([docker, 'image', 'inspect', '--format', '{{.Id}}', IMAGE],
+                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pytest.skip('Docker runtime unavailable')
     if inspect.returncode:
         pytest.skip('Docker runtime or cached NGINX image unavailable')
+    image_id = inspect.stdout.strip()
+    assert re.fullmatch(r'sha256:[0-9a-f]{64}', image_id), 'invalid cached image identity'
+    print('NGINX test image:', image_id, flush=True)
     template = Path('deployment/staging-observer/nginx-http.conf').read_bytes()
     script = 'TEMPLATE = ' + repr(base64.b64encode(template).decode()) + '\n' + CONTAINER_TEST
     name = 'eh-observer-proxy-test-' + uuid.uuid4().hex
     try:
         result = subprocess.run([docker, 'run', '--rm', '-i', '--name', name, '--pull=never', '--network', 'none',
-            '--memory', '128m', '--cpus', '0.5', '--pids-limit', '32', '--entrypoint', 'python3', IMAGE, '-'],
+            '--memory', '128m', '--cpus', '0.5', '--pids-limit', '32', '--entrypoint', 'python3', image_id, '-'],
             input=script, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         assert 'adversarial checks passed' in result.stdout
     finally:
-        # Exact random task-owned name only; also stops a run after timeout.
-        subprocess.run([docker, 'rm', '-f', name], capture_output=True, timeout=10)
+        original = sys.exception()
+        problem = None
+        try:
+            removal = subprocess.run([docker, 'rm', '-f', name], capture_output=True, text=True, timeout=10)
+            check = subprocess.run([docker, 'container', 'inspect', name], capture_output=True, text=True, timeout=10)
+            if removal.returncode and 'No such container' not in removal.stderr and 'No such object' not in removal.stderr:
+                problem = 'container removal command failed'
+            if check.returncode == 0:
+                problem = 'task-owned container still exists after cleanup'
+            elif 'No such object' not in check.stderr and 'No such container' not in check.stderr:
+                problem = 'could not verify task-owned container absence'
+        except (OSError, subprocess.TimeoutExpired):
+            problem = 'could not verify task-owned container absence'
+        if problem:
+            if original is not None:
+                original.add_note('Cleanup failure: ' + problem)
+            else:
+                pytest.fail('Cleanup failure: ' + problem)
