@@ -306,3 +306,33 @@ def test_trusted_guard_write_postcheck_rolls_back_before_commit():
         assert registry.db.execute('SELECT count(*) FROM infra_devices').fetchone()[0]==0
         assert registry.db.execute('SELECT count(*) FROM infra_events').fetchone()[0]==0
     finally:registry.close()
+
+
+def test_startup_diagnostics_are_bounded_and_do_not_expose_configuration(tmp_path, caplog):
+    secret = 'private-token-in-path-and-content'
+    path = tmp_path / secret
+    path.write_text(secret)
+    module = compose_infrastructure(path, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'config_unreadable_or_invalid' in caplog.text
+    assert secret not in caplog.text and str(tmp_path) not in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(tmp_path / 'absent', state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'config_missing_no_default_owner' in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(write(tmp_path / 'disabled', config(False)), state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'explicitly_disabled' in caplog.text
+
+
+@POSIX
+def test_startup_diagnostics_identify_private_directory_failure(tmp_path, caplog):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
