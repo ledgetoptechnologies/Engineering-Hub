@@ -106,3 +106,12 @@ pulls an image or publishes a host port; it runs a bounded networkless container
 and removes its exact task-owned container. It skips if the Docker runtime or
 cached image is unavailable. These checks do not prove production configuration,
 startup-failure secrecy, kernel firewall behavior, or TLS acceptance.
+
+The opt-in suite also runs `tests/test_staging_observer_tls_integration.py`
+using two cached immutable images sharing a networkless namespace and a
+task-owned volume, with no published ports. It tests the real Hub client,
+observer and proxy using synthetic TLS and a fabricated protected snapshot.
+The collector is not run: the snapshot is fixture data. Both containers run as
+root for fixture creation, so this does not validate the planned unprivileged
+observer identity, production filesystem permissions, source firewall or live
+NAS route. Both containers and the volume are removed and absence verified.
