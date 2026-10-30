@@ -140,23 +140,26 @@ async def test_cap_malformed_and_oversized_target_response(service):
 async def test_successful_target_discovery_survives_query_phase_failure(service, monkeypatch, query_failure):
     from engineering_hub import infrastructure_discovery_metrics as module
     from engineering_hub.infrastructure_metrics import _Exhausted
-    target_returned = asyncio.Event()
-    respond = handler([target('node')])
+    target_parsed, first_query_completed = asyncio.Event(), asyncio.Event()
+    parse_targets = module._discovery_targets
 
-    def transport(request):
-        response = respond(request)
-        if request.url.raw_path.decode() == TARGET_PATH:
-            target_returned.set()
-        return response
+    def record_parsed_targets(raw):
+        result = parse_targets(raw)
+        target_parsed.set()
+        return result
 
-    instance = reader(service, transport)
+    monkeypatch.setattr(module, '_discovery_targets', record_parsed_targets)
+    instance = reader(service, handler([target('node')]))
 
     async def unavailable_query(client, query, budget):
-        await target_returned.wait()
-        # Allow the successful target response to finish parsing before failing
-        # the independent query phase; no actual network or slow server is used.
-        await asyncio.sleep(0.01 if query_failure == 'budget' else 10)
-        raise _Exhausted()
+        await target_parsed.wait()
+        if query == QUERIES[0][2]:
+            first_query_completed.set()
+            return [({'job': 'node', 'instance': 'pc:9100'}, 0.25)]
+        await first_query_completed.wait()
+        if query_failure == 'budget':
+            raise _Exhausted()
+        await asyncio.Event().wait()
 
     instance._query = unavailable_query
     monkeypatch.setattr(module, 'DEADLINE_SECONDS', 0.2)
@@ -164,4 +167,4 @@ async def test_successful_target_discovery_survives_query_phase_failure(service,
     assert result['source']['status'] == 'partial'
     assert result['source']['warnings'] == ['query_failed']
     assert [(row['job'], row['instance']) for row in result['devices']] == [('node', 'pc:9100')]
-    assert result['devices'][0]['cpu_busy_ratio'] is None
+    assert result['devices'][0]['cpu_busy_ratio'] == 0.25
