@@ -111,10 +111,11 @@ The opt-in suite also runs `tests/test_staging_observer_tls_integration.py`
 using two cached immutable images sharing a networkless namespace and a
 task-owned volume, with no published ports. It tests the real Hub client,
 observer and proxy using synthetic TLS and a fabricated protected snapshot.
-The collector is not run: the snapshot is fixture data. Both containers run as
-root for fixture creation, so this does not validate the planned unprivileged
-observer identity, production filesystem permissions, source firewall or live
-NAS route. Both containers and the volume are removed and absence verified.
+The collector is not run: the snapshot is fixture data. Both containers use root for fixture creation and the Hub client; the observer
+process drops supplementary groups and runs as synthetic UID/GID 12345 with its
+own mode-0600 token. Root-owned snapshots and ancestor protections are checked,
+including unsafe modes. This does not validate the actual service account, Hub
+UID 568 file permissions, host firewall or live NAS route. Both containers and the volume are removed and absence verified.
 
 The same isolated test composes the actual Hub application and exercises its
 authenticated runtime route using a synthetic internally created human session.

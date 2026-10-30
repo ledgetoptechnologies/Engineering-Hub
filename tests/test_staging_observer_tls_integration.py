@@ -34,7 +34,7 @@ subprocess.run(['nginx','-c','/shared/nginx.conf'],check=True)
 '''
 
 CLIENT_TEST = r'''
-import asyncio,datetime,http.client,ipaddress,json,pathlib,socket,ssl,threading
+import asyncio,datetime,http.client,ipaddress,json,os,pathlib,socket,ssl,subprocess,sys,time
 import httpx
 from engineering_hub.staging_client import StagingConnectionConfig
 from engineering_hub.staging_observer import StagingObserver
@@ -45,8 +45,17 @@ r=pathlib.Path('/shared');token=r/'token'; token.write_text('synthetic-test-toke
 now=datetime.datetime.now(datetime.timezone.utc)
 host=_empty(now);host['sources']=[_source('host','observed',_timestamp(now))]
 publish_host(host,r/'snapshot.json')
-server=BoundedServer(('127.0.0.1',18781),handler(r/'snapshot.json','synthetic-test-token-only',{ipaddress.ip_address('127.0.0.1')}))
-thread=threading.Thread(target=server.serve_forever);thread.start()
+observer_token=r/'observer-token'; observer_token.write_text('synthetic-test-token-only')
+os.chown(observer_token,12345,12345); observer_token.chmod(0o600)
+assert not pathlib.Path('/var/run/docker.sock').exists()
+def drop_identity():
+ os.setgroups([]);os.setgid(12345);os.setuid(12345)
+observer=subprocess.Popen([sys.executable,'-m','hub_staging_service.observer','--snapshot',str(r/'snapshot.json'),
+ '--token-file',str(observer_token),'--port','18781'],preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+for _ in range(60):
+ try: socket.create_connection(('127.0.0.1',18781),timeout=.1).close();break
+ except OSError: time.sleep(.05)
+else: raise AssertionError('unprivileged observer failed to start')
 async def run():
  config=StagingConnectionConfig(origin='https://127.0.0.1:19443',credential_file=token,ca_file=r/'ca',admin_actors=frozenset({'human:1'}),enabled=True)
  client=StagingObserver(config)
@@ -55,6 +64,12 @@ async def run():
   host['observed_at']=_timestamp(now-datetime.timedelta(seconds=100));host['sources'][0]['observed_at']=host['observed_at']
   (r/'snapshot.json').write_text(json.dumps(host)); (r/'snapshot.json').chmod(0o644)
   result=await client.runtime('human:1');assert result['snapshot']['sources'][1]['state']=='stale' and not result['snapshot']['containers']
+  (r/'snapshot.json').chmod(0o666)
+  result=await client.runtime('human:1');assert result['snapshot']['sources'][1]['state']=='unavailable' and not result['snapshot']['containers']
+  (r/'snapshot.json').chmod(0o644)
+  r.chmod(0o777)
+  result=await client.runtime('human:1');assert result['snapshot']['sources'][1]['state']=='unavailable'
+  r.chmod(0o755)
  finally: await client.close()
  wrong_token=r/'wrong-token';wrong_token.write_text('wrong-synthetic-token');wrong_token.chmod(0o600)
  for credential,ca in ((token,r/'wrong-ca'),(wrong_token,r/'ca')):
@@ -103,7 +118,7 @@ try:
   assert response.json()['snapshot']['sources'][1]['state']=='stale'
  print('real observer and hub client TLS checks passed')
 finally:
- server.shutdown();server.server_close();thread.join()
+ observer.terminate();observer.wait(timeout=5)
 '''
 
 @pytest.mark.skipif(os.environ.get('EH_TEST_NGINX_PROXY') != '1', reason='explicit opt-in required')
