@@ -145,4 +145,3 @@ read-only at `/repo/src`, `PYTHONPATH=/repo/src`, and no network or host sockets
 It drops supplementary groups and executes checks as UID/GID 12345, including
 negative ownership, mode, symlink, hardlink, identity and stale-snapshot cases.
 It does not test production ACLs or a real service account.
-

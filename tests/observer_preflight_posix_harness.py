@@ -71,5 +71,3 @@ token.rename(root / 'real-token')
 link.rename(token)
 expect(cred='unavailable')
 print('POSIX preflight integration: 10 cases passed')
-
-
