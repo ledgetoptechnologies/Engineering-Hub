@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ownershipRows, UNCLAIMED } from "./pages/WorkOwnership";
+import { CLOCK_SKEW_MS, ownershipRows, UNCLAIMED } from "./pages/WorkOwnership";
 import type { Task } from "./types";
 
 const now = Date.parse("2026-10-30T12:00:00Z");
@@ -52,6 +52,15 @@ describe("who's on what", () => {
   });
   it("leaves the oldest age unknown when no open task records one", () => {
     expect(ownershipRows([task({ owner: "codex", status: "claimed", state_since: null })], now)[0].oldestOpenSince).toBeNull();
+  });
+  it("accepts up to the clock skew ahead, and nothing beyond it", () => {
+    const at = (ms: number) => new Date(now + ms).toISOString();
+    const open = (ms: number) => ownershipRows([task({ owner: "codex", status: "claimed", state_since: at(ms) })], now)[0];
+    const passed = (ms: number) => ownershipRows([task({ owner: "codex", status: "verified", state_since: at(ms) })], now);
+    expect(open(CLOCK_SKEW_MS).oldestOpenSince).toBe(at(CLOCK_SKEW_MS));
+    expect(open(CLOCK_SKEW_MS + 1).oldestOpenSince).toBeNull();
+    expect(passed(CLOCK_SKEW_MS)[0].passedRecently).toBe(1);
+    expect(passed(CLOCK_SKEW_MS + 1)).toEqual([]);
   });
   it("never takes a future time as the oldest open item", () => {
     expect(ownershipRows([task({ owner: "codex", status: "claimed", state_since: ago(-1) })], now)[0].oldestOpenSince).toBeNull();

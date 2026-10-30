@@ -10,6 +10,8 @@ import { actorAvatar, actorName } from "../actors";
 
 export const UNCLAIMED = "unclaimed";
 const RECENT_MS = 7 * 24 * 60 * 60 * 1000;
+/** Clock skew allowed between the Hub and this browser, matching relativeAge (which shows such a time as "just now"). */
+export const CLOCK_SKEW_MS = 30_000;
 
 export interface OwnerRow {
   /** The exact recorded owner, or UNCLAIMED. */
@@ -21,7 +23,7 @@ export interface OwnerRow {
   inReview: number;
   /** Passed review within the last seven days, by when the task entered that state. */
   passedRecently: number;
-  /** Earliest valid, non-future state time among open tasks; null when there is none. */
+  /** Earliest valid state time among open tasks, at most CLOCK_SKEW_MS ahead of now; null when there is none. */
   oldestOpenSince: string | null;
   open: number;
 }
@@ -42,9 +44,10 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
         passedRecently: 0, oldestOpenSince: null, open: 0 };
       rows.set(key, row);
     }
-    // A time in the future can't be how long something has waited, so it counts as unknown.
+    // A time more than CLOCK_SKEW_MS in the future can't be how long something has waited, so it
+    // counts as unknown. Within that skew it's treated as just now, as relativeAge does.
     const recorded = stamp(task.state_since);
-    const since = recorded !== null && recorded <= now + 30_000 ? recorded : null;
+    const since = recorded !== null && recorded <= now + CLOCK_SKEW_MS ? recorded : null;
     if (task.status === "verified") {
       if (since !== null && now - since <= RECENT_MS) row.passedRecently++;
       continue;
