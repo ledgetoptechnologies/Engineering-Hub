@@ -220,19 +220,26 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         selected=Path(state_root).absolute()
         parent=_directory(selected)
         try:
+            stage='state_directory_create'
             try:
                 os.mkdir('infrastructure',0o700,dir_fd=parent)
-                os.chmod('infrastructure',0o700,dir_fd=parent,follow_symlinks=False)
             except FileExistsError:
                 pass
+            else:
+                stage='state_directory_chmod'
+                os.chmod('infrastructure',0o700,dir_fd=parent,follow_symlinks=False)
+            stage='state_directory_open'
             root_fd=os.open('infrastructure',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
             selected_info=os.fstat(parent)
         finally:os.close(parent)
         info=os.fstat(root_fd)
-        _need(info.st_uid==os.getuid() and stat.S_IMODE(info.st_mode)==0o700)
+        stage='state_directory_owner'
+        _need(info.st_uid==os.getuid())
+        stage='state_directory_mode'
+        _need(stat.S_IMODE(info.st_mode)==0o700)
         stage='state_lock'
         fcntl.flock(root_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        stage='state_directory'
+        stage='state_directory_identity'
         directory=selected/'infrastructure'
         _need(_identity(directory.stat(follow_symlinks=False))==_identity(info))
         stage='database_admission'

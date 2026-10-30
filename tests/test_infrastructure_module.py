@@ -334,5 +334,57 @@ def test_startup_diagnostics_identify_private_directory_failure(tmp_path, caplog
     root.chmod(0o755)
     module = compose_infrastructure(settings, state_root=tmp_path)
     assert module.state == 'invalid' and module.service is None
-    assert 'state_directory_failed' in caplog.text
+    assert 'state_directory_mode_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_chmod_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    def fail(*args, **kwargs):
+        raise OSError('private failure detail')
+    monkeypatch.setattr(os, 'chmod', fail)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_chmod_failed' in caplog.text
+    assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_owner_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = os.fstat
+    def altered(fd):
+        info = original(fd)
+        if info.st_ino == root.stat().st_ino:
+            values = list(info)
+            values[4] = info.st_uid + 1
+            return os.stat_result(values)
+        return info
+    monkeypatch.setattr(os, 'fstat', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_owner_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_identity_failure_is_safe(tmp_path, caplog, monkeypatch):
+    import engineering_hub.infrastructure_module as module_impl
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = module_impl._identity
+    calls = 0
+    def altered(info):
+        nonlocal calls
+        calls += 1
+        identity = original(info)
+        return (identity[0], identity[1] + 1) if calls == 3 else identity
+    monkeypatch.setattr(module_impl, '_identity', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_identity_failed' in caplog.text
     assert str(tmp_path) not in caplog.text
