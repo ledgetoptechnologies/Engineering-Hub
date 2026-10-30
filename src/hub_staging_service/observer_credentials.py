@@ -8,8 +8,10 @@ from .runtime_inventory import _secure_directory
 
 def restricted_identity():
     try:
-        return (os.name == 'posix' and os.geteuid() > 0 and os.getegid() > 0
-                and os.getgroups() == [])
+        if os.name != 'posix' or os.geteuid() <= 0:
+            return False
+        gid = os.getegid()
+        return gid > 0 and all(group == gid for group in os.getgroups())
     except (AttributeError, OSError):
         return False
 

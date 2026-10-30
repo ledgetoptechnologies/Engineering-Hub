@@ -94,7 +94,8 @@ def test_credential_rejects_unsafe_file_properties(monkeypatch):
     (123, 456, [], True),
     (0, 456, [], False),
     (123, 0, [], False),
-    (123, 456, [456], False),
+    (123, 456, [456], True),
+    (123, 456, [456, 999], False),
 ])
 def test_restricted_identity_direct(monkeypatch, uid, gid, groups, expected):
     setup(monkeypatch)

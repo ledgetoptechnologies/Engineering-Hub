@@ -112,7 +112,7 @@ using two cached immutable images sharing a networkless namespace and a
 task-owned volume, with no published ports. It tests the real Hub client,
 observer and proxy using synthetic TLS and a fabricated protected snapshot.
 The collector is not run: the snapshot is fixture data. Both containers use root for fixture creation and the Hub client; the observer
-process drops supplementary groups and runs as synthetic UID/GID 12345 with its
+process runs as synthetic UID/GID 12345 with only its effective primary GID in the group list and its
 own mode-0600 token. Root-owned snapshots and ancestor protections are checked,
 including unsafe modes. This does not validate the actual service account, Hub
 UID 568 file permissions, host firewall or live NAS route. Both containers and the volume are removed and absence verified.
@@ -139,9 +139,9 @@ that non-root effective UID and GID. It reports coarse statuses without paths,
 token contents, or snapshot contents. Exit status is zero only when all three local checks are observed; zero is not deployment readiness. It checks the existing snapshot reader and
 schema/freshness guard, and a single-link regular token owned by that UID with
 no group or other permissions, under root-owned non-writable ancestors. It reads
-but never creates or changes either file. The observer uses the same credential checks at startup. Both require an empty
-supplementary group list, which can require a service configuration change and
-does not by itself prove the Docker socket is inaccessible. `observed` is a
+but never creates or changes either file. The observer uses the same credential checks at startup. Both permit no supplementary groups other than the effective primary GID. This
+can require a service configuration change and does not by itself prove the
+Docker socket is inaccessible; verify its actual permissions and ACLs. `observed` is a
 point-in-time check, not a guarantee against later changes or a check of ACLs,
 service unit configuration, or the running process. It is not evidence of
 firewall, connection admission, TLS, NAS access, or pilot acceptance. The proxy

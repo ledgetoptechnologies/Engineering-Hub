@@ -69,7 +69,9 @@ observer_token.unlink();real.rename(observer_token)
 def drop_with_group():
  os.setgroups([12346]);os.setgid(12345);os.setuid(12345)
 assert subprocess.run(command,preexec_fn=drop_with_group,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode != 0
-observer=subprocess.Popen(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def drop_with_primary_group():
+ os.setgroups([12345]);os.setgid(12345);os.setuid(12345)
+observer=subprocess.Popen(command,preexec_fn=drop_with_primary_group,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 for _ in range(60):
  try: socket.create_connection(('127.0.0.1',18781),timeout=.1).close();break
  except OSError: time.sleep(.05)
@@ -81,7 +83,7 @@ try:
  fields=dict(line.split(':',1) for line in status.read_text().splitlines() if ':' in line)
  assert fields['Uid'].split()[:3] == ['12345']*3
  assert fields['Gid'].split()[:3] == ['12345']*3
- assert fields['Groups'].strip() == ''
+ assert fields['Groups'].split() == ['12345']
  assert not pathlib.Path('/var/run/docker.sock').exists()
 except BaseException:
  observer.terminate();observer.wait(timeout=5)

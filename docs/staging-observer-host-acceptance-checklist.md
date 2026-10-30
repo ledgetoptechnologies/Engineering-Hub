@@ -24,7 +24,7 @@ Existing production services and data must be preserved.
   disjoint from protected TEST and unrelated workloads. Do not infer physical
   isolation or writer exclusion from a different Engine ID.
 - [ ] Select a dedicated non-root observer UID/GID. Require and verify that the
-  observer has no supplementary groups, clear capabilities, and no effective
+  observer has no supplementary groups beyond its effective primary GID, clear capabilities, and no effective
   access to any Docker socket; define bounded process and connection resources.
   This applies to the snapshot-only observer, not the separate collector that
   reads its explicitly selected Docker endpoint. The effective-UID guard alone
