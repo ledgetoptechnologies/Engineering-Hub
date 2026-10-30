@@ -98,3 +98,11 @@ startup failures or all versions and modules are safe. In the same isolated
 configuration duplicate Authorization produced 400; method, query, encoded and
 case variants produced 404; an unapproved loopback peer with a spoofed forwarded
 IP produced 403. These are version-specific tests, not production acceptance.
+
+To repeat the isolated, synthetic proxy checks with the existing cached test
+image, set `EH_TEST_NGINX_PROXY=1` and run
+`pytest tests/test_staging_observer_proxy_integration.py`. The harness never
+pulls an image or publishes a host port; it runs a bounded networkless container
+and removes its exact task-owned container. It skips if the Docker runtime or
+cached image is unavailable. These checks do not prove production configuration,
+startup-failure secrecy, kernel firewall behavior, or TLS acceptance.
