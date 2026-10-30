@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 
-from .__main__ import BoundedServer, credentials
+from .__main__ import BoundedServer
+from .observer_credentials import read_observer_credential, restricted_identity
 from .runtime_inventory import _empty, _read_host, _source, _timestamp, _utc, _validate_host
 
 
@@ -59,14 +60,14 @@ def main():
     parser.add_argument('--token-file', required=True, type=Path)
     parser.add_argument('--port', required=True, type=int)
     args = parser.parse_args()
-    geteuid = getattr(os, 'geteuid', None)
-    if not callable(geteuid) or geteuid() <= 0:
+    if not restricted_identity():
         parser.error('unprivileged_observer_required')
     if not args.snapshot.is_absolute() or '..' in args.snapshot.parts or not 1024 <= args.port <= 65535:
         parser.error('absolute snapshot and valid unprivileged port required')
-    token = credentials(args.token_file)
-    if not token.isascii():
-        parser.error('ASCII token required')
+    try:
+        token = read_observer_credential(args.token_file, os.geteuid())
+    except (OSError, ValueError, UnicodeError):
+        parser.error('credential_invalid_or_unprotected')
     server = BoundedServer(('127.0.0.1', args.port), handler(args.snapshot, token, {ipaddress.ip_address('127.0.0.1')}))
     server.daemon_threads = True
     try:

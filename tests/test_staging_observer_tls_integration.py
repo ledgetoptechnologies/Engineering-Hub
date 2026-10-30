@@ -57,6 +57,18 @@ for mode in (0o644,0o000):
  failed=subprocess.run(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
  assert failed.returncode != 0
 observer_token.chmod(0o600)
+link=r/'observer-hardlink';os.link(observer_token,link)
+assert subprocess.run(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode != 0
+link.unlink()
+os.chown(observer_token,12346,12345)
+assert subprocess.run(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode != 0
+os.chown(observer_token,12345,12345)
+real=r/'observer-real-token';observer_token.rename(real);observer_token.symlink_to(real.name)
+assert subprocess.run(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode != 0
+observer_token.unlink();real.rename(observer_token)
+def drop_with_group():
+ os.setgroups([12346]);os.setgid(12345);os.setuid(12345)
+assert subprocess.run(command,preexec_fn=drop_with_group,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode != 0
 observer=subprocess.Popen(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 for _ in range(60):
  try: socket.create_connection(('127.0.0.1',18781),timeout=.1).close();break

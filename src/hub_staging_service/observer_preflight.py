@@ -3,9 +3,9 @@ import argparse
 import json
 import os
 from pathlib import Path
-import stat
 
-from .runtime_inventory import _read_host, _secure_directory, _utc, _validate_host
+from .runtime_inventory import _read_host, _utc, _validate_host
+from .observer_credentials import read_observer_credential, restricted_identity
 
 
 def check(snapshot_path, token_path, expected_uid, expected_gid):
@@ -13,7 +13,7 @@ def check(snapshot_path, token_path, expected_uid, expected_gid):
               'firewall_admission_tls_acceptance': 'not_assessed'}
     if os.name != 'posix' or expected_uid <= 0 or expected_gid <= 0:
         return result
-    if os.geteuid() != expected_uid or os.getegid() != expected_gid:
+    if not restricted_identity() or os.geteuid() != expected_uid or os.getegid() != expected_gid:
         return result
     result['identity'] = 'observed'
     try:
@@ -23,25 +23,7 @@ def check(snapshot_path, token_path, expected_uid, expected_gid):
     except (OSError, ValueError, TypeError, KeyError):
         pass
     try:
-        path = Path(token_path)
-        directory = _secure_directory(path.parent)
-        try:
-            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-            try:
-                info = os.fstat(fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or info.st_uid != expected_uid or stat.S_IMODE(info.st_mode) & 0o077
-                        or info.st_size > 4096):
-                    raise ValueError('credential_protection')
-                # Validate the opened file itself; never print its contents.
-                raw = os.read(fd, 4097)
-                token = raw.decode('utf-8').strip()
-                if not token.isascii() or not 16 <= len(token) <= 4096 or '\n' in token or '\r' in token:
-                    raise ValueError('credential_invalid')
-            finally:
-                os.close(fd)
-        finally:
-            os.close(directory)
+        read_observer_credential(token_path, expected_uid)
         result['credential'] = 'observed'
     except (OSError, ValueError, UnicodeError):
         pass

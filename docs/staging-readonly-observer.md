@@ -139,9 +139,10 @@ that non-root effective UID and GID. It reports coarse statuses without paths,
 token contents, or snapshot contents. Exit status is zero only when all three local checks are observed; zero is not deployment readiness. It checks the existing snapshot reader and
 schema/freshness guard, and a single-link regular token owned by that UID with
 no group or other permissions, under root-owned non-writable ancestors. It reads
-but never creates or changes either file. These token conditions are stricter
-than the observer's own credential loader. `observed` is a point-in-time check,
-not a guarantee against later changes or a check of supplementary groups, ACLs,
+but never creates or changes either file. The observer uses the same credential checks at startup. Both require an empty
+supplementary group list, which can require a service configuration change and
+does not by itself prove the Docker socket is inaccessible. `observed` is a
+point-in-time check, not a guarantee against later changes or a check of ACLs,
 service unit configuration, or the running process. It is not evidence of
 firewall, connection admission, TLS, NAS access, or pilot acceptance. The proxy
 remains BLOCKED and must not be deployed before independent acceptance.

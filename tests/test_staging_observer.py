@@ -64,9 +64,8 @@ def test_http_auth_exact_route_and_no_mutations():
 def test_main_rejects_root_or_missing_posix_identity_before_access(monkeypatch, identity):
     monkeypatch.setattr(sys, 'argv', ['observer', '--snapshot', str(Path.cwd() / 'snapshot'),
                                     '--token-file', str(Path.cwd() / 'token'), '--port', '8781'])
-    monkeypatch.setattr(observer.os, 'geteuid', None if identity is None else lambda: identity,
-                        raising=False)
-    with patch.object(observer, 'credentials') as credentials, \
+    monkeypatch.setattr(observer, 'restricted_identity', lambda: False)
+    with patch.object(observer, 'read_observer_credential') as credentials, \
             patch.object(observer, 'BoundedServer') as server:
         with pytest.raises(SystemExit) as exc:
             observer.main()
@@ -79,7 +78,8 @@ def test_main_accepts_nonroot_identity_and_closes_server(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['observer', '--snapshot', str(Path.cwd() / 'snapshot'),
                                     '--token-file', str(Path.cwd() / 'token'), '--port', '8781'])
     monkeypatch.setattr(observer.os, 'geteuid', lambda: 12345, raising=False)
-    with patch.object(observer, 'credentials', return_value='fake-observer-token-only') as credentials, \
+    monkeypatch.setattr(observer, 'restricted_identity', lambda: True)
+    with patch.object(observer, 'read_observer_credential', return_value='fake-observer-token-only') as credentials, \
             patch.object(observer, 'BoundedServer') as server:
         observer.main()
         credentials.assert_called_once()
