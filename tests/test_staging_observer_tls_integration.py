@@ -50,12 +50,30 @@ os.chown(observer_token,12345,12345); observer_token.chmod(0o600)
 assert not pathlib.Path('/var/run/docker.sock').exists()
 def drop_identity():
  os.setgroups([]);os.setgid(12345);os.setuid(12345)
-observer=subprocess.Popen([sys.executable,'-m','hub_staging_service.observer','--snapshot',str(r/'snapshot.json'),
- '--token-file',str(observer_token),'--port','18781'],preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+command=[sys.executable,'-m','hub_staging_service.observer','--snapshot',str(r/'snapshot.json'),
+ '--token-file',str(observer_token),'--port','18781']
+for mode in (0o644,0o000):
+ observer_token.chmod(mode)
+ failed=subprocess.run(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+ assert failed.returncode != 0
+observer_token.chmod(0o600)
+observer=subprocess.Popen(command,preexec_fn=drop_identity,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 for _ in range(60):
  try: socket.create_connection(('127.0.0.1',18781),timeout=.1).close();break
  except OSError: time.sleep(.05)
-else: raise AssertionError('unprivileged observer failed to start')
+else:
+ observer.terminate();observer.wait(timeout=5)
+ raise AssertionError('unprivileged observer failed to start')
+try:
+ status=pathlib.Path('/proc')/str(observer.pid)/'status'
+ fields=dict(line.split(':',1) for line in status.read_text().splitlines() if ':' in line)
+ assert fields['Uid'].split()[:3] == ['12345']*3
+ assert fields['Gid'].split()[:3] == ['12345']*3
+ assert fields['Groups'].strip() == ''
+ assert not pathlib.Path('/var/run/docker.sock').exists()
+except BaseException:
+ observer.terminate();observer.wait(timeout=5)
+ raise
 async def run():
  config=StagingConnectionConfig(origin='https://127.0.0.1:19443',credential_file=token,ca_file=r/'ca',admin_actors=frozenset({'human:1'}),enabled=True)
  client=StagingObserver(config)
