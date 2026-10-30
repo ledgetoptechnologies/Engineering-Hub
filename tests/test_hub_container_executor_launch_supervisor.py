@@ -1054,6 +1054,17 @@ def test_daemon_pin_rejects_any_host_uid_except_allocated_rootless_pilot(uid):
         launch._DaemonPin('/run/synthetic.sock', 1, 1, uid, 10001, 'synthetic', '1.54')
 
 
+@pytest.mark.parametrize('uid', [0, 10001])
+def test_disjoint_daemon_pin_rejects_root_and_held_account(uid):
+    with pytest.raises(RuntimeError):
+        launch._DaemonPin('/run/synthetic.sock', 1, 1, uid, 10002, 'synthetic', '1.54', disjoint=True)
+
+
+def test_disjoint_daemon_pin_accepts_independently_enrolled_uid():
+    pin = launch._DaemonPin('/run/synthetic.sock', 1, 1, 10002, 10002, 'synthetic', '1.54', disjoint=True)
+    assert pin.uid == 10002
+
+
 def test_fake_engine_missing_rootless_identity_denied_before_image_fetch(short_root):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs, rootless=False) as (pin, requests):
@@ -1223,6 +1234,53 @@ def test_whole_constructor_reads_protected_root_files_without_engine_effects(sho
             authority.close()
         assert Path(kwargs['signing_key_file']).is_file() and Path(kwargs['enrollment_file']).is_file()
         assert requests == []
+
+
+@pytest.mark.parametrize(('schema', 'uid', 'extra'), [
+    ('executor_launch_supervisor_v2', 10002, False),
+    ('executor_launch_supervisor_v3', 10001, False),
+    ('executor_launch_supervisor_v3', 0, False),
+    ('executor_launch_supervisor_v1', 10002, False),
+    ('executor_launch_supervisor_v4', 10002, False),
+    ('executor_launch_supervisor_v3', 10002, True),
+])
+def test_protected_enrollment_rejects_invalid_daemon_policy(short_root, root_journal, schema, uid, extra):
+    legacy_check = launch._rootless_daemon_uid
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['schema'], data['daemon']['uid'] = schema, uid
+        if extra:
+            data['daemon']['disjoint'] = True
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        # The fake Engine fixture bypasses legacy UID admission; restore the
+        # real check so this exercises the actual protected enrollment parser.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(launch, '_rootless_daemon_uid', legacy_check)
+            with pytest.raises(launch.LaunchSupervisorError):
+                launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['schema'] = 'executor_launch_supervisor_v3'
+        data['daemon']['uid'] = 10002
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            assert authority._daemon_pin.uid == 10002
+            authority._guard()
+            authority._pin_sources()
+            # Synthetic server runs as root, not the enrolled UID; no HTTP
+            # request can pass the kernel SO_PEERCRED check.
+            with pytest.raises(RuntimeError):
+                authority._engine.json('GET', '/info', time.monotonic() + 1)
+            assert requests == []
+            profile, status, uid_map, gid_map, mounts = kernel_profile_fixture()
+            launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110001, 110001)
+            with pytest.raises(RuntimeError):
+                launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110002, 110001)
+        finally:
+            authority.close()
 
 
 @pytest.mark.parametrize('mutation', ['public-key', 'profile-pin', 'extra-field', 'consumer-mapping',

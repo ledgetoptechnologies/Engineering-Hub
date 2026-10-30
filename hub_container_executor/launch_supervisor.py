@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, InitVar
 import fcntl
 import hashlib
 import http.client
@@ -304,15 +304,21 @@ class _DaemonPin:
     gid: int
     daemon_id: str
     api_version: str
+    disjoint: InitVar[bool] = False
 
-    def __post_init__(self):
+    def __post_init__(self, disjoint):
         _path(self.socket_path)
         _require(all(type(value) is int and value > 0 for value in (self.pid, self.start_ticks))
                  and all(type(value) is int and 0 <= value < 2**32 - 1 for value in (self.uid, self.gid))
                  and type(self.daemon_id) is str and re.fullmatch(r'[A-Za-z0-9:_.-]{1,128}', self.daemon_id)
                  and type(self.api_version) is str and re.fullmatch(r'1\.[0-9]{2,3}', self.api_version)
                  and int(self.api_version.split('.')[1]) >= 41)
-        _rootless_daemon_uid(self.uid)
+        _require(type(disjoint) is bool)
+        if disjoint:
+            # A separate root-protected v3 enrollment pins this exact UID.
+            _require(self.uid not in (0, 10001))
+        else:
+            _rootless_daemon_uid(self.uid)
 
 
 def _rootless_daemon_uid(uid):
@@ -633,7 +639,7 @@ class LaunchSupervisor:
             _require(type(data) is dict and set(data) == {'schema', 'release', 'image', 'profile', 'daemon',
                 'socket_path', 'consumer_host_uid', 'consumer_host_gid', 'receipt_lifetime_seconds',
                 'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'})
-            _require(data['schema'] == 'executor_launch_supervisor_v2')
+            _require(data['schema'] in ('executor_launch_supervisor_v2', 'executor_launch_supervisor_v3'))
             self._configuration_raw_digest = data['configuration_raw_digest']
             _require(type(self._configuration_raw_digest) is str
                      and _SHA.fullmatch(self._configuration_raw_digest))
@@ -655,7 +661,9 @@ class LaunchSupervisor:
                      and self.image.image_config_id == self.release.image_config_id
                      and self.image.platform == self.release.platform
                      and self.image.source_commit == self.release.implementation_commit)
-            self._daemon_pin = _DaemonPin(**data['daemon'])
+            _require(type(data['daemon']) is dict and 'disjoint' not in data['daemon'])
+            self._daemon_pin = _DaemonPin(**data['daemon'],
+                                          disjoint=data['schema'] == 'executor_launch_supervisor_v3')
             self._socket_path = _path(data['socket_path'])
             self._consumer_uid, self._consumer_gid = data['consumer_host_uid'], data['consumer_host_gid']
             _require(all(type(value) is int and 0 < value < 2**32 - 1

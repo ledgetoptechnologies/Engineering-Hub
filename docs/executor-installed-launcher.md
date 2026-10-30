@@ -21,8 +21,14 @@ or prove live NAS dispatch or reboot recovery.
 
 The supervisor consumes independent root-protected release/image/profile/daemon
 enrollment and an existing raw Ed25519 private key. It does not generate approval
-or keys. Its enrollment schema is `executor_launch_supervisor_v2`; v1 is rejected
-without fallback or implicit migration. The runner's
+or keys. The legacy `executor_launch_supervisor_v2` enrollment remains restricted
+to host daemon UID 10001. The separately reviewed `executor_launch_supervisor_v3`
+uses the same closed enrollment fields and configuration commitment, but pins a
+non-root daemon UID other than 10001 in the independently root-protected daemon
+record. It does not consume the offline selection record, establish disjoint
+storage or resources, or approve a host. Existing peer and process verification
+remain mandatory. V1 is rejected without fallback or implicit migration; v3
+requires a newly reviewed artifact and fresh independent enrollment. The runner's
 separate closed configuration schema is `engineering-hub.installed-executor.v1`.
 Canonical JSON and matching hashes validate shape and consistency, not approval.
 The configuration's exact bytes are pinned by the required top-level root
