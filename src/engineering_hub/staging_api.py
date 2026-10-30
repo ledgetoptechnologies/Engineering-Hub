@@ -258,4 +258,3 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
             session = await session
         result = preview_broker.issue(principal, resource_id, *session)
         return {'url': result['preview_url'], 'expires_at': result['expires_at']}
-

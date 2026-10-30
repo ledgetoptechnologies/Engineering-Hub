@@ -54,4 +54,3 @@ def test_http_auth_exact_route_and_no_mutations():
         server.shutdown()
         server.server_close()
         thread.join()
-
