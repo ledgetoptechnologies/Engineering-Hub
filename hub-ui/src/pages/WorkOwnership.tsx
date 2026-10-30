@@ -62,10 +62,9 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
       || b.passedRecently - a.passedRecently || a.key.localeCompare(b.key));
 }
 
-export function WorkOwnership({ hub, tasks, selected, onSelect }: {
-  hub: Hub; tasks: Task[]; selected: string; onSelect: (key: string) => void;
+export function WorkOwnership({ hub, rows, selected, onSelect }: {
+  hub: Hub; rows: OwnerRow[]; selected: string; onSelect: (key: string) => void;
 }) {
-  const rows = ownershipRows(tasks);
   if (rows.length === 0) return null;
   const name = (row: OwnerRow) => row.owner
     ? actorName(row.owner, { family: row.family, viewer: hub.session?.actor }) : "Unclaimed";

@@ -1,12 +1,12 @@
 import { link } from "../router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
-import { UNCLAIMED, WorkOwnership } from "./WorkOwnership";
+import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -45,9 +45,14 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   const [project, setProject] = useState("all");
   const [status, setStatus] = useState<(typeof statuses)[number]>("all");
   const [query, setQuery] = useState("");
-  const [owner, setOwner] = useState("all");
+  const [chosenOwner, setOwner] = useState("all");
   const needle = query.trim().toLowerCase();
   const inProject = hub.data.tasks.filter((task) => project === "all" || task.project === project);
+  const owners = ownershipRows(inProject);
+  // A refresh can remove the chosen owner's last summary card (withdrawn, or passed review over a week
+  // ago); then the filter, and its "Show everyone" control, would be stranded. Fall back to everyone.
+  const owner = owners.some((row) => row.key === chosenOwner) ? chosenOwner : "all";
+  useEffect(() => { if (owner !== chosenOwner) setOwner("all"); }, [owner, chosenOwner]);
   const byOwner = inProject.filter((task) => owner === "all" || (task.owner ?? UNCLAIMED) === owner);
   const tasks = byOwner.filter((task) => (status === "all" || task.status === status)
     && (!needle || task.title.toLowerCase().includes(needle)));
@@ -76,7 +81,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           ))}
         </div>
       </div>
-      <WorkOwnership hub={hub} tasks={inProject} selected={owner} onSelect={setOwner} />
+      <WorkOwnership hub={hub} rows={owners} selected={owner} onSelect={setOwner} />
       <section className="panel work" id="work">
         <PanelTitle title="Work in motion" count={tasks.length} />
         <p className="panel-description">An owner, an exact candidate, and a separate reviewer.</p>
