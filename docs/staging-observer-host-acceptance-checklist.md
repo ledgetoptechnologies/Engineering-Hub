@@ -23,18 +23,23 @@ Existing production services and data must be preserved.
   network source, and resource headroom. Verify proposed paths and mounts are
   disjoint from protected TEST and unrelated workloads. Do not infer physical
   isolation or writer exclusion from a different Engine ID.
-- [ ] Select a dedicated non-root observer UID/GID, clear unnecessary groups
-  and capabilities, deny Docker socket access, and define bounded process and
-  connection resources. The effective-UID guard alone does not prove isolation.
+- [ ] Select a dedicated non-root observer UID/GID. Require and verify that the
+  observer has no supplementary groups, clear capabilities, and no effective
+  access to any Docker socket; define bounded process and connection resources.
+  This applies to the snapshot-only observer, not the separate collector that
+  reads its explicitly selected Docker endpoint. The effective-UID guard alone
+  does not prove isolation.
 - [ ] Resolve collector reliability before relying on it: bounded one-shot
   operator observations produced both observed and unavailable results, including
   a Docker-capture failure. The credential-free receipts are in the Engineering
   Hub shared note `reviews/staging-collector-one-shot-20261030.md`; these were
   host observations, not repository test results. Identify and correct the
   cause, establish a bounded
-  refresh and monitoring approach, and verify stale/unavailable behavior.
-  Publication exit zero alone does not mean observation succeeded. No scheduler
-  is supplied by the source.
+  refresh and monitoring approach, assign an accountable human owner for its
+  freshness checks and stale/unavailable response, and define the check cadence
+  and freshness threshold. Verify stale/unavailable behavior. Publication exit
+  zero alone does not mean observation succeeded. No scheduler is supplied by
+  the source.
 - [ ] Resolve and independently test the blocked proxy boundaries: duplicate
   Authorization handling, error and startup logging, actual TCP peer semantics,
   pre-header/TLS connection admission, source restriction and effective firewall
@@ -78,9 +83,23 @@ NAS app update or restart under the separately agreed scope.
 Verify the installed Hub build, authenticated human and administrator access,
 actual private route and fresh snapshot through the Hub. Deny an unauthorized
 actor and verify wrong CA/bearer and stale/unavailable results fail closed.
+Exercise authorization with a real authenticated human session whose exact
+identity is in the reviewed `admin_actors` list, then with an authenticated
+human outside that list; verify the former is allowed and the latter denied.
+Synthetic sessions do not establish actual identity-provider mapping or actor
+authorization.
 Record artifact identities, timestamps, coarse states and test outcomes without
 names, credentials or raw telemetry. A source fixture does not prove NAS route,
 actual peer identity, reboot recovery or protected Engine reconciliation.
+
+Before activation, document the approved expected boot behavior for each new
+component and the human owner responsible for checking freshness after restart.
+No autostart or reboot action is implied here. Only after separate explicit
+authorization, verify the actual post-reboot state: only approved components
+start, the snapshot refreshes within its defined freshness threshold, stale or
+unavailable data fails closed, and no job, replay, or protected TEST resource
+action occurs. Source and container-restart fixtures are not host-reboot
+acceptance.
 
 ## Rollback
 
