@@ -241,6 +241,80 @@ class ExecutorLaunchMount(_Closed):
         return self
 
 
+_HELD_HOST_IDS = frozenset({0, 10001})
+_UNUSABLE_DAEMON_IDS = frozenset({0, 10001, 65534})
+
+
+def _map_rows(value):
+    """Closed (inside, outside, length) rows in ascending inside order, no overlaps."""
+    _require(type(value) in {list, tuple} and 2 <= len(value) <= 8)
+    rows = []
+    for row in value:
+        _require(type(row) in {list, tuple} and len(row) == 3 and all(type(item) is int for item in row))
+        inside, outside, length = row
+        _require(inside >= 0 and outside >= 0 and length > 0
+                 and inside + length <= 2**32 and outside + length <= 2**32)
+        rows.append((inside, outside, length))
+    _require(rows == sorted(rows))
+    for left, right in zip(rows, rows[1:]):
+        _require(left[0] + left[2] <= right[0])
+    by_outside = sorted(rows, key=lambda row: row[1])
+    for left, right in zip(by_outside, by_outside[1:]):
+        _require(left[1] + left[2] <= right[1])
+    return tuple(rows)
+
+
+def _proc_map_rows(raw):
+    """Rows from kernel /proc/<pid>/{uid,gid}_map text, in the same closed form."""
+    _require(type(raw) is str and len(raw) <= 65536)
+    rows = []
+    for line in raw.splitlines():
+        fields = line.split()
+        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]+', value) for value in fields))
+        rows.append(tuple(int(value) for value in fields))
+    return _map_rows(sorted(rows))
+
+
+def _covers(rows, host_id):
+    return any(outside <= host_id < outside + length for _, outside, length in rows)
+
+
+def _covers_inside(rows, inside_id):
+    return sum(1 for inside, _, length in rows if inside <= inside_id < inside + length) == 1
+
+
+class DisjointDaemonPolicy(_Closed):
+    """A v3 profile's pinned separate daemon: its account and exact live ID maps.
+
+    Being inside the signed launch profile digest makes this verifier-bound.
+    It describes what must be observed; it is not itself evidence of disjointness.
+    """
+    kind: str
+    engine_id: str
+    daemon_uid: int
+    daemon_gid: int
+    uid_map: tuple[tuple[int, int, int], ...]
+    gid_map: tuple[tuple[int, int, int], ...]
+
+    @field_validator('uid_map', 'gid_map', mode='before')
+    @classmethod
+    def maps(cls, value):
+        return _map_rows(value)
+
+    @model_validator(mode='after')
+    def closed_policy(self):
+        _require(self.kind == 'disjoint-v1'
+                 and re.fullmatch(r'[A-Za-z0-9:_.-]{1,128}', self.engine_id)
+                 and all(0 < value < 2**32 - 1 and value not in _UNUSABLE_DAEMON_IDS
+                         for value in (self.daemon_uid, self.daemon_gid)))
+        # Rootless convention: namespace root is exactly the daemon account.
+        _require(self.uid_map[0] == (0, self.daemon_uid, 1) and self.gid_map[0] == (0, self.daemon_gid, 1))
+        # The executor identity inside must map, and no host range may reach the held account or root.
+        _require(_covers_inside(self.uid_map, 10001) and _covers_inside(self.gid_map, 10001))
+        _require(not any(_covers(rows, host_id) for rows in (self.uid_map, self.gid_map) for host_id in _HELD_HOST_IDS))
+        return self
+
+
 class ExecutorLaunchProfile(_Closed):
     """Exact independently enrolled executor-only profile, NOT an app profile."""
     user: str
@@ -256,6 +330,8 @@ class ExecutorLaunchProfile(_Closed):
     mounts: tuple[ExecutorLaunchMount, ...]
     runner_file: str
     runner_digest: str
+    # Present only in v3 profiles. Absent keeps a legacy profile's exact digest.
+    daemon_policy: DisjointDaemonPolicy | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -292,7 +368,11 @@ class ExecutorLaunchProfile(_Closed):
         return self
 
     def digest(self):
-        return 'sha256:' + hashlib.sha256(_canonical(self.model_dump(mode='json'))).hexdigest()
+        value = self.model_dump(mode='json')
+        if value['daemon_policy'] is None:
+            # Legacy profiles never carried this key; their digest bytes must not change.
+            del value['daemon_policy']
+        return 'sha256:' + hashlib.sha256(_canonical(value)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -315,8 +395,8 @@ class _DaemonPin:
                  and int(self.api_version.split('.')[1]) >= 41)
         _require(type(disjoint) is bool)
         if disjoint:
-            # A separate root-protected v3 enrollment pins this exact UID.
-            _require(self.uid not in (0, 10001))
+            # A separate root-protected v3 enrollment pins this exact UID and GID.
+            _require(self.uid not in _UNUSABLE_DAEMON_IDS and self.gid not in _UNUSABLE_DAEMON_IDS)
         else:
             _rootless_daemon_uid(self.uid)
 
@@ -324,6 +404,43 @@ class _DaemonPin:
 def _rootless_daemon_uid(uid):
     # This deliberately narrow pilot enrolls only the allocated ehpilot daemon.
     _require(uid == 10001)
+
+
+HELD_RANGES_SCHEMA = 'engineering-hub.held-id-ranges.v1'
+
+
+def _host_ranges(value):
+    _require(type(value) is list and 1 <= len(value) <= 16)
+    ranges = []
+    for item in value:
+        _require(type(item) is list and len(item) == 2 and all(type(part) is int for part in item))
+        start, length = item
+        _require(start >= 0 and length > 0 and start + length <= 2**32)
+        ranges.append((start, length))
+    return tuple(ranges)
+
+
+def _held_ranges(raw):
+    """Independently pinned host ID ranges the held TEST account owns; evidence, not discovery."""
+    data = _strict(raw, 65536)
+    _require(type(data) is dict and set(data) == {'schema', 'uid_ranges', 'gid_ranges', 'evidence_sha256'}
+             and data['schema'] == HELD_RANGES_SCHEMA
+             and type(data['evidence_sha256']) is str and _HEX.fullmatch(data['evidence_sha256']))
+    uids, gids = _host_ranges(data['uid_ranges']), _host_ranges(data['gid_ranges'])
+    # A record that doesn't even cover the held account itself is not about it.
+    _require(any(start <= 10001 < start + length for start, length in uids)
+             and any(start <= 10001 < start + length for start, length in gids))
+    return uids, gids
+
+
+def _disjoint_from(rows, ranges):
+    return not any(outside < start + length and start < outside + size
+                   for _, outside, size in rows for start, length in ranges)
+
+
+def _live_maps(policy, uid_map, gid_map):
+    """Exact equality between kernel-reported maps and the profile-pinned policy."""
+    _require(_proc_map_rows(uid_map) == policy.uid_map and _proc_map_rows(gid_map) == policy.gid_map)
 
 
 def _mapped_id(raw, identifier):
@@ -614,8 +731,9 @@ class LaunchSupervisor:
     No automatic name adoption, POST retry, Docker stop/kill timeout, remove,
     cleanup of generations, key creation or restart recovery is implemented.
     """
-    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal):
+    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal, held_ranges_file=None):
         self._pid = os.getpid()
+        self._held_path = self._held_identity = None
         self._mutex = threading.Lock()
         self._journal = self._engine = self._consumer = self._listener = None
         self._socket_parent = None
@@ -662,12 +780,31 @@ class LaunchSupervisor:
                      and self.image.platform == self.release.platform
                      and self.image.source_commit == self.release.implementation_commit)
             _require(type(data['daemon']) is dict and 'disjoint' not in data['daemon'])
-            self._daemon_pin = _DaemonPin(**data['daemon'],
-                                          disjoint=data['schema'] == 'executor_launch_supervisor_v3')
+            disjoint = data['schema'] == 'executor_launch_supervisor_v3'
+            self._daemon_pin = _DaemonPin(**data['daemon'], disjoint=disjoint)
             self._socket_path = _path(data['socket_path'])
             self._consumer_uid, self._consumer_gid = data['consumer_host_uid'], data['consumer_host_gid']
             _require(all(type(value) is int and 0 < value < 2**32 - 1
                          for value in (self._consumer_uid, self._consumer_gid)))
+            policy = self.profile.daemon_policy
+            # The version and the signed profile must agree: legacy never carries a
+            # policy or held evidence; v3 needs both and can't run without them.
+            _require((policy is not None) is disjoint and (held_ranges_file is not None) is disjoint)
+            if disjoint:
+                self._held_path = _path(held_ranges_file)
+                held_raw, self._held_identity = _root_file(self._held_path, 65536)
+                held_uids, held_gids = _held_ranges(held_raw)
+                _require(self._daemon_pin.uid == policy.daemon_uid and self._daemon_pin.gid == policy.daemon_gid
+                         and self._daemon_pin.daemon_id == policy.engine_id
+                         and _disjoint_from(policy.uid_map, held_uids) and _disjoint_from(policy.gid_map, held_gids))
+                # The executor's host identity is what the pinned map gives namespace 10001.
+                uid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.uid_map)
+                gid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.gid_map)
+                _require(_mapped_id(uid_text, 10001) == self._consumer_uid
+                         and _mapped_id(gid_text, 10001) == self._consumer_gid)
+                _require(len({self._held_path, self._enrollment_path, self._key_path, _path(journal_file)}) == 4)
+            else:
+                self._held_path = self._held_identity = None
             self._ttl, self._request_ms, self._launch_ms = (data['receipt_lifetime_seconds'],
                 data['request_timeout_ms'], data['launch_timeout_ms'])
             _require(type(self._ttl) is int and 1 <= self._ttl <= 3600
@@ -695,6 +832,18 @@ class LaunchSupervisor:
         _require(self._pid == os.getpid() and not self._closed and (allow_held or not self._held))
         _require(_root_file(self._enrollment_path, 1024**2)[1] == self._enrollment_identity
                  and _root_file(self._key_path, 32)[1] == self._key_identity)
+        if self._held_path is not None:
+            _require(_root_file(self._held_path, 65536)[1] == self._held_identity)
+
+    def _check_daemon_maps(self):
+        """v3 only: the pinned daemon's live kernel maps equal the signed policy."""
+        policy = self.profile.daemon_policy
+        if policy is None:
+            return
+        self._engine.process.check()
+        _live_maps(policy, Path(f'/proc/{self._daemon_pin.pid}/uid_map').read_text(),
+                   Path(f'/proc/{self._daemon_pin.pid}/gid_map').read_text())
+        self._engine.process.check()
 
     def _hold(self):
         self._held = True
@@ -857,6 +1006,8 @@ class LaunchSupervisor:
                 self._guard()
                 _require(self._launch_id is None)
                 deadline = time.monotonic() + self._launch_ms / 1000
+                # Before any socket bind or Engine request: wrong live maps mean no effect at all.
+                self._check_daemon_maps()
                 self._bind_issuer()
                 self._pin_sources()
                 defaults = self._engine.image(self.image, deadline)
@@ -909,11 +1060,15 @@ class LaunchSupervisor:
             if ':' in line:
                 key, value = line.split(':', 1)
                 status[key] = value.strip()
-        _kernel_profile(self.profile, status,
-                        Path(f'/proc/{self._consumer.pid}/uid_map').read_text(),
-                        Path(f'/proc/{self._consumer.pid}/gid_map').read_text(),
+        consumer_uid_map = Path(f'/proc/{self._consumer.pid}/uid_map').read_text()
+        consumer_gid_map = Path(f'/proc/{self._consumer.pid}/gid_map').read_text()
+        _kernel_profile(self.profile, status, consumer_uid_map, consumer_gid_map,
                         Path(f'/proc/{self._consumer.pid}/mountinfo').read_bytes(),
                         self._consumer_uid, self._consumer_gid)
+        if self.profile.daemon_policy is not None:
+            # Rootless containers share the daemon's user namespace: both must match the policy.
+            _live_maps(self.profile.daemon_policy, consumer_uid_map, consumer_gid_map)
+            self._check_daemon_maps()
         for namespace in ('ipc', 'cgroup', 'net'):
             _require(_identity(os.stat(f'/proc/{self._consumer.pid}/ns/{namespace}'))
                      != _identity(os.stat('/proc/self/ns/' + namespace)))

@@ -1132,11 +1132,12 @@ def test_synthetic_kernel_profile_translates_declared_supplementary_group():
 
 
 @contextmanager
-def root_file_constructor_fixture(short_root, root_journal):
+def root_file_constructor_fixture(short_root, root_journal, *, daemon_policy=None):
     """Actual protected files/journal/proc constructor, synthetic release/key/HTTP.
 
     Fake image is deliberately NOT an approved installed runner; constructor
     must not perform effects or turn these test pins into deployment approval.
+    A daemon_policy is signed into the profile before every digest is derived.
     """
     private = short_root / 'authority'
     private.mkdir(mode=0o700)
@@ -1146,6 +1147,8 @@ def root_file_constructor_fixture(short_root, root_journal):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs) as (pin, requests):
         raw_profile = profile_data(str(short_root / 'hub-pilot-constructor'))
+        if daemon_policy is not None:
+            raw_profile['daemon_policy'] = daemon_policy
         issuer_path = str(short_root / 'issuer' / 'issuer.sock')
         Path(issuer_path).parent.mkdir(mode=0o700)
         issuer = socket.socket(socket.AF_UNIX)
@@ -1260,14 +1263,41 @@ def test_protected_enrollment_rejects_invalid_daemon_policy(short_root, root_jou
         assert requests == [] and not Path(kwargs['journal_file']).exists()
 
 
-def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, root_journal):
-    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+# A separate daemon account 10002 whose namespace maps executor uid 10001 to
+# host 110001, exactly the consumer host identity the fixture enrolls.
+DISJOINT_MAP = [[0, 10002, 1], [1, 100001, 65536]]
+
+
+def disjoint_policy(**changes):
+    return {'kind': 'disjoint-v1', 'engine_id': 'test-daemon', 'daemon_uid': 10002, 'daemon_gid': 10002,
+            'uid_map': deepcopy(DISJOINT_MAP), 'gid_map': deepcopy(DISJOINT_MAP), **changes}
+
+
+def held_ranges(**changes):
+    # Synthetic stand-in for independently retained evidence about the held account.
+    return {'schema': launch.HELD_RANGES_SCHEMA, 'uid_ranges': [[10001, 1], [200000, 65536]],
+            'gid_ranges': [[10001, 1], [200000, 65536]], 'evidence_sha256': 'c' * 64, **changes}
+
+
+@contextmanager
+def v3_constructor(short_root, root_journal, *, policy=None, held=None, daemon=None):
+    with root_file_constructor_fixture(short_root, root_journal,
+                                       daemon_policy=disjoint_policy() if policy is None else policy) as (data, kwargs, requests):
         data['schema'] = 'executor_launch_supervisor_v3'
-        data['daemon']['uid'] = 10002
+        data['daemon'].update({'uid': 10002, 'gid': 10002, **(daemon or {})})
         Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        held_path = Path(kwargs['enrollment_file']).parent / 'held-ranges.json'
+        held_path.write_bytes(launch._canonical(held_ranges() if held is None else held))
+        held_path.chmod(0o600)
+        yield data, dict(kwargs, held_ranges_file=str(held_path)), requests
+
+
+def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
         authority = launch.LaunchSupervisor(**kwargs)
         try:
             assert authority._daemon_pin.uid == 10002
+            assert authority.profile.daemon_policy.uid_map == ((0, 10002, 1), (1, 100001, 65536))
             authority._guard()
             authority._pin_sources()
             # Synthetic server runs as root, not the enrolled UID; no HTTP
@@ -1279,6 +1309,191 @@ def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, roo
             launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110001, 110001)
             with pytest.raises(RuntimeError):
                 launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110002, 110001)
+        finally:
+            authority.close()
+
+
+def test_legacy_profile_digest_bytes_are_unchanged():
+    raw = profile_data()
+    # The digest every existing v2 enrollment, receipt and verifier already pins.
+    legacy = 'sha256:' + hashlib.sha256(launch._canonical(raw)).hexdigest()
+    assert launch.ExecutorLaunchProfile.model_validate(raw).digest() == legacy
+    # A tool that re-serializes with an explicit null still produces the same bytes.
+    assert launch.ExecutorLaunchProfile.model_validate({**raw, 'daemon_policy': None}).digest() == legacy
+    dumped = launch.ExecutorLaunchProfile.model_validate(raw).model_dump(mode='json')
+    assert launch.ExecutorLaunchProfile.model_validate(dumped).digest() == legacy
+
+
+def test_policy_is_part_of_the_signed_profile_digest():
+    base = profile_data()
+    legacy = launch.ExecutorLaunchProfile.model_validate(base).digest()
+    disjoint = launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': disjoint_policy()}).digest()
+    assert disjoint != legacy
+    moved = disjoint_policy(uid_map=[[0, 10002, 1], [1, 100002, 65536]])
+    assert launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': moved}).digest() != disjoint
+
+
+@pytest.mark.parametrize('change', [
+    {'kind': 'disjoint-v2'}, {'engine_id': 'bad id'}, {'daemon_uid': 0}, {'daemon_uid': 10001},
+    {'daemon_uid': 65534}, {'daemon_gid': 10001}, {'daemon_uid': True},
+    {'uid_map': [[0, 10003, 1], [1, 100001, 65536]]},                    # root isn't the daemon account
+    {'uid_map': [[1, 100001, 65536], [0, 10002, 1]]},                    # not canonical order
+    {'uid_map': [[0, 10002, 1], [1, 100001, 65536], [2, 300000, 1]]},    # overlapping inside
+    {'uid_map': [[0, 10002, 1], [1, 10002, 5]]},                         # overlapping outside
+    {'uid_map': [[0, 10002, 1], [1, 5000, 65536]]},                      # reaches held host uid 10001
+    {'gid_map': [[0, 10002, 1], [1, 0, 65536]]},                         # reaches host root
+    {'uid_map': [[0, 10002, 1], [1, 100001, 9000]]},                     # executor uid 10001 unmapped
+    {'uid_map': [[0, 10002, 1]]}, {'uid_map': [[0, 10002, 1]] + [[i, 100000 + i, 1] for i in range(1, 9)]},
+    {'uid_map': [[0, 10002, 1], [1, 100001, True]]}, {'uid_map': [[0, 10002, 1], [1, 100001]]},
+    {'uid_map': [[0, 10002, 1], [1, 2**32 - 10, 65536]]}, {'extra': 1},
+])
+def test_policy_refuses_unsafe_or_ambiguous_maps(change):
+    # LaunchSupervisorError is a RuntimeError; pydantic's ValidationError is a ValueError.
+    with pytest.raises((RuntimeError, ValueError)):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': disjoint_policy(**change)})
+
+
+def test_live_maps_need_exact_equality_with_the_policy():
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    exact = '         0      10002          1\n         1     100001      65536\n'
+    launch._live_maps(policy, exact, exact)
+    reordered = '1 100001 65536\n0 10002 1\n'
+    launch._live_maps(policy, reordered, reordered)
+    for wrong in ('0 10002 1\n1 100001 65535\n', '0 10002 1\n1 100001 65536\n70000 400000 1\n',
+                  '0 10002 1\n', '0 10002 1\n1 100001 x\n', ''):
+        with pytest.raises(RuntimeError):
+            launch._live_maps(policy, wrong, exact)
+        with pytest.raises(RuntimeError):
+            launch._live_maps(policy, exact, wrong)
+
+
+def test_real_init_namespace_map_never_satisfies_a_policy():
+    # The test process isn't in the policy's namespace (normally it's the
+    # initial one, a single identity row), so its real maps must never pass.
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    actual = Path('/proc/self/uid_map').read_text()
+    with pytest.raises(RuntimeError):
+        launch._live_maps(policy, actual, Path('/proc/self/gid_map').read_text())
+
+
+def test_real_kernel_user_namespace_maps_match_exactly():
+    if os.geteuid() != 0 or not hasattr(os, 'unshare'):
+        pytest.skip('needs root and os.unshare to create a mapped user namespace')
+    ready_read, ready_write = os.pipe()
+    done_read, done_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(ready_read)
+            os.close(done_write)
+            try:
+                os.unshare(os.CLONE_NEWUSER)
+                os.write(ready_write, b'1')
+            except OSError:
+                os.write(ready_write, b'0')
+            os.read(done_read, 1)
+        finally:
+            os._exit(0)
+    os.close(ready_write)
+    os.close(done_read)
+    try:
+        if os.read(ready_read, 1) != b'1':
+            pytest.skip('user namespaces are not permitted here')
+        for name in ('uid_map', 'gid_map'):
+            Path(f'/proc/{child}/{name}').write_text('0 10002 1\n1 100001 65536\n')
+        policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+        uid_map = Path(f'/proc/{child}/uid_map').read_text()
+        gid_map = Path(f'/proc/{child}/gid_map').read_text()
+        launch._live_maps(policy, uid_map, gid_map)
+        with pytest.raises(RuntimeError):
+            launch._live_maps(launch.DisjointDaemonPolicy.model_validate(
+                disjoint_policy(uid_map=[[0, 10002, 1], [1, 100002, 65536]])), uid_map, gid_map)
+    finally:
+        os.close(ready_read)
+        os.close(done_write)
+        os.waitpid(child, 0)
+
+
+@pytest.mark.parametrize('held', [
+    held_ranges(schema='engineering-hub.held-id-ranges.v2'), held_ranges(evidence_sha256='C' * 64),
+    held_ranges(uid_ranges=[[20000, 5]]),           # doesn't describe the held account at all
+    held_ranges(gid_ranges=[]), held_ranges(uid_ranges=[[10001, 0]]), held_ranges(uid_ranges=[[True, 1]]),
+    held_ranges(uid_ranges=[[10001, 1, 2]]), {**held_ranges(), 'extra': 1},
+])
+def test_held_range_evidence_is_closed(held):
+    with pytest.raises(RuntimeError):
+        launch._held_ranges(launch._canonical(held))
+
+
+def test_v3_constructor_accepts_only_a_consistent_signed_policy(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        launch.LaunchSupervisor(**kwargs).close()
+        assert requests == []
+
+
+@pytest.mark.parametrize('case', ['no-held-file', 'pin-uid', 'pin-gid', 'engine-id', 'overlaps-held',
+                                  'consumer-mismatch', 'held-not-root-mode'])
+def test_v3_constructor_refuses_inconsistent_policy(short_root, root_journal, case):
+    # Overlap: the held evidence claims a range inside the policy's 100001.. block,
+    # while the policy itself stays valid and still maps 10001 to the enrolled 110001.
+    held = {'overlaps-held': held_ranges(uid_ranges=[[10001, 1], [120000, 16]])}.get(case)
+    daemon = {'pin-uid': {'uid': 10003}, 'pin-gid': {'gid': 10003}, 'engine-id': {'daemon_id': 'other-daemon'}}.get(case)
+    with v3_constructor(short_root, root_journal, held=held, daemon=daemon) as (data, kwargs, requests):
+        if case == 'no-held-file':
+            kwargs.pop('held_ranges_file')
+        if case == 'consumer-mismatch':
+            data['consumer_host_uid'] = 110002
+            Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        if case == 'held-not-root-mode':
+            Path(kwargs['held_ranges_file']).chmod(0o644)
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+def test_legacy_enrollment_refuses_a_signed_policy(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal, daemon_policy=disjoint_policy()) as (data, kwargs, requests):
+        assert data['schema'] == 'executor_launch_supervisor_v2'
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+
+
+def test_legacy_enrollment_refuses_held_evidence(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        held_path = Path(kwargs['enrollment_file']).parent / 'held-ranges.json'
+        held_path.write_bytes(launch._canonical(held_ranges()))
+        held_path.chmod(0o600)
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs, held_ranges_file=str(held_path))
+        assert requests == []
+
+
+def test_v3_launch_refuses_wrong_live_maps_before_any_effect(short_root, root_journal):
+    # The fake daemon is this test process, in the initial user namespace:
+    # its live maps can't equal the policy, so launch stops before binding the
+    # issuer socket or sending any Engine request.
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.launch()
+            assert requests == [] and authority._launch_id is None and authority._listener is None
+        finally:
+            authority.close()
+
+
+def test_held_evidence_replacement_after_construction_is_refused(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            held_path = Path(kwargs['held_ranges_file'])
+            replacement = held_path.with_name('held-ranges.new')
+            replacement.write_bytes(launch._canonical(held_ranges(evidence_sha256='d' * 64)))
+            replacement.chmod(0o600)
+            os.replace(replacement, held_path)
+            with pytest.raises(RuntimeError):
+                authority._guard()
         finally:
             authority.close()
 

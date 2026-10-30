@@ -28,7 +28,34 @@ non-root daemon UID other than 10001 in the independently root-protected daemon
 record. It does not consume the offline selection record, establish disjoint
 storage or resources, or approve a host. Existing peer and process verification
 remain mandatory. V1 is rejected without fallback or implicit migration; v3
-requires a newly reviewed artifact and fresh independent enrollment. The runner's
+requires a newly reviewed artifact and fresh independent enrollment.
+
+A v3 launch profile must carry `daemon_policy` (`kind: disjoint-v1`): the daemon's
+Engine ID, UID and GID, and its exact `uid_map` and `gid_map` rows. Because the
+policy is inside the profile, it is inside `launch_profile_digest`, which every
+receipt and current observation already signs and every verifier already pins.
+A v2 profile must not carry it, and its digest bytes are unchanged. The policy
+must map namespace root to the daemon account, map executor UID 10001 exactly
+once, and never reach host ID 0 or 10001.
+
+v3 also requires a separate root-protected `held_ranges_file`
+(`engineering-hub.held-id-ranges.v1`): the host UID and GID ranges retained for the
+held TEST account, with a digest of the evidence they came from. It must cover the
+held account itself, the policy's ranges must not overlap it, and its file identity
+is rechecked like the enrollment. It is independently supplied evidence, never read
+from `/etc/subuid` or the host at runtime; without it, v3 refuses to start.
+
+Before binding the issuer socket or making any Engine request, `launch()` reads the
+pinned daemon process's `/proc/<pid>/uid_map` and `gid_map` and requires exact row
+equality with the policy; `_validate_live` repeats this and also requires the
+consumer's maps to match, since rootless containers are expected to share the
+daemon's user namespace. If they don't on the real host, launch fails closed;
+confirm the namespace layout during host acceptance.
+
+This does not establish issuer separation. A v3 launch can still be signed with a
+key that a verifier also trusts for v2 until the verifier enforces a distinct key
+against independently trusted legacy key evidence. Nor does it prove storage,
+cgroup or resource isolation, or approve any host change. The runner's
 separate closed configuration schema is `engineering-hub.installed-executor.v1`.
 Canonical JSON and matching hashes validate shape and consistency, not approval.
 The configuration's exact bytes are pinned by the required top-level root
