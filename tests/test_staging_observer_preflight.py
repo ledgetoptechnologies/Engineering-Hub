@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from pathlib import PurePosixPath
 import stat
 
+import pytest
+
 from hub_staging_service import observer_preflight as preflight
 from hub_staging_service import observer_credentials as credential
 
@@ -86,3 +88,24 @@ def test_credential_rejects_unsafe_file_properties(monkeypatch):
         monkeypatch.setattr(preflight.os, 'fstat', lambda fd: SimpleNamespace(
             st_mode=stat.S_IFREG | mode, st_nlink=links, st_uid=uid, st_size=20))
         assert preflight.check('/protected/snapshot', '/protected/token', 123, 456)['credential'] == 'unavailable'
+
+
+@pytest.mark.parametrize('uid,gid,groups,expected', [
+    (123, 456, [], True),
+    (0, 456, [], False),
+    (123, 0, [], False),
+    (123, 456, [456], False),
+])
+def test_restricted_identity_direct(monkeypatch, uid, gid, groups, expected):
+    setup(monkeypatch)
+    monkeypatch.setattr(credential.os, 'geteuid', lambda: uid, raising=False)
+    monkeypatch.setattr(credential.os, 'getegid', lambda: gid, raising=False)
+    monkeypatch.setattr(credential.os, 'getgroups', lambda: groups, raising=False)
+    assert credential.restricted_identity() is expected
+
+
+@pytest.mark.parametrize('api', ['geteuid', 'getegid', 'getgroups'])
+def test_restricted_identity_missing_api_fails_closed(monkeypatch, api):
+    setup(monkeypatch)
+    monkeypatch.delattr(credential.os, api)
+    assert credential.restricted_identity() is False

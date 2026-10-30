@@ -60,8 +60,7 @@ def test_http_auth_exact_route_and_no_mutations():
         thread.join()
 
 
-@pytest.mark.parametrize('identity', [0, None])
-def test_main_rejects_root_or_missing_posix_identity_before_access(monkeypatch, identity):
+def test_main_rejects_unrestricted_identity_before_access(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['observer', '--snapshot', str(Path.cwd() / 'snapshot'),
                                     '--token-file', str(Path.cwd() / 'token'), '--port', '8781'])
     monkeypatch.setattr(observer, 'restricted_identity', lambda: False)
