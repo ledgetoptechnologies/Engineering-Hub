@@ -43,3 +43,33 @@ the same implementation as the compatibility `scripts/collect_staging_runtime.py
 launcher. Use a root-owned, immutable wheel installation for both observer and
 collector, with a root-owned snapshot directory, and verify the exact artifact
 identity before enrollment.
+
+## Inert private proxy example
+
+`deployment/staging-observer/nginx-http.conf` is a non-installing NGINX http
+context example, not a validated or running configuration. Independently review
+and replace every placeholder with a verified bind address, distinct free ports,
+certificate paths and actual NAS source. It accepts only the original exact
+`GET:/v1/runtime` including absence of a query string; the dedicated bearer is
+forwarded, not stored in nginx configuration. It strips other request headers and
+request bodies. The existing observer checks its own bearer and actual loopback
+peer. The client must verify the dedicated CA and literal-IP certificate SAN.
+Never attach this to the public tunnel.
+
+NGINX is not currently installed on the assessed host; its package provenance,
+version, module support, service identity and resource limits need review. The
+example alone does not configure a firewall, bound pre-header connections or
+provision credentials. Enforce the measured NAS TCP source at the host/network
+boundary and bound TCP connection admission there before exposing the listener.
+HTTP `limit_conn` is not a pre-header or TLS-handshake connection limit. Header
+and handshake timeouts do not establish a concurrent connection bound. Preserve
+existing UFW rules and verify the effective policy before any narrow change.
+
+Before activation, run `nginx -t` against the exact reviewed configuration and
+operator-provisioned TLS material in an isolated test setup. Test correct and
+incorrect source, CA, IP SAN and bearer; exact method/path/query variants and
+body handling; redirects and duplicate authorization; incomplete TLS/headers
+under bounded connection load; upstream unavailable/stale; and resource limits.
+Then test the actual NAS-to-staging route and rollback of only the newly owned
+proxy and firewall rule. Static checks and a successful syntax test do not prove
+firewall enforcement, TLS peer identity, resource limits, or live readiness.
