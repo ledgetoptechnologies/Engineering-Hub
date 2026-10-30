@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import httpx
 
 from engineering_hub.infrastructure_prometheus import PrometheusOrigin, TARGET_PATH
-from test_session_hub_bridge import unified, sdk, data, pair
+from tests.test_session_hub_bridge import unified, sdk, data, pair
 
 
 def test_owner_bulk_classification_and_mcp_read_isolation(unified):
