@@ -46,14 +46,18 @@ class InstallationScopeRepository:
     def list(self, actor):
         self.sessions._owner(actor)
         with self.sessions._transaction() as db:
-            installations = db.execute('SELECT * FROM session_installations WHERE approved_at IS NOT NULL '
-                                       'ORDER BY created_at DESC,id LIMIT 257').fetchall()
-            scopes = db.execute('SELECT * FROM session_installation_scopes LIMIT 257').fetchall()
-            if len(installations) > 256 or len(scopes) > 256:
-                raise AgentSessionError('installation_scope_limit', 503)
-            by_id = {row['installation_id']: row for row in scopes}
             now = self.sessions._now()
-            return {'installations': [self._public(row, by_id.get(row['id']), now) for row in installations]}
+            installations = db.execute('SELECT * FROM session_installations WHERE approved_at IS NOT NULL '
+                'ORDER BY CASE WHEN revoked_at IS NULL AND (expires_at=0 OR expires_at>?) '
+                'THEN 0 ELSE 1 END,created_at DESC,id LIMIT 257', (now,)).fetchall()
+            truncated = len(installations) > 256
+            installations = installations[:256]
+            ids = [row['id'] for row in installations]
+            scopes = db.execute('SELECT * FROM session_installation_scopes WHERE installation_id IN ('
+                + ','.join('?' for _ in ids) + ')', ids).fetchall() if ids else []
+            by_id = {row['installation_id']: row for row in scopes}
+            return {'installations': [self._public(row, by_id.get(row['id']), now) for row in installations],
+                    'truncated': truncated}
 
     def set(self, actor, installation_id, expected_revision, kind):
         return self.set_many(actor, [{'installation_id': installation_id,

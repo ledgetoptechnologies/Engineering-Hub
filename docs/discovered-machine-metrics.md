@@ -12,6 +12,8 @@ to initialize the ordinary inventory in its existing state directory. The owner
 gets the Infrastructure page without creating a settings file. Legacy internal
 agents get inventory reads, not automatic write permissions. An existing settings
 file takes precedence, including `enabled: false`.
+Without either a configured connection owner or an explicit GitHub owner, this
+automatic setup stays disabled. Browser metrics also require a known owner.
 
 Discovery needs one trusted literal-IP Prometheus origin. The optional settings
 object accepts `{"address":"192.0.2.80","port":9090}` without a target mapping
@@ -38,16 +40,18 @@ proof. Scope revisions are independent of installation connection revisions.
 
 | Method | Path below `/api/hub/v1/agent-connections` | Result |
 | --- | --- | --- |
-| GET | `/installation-scopes` | `{installations: Scope[]}` for approved installations |
-| PUT | `/installation-scopes` | Atomic batch, same result envelope |
+| GET | `/installation-scopes` | `{installations: Scope[], truncated: boolean}` for approved installations |
+| PUT | `/installation-scopes` | Atomic batch returning `{installations: Scope[]}` |
 | GET | `/installations/{id}/scope` | One scope |
 | PUT | `/installations/{id}/scope` | One updated scope |
 
 A scope contains `installation_id`, `kind`, `revision`, `updated_by`, `updated_at`
 and `internal_effective`. Missing classifications are `unclassified`, revision 0,
 with null update provenance. An inactive installation is never effectively
-internal. The list includes approved inactive installations and excludes pending
-enrollments; it is capped at the repository's 256 installations.
+internal. The list excludes pending enrollments and returns at most 256 approved
+installations, prioritizing active devices and then newer approvals by creation
+time. `truncated` reports omitted history; historical rows do not disable the
+list. Individual owner reads remain available for omitted installations.
 
 Single PUT: `{expected_revision, kind}`. Batch PUT:
 `{kind, installations: [{installation_id, expected_revision}]}`. Kinds are

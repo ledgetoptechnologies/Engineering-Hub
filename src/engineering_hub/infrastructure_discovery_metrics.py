@@ -81,22 +81,22 @@ class DiscoveryMetricsReader(MetricsReader):
                     headers={'Accept': 'application/json', 'Accept-Encoding': 'identity'},
                 ) as client:
                     async def fetch_targets():
+                        nonlocal targets
                         try:
-                            return _discovery_targets(await self._get(client, TARGET_PATH, budget))
+                            targets = _discovery_targets(await self._get(client, TARGET_PATH, budget))
                         except (httpx.HTTPError, ValueError, TypeError, RecursionError, UnicodeError):
-                            return None
-                    exhausted = False
+                            pass
+
+                    async def fetch_query(kind, key, query):
+                        results[(kind, key)] = await self._query(client, query, budget)
+
                     try:
                         async with asyncio.TaskGroup() as group:
-                            pending = [group.create_task(fetch_targets())] + [
-                                group.create_task(self._query(client, query, budget))
-                                for _, _, query in QUERIES]
+                            group.create_task(fetch_targets())
+                            for kind, key, query in QUERIES:
+                                group.create_task(fetch_query(kind, key, query))
                     except* _Exhausted:
-                        exhausted = True
-            if not exhausted:
-                targets = pending[0].result()
-                results = {(kind, key): task.result()
-                           for (kind, key, _), task in zip(QUERIES, pending[1:])}
+                        pass
         except TimeoutError:
             pass
         self._admit(actor)

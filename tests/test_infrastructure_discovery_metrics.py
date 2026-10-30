@@ -1,6 +1,7 @@
 """Discovery reader tests use only in-memory state and mocked HTTP."""
 
 from datetime import datetime, timezone
+import asyncio
 import json
 import sqlite3
 from urllib.parse import parse_qs
@@ -132,3 +133,35 @@ async def test_cap_malformed_and_oversized_target_response(service):
                               stream=httpx.ByteStream(b'x' * (1024 * 1024 + 1)))
     failure = await reader(service, oversized).read('agent')
     assert failure['source']['status'] == 'unreachable' and failure['devices'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('query_failure', ['timeout', 'budget'])
+async def test_successful_target_discovery_survives_query_phase_failure(service, monkeypatch, query_failure):
+    from engineering_hub import infrastructure_discovery_metrics as module
+    from engineering_hub.infrastructure_metrics import _Exhausted
+    target_returned = asyncio.Event()
+    respond = handler([target('node')])
+
+    def transport(request):
+        response = respond(request)
+        if request.url.raw_path.decode() == TARGET_PATH:
+            target_returned.set()
+        return response
+
+    instance = reader(service, transport)
+
+    async def unavailable_query(client, query, budget):
+        await target_returned.wait()
+        # Allow the successful target response to finish parsing before failing
+        # the independent query phase; no actual network or slow server is used.
+        await asyncio.sleep(0.01 if query_failure == 'budget' else 10)
+        raise _Exhausted()
+
+    instance._query = unavailable_query
+    monkeypatch.setattr(module, 'DEADLINE_SECONDS', 0.2)
+    result = await instance.read('agent')
+    assert result['source']['status'] == 'partial'
+    assert result['source']['warnings'] == ['query_failed']
+    assert [(row['job'], row['instance']) for row in result['devices']] == [('node', 'pc:9100')]
+    assert result['devices'][0]['cpu_busy_ratio'] is None
