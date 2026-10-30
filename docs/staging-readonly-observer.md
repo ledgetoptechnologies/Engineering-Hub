@@ -122,3 +122,27 @@ authenticated runtime route using a synthetic internally created human session.
 It also checks wrong CA and wrong bearer through the real `StagingObserver`
 client, in addition to raw HTTP negative checks. It does not exercise a real
 identity provider or deployment.
+
+## Read-only local preflight
+
+`python -m hub_staging_service.observer_preflight --snapshot /absolute/snapshot.json
+--token-file /absolute/token --expected-uid UID --expected-gid GID` runs only as
+that non-root effective UID and GID. It reports coarse statuses without paths,
+token contents, or snapshot contents. Exit status is zero only when all three local checks are observed; zero is not deployment readiness. It checks the existing snapshot reader and
+schema/freshness guard, and a single-link regular token owned by that UID with
+no group or other permissions, under root-owned non-writable ancestors. It reads
+but never creates or changes either file. These token conditions are stricter
+than the observer's own credential loader. `observed` is a point-in-time check,
+not a guarantee against later changes or a check of supplementary groups, ACLs,
+service unit configuration, or the running process. It is not evidence of
+firewall, connection admission, TLS, NAS access, or pilot acceptance. The proxy
+remains BLOCKED and must not be deployed before independent acceptance.
+
+A synthetic POSIX integration harness is available at
+`tests/observer_preflight_posix_harness.py`. It must run as root in a disposable
+Linux container with `/opt` as a private writable tmpfs, the source mounted
+read-only at `/repo/src`, `PYTHONPATH=/repo/src`, and no network or host sockets.
+It drops supplementary groups and executes checks as UID/GID 12345, including
+negative ownership, mode, symlink, hardlink, identity and stale-snapshot cases.
+It does not test production ACLs or a real service account.
+
