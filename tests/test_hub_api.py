@@ -313,6 +313,9 @@ def test_integrated_mcp_initialize_and_list_on_configured_https_origin(hub):
             "hub_component_list", "hub_component_get", "hub_component_create",
             "hub_component_update", "hub_component_retire", "hub_interactive_review_create",
             "hub_interactive_review_get", "hub_interactive_review_list",
+            "hub_infrastructure_list", "hub_infrastructure_get",
+            "hub_infrastructure_maintenance_open", "hub_infrastructure_maintenance_resolve",
+            "hub_infrastructure_probe_record", "hub_infrastructure_metrics",
         }
     assert client.get(BASE + "/overview", headers=agent_headers()).status_code == 200
     assert client.get("/health").json()["service"] == "engineering-hub-control"
