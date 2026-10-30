@@ -115,3 +115,9 @@ The collector is not run: the snapshot is fixture data. Both containers run as
 root for fixture creation, so this does not validate the planned unprivileged
 observer identity, production filesystem permissions, source firewall or live
 NAS route. Both containers and the volume are removed and absence verified.
+
+The same isolated test composes the actual Hub application and exercises its
+authenticated runtime route using a synthetic internally created human session.
+It also checks wrong CA and wrong bearer through the real `StagingObserver`
+client, in addition to raw HTTP negative checks. It does not exercise a real
+identity provider or deployment.

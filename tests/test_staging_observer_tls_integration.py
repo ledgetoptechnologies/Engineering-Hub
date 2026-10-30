@@ -56,6 +56,14 @@ async def run():
   (r/'snapshot.json').write_text(json.dumps(host)); (r/'snapshot.json').chmod(0o644)
   result=await client.runtime('human:1');assert result['snapshot']['sources'][1]['state']=='stale' and not result['snapshot']['containers']
  finally: await client.close()
+ wrong_token=r/'wrong-token';wrong_token.write_text('wrong-synthetic-token');wrong_token.chmod(0o600)
+ for credential,ca in ((token,r/'wrong-ca'),(wrong_token,r/'ca')):
+  bad_config=StagingConnectionConfig(origin='https://127.0.0.1:19443',credential_file=credential,
+   ca_file=ca,admin_actors=frozenset({'human:1'}),enabled=True)
+  bad=StagingObserver(bad_config)
+  try:
+   assert (await bad.runtime('human:1')) == {'configured':True,'state':'unavailable','snapshot':None}
+  finally: await bad.close()
  context=ssl.create_default_context(cafile=str(r/'ca'))
  async with httpx.AsyncClient(verify=context,trust_env=False,timeout=3) as raw:
   assert (await raw.get('https://127.0.0.1:19443/v1/runtime',headers={'Authorization':'Bearer wrong-synthetic-token'})).status_code==401
@@ -72,6 +80,23 @@ async def run():
   assert b' 403 ' in s.recv(4096).split(b'\r\n')[0]
 try:
  asyncio.run(run())
+ from agent_message_bus.auth import AuthSettings
+ from engineering_hub.app import Settings, create_app
+ from engineering_hub.auth import AuthConfig
+ from fastapi.testclient import TestClient
+ (r/'staging-observer.json').write_text(json.dumps({'schema':1,'enabled':True,'origin':'https://127.0.0.1:19443',
+  'credential_file':str(token),'ca_file':str(r/'ca'),'admin_actors':['human:42']}))
+ (r/'staging-observer.json').chmod(0o600)
+ settings=Settings(r/'hub.sqlite3',AuthSettings('synthetic-hermes','synthetic-codex',claude_token='synthetic-claude'),
+  AuthConfig('https://hub.test',beau_github_id=42))
+ app=create_app(settings)
+ with TestClient(app,base_url=settings.auth_config.origin) as web:
+  assert web.get('/api/hub/v1/staging/runtime').status_code==401
+  session=app.state.sessions.create_session(42)
+  web.cookies.set(settings.auth_config.cookie_name,session['cookie_token'])
+  response=web.get('/api/hub/v1/staging/runtime')
+  assert response.status_code==200, response.text
+  assert response.json()['snapshot']['sources'][1]['state']=='stale'
  print('real observer and hub client TLS checks passed')
 finally:
  server.shutdown();server.server_close();thread.join()
