@@ -43,8 +43,9 @@ function record(value: unknown, keys: readonly string[]): Record<string, unknown
 function list(value: unknown, max: number): unknown[] {
   return Array.isArray(value) && value.length <= max ? value : invalid();
 }
+/** Length is in Unicode characters, as the backend counts it; a character outside the BMP is one, not two. */
 function plain(value: unknown, max: number): string {
-  if (typeof value !== "string" || !value || value.trim() !== value || value.length > max) return invalid();
+  if (typeof value !== "string" || !value || value.trim() !== value || value.length > 2 * max || [...value].length > max) return invalid();
   for (const char of value) { const code = char.codePointAt(0)!; if (code < 32 || code === 127) return invalid(); }
   return value;
 }

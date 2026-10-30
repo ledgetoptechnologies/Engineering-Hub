@@ -113,3 +113,22 @@ describe("discovered machine metrics (schema 2)", () => {
     expect(parseMetrics(value).source.omitted_count).toBeNull();
   });
 });
+
+describe("text limits count Unicode characters, as the backend does", () => {
+  const tree = "\u{1F332}";
+  const withLabel = (label: string) => {
+    const value = JSON.parse(JSON.stringify(discovered.cases.discovered)) as any;
+    value.devices[0].host_label = label; value.devices[0].labels.host = label;
+    return value;
+  };
+  it("accepts 64 characters outside the BMP and 128-character job and instance values", () => {
+    expect(parseMetrics(withLabel(tree.repeat(64))).targets[0].host_label).toBe(tree.repeat(64));
+    const value = JSON.parse(JSON.stringify(discovered.cases.discovered)) as any;
+    value.devices[2].job = "j".repeat(128); value.devices[2].instance = "i".repeat(128);
+    expect(parseMetrics(value).targets[2].instance).toHaveLength(128);
+  });
+  it("still rejects 65 characters and control characters", () => {
+    expect(() => parseMetrics(withLabel(tree.repeat(65)))).toThrow();
+    expect(() => parseMetrics(withLabel("a\u0000b"))).toThrow();
+  });
+});
