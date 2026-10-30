@@ -2,7 +2,11 @@ import http.client
 import ipaddress
 import json
 import threading
+import sys
+
+import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from engineering_hub.staging_runtime import validate_runtime_snapshot
@@ -54,3 +58,30 @@ def test_http_auth_exact_route_and_no_mutations():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize('identity', [0, None])
+def test_main_rejects_root_or_missing_posix_identity_before_access(monkeypatch, identity):
+    monkeypatch.setattr(sys, 'argv', ['observer', '--snapshot', str(Path.cwd() / 'snapshot'),
+                                    '--token-file', str(Path.cwd() / 'token'), '--port', '8781'])
+    monkeypatch.setattr(observer.os, 'geteuid', None if identity is None else lambda: identity,
+                        raising=False)
+    with patch.object(observer, 'credentials') as credentials, \
+            patch.object(observer, 'BoundedServer') as server:
+        with pytest.raises(SystemExit) as exc:
+            observer.main()
+        assert exc.value.code == 2
+        credentials.assert_not_called()
+        server.assert_not_called()
+
+
+def test_main_accepts_nonroot_identity_and_closes_server(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['observer', '--snapshot', str(Path.cwd() / 'snapshot'),
+                                    '--token-file', str(Path.cwd() / 'token'), '--port', '8781'])
+    monkeypatch.setattr(observer.os, 'geteuid', lambda: 12345, raising=False)
+    with patch.object(observer, 'credentials', return_value='fake-observer-token-only') as credentials, \
+            patch.object(observer, 'BoundedServer') as server:
+        observer.main()
+        credentials.assert_called_once()
+        server.return_value.serve_forever.assert_called_once_with()
+        server.return_value.server_close.assert_called_once_with()

@@ -4,6 +4,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler
 import ipaddress
 import json
+import os
 from pathlib import Path
 
 from .__main__ import BoundedServer, credentials
@@ -58,6 +59,9 @@ def main():
     parser.add_argument('--token-file', required=True, type=Path)
     parser.add_argument('--port', required=True, type=int)
     args = parser.parse_args()
+    geteuid = getattr(os, 'geteuid', None)
+    if not callable(geteuid) or geteuid() <= 0:
+        parser.error('unprivileged_observer_required')
     if not args.snapshot.is_absolute() or '..' in args.snapshot.parts or not 1024 <= args.port <= 65535:
         parser.error('absolute snapshot and valid unprivileged port required')
     token = credentials(args.token_file)
