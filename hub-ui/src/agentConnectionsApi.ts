@@ -124,6 +124,60 @@ export const parseSessions = (value: unknown, installationId: string) => {
 export const parseAudit = (value: unknown) => list(value, "events", parseAuditEvent, 100, item => String(item.id));
 
 /**
+ * Whether the owner has marked an installation as one of their own agents. This is a separate
+ * owner choice from approval and project grants: the agent family never implies it.
+ */
+export const SCOPE_KINDS = ["internal", "project_only", "unclassified"] as const;
+export type ScopeKind = typeof SCOPE_KINDS[number];
+export const MAX_SCOPES = 256;
+export interface InstallationScope {
+  installation_id: string; kind: ScopeKind; revision: number; updated_by: string | null; updated_at: string | null;
+  /** Internal and currently able to act as internal (an inactive installation is not). */
+  internal_effective: boolean;
+}
+export function parseInstallationScope(value: unknown): InstallationScope {
+  const row = record(value, ["installation_id", "kind", "revision", "updated_by", "updated_at", "internal_effective"]);
+  if (!Number.isSafeInteger(row.revision) || (row.revision as number) < 0 || typeof row.internal_effective !== "boolean") return invalid();
+  const scope: InstallationScope = { installation_id: id(row.installation_id), kind: oneOf(SCOPE_KINDS)(row.kind), revision: row.revision as number,
+    updated_by: nullable(row.updated_by, line(128)), updated_at: nullable(row.updated_at, time), internal_effective: row.internal_effective };
+  // Never-set rows are unclassified at revision 0 with no author; any set row names who set it and when.
+  if ((scope.revision === 0) !== (scope.updated_by === null) || (scope.updated_by === null) !== (scope.updated_at === null)) return invalid();
+  if (scope.revision === 0 && scope.kind !== "unclassified") return invalid();
+  if (scope.internal_effective && scope.kind !== "internal") return invalid();
+  return scope;
+}
+export const parseInstallationScopes = (value: unknown) => list(value, "installations", parseInstallationScope, MAX_SCOPES, item => item.installation_id);
+export interface InstallationScopesClient {
+  list(signal: AbortSignal): Promise<InstallationScope[]>;
+  /** All or nothing: one stale revision or inactive installation rejects the whole set. */
+  set(kind: ScopeKind, rows: { installation_id: string; expected_revision: number }[], csrf: string): Promise<InstallationScope[]>;
+}
+export function httpInstallationScopes(fetchImpl: typeof fetch = globalThis.fetch): InstallationScopesClient {
+  return {
+    list: async signal => parseInstallationScopes(await ownerCall("/installation-scopes", read(signal), fetchImpl)),
+    set: async (kind, rows, csrf) => {
+      if (rows.length < 1 || rows.length > MAX_SCOPES) throw new HubApiError(422, "invalid_installation_scope");
+      const installations = rows.map(row => ({ installation_id: id(row.installation_id), expected_revision: row.expected_revision }));
+      const saved = parseInstallationScopes(await ownerCall("/installation-scopes", write("PUT", { kind, installations }, csrf), fetchImpl));
+      // The answer must cover exactly what was sent, all now of the chosen kind.
+      const sent = new Set(installations.map(row => row.installation_id));
+      if (saved.length !== sent.size || saved.some(row => !sent.has(row.installation_id) || row.kind !== kind)) return invalid();
+      return saved;
+    },
+  };
+}
+export function scopeFailureText(error: unknown): string {
+  const failure = error instanceof HubApiError ? error.code : "";
+  if (failure === "scope_revision_conflict") return "Someone changed these markings since you loaded them. The list has been read again: check it and confirm again.";
+  if (failure === "installation_inactive") return "One of the selected installations isn't active any more, so it can't be marked as yours. Nothing was changed.";
+  if (failure === "installation_not_approved") return "One of the selected installations hasn't been approved, so nothing was changed.";
+  if (failure === "installation_not_found") return "One of the selected installations no longer exists. Nothing was changed; Refresh to see the current list.";
+  if (failure === "session_owner_required" || failure === "human_session_required") return "Only the configured Hub owner, signed in to this Hub, can change these markings. Nothing was changed.";
+  if (failure === "invalid_installation_scope") return "The Hub didn't accept this selection. Nothing was changed.";
+  return writeFailureText(error);
+}
+
+/**
  * Agent-credential failures. On these owner routes they describe the installation or a target
  * session, never the signed-in person, so they must not read as a lost sign-in.
  */

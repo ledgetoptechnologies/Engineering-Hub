@@ -12,6 +12,7 @@ import {
 import { relativeAge } from "./dashboardText";
 import { httpHubGrants, type HubCatalog, type HubGrantsClient } from "./hubGrantsApi";
 import { InstallationHubAccess } from "./InstallationHubAccess";
+import { InstallationScopeReview } from "./InstallationScopeReview";
 export { untilText };
 import type { Hub } from "./hub";
 import { Badge, Modal } from "./ui";
@@ -305,6 +306,8 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
           </ul>}
         </section>;
       })}
+      {!demo && load === "loaded" && <InstallationScopeReview items={items} epoch={readAt ?? 0} canChange={canChange}
+        allowed={() => allowed.current} onDenied={denied} />}
       <details className="installation-history">
         <summary>History <span className="tab-count">{audit.length}</span></summary>
         {audit.length === 0 ? <p className="panel-footnote">No changes recorded yet.</p> : <ol className="timeline" aria-label="Installation history">
