@@ -11,6 +11,7 @@ description = "Private one-operation staging worker for Engineering Hub"
 
 [project.scripts]
 hub-staging-service = "hub_staging_service.__main__:main"
+hub-staging-runtime-collector = "hub_staging_service.collector:main"
 
 [tool.setuptools]
 package-dir = {"" = "../../src"}

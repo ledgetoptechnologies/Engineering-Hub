@@ -3,7 +3,7 @@
 This source-only optional observer serves the existing sanitized host snapshot at
 `GET /v1/runtime` without constructing a worker, Docker backend, journal, queue,
 or execution endpoint. It does not itself collect inventory. A separately
-provisioned root-owned `collect_staging_runtime.py` supplies the snapshot using
+provisioned root-owned `hub-staging-runtime-collector` supplies the snapshot using
 its fixed read-only commands. Missing, invalid, stale, or future-dated snapshots
 remain unavailable or stale; no execution readiness is inferred. The worker
 source is explicitly not configured. Existing Prometheus metrics remain separate.
@@ -37,3 +37,9 @@ or redirects, 15-second total deadline, and 128 KiB response cap. The configured
 TLS proxy must enforce the actual NAS source IP; Hub authentication remains the
 existing human session plus explicit observer administrator. Installation and
 end-to-end testing remain separate operator work.
+
+The staging service wheel also installs `hub-staging-runtime-collector`; it is
+the same implementation as the compatibility `scripts/collect_staging_runtime.py`
+launcher. Use a root-owned, immutable wheel installation for both observer and
+collector, with a root-owned snapshot directory, and verify the exact artifact
+identity before enrollment.
