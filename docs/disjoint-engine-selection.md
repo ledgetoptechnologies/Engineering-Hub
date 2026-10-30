@@ -25,6 +25,12 @@ to refuse any record that would reuse what is being held.
 - Any namespace ID. An old namespace number is history, not proof that a new
   Engine is isolated now.
 
+The protected list is a conservative snapshot taken from the recorded hold, not
+a complete live inventory. Recheck it against the current hold record before any
+selection is used, and add anything retained since. Excluding account 10001 may
+also be stricter than needed later, for example if that account is reassigned
+once the hold is resolved; relaxing it needs its own reviewed change.
+
 ## What it does not prove
 
 The path checks compare written paths only. They say nothing about mounts,
@@ -41,7 +47,8 @@ backing storage and shared resource limits all hide that. Current host
 evidence has to be verified independently, and checked again right before any
 effect. The existing Engine connection checks (`_UnixEngine` peer and
 generation identity) remain the authority at runtime; this record doesn't
-replace or relax them.
+replace or relax them. Neither the record nor the evidence it cites authorizes
+anything or establishes isolation.
 
 ## Example (disabled)
 
