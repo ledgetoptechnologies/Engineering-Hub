@@ -1,29 +1,37 @@
 /**
- * Machine health read from the Hub's configured Prometheus, for owners holding metrics_read.
- * The parser is exact-key and bounded like the rest of Infrastructure, and pinned to the
- * server-generated fixture (fixtures/infrastructure-metrics-v1.json). A missing value stays
- * null and is shown as "not reported", never as zero; an unreachable source is unknown, never down.
+ * Machine health read from the Hub's Prometheus: every active target it discovers, grouped by
+ * the operator's host label and matched to a recorded device where exactly one fits. The parser
+ * is exact-key and bounded like the rest of Infrastructure, and pinned to the contract fixture
+ * (fixtures/infrastructure-metrics-v2.json); schema 1 (explicit mappings) is still read during
+ * rollout. A missing value stays null and is shown as "not reported", never as zero; an
+ * unreachable source is unknown, never down.
  */
 import { HubApiError, isMissingRoute } from "./api";
 
 export const EXPORTERS = ["node", "windows", "nvidia"] as const;
 export const SCRAPE_STATES = ["fresh", "stale", "unknown"] as const;
-export const SOURCE_STATES = ["ok", "partial", "unreachable"] as const;
+export const SOURCE_STATES = ["not_configured", "ok", "partial", "unreachable"] as const;
+export const ASSOCIATIONS = ["matched", "unregistered", "ambiguous"] as const;
+export const WARNINGS = ["invalid_target", "ambiguous_inventory", "unknown_exporter", "targets_truncated", "series_truncated", "query_failed"] as const;
 export type Exporter = typeof EXPORTERS[number];
+export type Warning = typeof WARNINGS[number];
 export interface Disk { mount: string; size_bytes: number; free_bytes: number | null }
 export interface Gpu { index: number; model: string | null; util_ratio: number | null; mem_used_bytes: number | null; mem_total_bytes: number | null; temperature_c: number | null }
 export interface ProcessRow { name: string; count: number | null; working_set_bytes: number }
 export interface MachineTarget {
-  device_id: string; probe_id: string; job: string; instance: string; exporter: Exporter | null;
+  host_key: string; host_label: string | null; association: typeof ASSOCIATIONS[number];
+  device_id: string | null; probe_id: string | null; job: string; instance: string; exporter: Exporter | null;
   labels: { host?: string; role?: string; env?: string }; up: boolean | null; last_scrape: string | null;
   state: typeof SCRAPE_STATES[number]; cpu_busy_ratio: number | null; mem_total_bytes: number | null;
   mem_available_bytes: number | null; uptime_seconds: number | null; disks: Disk[]; gpus: Gpu[]; top_processes: ProcessRow[];
 }
-export interface MachineMetrics { generated_at: string; source: typeof SOURCE_STATES[number]; targets: MachineTarget[] }
+export interface MetricsSource { status: typeof SOURCE_STATES[number]; truncated: boolean; omitted_count: number | null; warnings: Warning[] }
+export interface MachineMetrics { generated_at: string; source: MetricsSource; targets: MachineTarget[] }
 
 const MAX_TARGETS = 200, MAX_DISKS = 16, MAX_GPUS = 8, MAX_PROCESSES = 10;
 const LABELS = ["host", "role", "env"] as const;
 const slug = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const hostKey = /^(host|target):[a-f0-9]{64}$/;
 
 function invalid(): never { throw new HubApiError(502, "invalid_infrastructure_metrics"); }
 function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -71,10 +79,31 @@ function processRow(value: unknown): ProcessRow {
   return { name: plain(row.name, 128), count: row.count === null ? null : number(row.count, { min: 1, integer: true, nullable: false }),
     working_set_bytes: number(row.working_set_bytes, { integer: true, nullable: false })! };
 }
-function target(value: unknown): MachineTarget {
-  const row = record(value, ["device_id", "probe_id", "job", "instance", "exporter", "labels", "up", "last_scrape", "state",
-    "cpu_busy_ratio", "mem_total_bytes", "mem_available_bytes", "uptime_seconds", "disks", "gpus", "top_processes"]);
-  if (typeof row.device_id !== "string" || !slug.test(row.device_id) || typeof row.probe_id !== "string" || !slug.test(row.probe_id)) return invalid();
+const METRIC_KEYS = ["job", "instance", "exporter", "labels", "up", "last_scrape", "state",
+  "cpu_busy_ratio", "mem_total_bytes", "mem_available_bytes", "uptime_seconds", "disks", "gpus", "top_processes"];
+const isSlug = (value: unknown): value is string => typeof value === "string" && slug.test(value);
+
+/** Schema 1 rows are explicit owner mappings, so each is a matched device of its own. */
+function mappedTarget(value: unknown): MachineTarget {
+  const row = record(value, ["device_id", "probe_id", ...METRIC_KEYS]);
+  if (!isSlug(row.device_id) || !isSlug(row.probe_id)) return invalid();
+  const metrics = target(row);
+  return { ...metrics, host_key: metrics.labels.host ? `v1-host:${metrics.labels.host}` : `v1-device:${row.device_id}`,
+    host_label: metrics.labels.host ?? null, association: "matched", device_id: row.device_id, probe_id: row.probe_id };
+}
+function discoveredTarget(value: unknown): MachineTarget {
+  const row = record(value, ["host_key", "host_label", "association", "device_id", "probe_id", ...METRIC_KEYS]);
+  if (typeof row.host_key !== "string" || !hostKey.test(row.host_key)) return invalid();
+  const association = oneOf(row.association, ASSOCIATIONS);
+  // Only a unique inventory match names a device; unregistered and ambiguous targets never do.
+  if (association === "matched" ? !isSlug(row.device_id) : row.device_id !== null) return invalid();
+  if (row.probe_id !== null && !isSlug(row.probe_id)) return invalid();
+  const label = row.host_label === null ? null : plain(row.host_label, 64);
+  if ((label === null) !== row.host_key.startsWith("target:")) return invalid();
+  return { ...target(row), host_key: row.host_key, host_label: label, association,
+    device_id: row.device_id as string | null, probe_id: row.probe_id as string | null };
+}
+function target(row: Record<string, unknown>): MachineTarget {
   if (!row.labels || typeof row.labels !== "object" || Array.isArray(row.labels)) return invalid();
   const raw = row.labels as Record<string, unknown>;
   if (Object.keys(raw).some(key => !(LABELS as readonly string[]).includes(key))) return invalid();
@@ -88,7 +117,8 @@ function target(value: unknown): MachineTarget {
   const total = bytes(row.mem_total_bytes), available = bytes(row.mem_available_bytes);
   if (available !== null && (total === null || available > total)) return invalid();
   return {
-    device_id: row.device_id, probe_id: row.probe_id, job: plain(row.job, 128), instance: plain(row.instance, 64),
+    host_key: "", host_label: null, association: "matched", device_id: null, probe_id: null,
+    job: plain(row.job, 128), instance: plain(row.instance, 128),
     exporter: row.exporter === null ? null : oneOf(row.exporter, EXPORTERS), labels, up: row.up as boolean | null, last_scrape: last, state,
     cpu_busy_ratio: number(row.cpu_busy_ratio, { max: 1 }), mem_total_bytes: total,
     mem_available_bytes: available, uptime_seconds: number(row.uptime_seconds, { integer: true }),
@@ -96,13 +126,26 @@ function target(value: unknown): MachineTarget {
     top_processes: list(row.top_processes, MAX_PROCESSES).map(processRow),
   };
 }
+function discoveredSource(value: unknown): MetricsSource {
+  const row = record(value, ["status", "truncated", "omitted_count", "warnings"]);
+  if (typeof row.truncated !== "boolean") return invalid();
+  const warnings = list(row.warnings, WARNINGS.length).map(item => oneOf(item, WARNINGS));
+  if (warnings.some((item, index) => index > 0 && warnings[index - 1] >= item)) return invalid();
+  const omitted = number(row.omitted_count, { integer: true });
+  if (!row.truncated && omitted !== 0) return invalid();
+  return { status: oneOf(row.status, SOURCE_STATES), truncated: row.truncated, omitted_count: omitted, warnings };
+}
 export function parseMetrics(value: unknown): MachineMetrics {
   const row = record(value, ["schema_version", "generated_at", "source", "devices"]);
-  if (row.schema_version !== 1) return invalid();
-  const source = record(row.source, ["status"]);
-  const targets = list(row.devices, MAX_TARGETS).map(target);
+  if (row.schema_version !== 1 && row.schema_version !== 2) return invalid();
+  const v2 = row.schema_version === 2;
+  const source: MetricsSource = v2 ? discoveredSource(row.source)
+    : { status: oneOf(record(row.source, ["status"]).status, ["ok", "partial", "unreachable"] as const), truncated: false, omitted_count: 0, warnings: [] };
+  const targets = list(row.devices, MAX_TARGETS).map(v2 ? discoveredTarget : mappedTarget);
   if (new Set(targets.map(item => `${item.job}\n${item.instance}`)).size !== targets.length) return invalid();
-  return { generated_at: time(row.generated_at), source: oneOf(source.status, SOURCE_STATES), targets };
+  // Not configured means nothing was fetched; unreachable keeps no stale rows.
+  if ((source.status === "not_configured" || (v2 && source.status === "unreachable")) && targets.length > 0) return invalid();
+  return { generated_at: time(row.generated_at), source, targets };
 }
 
 /** null means this Hub or this person has no metrics: the panel is hidden, as for other optional routes. */
@@ -124,17 +167,27 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
   return parseMetrics(body);
 }
 
-/** Groups CPU and GPU exporters of one machine together: by the operator's host label, else the device. */
-export function groupMachines(targets: MachineTarget[]): { key: string; title: string; labels: MachineTarget["labels"]; targets: MachineTarget[] }[] {
+export interface MachineGroup {
+  key: string; title: string; labels: MachineTarget["labels"]; targets: MachineTarget[];
+  /** The one recorded device every target here matched, if they agree. */
+  device_id: string | null; unregistered: boolean; ambiguous: boolean;
+}
+/**
+ * Groups a machine's CPU and GPU exporters by the server's host key: the operator's host label,
+ * else the single target. A shared label is display grouping, not proof of one physical machine.
+ */
+export function groupMachines(targets: MachineTarget[]): MachineGroup[] {
   const groups = new Map<string, MachineTarget[]>();
-  for (const item of targets) {
-    const key = item.labels.host ? `host:${item.labels.host}` : `device:${item.device_id}`;
-    groups.set(key, [...(groups.get(key) ?? []), item]);
-  }
-  return [...groups.entries()].map(([key, items]) => ({ key, title: items[0].labels.host ?? items[0].device_id,
-    labels: { role: items.find(item => item.labels.role)?.labels.role, env: items.find(item => item.labels.env)?.labels.env },
-    targets: [...items].sort((a, b) => (a.exporter === "nvidia" ? 1 : 0) - (b.exporter === "nvidia" ? 1 : 0)) }))
-    .sort((a, b) => a.title.localeCompare(b.title));
+  for (const item of targets) groups.set(item.host_key, [...(groups.get(item.host_key) ?? []), item]);
+  return [...groups.entries()].map(([key, items]) => {
+    const devices = new Set(items.map(item => item.device_id));
+    return { key, title: items[0].host_label ?? items[0].device_id ?? items[0].instance,
+      labels: { role: items.find(item => item.labels.role)?.labels.role, env: items.find(item => item.labels.env)?.labels.env },
+      targets: [...items].sort((a, b) => (a.exporter === "nvidia" ? 1 : 0) - (b.exporter === "nvidia" ? 1 : 0)),
+      device_id: devices.size === 1 ? items[0].device_id : null,
+      unregistered: items.every(item => item.association === "unregistered"),
+      ambiguous: items.some(item => item.association === "ambiguous") };
+  }).sort((a, b) => a.title.localeCompare(b.title));
 }
 
 export function formatBytes(value: number | null): string {

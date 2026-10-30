@@ -1,0 +1,176 @@
+{
+  "description": "Synthetic contract examples; generated with stdlib, not runtime/server acceptance. Documentation-only IPs.",
+  "limits": {
+    "targets": 200,
+    "disks": 16,
+    "gpus": 8,
+    "processes": 10
+  },
+  "cases": {
+    "not_configured": {
+      "schema_version": 2,
+      "generated_at": "2026-10-30T01:30:00Z",
+      "source": {
+        "status": "not_configured",
+        "truncated": false,
+        "omitted_count": 0,
+        "warnings": []
+      },
+      "devices": []
+    },
+    "unreachable": {
+      "schema_version": 2,
+      "generated_at": "2026-10-30T01:30:00Z",
+      "source": {
+        "status": "unreachable",
+        "truncated": false,
+        "omitted_count": 0,
+        "warnings": []
+      },
+      "devices": []
+    },
+    "discovered": {
+      "schema_version": 2,
+      "generated_at": "2026-10-30T01:30:00Z",
+      "source": {
+        "status": "ok",
+        "truncated": false,
+        "omitted_count": 0,
+        "warnings": [
+          "ambiguous_inventory",
+          "unknown_exporter"
+        ]
+      },
+      "devices": [
+        {
+          "host_key": "host:424b233dc47c751a5af12a4cb71cab8826c4a4616d981e877f6b985dd3673236",
+          "host_label": "demo-workstation",
+          "association": "matched",
+          "device_id": "demo-workstation",
+          "probe_id": null,
+          "job": "windows",
+          "instance": "192.0.2.10:9182",
+          "exporter": "windows",
+          "labels": {
+            "host": "demo-workstation"
+          },
+          "up": null,
+          "last_scrape": null,
+          "state": "unknown",
+          "cpu_busy_ratio": null,
+          "mem_total_bytes": null,
+          "mem_available_bytes": null,
+          "uptime_seconds": null,
+          "disks": [],
+          "gpus": [],
+          "top_processes": []
+        },
+        {
+          "host_key": "host:424b233dc47c751a5af12a4cb71cab8826c4a4616d981e877f6b985dd3673236",
+          "host_label": "demo-workstation",
+          "association": "matched",
+          "device_id": "demo-workstation",
+          "probe_id": null,
+          "job": "nvidia",
+          "instance": "192.0.2.10:9400",
+          "exporter": "nvidia",
+          "labels": {
+            "host": "demo-workstation"
+          },
+          "up": null,
+          "last_scrape": null,
+          "state": "unknown",
+          "cpu_busy_ratio": null,
+          "mem_total_bytes": null,
+          "mem_available_bytes": null,
+          "uptime_seconds": null,
+          "disks": [],
+          "gpus": [],
+          "top_processes": []
+        },
+        {
+          "host_key": "target:f527719bb2302c10a3e6014b1b96cb134ceaa28d55f70f56058d7bb32967dc18",
+          "host_label": null,
+          "association": "unregistered",
+          "device_id": null,
+          "probe_id": null,
+          "job": "custom",
+          "instance": "192.0.2.11:9000",
+          "exporter": null,
+          "labels": {},
+          "up": null,
+          "last_scrape": null,
+          "state": "unknown",
+          "cpu_busy_ratio": null,
+          "mem_total_bytes": null,
+          "mem_available_bytes": null,
+          "uptime_seconds": null,
+          "disks": [],
+          "gpus": [],
+          "top_processes": []
+        },
+        {
+          "host_key": "host:3b092f41df1c1db1b52e5356c967571a5ebcaaf393081fc566828fc495bf0f14",
+          "host_label": "duplicate-demo",
+          "association": "ambiguous",
+          "device_id": null,
+          "probe_id": null,
+          "job": "node",
+          "instance": "192.0.2.12:9100",
+          "exporter": "node",
+          "labels": {
+            "host": "duplicate-demo"
+          },
+          "up": null,
+          "last_scrape": null,
+          "state": "unknown",
+          "cpu_busy_ratio": null,
+          "mem_total_bytes": null,
+          "mem_available_bytes": null,
+          "uptime_seconds": null,
+          "disks": [],
+          "gpus": [],
+          "top_processes": []
+        }
+      ]
+    },
+    "partial_truncated": {
+      "schema_version": 2,
+      "generated_at": "2026-10-30T01:30:00Z",
+      "source": {
+        "status": "partial",
+        "truncated": true,
+        "omitted_count": 3,
+        "warnings": [
+          "query_failed",
+          "targets_truncated"
+        ]
+      },
+      "devices": [
+        {
+          "host_key": "host:a4d4de00d862ce3c4a2df8b192316c39403afc7295ff415f192bc69c45c55708",
+          "host_label": "demo-node",
+          "association": "unregistered",
+          "device_id": null,
+          "probe_id": null,
+          "job": "node",
+          "instance": "192.0.2.13:9100",
+          "exporter": "node",
+          "labels": {
+            "host": "demo-node"
+          },
+          "up": null,
+          "last_scrape": null,
+          "state": "unknown",
+          "cpu_busy_ratio": null,
+          "mem_total_bytes": null,
+          "mem_available_bytes": null,
+          "uptime_seconds": null,
+          "disks": [],
+          "gpus": [],
+          "top_processes": []
+        }
+      ]
+    }
+  }
+}
