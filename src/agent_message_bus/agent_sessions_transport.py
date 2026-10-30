@@ -231,7 +231,8 @@ class MCPAuthMiddleware:
             return await denied(scope, receive, send, 'session_not_found', 404)
         if new and scope['method'] == 'POST':
             replay = await session_post(scope, receive, send,
-                getattr(self.agent_sessions, '_hub_bridge_tools', ()))
+                tuple(getattr(self.agent_sessions, '_hub_bridge_tools', ()))
+                + tuple(getattr(self.agent_sessions, '_infrastructure_metric_tools', ())))
             if replay is None:
                 return
             receive = replay

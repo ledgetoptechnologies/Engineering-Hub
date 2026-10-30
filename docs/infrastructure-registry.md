@@ -58,7 +58,10 @@ The adapters enforce the same default-deny capability on every
 HTTP and MCP list/read/write route, require human CSRF for mutations, and expose
 caller-specific UI capabilities. Client/project-only collaborators must not
 inherit global infrastructure access. UI hiding is not authorization. Default
-configuration remains disabled until the owner provisions the intended policy.
+configuration may use the application's explicitly configured owner defaults
+when no operator file exists. Explicit operator settings and disables retain
+precedence. See [discovered machine metrics](discovered-machine-metrics.md) for
+the separate owner/internal-agent metrics policy and installation classification.
 
 The UI shows declared facts, each probe's age/source and the maintenance journal,
 with manual refresh and existing event invalidation. It ages observations locally
@@ -125,7 +128,13 @@ time and expiry (three scrape intervals, at most one hour). Missing, invalid, du
 or older/replayed observations cannot refresh health. Authorization and current device
 addresses are checked before network I/O and again before writes.
 
-### Machine health (owner metrics)
+### Legacy mapped machine metrics adapter
+
+The following describes the retained schema 1 `MetricsReader` adapter and its
+standalone route binding. The Hub application now composes schema 2 discovery
+with owner/internal-agent admission; use [discovered machine metrics](discovered-machine-metrics.md)
+for its defaults, routes and installation classification. Schema 1 remains a
+compatibility input while the UI transition is integrated.
 
 Give a mapping an `exporter` of `node`, `windows` or `nvidia` to include it in the
 Infrastructure page's **Machine health** panel. Mappings without one stay up/down only.

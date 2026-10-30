@@ -100,12 +100,14 @@ def browser_route_allowed(method, path):
     """Closed browser surface; new backend routes are not exposed implicitly."""
     owner = '/api/hub/v1/agent-connections'
     installation = owner + '/installations/' + _UUID
+    if method in {'GET', 'HEAD', 'PUT'} and path == owner + '/installation-scopes':
+        return True
     if method in {'GET', 'HEAD'} and (
             path in {owner + '/capabilities', owner + '/hub-capabilities', owner + '/installations', owner + '/audit'}
-            or re.fullmatch(installation + r'/(?:sessions|hub-grant|task-claims)', path) is not None
+            or re.fullmatch(installation + r'/(?:sessions|hub-grant|task-claims|scope)', path) is not None
             or re.fullmatch(owner + '/tasks/' + _UUID + '/claim-recoveries', path) is not None):
         return True
-    if method == 'PUT' and re.fullmatch(installation + '/hub-grant', path) is not None:
+    if method == 'PUT' and re.fullmatch(installation + r'/(?:hub-grant|scope)', path) is not None:
         return True
     if method == 'PATCH' and re.fullmatch(installation, path) is not None:
         return True

@@ -11,7 +11,9 @@ Operator-owned schema1 settings example (no implicit owner or agent grant)::
 Only the fixed state_root/infrastructure/inventory.sqlite3 is used. Optional
 Prometheus settings select one literal IP/port and explicit target mappings for
 an authenticated on-demand refresh tool; never a caller URL, scheduler or listener. Missing/disabled
-settings cause no database/directory writes. Existing inventory schemas must
+settings cause no database/directory writes unless the application explicitly
+supplies its configured owner for built-in defaults. An existing operator file
+always takes precedence, including an explicit disable. Existing inventory schemas must
 match this standalone implementation; migrations require explicit review.
 Operators must not rename live state paths. SQLite's Unix VFS may canonicalize
 proc-FD paths; live identity guards fail closed on named-path drift instead of
@@ -21,6 +23,7 @@ are not protection against hostile root racing within an individual syscall.
 from dataclasses import dataclass
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import stat
@@ -31,6 +34,10 @@ from .repository import AGENTS, HubRepository
 
 
 MAX_CONFIG_BYTES = 16384
+# Existing private Prometheus endpoint, independently observed serving active
+# targets on 2026-10-30 UTC. An explicit operator origin always overrides it.
+DEFAULT_PROMETHEUS_ADDRESS = '192.168.50.80'
+DEFAULT_PROMETHEUS_PORT = 30104
 
 
 def _need(value):
@@ -111,10 +118,10 @@ def _settings(path):
     if 'prometheus' in value:
         from .infrastructure_prometheus import PrometheusOrigin, TargetMapping, MAX_TARGETS
         source=value['prometheus']
-        _need(type(source) is dict and set(source)=={'address','port','mappings'})
+        _need(type(source) is dict and {'address','port'} <= set(source) <= {'address','port','mappings'})
         origin=PrometheusOrigin(source['address'],source['port'])
-        rows=source['mappings']
-        _need(type(rows) is list and 1<=len(rows)<=MAX_TARGETS)
+        rows=source.get('mappings', [])
+        _need(type(rows) is list and len(rows)<=MAX_TARGETS)
         mappings=[]
         for row in rows:
             keys={'job','instance','device_id','probe_id'}
@@ -148,6 +155,7 @@ class InfrastructureModule:
     service: object = None
     collector: object = None
     metrics: object = None
+    prometheus_origin: object = None
     state: str = 'disabled'
     _directory_fd: object = None
     _registry: object = None
@@ -159,6 +167,7 @@ class InfrastructureModule:
         self._closed=True
         self.collector=None
         self.metrics=None
+        self.prometheus_origin=None
         service,self.service=self.service,None
         registry,self._registry=self._registry,None
         try:
@@ -169,7 +178,7 @@ class InfrastructureModule:
                 os.close(self._directory_fd);self._directory_fd=None
 
 
-def compose_infrastructure(path,*,state_root,on_change=None):
+def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
     """Load optional settings; closed failures expose no paths or raw errors."""
     module=InfrastructureModule()
     if path is None:
@@ -177,7 +186,16 @@ def compose_infrastructure(path,*,state_root,on_change=None):
     try:
         enabled,grants,prometheus=_settings(path)
     except FileNotFoundError:
-        return module
+        if default_owner is None:
+            return module
+        # Explicit app-owned defaults remove manual settings-file setup. An
+        # existing file, including enabled:false, always retains precedence.
+        if (type(default_owner) is not str or re.fullmatch(
+                r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', default_owner) is None):
+            module.state='invalid';return module
+        enabled, prometheus = True, None
+        grants = {InfrastructurePrincipal('human', default_owner): CAPABILITIES}
+        grants.update({InfrastructurePrincipal('agent', agent): frozenset({'read'}) for agent in AGENTS})
     except Exception:
         module.state='invalid';return module
     if not enabled:
@@ -263,8 +281,15 @@ def compose_infrastructure(path,*,state_root,on_change=None):
         if prometheus is not None:
             from .infrastructure_prometheus import PrometheusCollector
             from .infrastructure_metrics import MetricsReader
-            module.collector=PrometheusCollector(service,*prometheus)
-            module.metrics=MetricsReader(service,*prometheus)
+            module.prometheus_origin=prometheus[0]
+            # Explicit mappings remain available for the legacy ledger refresh;
+            # read-only discovery needs only the fixed origin.
+            if prometheus[1]:
+                module.collector=PrometheusCollector(service,*prometheus)
+                module.metrics=MetricsReader(service,*prometheus)
+        elif default_owner is not None:
+            from .infrastructure_prometheus import PrometheusOrigin
+            module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
         root_fd=None;db=None

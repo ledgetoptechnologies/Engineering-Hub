@@ -35,6 +35,30 @@ def test_missing_default_and_disabled_never_create_state(tmp_path):
         assert not state.exists()
 
 
+@POSIX
+def test_explicit_app_defaults_need_no_file_and_preserve_operator_disable(tmp_path):
+    path = tmp_path / 'infrastructure.json'
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert module.state == 'ready' and not path.exists()
+    assert module.prometheus_origin.url == 'http://192.168.50.80:30104'
+    assert module.service.list_devices('human:1')['items'] == []
+    module.close()
+    write(path, config(False))
+    disabled = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert disabled.state == 'disabled' and disabled.service is None
+
+
+@POSIX
+def test_prometheus_origin_without_mapping_list_is_valid(tmp_path):
+    value = config()
+    value['prometheus'] = {'address': '192.0.2.80', 'port': 9090}
+    path = write(tmp_path / 'infrastructure.json', value)
+    module = compose_infrastructure(path, state_root=tmp_path)
+    assert module.state == 'ready' and module.prometheus_origin.url == 'http://192.0.2.80:9090'
+    assert module.collector is None
+    module.close()
+
+
 @pytest.mark.parametrize('value',[
     {'schema_version':True,'enabled':False,'principals':[]},
     {'schema_version':2,'enabled':False,'principals':[]},
