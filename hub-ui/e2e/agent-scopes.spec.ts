@@ -11,7 +11,7 @@ function installation(fields: Partial<Installation> & Pick<Installation, "id" | 
 }
 const unset = (id: string): InstallationScope => ({ installation_id: id, kind: "unclassified", revision: 0, updated_by: null, updated_at: null, internal_effective: false });
 
-async function fixture(page: Page, options: { scopesStatus?: number; writeCode?: string } = {}) {
+async function fixture(page: Page, options: { scopesStatus?: number; writeCode?: string; truncated?: boolean } = {}) {
   const state = {
     installations: [
       installation({ id: "inst_laptop", family: "claude", name: "Claude on the laptop", host_label: "beau-laptop" }),
@@ -44,9 +44,9 @@ async function fixture(page: Page, options: { scopesStatus?: number; writeCode?:
         state.holdNextRead = false;
         const then = structuredClone(state.scopes);
         await new Promise<void>(resolve => { state.release = resolve; });
-        return respond({ installations: then });
+        return respond({ installations: then, truncated: false });
       }
-      return options.scopesStatus ? respond({ detail: { code: "not_found" } }, options.scopesStatus) : respond({ installations: state.scopes });
+      return options.scopesStatus ? respond({ detail: { code: "not_found" } }, options.scopesStatus) : respond({ installations: state.scopes, truncated: options.truncated ?? false });
     }
     if (rest === "/installation-scopes" && request.method() === "PUT") {
       const body = request.postDataJSON();
@@ -142,4 +142,15 @@ test("a list read that was asked before a confirm can't overwrite what the confi
   state.release!();
   await page.waitForTimeout(300);
   await expect(review.getByRole("listitem").filter({ hasText: "Codex on BEAST" })).toContainText("Our agent");
+});
+
+test("says when older installations were left out of the list, and only then", async ({ page }) => {
+  await fixture(page, { truncated: true });
+  await page.goto("/#/agents");
+  await expect(section(page)).toContainText("Only 4 installations are listed: active ones first, then the newest.");
+  await page.unrouteAll();
+  await fixture(page);
+  await page.reload();
+  await expect(section(page)).toContainText("Codex on BEAST");
+  await expect(section(page)).not.toContainText("installations are listed");
 });

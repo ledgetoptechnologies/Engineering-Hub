@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { HubApiError } from "./api";
-import { httpInstallationScopes, parseInstallationScopes, scopeFailureText } from "./agentConnectionsApi";
+import { httpInstallationScopes, parseInstallationScopeList, parseInstallationScopes, scopeFailureText } from "./agentConnectionsApi";
 
 const unset = { installation_id: "inst_a", kind: "unclassified", revision: 0, updated_by: null, updated_at: null, internal_effective: false };
 const ours = { installation_id: "inst_b", kind: "internal", revision: 2, updated_by: "human:1", updated_at: "2026-10-30T02:00:00Z", internal_effective: true };
@@ -24,6 +24,14 @@ describe("installation scopes", () => {
   it("rejects duplicates and oversized lists", () => {
     expect(() => parseInstallationScopes({ installations: [ours, ours] })).toThrow();
     expect(() => parseInstallationScopes({ installations: Array.from({ length: 257 }, (_, i) => ({ ...unset, installation_id: `inst_${i}` })) })).toThrow();
+  });
+  it("reads the owner list with its truncated flag, exactly", async () => {
+    expect(parseInstallationScopeList({ installations: [unset, ours], truncated: true }).truncated).toBe(true);
+    expect(() => parseInstallationScopeList({ installations: [unset] })).toThrow();
+    expect(() => parseInstallationScopeList({ installations: [unset], truncated: "no" })).toThrow();
+    expect(() => parseInstallationScopeList({ installations: [unset], truncated: false, extra: 1 })).toThrow();
+    const listed = await httpInstallationScopes(vi.fn(async () => json({ installations: [ours], truncated: false }))).list(new AbortController().signal);
+    expect(listed).toEqual({ installations: [ours], truncated: false });
   });
   it("sends one PUT with the chosen kind, revisions and CSRF", async () => {
     const fetchImpl = vi.fn(async () => json({ installations: [{ ...ours, installation_id: "inst_a", revision: 1 }] }));

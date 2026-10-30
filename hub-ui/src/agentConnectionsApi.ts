@@ -146,15 +146,22 @@ export function parseInstallationScope(value: unknown): InstallationScope {
   if (scope.internal_effective && scope.kind !== "internal") return invalid();
   return scope;
 }
+/** A write's answer: exactly the rows it changed. */
 export const parseInstallationScopes = (value: unknown) => list(value, "installations", parseInstallationScope, MAX_SCOPES, item => item.installation_id);
+/** The owner list: active installations first, then newest, at most MAX_SCOPES, saying whether older ones were left out. */
+export function parseInstallationScopeList(value: unknown): { installations: InstallationScope[]; truncated: boolean } {
+  const row = record(value, ["installations", "truncated"]);
+  if (typeof row.truncated !== "boolean") return invalid();
+  return { installations: parseInstallationScopes({ installations: row.installations }), truncated: row.truncated };
+}
 export interface InstallationScopesClient {
-  list(signal: AbortSignal): Promise<InstallationScope[]>;
+  list(signal: AbortSignal): Promise<{ installations: InstallationScope[]; truncated: boolean }>;
   /** All or nothing: one stale revision or inactive installation rejects the whole set. */
   set(kind: ScopeKind, rows: { installation_id: string; expected_revision: number }[], csrf: string): Promise<InstallationScope[]>;
 }
 export function httpInstallationScopes(fetchImpl: typeof fetch = globalThis.fetch): InstallationScopesClient {
   return {
-    list: async signal => parseInstallationScopes(await ownerCall("/installation-scopes", read(signal), fetchImpl)),
+    list: async signal => parseInstallationScopeList(await ownerCall("/installation-scopes", read(signal), fetchImpl)),
     set: async (kind, rows, csrf) => {
       if (rows.length < 1 || rows.length > MAX_SCOPES) throw new HubApiError(422, "invalid_installation_scope");
       const installations = rows.map(row => ({ installation_id: id(row.installation_id), expected_revision: row.expected_revision }));

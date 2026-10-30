@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import { HubApiError } from "./api";
 import {
-  FAMILY_NAME, httpInstallationScopes, MAX_SCOPES, scopeFailureText, STATE_LABEL,
+  FAMILY_NAME, httpInstallationScopes, scopeFailureText, STATE_LABEL,
   type Installation, type InstallationScope, type InstallationScopesClient, type ScopeKind,
 } from "./agentConnectionsApi";
 import { relativeAge } from "./dashboardText";
@@ -27,6 +27,7 @@ export function InstallationScopeReview({ items, epoch, canChange, allowed, onDe
   const client = useRef(given ?? httpInstallationScopes()).current;
   const [load, setLoad] = useState<Load>("loading");
   const [scopes, setScopes] = useState<InstallationScope[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [kind, setKind] = useState<ScopeKind>("internal");
   const [confirming, setConfirming] = useState(false);
@@ -43,9 +44,9 @@ export function InstallationScopeReview({ items, epoch, canChange, allowed, onDe
     try {
       const found = await client.list(controller.signal);
       if (!mounted.current || current !== reads.current) return;
-      setScopes(found); setLoad("loaded");
+      setScopes(found.installations); setTruncated(found.truncated); setLoad("loaded");
       // A selection only ever names rows that still exist.
-      setSelected(previous => new Set([...previous].filter(key => found.some(row => row.installation_id === key))));
+      setSelected(previous => new Set([...previous].filter(key => found.installations.some(row => row.installation_id === key))));
     } catch (error) {
       if (!mounted.current || current !== reads.current || onDenied(error)) return;
       // Before the Hub offers this list, or for someone who can't use it, the section isn't shown.
@@ -127,7 +128,8 @@ export function InstallationScopeReview({ items, epoch, canChange, allowed, onDe
           </li>;
         })}
       </ul>}
-      {scopes.length >= MAX_SCOPES && <p className="panel-footnote">Only the newest {MAX_SCOPES} installations are listed.</p>}
+      {truncated && <p className="panel-footnote">Only {scopes.length} installations are listed: active ones first, then the newest.
+        Older ones are left out.</p>}
       <div className="note-actions">
         <button type="button" className="primary" disabled={!canChange || busy || chosen.length === 0} onClick={() => { setNotice(null); setConfirming(true); }}>
           {chosen.length === 0 ? "Select installations to change" : `Mark ${chosen.length} as ${KIND_ACTION[kind]}…`}</button>
