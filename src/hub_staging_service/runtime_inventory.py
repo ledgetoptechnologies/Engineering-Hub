@@ -142,7 +142,11 @@ def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
             reader_failed.set()
             failed.set()
         finally:
-            process.stdout.close()
+            try:
+                process.stdout.close()
+            except Exception:
+                reader_failed.set()
+                failed.set()
 
     try:
         reader = threading.Thread(target=drain, daemon=True)
@@ -176,7 +180,10 @@ def capture_fixed(command, *, timeout=8, maximum=MAX_BYTES):
                 except Exception:
                     failed.set()
             else:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except Exception:
+                    failed.set()
     if (expired or overflow.is_set() or failed.is_set() or not started
             or reader.is_alive() or process.returncode):
         reason = ('overflow' if overflow.is_set() else 'reader' if reader_failed.is_set()

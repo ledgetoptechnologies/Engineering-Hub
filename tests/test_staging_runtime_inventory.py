@@ -495,3 +495,50 @@ def test_capture_failure_service_subcode_and_untrusted_error_fallback():
         raise RuntimeError('SECRET')
     inventory.collect_host(now=NOW, capture=untrusted, diagnostic=messages.append)
     assert messages == ['staging_runtime_docker_capture_failed']
+
+
+def test_capture_internal_failure_emits_fixed_subcode_and_reaps(monkeypatch):
+    child = CapturedProcess(b'', running=True)
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    def broken_thread(**kwargs):
+        raise RuntimeError('SECRET lifecycle detail')
+    monkeypatch.setattr(inventory.threading, 'Thread', broken_thread)
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_internal']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.killed and child.wait_count == 1 and child.stdout.closed
+    assert 'SECRET' not in str(messages) + json.dumps(result)
+
+
+def test_capture_reader_close_failure_is_silent_and_fails_closed(monkeypatch, capsys):
+    class BrokenClose(io.BytesIO):
+        def close(self):
+            super().close()
+            raise OSError('SECRET close detail')
+    child = CapturedProcess(b'')
+    child.stdout = BrokenClose()
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_reader']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.stdout.closed and child.wait_count >= 1
+    assert 'SECRET' not in str(messages) + json.dumps(result) + capsys.readouterr().err
+
+
+def test_capture_unstarted_reader_close_failure_stays_internal(monkeypatch, capsys):
+    class BrokenClose(io.BytesIO):
+        def close(self):
+            super().close()
+            raise OSError('SECRET close detail')
+    child = CapturedProcess(b'', running=True)
+    child.stdout = BrokenClose()
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    monkeypatch.setattr(inventory.threading, 'Thread', lambda **kwargs: (_ for _ in ()).throw(RuntimeError('SECRET')))
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_internal']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.killed and child.wait_count == 1 and child.stdout.closed
+    assert 'SECRET' not in str(messages) + json.dumps(result) + capsys.readouterr().err
