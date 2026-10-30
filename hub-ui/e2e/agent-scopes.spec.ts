@@ -22,6 +22,7 @@ async function fixture(page: Page, options: { scopesStatus?: number; writeCode?:
     scopes: [unset("inst_laptop"), unset("inst_codex"), unset("inst_guest"), unset("inst_old")],
     puts: [] as { body: { kind: string; installations: { installation_id: string; expected_revision: number }[] }; csrf?: string }[],
     scopeReads: 0, writeCode: options.writeCode ?? "",
+    holdNextRead: false, release: null as (() => void) | null,
   };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -38,6 +39,13 @@ async function fixture(page: Page, options: { scopesStatus?: number; writeCode?:
     if (rest === "/audit") return respond({ events: [] });
     if (rest === "/installation-scopes" && request.method() === "GET") {
       state.scopeReads++;
+      // A held read answers later with what the server had when it was asked.
+      if (state.holdNextRead) {
+        state.holdNextRead = false;
+        const then = structuredClone(state.scopes);
+        await new Promise<void>(resolve => { state.release = resolve; });
+        return respond({ installations: then });
+      }
       return options.scopesStatus ? respond({ detail: { code: "not_found" } }, options.scopesStatus) : respond({ installations: state.scopes });
     }
     if (rest === "/installation-scopes" && request.method() === "PUT") {
@@ -117,4 +125,21 @@ test("is hidden until the Hub offers it", async ({ page }) => {
   await page.goto("/#/agents");
   await expect(page.getByRole("region", { name: "Installations", exact: true })).toContainText("Codex on BEAST");
   await expect(section(page)).toHaveCount(0);
+});
+
+test("a list read that was asked before a confirm can't overwrite what the confirm saved", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/agents");
+  const review = section(page);
+  await expect(review).toContainText("Codex on BEAST");
+  state.holdNextRead = true;
+  await page.getByRole("region", { name: "Installations", exact: true }).getByRole("button", { name: "Refresh" }).first().click();
+  await expect.poll(() => state.release !== null).toBe(true);
+  await review.getByRole("checkbox", { name: /Codex on BEAST/ }).check();
+  await review.getByRole("button", { name: "Mark 1 as our own agents…" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Confirm" }).click();
+  await expect(review).toContainText("Marked 1 installation as our own agents.");
+  state.release!();
+  await page.waitForTimeout(300);
+  await expect(review.getByRole("listitem").filter({ hasText: "Codex on BEAST" })).toContainText("Our agent");
 });
