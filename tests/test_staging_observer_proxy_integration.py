@@ -15,16 +15,22 @@ IMAGE = 'engineering-hub-backend-qa:node24-vitest-nginx-20261030-v1'
 # Executed only in a disposable networkless container. TLS material and logs
 # exist solely in its temporary filesystem and use synthetic markers.
 CONTAINER_TEST = r'''
-import base64, http.server, pathlib, socket, ssl, subprocess, tempfile, threading, time
+import base64, http.server, pathlib, select, socket, ssl, subprocess, tempfile, threading, time
 root = pathlib.Path(tempfile.mkdtemp())
 subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes',
  '-keyout',str(root/'key'),'-out',str(root/'cert'),'-days','1',
  '-subj','/CN=127.0.0.1'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 seen=[]
 class Handler(http.server.BaseHTTPRequestHandler):
+ # Avoid buffered header parsing consuming body bytes before the socket check.
+ rbufsize = 0
  def do_GET(self):
+  # The proxy closes each upstream connection, so any readable bytes here
+  # are request body data, not another request on a keepalive connection.
+  readable, _, _ = select.select([self.connection], [], [], 0.2)
+  body = self.connection.recv(4096, socket.MSG_PEEK) if readable else b''
   seen.append((self.headers.get_all('Authorization'), self.headers.get('X-Synthetic'),
-   self.headers.get('Content-Length'), self.headers.get('Transfer-Encoding')))
+   self.headers.get('Content-Length'), self.headers.get('Transfer-Encoding'), body))
   self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
  def log_message(self,*args): pass
 server=http.server.HTTPServer(('127.0.0.1',18781),Handler)
@@ -61,6 +67,7 @@ try:
  assert request('GET','/v1/runtime',bearer)==200
  assert request('GET','/v1/runtime',bearer+'X-Synthetic: marker\r\nContent-Length: 4\r\n',body=b'test')==200
  assert request('GET','/v1/runtime',bearer+'Transfer-Encoding: chunked\r\n',body=b'0\r\n\r\n')==400
+ assert request('GET','/v1/runtime',bearer+'Transfer-Encoding: chunked\r\n',body=b'4\r\ntest\r\n0\r\n\r\n')==400
  assert request('GET','/v1/runtime',bearer+'Authorization: Bearer synthetic-other-marker\r\n')==400
  assert request('GET','/v1/runtime', 'Authorization: Bearer synthetic-other-marker\r\n'+bearer)==400
  for method,path in [('GET','/v1/runtime?synthetic-query-marker'),('GET','/V1/runtime'),
@@ -68,7 +75,7 @@ try:
   assert request(method,path,bearer)==404
  assert request('GET','/v1/runtime','X-Forwarded-For: 127.0.0.1\r\n', '127.0.0.2')==403
  assert request('GET','/synthetic-uri-marker?synthetic-query-marker','Bad Header: x\r\n')==400
- assert seen == [(['Bearer synthetic-bearer-marker'], None, None, None)] * 2
+ assert seen == [(['Bearer synthetic-bearer-marker'], None, None, None, b'')] * 2
  server.shutdown();server.server_close()
  assert request('GET','/v1/runtime',bearer)==502
 finally:
