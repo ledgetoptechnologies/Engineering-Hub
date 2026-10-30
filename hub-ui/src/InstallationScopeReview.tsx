@@ -72,9 +72,12 @@ export function InstallationScopeReview({ items, epoch, canChange, allowed, onDe
     const { canChange: may, csrf } = allowed();
     if (!may || !csrf) { setNotice({ error: true, text: "Changes aren't available right now: sign in again or Refresh, then try again. Nothing was sent." }); return; }
     setBusy(true); setNotice(null);
+    // A list read still open was asked before this write, so its answer must not replace what the write returns.
+    reads.current++;
     try {
       const saved = await client.set(kind, chosen.map(row => ({ installation_id: row.scope.installation_id, expected_revision: row.scope.revision })), csrf);
       if (!mounted.current) return;
+      reads.current++;
       const next = new Map(saved.map(row => [row.installation_id, row]));
       setScopes(previous => previous.map(row => next.get(row.installation_id) ?? row));
       setSelected(new Set()); setConfirming(false);
