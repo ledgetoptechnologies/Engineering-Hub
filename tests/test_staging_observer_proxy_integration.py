@@ -23,7 +23,8 @@ subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes',
 seen=[]
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
-  seen.append(self.headers.get_all('Authorization'))
+  seen.append((self.headers.get_all('Authorization'), self.headers.get('X-Synthetic'),
+   self.headers.get('Content-Length'), self.headers.get('Transfer-Encoding')))
   self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
  def log_message(self,*args): pass
 server=http.server.HTTPServer(('127.0.0.1',18781),Handler)
@@ -41,8 +42,8 @@ for key,value in {'__STAGING_BIND_IP__':'127.0.0.1','__TLS_PORT__':'19443',
  '; include '+str(root/'observer.conf')+'; }')
 logs=(root/'stderr').open('wb')
 process=subprocess.Popen(['nginx','-c',str(root/'nginx.conf')],stdout=logs,stderr=logs)
-def request(method,path,headers='',source='127.0.0.1'):
- raw=(method+' '+path+' HTTP/1.1\r\nHost: localhost\r\n'+headers+'Connection: close\r\n\r\n').encode()
+def request(method,path,headers='',source='127.0.0.1',body=b''):
+ raw=(method+' '+path+' HTTP/1.1\r\nHost: localhost\r\n'+headers+'Connection: close\r\n\r\n').encode()+body
  with ssl._create_unverified_context().wrap_socket(socket.create_connection(
   ('127.0.0.1',19443),timeout=3,source_address=(source,0)),server_hostname='127.0.0.1') as connection:
   connection.sendall(raw); output=b''
@@ -58,6 +59,8 @@ try:
  else: raise AssertionError('nginx did not start')
  bearer='Authorization: Bearer synthetic-bearer-marker\r\n'
  assert request('GET','/v1/runtime',bearer)==200
+ assert request('GET','/v1/runtime',bearer+'X-Synthetic: marker\r\nContent-Length: 4\r\n',body=b'test')==200
+ assert request('GET','/v1/runtime',bearer+'Transfer-Encoding: chunked\r\n',body=b'0\r\n\r\n')==400
  assert request('GET','/v1/runtime',bearer+'Authorization: Bearer synthetic-other-marker\r\n')==400
  assert request('GET','/v1/runtime', 'Authorization: Bearer synthetic-other-marker\r\n'+bearer)==400
  for method,path in [('GET','/v1/runtime?synthetic-query-marker'),('GET','/V1/runtime'),
@@ -65,7 +68,7 @@ try:
   assert request(method,path,bearer)==404
  assert request('GET','/v1/runtime','X-Forwarded-For: 127.0.0.1\r\n', '127.0.0.2')==403
  assert request('GET','/synthetic-uri-marker?synthetic-query-marker','Bad Header: x\r\n')==400
- assert seen == [['Bearer synthetic-bearer-marker']]
+ assert seen == [(['Bearer synthetic-bearer-marker'], None, None, None)] * 2
  server.shutdown();server.server_close()
  assert request('GET','/v1/runtime',bearer)==502
 finally:
