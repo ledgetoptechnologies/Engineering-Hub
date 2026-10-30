@@ -1,11 +1,12 @@
 import { link } from "../router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { Badge, PageHeader, PanelTitle, pretty } from "../ui";
 import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from "./decisions";
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
+import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -44,9 +45,16 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   const [project, setProject] = useState("all");
   const [status, setStatus] = useState<(typeof statuses)[number]>("all");
   const [query, setQuery] = useState("");
+  const [chosenOwner, setOwner] = useState("all");
   const needle = query.trim().toLowerCase();
-  const tasks = hub.data.tasks.filter((task) => (project === "all" || task.project === project)
-    && (status === "all" || task.status === status)
+  const inProject = hub.data.tasks.filter((task) => project === "all" || task.project === project);
+  const owners = ownershipRows(inProject);
+  // A refresh can remove the chosen owner's last summary card (withdrawn, or passed review over a week
+  // ago); then the filter, and its "Show everyone" control, would be stranded. Fall back to everyone.
+  const owner = owners.some((row) => row.key === chosenOwner) ? chosenOwner : "all";
+  useEffect(() => { if (owner !== chosenOwner) setOwner("all"); }, [owner, chosenOwner]);
+  const byOwner = inProject.filter((task) => owner === "all" || (task.owner ?? UNCLAIMED) === owner);
+  const tasks = byOwner.filter((task) => (status === "all" || task.status === status)
     && (!needle || task.title.toLowerCase().includes(needle)));
   return (
     <>
@@ -59,7 +67,7 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         </label>
         <label className="select-field">
           <span className="sr-only">Project</span>
-          <select value={project} onChange={(event) => setProject(event.target.value)}>
+          <select value={project} onChange={(event) => { setProject(event.target.value); setOwner("all"); }}>
             <option value="all">All projects</option>
             {hub.data.projects.filter((item) => !item.archived).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
@@ -68,16 +76,16 @@ export function WorkPage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
           {statuses.map((value) => (
             <button key={value} className={status === value ? "chip selected" : "chip"} onClick={() => setStatus(value)}>
               {value === "all" ? "All" : value === "verified" ? "Review passed" : pretty(value)}{" "}
-              <span>{hub.data.tasks.filter((task) => (value === "all" || task.status === value)
-                && (project === "all" || task.project === project)).length}</span>
+              <span>{byOwner.filter((task) => value === "all" || task.status === value).length}</span>
             </button>
           ))}
         </div>
       </div>
+      <WorkOwnership hub={hub} rows={owners} selected={owner} onSelect={setOwner} />
       <section className="panel work" id="work">
         <PanelTitle title="Work in motion" count={tasks.length} />
         <p className="panel-description">An owner, an exact candidate, and a separate reviewer.</p>
-        <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" ? "No tasks match these filters." : "No assigned work for this project."} />
+        <TaskTable hub={hub} tasks={tasks} empty={needle || status !== "all" || owner !== "all" ? "No tasks match these filters." : "No assigned work for this project."} />
         <WithdrawnList hub={hub} kind="task" project={project === "all" ? undefined : project} />
       </section>
     </>

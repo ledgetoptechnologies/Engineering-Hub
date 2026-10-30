@@ -97,7 +97,7 @@ async def _payload(request, model, *, maximum=65536):
 
 
 def attach_staging_routes(app, controller, actor, human, preview_broker=None, preview_session=None,
-                          module_status=None, diagnostic_session=None):
+                          module_status=None, diagnostic_session=None, observer=None):
     """Compose existing authenticated callbacks; attaching starts no work."""
     def configured():
         if controller is None:
@@ -131,13 +131,18 @@ def attach_staging_routes(app, controller, actor, human, preview_broker=None, pr
     @app.get('/api/hub/v1/staging/runtime')
     async def runtime(request: Request):
         principal = authenticated(request, human_only=True)
-        if controller is None:
+        if observer is False:
             raise HubError('staging_not_configured', 503)
-        # Host-wide observations are owner-only, never inherited from a project
-        # read grant. The controller repeats this check for non-HTTP callers.
-        if principal not in controller.resources.admin_actors:
-            raise HubError('staging_admin_required', 403)
-        result = await controller.runtime(principal)
+        if observer is not None:
+            if principal not in observer.admin_actors:
+                raise HubError('staging_admin_required', 403)
+            result = await observer.runtime(principal)
+        else:
+            if controller is None:
+                raise HubError('staging_not_configured', 503)
+            if principal not in controller.resources.admin_actors:
+                raise HubError('staging_admin_required', 403)
+            result = await controller.runtime(principal)
         if result.get('snapshot') is not None:
             from .staging_runtime import validate_runtime_snapshot
             try:
