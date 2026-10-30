@@ -18,7 +18,7 @@ def main():
         parser.error('root_collector_required')
     try:
         while True:
-            publish_host(collect_host(), args.output)
+            publish_host(collect_host(diagnostic=lambda code: print(code, file=sys.stderr)), args.output)
             if args.once:
                 return 0
             time.sleep(30)

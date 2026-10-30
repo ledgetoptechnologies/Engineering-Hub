@@ -174,21 +174,33 @@ def _empty(now):
             'containers': [], 'services': []}
 
 
-def collect_host(*, now=None, capture=capture_fixed):
+def collect_host(*, now=None, capture=capture_fixed, diagnostic=None):
+    """Collect all or nothing; optionally emit one fixed, nonsecret failure stage."""
     now = _utc(now)
     result = _empty(now)
+    stage = 'staging_runtime_docker_capture_failed'
     try:
-        containers = parse_containers(capture(HOST_DOCKER_COMMAND), 'host')
-        services = parse_services(capture(HOST_SERVICES_COMMAND))
+        docker_raw = capture(HOST_DOCKER_COMMAND)
+        stage = 'staging_runtime_docker_parse_failed'
+        containers = parse_containers(docker_raw, 'host')
+        stage = 'staging_runtime_service_capture_failed'
+        service_raw = capture(HOST_SERVICES_COMMAND)
+        stage = 'staging_runtime_service_parse_failed'
+        services = parse_services(service_raw)
         result.update(containers=containers, services=services,
                       sources=[_source('host', 'observed', _timestamp(now))])
+        stage = 'staging_runtime_snapshot_size_failed'
         if len(json.dumps(result, separators=(',', ':')).encode()) > MAX_BYTES:
             raise ValueError('inventory_size')
     except Exception:
         result = _empty(now)
         result['sources'] = [_source('host', 'unavailable')]
+        if diagnostic is not None:
+            try:
+                diagnostic(stage)
+            except Exception:
+                pass  # Diagnostic failure must not change the fail-closed snapshot.
     return result
-
 
 def _secure_directory(path):
     """Return an anchored directory FD, checking every ancestor without symlinks."""
