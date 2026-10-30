@@ -53,4 +53,11 @@ describe("who's on what", () => {
   it("leaves the oldest age unknown when no open task records one", () => {
     expect(ownershipRows([task({ owner: "codex", status: "claimed", state_since: null })], now)[0].oldestOpenSince).toBeNull();
   });
+  it("never takes a future time as the oldest open item", () => {
+    expect(ownershipRows([task({ owner: "codex", status: "claimed", state_since: ago(-1) })], now)[0].oldestOpenSince).toBeNull();
+    expect(ownershipRows([
+      task({ owner: "codex", status: "claimed", state_since: ago(-1) }),
+      task({ owner: "codex", status: "in_review", state_since: ago(2) }),
+    ], now)[0].oldestOpenSince).toBe(ago(2));
+  });
 });

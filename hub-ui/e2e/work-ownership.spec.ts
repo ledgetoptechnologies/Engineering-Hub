@@ -43,7 +43,7 @@ test("who's on what groups work by recorded owner and filters the table", async 
   const paired = rows.filter({ hasText: "1 in review" });
   await expect(paired).toHaveCount(1);
   await expect(paired.locator("strong")).toHaveText("Codex on install 11111111");
-  await expect(paired).toContainText("Time in state not recorded");
+  await expect(paired).toContainText("Time in state not available");
   await expect(summary.getByRole("button", { name: /Codex.*passed review in the last 7 days/ })).toBeVisible();
 
   const table = page.locator("#work .task-table");

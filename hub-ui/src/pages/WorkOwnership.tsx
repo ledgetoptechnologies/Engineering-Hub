@@ -21,7 +21,7 @@ export interface OwnerRow {
   inReview: number;
   /** Passed review within the last seven days, by when the task entered that state. */
   passedRecently: number;
-  /** Earliest recorded state time among open tasks; null when none is recorded. */
+  /** Earliest valid, non-future state time among open tasks; null when there is none. */
   oldestOpenSince: string | null;
   open: number;
 }
@@ -42,9 +42,11 @@ export function ownershipRows(tasks: Task[], now = Date.now()): OwnerRow[] {
         passedRecently: 0, oldestOpenSince: null, open: 0 };
       rows.set(key, row);
     }
-    const since = stamp(task.state_since);
+    // A time in the future can't be how long something has waited, so it counts as unknown.
+    const recorded = stamp(task.state_since);
+    const since = recorded !== null && recorded <= now + 30_000 ? recorded : null;
     if (task.status === "verified") {
-      if (since !== null && since <= now + 30_000 && now - since <= RECENT_MS) row.passedRecently++;
+      if (since !== null && now - since <= RECENT_MS) row.passedRecently++;
       continue;
     }
     if (task.status === "assigned") row.notStarted++;
@@ -90,15 +92,15 @@ export function WorkOwnership({ hub, tasks, selected, onSelect }: {
               <span className="work-owner-text">
                 <strong>{name(row)}</strong>
                 <small>{counts}</small>
-                {row.open > 0 && <small>{age ? `Oldest open item: in its state since ${age}` : "Time in state not recorded"}</small>}
+                {row.open > 0 && <small>{age ? `Oldest open item: in its state since ${age}` : "Time in state not available"}</small>}
               </span>
             </button>
           </li>;
         })}
       </ul>
       <p className="panel-footnote">Counts come from each task's recorded owner and state. "Passed review in the last 7 days" uses when
-        a task entered that state; tasks without a recorded time aren't counted there. Reviewers and test results aren't shown
-        here because tasks don't record them yet.</p>
+        a task entered that state; tasks without a valid recorded time aren't counted there. This summary doesn't show who is
+        assigned to review or any test results; tasks don't track those. A recorded review appears on the task itself.</p>
     </section>
   );
 }
