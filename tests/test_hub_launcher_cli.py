@@ -148,6 +148,25 @@ def test_exact_order_one_launch_receipt_wait_explicit_stop_close_restore(module,
     assert capsys.readouterr().out == 'receipt_served\nstopped\n'
 
 
+def test_held_ranges_file_passes_through_only_when_given(module, monkeypatch):
+    calls = harness(module, monkeypatch)
+    assert module.main(ARGS + ['--held-ranges-file', '/protected/held-ranges.json',
+                               '--execute', '--create-journal']) == 0
+    assert calls[1] == ('construct', {
+        'enrollment_file': ARGS[1], 'signing_key_file': ARGS[3], 'journal_file': ARGS[5],
+        'create_journal': True, 'held_ranges_file': '/protected/held-ranges.json'})
+
+
+@pytest.mark.parametrize('held', ['relative/held.json', '/protected/enrollment.json', '/fresh/journal.sqlite3',
+                                  '/SECRET\x00'])
+def test_invalid_held_ranges_file_denies_before_native_construction(module, monkeypatch, capsys, held):
+    calls = harness(module, monkeypatch)
+    assert module.main(ARGS + ['--held-ranges-file', held, '--execute', '--create-journal']) == 2
+    assert calls == []
+    output = capsys.readouterr()
+    assert output.err == 'invalid_operator_request\n' and 'SECRET' not in output.out + output.err
+
+
 @pytest.mark.parametrize('stop_at', ['handlers', 'construct'])
 def test_stop_before_launch_nonzero_no_stopped_claim(module, monkeypatch, capsys, stop_at):
     calls = harness(module, monkeypatch, stop_at=stop_at)

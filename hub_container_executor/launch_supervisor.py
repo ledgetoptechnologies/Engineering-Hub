@@ -339,6 +339,14 @@ class ExecutorLaunchProfile(_Closed):
         _require(type(value) in {list, tuple})
         return tuple(value)
 
+    @model_validator(mode='before')
+    @classmethod
+    def no_explicit_null_policy(cls, value):
+        # Legacy input never had this key; an explicit null was refused then and still is.
+        if isinstance(value, dict) and 'daemon_policy' in value:
+            _require(value['daemon_policy'] is not None)
+        return value
+
     @model_validator(mode='after')
     def closed_profile(self):
         _require(self.user == '10001:10001' and len(self.supplementary_groups) <= 2
@@ -367,12 +375,16 @@ class ExecutorLaunchProfile(_Closed):
                          for item in self.mounts) and type(self.runner_digest) is str and _SHA.fullmatch(self.runner_digest))
         return self
 
-    def digest(self):
+    def enrollment_value(self):
+        """The exact JSON object this profile is enrolled and digested as."""
         value = self.model_dump(mode='json')
         if value['daemon_policy'] is None:
-            # Legacy profiles never carried this key; their digest bytes must not change.
+            # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        return 'sha256:' + hashlib.sha256(_canonical(value)).hexdigest()
+        return value
+
+    def digest(self):
+        return 'sha256:' + hashlib.sha256(_canonical(self.enrollment_value())).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -421,7 +433,12 @@ def _host_ranges(value):
 
 
 def _held_ranges(raw):
-    """Independently pinned host ID ranges the held TEST account owns; evidence, not discovery."""
+    """Operator-attested host ID ranges for the held TEST account.
+
+    Root ownership protects the file's integrity after it is placed. It does not
+    prove the ranges are complete or where they came from; the evidence digest is
+    only checked for form. Overlap checks against it are only as good as that attestation.
+    """
     data = _strict(raw, 65536)
     _require(type(data) is dict and set(data) == {'schema', 'uid_ranges', 'gid_ranges', 'evidence_sha256'}
              and data['schema'] == HELD_RANGES_SCHEMA

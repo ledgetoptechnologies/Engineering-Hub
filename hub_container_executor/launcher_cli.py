@@ -124,10 +124,12 @@ def _execute(options):
         if stop.requested:
             code, phase = 130, 'interrupted_before_launch'
         else:
+            # Only v3 enrollments take held-range evidence; legacy calls stay exactly as before.
+            held = {} if options.held_ranges_file is None else {'held_ranges_file': options.held_ranges_file}
             supervisor = _load_supervisor()(
                 enrollment_file=options.enrollment_file,
                 signing_key_file=options.signing_key_file,
-                journal_file=options.journal_file, create_journal=True)
+                journal_file=options.journal_file, create_journal=True, **held)
             if stop.requested:
                 code, phase = 130, 'interrupted_before_launch'
             else:
@@ -178,10 +180,14 @@ def main(argv=None):
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--create-journal', action='store_true',
                         help='require fresh native journal; existing journal/lock is rejected')
+    parser.add_argument('--held-ranges-file', default=None,
+                        help='v3 only: root-protected held TEST ID ranges, an operator attestation')
     try:
         options = parser.parse_args(argv)
         paths = (options.enrollment_file, options.signing_key_file, options.journal_file)
-        if (not all(_path(value) for value in paths) or len(set(paths)) != 3
+        if options.held_ranges_file is not None:
+            paths += (options.held_ranges_file,)
+        if (not all(_path(value) for value in paths) or len(set(paths)) != len(paths)
                 or not 1 <= options.wait_seconds <= 3600):
             raise _UsageError()
         if not options.execute:

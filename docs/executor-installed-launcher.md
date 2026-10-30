@@ -42,8 +42,13 @@ v3 also requires a separate root-protected `held_ranges_file`
 (`engineering-hub.held-id-ranges.v1`): the host UID and GID ranges retained for the
 held TEST account, with a digest of the evidence they came from. It must cover the
 held account itself, the policy's ranges must not overlap it, and its file identity
-is rechecked like the enrollment. It is independently supplied evidence, never read
-from `/etc/subuid` or the host at runtime; without it, v3 refuses to start.
+is rechecked like the enrollment. It is never read from `/etc/subuid` or the host at
+runtime; without it, v3 refuses to start. It is an operator attestation: root
+ownership protects it once placed, but nothing here proves the ranges are complete
+or traces them to their source (the evidence digest is only checked for form). The
+overlap check is only as good as that attestation, so a reviewer must confirm the
+ranges against the retained hold record. The installed launcher takes it as
+`--held-ranges-file`; legacy invocations are unchanged.
 
 Before binding the issuer socket or making any Engine request, `launch()` reads the
 pinned daemon process's `/proc/<pid>/uid_map` and `gid_map` and requires exact row

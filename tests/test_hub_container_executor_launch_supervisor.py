@@ -1106,7 +1106,7 @@ def test_synthetic_kernel_profile_denies_engine_claims_not_supported_by_proc(mut
     if mutation == 'uid-map': uid_map = '0 10001 1\n1 200001 65536\n'
     elif mutation == 'gid-map': gid_map = '0 10001 1\n1 200001 65536\n'
     elif mutation in {'unmapped-group', 'missing-group'}:
-        raw = profile.model_dump(mode='json')
+        raw = profile.enrollment_value()
         raw['supplementary_groups'] = [999999 if mutation == 'unmapped-group' else 10002]
         profile = launch.ExecutorLaunchProfile.model_validate(raw)
     elif mutation == 'extra-group': status['Groups'] += ' 110002'
@@ -1124,7 +1124,7 @@ def test_synthetic_kernel_profile_denies_engine_claims_not_supported_by_proc(mut
 
 def test_synthetic_kernel_profile_translates_declared_supplementary_group():
     profile, status, uid_map, gid_map, mounts = kernel_profile_fixture()
-    raw = profile.model_dump(mode='json')
+    raw = profile.enrollment_value()
     raw['supplementary_groups'] = [10002]
     profile = launch.ExecutorLaunchProfile.model_validate(raw)
     status['Groups'] = '110001 110002'
@@ -1207,7 +1207,7 @@ def root_file_constructor_fixture(short_root, root_journal, *, daemon_policy=Non
         config_path.write_bytes(runner_raw)
         data = dict(schema='executor_launch_supervisor_v2', configuration_raw_digest=commitment.raw_digest,
             release=release_data,
-            image=image_data, profile=profile.model_dump(mode='json'), daemon=asdict(pin),
+            image=image_data, profile=profile.enrollment_value(), daemon=asdict(pin),
             socket_path=issuer_path, consumer_host_uid=110001, consumer_host_gid=110001,
             receipt_lifetime_seconds=30, request_timeout_ms=1000, launch_timeout_ms=1000)
         enrollment, key, journal = private / 'enrollment.json', private / 'signing.key', journal_parent / 'launch.sqlite3'
@@ -1317,11 +1317,17 @@ def test_legacy_profile_digest_bytes_are_unchanged():
     raw = profile_data()
     # The digest every existing v2 enrollment, receipt and verifier already pins.
     legacy = 'sha256:' + hashlib.sha256(launch._canonical(raw)).hexdigest()
-    assert launch.ExecutorLaunchProfile.model_validate(raw).digest() == legacy
-    # A tool that re-serializes with an explicit null still produces the same bytes.
-    assert launch.ExecutorLaunchProfile.model_validate({**raw, 'daemon_policy': None}).digest() == legacy
-    dumped = launch.ExecutorLaunchProfile.model_validate(raw).model_dump(mode='json')
-    assert launch.ExecutorLaunchProfile.model_validate(dumped).digest() == legacy
+    profile = launch.ExecutorLaunchProfile.model_validate(raw)
+    assert profile.digest() == legacy
+    # The enrolled form is byte-identical to the legacy input and round-trips.
+    assert launch._canonical(profile.enrollment_value()) == launch._canonical(raw)
+    assert launch.ExecutorLaunchProfile.model_validate(profile.enrollment_value()).digest() == legacy
+
+
+def test_legacy_input_still_refuses_an_explicit_null_policy():
+    # Before v3 any unknown key, null included, was refused; that stays true.
+    with pytest.raises(RuntimeError):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': None})
 
 
 def test_policy_is_part_of_the_signed_profile_digest():
