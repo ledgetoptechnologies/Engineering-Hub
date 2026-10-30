@@ -494,9 +494,22 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 'id': '00000000-0000-0000-0000-000000000000', 'revision': 0,
                 'updated_at': datetime.now(timezone.utc).isoformat()})
 
+    metrics_owner = (connection_service.owner if connection_service is not None else
+                     'human:' + str(settings.auth_config.beau_github_id)
+                     if settings.auth_config.human_auth_mode == 'github'
+                     and settings.auth_config.beau_github_id is not None else None)
     infrastructure = compose_infrastructure(
         settings.infrastructure_config_path or Path(settings.database).parent / 'infrastructure.json',
-        state_root=Path(settings.database).parent, on_change=infrastructure_changed)
+        state_root=Path(settings.database).parent, on_change=infrastructure_changed,
+        default_owner=metrics_owner if settings.infrastructure_config_path is None else None)
+    metrics_access = None
+
+    def clear_metrics_transport():
+        if connection_service is not None and metrics_access is not None:
+            with connection_service._lock:
+                if getattr(connection_service, '_infrastructure_metrics_owner', None) is metrics_access:
+                    connection_service._infrastructure_metric_tools = ()
+                    connection_service._infrastructure_metrics_owner = None
     session_bridge = None
     if connection_config is not None and connection_config.hub_bridge:
         from .session_hub_bridge import SessionHubBridge
@@ -571,6 +584,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                         finally:
                             if session_bridge is not None:
                                 session_bridge.close()
+                            clear_metrics_transport()
                             infrastructure.close()
             await finish_owned(stop_all())
 
@@ -709,6 +723,33 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             return settings.agent_auth.agent(request)
         return human(request, mutation=mutation)
 
+    installation_scopes = None
+    if connection_service is not None:
+        from agent_message_bus.agent_installation_scope import InstallationScopeRepository, attach_scope_routes
+        installation_scopes = InstallationScopeRepository(connection_service)
+        attach_scope_routes(app, installation_scopes, human)
+
+    metrics_identity = None
+    if infrastructure.service is not None:
+        from .infrastructure_metrics_access import MetricsAccess, register_metrics_tool
+        from .infrastructure_discovery_metrics import DiscoveryMetricsReader
+        metrics_access = MetricsAccess(infrastructure.service, settings.agent_auth, human,
+            owner=metrics_owner,
+            scopes=installation_scopes, connection_config=connection_config)
+        infrastructure.metrics = DiscoveryMetricsReader(infrastructure.service,
+            infrastructure.prometheus_origin, authorize=metrics_access.authorize,
+            inventory=metrics_access.inventory)
+
+        def metrics_identity(request):
+            metrics_access.authorize(request)
+            return request
+
+        register_metrics_tool(hub_mcp, infrastructure.metrics)
+        if connection_service is not None:
+            if getattr(connection_service, '_infrastructure_metrics_owner', None) is not None:
+                raise ValueError('metrics_transport_already_owned')
+    app.state.installation_scopes = installation_scopes
+
     # The optional environment-bound service stays the bus's exact single owner. It does
     # not turn installation/session credentials into existing Hub principals.
     if connection_service is not None:
@@ -729,7 +770,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .planning_api import attach_planning_routes
     attach_planning_routes(app, repository=notes_repository, actor=actor)
     from .infrastructure_api import attach_infrastructure_routes
-    attach_infrastructure_routes(app, infrastructure.service, actor, metrics=infrastructure.metrics)
+    attach_infrastructure_routes(app, infrastructure.service, actor, metrics=infrastructure.metrics,
+                                 metrics_identity=metrics_identity)
     app.state.infrastructure = infrastructure
     from .label_sets_api import attach_label_set_routes
     attach_label_set_routes(app, repository=label_sets, actor=actor, human=human)
@@ -940,6 +982,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 infrastructure_visible = True
             except HubError:
                 pass
+            if not infrastructure_visible and metrics_access is not None:
+                try:
+                    metrics_access.authorize(request)
+                    infrastructure_visible = True
+                except (HubError, HTTPException):
+                    pass
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
@@ -1125,4 +1173,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         # exact-repository scope marker prevents duplicate front-door/bus guards.
         app.add_middleware(AgentSessionResponseGuardMiddleware,
                            auth=settings.agent_auth, repository=connection_service)
+    if connection_service is not None and metrics_access is not None:
+        # Publish the finite transport tool only after construction succeeds;
+        # an exception above must not leave a stale registration on the bus.
+        with connection_service._lock:
+            if getattr(connection_service, '_infrastructure_metrics_owner', None) is not None:
+                raise ValueError('metrics_transport_already_owned')
+            connection_service._infrastructure_metrics_owner = metrics_access
+            connection_service._infrastructure_metric_tools = ('hub_infrastructure_metrics',)
     return app

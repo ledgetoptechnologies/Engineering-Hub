@@ -62,10 +62,11 @@ export function InfrastructurePage({ hub, actions, deviceId }: { hub: Hub; actio
   return deviceId ? <DevicePage hub={hub} actions={actions} id={deviceId} /> : <DeviceListPage hub={hub} actions={actions} />;
 }
 
-function Unavailable({ actions }: { actions: React.ReactNode }) {
+function Unavailable({ actions, children }: { actions: React.ReactNode; children?: React.ReactNode }) {
   return <>
     <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure">{actions}</PageHeader>
     <section className="panel"><p>{UNAVAILABLE}</p></section>
+    {children}
   </>;
 }
 
@@ -76,7 +77,8 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
   const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
-  if (load.state === "unavailable") return <Unavailable actions={actions} />;
+  // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
+  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} /></Unavailable>;
   const list = load.state === "loaded" ? load.value : null;
   const shown = (list?.items ?? []).filter(device => filter === "all" ? true
     : filter === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now));

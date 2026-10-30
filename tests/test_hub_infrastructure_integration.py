@@ -76,7 +76,9 @@ def test_owner_routes_caps_csrf_invalidation_and_lifetime(tmp_path):
         with app.state.repository._connection() as db:
             assert db.execute("SELECT count(*) FROM hub_outbox WHERE action='views.invalidated'").fetchone()[0] == 2
         denied = {'Authorization': 'Bearer test-codex'}
-        assert client.get('/api/hub/v1/overview', headers=denied).json()['capabilities']['infrastructure'] is False
+        # Internal metrics admission exposes navigation independently of registry
+        # read/write grants, which remain denied below.
+        assert client.get('/api/hub/v1/overview', headers=denied).json()['capabilities']['infrastructure'] is True
         for suffix in ('/devices', '/devices/synthetic-pc', '/devices/missing'):
             assert client.get(BASE + suffix, headers=denied).status_code == 403
         assert client.put(BASE + '/devices/anything', headers=denied, content='not-json').status_code == 403
@@ -102,8 +104,22 @@ def test_missing_optional_settings_do_not_open_inventory(tmp_path):
         assert not (tmp_path / 'infrastructure').exists()
 
 
+def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path):
+    config = settings(tmp_path)
+    operator = json.loads(config.infrastructure_config_path.read_text())
+    operator['principals'] = []
+    config.infrastructure_config_path.write_text(json.dumps(operator))
+    app = create_app(config)
+    with TestClient(app, base_url=config.auth_config.origin) as client:
+        login(client, app, config)
+        assert client.get(BASE + '/devices').status_code == 403
+        assert client.get('/api/hub/v1/overview').json()['capabilities']['infrastructure']
+        response = client.get(BASE + '/metrics')
+        assert response.status_code == 200 and response.json()['source']['status'] == 'not_configured'
+
+
 @pytest.mark.skipif(os.name != 'posix', reason='Actual private inventory and session composition')
-def test_composed_metrics_use_owner_session_and_reject_agents_before_fetch(tmp_path, monkeypatch):
+def test_composed_metrics_use_owner_session_and_authenticated_internal_agents(tmp_path, monkeypatch):
     from engineering_hub.infrastructure_metrics import MetricsReader, QUERIES
     from engineering_hub.infrastructure_prometheus import TARGET_PATH
     from urllib.parse import parse_qs, urlsplit
@@ -115,7 +131,7 @@ def test_composed_metrics_use_owner_session_and_reject_agents_before_fetch(tmp_p
     config.infrastructure_config_path.write_text(json.dumps(operator))
     calls = []
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    by_query = {query: key for kind, key, query in QUERIES if kind == 'node'}
+    by_query = {query: (kind, key) for kind, key, query in QUERIES}
 
     async def fetch(reader, client, path, budget):
         calls.append(path)
@@ -124,7 +140,8 @@ def test_composed_metrics_use_owner_session_and_reject_agents_before_fetch(tmp_p
                 'labels': {'job': 'Fixture', 'instance': '192.0.2.1:9100'},
                 'health': 'up', 'lastScrape': stamp, 'scrapeInterval': '1m'}]}}).encode()
         query = parse_qs(urlsplit(path).query)['query'][0]
-        value = {'cpu': '0.25', 'mem_total': '1024', 'mem_available': '256', 'uptime': '42'}.get(by_query[query])
+        kind, key = by_query[query]
+        value = {'cpu': '0.25', 'mem_total': '1024', 'mem_available': '256', 'uptime': '42'}.get(key) if kind == 'node' else None
         series = [] if value is None else [{'metric': {'job': 'Fixture', 'instance': '192.0.2.1:9100'},
                                           'value': [0, value]}]
         return json.dumps({'status': 'success', 'data': {'resultType': 'vector', 'result': series}}).encode()
@@ -135,13 +152,17 @@ def test_composed_metrics_use_owner_session_and_reject_agents_before_fetch(tmp_p
     with TestClient(app, base_url=config.auth_config.origin) as client:
         assert app.state.infrastructure.metrics is not None and calls == []
         assert client.get(BASE + '/metrics').status_code == 401
-        assert client.get(BASE + '/metrics', headers={'Authorization': 'Bearer test-hermes'}).status_code == 403
+        assert client.get(BASE + '/metrics', headers={'Authorization': 'Bearer wrong'}).status_code == 401
         assert calls == []
+        assert client.get(BASE + '/metrics', headers={'Authorization': 'Bearer test-hermes'}).status_code == 200
+        assert len(calls) == 1 + len(by_query)
+        calls.clear()
         login(client, app, config)
         response = client.get(BASE + '/metrics')
         assert response.status_code == 200, response.text
         result = response.json()
-        assert result['source'] == {'status': 'ok'}
+        assert result['schema_version'] == 2
+        assert result['source'] == {'status': 'ok', 'truncated': False, 'omitted_count': 0, 'warnings': []}
         target = result['devices'][0]
         assert target['cpu_busy_ratio'] == 0.25 and target['mem_total_bytes'] == 1024
         assert target['mem_available_bytes'] == 256 and target['up'] is True
@@ -175,7 +196,7 @@ def test_real_mcp_uses_authenticated_agent_capabilities(tmp_path):
         inventory = {tool['name']: tool for tool in tools if tool['name'].startswith('hub_infrastructure_')}
         assert set(inventory) == {'hub_infrastructure_list', 'hub_infrastructure_get',
             'hub_infrastructure_maintenance_open', 'hub_infrastructure_maintenance_resolve',
-            'hub_infrastructure_probe_record'}
+            'hub_infrastructure_probe_record', 'hub_infrastructure_metrics'}
         assert all(not {'actor', 'identity', 'principal'} & set(tool['inputSchema'].get('properties', {}))
                    for tool in inventory.values())
         allowed = rpc('tools/call', {'name': 'hub_infrastructure_list', 'arguments': {}}, 'test-hermes')

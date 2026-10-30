@@ -72,7 +72,7 @@ async def _payload(request,model,maximum=16384):
         raise HubError('invalid_infrastructure_input') from None
 
 
-def attach_infrastructure_routes(app,service,actor,*,metrics=None):
+def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identity=None):
     if service is not None and type(service) is not InfrastructureService:
         raise TypeError('Explicit InfrastructureService required')
     if metrics is not None and (service is None or metrics.service is not service):
@@ -98,7 +98,7 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None):
     @app.get('/api/hub/v1/infrastructure/metrics')
     async def machine_metrics(request:Request):
         # Same 503/403 order as other reads; then 404 while Prometheus metrics are unconfigured.
-        identity=authorized(request,'metrics_read')
+        identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
         if request.query_params:
             raise HubError('invalid_infrastructure_filter')
         if metrics is None:

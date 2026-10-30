@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { createDemoOverview, createDemoTopic } from "../src/mocks";
 import { audit, blocking } from "./audit";
 import metricsFixture from "../src/fixtures/infrastructure-metrics-v1.json" with { type: "json" };
+import discoveredFixture from "../src/fixtures/infrastructure-metrics-v2.json" with { type: "json" };
 
 const human = "human:cf:" + "e".repeat(64);
 type Reply = { status: number; body: unknown } | "abort";
@@ -271,7 +272,7 @@ test("machine health groups each machine's exporters, says what's missing and re
   await expect(desk.getByRole("row", { name: /msedge/ })).toContainText("57");
   await expect(desk).toContainText("329 GB free of 3.6 TB");
   await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Out of date");
-  await expect(panel.getByRole("listitem").filter({ hasText: "old-box" })).toContainText("Only scrape status is configured");
+  await expect(panel.getByRole("listitem").filter({ hasText: "old-box" })).toContainText("Not a recognized exporter");
   expect(state.metrics).toBe(1);
   await panel.getByRole("button", { name: "Refresh" }).click();
   await expect.poll(() => state.metrics).toBe(2);
@@ -288,6 +289,63 @@ test("an unreachable source is unknown, never down, and shows no stale readings"
   await expect(panel).toContainText("Prometheus didn't answer");
   await expect(panel.getByText("Unknown", { exact: true }).first()).toBeVisible();
   await expect(panel.getByRole("meter")).toHaveCount(0);
+});
+
+const discovered = (name: keyof typeof discoveredFixture.cases, change: (value: any) => void = () => {}) => {
+  const value = JSON.parse(JSON.stringify(discoveredFixture.cases[name])); change(value); return { status: 200, body: value };
+};
+
+test("discovered machines show without mappings, flag unregistered and ambiguous ones, and link matched devices", async ({ page }) => {
+  await fixture(page, { metrics: [discovered("discovered", value => { value.devices[0].device_id = value.devices[1].device_id = "build-pc"; })] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  const cards = panel.getByRole("listitem");
+  await expect(cards).toHaveCount(3);
+  const workstation = cards.filter({ hasText: "demo-workstation" });
+  await expect(workstation).toContainText("Windows");
+  await expect(workstation).toContainText("GPUs");
+  await expect(workstation.getByRole("link", { name: "demo-workstation" })).toHaveAttribute("href", "/infrastructure/build-pc");
+  await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not in devices");
+  await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not a recognized exporter");
+  await expect(cards.filter({ hasText: "duplicate-demo" })).toContainText("Matches more than one device");
+  await expect(cards.filter({ hasText: "duplicate-demo" }).getByRole("link")).toHaveCount(0);
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(blocking(await audit(page, "page", 375))).toEqual([]);
+});
+
+test("says when Prometheus isn't set up, and when targets were left out", async ({ page }) => {
+  await fixture(page, { metrics: [discovered("not_configured"), discovered("partial_truncated")] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel).toContainText("isn't connected to Prometheus yet");
+  await expect(panel).not.toContainText("isn't scraping any machines");
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect(panel).toContainText("3 more targets aren't shown.");
+  await expect(panel).toContainText("Some readings didn't come back");
+  await expect(panel.getByRole("listitem").filter({ hasText: "demo-node" })).toContainText("Not in devices");
+});
+
+test("an unreachable discovery source shows no machines and no zeros", async ({ page }) => {
+  await fixture(page, { metrics: [discovered("unreachable")] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel).toContainText("Prometheus didn't answer");
+  await expect(panel.getByRole("listitem")).toHaveCount(0);
+  await expect(panel.getByRole("meter")).toHaveCount(0);
+});
+
+test("machine health shows even when the device list is refused, and stays hidden when metrics are too", async ({ page }) => {
+  const refused = { status: 403, body: { detail: { code: "infrastructure_forbidden" } } };
+  await fixture(page, { list: [refused], metrics: [discovered("discovered")] });
+  await page.goto("/#/infrastructure");
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await expect(healthPanel(page)).toContainText("demo-workstation");
+  await page.unrouteAll();
+  await fixture(page, { list: [refused], metrics: [{ status: 403, body: { detail: { code: "forbidden" } } }] });
+  await page.reload();
+  await expect(page.getByText("Infrastructure isn't available to you on this Hub.")).toBeVisible();
+  await expect(healthPanel(page)).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("192.0.2.");
 });
 
 test("machine health stays hidden without metrics access or when not set up", async ({ page }) => {
