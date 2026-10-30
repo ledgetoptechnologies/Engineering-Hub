@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -13,6 +14,8 @@ from engineering_hub.staging_observer import StagingObserver, compose_observer
 async def test_observer_client_authorization_fresh_stale_and_unavailable(tmp_path):
     token = tmp_path / 'token'
     token.write_text('fake-test-token-only')
+    if os.name == 'posix':
+        token.chmod(0o600)
     config = StagingConnectionConfig(origin='http://127.0.0.1', credential_file=token,
                                      admin_actors=frozenset({'human:1'}), enabled=True)
     now = datetime.now(timezone.utc)
