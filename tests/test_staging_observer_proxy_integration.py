@@ -70,6 +70,10 @@ try:
  assert request('GET','/v1/runtime',bearer+'Transfer-Encoding: chunked\r\n',body=b'4\r\ntest\r\n0\r\n\r\n')==400
  assert request('GET','/v1/runtime',bearer+'Authorization: Bearer synthetic-other-marker\r\n')==400
  assert request('GET','/v1/runtime', 'Authorization: Bearer synthetic-other-marker\r\n'+bearer)==400
+ # Header names are case-insensitive; both orders must be rejected before
+ # nginx can collapse the original fields into its upstream variable.
+ assert request('GET','/v1/runtime',bearer+'authorization: Bearer synthetic-other-marker\r\n')==400
+ assert request('GET','/v1/runtime','AUTHORIZATION: Bearer synthetic-other-marker\r\n'+bearer)==400
  for method,path in [('GET','/v1/runtime?synthetic-query-marker'),('GET','/V1/runtime'),
   ('GET','/v1/%72untime'),('POST','/v1/runtime')]:
   assert request(method,path,bearer)==404

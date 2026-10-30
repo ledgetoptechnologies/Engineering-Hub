@@ -95,7 +95,8 @@ A missing-certificate startup failure still wrote its certificate path to stderr
 before the configured log destination took effect. Independently review service
 stderr handling and configuration/path contents: `/dev/null` does not prove
 startup failures or all versions and modules are safe. In the same isolated
-configuration duplicate Authorization produced 400; method, query, encoded and
+configuration duplicate Authorization, including mixed-case field names in both
+orders, produced 400; method, query, encoded and
 case variants produced 404; an unapproved loopback peer with a spoofed forwarded
 IP produced 403. These are version-specific tests, not production acceptance.
 
