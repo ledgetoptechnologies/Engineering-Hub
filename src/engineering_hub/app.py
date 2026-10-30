@@ -982,6 +982,12 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 infrastructure_visible = True
             except HubError:
                 pass
+            if not infrastructure_visible and metrics_access is not None:
+                try:
+                    metrics_access.authorize(request)
+                    infrastructure_visible = True
+                except (HubError, HTTPException):
+                    pass
         return {"paused": repo.get_paused(), "projects": projects(),
                 "tasks": repo.list_task_views(), "decisions": repo.list_decisions(),
                 "runs": repo.list_runs(), "agents": await agents_for(), "autonomy": autonomy_for(),
