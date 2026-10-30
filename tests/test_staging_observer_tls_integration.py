@@ -73,7 +73,8 @@ async def run():
   async with httpx.AsyncClient(verify=ssl.create_default_context(cafile=str(r/'wrong-ca')),trust_env=False,timeout=3) as wrong:
    await wrong.get('https://127.0.0.1:19443/v1/runtime')
   raise AssertionError('untrusted CA accepted')
- except httpx.ConnectError: pass
+ except httpx.ConnectError as error:
+  assert 'CERTIFICATE_VERIFY_FAILED' in str(error)
  ctx=ssl.create_default_context(cafile=str(r/'ca'))
  with ctx.wrap_socket(socket.create_connection(('127.0.0.1',19443),source_address=('127.0.0.2',0),timeout=3),server_hostname='127.0.0.1') as s:
   s.sendall(b'GET /v1/runtime HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n\r\n')
@@ -92,6 +93,9 @@ try:
  app=create_app(settings)
  with TestClient(app,base_url=settings.auth_config.origin) as web:
   assert web.get('/api/hub/v1/staging/runtime').status_code==401
+  non_admin=app.state.sessions.create_session(43)
+  web.cookies.set(settings.auth_config.cookie_name,non_admin['cookie_token'])
+  assert web.get('/api/hub/v1/staging/runtime').status_code==403
   session=app.state.sessions.create_session(42)
   web.cookies.set(settings.auth_config.cookie_name,session['cookie_token'])
   response=web.get('/api/hub/v1/staging/runtime')
