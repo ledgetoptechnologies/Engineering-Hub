@@ -35,6 +35,14 @@ namespace review and capacity. Even then its status is `selected_unverified`:
 an independent reviewer still has to check that evidence on the host, and
 activation remains a separate, explicitly approved step.
 
+A socket path or Engine ID on its own can't show that a daemon or its storage
+is really separate: aliases, symlinks, bind mounts, reused process IDs, shared
+backing storage and shared resource limits all hide that. Current host
+evidence has to be verified independently, and checked again right before any
+effect. The existing Engine connection checks (`_UnixEngine` peer and
+generation identity) remain the authority at runtime; this record doesn't
+replace or relax them.
+
 ## Example (disabled)
 
 ```json
