@@ -123,6 +123,14 @@ It also checks wrong CA and wrong bearer through the real `StagingObserver`
 client, in addition to raw HTTP negative checks. It does not exercise a real
 identity provider or deployment.
 
+The collector writes a fixed diagnostic code to stderr if host collection fails:
+`staging_runtime_docker_capture_failed`, `staging_runtime_docker_parse_failed`,
+`staging_runtime_service_capture_failed`, `staging_runtime_service_parse_failed`,
+or `staging_runtime_snapshot_size_failed`. These identify only the failed stage,
+not the cause. They contain no command output, names, paths, or exception text.
+The published snapshot remains fail-closed and unchanged in schema; a successful
+one-shot publication of an unavailable snapshot still exits successfully.
+
 ## Read-only local preflight
 
 `python -m hub_staging_service.observer_preflight --snapshot /absolute/snapshot.json
