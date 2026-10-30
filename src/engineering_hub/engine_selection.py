@@ -172,7 +172,13 @@ def _check_paths(socket_path, data_root):
 
 def parse_selection(text):
     """Parse one record from JSON text; refuses oversized, duplicate or unknown keys."""
-    if type(text) is not str or len(text.encode('utf-8')) > MAX_RECORD_BYTES:
+    if type(text) is not str:
+        _refuse('record_json')
+    try:
+        size = len(text.encode('utf-8'))
+    except UnicodeError:
+        raise SelectionError('record_encoding') from None
+    if size > MAX_RECORD_BYTES:
         _refuse('record_size')
     try:
         data = json.loads(text, object_pairs_hook=_unique)
@@ -197,7 +203,7 @@ def validate_selection(data):
         _refuse('engine_id')
     if engine['engine_id'].lower() == HELD_ENGINE_ID:
         _refuse('held_engine')
-    if engine['mode'] not in ('rootless', 'rootful'):
+    if type(engine['mode']) is not str or engine['mode'] not in ('rootless', 'rootful'):
         _refuse('mode')
     uid = engine['run_as_uid']
     if type(uid) is not int or not 0 <= uid <= 0x7fffffff:
@@ -220,7 +226,7 @@ def validate_selection(data):
     evidence = []
     for item in record['evidence']:
         item = _closed(item, {'kind', 'note_path', 'sha256'}, 'evidence_shape')
-        if item['kind'] not in EVIDENCE_KINDS:
+        if type(item['kind']) is not str or item['kind'] not in EVIDENCE_KINDS:
             _refuse('evidence_kind')
         if type(item['note_path']) is not str or _NOTE.fullmatch(item['note_path']) is None or '..' in item['note_path']:
             _refuse('evidence_note_path')

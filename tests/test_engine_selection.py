@@ -169,6 +169,24 @@ def test_evidence_references_are_closed(item, code):
     refused(record(evidence=[item]), code)
 
 
+@pytest.mark.parametrize('kind', [[], {}, ['capacity'], None, 7])
+def test_non_string_evidence_kinds_are_refused_not_crashed(kind):
+    refused(record(evidence=[{'kind': kind, 'note_path': 'reviews/x.md', 'sha256': SHA}]), 'evidence_kind')
+
+
+@pytest.mark.parametrize('mode', [[], {}, ['rootless'], None])
+def test_non_string_modes_are_refused_not_crashed(mode):
+    refused(record(engine={'mode': mode}), 'mode')
+
+
+@pytest.mark.parametrize('field,value', [
+    ('schema', []), ('machine_id', {}), ('approval', []), ('evidence', {}), ('engine', []), ('budget', None),
+])
+def test_wrong_container_types_are_refused_not_crashed(field, value):
+    with pytest.raises(SelectionError):
+        validate_selection(record(**{field: value}))
+
+
 def test_each_evidence_kind_is_cited_once():
     refused(record(evidence=evidence({'capacity'}) * 2), 'evidence_duplicate_kind')
 
@@ -197,6 +215,20 @@ def test_json_parsing_refuses_duplicates_and_oversized_records():
     assert caught.value.code == 'record_size'
     with pytest.raises(SelectionError) as caught:
         parse_selection('{')
+    assert caught.value.code == 'record_json'
+
+
+@pytest.mark.parametrize('text', ['{"schema": "\ud800"}', '\udfff', 'x\ud83d'])
+def test_text_that_isnt_valid_unicode_is_refused_not_crashed(text):
+    with pytest.raises(SelectionError) as caught:
+        parse_selection(text)
+    assert caught.value.code == 'record_encoding'
+
+
+@pytest.mark.parametrize('value', [None, b'{}', 42, ['{}']])
+def test_non_text_records_are_refused(value):
+    with pytest.raises(SelectionError) as caught:
+        parse_selection(value)
     assert caught.value.code == 'record_json'
 
 
