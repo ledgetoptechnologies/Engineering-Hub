@@ -47,6 +47,11 @@ def test_explicit_app_defaults_need_no_file_and_preserve_operator_disable(tmp_pa
     disabled = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     assert disabled.state == 'disabled' and disabled.service is None
 
+    write(path, config(True))
+    explicit = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert explicit.state == 'ready' and explicit.prometheus_origin is None
+    explicit.close()
+
 
 @POSIX
 def test_prometheus_origin_without_mapping_list_is_valid(tmp_path):
