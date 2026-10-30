@@ -20,9 +20,20 @@ service has no installer, persistence, TLS, credential generation, or collector
 scheduling. Configure process resource bounds and protect the snapshot directory
 and every ancestor as required by the existing inventory reader.
 
-This does not connect the Hub dashboard by itself: its current runtime route is
-coupled to the execution-capable staging module and expects an enabled project
-configuration. A separate read-only Hub composition and authentication review,
-private proxy and CA/token handoff, installed build verification, and end-to-end
+This does not connect the Hub dashboard by itself. Independent review, a private
+proxy and CA/token handoff, installed build verification, and end-to-end
 acceptance are required before reporting a live connection. Nothing here changes
 machine holds or authorizes jobs, worker activation, or host cleanup.
+
+The optional Hub connection reads `staging-observer.json` beside the ordinary
+staging configuration. Its exact keys are `schema` (1), `enabled` (boolean),
+`origin` (private literal-IP HTTPS), `credential_file`, `ca_file` (absolute
+protected files visible to the Hub), and `admin_actors` (nonempty exact human
+IDs). Invalid, missing, or disabled configuration leaves it unavailable. The
+observer takes precedence for the runtime read when separately configured;
+project work and the execution service retain their existing configuration and
+queue. This is on-demand only and uses the existing pinned-CA client, no proxy
+or redirects, 15-second total deadline, and 128 KiB response cap. The configured
+TLS proxy must enforce the actual NAS source IP; Hub authentication remains the
+existing human session plus explicit observer administrator. Installation and
+end-to-end testing remain separate operator work.

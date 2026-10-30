@@ -480,6 +480,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                 owned_pilot_service, queued_pilot_runtime))))
     if staging_module.controller is not None:
         work_queue = staging_module.controller.queue
+    from .staging_observer import compose_observer
+    staging_observer = compose_observer((settings.staging_config_path or Path(settings.database).parent / 'staging-service.json').parent / 'staging-observer.json')
     configure_preview(staging_module, repo=repo, sessions=sessions,
                       hub_origin=settings.auth_config.origin)
     if notes_repository is not None:
@@ -583,15 +585,19 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                         await staging_module.client.aclose()
                 finally:
                     try:
-                        await interactive_service.close()
+                        if staging_observer not in (None, False):
+                            await staging_observer.close()
                     finally:
                         try:
-                            await stop_existing_components()
+                            await interactive_service.close()
                         finally:
-                            if session_bridge is not None:
-                                session_bridge.close()
-                            clear_metrics_transport()
-                            infrastructure.close()
+                            try:
+                                await stop_existing_components()
+                            finally:
+                                if session_bridge is not None:
+                                    session_bridge.close()
+                                clear_metrics_transport()
+                                infrastructure.close()
             await finish_owned(stop_all())
 
         async def stop_existing_components():
@@ -830,7 +836,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     from .staging_api import attach_staging_routes
     attach_staging_routes(app, staging_module.controller, actor, human,
         preview_broker=staging_module.preview_broker, preview_session=preview_session,
-        module_status=staging_module.status, diagnostic_session=diagnostic_session)
+        module_status=staging_module.status, diagnostic_session=diagnostic_session, observer=staging_observer)
     from .shared_staging_api import attach_shared_staging_routes
     attach_shared_staging_routes(app, shared_staging, human)
 
