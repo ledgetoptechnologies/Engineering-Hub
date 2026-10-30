@@ -95,11 +95,17 @@ class LoseDeployResponse(httpx.AsyncBaseTransport):
     def __init__(self, app):
         self.transport = httpx.ASGITransport(app=app)
         self.lost = False
+        self.posts = []
+        self.gets = []
 
     async def handle_async_request(self, request):
+        if request.method == 'POST':
+            payload = json.loads(await request.aread())
+            self.posts.append((payload['action'], payload['command_id']))
+        elif request.method == 'GET':
+            self.gets.append(request.url.path)
         response = await self.transport.handle_async_request(request)
         if request.method == 'POST' and not self.lost:
-            payload = json.loads(await request.aread())
             if payload['action'] == 'deploy_container':
                 self.lost = True
                 await response.aclose()
@@ -135,9 +141,14 @@ async def test_lost_deploy_response_keeps_machine_held_without_replaying_or_adva
             assert (await bridge.run_once())['state'] == 'held'
             assert transport.lost and len(host.commands) == 1
             original_ids = set(host.commands)
+            command_id, = original_ids
+            assert transport.posts == [('deploy_container', command_id)]
             assert (await bridge.recover(job['id']))['state'] == 'held'
+            assert queue.get_job(job['id'])['state'] == 'held'
+            assert transport.posts == [('deploy_container', command_id)]
+            assert len(transport.gets) == 1 and transport.gets[0].endswith('/' + command_id)
             assert set(host.commands) == original_ids
-            assert set(host.inspected) == original_ids
+            assert host.inspected == [command_id]
             with repo._connection() as db:
                 reservation = db.execute(
                     'SELECT job_id FROM hub_work_machines WHERE machine_id=?',
