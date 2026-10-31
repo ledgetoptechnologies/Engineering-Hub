@@ -23,6 +23,7 @@ from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
 from engineering_hub.container_pilot_manifest import Platform
 from hub_container_executor.runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVerifier
 from hub_container_executor.launch_transport import UnixCurrentObservationTransport
+from hub_container_executor.broker_seqpacket import _start
 from cryptography.hazmat.primitives import serialization
 
 
@@ -182,3 +183,39 @@ def test_actual_dispatcher_and_receiver_exchange(rig):
         if fd is not None: os.close(fd)
         transport.close(); thread.join(4); issuer.close(); verifier.close()
         assert not thread.is_alive() and not errors
+
+
+def test_supervisor_opens_only_reserved_protected_listener(rig):
+    supervisor, journal, _, directory, _, held = rig
+    supervisor._consumer = SimpleNamespace(boot=supervisor._consumer.boot, pid=os.getpid(), start=_start(os.getpid()))
+    supervisor._consumer_uid, supervisor._consumer_gid = os.getuid(), os.getgid()
+    supervisor._mutex = threading.Lock(); supervisor._observation_thread = None
+    record = {'boot_id': supervisor._consumer.boot, 'container_id': supervisor._container_id,
+              'pid': supervisor._consumer.pid, 'start_ticks': supervisor._consumer.start,
+              'manifest': supervisor.release.launch_profile_digest,
+              'approval_expires_at_ms': supervisor._approval_expires_at_ms}
+    supervisor._record = lambda: record
+    journal.state(supervisor._launch_id, 'running', record)
+    client, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener_fd = None
+    try:
+        assert supervisor._issue_ledger_handoff_locked(sender, 'e' * 64, time.monotonic() + 3)
+        _, anc, _, _ = client.recvmsg(16384, socket.CMSG_SPACE(4), socket.MSG_CMSG_CLOEXEC)
+        descriptors = array.array('i'); descriptors.frombytes(anc[0][2]); listener_fd = descriptors[0]
+        listener = socket.socket(fileno=listener_fd); listener_fd = None
+        listener.settimeout(2)
+        try:
+            with supervisor.open_gate_ledger_client(manifest_digest='sha256:' + 'b' * 64, timeout_seconds=2) as peer:
+                accepted, _ = listener.accept()
+                accepted.close()
+                assert peer._peer.pid == os.getpid()
+            assert not held
+            os.rename(directory / 'ledger.sock', directory / 'original.sock')
+            with pytest.raises(launch.LaunchSupervisorError):
+                with supervisor.open_gate_ledger_client(manifest_digest='sha256:' + 'b' * 64, timeout_seconds=2):
+                    pass
+            assert held
+        finally: listener.close()
+    finally:
+        if listener_fd is not None: os.close(listener_fd)
+        client.close(); sender.close()

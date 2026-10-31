@@ -122,3 +122,70 @@ def test_signed_inspection_uses_real_worker_and_ledger(completed):
     finally:
         client.close(); server.close(); thread.join(4); peer.close(); launch.close()
         assert not thread.is_alive()
+
+
+def test_acceptance_is_one_shot_and_lookup_survives_held(completed):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    args = dict(role='candidate', executable_digest='sha256:' + '3' * 64,
+                health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+                health_receipt_digest=snapshot['health_receipt_digest'],
+                decision_payload_digest=snapshot['decision_payload_digest'])
+    assert ledger.lookup_gate_completion(pins) is None
+    accepted = ledger.accept_gate_completion(pins, **args)
+    assert ledger.lookup_gate_completion(pins) == accepted
+    with pytest.raises(PermissionError):
+        ledger.accept_gate_completion(pins, **args)
+    assert ledger.finish(command.command_id, state='succeeded', reason=None, evidence=evidence()).state == 'held'
+    assert ledger.lookup_gate_completion(pins) == accepted
+    with ledger._transaction() as db:
+        db.execute("UPDATE gate_acceptances SET record_mac='bad'")
+    with pytest.raises(PermissionError):
+        ledger.lookup_gate_completion(pins)
+
+
+def test_acceptance_rejects_drift_and_stale_fence(completed):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    args = dict(role='candidate', executable_digest='sha256:' + '3' * 64,
+                health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+                health_receipt_digest='sha256:' + '0' * 64,
+                decision_payload_digest=snapshot['decision_payload_digest'])
+    with pytest.raises(PermissionError):
+        ledger.accept_gate_completion(pins, **args)
+    args['health_receipt_digest'] = snapshot['health_receipt_digest']
+    with ledger._transaction() as db:
+        db.execute('UPDATE targets SET fence=fence+1')
+    with pytest.raises(PermissionError):
+        ledger.accept_gate_completion(pins, **args)
+    with pytest.raises(PermissionError):
+        ledger.lookup_gate_completion(pins)
+
+
+def test_acceptance_concurrent_one_winner_and_reopen(completed, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    args = dict(role='candidate', executable_digest='sha256:' + '3' * 64,
+                health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+                health_receipt_digest=snapshot['health_receipt_digest'],
+                decision_payload_digest=snapshot['decision_payload_digest'])
+    def attempt():
+        try:
+            return ledger.accept_gate_completion(pins, **args)
+        except PermissionError:
+            return None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: attempt(), range(2)))
+    assert sum(item is not None for item in results) == 1
+    expected = next(item for item in results if item is not None)
+    ledger.close()
+    reopened = open_ledger(tmp_path)
+    try:
+        assert reopened.lookup_gate_completion(pins) == expected
+        assert reopened.get(command.command_id).state == 'held'
+    finally:
+        reopened.close()

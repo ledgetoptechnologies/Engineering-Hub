@@ -1667,6 +1667,51 @@ class LaunchSupervisor:
                 finally: self._mutex.release()
             raise LaunchSupervisorError() from None
 
+    def accept_gate_completion(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+        """Commit exact freshly observed gate evidence through the owned v5 channel.
+
+        The fenced ledger commit is authoritative. A lost reply or failed later
+        recheck is unknown: preserve the original operation and reconcile by a
+        separate authenticated lookup, never by repeating this acceptance.
+        Direct non-relayed custody and host writer exclusion remain prerequisites.
+        """
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                facts = self.observe_gate_completion_facts(peer=peer, pins=pins, manifest=manifest, image=image,
+                    enrollment_file=enrollment_file, ledger_client=client, timeout_seconds=_remaining(deadline))
+            before = self.measure_gate_post_exec(peer=peer, pins=facts['identity'], manifest=manifest, image=image,
+                enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(before == facts['measurement'])
+            snapshot = facts['ledger_snapshot']
+            value = {'identity': facts['identity'], 'role': image.role,
+                     'executable_digest': before['executable_digest'],
+                     'health_contract': 'engineering-hub.health-json-build-commit.v1',
+                     'probe_digest': snapshot['probe_digest'],
+                     'health_receipt_digest': snapshot['health_receipt_digest'],
+                     'decision_payload_digest': snapshot['decision_payload_digest']}
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                accepted = client.invoke('accept_completion_v5', value, deadline_monotonic=deadline)
+            after = self.measure_gate_post_exec(peer=peer, pins=facts['identity'], manifest=manifest, image=image,
+                enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(after == before and accepted == value)
+            _remaining(deadline)
+            return accepted
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def lookup_gate_completion(self, *, identity, manifest_digest, timeout_seconds):
+        """Authenticated read of authoritative acceptance; never replay effects."""
+        with self._open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds,
+                                           lookup_only=True) as client:
+            return client.invoke('lookup_completion_v5', {'identity': identity})
+
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
                                         verify_live, timeout_seconds):
@@ -2036,6 +2081,75 @@ class LaunchSupervisor:
                  and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == endpoint.st_gid == 0
                  and stat.S_IMODE(endpoint.st_mode) == 0o600
                  and _identity(endpoint) == self._ledger_handoff_path_identity)
+
+    @contextmanager
+    def open_gate_ledger_client(self, *, manifest_digest, timeout_seconds):
+        with self._open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds,
+                                           lookup_only=False) as client:
+            yield client
+
+    @contextmanager
+    def _open_gate_ledger_client(self, *, manifest_digest, timeout_seconds, lookup_only):
+        """Own one connection to the reserved v5 listener and pinned executor.
+
+        This checks the protected path and per-packet executor credentials, but
+        relies on independently enforced host nondelegation and writer exclusion.
+        No result authorizes completion merely because this connection exists.
+        """
+        from .gate_ledger_channel import SupervisorLedgerClient
+        from .broker_seqpacket import PeerPin
+        _require(self._pid == os.getpid() and type(manifest_digest) is str and _SHA.fullmatch(manifest_digest)
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        channel = peer = None
+        try:
+            with self._observation_mutex(deadline):
+                if lookup_only:
+                    self._guard(allow_held=True); self._validate_live(deadline, allow_held=True)
+                    _require(not self._held or self._hold_persisted)
+                else:
+                    self._guard(); self._validate_live(deadline)
+                _require(self.profile.gate_ledger_channel == 'supervisor-listener-v1'
+                         and self._journal.ledger_mode and self._handoff_manifest_digest() == manifest_digest
+                         and self._consumer is not None)
+                self._ledger_handoff_path_check()
+                with self._journal.transaction() as db:
+                    row = db.execute('SELECT binding FROM ledger_handoff WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                _require(row is not None)
+                binding = _strict(row[0].encode(), MAX_RECEIPT_BYTES)
+                _require(binding['manifest_digest'] == manifest_digest
+                         and binding['launch_profile_digest'] == self.release.launch_profile_digest
+                         and (binding['path_device'], binding['path_inode']) == self._ledger_handoff_path_identity)
+                endpoint = f'/proc/self/fd/{self._ledger_handoff_parent}/ledger.sock'
+                channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+                channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                channel.settimeout(_remaining(deadline)); channel.connect(endpoint)
+                _require(channel.getpeername() == endpoint)
+                peer = PeerPin(pid=self._consumer.pid, uid=self._consumer_uid, gid=self._consumer_gid,
+                               start_ticks=self._consumer.start)
+                if lookup_only: self._validate_live(deadline, allow_held=True)
+                else: self._validate_live(deadline)
+                self._ledger_handoff_path_check(); _remaining(deadline)
+                client = SupervisorLedgerClient(channel=channel, peer=peer, signing_key=self._signer,
+                    launch_binding=(self._launch_id, self._consumer.boot, self._consumer.pid,
+                                    self._consumer.start, self._container_id),
+                    manifest_digest=manifest_digest, timeout_seconds=min(timeout_seconds, _remaining(deadline)),
+                    lookup_only=lookup_only)
+            yield client
+            with self._observation_mutex(deadline):
+                if lookup_only: self._validate_live(deadline, allow_held=True)
+                else: self._validate_live(deadline)
+                self._ledger_handoff_path_check(); peer.check(); _remaining(deadline)
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+        finally:
+            if peer is not None: peer.close()
+            if channel is not None: channel.close()
 
     def _issue_ledger_handoff_locked(self, peer, nonce, deadline):
         """Reserve once and deliver one protected listener to the exact executor.
