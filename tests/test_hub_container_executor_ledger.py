@@ -59,6 +59,25 @@ def gate_fixture(ledger):
     return command, decision, {k: decision[k] for k in IDENTITY_FIELDS}
 
 
+def test_gate_requirement_blocks_authenticated_start_failure_resolution(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, pins = gate_fixture(ledger)
+        ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        start_id = ledger.begin_operation(command.command_id, 'start_candidate')
+        ledger.record_terminal_failure(start_id)
+        result = ledger.finish(command.command_id, state='failed', reason='effect_failed', evidence=evidence())
+        assert result.state == 'held' and result.reason == 'inspect_required'
+        failure = next(item for item in ledger.operation_rows(command.command_id) if item['operation_id'] == start_id)
+        assert failure['status'] == 'terminal_failed' and failure['receipt_authentic'] is True
+        with pytest.raises(PermissionError): ledger.resolve_terminal_failure(command.command_id)
+        assert ledger.get(command.command_id).state == 'held'
+        assert ledger.target_snapshot(command.target_id)['state'] == 'held'
+    finally:
+        ledger.close()
+
+
 def test_gate_challenge_is_consumed_once_under_concurrent_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     ledger = open_ledger(tmp_path)
@@ -169,6 +188,102 @@ def test_gate_transaction_failure_does_not_partially_consume(tmp_path, monkeypat
         db.execute('DROP TRIGGER fail_gate')
     assert ledger.consume_mount_gate_challenge(decision) is True
     ledger.close()
+
+
+@pytest.mark.parametrize('requirement', ['pending', 'held', 'tampered'])
+@pytest.mark.parametrize('requested', ['succeeded', 'failed'])
+def test_required_gate_outcome_never_finishes_as_success_or_failure(tmp_path, monkeypatch, requirement, requested):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, pins = gate_fixture(ledger)
+        ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        if requirement == 'held': ledger.hold_gate_uncertain(pins)
+        if requirement == 'tampered':
+            with ledger._transaction() as db: db.execute("UPDATE gate_required SET state='complete',state_mac='invalid'")
+        result = ledger.finish(command.command_id, state=requested,
+                               reason=None if requested == 'succeeded' else 'effect_failed', evidence=evidence())
+        assert result.state == 'held' and result.reason == 'inspect_required'
+        assert ledger.get(command.command_id).state == 'held'
+    finally:
+        ledger.close()
+
+
+def test_gate_hold_racing_finish_cannot_commit_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, pins = gate_fixture(ledger)
+        ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        barrier = threading.Barrier(2); outcomes = []
+        def hold():
+            barrier.wait()
+            try: ledger.hold_gate_uncertain(pins); outcomes.append('held')
+            except PermissionError: outcomes.append('already_finished')
+        def finish():
+            barrier.wait()
+            try: outcomes.append(ledger.finish(command.command_id, state='succeeded', reason=None, evidence=evidence()).state)
+            except Exception as exc: outcomes.append(exc)
+        threads = [threading.Thread(target=hold), threading.Thread(target=finish)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert 'held' in outcomes and all(outcome in {'held', 'already_finished'} for outcome in outcomes)
+        assert ledger.get(command.command_id).state == 'held'
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize('mark_held', [False, True])
+def test_gate_requirement_survives_owner_restart_as_held(tmp_path, monkeypatch, mark_held):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    command, _, pins = gate_fixture(ledger)
+    ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+    if mark_held: ledger.hold_gate_uncertain(pins)
+    ledger.close()
+    reopened = open_ledger(tmp_path)
+    try:
+        assert reopened.get(command.command_id).state == 'held'
+        with reopened._connection() as db:
+            assert db.execute('SELECT state FROM gate_required').fetchone()[0] == ('held' if mark_held else 'pending')
+        with pytest.raises(PermissionError): reopened.hold_gate_uncertain(pins)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize('fault', ['context_mac', 'target_fence'])
+@pytest.mark.parametrize('method', ['require', 'hold'])
+def test_gate_requirement_rechecks_authenticated_context_and_fence(tmp_path, monkeypatch, fault, method):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, pins = gate_fixture(ledger)
+        if method == 'hold': ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        with ledger._transaction() as db:
+            if fault == 'context_mac': db.execute("UPDATE create_contexts SET context_mac='invalid'")
+            else: db.execute('UPDATE targets SET fence=fence+1')
+        with pytest.raises(PermissionError):
+            if method == 'require': ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+            else: ledger.hold_gate_uncertain(pins)
+        with ledger._connection() as db:
+            rows = db.execute('SELECT state FROM gate_required').fetchall()
+        assert [row[0] for row in rows] == (['pending'] if method == 'hold' else [])
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize('requested', ['succeeded', 'failed'])
+def test_legacy_command_without_gate_requirement_retains_finish_behavior(tmp_path, monkeypatch, requested):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, _ = gate_fixture(ledger)
+        result = ledger.finish(command.command_id, state=requested,
+                               reason=None if requested == 'succeeded' else 'effect_failed', evidence=evidence())
+        assert result.state == requested
+    finally:
+        ledger.close()
 
 
 def open_ledger(tmp_path):

@@ -287,6 +287,7 @@ class SQLiteLedger:
                     "CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS create_contexts (operation_id TEXT PRIMARY KEY, context TEXT NOT NULL, context_mac TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS mount_gate_challenges (operation_id TEXT PRIMARY KEY, launch_id TEXT NOT NULL UNIQUE, nonce TEXT NOT NULL UNIQUE, identity TEXT NOT NULL, identity_mac TEXT NOT NULL, state TEXT NOT NULL, decision TEXT, decision_mac TEXT)",
+                    "CREATE TABLE IF NOT EXISTS gate_required (command_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, state_mac TEXT NOT NULL)",
                 )
                 for statement in statements:
                     db.execute(statement)
@@ -568,6 +569,68 @@ class SQLiteLedger:
             raise PermissionError('gate binding unavailable')
         return operation
 
+    def require_gate_outcome(self, command_id, operation_id):
+        """Durably require a gate outcome before starting; no completion proof exists yet.
+
+        This record relies on independently protected ledger storage; it does
+        not prevent restoration of an older complete database or old binaries.
+        """
+        with self._transaction() as db:
+            operation = db.execute('SELECT * FROM operations WHERE operation_id=? AND command_id=?',
+                                   (operation_id, command_id)).fetchone()
+            if operation is None or operation['kind'] not in {'create_candidate', 'create_rollback'}:
+                raise PermissionError('gate requirement unavailable')
+            row = db.execute('SELECT context,context_mac FROM create_contexts WHERE operation_id=?',
+                             (operation_id,)).fetchone()
+            if row is None or type(row['context']) is not str or len(row['context'].encode()) > 16384:
+                raise PermissionError('gate requirement unavailable')
+            mac = self._operation_mac(operation_id, command_id, operation['kind'], 'create_context', row['context'])
+            if type(row['context_mac']) is not str or not hmac.compare_digest(mac, row['context_mac']):
+                raise PermissionError('gate requirement unavailable')
+            context = json.loads(row['context'])
+            if type(context) is not dict or _canonical(context) != row['context']:
+                raise PermissionError('gate requirement unavailable')
+            receipt = self._format_operation(operation)
+            if (receipt['status'] != 'completed' or receipt['receipt_authentic'] is not True
+                    or type(receipt['receipt']) is not dict or set(receipt['receipt']) != {'container_id'}):
+                raise PermissionError('gate requirement unavailable')
+            try:
+                pins = {'operation_id': operation_id, 'container_id': receipt['receipt']['container_id'],
+                        'run_id': context['run_id'], 'fence': context['fencing_generation'],
+                        'manifest_digest': context['manifest_digest'], 'image_config_id': context['image_config_id'],
+                        'generation_id': context['generation_id'], 'runnable_digest': context['runnable_reference'],
+                        'platform_manifest_digest': context['platform_manifest_digest']}
+                self._gate_binding(db, pins)
+            except (KeyError, TypeError, ValueError):
+                raise PermissionError('gate requirement unavailable') from None
+            state = 'pending'
+            signature = self._operation_mac(operation_id, command_id, 'gate_required', state, '')
+            try:
+                db.execute('INSERT INTO gate_required VALUES(?,?,?,?)', (command_id, operation_id, state, signature))
+            except sqlite3.IntegrityError:
+                raise PermissionError('gate requirement already exists') from None
+
+    def hold_gate_uncertain(self, value):
+        """Mark an authenticated current gate operation uncertain without claiming completion."""
+        if type(value) is not dict:
+            raise ValueError('invalid gate identity')
+        from .mount_gate_protocol import IDENTITY_FIELDS
+        if not IDENTITY_FIELDS.issubset(value):
+            raise ValueError('invalid gate identity')
+        pins = {name: value[name] for name in IDENTITY_FIELDS}
+        with self._transaction() as db:
+            operation = self._gate_binding(db, pins)
+            row = db.execute('SELECT * FROM gate_required WHERE command_id=? AND operation_id=?',
+                             (operation['command_id'], pins['operation_id'])).fetchone()
+            if row is None or row['state'] not in {'pending', 'held'}:
+                raise PermissionError('gate requirement unavailable')
+            expected = self._operation_mac(pins['operation_id'], operation['command_id'], 'gate_required', row['state'], '')
+            if type(row['state_mac']) is not str or not hmac.compare_digest(row['state_mac'], expected):
+                raise PermissionError('gate requirement unavailable')
+            signature = self._operation_mac(pins['operation_id'], operation['command_id'], 'gate_required', 'held', '')
+            db.execute("UPDATE gate_required SET state='held',state_mac=? WHERE command_id=? AND operation_id=?",
+                       (signature, operation['command_id'], pins['operation_id']))
+
     def reserve_mount_gate_challenge(self, identity):
         """Reserve one independently enrolled identity; this verifies no host claim.
 
@@ -696,6 +759,10 @@ class SQLiteLedger:
             row = db.execute("SELECT * FROM commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None or row["state"] != "held":
                 raise RuntimeError("command is not held")
+            # A terminal engine result does not prove the gate's outcome or
+            # resolve an uncertain authenticated handoff.
+            if db.execute('SELECT 1 FROM gate_required WHERE command_id=?', (command_id,)).fetchone():
+                raise PermissionError('gate outcome remains unresolved')
             failures = db.execute(
                 "SELECT operation_id,command_id,kind,status,intent,receipt,receipt_mac "
                 "FROM operations WHERE command_id=? AND status='terminal_failed' ORDER BY operation_id",
@@ -732,6 +799,10 @@ class SQLiteLedger:
             row = db.execute("SELECT * FROM commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None or row["state"] != "running":
                 raise RuntimeError("command is not running")
+            # No authenticated gate-completion signal exists yet. A pending,
+            # held, or malformed requirement must never become success/failure.
+            if db.execute('SELECT 1 FROM gate_required WHERE command_id=?', (command_id,)).fetchone():
+                state, reason = 'held', 'inspect_required'
             old = ContainerPilotResponse.model_validate_json(row["response"])
             result = old.model_copy(update={"state": state, "reason": reason,
                                             "evidence": evidence, "replayed": False})

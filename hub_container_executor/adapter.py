@@ -478,9 +478,13 @@ class HostAdapter:
                              immutable_reference=image.runnable_reference, pull=False,
                              profile=profile)
         timeout_field = self.manifest.timeouts.create_ms
+        create_operation = []
+        def create(operation_id, timeout):
+            create_operation.append(operation_id)
+            return self.backend.create_container(plan, operation_id, timeout)
         container_id = self._effect(
             request, "create_" + role,
-            lambda operation_id, timeout: self.backend.create_container(plan, operation_id, timeout),
+            create,
             timeout_field, deadline,
             lambda value: {"container_id": value} if isinstance(value, str) else
             (_raise_held("evidence_mismatch")),
@@ -499,6 +503,10 @@ class HostAdapter:
                                 {"created"}, deadline)
         self.ledger.record_target_instance(request.command_id, container_id,
                                            image.image_config_id, state.generation_id)
+        if self.gate_socket_directory is not None:
+            if len(create_operation) != 1:
+                raise _Held('inspect_required')
+            self.ledger.require_gate_outcome(request.command_id, create_operation[0])
         self._effect(
             request, "start_" + role,
             lambda operation_id, timeout: self.backend.start_container(container_id, operation_id, timeout),

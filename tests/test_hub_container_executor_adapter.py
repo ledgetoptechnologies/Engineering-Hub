@@ -287,6 +287,26 @@ def test_gated_deploy_holds_before_effect_if_rollback_image_is_ungated(tmp_path,
         adapter.close()
 
 
+def test_gated_start_cannot_finish_success_without_confirmed_gate(tmp_path, monkeypatch):
+    from hub_container_executor.application_gate_enrollment import STATIC_ENTRYPOINT
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    adapter.gate_socket_directory = '/synthetic/gate'
+    inspect_defaults = adapter._image_defaults
+    monkeypatch.setattr(adapter, '_image_defaults', lambda image, deadline:
+                        replace(inspect_defaults(image, deadline), entrypoint=STATIC_ENTRYPOINT, command=()))
+    monkeypatch.setattr(adapter, '_verify_baseline_container', lambda *_: None)
+    try:
+        request = command(manifest, 'deploy_container')
+        response = adapter.submit(request)
+        assert response.state == 'held' and response.reason == 'inspect_required'
+        assert state.calls and 'start' in backend.events
+        with adapter.ledger._connection() as db:
+            row = db.execute('SELECT state FROM gate_required WHERE command_id=?', (request.command_id,)).fetchone()
+            assert row is not None and row['state'] == 'pending'
+    finally:
+        adapter.close()
+
+
 def test_fake_engine_candidate_failure_requires_separate_rollback_smoke(tmp_path):
     adapter, backend, state, manifest = make_fixture(tmp_path)
     run_id = str(uuid.uuid4())
