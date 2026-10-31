@@ -467,3 +467,90 @@ def test_a_privileged_holder_can_claim_the_expected_account(rig):
         assert backend.events.count('create') == 1
     finally:
         claimed.close()
+
+
+def steal_after_readiness(channel, thief):
+    """Report readiness, then let another holder take the ready packet before the read."""
+    original = channel._readable
+    def readable(deadline):
+        ready = original(deadline)
+        if ready:
+            thief.setblocking(False)
+            thief.recv(65536)
+        return ready
+    channel._readable = readable
+
+
+def test_a_request_taken_by_another_holder_fails_closed_without_blocking(rig):
+    backend, manifest, broker, client = rig
+    thief = socket.socket(fileno=os.dup(broker._socket.fileno()))
+    try:
+        steal_after_readiness(broker, thief)
+        thread, errors = serve_once(broker, timeout=30)
+        started = time.monotonic()
+        with pytest.raises(BrokerTransportError):
+            client.submit(command(manifest, 'deploy_container'), 2)
+        thread.join(5)
+        assert not thread.is_alive() and time.monotonic() - started < 5
+        assert len(errors) == 1 and not isinstance(errors[0], BrokerReadTimeout)
+        assert broker.closed and client.closed and 'create' not in backend.events
+    finally:
+        thief.close()
+
+
+def test_a_reply_taken_by_another_holder_fails_the_client_closed_without_blocking(rig):
+    backend, manifest, broker, client = rig
+    thief = socket.socket(fileno=os.dup(client._socket.fileno()))
+    try:
+        original = client._readable
+        calls = []
+        def readable(deadline):
+            calls.append(deadline)
+            ready = original(deadline)
+            if ready and len(calls) == 2:   # the first call is the unsolicited-packet check
+                thief.setblocking(False)
+                thief.recv(65536)
+            return ready
+        client._readable = readable
+        thread, errors = serve_once(broker)
+        started = time.monotonic()
+        with pytest.raises(BrokerTransportError):
+            client.submit(command(manifest, 'deploy_container'), 30)
+        assert time.monotonic() - started < 5 and client.closed
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+        assert backend.events.count('create') == 1   # dispatched; the coordinator's outcome is unknown
+    finally:
+        thief.close()
+
+
+def test_a_peer_exit_wakes_a_waiting_executor_promptly(parts):
+    adapter, backend, _ = parts
+    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    broker = InheritedCommandBroker(executor_end.detach(), adapter, me())
+    child = os.fork()
+    if child == 0:
+        time.sleep(0.3)
+        os._exit(0)
+    coordinator_end.close()
+    started = time.monotonic()
+    with pytest.raises(BrokerChannelClosed):
+        broker.serve_once(30)
+    os.waitpid(child, 0)
+    assert time.monotonic() - started < 5 and broker.closed and 'create' not in backend.events
+
+
+def test_a_peer_exit_wakes_a_waiting_coordinator_promptly(parts):
+    _, _, manifest = parts
+    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client = InheritedCommandClient(coordinator_end.detach(), me())
+    child = os.fork()
+    if child == 0:
+        time.sleep(0.3)
+        os._exit(0)
+    executor_end.close()
+    started = time.monotonic()
+    with pytest.raises(BrokerTransportError):
+        client.get(command(manifest, 'deploy_container'), 30)
+    os.waitpid(child, 0)
+    assert time.monotonic() - started < 5 and client.closed

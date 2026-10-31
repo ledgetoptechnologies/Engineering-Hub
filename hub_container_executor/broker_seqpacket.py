@@ -408,10 +408,14 @@ class _InheritedChannel:
         poller.register(self._socket, hangup)
         return not any(events & hangup for _, events in poller.poll(0))
 
-    def _receive_value(self):
+    def _receive_value(self, deadline):
+        # Readiness is only a hint: another holder of the descriptor can take the
+        # packet first. Never block here; a vanished packet fails the channel closed.
+        self._socket.setblocking(False)
         raw, credentials = _read_packet(self._socket, allow_eof=True)
         if raw is None:
             raise BrokerChannelClosed()
+        _require(time.monotonic() < deadline)
         _require(len(credentials) == 1 and credentials[0][1:] == (self.peer.uid, self.peer.gid))
         return _parse(raw)
 
@@ -456,7 +460,7 @@ class InheritedCommandBroker(_InheritedChannel):
             if not self._readable(min(deadline, time.monotonic() + (read_timeout_seconds or timeout_seconds))):
                 # Nothing was read, so nothing was admitted; the channel stays usable.
                 raise BrokerReadTimeout()
-            request = self._receive_value()
+            request = self._receive_value(deadline)
             _require(set(request) == {'protocol', 'sequence', 'action', 'payload'}
                      and request['protocol'] == _CHANNEL_PROTOCOL
                      and type(request['sequence']) is int and request['sequence'] == self._sequence + 1)
@@ -510,7 +514,7 @@ class InheritedCommandClient(_InheritedChannel):
                                  'action': action, 'payload': payload})
             self._sequence = sequence
             _require(self._readable(deadline))
-            reply = self._receive_value()
+            reply = self._receive_value(deadline)
             _require(time.monotonic() < deadline and set(reply) == {'protocol', 'sequence', 'result'}
                      and reply['protocol'] == _CHANNEL_PROTOCOL and type(reply['sequence']) is int
                      and reply['sequence'] == sequence)
