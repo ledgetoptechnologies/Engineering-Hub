@@ -163,12 +163,27 @@ def test_real_pair_receipts_verify_both_roles_before_fd_release(tmp_path, role):
 @pytest.mark.parametrize('failure', ['peer_launch', 'peer_release', 'peer_manifest', 'peer_signature',
     'own_inode', 'missing_commit', 'pair_id', 'peer_digest', 'pair_signature',
     'same_process', 'same_container', 'same_endpoint'])
-def test_pair_bad_peer_or_commit_never_releases_fd(tmp_path, role, failure):
-    before = len(os.listdir('/proc/self/fd'))
+def test_pair_bad_peer_or_commit_never_releases_fd(tmp_path, role, failure, monkeypatch):
+    # Trace the exact received socket identity at successful os.close, instead
+    # of counting unrelated process-wide descriptors that can close at any time.
+    original_close, closed = os.close, []
+    def traced_close(fd):
+        try:
+            info = os.fstat(fd)
+            identity = (info.st_dev, info.st_ino)
+        except OSError:
+            identity = None
+        original_close(fd)
+        if identity is not None:
+            closed.append(identity)
+    monkeypatch.setattr(os, 'close', traced_close)
     _, left, right = exercise(tmp_path, role=role, failure=failure)
-    left.close()
-    right.close()
-    assert len(os.listdir('/proc/self/fd')) == before
+    try:
+        info = os.fstat((left if role == 'executor' else right).fileno())
+        assert (info.st_dev, info.st_ino) in closed
+    finally:
+        left.close()
+        right.close()
 
 
 def test_pair_fd_quarantined_until_commit(tmp_path):
