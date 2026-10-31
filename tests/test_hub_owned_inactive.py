@@ -31,7 +31,7 @@ from tests.test_hub_queued_pilot import rig as pilot_rig, submit
 
 @pytest.fixture
 def rig(pilot_rig, tmp_path, monkeypatch):
-    config, assertion = signed_access(monkeypatch)
+    config, assertion, _diagnostics = signed_access(monkeypatch)
     settings = Settings(Path(pilot_rig.repo.path), AuthSettings('test-hermes', 'test-codex',
         claude_token='test-claude', allowed_ips=frozenset({'127.0.0.1'})), config)
     root = tmp_path / 'bus'

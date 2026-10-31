@@ -46,7 +46,7 @@ def setup(tmp_path, monkeypatch):
     private.mkdir(mode=0o700)
     sockets = tmp_path / 'socket'
     sockets.mkdir(mode=0o700)
-    config, assertion = signed_access(monkeypatch)
+    config, assertion, _diagnostics = signed_access(monkeypatch)
     state = SimpleNamespace(service=service, owners=[], clients=[], events=[],
         host=DistinctContainerClient(), requests=[], block=None,
         settings=Settings(private / 'hub.sqlite3',

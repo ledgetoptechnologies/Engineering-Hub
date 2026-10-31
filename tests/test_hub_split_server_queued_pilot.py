@@ -35,7 +35,7 @@ async def until(predicate):
 async def test_two_runner_http_review_and_native_pilot_flow(
         pilot_rig, tmp_path, monkeypatch, failed_smoke, recover_socket):
     rig = pilot_rig
-    config, assertion = signed_access(monkeypatch)
+    config, assertion, _diagnostics = signed_access(monkeypatch)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude',
                         allowed_ips=frozenset({'127.0.0.1'}))
     if failed_smoke:
@@ -136,7 +136,7 @@ async def test_endpoint_recovery_requires_explicit_boolean_before_factory(tmp_pa
 async def test_private_stop_vetoes_new_jobs_before_blocked_http_and_effect_drain(
         pilot_rig, tmp_path, monkeypatch):
     rig = pilot_rig
-    config, _ = signed_access(monkeypatch)
+    config, _, _diagnostics = signed_access(monkeypatch)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude')
     _, first = submit(rig, 'first')
     _, second = submit(rig, 'second')
