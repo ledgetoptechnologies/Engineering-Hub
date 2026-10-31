@@ -23,6 +23,11 @@ held metadata. It reports quiescence as unknown and cannot release the hold.
 the private ownership step is present and matches the held identity. It does
 not prove the prior caller received success, establish current ownership or
 writer exclusion, or authorize a mount, handoff, rollback or release.
+The signed `intent_state` and `preparation_state` can be `absent`, `valid`, or
+`incomplete`. An incomplete file is an exact prefix of the expected protected
+record; it does not establish whether interruption or tampering caused it.
+Malformed or unsafe files remain unavailable for inspection. In every case the
+hold remains in place and incomplete data is not adopted or retried.
 It opens the journal read-only, refuses SQLite sidecars or WAL mode, and must
 obtain the journal's exclusive owner lock; it is unavailable while a cooperating
 owner is active and is not a concurrent health check. Root, the host and the

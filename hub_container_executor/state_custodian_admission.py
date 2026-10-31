@@ -32,6 +32,8 @@ HOLD_OBSERVATION = 'engineering-hub.state-custodian-held-observation.v1'
 HOLD_DOMAIN = b'engineering-hub.state-custodian-held-observation.v1\x00'
 HOLD_OBSERVATION_V2 = 'engineering-hub.state-custodian-held-observation.v2'
 HOLD_DOMAIN_V2 = b'engineering-hub.state-custodian-held-observation.v2\x00'
+HOLD_OBSERVATION_V3 = 'engineering-hub.state-custodian-held-observation.v3'
+HOLD_DOMAIN_V3 = b'engineering-hub.state-custodian-held-observation.v3\x00'
 FIELDS = frozenset({'protocol', 'operation_id', 'command_id', 'run_id', 'target_id',
                     'fencing_generation', 'manifest_digest', 'role', 'source_backup_digest',
                     'provider_key_digest', 'nonce', 'issued_at_ms', 'expires_at_ms'})
@@ -189,6 +191,29 @@ class CustodianAdmissionJournal:
                     or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
                     or raw != _canonical(self._private_preparation(marker, admission, hold))):
                 raise ValueError()
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _inspect_prefix(stage_fd, name, expected):
+        """Classify only a protected exact prefix; never use it as authority."""
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=stage_fd)
+        except FileNotFoundError:
+            return 'absent'
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > len(expected)):
+                raise ValueError()
+            raw = os.read(fd, len(expected) + 1)
+            after = os.fstat(fd)
+            named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+            fingerprint = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if (len(raw) != before.st_size or fingerprint(before) != fingerprint(after)
+                    or fingerprint(before) != fingerprint(named) or not expected.startswith(raw)):
+                raise ValueError()
+            return 'valid' if raw == expected else 'incomplete'
         finally:
             os.close(fd)
 
@@ -555,7 +580,7 @@ class CustodianAdmissionJournal:
             if failed: raise CustodianAdmissionError() from None
 
     def observe_held(self, *, target_id, nonce, owner_policy_path, copy_policy_path, provider_key_path, timeout_seconds,
-                     include_preparation=False):
+                     include_preparation=False, include_incomplete=False):
         """Sign a read-only held observation; it never establishes quiescence.
 
         The provider key is independently root-enrolled. This verifies the
@@ -565,7 +590,8 @@ class CustodianAdmissionJournal:
         stage_fd = file_fd = None
         try:
             self._check()
-            if (type(include_preparation) is not bool or not self._holds_supported or target_id != 'engineering-hub:staging'
+            if (type(include_preparation) is not bool or type(include_incomplete) is not bool
+                    or (include_incomplete and not include_preparation) or not self._holds_supported or target_id != 'engineering-hub:staging'
                     or type(nonce) is not str or not _HEX.fullmatch(nonce)
                     or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
@@ -608,7 +634,16 @@ class CustodianAdmissionJournal:
                         or (info.st_uid, info.st_gid) not in ((0, 0), (hold[6], hold[7]))): raise ValueError()
                 marker_name = hold[1] + '.ownership-intent'
                 marker_present = os.path.lexists(str(stage / marker_name))
-                if marker_present:
+                if include_incomplete:
+                    expected_marker = {'operation_id': hold[1], 'admission_digest': hold[2],
+                        'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7],
+                        'size': info.st_size, 'digest': admission['source_backup_digest']}
+                    intent_state = self._inspect_prefix(stage_fd, marker_name, _canonical(expected_marker))
+                    preparation_state = self._inspect_prefix(stage_fd, hold[1] + '.ownership-observed',
+                        _canonical(self._private_preparation(expected_marker, admission, hold)))
+                    if intent_state != 'valid' and preparation_state != 'absent': raise ValueError()
+                    marker_present = intent_state != 'absent'
+                elif marker_present:
                     marker_fd = os.open(marker_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
                     try:
                         marker_info = os.fstat(marker_fd)
@@ -626,7 +661,9 @@ class CustodianAdmissionJournal:
                     finally:
                         os.close(marker_fd)
                 preparation_recorded = False
-                if include_preparation and os.path.lexists(str(stage / (hold[1] + '.ownership-observed'))):
+                if include_incomplete:
+                    preparation_recorded = preparation_state == 'valid'
+                elif include_preparation and os.path.lexists(str(stage / (hold[1] + '.ownership-observed'))):
                     if not marker_present: raise ValueError()
                     self._read_private_preparation(stage_fd, hold[1], marker, admission, hold)
                     preparation_recorded = True
@@ -637,14 +674,17 @@ class CustodianAdmissionJournal:
                     raise ValueError()
                 now = time.time_ns() // 1_000_000; elapsed = time.monotonic() - started
                 if not 0 <= elapsed < timeout_seconds or now < wall_start: raise ValueError()
-                payload = {'protocol': HOLD_OBSERVATION_V2 if include_preparation else HOLD_OBSERVATION, 'nonce': nonce, 'target_id': target_id,
+                payload = {'protocol': HOLD_OBSERVATION_V3 if include_incomplete else HOLD_OBSERVATION_V2 if include_preparation else HOLD_OBSERVATION, 'nonce': nonce, 'target_id': target_id,
                     'operation_id': hold[1], 'run_id': admission['run_id'], 'manifest_digest': admission['manifest_digest'],
                     'admission_digest': hold[2], 'fencing_generation': hold[3],
                     'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7],
                     'owner_policy_digest': hold[8], 'marker_present': marker_present, 'quiescence': 'unknown',
                     'issued_at_ms': now, 'expires_at_ms': now + min(5000, max(1, int((timeout_seconds - elapsed) * 1000)))}
                 if include_preparation: payload['private_preparation_recorded'] = preparation_recorded
-                signature = signer.sign((HOLD_DOMAIN_V2 if include_preparation else HOLD_DOMAIN) + _canonical(payload)).hex()
+                if include_incomplete:
+                    payload.update(intent_state=intent_state, preparation_state=preparation_state)
+                domain = HOLD_DOMAIN_V3 if include_incomplete else HOLD_DOMAIN_V2 if include_preparation else HOLD_DOMAIN
+                signature = signer.sign(domain + _canonical(payload)).hex()
                 end_info = os.fstat(file_fd)
                 if (not now <= time.time_ns() // 1_000_000 < payload['expires_at_ms']
                         or not 0 <= time.monotonic() - started < timeout_seconds

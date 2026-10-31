@@ -6,7 +6,8 @@ import time
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from .state_custodian_admission import HOLD_DOMAIN, HOLD_OBSERVATION, HOLD_DOMAIN_V2, HOLD_OBSERVATION_V2, _canonical
+from .state_custodian_admission import (HOLD_DOMAIN, HOLD_OBSERVATION, HOLD_DOMAIN_V2, HOLD_OBSERVATION_V2,
+                                        HOLD_DOMAIN_V3, HOLD_OBSERVATION_V3, _canonical)
 
 IDENTITY = frozenset({'target_id', 'operation_id', 'run_id', 'manifest_digest', 'admission_digest',
                       'fencing_generation', 'device', 'inode', 'host_uid', 'host_gid', 'owner_policy_digest'})
@@ -42,10 +43,17 @@ def verify_held_observation(raw, *, provider_public_key, nonce, expected, start_
                 or type(envelope['signature']) is not str or not re.fullmatch(r'[0-9a-f]{128}', envelope['signature'])):
             raise ValueError()
         p = envelope['payload']
+        v3 = p.get('protocol') == HOLD_OBSERVATION_V3
         v2 = p.get('protocol') == HOLD_OBSERVATION_V2
-        if (set(p) != (FIELDS | {'private_preparation_recorded'} if v2 else FIELDS)
-                or p['protocol'] not in (HOLD_OBSERVATION, HOLD_OBSERVATION_V2)
-                or (v2 and type(p['private_preparation_recorded']) is not bool)
+        fields = FIELDS | ({'private_preparation_recorded', 'intent_state', 'preparation_state'} if v3 else
+                           {'private_preparation_recorded'} if v2 else set())
+        if (set(p) != fields or p['protocol'] not in (HOLD_OBSERVATION, HOLD_OBSERVATION_V2, HOLD_OBSERVATION_V3)
+                or ((v2 or v3) and type(p['private_preparation_recorded']) is not bool)
+                or (v3 and (p['intent_state'] not in ('absent', 'incomplete', 'valid')
+                    or p['preparation_state'] not in ('absent', 'incomplete', 'valid')
+                    or p['marker_present'] != (p['intent_state'] != 'absent')
+                    or p['private_preparation_recorded'] != (p['preparation_state'] == 'valid')
+                    or (p['intent_state'] != 'valid' and p['preparation_state'] != 'absent')))
                 or p['nonce'] != nonce or p['quiescence'] != 'unknown'
                 or type(p['marker_present']) is not bool or p['target_id'] != 'engineering-hub:staging'
                 or any(type(p[k]) is not type(expected[k]) or p[k] != expected[k] for k in IDENTITY)
@@ -63,7 +71,7 @@ def verify_held_observation(raw, *, provider_public_key, nonce, expected, start_
                 or not start_monotonic <= tick or (tick - start_monotonic) * 1000 >= p['expires_at_ms'] - start_wall_ms):
             raise ValueError()
         Ed25519PublicKey.from_public_bytes(provider_public_key).verify(bytes.fromhex(envelope['signature']),
-            (HOLD_DOMAIN_V2 if v2 else HOLD_DOMAIN) + _canonical(p))
+            (HOLD_DOMAIN_V3 if v3 else HOLD_DOMAIN_V2 if v2 else HOLD_DOMAIN) + _canonical(p))
         final_wall = time.time_ns() // 1_000_000; final_tick = time.monotonic()
         if (not wall <= final_wall < p['expires_at_ms'] or not tick <= final_tick
                 or (final_tick - start_monotonic) * 1000 >= p['expires_at_ms'] - start_wall_ms):

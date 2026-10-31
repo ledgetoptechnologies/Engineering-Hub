@@ -374,13 +374,12 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
             result = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src',
                 '--enrollment', str(cli_enrollment)], capture_output=True, text=True, timeout=8, cwd='/',
                 env={'LANG': 'C.UTF-8'})
-            if uncertain_chown == 'record_write':
-                assert result.returncode == 2 and result.stdout == '' and result.stderr == 'Custodian hold inspection unavailable\n'
-            else:
-                assert result.returncode == 0 and result.stderr == ''
-                assert json.loads(result.stdout) == {'status': 'held', 'quiescence': 'unknown',
-                    'operation_id': payload['operation_id'], 'fencing_generation': 1, 'marker_present': True,
-                    'private_preparation_recorded': uncertain_chown in (False, 'record_fsync')}
+            assert result.returncode == 0 and result.stderr == ''
+            assert json.loads(result.stdout) == {'status': 'held', 'quiescence': 'unknown',
+                'operation_id': payload['operation_id'], 'fencing_generation': 1, 'marker_present': True,
+                'private_preparation_recorded': uncertain_chown in (False, 'record_fsync'), 'intent_state': 'valid',
+                'preparation_state': 'incomplete' if uncertain_chown == 'record_write' else
+                                     'valid' if uncertain_chown in (False, 'record_fsync') else 'absent'}
             assert provider_raw.hex() not in result.stdout and provider_raw.hex() not in result.stderr
             assert hashlib.sha256((tmp_path / 'journal.sqlite').read_bytes()).digest() == before
             assert set(os.listdir(tmp_path)) == before_names
@@ -473,7 +472,7 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         reopened.close()
 
 
-@pytest.mark.parametrize('crashpoint', ['before_marker', 'record_fsync'])
+@pytest.mark.parametrize('crashpoint', ['before_marker', 'intent_write', 'intent_partial', 'record_write', 'record_partial', 'record_fsync'])
 def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoint):
     source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
     stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
@@ -483,9 +482,14 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoi
     digest = 'sha256:' + 'a' * 64
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    provider_key = Ed25519PrivateKey.generate()
+    provider_raw = provider_key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    provider_public = provider_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    provider_digest = 'sha256:' + hashlib.sha256(provider_public).hexdigest()
+    provider_path = tmp_path / 'provider.key'; provider_path.write_bytes(provider_raw); provider_path.chmod(0o600)
     enrollment = tmp_path / 'enrollment.json'; journal_path = tmp_path / 'journal.sqlite'
     enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(journal_path), 'supervisor_public_key': public,
-        'manifest_digest': digest, 'source_backup_digest': backup, 'provider_key_digest': digest,
+        'manifest_digest': digest, 'source_backup_digest': backup, 'provider_key_digest': provider_digest,
         'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
     copy_policy = tmp_path / 'copy.json'
     copy_policy.write_bytes(_canonical({'schema': 1, 'source': str(source), 'source_digest': backup,
@@ -497,7 +501,7 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoi
         payload = {'protocol': PROTOCOL, 'operation_id': operation, 'command_id': str(uuid4()),
             'run_id': str(uuid4()), 'target_id': 'engineering-hub:staging', 'fencing_generation': 1,
             'manifest_digest': digest, 'role': 'candidate', 'source_backup_digest': backup,
-            'provider_key_digest': digest, 'nonce': '9' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
+            'provider_key_digest': provider_digest, 'nonce': '9' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
         journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=journal_path, create=True)
         token = journal.reserve(payload, key.sign(DOMAIN + _canonical(payload)))
         journal.stage_quarantined_backup(operation_id=operation, admission_digest=token, copy_policy_path=copy_policy, timeout_seconds=3)
@@ -505,17 +509,24 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoi
         owner.write_bytes(_canonical({'schema': 1, 'boot_id': _boot_id(), 'daemon_pid': os.getpid(),
             'daemon_start_ticks': _proc_start(os.getpid()), 'uid_map': open('/proc/self/uid_map').read(),
             'gid_map': open('/proc/self/gid_map').read(), 'app_uid': 10002, 'app_gid': 10002})); owner.chmod(0o600)
-        original_open, original_fsync = os.open, os.fsync
-        record_fds = set()
+        original_open, original_write, original_fsync = os.open, os.write, os.fsync
+        record_fds, intent_fds = set(), set()
         def crash_on_marker(path, *args, **kwargs):
             if crashpoint == 'before_marker' and str(path).endswith('.ownership-intent'): os.kill(os.getpid(), signal.SIGKILL)
             fd = original_open(path, *args, **kwargs)
             if str(path).endswith('.ownership-observed'): record_fds.add(fd)
+            if str(path).endswith('.ownership-intent'): intent_fds.add(fd)
             return fd
+        def crash_on_write(fd, value):
+            if (crashpoint in ('intent_write', 'intent_partial') and fd in intent_fds) or (crashpoint in ('record_write', 'record_partial') and fd in record_fds):
+                if crashpoint.endswith('_partial'): original_write(fd, value[:7])
+                os.kill(os.getpid(), signal.SIGKILL)
+            return original_write(fd, value)
         def crash_on_record_sync(fd):
             if crashpoint == 'record_fsync' and fd in record_fds: os.kill(os.getpid(), signal.SIGKILL)
             return original_fsync(fd)
         admission_module.os.open = crash_on_marker
+        admission_module.os.write = crash_on_write
         admission_module.os.fsync = crash_on_record_sync
         journal.prepare_private_owner(operation_id=operation, admission_digest=token, owner_policy_path=owner)
     process = multiprocessing.get_context('fork').Process(target=child)
@@ -529,9 +540,43 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoi
         journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=journal_path, create=False)
         try:
             assert journal._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (operation,)
-            assert (stage / (operation + '.ownership-intent')).exists() is (crashpoint == 'record_fsync')
+            assert (stage / (operation + '.ownership-intent')).exists() is (crashpoint != 'before_marker')
+            hold = journal._db.execute('SELECT * FROM custody_holds').fetchone()
+            admission = json.loads(journal._db.execute('SELECT payload FROM admissions WHERE operation_id=?', (operation,)).fetchone()[0])
         finally:
             journal.close()
+        installed = os.environ.get('EH_INSTALLED_EXECUTOR_PATH')
+        if installed:
+            expected = {'target_id': hold[0], 'operation_id': hold[1], 'run_id': admission['run_id'],
+                'manifest_digest': admission['manifest_digest'], 'admission_digest': hold[2], 'fencing_generation': hold[3],
+                'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7], 'owner_policy_digest': hold[8]}
+            inspect = tmp_path / 'inspect.json'
+            inspect.write_bytes(_canonical({'schema': 1, 'journal_enrollment': str(enrollment), 'journal_path': str(journal_path),
+                'owner_policy': str(tmp_path / 'owner.json'), 'copy_policy': str(copy_policy), 'provider_key_path': str(provider_path),
+                'provider_public_key': provider_public.hex(), 'expected': expected})); inspect.chmod(0o600)
+            invoke = ("import runpy,sys; sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)]; "
+                "import hub_container_executor; assert hub_container_executor.__file__.startswith(sys.path[0]); "
+                "runpy.run_module('hub_container_executor.state_custodian_inspect',run_name='__main__')")
+            before = hashlib.sha256(journal_path.read_bytes()).digest()
+            result = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src', '--enrollment', str(inspect)],
+                capture_output=True, text=True, timeout=8, cwd='/', env={'LANG': 'C.UTF-8'})
+            assert result.returncode == 0 and result.stderr == ''
+            output = json.loads(result.stdout)
+            assert output['status'] == 'held' and output['quiescence'] == 'unknown'
+            assert output['intent_state'] == ('absent' if crashpoint == 'before_marker' else 'incomplete' if crashpoint in ('intent_write', 'intent_partial') else 'valid')
+            assert output['preparation_state'] == ('incomplete' if crashpoint in ('record_write', 'record_partial') else 'valid' if crashpoint == 'record_fsync' else 'absent')
+            assert hashlib.sha256(journal_path.read_bytes()).digest() == before
+            if crashpoint == 'intent_partial':
+                marker = stage / (operation + '.ownership-intent')
+                saved = marker.read_bytes(); marker.write_bytes(b'not-a-prefix'); marker.chmod(0o600)
+                bad = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src', '--enrollment', str(inspect)],
+                    capture_output=True, text=True, timeout=8, cwd='/', env={'LANG': 'C.UTF-8'})
+                assert bad.returncode == 2 and bad.stdout == '' and bad.stderr == 'Custodian hold inspection unavailable\n'
+                marker.write_bytes(saved); marker.chmod(0o644)
+                bad_mode = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src', '--enrollment', str(inspect)],
+                    capture_output=True, text=True, timeout=8, cwd='/', env={'LANG': 'C.UTF-8'})
+                assert bad_mode.returncode == 2 and bad_mode.stdout == '' and bad_mode.stderr == 'Custodian hold inspection unavailable\n'
+                assert hashlib.sha256(journal_path.read_bytes()).digest() == before
     finally:
         if process.is_alive(): process.kill(); process.join(timeout=3)
         process.close()
