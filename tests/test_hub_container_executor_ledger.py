@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -441,3 +442,100 @@ def test_terminal_failure_resolution_rejects_forged_private_receipt_atomically(t
         ).fetchone()
     assert (phase, run, target) == ("held", "held", "held")
     recovered.close()
+
+
+def test_create_context_is_atomic_authenticated_and_survives_reopen(tmp_path):
+    ledger = open_ledger(tmp_path)
+    command = request()
+    ledger.admit(command)
+    context = {"schema": 1, "generation_id": "synthetic-g1"}
+    with ledger._connection() as db:
+        db.execute("CREATE TRIGGER reject_context BEFORE INSERT ON create_contexts BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    with pytest.raises(RuntimeError):
+        ledger.begin_operation(command.command_id, "create_candidate", create_context=context)
+    assert ledger.operation_rows(command.command_id) == ()
+    with ledger._connection() as db:
+        db.execute("DROP TRIGGER reject_context")
+    operation = ledger.begin_operation(command.command_id, "create_candidate", create_context=context)
+    assert ledger.create_context(operation) == context
+    ledger.close()
+    reopened = open_ledger(tmp_path)
+    assert reopened.get(command.command_id).state == "held"
+    assert reopened.create_context(operation) == context
+    with reopened._connection() as db:
+        db.execute("UPDATE create_contexts SET context=? WHERE operation_id=?",
+                   ('{"generation_id":"other","schema":1}', operation))
+    assert reopened.create_context(operation) is None
+    reopened.close()
+
+
+def test_legacy_create_has_no_context_authority(tmp_path):
+    ledger = open_ledger(tmp_path)
+    command = request()
+    ledger.admit(command)
+    operation = ledger.begin_operation(command.command_id, "create_candidate")
+    assert ledger.create_context(operation) is None
+    ledger.close()
+
+
+def _crash_after_bound_create_intent(database_path, payload, pipe):
+    ledger = SQLiteLedger(database_path, manifest_digest=MANIFEST,
+                          candidate_commit=COMMIT, policy_revision=1)
+    command = ContainerPilotRequest.model_validate(payload)
+    ledger.admit(command)
+    operation = ledger.begin_operation(command.command_id, "create_candidate",
+                                       create_context={"schema": 1, "generation_id": "synthetic-g1"})
+    pipe.send(operation)
+    while True:
+        time.sleep(1)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SIGKILL and owner semantics required")
+def test_sigkill_after_bound_intent_retains_context_and_holds(tmp_path):
+    ledger = open_ledger(tmp_path)
+    path = str(ledger.path)
+    ledger.close()
+    command = request()
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_crash_after_bound_create_intent,
+                              args=(path, command.model_dump(mode="json"), child))
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(15)
+        operation = parent.recv()
+    finally:
+        process.kill()
+        process.join(10)
+        parent.close()
+    assert process.exitcode == -9
+    recovered = open_ledger(tmp_path)
+    assert recovered.get(command.command_id).state == "held"
+    assert recovered.create_context(operation) == {"schema": 1, "generation_id": "synthetic-g1"}
+    assert recovered.operation_rows(command.command_id)[0]["status"] == "intent"
+    assert recovered.admit(command).response.state == "held"
+    recovered.close()
+
+
+@pytest.mark.parametrize("raw,mac", [
+    ("x" * 16385, "0" * 64),
+    ("é" * 8193, "0" * 64),
+    (b"binary", "0" * 64),
+    ("{}", "not-a-mac"),
+    ("{}", b"0" * 64),
+    ("{", "0" * 64),
+])
+def test_context_rejects_untrusted_bytes_before_parsing(tmp_path, monkeypatch, raw, mac):
+    ledger = open_ledger(tmp_path)
+    command = request()
+    ledger.admit(command)
+    operation = ledger.begin_operation(command.command_id, "create_candidate", create_context={"schema": 2})
+    with ledger._connection() as db:
+        db.execute("UPDATE create_contexts SET context=?,context_mac=? WHERE operation_id=?",
+                   (raw, mac, operation))
+    def refuse_parse(*args, **kwargs):
+        raise AssertionError("unauthenticated context must not be parsed")
+    monkeypatch.setattr(ledger_module.json, "loads", refuse_parse)
+    assert ledger.create_context(operation) is None
+    ledger.close()

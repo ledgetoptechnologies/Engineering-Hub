@@ -17,6 +17,7 @@ import stat
 import threading
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 from engineering_hub.container_pilot_client import (
@@ -24,6 +25,8 @@ from engineering_hub.container_pilot_client import (
     ContainerPilotRequest,
     ContainerPilotResponse,
 )
+
+from .backend import EffectiveProfile
 
 TARGET_ID = "engineering-hub:staging"
 PHASES = (
@@ -282,6 +285,7 @@ class SQLiteLedger:
                     "CREATE TABLE IF NOT EXISTS phases (run_id TEXT NOT NULL, action TEXT NOT NULL, command_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (run_id, action), UNIQUE (command_id))",
                     "CREATE TABLE IF NOT EXISTS operations (operation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, intent TEXT NOT NULL, receipt TEXT, receipt_mac TEXT, UNIQUE (command_id, kind))",
                     "CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    "CREATE TABLE IF NOT EXISTS create_contexts (operation_id TEXT PRIMARY KEY, context TEXT NOT NULL, context_mac TEXT NOT NULL)",
                 )
                 for statement in statements:
                     db.execute(statement)
@@ -410,10 +414,18 @@ class SQLiteLedger:
             return "target_busy"
         return None if found.get(PHASES[2]) == "succeeded" else "identity_conflict"
 
-    def begin_operation(self, command_id: str, kind: str) -> str:
+    def begin_operation(self, command_id: str, kind: str, *, create_context=None) -> str:
         self._check_open()
         if not isinstance(kind, str) or not _OPERATION_NAME.fullmatch(kind):
             raise ValueError("invalid operation kind")
+        if create_context is not None:
+            if kind not in {"create_candidate", "create_rollback"} or type(create_context) is not dict:
+                raise ValueError("invalid create context")
+            encoded_context = _canonical(create_context)
+            if len(encoded_context.encode("utf-8")) > 16384:
+                raise ValueError("create context exceeds limit")
+        else:
+            encoded_context = None
         with self._transaction() as db:
             row = db.execute("SELECT run_id,target_id,state,payload FROM commands WHERE command_id=?",
                              (command_id,)).fetchone()
@@ -435,6 +447,11 @@ class SQLiteLedger:
             try:
                 db.execute("INSERT INTO operations VALUES (?,?,?,'intent',?,NULL,NULL)",
                            (operation_id, command_id, kind, intent))
+                if encoded_context is not None:
+                    mac = self._operation_mac(operation_id, command_id, kind,
+                                              "create_context", encoded_context)
+                    db.execute("INSERT INTO create_contexts VALUES (?,?,?)",
+                               (operation_id, encoded_context, mac))
             except sqlite3.IntegrityError:
                 raise RuntimeError("operation already reserved; never repeat") from None
             return operation_id
@@ -444,6 +461,53 @@ class SQLiteLedger:
         value = _canonical({"operation_id": operation_id, "command_id": command_id,
                             "kind": kind, "status": status, "receipt": receipt}).encode("utf-8")
         return hmac.new(self._evidence_key, value, hashlib.sha256).hexdigest()
+
+    def profile_commitment(self, profile: EffectiveProfile) -> str:
+        """Bind an exact private profile without persisting its secret environment."""
+        self._check_open()
+        if type(profile) is not EffectiveProfile:
+            raise ValueError("exact effective profile required")
+        raw = _canonical(asdict(profile)).encode("utf-8")
+        return hmac.new(self._evidence_key,
+                        b"engineering-hub.create-profile-commitment.v1\x00" + raw,
+                        hashlib.sha256).hexdigest()
+
+    def matches_profile_commitment(self, profile: EffectiveProfile, commitment) -> bool:
+        if type(commitment) is not str or not re.fullmatch(r"[0-9a-f]{64}", commitment):
+            return False
+        return hmac.compare_digest(self.profile_commitment(profile), commitment)
+
+    def create_context(self, operation_id: str) -> dict | None:
+        """Return authenticated original create context, or no authority.
+
+        Legacy intents have no context. Never infer it from daemon metadata.
+        """
+        self._check_open()
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT o.command_id,o.kind,c.context,c.context_mac FROM operations o "
+                "JOIN create_contexts c ON c.operation_id=o.operation_id WHERE o.operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        if row is None or row["kind"] not in {"create_candidate", "create_rollback"}:
+            return None
+        try:
+            raw, supplied = row["context"], row["context_mac"]
+            if (type(raw) is not str or len(raw) > 16384
+                    or len(raw.encode("utf-8")) > 16384
+                    or type(supplied) is not str
+                    or not re.fullmatch(r"[0-9a-f]{64}", supplied)):
+                return None
+            mac = self._operation_mac(operation_id, row["command_id"], row["kind"],
+                                      "create_context", raw)
+            if not hmac.compare_digest(mac, supplied):
+                return None
+            parsed = json.loads(raw)
+            if type(parsed) is not dict or _canonical(parsed) != raw:
+                return None
+            return parsed
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            return None
 
     def complete_operation(self, operation_id: str, receipt) -> None:
         encoded = _canonical(receipt)

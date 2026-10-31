@@ -402,10 +402,10 @@ class HostAdapter:
                 or state.baseline_unchanged is not True):
             raise _Held("evidence_mismatch")
 
-    def _effect(self, request, kind, callback, phase_limit, deadline, receipt_builder):
+    def _effect(self, request, kind, callback, phase_limit, deadline, receipt_builder, *, create_context=None):
         try:
             timeout = self._timeout(deadline, phase_limit)
-            operation_id = self.ledger.begin_operation(request.command_id, kind)
+            operation_id = self.ledger.begin_operation(request.command_id, kind, create_context=create_context)
         except PermissionError as error:
             if str(error) == "paused":
                 raise _Held("paused") from None
@@ -468,6 +468,14 @@ class HostAdapter:
             timeout_field, deadline,
             lambda value: {"container_id": value} if isinstance(value, str) else
             (_raise_held("evidence_mismatch")),
+            create_context={"schema": 2, "manifest_digest": self.manifest_digest,
+                            "run_id": request.run_id, "fencing_generation": request.fencing_generation,
+                            "role": role, "runnable_reference": image.runnable_reference,
+                            "platform_manifest_digest": image.platform_manifest_digest,
+                            "image_config_id": image.image_config_id,
+                            "record_digest": image.record_digest,
+                            "generation_id": state.generation_id,
+                            "profile_commitment": self.ledger.profile_commitment(profile)},
         )
         if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
             raise _Held("container_conflict")
@@ -538,6 +546,27 @@ class HostAdapter:
         if not snapshot:
             return response
         for operation in snapshot["operations"]:
+            if operation["kind"] in {"create_candidate", "create_rollback"}:
+                try:
+                    context = self.ledger.create_context(operation["operation_id"])
+                    role = operation["kind"].removeprefix("create_")
+                    image = self._verified_image(role)
+                    if (type(context) is not dict or context.get("schema") != 2
+                            or context.get("manifest_digest") != self.manifest_digest
+                            or context.get("role") != role
+                            or context.get("runnable_reference") != image.runnable_reference
+                            or context.get("platform_manifest_digest") != image.platform_manifest_digest
+                            or context.get("image_config_id") != image.image_config_id
+                            or context.get("record_digest") != image.record_digest
+                            or context.get("run_id") != operation["intent"].get("run_id")
+                            or context.get("fencing_generation") != operation["intent"].get("fencing_generation")):
+                        return response
+                    defaults = self._defaults_from_record(image)
+                    profile = self._profile(image, defaults, context["generation_id"], self._resolve_secrets())
+                    if not self.ledger.matches_profile_commitment(profile, context.get("profile_commitment")):
+                        return response
+                except Exception:
+                    return response
             if operation["status"] == "terminal_failed":
                 try:
                     observed = self.backend.inspect_operation(

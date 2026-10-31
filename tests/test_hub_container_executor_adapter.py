@@ -518,3 +518,130 @@ def test_reentrant_close_from_effect_callback_is_deferred_until_result_commit(tm
     replacement = HostAdapter(adapter.ledger.path, manifest)
     assert replacement.get(request.command_id).state == "succeeded"
     replacement.close()
+
+
+def test_create_context_tamper_keeps_reconcile_held_without_inspection(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path, late_create=True)
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    operation = next(row for row in adapter.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    context = adapter.ledger.create_context(operation["operation_id"])
+    assert context["manifest_digest"] == manifest.digest()
+    assert context["generation_id"] == "candidate-g1"
+    assert "test-codex-value" not in json.dumps(context)
+    with adapter.ledger._connection() as db:
+        db.execute("UPDATE create_contexts SET context_mac=? WHERE operation_id=?",
+                   ("0" * 64, operation["operation_id"]))
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert "inspect_operation" not in backend.events
+    assert backend.events.count("create") == 1
+    adapter.close()
+
+
+def reopen_adapter(adapter):
+    path, manifest = adapter.ledger.path, adapter.manifest
+    kwargs = dict(record_store=adapter.record_store, metadata_store=adapter.metadata_store,
+                  provenance_verifier=adapter.provenance_verifier, backend=adapter.backend,
+                  baseline_provider=adapter.baseline_provider,
+                  state_provisioner=adapter.state_provisioner,
+                  secret_resolver=adapter.secret_resolver,
+                  driver_identity_verifier=adapter.driver_identity_verifier)
+    adapter.close()
+    return HostAdapter(path, manifest, **kwargs)
+
+
+def test_lost_create_matching_context_after_restart_remains_inspect_only(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path, late_create=True)
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    adapter = reopen_adapter(adapter)
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert backend.events == ["inspect_operation", "inspect_container"]
+    assert adapter.submit(request).replayed is True
+    assert backend.events == ["inspect_operation", "inspect_container"]
+    adapter.close()
+
+
+@pytest.mark.parametrize("drift", ["secret", "record", "context_missing"])
+def test_reconcile_requires_original_context_and_inputs_before_backend_access(tmp_path, drift):
+    adapter, backend, _, manifest = make_fixture(tmp_path, late_create=True)
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    operation = next(row for row in adapter.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    adapter = reopen_adapter(adapter)
+    if drift == "secret":
+        adapter.secret_resolver.values["CODEX_TOKEN"] = "test-changed-value"
+    elif drift == "record":
+        adapter.record_store.values.clear()
+    else:
+        with adapter.ledger._connection() as db:
+            db.execute("DELETE FROM create_contexts WHERE operation_id=?", (operation["operation_id"],))
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert backend.events == []
+    adapter.close()
+
+
+def test_legacy_terminal_failure_remains_held_without_backend_access(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path, late_create=True)
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    operation = next(row for row in adapter.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    adapter.ledger.record_terminal_failure(operation["operation_id"])
+    with adapter.ledger._connection() as db:
+        db.execute("DELETE FROM create_contexts WHERE operation_id=?", (operation["operation_id"],))
+    adapter = reopen_adapter(adapter)
+    backend.terminal_operations[operation["operation_id"]] = OperationObservation(
+        operation["operation_id"], "terminal_failed", True, None)
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert backend.events == []
+    adapter.close()
+
+
+def test_failure_after_create_intent_before_effect_stays_held_on_restart(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    request = command(manifest, "deploy_container")
+    def refuse_before_effect(plan, operation_id, timeout_ms):
+        assert adapter.ledger.create_context(operation_id)["generation_id"] == "candidate-g1"
+        raise TimeoutError("crash boundary before daemon effect")
+    backend.create_container = refuse_before_effect
+    assert adapter.submit(request).state == "held"
+    operation = next(row for row in adapter.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    assert operation["status"] == "intent"
+    adapter = reopen_adapter(adapter)
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert "create" not in backend.events and "start" not in backend.events
+    adapter.close()
+
+
+def test_create_profile_commitment_is_keyed_and_stable_after_reopen(tmp_path):
+    from hub_container_executor.runtime_profile import runtime_profile_digest
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first, backend, _, manifest = make_fixture(tmp_path / "first", late_create=True)
+    request = command(manifest, "deploy_container")
+    assert first.submit(request).state == "held"
+    operation = next(row for row in first.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    profile = backend.containers["c" * 64].profile
+    context = first.ledger.create_context(operation["operation_id"])
+    commitment = context["profile_commitment"]
+    assert context["schema"] == 2
+    assert commitment != runtime_profile_digest(profile).removeprefix("sha256:")
+    assert "profile_digest" not in context
+    assert first.ledger.matches_profile_commitment(profile, commitment)
+    second, _, _, _ = make_fixture(tmp_path / "second")
+    assert second.ledger.profile_commitment(profile) != commitment
+    second.close()
+    first = reopen_adapter(first)
+    assert first.ledger.matches_profile_commitment(profile, commitment)
+    assert not first.ledger.matches_profile_commitment(
+        replace(profile, environment=profile.environment + (("OTHER", "changed"),)), commitment)
+    first.close()
