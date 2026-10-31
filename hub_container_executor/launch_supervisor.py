@@ -43,7 +43,8 @@ from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
                                SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES)
 from .launch_transport import REQUEST_PROTOCOL, MAX_REQUEST_BYTES
-from .configuration_commitment import configuration_commitment, coordinator_configuration_commitment
+from .configuration_commitment import (configuration_commitment, coordinator_configuration_commitment,
+                                       trusted_local_coordinator_commitment)
 
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -972,7 +973,11 @@ class LaunchSupervisor:
                 'start_ticks': None if self._consumer is None else self._consumer.start}
 
     def _pin_sources(self):
+        if self.profile.role == 'trusted-local-coordinator-v1':
+            self._pin_trusted_local_inputs()
         for role, mount in self._mounts.items():
+            if role in {'local_config', 'local_enrollment'}:
+                continue
             path = _path(mount.source)
             _require(path.resolve(strict=True) == path)
             info = path.lstat()
@@ -1005,6 +1010,55 @@ class LaunchSupervisor:
                 _require(self._source_pins[role] == _identity(info))
             else:
                 self._source_pins[role] = _identity(info)
+
+    def _pin_trusted_local_inputs(self):
+        """Capture and bind both exact protected inputs; no launch authority is inferred."""
+        from .installed_coordinator import MAX_CONFIG_BYTES
+        from engineering_hub.trusted_queued_session import MAX_ENROLLMENT_BYTES
+        def capture(role, maximum):
+            mount = self._mounts[role]
+            path = _path(mount.source)
+            parent = _root_parent(path, private=False)
+            fd = None
+            try:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                             dir_fd=parent)
+                before = os.fstat(fd)
+                def stable(info):
+                    return (_identity(info), info.st_mode, info.st_uid, info.st_gid, info.st_nlink,
+                            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                _require(stat.S_ISREG(before.st_mode) and before.st_uid == mount.uid
+                         and before.st_gid == mount.gid and stat.S_IMODE(before.st_mode) == 0o600
+                         and before.st_nlink == 1 and 0 < before.st_size <= maximum)
+                raw = bytearray()
+                while len(raw) <= maximum:
+                    block = os.read(fd, min(65536, maximum + 1 - len(raw)))
+                    if not block: break
+                    raw.extend(block)
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                _require(len(raw) == before.st_size and stable(before) == stable(os.fstat(fd)) == stable(named)
+                         and _identity(os.fstat(parent)) == _identity(os.lstat(path.parent))
+                         and path.resolve(strict=True) == path
+                         and 'sha256:' + hashlib.sha256(raw).hexdigest() == mount.content_digest)
+                return bytes(raw), stable(before)
+            finally:
+                try:
+                    if fd is not None: os.close(fd)
+                finally:
+                    os.close(parent)
+        config, config_pin = capture('local_config', MAX_CONFIG_BYTES)
+        enrollment, enrollment_pin = capture('local_enrollment', MAX_ENROLLMENT_BYTES)
+        commitment = trusted_local_coordinator_commitment(self.profile, config, enrollment)
+        _require(commitment.raw_digest == self._configuration_raw_digest)
+        _require(capture('local_config', MAX_CONFIG_BYTES) == (config, config_pin)
+                 and capture('local_enrollment', MAX_ENROLLMENT_BYTES) == (enrollment, enrollment_pin))
+        pins = {'local_config': config_pin, 'local_enrollment': enrollment_pin}
+        previous = getattr(self, '_trusted_local_input_pins', None)
+        _require(previous is None or previous == pins)
+        _require(all(role not in self._source_pins or self._source_pins[role] == pin[0]
+                     for role, pin in pins.items()))
+        self._trusted_local_input_pins = pins
+        self._source_pins.update({role: pin[0] for role, pin in pins.items()})
 
     def _bind_issuer(self):
         self._socket_parent = _root_parent(self._socket_path, private=False)

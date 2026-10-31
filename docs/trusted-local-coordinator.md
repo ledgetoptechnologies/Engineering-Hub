@@ -33,8 +33,9 @@ and closed, separately mounted config, enrollment, database, secret and socket
 directories. The pure configuration commitment checks the v2 GitHub config,
 v3 enrollment, paths and file digests together. **The supervisor still rejects
 this role before creating its journal or contacting the Engine.** This profile
-is not an installed launch path: protected mount capture, commitment checks in
-the supervisor, coordinator/executor lifecycle binding and host custody still
+is not an installed launch path: the supervisor has a role-specific protected
+config/enrollment capture and cross-check, but complete mount custody,
+pre-admission handshake and coordinator/executor lifecycle binding still
 need to be implemented and verified before that guard can be reconsidered.
 
 Run the following as the independently launched container's PID 1, using paths
