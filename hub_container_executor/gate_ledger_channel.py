@@ -5,11 +5,13 @@ authenticate the executor endpoint to the supervisor, and own/drain this call
 before closing the ledger. A signed request does not prove host mount custody.
 """
 import inspect
+import array
 import hmac
 import json
 import math
 import os
 import re
+import select
 import secrets
 import socket
 import threading
@@ -28,6 +30,44 @@ REQUEST = 'engineering-hub.gate-ledger-request.v1'
 RESPONSE = 'engineering-hub.gate-ledger-response.v1'
 DOMAIN = b'engineering-hub-gate-ledger-request-v1\x00'
 _HEX = re.compile(r'[0-9a-f]{128}\Z')
+# Linux generic socket ABI (the supported installed profiles are x86-64/arm64).
+_SO_PASSPIDFD = 76
+_SCM_PIDFD = 4
+
+
+def _sender_packet(channel):
+    """Receive the kernel-provided sender pidfd; quarantine every other FD."""
+    received = []
+    try:
+        raw, ancillary, flags, _ = channel.recvmsg(MAX_BYTES + 1,
+            socket.CMSG_SPACE(12) + socket.CMSG_SPACE(65 * array.array('i').itemsize),
+            socket.MSG_CMSG_CLOEXEC)
+        credentials, pidfds, invalid = [], [], False
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind in (socket.SCM_RIGHTS, _SCM_PIDFD):
+                fds = array.array('i')
+                fds.frombytes(data[:len(data) - len(data) % fds.itemsize])
+                received.extend(fds)
+                if kind == _SCM_PIDFD and len(data) == fds.itemsize and len(fds) == 1:
+                    pidfds.extend(fds)
+                else:
+                    invalid = True
+            elif level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS and len(data) == 12:
+                credentials.append(data)
+            else:
+                invalid = True
+        if (invalid or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                or not 0 < len(raw) <= MAX_BYTES or len(credentials) != 1 or len(pidfds) != 1):
+            raise ValueError()
+        fd = pidfds[0]
+        if os.readlink('/proc/self/fd/' + str(fd)) != 'anon_inode:[pidfd]' or select.select([fd], [], [], 0)[0]:
+            raise ValueError()
+        received.remove(fd)
+        return raw, fd
+    finally:
+        for fd in received:
+            try: os.close(fd)
+            except OSError: pass
 
 
 class GateLedgerChannelError(RuntimeError):
@@ -48,10 +88,13 @@ class GateLedgerWorker:
     original operation when a transaction may have committed without delivery.
     A blocking ledger/callback is not cancellable by this class. The supervisor
     must separately authenticate this endpoint and its responses; the public key
-    authenticates requests in the opposite direction only.
+    authenticates requests in the opposite direction only. Sender pidfd checks
+    require independently enrolled direct, non-relayed host channel custody;
+    kernel sender liveness alone does not prove the sender is the signing owner.
     """
     def __init__(self, *, channel, ledger, supervisor_public_key, launch_verifier,
-                 manifest_digest, hold_uncertain, timeout_seconds, completion_policy=None):
+                 manifest_digest, hold_uncertain, timeout_seconds, completion_policy=None,
+                 require_sender_liveness=False):
         try:
             if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -62,6 +105,7 @@ class GateLedgerWorker:
                     or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
                     or (completion_policy is not None and type(completion_policy) is not GateCompletionPolicy)
+                    or type(require_sender_liveness) is not bool
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
             channel.getpeername()
@@ -69,6 +113,11 @@ class GateLedgerWorker:
             self._key = Ed25519PublicKey.from_public_bytes(supervisor_public_key)
             self._launch, self._manifest, self._hold = launch_verifier, manifest_digest, hold_uncertain
             self._completion_policy = completion_policy
+            if require_sender_liveness:
+                if not hasattr(socket, 'MSG_CMSG_CLOEXEC'): raise ValueError()
+                channel.setsockopt(socket.SOL_SOCKET, _SO_PASSPIDFD, 1)
+                if channel.getsockopt(socket.SOL_SOCKET, _SO_PASSPIDFD) != 1: raise ValueError()
+            self._require_sender_liveness = require_sender_liveness
             self._timeout, self._pid, self._used, self._lock = timeout_seconds, os.getpid(), False, threading.Lock()
         except Exception:
             raise GateLedgerChannelError() from None
@@ -83,9 +132,11 @@ class GateLedgerWorker:
         wall = int(time.time() * 1000)
         attempted = sent = False
         value = None
+        sender_fd = None
         def scope():
             now = time.monotonic()
             if os.getpid() != self._pid or not started <= now < deadline: raise ValueError()
+            if sender_fd is not None and select.select([sender_fd], [], [], 0)[0]: raise ValueError()
         try:
             binding = self._launch.launch_binding()
             if (type(binding) is not tuple or len(binding) != 5
@@ -97,8 +148,11 @@ class GateLedgerWorker:
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if self._channel.send(request) != len(request): raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
-            raw, credentials = _read_observation(self._channel)
-            if len(credentials) != 1: raise ValueError()
+            if self._require_sender_liveness:
+                raw, sender_fd = _sender_packet(self._channel)
+            else:
+                raw, credentials = _read_observation(self._channel)
+                if len(credentials) != 1: raise ValueError()
             envelope = _parse(raw)
             if type(envelope) is not dict or set(envelope) != {'payload', 'signature'}: raise ValueError()
             payload, signature = envelope['payload'], envelope['signature']
@@ -175,14 +229,19 @@ class GateLedgerWorker:
             if payload['action'] == 'consume': fresh_decision()
             if not last_wall[0] <= int(time.time() * 1000) < expires: raise ValueError()
             if self._channel.send(response) != len(response): raise ValueError()
+            scope()
             sent = True
             return 'sent_unconfirmed'
         except Exception:
             raise GateLedgerChannelError() from None
         finally:
-            if attempted and not sent:
-                try: self._hold(json.loads(_canonical(value)))
-                except Exception: pass
+            try:
+                if attempted and not sent:
+                    try: self._hold(json.loads(_canonical(value)))
+                    except Exception: pass
+            finally:
+                if sender_fd is not None:
+                    os.close(sender_fd)
 
 
 class SupervisorLedgerClient:
@@ -292,7 +351,8 @@ class OwnedGateLedgerService:
     commit: close waits for the worker thread, even after a deadline expires.
     """
     def __init__(self, *, listener, ledger, supervisor_public_key, launch_verifier,
-                 manifest_digest, hold_uncertain, timeout_seconds, completion_profile_bytes=None):
+                 manifest_digest, hold_uncertain, timeout_seconds, completion_profile_bytes=None,
+                 require_sender_liveness=False):
         try:
             if (type(listener) is not socket.socket or listener.family != socket.AF_UNIX
                     or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -302,6 +362,7 @@ class OwnedGateLedgerService:
                     or not _sync(hold_uncertain)
                     or type(manifest_digest) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
+                    or type(require_sender_liveness) is not bool
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5): raise ValueError()
             self.ledger = ledger
             if not hmac.compare_digest(launch_verifier.issuer_public_key(), supervisor_public_key):
@@ -314,6 +375,7 @@ class OwnedGateLedgerService:
             self._listener, self._key, self._launch = listener, supervisor_public_key, launch_verifier
             self._manifest, self._hold, self._timeout, self._on_failure = manifest_digest, hold_uncertain, timeout_seconds, None
             self._completion_policy = completion_policy
+            self._require_sender_liveness = require_sender_liveness
             self._pid, self._lock, self._stopping, self._thread, self._failed = os.getpid(), threading.Lock(), False, None, False
             listener.settimeout(.1)
         except Exception:
@@ -346,7 +408,8 @@ class OwnedGateLedgerService:
                     channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
                     worker = GateLedgerWorker(channel=channel, ledger=self.ledger, supervisor_public_key=self._key,
                         launch_verifier=self._launch, manifest_digest=self._manifest, hold_uncertain=self._hold,
-                        timeout_seconds=self._timeout, completion_policy=self._completion_policy)
+                        timeout_seconds=self._timeout, completion_policy=self._completion_policy,
+                        require_sender_liveness=self._require_sender_liveness)
                     worker.serve_once()
         except BaseException:
             failed = True
