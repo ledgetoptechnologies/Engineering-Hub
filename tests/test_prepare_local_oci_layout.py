@@ -51,7 +51,7 @@ def test_prepares_exact_manifest(tmp_path):
     assert index['manifests'][0]['digest'] == digest
 
 
-@pytest.mark.parametrize('unsupported', ['platform', 'dir_fd', 'nofollow'])
+@pytest.mark.parametrize('unsupported', ['platform', 'dir_fd', 'nofollow', 'directory', 'follow_symlinks'])
 def test_unsupported_capabilities_fail_before_output_creation(tmp_path, monkeypatch, unsupported):
     from scripts import prepare_local_oci_layout as helper
     rows, digest = fixture()
@@ -59,8 +59,12 @@ def test_unsupported_capabilities_fail_before_output_creation(tmp_path, monkeypa
         monkeypatch.setattr(helper.sys, 'platform', 'win32')
     elif unsupported == 'dir_fd':
         monkeypatch.setattr(helper.os, 'supports_dir_fd', set())
-    else:
+    elif unsupported == 'nofollow':
         monkeypatch.delattr(helper.os, 'O_NOFOLLOW')
+    elif unsupported == 'directory':
+        monkeypatch.delattr(helper.os, 'O_DIRECTORY')
+    else:
+        monkeypatch.setattr(helper.os, 'supports_follow_symlinks', set())
     output = tmp_path / 'new'
     with pytest.raises(RuntimeError, match='no output created'):
         prepare(archive(rows), output, digest)
