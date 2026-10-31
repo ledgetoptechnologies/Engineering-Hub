@@ -8,6 +8,22 @@ disjoint daemon and storage, a root-controlled broker cgroup and the existing
 protected enrollment files. It is source-level tooling; synthetic tests do not
 establish a staging host's custody or readiness.
 
+The supervised coordinator has a distinct image command from the executor.
+`docker/Dockerfile.hub-coordinator` derives that image from an executor image
+and changes only the entrypoint and command to `trusted_local_session
+--supervised`. Before building, independently approve an immutable
+`EXECUTOR_IMAGE` reference in `repository@sha256:<digest>` form, verify its
+full source commit matches the intended coordinator release, and inspect its
+user, environment, working directory and other inherited image defaults against
+the enrolled profile. In particular, require empty `OnBuild`, `Volumes` and
+`Healthcheck` fields: inherited `ONBUILD` triggers run during the child build.
+Docker resolves `FROM` before this recipe can verify its
+argument; the recipe itself neither enforces that approval nor proves
+provenance. After building, independently verify the resulting immutable image
+and its exact defaults against the signed coordinator profile and release
+enrollment. A successful build does not authorize publication or launch. No
+workflow or automatic publication is provided by this recipe.
+
 The operator supplies an already bound, listening Unix stream socket as an
 inherited descriptor. A trusted root setup must prepare that socket and the
 independent broker enrollment with its exact descriptor and named-socket
