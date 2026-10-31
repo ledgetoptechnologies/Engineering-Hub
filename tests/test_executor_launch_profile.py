@@ -87,6 +87,35 @@ def test_generation_isolation_is_signed_and_rejects_overlapping_accounts():
         core.ExecutorLaunchProfile.model_validate(dict(data, generation_isolation=None))
 
 
+def test_custodian_control_has_closed_signed_host_pins_and_preserves_prior_profiles():
+    data = gate_profile()
+    data['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+    data['gate_ledger_channel'] = 'supervisor-listener-v1'
+    data['generation_isolation'] = dict(kind='separate-provider-v1', app_uid=10002,
+        app_gid=10002, provider_host_uid=200000, provider_host_gid=200000, provider_public_key='1' * 64)
+    old = core.ExecutorLaunchProfile.model_validate(data)
+    assert old.enrollment_value() == data and old.digest() == digest_of(core.canonical(data))
+    data['custodian_control'] = {'kind': 'protected-listener-v1', 'listener_path': '/run/custodian/issuer.sock',
+        'journal_path': '/root/custodian/journal.sqlite', 'journal_enrollment_path': '/root/custodian/enrollment.json',
+        'journal_enrollment_digest': 'sha256:' + 'a' * 64, 'copy_policy_path': '/root/custodian/copy.json',
+        'copy_policy_digest': 'sha256:' + 'b' * 64, 'owner_policy_path': '/root/custodian/owner.json',
+        'owner_policy_digest': 'sha256:' + 'c' * 64}
+    parsed = core.ExecutorLaunchProfile.model_validate(data)
+    assert parsed.digest() == digest_of(core.canonical(data)) and parsed.digest() != old.digest()
+    for key, value in [('listener_path', '/run/custodian/../issuer.sock'),
+                       ('listener_path', '/run/' + 'a' * 110),
+                       ('journal_path', '/root/custodian/copy.json'),
+                       ('copy_policy_path', '/operator/hub-pilot-synthetic/state/policy.json'),
+                       ('owner_policy_digest', 'sha256:' + 'A' * 64),
+                       ('unknown', 'untrusted')]:
+        bad = dict(data, custodian_control=dict(data['custodian_control'], **{key: value}))
+        with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(bad)
+    for bad in (dict(data, custodian_control=None), {k: v for k, v in data.items() if k != 'generation_isolation'}):
+        with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(bad)
+
+
 @pytest.mark.parametrize('change', ['missing_mode', 'writable', 'wrong_owner', 'alias', 'missing_policy', 'extra_mount'])
 def test_gate_profile_denies_unbound_mount(change):
     data = gate_profile(); mount = data['mounts'][-1]

@@ -1766,7 +1766,7 @@ class LaunchSupervisor:
         with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
             return client.invoke('pending_state_v1', {'operation_id': operation_id})
 
-    def serve_state_custodian_admission(self, *, channel, manifest, timeout_seconds):
+    def serve_state_custodian_admission(self, *, channel, manifest, timeout_seconds, _custody_check=None):
         """Serve one peer-challenged intent observation, not a live effect lease.
 
         The accepted socket and its listener are owned by the caller. The
@@ -1823,6 +1823,8 @@ class LaunchSupervisor:
                 peer.check()
                 _require(digest == self._handoff_manifest_digest()
                          and profile.digest() == self.release.launch_profile_digest)
+                if _custody_check is not None:
+                    _custody_check()
                 now = int(time.time() * 1000)
                 _require(now >= start_wall and _remaining(deadline) > 0)
                 payload = dict(context, protocol=PROTOCOL,
@@ -1840,6 +1842,121 @@ class LaunchSupervisor:
         finally:
             if peer is not None:
                 peer.close()
+
+    def serve_protected_state_custodian(self, *, manifest, timeout_seconds):
+        """Serve one observation on an enrolled root-owned socket; no state effect.
+
+        The socket name remains as evidence after closure. This does not start
+        a custodian, establish writer exclusion, or authorize publication.
+        """
+        from engineering_hub.container_pilot_manifest import PilotManifest
+        from engineering_hub.executor_launch_profile import _proc_map_rows
+        listener = channel = parent = None
+        try:
+            _require(self._pid == os.getpid() and type(manifest) is PilotManifest
+                     and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                     and 0 < timeout_seconds <= 5)
+            deadline = time.monotonic() + timeout_seconds
+            profile, release = self.profile, self.release
+            control, isolation, daemon = profile.custodian_control, profile.generation_isolation, profile.daemon_policy
+            _require(control is not None and isolation is not None and daemon is not None
+                     and profile.digest() == release.launch_profile_digest)
+            manifest = PilotManifest.model_validate_json(manifest.canonical_bytes())
+            digest = manifest.digest()
+            _require(digest == self._handoff_manifest_digest())
+            paths = {name: _path(getattr(control, name + '_path'))
+                     for name in ('journal_enrollment', 'copy_policy', 'owner_policy')}
+            pins = {}
+            def policies():
+                records = {}
+                for name, path in paths.items():
+                    raw, pin = _root_file(path, 16384 if name == 'owner_policy' else 4096)
+                    _require('sha256:' + hashlib.sha256(raw).hexdigest() == getattr(control, name + '_digest'))
+                    if name in pins:
+                        _require(pins[name] == pin)
+                    else:
+                        pins[name] = pin
+                    records[name] = _strict(raw, 16384 if name == 'owner_policy' else 4096)
+                enrollment, copy, owner = records['journal_enrollment'], records['copy_policy'], records['owner_policy']
+                public = self._signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+                _require(type(enrollment) is dict and set(enrollment) == {'schema', 'supervisor_public_key',
+                    'manifest_digest', 'source_backup_digest', 'provider_key_digest', 'provider_uid', 'provider_gid', 'journal_path'}
+                    and type(enrollment['schema']) is int and enrollment['schema'] == 2
+                    and enrollment['supervisor_public_key'] == public and enrollment['manifest_digest'] == digest
+                    and enrollment['source_backup_digest'] == manifest.state_policy.baseline_backup_digest
+                    and enrollment['provider_key_digest'] == 'sha256:' + hashlib.sha256(bytes.fromhex(isolation.provider_public_key)).hexdigest()
+                    and type(enrollment['provider_uid']) is int and enrollment['provider_uid'] == isolation.provider_host_uid
+                    and type(enrollment['provider_gid']) is int and enrollment['provider_gid'] == isolation.provider_host_gid
+                    and enrollment['journal_path'] == control.journal_path)
+                _require(type(copy) is dict and copy.get('source_digest') == manifest.state_policy.baseline_backup_digest)
+                _require(type(owner) is dict and set(owner) == {'schema', 'boot_id', 'daemon_pid', 'daemon_start_ticks',
+                    'uid_map', 'gid_map', 'app_uid', 'app_gid'} and type(owner['schema']) is int and owner['schema'] == 1
+                    and type(owner['daemon_pid']) is int and owner['daemon_pid'] == self._daemon_pin.pid
+                    and type(owner['daemon_start_ticks']) is int and owner['daemon_start_ticks'] == self._daemon_pin.start_ticks
+                    and type(owner['app_uid']) is int and owner['app_uid'] == isolation.app_uid
+                    and type(owner['app_gid']) is int and owner['app_gid'] == isolation.app_gid
+                    and owner['boot_id'] == _boot_id()
+                    and _proc_map_rows(owner['uid_map']) == daemon.uid_map
+                    and _proc_map_rows(owner['gid_map']) == daemon.gid_map)
+                self._check_daemon_maps()
+                _require(profile.digest() == release.launch_profile_digest and digest == self._handoff_manifest_digest())
+                _remaining(deadline)
+            policies()
+            path = _path(control.listener_path)
+            parent = _root_parent(path, private=False)
+            parent_info = os.fstat(parent)
+            _require(parent_info.st_uid == 0 and parent_info.st_gid == isolation.provider_host_gid
+                     and stat.S_IMODE(parent_info.st_mode) == 0o710
+                     and _identity(os.lstat(path.parent)) == _identity(parent_info)
+                     and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001 for ancestor in path.parent.parents))
+            try:
+                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            endpoint = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(os.fsencode(endpoint)) <= 107)
+            listener.bind(endpoint)
+            first = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(first.st_mode))
+            os.chown(path.name, 0, isolation.provider_host_gid, dir_fd=parent, follow_symlinks=False)
+            os.chmod(path.name, 0o660, dir_fd=parent, follow_symlinks=False)
+            identity = _identity(first)
+            def custody():
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                current_parent = os.fstat(parent)
+                _require(_identity(named) == identity and stat.S_ISSOCK(named.st_mode)
+                         and named.st_uid == 0 and named.st_gid == isolation.provider_host_gid
+                         and stat.S_IMODE(named.st_mode) == 0o660
+                         and _identity(os.lstat(path.parent)) == _identity(parent_info)
+                         and _identity(current_parent) == _identity(parent_info)
+                         and current_parent.st_uid == 0 and current_parent.st_gid == isolation.provider_host_gid
+                         and stat.S_IMODE(current_parent.st_mode) == 0o710
+                         and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001 for ancestor in path.parent.parents))
+                policies()
+            custody()
+            listener.listen(1); listener.settimeout(_remaining(deadline))
+            channel, _ = listener.accept()
+            channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            custody()
+            return self.serve_state_custodian_admission(channel=channel, manifest=manifest,
+                timeout_seconds=_remaining(deadline), _custody_check=custody)
+        except Exception:
+            raise LaunchSupervisorError() from None
+        finally:
+            failed = False
+            for resource in (channel, listener):
+                if resource is not None:
+                    try: resource.close()
+                    except OSError: failed = True
+            if parent is not None:
+                try: os.close(parent)
+                except OSError: failed = True
+            if failed:
+                raise LaunchSupervisorError() from None
 
     def observe_pending_gate_runtime(self, *, manifest, image, enrollment_file, timeout_seconds):
         """Bind the current fenced create to the live bootstrap and host source.

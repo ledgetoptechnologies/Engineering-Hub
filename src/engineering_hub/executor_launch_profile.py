@@ -230,6 +230,30 @@ class GenerationIsolationPolicy(_Closed):
         return self
 
 
+class CustodianControlPolicy(_Closed):
+    """Signed host expectations, not proof of a listener or exclusive custody."""
+    kind: Literal['protected-listener-v1']
+    listener_path: str
+    journal_path: str
+    journal_enrollment_path: str
+    journal_enrollment_digest: str
+    copy_policy_path: str
+    copy_policy_digest: str
+    owner_policy_path: str
+    owner_policy_digest: str
+
+    @model_validator(mode='after')
+    def closed_paths_and_digests(self):
+        names = ('listener_path', 'journal_path', 'journal_enrollment_path', 'copy_policy_path', 'owner_policy_path')
+        paths = [_path(getattr(self, name)) for name in names]
+        _require(len(set(paths)) == len(paths) and len(self.listener_path.encode('utf-8')) <= 107
+                 and all(not (left in right.parents or right in left.parents)
+                         for index, left in enumerate(paths) for right in paths[index + 1:])
+                 and all(type(getattr(self, name)) is str and _SHA.fullmatch(getattr(self, name))
+                         for name in ('journal_enrollment_digest', 'copy_policy_digest', 'owner_policy_digest')))
+        return self
+
+
 class ExecutorLaunchProfile(_Closed):
     """Exact independently enrolled executor or pilot-coordinator profile, NOT an app profile."""
     user: str
@@ -260,6 +284,8 @@ class ExecutorLaunchProfile(_Closed):
     gate_completion: GateCompletionPolicy | None = None
     gate_ledger_channel: Literal['supervisor-listener-v1'] | None = None
     generation_isolation: GenerationIsolationPolicy | None = None
+    # Host-side signed expectations only. Existing runtime guard remains closed.
+    custodian_control: CustodianControlPolicy | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -272,7 +298,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -314,6 +340,8 @@ class ExecutorLaunchProfile(_Closed):
                      and _covers_inside(daemon.gid_map, isolation.app_gid)
                      and not _covers(daemon.uid_map, isolation.provider_host_uid)
                      and not _covers(daemon.gid_map, isolation.provider_host_gid))
+        if self.custodian_control is not None:
+            _require(not coordinator and self.generation_isolation is not None and self.gate_ledger_channel is not None)
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
@@ -329,6 +357,11 @@ class ExecutorLaunchProfile(_Closed):
         fixture = _path(self.fixture_root)
         _require(re.fullmatch(r'hub-pilot-[a-z0-9][a-z0-9-]{0,63}', fixture.name))
         sources = [PurePosixPath(item.source) for item in self.mounts]
+        if self.custodian_control is not None:
+            protected = [_path(getattr(self.custodian_control, name)) for name in
+                         ('listener_path', 'journal_path', 'journal_enrollment_path', 'copy_policy_path', 'owner_policy_path')]
+            _require(all(not (path == source or path in source.parents or source in path.parents)
+                         for path in protected for source in sources))
         _require(all(fixture in PurePosixPath(item.source).parents for item in self.mounts
                      if item.role not in {'engine_socket', 'issuer_socket', 'broker_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
@@ -345,7 +378,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control'):
             if value[name] is None:
                 del value[name]
         return value
