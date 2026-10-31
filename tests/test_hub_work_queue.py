@@ -141,6 +141,28 @@ def test_idempotence_full_target_and_capacity(setup_queue):
         submit(q, 'two')
 
 
+@pytest.mark.parametrize('changed', ['target_policy', 'task_scope'])
+def test_lost_submit_response_can_be_retried_after_admission_changes(setup_queue, monkeypatch, changed):
+    queue, _, repo, _ = setup_queue
+    work = target()
+    original = submit(queue, target=work)
+    verifier_calls = []
+    if changed == 'target_policy':
+        queue.target_verifier = lambda *args: verifier_calls.append(args) or False
+    else:
+        monkeypatch.setattr(repo, 'task_allows_environment', lambda *args, **kwargs: False)
+    # This is a readback of the original durable job, not renewed admission.
+    assert submit(queue, target=work) == original
+    assert verifier_calls == []
+    with pytest.raises(HubError, match='work_request_conflict'):
+        submit(queue, target=target())
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        submit(queue, 'new-request', target=work)
+    assert queue.claim(worker=w('codex')) is None
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_work_jobs').fetchone()[0] == 1
+
+
 def test_production_verifier_receives_exact_immutable_target(setup_queue):
     _, _, repo, actions = setup_queue
     seen = []

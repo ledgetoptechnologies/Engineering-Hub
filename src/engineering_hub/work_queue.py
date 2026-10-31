@@ -298,7 +298,7 @@ class WorkQueue:
             db.execute("UPDATE hub_work_jobs SET state='held' WHERE id=?", (row['id'],))
             self._event(db, 'work.held', row['id'], 'system:work-queue')
 
-    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+    def _submission_fingerprint(self, *, actor, request_id, action_key, environment, target, approval_id):
         if type(actor) is not str or actor not in AGENTS:
             raise HubError('invalid_work_actor')
         _key(request_id)
@@ -313,18 +313,41 @@ class WorkQueue:
         self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
-        if not self._target_verified(actor, action_key, environment, target):
-            raise HubError('work_target_not_verified', 403)
         target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
+        return action, target_json, fingerprint
+
+    def existing_submission(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+        """Read one actor's exact prior request; never create or admit work."""
+        _, _, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
+            action_key=action_key, environment=environment, target=target, approval_id=approval_id)
+        with self.repo._connection() as db:
+            old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
+        if old is None:
+            return None
+        if old['fingerprint'] != fingerprint:
+            raise HubError('work_request_conflict', 409)
+        return self._public(old)
+
+    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+        action, target_json, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
+            action_key=action_key, environment=environment, target=target, approval_id=approval_id)
+        existing = self.existing_submission(actor=actor, request_id=request_id, action_key=action_key,
+            environment=environment, target=target, approval_id=approval_id)
+        if existing is not None:
+            return existing
+        # The verifier stays outside the SQLite write transaction and still
+        # gates every genuinely new job. The transaction rechecks for a retry
+        # which committed while this verifier was running.
+        target_verified = self._target_verified(actor, action_key, environment, target)
         with self.repo._transaction() as db:
-            if not self.repo.task_allows_environment(target.task_id, environment, db=db):
-                raise HubError('work_target_not_verified', 403)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
                 if old['fingerprint'] != fingerprint:
                     raise HubError('work_request_conflict', 409)
                 return self._public(old)
+            if not target_verified or not self.repo.task_allows_environment(target.task_id, environment, db=db):
+                raise HubError('work_target_not_verified', 403)
             if db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] >= self.max_jobs:
                 raise HubError('work_queue_capacity', 503)
             job_id = str(uuid.uuid4())

@@ -189,6 +189,31 @@ def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
 
 
+def test_submit_retry_reads_original_job_after_review_changes_without_readmitting(rig):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    first = client.post(BASE + '/jobs', headers=bearer(), json=payload)
+    assert first.status_code == 201
+    task = repo.get_task(payload['target']['task_id'])
+    repo.set_candidate('codex', task['id'], task['revision'], 'c' * 40)
+    retry = client.post(BASE + '/jobs', headers=bearer(), json=payload)
+    assert retry.status_code == 201 and retry.json()['id'] == first.json()['id']
+    changed = {**payload, 'target': {**payload['target'], 'artifact_digest': 'sha256:' + 'c' * 64}}
+    assert client.post(BASE + '/jobs', headers=bearer(), json=changed).status_code == 409
+    assert client.post(BASE + '/jobs', headers=bearer('hermes'), json=payload).status_code == 403
+    assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
+    assert len(queue.status()['jobs']) == 1
+
+
+def test_submit_retry_preserves_session_ownership_guard(rig, monkeypatch):
+    from engineering_hub import work_queue_api
+    client, _, _, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    monkeypatch.setattr(work_queue_api.session_context, 'continuation_allowed', lambda *_: False)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+
+
 @pytest.mark.parametrize('evidence', [None, 'untrusted-evidence'])
 def test_executable_completion_without_verified_proof_keeps_machine_reserved(rig, evidence):
     client, _, queue, _, _, submission, *_ = rig
