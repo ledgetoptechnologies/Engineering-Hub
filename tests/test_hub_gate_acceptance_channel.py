@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 import pytest
 
@@ -18,6 +19,7 @@ from tests.test_hub_gate_completion_snapshot import completed, PROBE
 from tests.test_hub_gate_ledger_channel import verified_launch, canonical
 from tests.test_hub_container_executor_ledger import evidence
 from tests.test_hub_gate_ledger_handoff_supervisor import rig
+from tests.test_hub_gate_socket_supervisor import socket_rig
 from tests.test_hub_container_executor_launch_supervisor import short_root
 from tests.test_hub_application_gate_enrollment import vector
 from tests.test_hub_container_executor_runtime_identity import Issuer
@@ -26,6 +28,31 @@ from hub_container_executor.runtime_identity import ExecutorReleaseEnrollment, L
 from hub_container_executor.runtime_profile import probe_set_digest
 from engineering_hub.container_pilot_manifest import Platform
 from hub_container_executor import launch_supervisor as launch
+
+
+def test_revoked_authority_denies_before_acceptance_commit(socket_rig, monkeypatch):
+    supervisor, manifest, image, path, _, held = socket_rig
+    measurements = {'executable_digest': 'sha256:' + 'a' * 64}
+    facts = {'identity': {'synthetic': 'pins'}, 'measurement': measurements,
+        'ledger_snapshot': {'probe_digest': 'sha256:' + 'b' * 64, 'health_receipt_digest': 'sha256:' + 'c' * 64,
+                            'decision_payload_digest': 'sha256:' + 'd' * 64}}
+    monkeypatch.setattr(supervisor, 'observe_gate_completion_facts', lambda **_: facts)
+    monkeypatch.setattr(supervisor, 'measure_gate_post_exec', lambda **_: measurements)
+    calls = []
+    @contextmanager
+    def client(**_):
+        class Client:
+            def invoke(self, *args, **kwargs): calls.append('commit'); return {}
+        yield Client()
+    monkeypatch.setattr(supervisor, 'open_gate_ledger_client', client)
+    checks = []
+    def authority_check():
+        checks.append(True)
+        if len(checks) == 2: raise RuntimeError('approval changed')
+    with pytest.raises(launch.LaunchSupervisorError):
+        supervisor.accept_gate_completion(peer=object(), pins={}, manifest=manifest, image=image,
+            enrollment_file=path, timeout_seconds=2, authority_check=authority_check)
+    assert held and calls == []
 
 
 def test_signed_acceptance_and_authenticated_read_leave_finish_held(completed):
@@ -77,6 +104,39 @@ def test_signed_acceptance_and_authenticated_read_leave_finish_held(completed):
         assert exchange('lookup_completion_v5', {'identity': pins}) == value
     finally:
         verifier.close()
+
+
+def test_signed_health_readiness_reports_pending_without_acceptance(completed):
+    ledger, command, pins, health_id, _ = completed
+    with ledger._transaction() as db:
+        db.execute('DELETE FROM operations WHERE operation_id=?', (health_id,))
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    verifier = verified_launch(key, public)
+    policy = GateCompletionPolicy(candidate_executable_digest='sha256:' + 'a' * 64,
+        rollback_executable_digest='sha256:' + 'b' * 64,
+        health_contract='engineering-hub.health-json-build-commit.v1')
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    for endpoint in (client, server): endpoint.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    worker = GateLedgerWorker(channel=server, ledger=ledger, supervisor_public_key=public,
+        launch_verifier=verifier, manifest_digest=pins['manifest_digest'], hold_uncertain=ledger.hold_gate_uncertain,
+        timeout_seconds=3, completion_policy=policy, require_sender_liveness=True)
+    supervisor = SupervisorLedgerClient(channel=client, peer=peer, signing_key=key,
+        launch_binding=verifier.launch_binding(), manifest_digest=pins['manifest_digest'], timeout_seconds=3)
+    results = []
+    def serve():
+        try: results.append(worker.serve_once())
+        except BaseException as error: results.append(error)
+    thread = threading.Thread(target=serve); thread.start()
+    try:
+        assert supervisor.invoke('health_ready_v5', {'identity': pins, 'probe_digest': PROBE}) == {'ready': False}
+        thread.join(4)
+        assert not thread.is_alive() and results == ['sent_unconfirmed']
+        assert ledger.lookup_gate_completion(pins) is None and ledger.get(command.command_id).state == 'running'
+    finally:
+        client.close(); server.close(); thread.join(4); peer.close(); verifier.close()
+        assert not thread.is_alive()
 
 
 def test_supervisor_owned_path_accepts_exact_fenced_evidence(rig, completed, monkeypatch):
@@ -151,7 +211,8 @@ def test_supervisor_owned_path_accepts_exact_fenced_evidence(rig, completed, mon
         thread = threading.Thread(target=serve); thread.start()
         try:
             accepted = supervisor.accept_gate_completion(peer=SimpleNamespace(pid=pins['host_pid']), pins=pins,
-                manifest=manifest, image=SimpleNamespace(role='candidate'), enrollment_file='synthetic', timeout_seconds=5)
+                manifest=manifest, image=SimpleNamespace(role='candidate'), enrollment_file='synthetic',
+                timeout_seconds=5, authority_check=lambda: None)
             assert accepted['identity'] == pins and ledger.lookup_gate_completion(pins) == accepted
             assert ledger.get(command.command_id).state == 'running' and not held
             supervisor._held = supervisor._hold_persisted = True

@@ -8,6 +8,7 @@ import ast
 from pathlib import Path
 import signal
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,85 @@ def module(monkeypatch):
 ARGS = ['--enrollment-file', '/protected/enrollment.json', '--signing-key-file',
         '/protected/existing.key', '--journal-file', '/fresh/journal.sqlite3',
         '--wait-seconds', '60']
+
+
+@pytest.mark.parametrize('fault', ['none', 'preflight', 'gate'])
+def test_explicit_gate_owner_runs_with_observations_and_joins_before_close(module, monkeypatch, fault):
+    calls = []; state = SimpleNamespace(stop=None); gate_started = threading.Event()
+    operation = SimpleNamespace(manifest=object(), image=object(), application_enrollment_file='/protected/app',
+                                controller_key_file='/protected/gate-key', check=lambda: calls.append('check'))
+    class Supervisor:
+        def __init__(self, **kwargs):
+            assert kwargs['gate_start_mode'] is True
+            self._mutex = threading.Lock(); calls.append('construct')
+        def launch(self): calls.append('launch')
+        def wait_for_receipt_request(self, **_): return True
+        def serve_one_receipt(self): calls.append('receipt')
+        def run_gate_operation(self, **kwargs):
+            calls.append('gate-start'); gate_started.set()
+            if fault == 'gate': raise RuntimeError('synthetic')
+            while not kwargs['stop_requested'](): threading.Event().wait(.01)
+            calls.append('gate-done')
+        def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
+            calls.append('observations'); assert gate_started.wait(2)
+            if fault == 'gate':
+                for _ in range(200):
+                    if stop_requested(): return True
+                    threading.Event().wait(.01)
+                raise AssertionError('gate failure did not stop observation wait')
+            state.stop.request(0, None); return True
+        def _hold(self): calls.append('hold')
+        def graceful_stop(self): calls.append('stop')
+        def close(self): calls.append('close')
+    def install(stop): state.stop = stop; return []
+    def preflight(*_):
+        calls.append('preflight')
+        if fault == 'preflight': raise RuntimeError('synthetic')
+    monkeypatch.setattr(module, '_host_available', lambda: True)
+    monkeypatch.setattr(module, '_load_supervisor', lambda: Supervisor)
+    monkeypatch.setattr(module, '_load_gate_operation', lambda _: operation)
+    monkeypatch.setattr(module, '_preflight_gate_operation', preflight)
+    monkeypatch.setattr(module, '_install_handlers', install)
+    monkeypatch.setattr(module, '_restore_handlers', lambda _: None)
+    code = module.main(ARGS + ['--execute', '--create-journal', '--gate-operation-file', '/protected/gate',
+                               '--gate-timeout-seconds', '10'])
+    if fault == 'preflight':
+        assert code == 2 and 'launch' not in calls and calls[-1] == 'close'
+    elif fault == 'gate':
+        assert code == 2 and 'hold' in calls and 'stop' not in calls and calls[-1] == 'close'
+    else:
+        assert code == 0 and calls.index('gate-start') < calls.index('gate-done') < calls.index('stop') < calls.index('close')
+
+
+def test_second_join_releases_supervisor_only_after_gate_exits(module, monkeypatch):
+    calls = []
+    operation = SimpleNamespace(manifest=object(), image=object(), application_enrollment_file='/app',
+                                controller_key_file='/key', check=lambda: None)
+    class Supervisor:
+        def __init__(self, **_): calls.append('construct')
+        def launch(self): pass
+        def wait_for_receipt_request(self, **_): return True
+        def serve_one_receipt(self): pass
+        def wait_for_stop_with_observations(self, **_): return False
+        def close(self): calls.append('close')
+    class DelayedThread:
+        def __init__(self, **_): self.alive = True; self.joins = 0
+        def start(self): pass
+        def is_alive(self): return self.alive
+        def join(self, *, timeout):
+            assert timeout == 6
+            self.joins += 1; calls.append('join')
+            if self.joins == 2: self.alive = False
+    monkeypatch.setattr(module, '_host_available', lambda: True)
+    monkeypatch.setattr(module, '_load_supervisor', lambda: Supervisor)
+    monkeypatch.setattr(module, '_load_gate_operation', lambda _: operation)
+    monkeypatch.setattr(module, '_preflight_gate_operation', lambda *_: None)
+    monkeypatch.setattr(module, '_install_handlers', lambda _: [])
+    monkeypatch.setattr(module, '_restore_handlers', lambda _: None)
+    monkeypatch.setattr(module.threading, 'Thread', DelayedThread)
+    assert module.main(ARGS + ['--execute', '--create-journal', '--gate-operation-file', '/protected/gate',
+                               '--gate-timeout-seconds', '10']) == 2
+    assert calls == ['construct', 'join', 'join', 'close']
 
 
 def harness(module, monkeypatch, *, failure=None, stop_at='wait', close_failure=False):

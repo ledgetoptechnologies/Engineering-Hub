@@ -19,7 +19,7 @@ from tests.test_hub_application_gate_enrollment import raw
 from tests.test_hub_application_mount_gate import pins
 
 
-@pytest.mark.parametrize('fault', ['none', 'reserve', 'consume'])
+@pytest.mark.parametrize('fault', ['none', 'reserve', 'consume', 'revoked'])
 def test_supervisor_owns_bootstrap_decision_and_consume(socket_rig, tmp_path, monkeypatch, fault):
     supervisor, manifest, image, path, directory, held = socket_rig
     data = json.loads(Path(path).read_bytes()); v4_policy(supervisor, data); Path(path).write_bytes(raw(data))
@@ -83,8 +83,13 @@ def test_supervisor_owns_bootstrap_decision_and_consume(socket_rig, tmp_path, mo
                     return True
             yield Client()
         supervisor.open_gate_ledger_client = ledger_client
+        checks = []
+        def authority_check():
+            checks.append(True)
+            if fault == 'revoked' and len(checks) == 5: raise RuntimeError('approval changed')
         args = dict(manifest=manifest, image=image, enrollment_file=path,
-                    controller_key_file=str(Path(path).parent / 'controller-key'), timeout_seconds=4)
+                    controller_key_file=str(Path(path).parent / 'controller-key'), timeout_seconds=4,
+                    authority_check=authority_check)
         if fault == 'none':
             result = supervisor.serve_pending_gate_bootstrap(**args)
             assert result['nonce'] == 'a' * 64 and [item[0] for item in operations] == ['reserve', 'consume']
@@ -92,10 +97,11 @@ def test_supervisor_owns_bootstrap_decision_and_consume(socket_rig, tmp_path, mo
             assert not held
         else:
             with pytest.raises(launch.LaunchSupervisorError): supervisor.serve_pending_gate_bootstrap(**args)
-            assert held and [item[0] for item in operations] == (['reserve'] if fault == 'reserve' else ['reserve', 'consume'])
+            wanted = [] if fault == 'revoked' else ['reserve'] if fault == 'reserve' else ['reserve', 'consume']
+            assert held and [item[0] for item in operations] == wanted
             with supervisor._journal.transaction() as db:
                 assert db.execute('SELECT count(*) FROM gate_start').fetchone() == (1,)
-                assert db.execute('SELECT count(*) FROM gate_issuance').fetchone() == (0 if fault == 'reserve' else 1,)
+                assert db.execute('SELECT count(*) FROM gate_issuance').fetchone() == (1 if fault == 'consume' else 0,)
     finally:
         os.close(ready_read); os.close(release_write)
         deadline = time.monotonic() + 3
@@ -127,7 +133,8 @@ def test_owned_sequence_only_retries_observational_waits(socket_rig, monkeypatch
     monkeypatch.setattr(supervisor, 'finish_pending_gate', finish)
     stopped = lambda: fault == 'stop'
     args = dict(manifest=manifest, image=image, enrollment_file=path,
-                controller_key_file='synthetic', timeout_seconds=.15 if fault == 'timeout' else 2, stop_requested=stopped)
+                controller_key_file='synthetic', timeout_seconds=.15 if fault == 'timeout' else 2,
+                stop_requested=stopped, authority_check=lambda: None)
     if fault == 'none':
         assert supervisor.run_gate_operation(**args)['acceptance'] == {'accepted': True}
         assert observed == ['bootstrap', 'bootstrap', 'finish', 'finish'] and not held
@@ -137,3 +144,20 @@ def test_owned_sequence_only_retries_observational_waits(socket_rig, monkeypatch
         if fault == 'uncertain_acceptance': assert observed.count('finish') == 1
         elif fault == 'timeout': assert observed and all(item == 'bootstrap' for item in observed)
         else: assert observed == []
+
+
+@pytest.mark.parametrize('kind', ['async', 'async_call', 'returned_coroutine', 'false', 'other'])
+def test_authority_check_must_complete_synchronously_with_none(socket_rig, monkeypatch, kind):
+    supervisor, manifest, image, path, _, held = socket_rig
+    effects = []
+    monkeypatch.setattr(supervisor, 'serve_pending_gate_bootstrap', lambda **_: effects.append('effect'))
+    async def async_check(): return None
+    class AsyncCall:
+        async def __call__(self): return None
+    callbacks = {'async': async_check, 'async_call': AsyncCall(), 'returned_coroutine': lambda: async_check(),
+                 'false': lambda: False, 'other': lambda: 'approved'}
+    with pytest.raises(launch.LaunchSupervisorError):
+        supervisor.run_gate_operation(manifest=manifest, image=image, enrollment_file=path,
+            controller_key_file='synthetic', timeout_seconds=2, stop_requested=lambda: False,
+            authority_check=callbacks[kind])
+    assert held and effects == []

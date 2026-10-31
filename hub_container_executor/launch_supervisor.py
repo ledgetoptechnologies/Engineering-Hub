@@ -16,6 +16,7 @@ from dataclasses import dataclass, InitVar
 import fcntl
 import hashlib
 import http.client
+import inspect
 import json
 import math
 import os
@@ -67,6 +68,20 @@ class LaunchSupervisorError(RuntimeError):
 def _require(value):
     if not value:
         raise LaunchSupervisorError()
+
+
+def _check_gate_authority(callback):
+    """Require a synchronous completed check; never schedule caller-owned work."""
+    _require(callable(callback) and not inspect.iscoroutinefunction(callback)
+             and not inspect.isasyncgenfunction(callback)
+             and not inspect.iscoroutinefunction(getattr(callback, '__call__', None))
+             and not inspect.isasyncgenfunction(getattr(callback, '__call__', None)))
+    result = callback()
+    if inspect.isawaitable(result) or inspect.isasyncgen(result):
+        if inspect.iscoroutine(result) and inspect.getcoroutinestate(result) == inspect.CORO_CREATED:
+            result.close()
+        raise LaunchSupervisorError()
+    _require(result is None)
 
 
 def _canonical(value):
@@ -1668,7 +1683,7 @@ class LaunchSupervisor:
                 finally: self._mutex.release()
             raise LaunchSupervisorError() from None
 
-    def accept_gate_completion(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+    def accept_gate_completion(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds, authority_check):
         """Commit exact freshly observed gate evidence through the owned v5 channel.
 
         The fenced ledger commit is authoritative. A lost reply or failed later
@@ -1677,9 +1692,10 @@ class LaunchSupervisor:
         Direct non-relayed custody and host writer exclusion remain prerequisites.
         """
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
-                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5 and callable(authority_check))
         deadline = time.monotonic() + timeout_seconds
         try:
+            _check_gate_authority(authority_check); _remaining(deadline)
             with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
                 facts = self.observe_gate_completion_facts(peer=peer, pins=pins, manifest=manifest, image=image,
                     enrollment_file=enrollment_file, ledger_client=client, timeout_seconds=_remaining(deadline))
@@ -1693,8 +1709,11 @@ class LaunchSupervisor:
                      'probe_digest': snapshot['probe_digest'],
                      'health_receipt_digest': snapshot['health_receipt_digest'],
                      'decision_payload_digest': snapshot['decision_payload_digest']}
+            _check_gate_authority(authority_check); _remaining(deadline)
             with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                _check_gate_authority(authority_check); _remaining(deadline)
                 accepted = client.invoke('accept_completion_v5', value, deadline_monotonic=deadline)
+            _check_gate_authority(authority_check); _remaining(deadline)
             after = self.measure_gate_post_exec(peer=peer, pins=facts['identity'], manifest=manifest, image=image,
                 enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
             _require(after == before and accepted == value)
@@ -1713,7 +1732,7 @@ class LaunchSupervisor:
                                            lookup_only=True) as client:
             return client.invoke('lookup_completion_v5', {'identity': identity})
 
-    def finish_pending_gate(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+    def finish_pending_gate(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds, authority_check):
         """Observe health readiness, then attempt one fully rechecked acceptance.
 
         None means no authenticated health receipt yet, not healthy or accepted.
@@ -1721,17 +1740,20 @@ class LaunchSupervisor:
         """
         from .runtime_profile import probe_set_digest
         _require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
-                 and 0 < timeout_seconds <= 5)
+                 and 0 < timeout_seconds <= 5 and callable(authority_check))
         deadline = time.monotonic() + timeout_seconds
         pins = json.loads(_canonical(pins))
+        _check_gate_authority(authority_check); _remaining(deadline)
         probes = manifest.probes.candidate if image.role == 'candidate' else manifest.probes.rollback
         with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
             readiness = client.invoke('health_ready_v5', {'identity': pins, 'probe_digest': probe_set_digest(probes)},
                                       deadline_monotonic=deadline)
         _require(type(readiness) is dict and set(readiness) == {'ready'} and type(readiness['ready']) is bool)
         if not readiness['ready']: return None
+        _check_gate_authority(authority_check); _remaining(deadline)
         return self.accept_gate_completion(peer=peer, pins=pins, manifest=manifest, image=image,
-                                           enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+                                           enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline),
+                                           authority_check=authority_check)
 
     def pending_gate_context(self, *, role, manifest_digest, timeout_seconds):
         """Read one fenced pending create from the enrolled ledger owner."""
@@ -1821,7 +1843,8 @@ class LaunchSupervisor:
             for fd in reversed(fds): os.close(fd)
             if peer is not None: peer.close()
 
-    def serve_pending_gate_bootstrap(self, *, manifest, image, enrollment_file, controller_key_file, timeout_seconds):
+    def serve_pending_gate_bootstrap(self, *, manifest, image, enrollment_file, controller_key_file, timeout_seconds,
+                                     authority_check):
         """One fenced bootstrap exchange, or None while the create is pending.
 
         A caller owns repeated readiness waits and later health acceptance.
@@ -1834,15 +1857,17 @@ class LaunchSupervisor:
         from .mount_gate_consume_protocol import MountGateConsumeController
         from .mount_gate_protocol import issue_decision
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
-                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5 and callable(authority_check))
         deadline = time.monotonic() + timeout_seconds
         try:
+            _check_gate_authority(authority_check); _remaining(deadline)
             if self._gate_listener is None:
                 self.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=enrollment_file,
                                          timeout_seconds=_remaining(deadline))
             base = self.observe_pending_gate_runtime(manifest=manifest, image=image, enrollment_file=enrollment_file,
                                                      timeout_seconds=_remaining(deadline))
             if base is None: return None
+            _check_gate_authority(authority_check); _remaining(deadline)
             channel, peer = self.accept_gate_channel(manifest=manifest, image=image, enrollment_file=enrollment_file,
                 host_pid=base['host_pid'], process_start_ticks=base['process_start_ticks'],
                 timeout_seconds=_remaining(deadline))
@@ -1856,6 +1881,7 @@ class LaunchSupervisor:
                      serialization.PublicFormat.Raw) == enrolled.controller_public_key)
 
             def source_current(pins):
+                _check_gate_authority(authority_check); _remaining(deadline)
                 root = _path(self._mounts['generations'].source)
                 root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
                 source = None
@@ -1878,10 +1904,13 @@ class LaunchSupervisor:
                 controller_key_file=controller_key_file, verify_live=source_current,
                 timeout_seconds=_remaining(deadline))
             pins = started['identity']
+            _check_gate_authority(authority_check); _remaining(deadline)
             with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                _check_gate_authority(authority_check); _remaining(deadline)
                 _require(client.invoke('reserve', pins, deadline_monotonic=deadline) is True)
 
             def current_locked(candidate):
+                _check_gate_authority(authority_check); _remaining(deadline)
                 self._validate_live(deadline)
                 _require(load_application_gate_enrollment(enrollment_file, manifest=manifest, image=image, supervisor=self) == enrolled
                          and _root_file(key_path, 32)[1] == key_identity and candidate == pins)
@@ -1912,7 +1941,9 @@ class LaunchSupervisor:
                 timeout_seconds=_remaining(deadline))
             _require(decision.serve_once() == 'sent_unconfirmed' and len(wire) == 1)
             def consume(value):
+                _check_gate_authority(authority_check); _remaining(deadline)
                 with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                    _check_gate_authority(authority_check); _remaining(deadline)
                     return client.invoke('consume', value, deadline_monotonic=deadline)
             consumer = MountGateConsumeController(channel=channel, peer=peer, expected=pins,
                 decision_wire=wire[0], signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
@@ -1929,7 +1960,7 @@ class LaunchSupervisor:
             raise LaunchSupervisorError() from None
 
     def run_gate_operation(self, *, manifest, image, enrollment_file, controller_key_file,
-                           timeout_seconds, stop_requested):
+                           timeout_seconds, stop_requested, authority_check):
         """Own one role-specific bootstrap and accepted health sequence.
 
         All waits are bounded and observational. A timeout, stop, lost response
@@ -1939,7 +1970,7 @@ class LaunchSupervisor:
         """
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
                  and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 120
-                 and callable(stop_requested))
+                 and callable(stop_requested) and callable(authority_check))
         deadline = time.monotonic() + timeout_seconds
         def wait():
             stopped = stop_requested()
@@ -1950,14 +1981,17 @@ class LaunchSupervisor:
             pins = None
             while pins is None:
                 _require(stop_requested() is False)
+                _check_gate_authority(authority_check); _remaining(deadline)
                 pins = self.serve_pending_gate_bootstrap(manifest=manifest, image=image,
                     enrollment_file=enrollment_file, controller_key_file=controller_key_file,
-                    timeout_seconds=min(5, _remaining(deadline)))
+                    timeout_seconds=min(5, _remaining(deadline)), authority_check=authority_check)
                 if pins is None: wait()
             while True:
                 _require(stop_requested() is False and self._gate_accepted_peer is not None)
+                _check_gate_authority(authority_check); _remaining(deadline)
                 accepted = self.finish_pending_gate(peer=self._gate_accepted_peer, pins=pins, manifest=manifest,
-                    image=image, enrollment_file=enrollment_file, timeout_seconds=min(5, _remaining(deadline)))
+                    image=image, enrollment_file=enrollment_file, timeout_seconds=min(5, _remaining(deadline)),
+                    authority_check=authority_check)
                 if accepted is not None:
                     _remaining(deadline)
                     return {'identity': pins, 'acceptance': accepted}
