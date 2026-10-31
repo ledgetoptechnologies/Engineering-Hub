@@ -161,6 +161,20 @@ async def test_one_failed_query_is_partial_and_null_never_zero(service):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_query_json_keys_produce_partial_results(service):
+    normal = handler_for()
+    def handler(request):
+        if b"query=" in request.url.raw_path and b"windows_memory_physical_total_bytes" in request.url.raw_path:
+            return httpx.Response(200, headers={"content-type": "application/json"},
+                stream=httpx.ByteStream(b'{"status":"success","data":{"resultType":"vector","result":[],"result":[]}}'))
+        return normal(request)
+    result = await reader(service, handler).read('human:1')
+    assert result['source']['status'] == 'partial'
+    assert result['devices'][0]['mem_total_bytes'] is None
+    assert result['devices'][0]['cpu_busy_ratio'] == 0.25
+
+
+@pytest.mark.asyncio
 async def test_aggregate_deadline_bounds_every_request(service,monkeypatch):
     monkeypatch.setattr(module,'DEADLINE_SECONDS',0.2)
     started=asyncio.get_running_loop().time()

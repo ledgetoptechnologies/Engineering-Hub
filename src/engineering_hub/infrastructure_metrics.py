@@ -29,7 +29,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .infrastructure_prometheus import (EXPORTERS, MAX_TARGETS, TARGET_PATH, PrometheusOrigin, TargetMapping,
-                                        _interval, _need, _targets)
+                                        _interval, _need, _targets, _unique)
 from .infrastructure_service import InfrastructureService
 from .repository import HubError
 
@@ -86,7 +86,7 @@ def _number(text):
 def _vector(raw):
     def finite(value):
         number=float(value);_need(math.isfinite(number));return number
-    value=json.loads(raw,parse_float=finite,parse_constant=lambda value:(_ for _ in ()).throw(ValueError()))
+    value=json.loads(raw,object_pairs_hook=_unique,parse_float=finite,parse_constant=lambda value:(_ for _ in ()).throw(ValueError()))
     _need(type(value) is dict and value.get('status')=='success' and type(value.get('data')) is dict)
     _need(value['data'].get('resultType')=='vector')
     result=value['data'].get('result')
