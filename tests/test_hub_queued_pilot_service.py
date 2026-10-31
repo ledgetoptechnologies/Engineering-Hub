@@ -514,6 +514,99 @@ async def test_repeated_cancel_drains_accepted_http_and_phase_before_client_and_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('factory_result', ['raises', 'invalid'])
+async def test_inherited_factory_failure_preserves_remote_hold(setup, factory_result):
+    state = setup
+    def failed_factory():
+        with sqlite3.connect(state.settings.database) as db:
+            assert db.execute('SELECT count(*) FROM hub_pilot_remote_cleanup_hold').fetchone() == (1,)
+        if factory_result == 'raises':
+            raise RuntimeError('synthetic factory failure')
+        return object()
+    state.client_factory = failed_factory
+    with pytest.raises(RuntimeError):
+        await state.service.serve_owned_queued_pilot(
+            state.settings, state.manifest, state.client_factory,
+            **options(state, inherited_broker=True))
+    assert len(state.owners) == 1 and state.owners[0].close_count == 1
+    with pytest.raises(PilotOwnershipError):
+        PilotOwner(state.settings.database, allow_ephemeral_test_storage=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drain_fails', [False, True])
+async def test_inherited_drain_finishes_before_owned_close_and_failure_is_reported(setup, monkeypatch, drain_fails):
+    state = setup
+    monkeypatch.setattr(ContainerPilotClient, 'uses_inherited_broker', property(lambda self: True))
+    original_factory = state.client_factory
+    def factory_after_hold():
+        with sqlite3.connect(state.settings.database) as db:
+            assert db.execute('SELECT count(*) FROM hub_pilot_remote_cleanup_hold').fetchone() == (1,)
+        return original_factory()
+    state.client_factory = factory_after_hold
+    stop, serving, _ = await start(state, inherited_broker=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def drain():
+        state.events.append('drain-start')
+        entered.set()
+        await release.wait()
+        state.events.append('drain-end')
+        if drain_fails:
+            raise RuntimeError('sensitive-drain-error')
+    state.clients[0].drain_inherited_broker = drain
+    try:
+        stop.set()
+        await asyncio.wait_for(entered.wait(), 8)
+        assert state.clients[0].close_count == state.owners[0].close_count == 0
+        release.set()
+        if drain_fails:
+            with pytest.raises(RuntimeError) as failed:
+                await asyncio.wait_for(serving, 8)
+            assert 'sensitive-drain-error' not in str(failed.value)
+        else:
+            await asyncio.wait_for(serving, 8)
+        assert state.events[-4:] == ['drain-start', 'drain-end', 'client-close', 'owner-close']
+        assert_closed(state)
+        if drain_fails:
+            with pytest.raises(PilotOwnershipError):
+                PilotOwner(state.settings.database, allow_ephemeral_test_storage=True)
+        else:
+            with PilotOwner(state.settings.database, allow_ephemeral_test_storage=True):
+                pass
+    finally:
+        release.set()
+        await asyncio.gather(serving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_waits_for_inherited_drain_before_releasing_owner(setup, monkeypatch):
+    state = setup
+    monkeypatch.setattr(ContainerPilotClient, 'uses_inherited_broker', property(lambda self: True))
+    stop, serving, _ = await start(state, inherited_broker=True)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def drain():
+        entered.set()
+        await release.wait()
+    state.clients[0].drain_inherited_broker = drain
+    try:
+        stop.set()
+        await asyncio.wait_for(entered.wait(), 8)
+        serving.cancel()
+        await asyncio.sleep(0)
+        serving.cancel()
+        await asyncio.sleep(0)
+        assert not serving.done()
+        assert state.clients[0].close_count == state.owners[0].close_count == 0
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(serving, 8)
+        assert_closed(state)
+    finally:
+        release.set()
+        await asyncio.gather(serving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('failed_close', ['client', 'owner'])
 async def test_cleanup_failure_is_sanitized_and_still_closes_other_resource(setup, failed_close):
     state = setup

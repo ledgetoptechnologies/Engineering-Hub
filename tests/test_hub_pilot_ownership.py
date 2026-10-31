@@ -70,6 +70,38 @@ def test_enrollment_and_new_epoch(database):
         second.assert_active(database)
 
 
+def test_remote_cleanup_hold_blocks_restart_until_verified_completion(database):
+    with PilotOwner(database) as owner:
+        owner.reserve_remote_cleanup()
+        owner.confirm_remote_cleanup()
+    with PilotOwner(database) as owner:
+        owner.reserve_remote_cleanup()
+    with pytest.raises(PilotOwnershipError):
+        PilotOwner(database)
+
+
+def test_remote_cleanup_hold_survives_sigkill(database):
+    child = worker(database, '''
+import sys
+from engineering_hub.pilot_ownership import PilotOwner
+owner = PilotOwner(sys.argv[1], allow_ephemeral_test_storage=True)
+owner.reserve_remote_cleanup()
+print('held', flush=True)
+sys.stdin.read()
+''')
+    try:
+        assert child.stdout.readline().strip() == 'held'
+        child.kill()
+        child.wait(timeout=10)
+        with pytest.raises(PilotOwnershipError):
+            PilotOwner(database)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+        close_worker_pipes(child)
+
+
 def test_other_process_and_sigstop_cannot_be_adopted(database):
     child = worker(database)
     try:

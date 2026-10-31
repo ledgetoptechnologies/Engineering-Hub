@@ -300,6 +300,14 @@ class ContainerPilotClient:
         """Whole-operation deadline, including connection and response transport."""
         return self.__timeout_seconds
 
+    @property
+    def uses_inherited_broker(self) -> bool:
+        """Whether this owned client requires authenticated remote drain."""
+        if self.__broker is None:
+            return False
+        from hub_container_executor.broker_seqpacket import InheritedCommandClient
+        return type(self.__broker) is InheritedCommandClient
+
     async def __aenter__(self):
         if self.__broker is None:
             await self.__client.__aenter__()

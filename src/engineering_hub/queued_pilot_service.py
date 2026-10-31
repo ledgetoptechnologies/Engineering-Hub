@@ -52,7 +52,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None, access_verifier=None):
+                                 session_acceptance_factory=None, access_verifier=None,
+                                 inherited_broker=False):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -60,6 +61,9 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     an invalid return or a factory that raises owns its own unaccepted resources.
     Freshness/exclusivity is the trusted factory's precondition, not something
     the exact-type check proves; never return a borrowed, reused or closed client.
+    The factory must not issue commands itself. In inherited mode the local hold
+    is reserved before invoking it. This hold does not fence older binaries or
+    restored databases; deployment requires an independent version/storage fence.
     This factory exposes no injected owner or ephemeral-storage override.
 
     The supervisor grace is an operator assertion, not a configured or verified
@@ -74,6 +78,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
                 or not _synchronous(reconciliation_factory)
+                or type(inherited_broker) is not bool
                 or session_acceptance_factory is not None and not _synchronous(session_acceptance_factory)
                 or stop_event is not None and type(stop_event) is not asyncio.Event
                 or type(supervisor_stop_grace_seconds) is not int
@@ -99,6 +104,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     constructed = False
+    remote_cleanup_reserved = False
     stop = stop_event if stop_event is not None else asyncio.Event()
 
     def additional_veto(*args):
@@ -113,17 +119,22 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, remote_cleanup_reserved
         if constructed:
             raise QueuedPilotServiceError()
         constructed = True
         owner = PilotOwner(settings.database)
         reconciliation = _reconciliation(reconciliation_factory, owner, target,
                                          rejected_reconciliation_tasks, lifecycle_task)
+        if inherited_broker:
+            owner.reserve_remote_cleanup()
+            remote_cleanup_reserved = True
         accepted = client_factory()
         if type(accepted) is not ContainerPilotClient:
             raise QueuedPilotServiceError()
         client = accepted
+        if client.uses_inherited_broker is not inherited_broker:
+            raise QueuedPilotServiceError()
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
         workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
@@ -180,6 +191,13 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 except BaseException:
                     failed = True
             if client is not None:
+                if client.uses_inherited_broker:
+                    try:
+                        await client.drain_inherited_broker()
+                        if remote_cleanup_reserved:
+                            owner.confirm_remote_cleanup()
+                    except BaseException:
+                        failed = True
                 try:
                     await client.aclose()
                 except BaseException:

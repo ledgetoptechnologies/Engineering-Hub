@@ -27,6 +27,8 @@ _SCHEMA = ('CREATE TABLE hub_pilot_owner (id INTEGER PRIMARY KEY CHECK(id=1), '
            'inode INTEGER NOT NULL, lock_device INTEGER NOT NULL, lock_inode INTEGER NOT NULL, '
            'epoch TEXT NOT NULL, previous_epoch TEXT)')
 _EPOCH_SCHEMA = 'CREATE TABLE hub_pilot_owner_epochs(epoch TEXT PRIMARY KEY, previous_epoch TEXT)'
+_REMOTE_HOLD_SCHEMA = ('CREATE TABLE hub_pilot_remote_cleanup_hold '
+                       '(id INTEGER PRIMARY KEY CHECK(id=1), epoch TEXT NOT NULL)')
 _OWNERS = weakref.WeakSet()
 
 
@@ -154,6 +156,7 @@ class PilotOwner:
                     db.execute('INSERT INTO hub_pilot_owner_epochs VALUES(?,?)', (row[7], None))
                 else:
                     row = self._read(db)
+                    self._check_remote_hold(db)
                     previous = row[7]
                     epoch = str(uuid.uuid4())
                     db.execute('UPDATE hub_pilot_owner SET epoch=?, previous_epoch=? WHERE id=1', (epoch, previous))
@@ -241,6 +244,47 @@ class PilotOwner:
         if history is None or history[0] != row[8]:
             raise PilotOwnershipError()
         return row
+
+    def _check_remote_hold(self, db):
+        schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='hub_pilot_remote_cleanup_hold'").fetchone()
+        if schema is None:
+            return
+        if schema[0] != _REMOTE_HOLD_SCHEMA or db.execute('SELECT * FROM hub_pilot_remote_cleanup_hold').fetchall():
+            raise PilotOwnershipError()
+
+    def reserve_remote_cleanup(self):
+        """Persist a hold before an inherited broker can receive commands."""
+        try:
+            self.assert_active(self._path)
+            with self._connect() as db:
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('BEGIN IMMEDIATE')
+                if self._read(db) != self._row:
+                    raise PilotOwnershipError()
+                self._check_remote_hold(db)
+                db.execute(_REMOTE_HOLD_SCHEMA.replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1))
+                db.execute('INSERT INTO hub_pilot_remote_cleanup_hold VALUES(1,?)', (self.epoch,))
+                self._check_paths()
+        except Exception:
+            raise PilotOwnershipError() from None
+
+    def confirm_remote_cleanup(self):
+        """Clear only after the caller has verified authenticated remote cleanup."""
+        try:
+            self.assert_active(self._path)
+            with self._connect() as db:
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('BEGIN IMMEDIATE')
+                if self._read(db) != self._row:
+                    raise PilotOwnershipError()
+                schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='hub_pilot_remote_cleanup_hold'").fetchone()
+                if (schema is None or schema[0] != _REMOTE_HOLD_SCHEMA
+                        or db.execute('SELECT * FROM hub_pilot_remote_cleanup_hold').fetchall() != [(1, self.epoch)]):
+                    raise PilotOwnershipError()
+                db.execute('DELETE FROM hub_pilot_remote_cleanup_hold WHERE id=1 AND epoch=?', (self.epoch,))
+                self._check_paths()
+        except Exception:
+            raise PilotOwnershipError() from None
 
     def assert_prior_epoch(self, epoch):
         """Prove historical enrollment ancestry, never authorize a live takeover.
