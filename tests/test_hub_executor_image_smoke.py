@@ -30,7 +30,7 @@ def runtime(owner):
             'MemorySwap': 256 * 1024**2, 'NanoCpus': 1_000_000_000, 'PidsLimit': 64}}
 
 
-def fake_cli(monkeypatch, *, alter=None, fail_start=False):
+def fake_cli(monkeypatch, *, alter=None, fail_start=False, report=None):
     calls, cleanup = [], []
     owner = []
     def run(*args, **kwargs):
@@ -43,8 +43,8 @@ def fake_cli(monkeypatch, *, alter=None, fail_start=False):
         if args[1:3] == ('container', 'start'):
             if fail_start:
                 raise RuntimeError('fixture start failed')
-            return json.dumps({'source_commit': COMMIT, 'installed_artifact': 'passed',
-                               'private_unix_client': True})
+            return json.dumps(report if report is not None else {'source_commit': COMMIT,
+                'installed_artifact': 'passed', 'private_unix_client': True, 'shared_launch_profile': True})
         if args[1:3] == ('container', 'inspect'):
             info = runtime(owner[0])
             if alter:
@@ -109,6 +109,17 @@ def test_effective_profile_mismatch_fails_and_cleans_owned_fixture(monkeypatch, 
     assert len(cleanup) == 1
 
 
+@pytest.mark.parametrize('shared', [None, False, 'true'])
+def test_image_without_the_shared_launch_profile_fails(monkeypatch, shared):
+    report = {'source_commit': COMMIT, 'installed_artifact': 'passed', 'private_unix_client': True}
+    if shared is not None:
+        report['shared_launch_profile'] = shared
+    _, cleanup = fake_cli(monkeypatch, report=report)
+    with pytest.raises(RuntimeError):
+        MODULE.smoke(IMAGE, COMMIT)
+    assert len(cleanup) == 1
+
+
 def test_start_failure_still_runs_owned_cleanup(monkeypatch):
     _, cleanup = fake_cli(monkeypatch, fail_start=True)
     with pytest.raises(RuntimeError):
@@ -129,6 +140,7 @@ def test_probe_fixed_installed_paths_and_required_core_api():
     assert 'configuration_commitment' in MODULE.PROBE
     assert 'launcher_cli' in MODULE.PROBE
     assert 'for_private_unix' in MODULE.PROBE
+    assert 'executor_launch_profile' in MODULE.PROBE and 'shared_launch_profile' in MODULE.PROBE
     assert '/opt/venv/lib/python3.12/site-packages' in MODULE.PROBE
     assert 'run_installed_executor(' not in MODULE.PROBE
     assert 'LaunchSupervisor(' not in MODULE.PROBE
