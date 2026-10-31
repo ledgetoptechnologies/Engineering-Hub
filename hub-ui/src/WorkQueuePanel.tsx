@@ -78,7 +78,8 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
         {snapshot.stagingMachines.slice(0, 8).map(machine => <p key={machine}>{machine}: {({
           not_reserved: "No reservation in this queue", active: "Active queue reservation",
           held: "Held — reconciliation required", unknown: "Reservation unknown", unavailable: "Reservation unavailable",
-        } as const)[reservations[machine] ?? "unavailable"]}</p>)}
+          checking: "Checking reservation…",
+        } as const)[reservations[machine] ?? "checking"]}</p>)}
         {snapshot.stagingMachines.length > 8 && <p>Additional machines are not shown.</p>}
         <p className="panel-footnote">Queue records only; this does not establish physical machine availability or exclude other writers.</p>
       </div>}

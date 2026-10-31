@@ -80,6 +80,26 @@ test("reservation refresh shows unknown and unavailable without asserting machin
   expect(state.writes).toBe(0);
 });
 
+test("reservation remains checking until its response arrives", async ({ page }) => {
+  const state = await fixture(page);
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/work/machines/staging-pc", async route => {
+    await pending;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      machine_id: "staging-pc", queue_reservation: "held", requires_reconciliation: true }) });
+  });
+  try {
+    await page.goto("/#/staging");
+    const panel = page.getByRole("region", { name: "Software validation queue" });
+    await expect(panel.getByText("staging-pc: Checking reservation…")).toBeVisible();
+    await expect(panel.getByText("Reservation unavailable", { exact: false })).toHaveCount(0);
+    release();
+    await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+    expect(state.writes).toBe(0);
+  } finally { release(); }
+});
+
 test("reservation authentication failure clears the private workspace", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/#/staging");
