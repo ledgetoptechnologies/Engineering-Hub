@@ -7,7 +7,9 @@ import array
 import asyncio
 import os
 import select
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -423,43 +425,88 @@ def _root_only():
     return pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root')
 
 
+def _require_pid_namespace():
+    # Only the disposable child enters a namespace; EPERM/EACCES are expected
+    # on restricted hosts. Any other failure remains a real test failure.
+    probe = """import errno, os, sys
+try:
+    os.unshare(os.CLONE_NEWPID)
+except OSError as error:
+    sys.exit(77 if error.errno in (errno.EPERM, errno.EACCES) else 1)
+"""
+    result = subprocess.run([sys.executable, '-c', probe], timeout=5, capture_output=True)
+    if result.returncode == 77:
+        pytest.skip('PID namespace creation denied by host policy')
+    assert result.returncode == 0, 'unexpected PID namespace probe failure'
+
+
+@pytest.mark.parametrize('returncode', [0, 77, 1])
+def test_pid_namespace_probe_only_skips_explicit_permission_denial(monkeypatch, returncode):
+    monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args[0], returncode))
+    if returncode == 77:
+        with pytest.raises(pytest.skip.Exception):
+            _require_pid_namespace()
+    elif returncode == 1:
+        with pytest.raises(AssertionError, match='unexpected PID namespace'):
+            _require_pid_namespace()
+    else:
+        _require_pid_namespace()
+
+
 @_root_only()
 @pytest.mark.skipif(not hasattr(os, 'unshare') or not hasattr(os, 'CLONE_NEWPID'), reason='needs os.unshare')
 def test_a_receiver_in_a_child_pid_namespace_sees_pid_0_and_still_checks_the_account():
-    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    report_read, report_write = os.pipe()
-    child = os.fork()
-    if child == 0:
-        status = 1
+    _require_pid_namespace()
+    script = r'''import os, select, socket
+from hub_container_executor.broker_seqpacket import InheritedCommandClient, PeerAccount, _read_packet
+left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+read_fd, write_fd = os.pipe()
+child = os.fork()
+if child == 0:
+    status = 1
+    try:
+        right.close(); os.close(read_fd)
+        os.unshare(os.CLONE_NEWPID)
+        grandchild = os.fork()
+        if grandchild == 0:
+            code = 1
+            try:
+                channel = InheritedCommandClient(left.detach(), PeerAccount(uid=os.getuid(), gid=os.getgid()))
+                assert select.select([channel._socket], [], [], 5)[0]
+                _, credentials = _read_packet(channel._socket)
+                accepted = len(credentials) == 1 and credentials[0][1:] == (os.getuid(), os.getgid())
+                os.write(write_fd, b'%d %d' % (credentials[0][0], accepted))
+                code = 0
+            finally:
+                os._exit(code)
+        _, waited = os.waitpid(grandchild, 0)
+        status = 0 if os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0 else 1
+    finally:
+        os._exit(status)
+left.close(); os.close(write_fd)
+right.send(b'{}'); right.close()
+_, waited = os.waitpid(child, 0)
+report = os.read(read_fd, 64); os.close(read_fd)
+assert os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0
+assert report == b'0 1'
+'''
+    # start_new_session is completed before Popen returns, so any forced group
+    # cleanup is confined to the process tree created for this test.
+    process = subprocess.Popen([sys.executable, '-c', script], start_new_session=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
         try:
-            coordinator_end.close()
-            os.close(report_read)
-            os.unshare(os.CLONE_NEWPID)
-            grandchild = os.fork()
-            if grandchild == 0:
-                code = 1
-                try:
-                    channel = InheritedCommandClient(executor_end.detach(), me())
-                    assert select.select([channel._socket], [], [], 5)[0]
-                    _, credentials = _read_packet(channel._socket)
-                    accepted = len(credentials) == 1 and credentials[0][1:] == (os.getuid(), os.getgid())
-                    os.write(report_write, b'%d %d' % (credentials[0][0], accepted))
-                    code = 0
-                finally:
-                    os._exit(code)
-            _, waited = os.waitpid(grandchild, 0)
-            status = 0 if os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0 else 1
-        finally:
-            os._exit(status)
-    executor_end.close()
-    os.close(report_write)
-    with raw_end(coordinator_end) as raw:
-        raw.send(b'{}')
-        _, waited = os.waitpid(child, 0)
-    report = os.read(report_read, 64)
-    os.close(report_read)
-    assert os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0
-    assert report == b'0 1'   # the sender's pid isn't visible there; the account still matches
+            _, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+            pytest.fail('PID namespace test timed out')
+        assert process.returncode == 0, stderr.decode('utf-8', 'replace')[-2048:]
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
 
 
 @_root_only()
