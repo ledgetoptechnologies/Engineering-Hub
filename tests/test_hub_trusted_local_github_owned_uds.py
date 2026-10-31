@@ -35,8 +35,8 @@ def owned_resources():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('tamper_observation', [False, True])
-@pytest.mark.parametrize(('supervised', 'cleanup_failure'), [(False, False), (True, False), (True, True)])
-async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources, tamper_observation, supervised, cleanup_failure):
+@pytest.mark.parametrize(('supervised', 'cleanup_failure','with_broker'), [(False, False,False), (True, False,False), (True, True,False), (True,False,True)])
+async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources, tamper_observation, supervised, cleanup_failure, with_broker):
     import engineering_hub.pilot_ownership as ownership
     synthetic_filesystem=ownership._local_filesystem
     monkeypatch.setattr(ownership,'_local_filesystem',lambda fd, **_:synthetic_filesystem(fd))
@@ -91,7 +91,7 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
     async def exchange(self, code, verifier):
         assert code=='synthetic-code' and verifier
         return 123
-    monkeypatch.setattr(GitHubIdentityProvider,'exchange',exchange)
+    if not with_broker: monkeypatch.setattr(GitHubIdentityProvider,'exchange',exchange)
     listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
     owned_resources.callback(listener.close)
     listener.bind(str(executor_path));os.chmod(executor_path,0o600);listener.listen(4);listener.settimeout(.2)
@@ -147,12 +147,35 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
     session=local.TrustedLocalQueuedSession(config=config,enrollment=enrollment,credential=token.encode())
     owned_resources.callback(session.close)
     owned_resources.enter_context(owned_supervisor_wait(authority))
-    serving=None
+    serving=None; broker_task=None; broker_stop=None; broker=None; oauth_client=None
     try:
+        oauth_options={}
+        if with_broker:
+            from engineering_hub.github_oauth_broker import GitHubOAuthBroker,GitHubOAuthUnixClient,serve_github_oauth_broker
+            from hub_container_executor import coordinator_admission
+            from hub_container_executor.coordinator_admission import GitHubBrokerEnrollment
+            oauth_path=str(root/'oauth.sock'); provider_calls=[]
+            # Test-only endpoint is task-private; production path remains fixed.
+            monkeypatch.setattr(coordinator_admission,'OAUTH_SOCKET',oauth_path)
+            async def github(request):
+                provider_calls.append((request.method,str(request.url)))
+                return httpx.Response(200,json={'access_token':'test-only-token'} if request.method=='POST' else {'id':123})
+            broker=GitHubOAuthBroker(client_id='fixture-client',client_secret=tokens['github'],
+                secret_sha256='sha256:'+hashlib.sha256(tokens['github'].encode()).hexdigest(),origin='https://pilot.example.test',
+                peer_uid=os.geteuid(),peer_gid=os.getegid(),transport=httpx.MockTransport(github))
+            broker_listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            owned_resources.callback(broker_listener.close)
+            broker_listener.bind(oauth_path);broker_listener.listen();broker_listener.setblocking(False)
+            broker_stop=asyncio.Event()
+            broker_task=asyncio.create_task(serve_github_oauth_broker(broker_listener,broker,broker_stop))
+            oauth_client=GitHubOAuthUnixClient(socket_path=oauth_path,issuer_uid=os.geteuid(),issuer_gid=os.getegid())
+            binding=GitHubBrokerEnrollment(oauth_path,os.geteuid(),os.getegid(),'fixture-client','https://pilot.example.test',
+                                           'sha256:'+hashlib.sha256(tokens['github'].encode()).hexdigest())
+            oauth_options={'github_client':oauth_client,'oauth_binding':binding}
         thread.start()
         serving=asyncio.create_task(installed.run_installed_coordinator(config,reconciliation_factory=session.reconciliation_factory,
                                                session_acceptance_factory=session.session_acceptance_factory,
-                                               admission_verifier=admission_verifier))
+                                               admission_verifier=admission_verifier,**oauth_options))
         done,_=await asyncio.wait({ready,serving},timeout=10,return_when=asyncio.FIRST_COMPLETED)
         if serving in done: await serving
         assert ready in done
@@ -166,6 +189,7 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
             callback=await browser.get('/api/hub/v1/auth/callback',params={'state':state,'code':'synthetic-code'},
                                        headers={'Cookie':'hub_session_oauth='+oauth_cookie})
             assert callback.status_code==303
+            if with_broker: assert provider_calls==[('POST','https://github.com/login/oauth/access_token'),('GET','https://api.github.com/user')]
             cookie=browser.cookies.get('hub_session');assert cookie
             browser.headers['Cookie']='hub_session='+cookie
             me=(await browser.get('/api/hub/v1/auth/me')).json();assert me['authenticated'] and me['actor']=='human:123'
@@ -248,4 +272,10 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
                     assert type(outcome[0]) is LocalCoordinatorDrain and outcome[0].manifest_digest == manifest.digest()
         finally:
             stop_thread.set()
-            if thread.ident is not None: thread.join(4); assert not thread.is_alive()
+            try:
+                if thread.ident is not None: thread.join(4); assert not thread.is_alive()
+            finally:
+                if broker_task is not None:
+                    broker_stop.set();await broker_task
+                if oauth_client is not None:oauth_client.close()
+                if broker is not None:broker.close()

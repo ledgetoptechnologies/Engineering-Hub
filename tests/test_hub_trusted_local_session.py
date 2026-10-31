@@ -131,6 +131,32 @@ async def test_wrong_github_enrollment_is_rejected_before_secret_access(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_wrong_oauth_broker_binding_is_rejected_before_secret_access(monkeypatch):
+    from hub_container_executor import runtime_identity
+    from engineering_hub.github_oauth_broker import GitHubOAuthUnixClient
+    from hub_container_executor.coordinator_admission import GitHubBrokerEnrollment, OAUTH_SOCKET
+    data = github_configuration(); data['manifest'] = profile_document()['manifest']
+    config = parse_configuration(canonical(data))
+    evidence = v2_document(); evidence.update(schema=local.SCHEMA_V3, operator_actor='human:123')
+    class Verifier:
+        def implementation_commit(self): pass
+    monkeypatch.setattr(runtime_identity, 'CoordinatorLaunchReceiptIdentityVerifier', Verifier)
+    monkeypatch.setattr(local, 'ImmutableTestSecretResolver',
+                        lambda *a, **kw: pytest.fail('secret resolver was reached'))
+    client = GitHubOAuthUnixClient(socket_path=OAUTH_SOCKET, issuer_uid=1, issuer_gid=1)
+    binding = GitHubBrokerEnrollment(OAUTH_SOCKET, 1, 1, 'wrong-client', config.auth.origin,
+                                     next(digest for slot, version, digest in config.bindings
+                                          if (slot, version) == config.roles['github']))
+    try:
+        with pytest.raises(TrustedSessionError):
+            await local.serve_trusted_local_coordinator(
+                config, enrollment=parse_enrollment(encode(evidence)), admission_verifier=Verifier(),
+                github_client=client, oauth_binding=binding)
+    finally:
+        client.close()
+
+
+@pytest.mark.asyncio
 async def test_explicit_local_coordinator_composition_drains_before_session_close(monkeypatch):
     data = configuration(); data['manifest'] = profile_document()['manifest']
     config = parse_configuration(canonical(data))

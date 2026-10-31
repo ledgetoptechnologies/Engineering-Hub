@@ -57,6 +57,10 @@ SUPERVISED_LOCAL_COORDINATOR_TARGETS = MappingProxyType({
     'local_admission': '/operator-admission/admission.json',
     'local_issuer_socket': '/run/engineering-hub/coordinator-issuer.sock',
 })
+SUPERVISED_LOCAL_OAUTH_TARGETS = MappingProxyType({
+    **SUPERVISED_LOCAL_COORDINATOR_TARGETS,
+    'local_oauth_socket': '/run/engineering-hub/github-oauth.sock',
+})
 # For the v2 admission mount, content_digest is the normalized admission
 # commitment, not its raw file hash. Independent root enrollment must also pin
 # the raw bytes and compare the complete measured coordinator release; parsing
@@ -116,10 +120,10 @@ class ExecutorLaunchMount(_Closed):
             _require(self.kind == 'directory' and self.read_only is False and self.uid > 0
                      and self.gid > 0 and self.mode == 0o700 and self.content_digest is None)
             return self
-        if self.role == 'local_issuer_socket':
-            _require(self.target == SUPERVISED_LOCAL_COORDINATOR_TARGETS[self.role])
+        if self.role in {'local_issuer_socket','local_oauth_socket'}:
+            _require(self.target == SUPERVISED_LOCAL_OAUTH_TARGETS[self.role])
             _path(self.source)
-            _require(self.kind == 'socket' and self.read_only is True and self.uid == 0
+            _require(self.kind == 'socket' and self.read_only is True and (self.uid == 0 if self.role=='local_issuer_socket' else self.uid > 0)
                      and self.gid > 0 and self.mode == 0o660 and self.content_digest is None)
             return self
         if self.role in SUPERVISED_LOCAL_COORDINATOR_TARGETS:
@@ -315,7 +319,7 @@ class ExecutorLaunchProfile(_Closed):
     broker_mode: Literal['broker-v1'] | None = None
     # Absent means the executor. A coordinator profile is a separate closed shape;
     # the supervisor refuses to launch it until pair launch is implemented.
-    role: Literal['coordinator', 'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2'] | None = None
+    role: Literal['coordinator', 'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'] | None = None
     # Signed opt-in: commands arrive on a descriptor handed over at launch
     # instead of a path socket. The supervisor refuses it until implemented.
     command_channel: Literal['inherited-seqpacket-v1'] | None = None
@@ -348,11 +352,12 @@ class ExecutorLaunchProfile(_Closed):
     @model_validator(mode='after')
     def closed_profile(self):
         coordinator = self.role == 'coordinator'
-        supervised = self.role == 'supervised-local-coordinator-v2'
+        oauth = self.role == 'supervised-local-coordinator-v3'
+        supervised = self.role == 'supervised-local-coordinator-v2' or oauth
         local = self.role == 'trusted-local-coordinator-v1' or supervised
         identity = _COORDINATOR_ID if coordinator else _EXECUTOR_ID
         module = 'installed_coordinator' if coordinator else 'trusted_local_session' if local else 'installed_runner'
-        targets = COORDINATOR_TARGETS if coordinator else SUPERVISED_LOCAL_COORDINATOR_TARGETS if supervised else TRUSTED_LOCAL_COORDINATOR_TARGETS if local else _TARGETS
+        targets = COORDINATOR_TARGETS if coordinator else SUPERVISED_LOCAL_OAUTH_TARGETS if oauth else SUPERVISED_LOCAL_COORDINATOR_TARGETS if supervised else TRUSTED_LOCAL_COORDINATOR_TARGETS if local else _TARGETS
         _require(self.user == f'{identity}:{identity}' and len(self.supplementary_groups) <= 2
                  and len(set(self.supplementary_groups)) == len(self.supplementary_groups)
                  and all(type(value) is int and 0 <= value < 2**32 - 1 for value in self.supplementary_groups))
@@ -377,8 +382,9 @@ class ExecutorLaunchProfile(_Closed):
             host_gid = next(outside + _EXECUTOR_ID - inside for inside, outside, count in self.daemon_policy.gid_map
                             if inside <= _EXECUTOR_ID < inside + count)
             _require(all((mount.uid == 0 and mount.gid == host_gid) if mount.role == 'local_issuer_socket'
+                         else (mount.uid > 0 and mount.uid != host_uid and mount.gid == host_gid) if mount.role == 'local_oauth_socket'
                          else (mount.uid == host_uid and mount.gid == host_gid) for mount in self.mounts))
-            roles = set(SUPERVISED_LOCAL_COORDINATOR_TARGETS if supervised else TRUSTED_LOCAL_COORDINATOR_TARGETS)
+            roles = set(SUPERVISED_LOCAL_OAUTH_TARGETS if oauth else SUPERVISED_LOCAL_COORDINATOR_TARGETS if supervised else TRUSTED_LOCAL_COORDINATOR_TARGETS)
         elif coordinator:
             roles = set(COORDINATOR_TARGETS)
         elif self.broker_mode is None:
@@ -433,7 +439,7 @@ class ExecutorLaunchProfile(_Closed):
             _require(all(not (path == source or path in source.parents or source in path.parents)
                          for path in protected for source in sources))
         _require(all(fixture in PurePosixPath(item.source).parents for item in self.mounts
-                     if item.role not in {'engine_socket', 'issuer_socket', 'broker_socket', 'local_issuer_socket'}))
+                     if item.role not in {'engine_socket', 'issuer_socket', 'broker_socket', 'local_issuer_socket', 'local_oauth_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
         _path(self.runner_file)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -211,14 +212,23 @@ class GitHubOAuthUnixClient:
             or os.path.normpath(socket_path)!=socket_path or len(os.fsencode(socket_path))>=108
             or any(type(x) is not int or not 0<=x<2**32-1 for x in (issuer_uid,issuer_gid))
             or type(timeout_seconds) is not int or not 1<=timeout_seconds<=30): raise OAuthBrokerError()
-        self._path=socket_path;self._uid=issuer_uid;self._gid=issuer_gid;self._timeout=timeout_seconds;self._pid=os.getpid()
+        self._path=socket_path;self._uid=issuer_uid;self._gid=issuer_gid;self._timeout=timeout_seconds;self._pid=os.getpid();self._closed=False
+
+    def matches(self, *, socket_path, issuer_uid, issuer_gid):
+        return (type(issuer_uid) is int and type(issuer_gid) is int
+                and os.getpid()==self._pid and not self._closed and self._path==socket_path
+                and self._uid==issuer_uid and self._gid==issuer_gid)
+
+    def close(self):
+        if os.getpid()!=self._pid:raise OAuthBrokerError()
+        self._closed=True
 
     async def exchange(self,code,verifier):
         writer=None
         try:
             deadline=asyncio.get_running_loop().time()+self._timeout
             async with asyncio.timeout_at(deadline):
-                if os.getpid()!=self._pid or not _code(code) or type(verifier) is not str or not _VERIFIER.fullmatch(verifier):raise ValueError()
+                if os.getpid()!=self._pid or self._closed or not _code(code) or type(verifier) is not str or not _VERIFIER.fullmatch(verifier):raise ValueError()
                 before=os.lstat(self._path)
                 import stat
                 if not stat.S_ISSOCK(before.st_mode):raise ValueError()
@@ -246,3 +256,14 @@ class GitHubOAuthUnixClient:
                 writer.close()
                 try: await asyncio.wait_for(writer.wait_closed(),1)
                 except Exception: pass
+
+
+def validate_broker_binding(client, binding, *, client_id, origin, secret_digest):
+    """Validate independently enrolled client pins without socket or secret I/O."""
+    from hub_container_executor.coordinator_admission import GitHubBrokerEnrollment, OAUTH_SOCKET
+    if (type(client) is not GitHubOAuthUnixClient or type(binding) is not GitHubBrokerEnrollment
+        or binding.socket_path!=OAUTH_SOCKET or not client.matches(socket_path=binding.socket_path,
+            issuer_uid=binding.issuer_uid,issuer_gid=binding.issuer_gid)
+        or binding.client_id!=client_id or binding.origin!=origin or type(secret_digest) is not str
+        or not hmac.compare_digest(binding.secret_digest,secret_digest)):
+        raise OAuthBrokerError()

@@ -225,7 +225,8 @@ def target_allowed(config, actor, action_key, environment, target):
 
 
 async def run_installed_coordinator(config, *, reconciliation_factory=None,
-                                     session_acceptance_factory=None, admission_verifier=None):
+                                     session_acceptance_factory=None, admission_verifier=None,
+                                     github_client=None, oauth_binding=None):
     try:
         _process()
         _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
@@ -239,6 +240,12 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         _require(_synchronous(reconciliation_factory))
         _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
         github = config.auth.human_auth_mode == 'github'
+        if github_client is not None or oauth_binding is not None:
+            from engineering_hub.github_oauth_broker import validate_broker_binding
+            digests=[digest for slot,version,digest in config.bindings if (slot,version)==config.roles.get('github')]
+            _require(github and admission_verifier is not None and len(digests)==1)
+            validate_broker_binding(github_client,oauth_binding,client_id=config.auth.github_client_id,
+                                    origin=config.auth.origin,secret_digest=digests[0])
         if github:
             _require(config.auth.github_client_secret == '' and set(config.roles) ==
                      {'codex', 'hermes', 'claude', 'executor', 'github'})
@@ -286,6 +293,7 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             return target_allowed(config, actor, action_key, environment, target)
 
         options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
+        if github_client is not None: options.update(github_client=github_client,oauth_binding=oauth_binding)
         return await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
             reconciliation_factory=reconciliation_factory,

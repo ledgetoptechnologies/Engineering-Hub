@@ -172,7 +172,7 @@ class GateLedgerWorker:
             if (payload['protocol'] != REQUEST or payload['challenge'] != challenge
                     or type(payload['launch_binding']) is not list or payload['launch_binding'] != list(binding)
                     or any(type(a) is not type(b) for a, b in zip(payload['launch_binding'], binding))
-                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1')
+                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1')
                     or type(issued) is not int or type(expires) is not int or not 0 < expires - issued <= 5000
                     or now < wall or issued < wall - 5000 or not issued <= now < expires
                     or expires <= wall or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
@@ -183,12 +183,13 @@ class GateLedgerWorker:
             is_pending = payload['action'] == 'pending_gate_v5'
             is_ready = payload['action'] == 'health_ready_v5'
             is_state = payload['action'] == 'pending_state_v1'
+            is_pair_seal = payload['action'] == 'seal_pair_drain_v1'
             if self._lookup_only and not is_lookup: raise ValueError()
-            if (is_accept or is_lookup or is_pending or is_ready or is_state) and (not self._require_sender_liveness or self._completion_policy is None):
+            if (is_accept or is_lookup or is_pending or is_ready or is_state or is_pair_seal) and (not self._require_sender_liveness or self._completion_policy is None):
                 raise ValueError()
             is_snapshot = payload['action'] in ('inspect_completion', 'inspect_completion_v4')
             identity = value.get('identity') if (is_snapshot or is_accept or is_lookup or is_ready) else value
-            if not (is_pending or is_state) and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
+            if not (is_pending or is_state or is_pair_seal) and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
             last_wall = [now]
             def fresh_decision():
                 current = int(time.time() * 1000)
@@ -198,7 +199,19 @@ class GateLedgerWorker:
                         or (time.monotonic() - started) * 1000 >= decision_expires - wall):
                     raise ValueError()
                 last_wall[0] = current
-            if is_state:
+            def fresh_seal():
+                scope()
+                current = int(time.time() * 1000)
+                if (self._launch.launch_binding() != binding or current < last_wall[0]
+                        or not issued <= current < expires
+                        or (time.monotonic() - started) * 1000 >= expires - wall):
+                    raise ValueError()
+                last_wall[0] = current
+                return True
+            if is_pair_seal:
+                if (set(value) != {'pair_id'} or type(value['pair_id']) is not str
+                        or str(UUID(value['pair_id'])) != value['pair_id']): raise ValueError()
+            elif is_state:
                 if (set(value) != {'operation_id'} or type(value['operation_id']) is not str
                         or str(UUID(value['operation_id'])) != value['operation_id']): raise ValueError()
             elif is_ready:
@@ -253,6 +266,8 @@ class GateLedgerWorker:
                 snapshot = self._ledger.gate_health_ready(identity, value['probe_digest'])
             elif is_state:
                 snapshot = self._ledger.pending_state_context(value['operation_id'])
+            elif is_pair_seal:
+                self._ledger.seal_pair_drain(value['pair_id'], binding, fresh_check=fresh_seal)
             elif is_snapshot:
                 snapshot = self._ledger.gate_completion_snapshot(identity, value['probe_digest'])
                 if payload['action'] == 'inspect_completion_v4' and snapshot['role'] != value['role']:
@@ -340,7 +355,7 @@ class SupervisorLedgerClient:
             if credentials != [(self._peer.pid, self._peer.uid, self._peer.gid)]: raise ValueError()
             scope(); return _parse(raw)
         try:
-            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1') or type(value) is not dict: raise ValueError()
+            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1') or type(value) is not dict: raise ValueError()
             if self._lookup_only and action != 'lookup_completion_v5': raise ValueError()
             snapshot = json.loads(_canonical(value))
             challenge = receive()

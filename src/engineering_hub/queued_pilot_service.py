@@ -56,7 +56,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
                                  session_acceptance_factory=None, access_verifier=None,
-                                 inherited_broker=False, allow_github=False, admission_verifier=None):
+                                 inherited_broker=False, allow_github=False, admission_verifier=None, github_client=None, oauth_binding=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -74,6 +74,11 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     closing the accepted client and finally its newly constructed PilotOwner.
     """
     try:
+        if github_client is not None or oauth_binding is not None:
+            from .github_oauth_broker import validate_broker_binding
+            if not allow_github or admission_verifier is None: raise ValueError()
+            validate_broker_binding(github_client,oauth_binding,client_id=settings.auth_config.github_client_id,
+                origin=settings.auth_config.origin,secret_digest='sha256:'+hashlib.sha256(settings.auth_config.github_client_secret.encode('ascii')).hexdigest())
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
                 or type(allow_github) is not bool
@@ -202,7 +207,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         if staging_draft is not None:
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier)
+                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier,
+                          **({} if github_client is None else {'github_client':github_client}))
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)

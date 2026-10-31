@@ -38,6 +38,20 @@ def test_normalized_commitment_preserves_exact_raw_pin_and_closed_schema():
         with pytest.raises(ValueError): admission.parse_admission(invalid)
 
 
+def test_oauth_broker_admission_is_versioned_closed_and_domain_separated():
+    value=document(); value['schema']=admission.SCHEMA_V2
+    value['oauth_broker']={'socket_path':admission.OAUTH_SOCKET,'issuer_uid':1234,'issuer_gid':2345,
+        'client_id':'fixture-client','origin':'https://pilot.example.test','secret_digest':'sha256:'+'5'*64}
+    raw=canonical(value); parsed=admission.parse_admission(raw)
+    assert parsed.oauth_broker.socket_path==admission.OAUTH_SOCKET and parsed.oauth_broker.issuer_uid==1234
+    assert admission.admission_commitment(raw)[0]!=admission.admission_commitment(canonical(document()))[0]
+    for key,bad in [('socket_path','/tmp/other'),('issuer_uid',True),('client_id','bad\n'),
+                    ('origin','https://pilot.example.test\n'),('secret_digest','bad')]:
+        changed=dict(value,oauth_broker=dict(value['oauth_broker'],**{key:bad}))
+        with pytest.raises(ValueError):admission.parse_admission(canonical(changed))
+    with pytest.raises(ValueError): admission.parse_admission(canonical(dict(value,schema=admission.SCHEMA)))
+
+
 def test_supervised_capture_requires_readonly_mount_and_rejects_symlink(tmp_path, monkeypatch):
     source = tmp_path / 'input.json'; source.write_bytes(b'valid'); os.chmod(source, 0o600)
     with monkeypatch.context() as patch:

@@ -2074,6 +2074,16 @@ class LaunchSupervisor:
         with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
             return client.invoke('pending_state_v1', {'operation_id': operation_id})
 
+    def seal_pair_drain(self, *, pair_id, manifest_digest, timeout_seconds):
+        """Seal this live executor's future command admission once.
+
+        The caller independently enrolls the pair and must preserve unknown
+        outcomes. This does not assert quiescence or release a held effect.
+        """
+        _require(type(pair_id) is str and str(UUID(pair_id)) == pair_id)
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('seal_pair_drain_v1', {'pair_id': pair_id})
+
     def serve_state_custodian_admission(self, *, channel, manifest, timeout_seconds, _custody_check=None):
         """Serve one peer-challenged intent observation, not a live effect lease.
 

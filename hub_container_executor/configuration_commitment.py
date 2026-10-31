@@ -131,7 +131,7 @@ def supervised_local_coordinator_commitment(profile, config_raw: bytes, enrollme
     from .coordinator_admission import admission_commitment, parse_admission
     from .runtime_identity import CoordinatorReleaseEnrollment
     try:
-        if (type(profile) is not ExecutorLaunchProfile or profile.role != 'supervised-local-coordinator-v2'
+        if (type(profile) is not ExecutorLaunchProfile or profile.role not in ('supervised-local-coordinator-v2','supervised-local-coordinator-v3')
             or type(independent_release) is not CoordinatorReleaseEnrollment): raise ValueError()
         expected=CoordinatorReleaseEnrollment(**{name:getattr(independent_release,name)
                     for name in CoordinatorReleaseEnrollment.__dataclass_fields__})
@@ -143,6 +143,14 @@ def supervised_local_coordinator_commitment(profile, config_raw: bytes, enrollme
             or admission.release!=expected or expected.launch_profile_digest!=profile.digest()
             or admission.config_digest!='sha256:'+hashlib.sha256(config_raw).hexdigest()
             or admission.session_digest!='sha256:'+hashlib.sha256(enrollment_raw).hexdigest()): raise ValueError()
-        return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,'supervised-local-coordinator-v2')
+        if profile.role=='supervised-local-coordinator-v3':
+            from .installed_coordinator import parse_configuration
+            config=parse_configuration(config_raw); oauth=admission.oauth_broker
+            digests=[digest for slot,version,digest in config.bindings if (slot,version)==config.roles.get('github')]
+            if (oauth is None or len(digests)!=1 or oauth.client_id!=config.auth.github_client_id
+                or oauth.origin!=config.auth.origin or oauth.secret_digest!=digests[0]
+                or oauth.socket_path!=mounts['local_oauth_socket'].target):raise ValueError()
+        elif admission.oauth_broker is not None:raise ValueError()
+        return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,profile.role)
     except Exception:
         raise ValueError('supervised local coordinator commitment invalid') from None

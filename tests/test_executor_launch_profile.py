@@ -328,6 +328,14 @@ def supervised_local_profile():
     return data
 
 
+def supervised_local_oauth_profile():
+    data=supervised_local_profile();data['role']='supervised-local-coordinator-v3'
+    data['mounts'].append(dict(role='local_oauth_socket',source='/run/owned-github-oauth.sock',
+        target='/run/engineering-hub/github-oauth.sock',kind='socket',read_only=True,
+        uid=120001,gid=110001,mode=0o660,content_digest=None))
+    return data
+
+
 def test_supervised_local_profile_is_new_closed_shape_and_legacy_unchanged():
     legacy=trusted_local_profile(); before=core.canonical(legacy)
     data=supervised_local_profile()
@@ -381,6 +389,37 @@ def test_supervised_commitment_requires_independent_raw_and_complete_release_pin
     changed=dict(adm);changed['release']=dict(adm['release'],launch_profile_digest='sha256:'+'f'*64);changed_raw=canonical(changed)
     assert admission_commitment(changed_raw)[0]==normalized
     with pytest.raises(ValueError): supervised_local_coordinator_commitment(profile,config_raw,enrollment_raw,changed_raw,root_raw_digest=admission_commitment(changed_raw)[1],independent_release=release)
+
+
+def test_supervised_oauth_profile_binds_independent_broker_to_github_config():
+    pytest.importorskip('fcntl')
+    from hub_container_executor.configuration_commitment import supervised_local_coordinator_commitment
+    from hub_container_executor.coordinator_admission import admission_commitment,parse_admission,SCHEMA_V2,OAUTH_SOCKET
+    from tests.test_hub_coordinator_admission import document
+    from tests.test_hub_container_executor_installed_coordinator import github_configuration,canonical
+    from tests.test_hub_trusted_queued_session import v2_document,encode
+    from tests.test_hub_unified_pilot_startup import profile_document
+    from engineering_hub.trusted_queued_session import SCHEMA_V3
+    config=github_configuration();config['manifest']=profile_document()['manifest']
+    config.update(database_path='/var/lib/engineering-hub/local-coordinator/hub.sqlite',coordinator_socket_path='/run/hub-browser/hub.sock',
+                  executor_socket_path='/run/hub-executor/executor.sock',secret_root='/var/lib/engineering-hub/local-secrets')
+    enrollment=v2_document();enrollment.update(schema=SCHEMA_V3,operator_actor='human:123')
+    cfg,session=canonical(config),encode(enrollment)
+    def bind(client_id='fixture-client'):
+        value=document(cfg,session);value['schema']=SCHEMA_V2
+        value['oauth_broker']={'socket_path':OAUTH_SOCKET,'issuer_uid':77,'issuer_gid':88,'client_id':client_id,
+                               'origin':'https://pilot.example.test','secret_digest':'sha256:'+'5'*64}
+        normalized,_=admission_commitment(canonical(value))
+        data=supervised_local_profile();data['role']='supervised-local-coordinator-v3';data['daemon_policy']['engine_id']=enrollment['launch']['engine_id']
+        _swap_mount(data,'local_config',content_digest=digest_of(cfg));_swap_mount(data,'local_enrollment',content_digest=digest_of(session));_swap_mount(data,'local_admission',content_digest=normalized)
+        data['mounts'].append(dict(role='local_oauth_socket',source='/run/owned-github-oauth.sock',target=OAUTH_SOCKET,
+                                  kind='socket',read_only=True,uid=120001,gid=110001,mode=0o660,content_digest=None))
+        profile=core.ExecutorLaunchProfile.model_validate(data);value['release']['launch_profile_digest']=profile.digest()
+        raw=canonical(value);return profile,raw,parse_admission(raw).release,admission_commitment(raw)[1]
+    profile,raw,release,pin=bind()
+    supervised_local_coordinator_commitment(profile,cfg,session,raw,root_raw_digest=pin,independent_release=release)
+    profile,raw,release,pin=bind('other-client')
+    with pytest.raises(ValueError):supervised_local_coordinator_commitment(profile,cfg,session,raw,root_raw_digest=pin,independent_release=release)
 
 
 def test_trusted_local_profile_is_distinct_closed_and_preserves_old_bytes():

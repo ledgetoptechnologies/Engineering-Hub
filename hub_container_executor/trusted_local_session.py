@@ -93,7 +93,7 @@ class TrustedLocalQueuedSession(TrustedQueuedSessionComposition):
         if failed: raise TrustedSessionError()
 
 
-async def serve_trusted_local_coordinator(config, *, enrollment, admission_verifier=None):
+async def serve_trusted_local_coordinator(config, *, enrollment, admission_verifier=None, github_client=None, oauth_binding=None):
     """Compose one local session under explicit dedicated-VM host trust.
 
     The operator must ensure exclusive authority to mutate the executor socket
@@ -116,12 +116,20 @@ async def serve_trusted_local_coordinator(config, *, enrollment, admission_verif
                  and enrolled.manifest_digest == config.manifest.digest()
                  and (enrolled.schema != SCHEMA_V3
                       or enrolled.operator_actor == f'human:{config.auth.beau_github_id}'))
+        if github_client is not None or oauth_binding is not None:
+            from engineering_hub.github_oauth_broker import validate_broker_binding
+            digests=[digest for slot,version,digest in config.bindings if (slot,version)==config.roles.get('github')]
+            _require(admission_verifier is not None and config.auth.human_auth_mode=='github' and len(digests)==1)
+            validate_broker_binding(github_client,oauth_binding,client_id=config.auth.github_client_id,
+                                    origin=config.auth.origin,secret_digest=digests[0])
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as resolver:
             token = resolver.resolve_test_secret(*config.roles['executor'])
         if admission_verifier is not None: admission_verifier.implementation_commit()
         _require(type(token) is str and token.isascii())
         session = TrustedLocalQueuedSession(config=config, enrollment=enrollment, credential=token.encode('ascii'))
         options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
+        if github_client is not None or oauth_binding is not None:
+            options.update(github_client=github_client,oauth_binding=oauth_binding)
         return await run_installed_coordinator(config, reconciliation_factory=session.reconciliation_factory,
                                         session_acceptance_factory=session.session_acceptance_factory, **options)
     except Exception:
@@ -218,7 +226,7 @@ def run_supervised_local_coordinator():
     from .runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
     from .installed_coordinator import MAX_CONFIG_BYTES, parse_configuration, _process
     admission = parse_admission(_read_supervised_input(_SUPERVISED_ADMISSION, MAX_BYTES))
-    transport = verifier = None
+    transport = verifier = github_client = None
     try:
         transport = CoordinatorUnixLaunchReceiptTransport(socket_path=_SUPERVISED_ISSUER,
             expected_issuer_uid=admission.issuer_uid, expected_issuer_gid=admission.issuer_gid)
@@ -233,6 +241,14 @@ def run_supervised_local_coordinator():
                  and hmac.compare_digest('sha256:' + hashlib.sha256(session_raw).hexdigest(), admission.session_digest))
         _process()
         config = parse_configuration(config_raw)
+        if admission.oauth_broker is not None:
+            from engineering_hub.github_oauth_broker import GitHubOAuthUnixClient
+            oauth=admission.oauth_broker
+            digests=[digest for slot,version,digest in config.bindings if (slot,version)==config.roles.get('github')]
+            _require(config.auth.human_auth_mode=='github' and len(digests)==1
+                     and oauth.client_id==config.auth.github_client_id and oauth.origin==config.auth.origin
+                     and oauth.secret_digest==digests[0])
+            github_client=GitHubOAuthUnixClient(socket_path=oauth.socket_path,issuer_uid=oauth.issuer_uid,issuer_gid=oauth.issuer_gid)
         config_path, session_path = Path(_SUPERVISED_CONFIG), Path(_SUPERVISED_SESSION)
         _require(config_path.parent != Path(config.database).parent
                  and Path(config.database).parent not in config_path.parents)
@@ -245,7 +261,8 @@ def run_supervised_local_coordinator():
         _require(_read_supervised_input(_SUPERVISED_CONFIG, MAX_CONFIG_BYTES) == config_raw
                  and _read_supervised_input(_SUPERVISED_SESSION, MAX_ENROLLMENT_BYTES) == session_raw)
         verifier.implementation_commit()
-        result = asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment, admission_verifier=verifier))
+        options={} if github_client is None else {'github_client':github_client,'oauth_binding':admission.oauth_broker}
+        result = asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment, admission_verifier=verifier, **options))
         from .coordinator_drain import LocalCoordinatorDrain, report_local_drain
         _require(type(result) is LocalCoordinatorDrain and result.manifest_digest == config.manifest.digest())
         report_local_drain(socket_path=_SUPERVISED_ISSUER, issuer_uid=admission.issuer_uid,
@@ -254,9 +271,12 @@ def run_supervised_local_coordinator():
             timeout_ms=admission.timeout_ms)
     finally:
         try:
-            if verifier is not None: verifier.close()
+            if github_client is not None: github_client.close()
         finally:
-            if transport is not None: transport.close()
+            try:
+                if verifier is not None: verifier.close()
+            finally:
+                if transport is not None: transport.close()
 
 
 def main(argv=None):

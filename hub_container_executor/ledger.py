@@ -323,6 +323,11 @@ class SQLiteLedger:
         payload = _canonical(request.model_dump(mode="json"))
         digest, commit, policy = self._expected
         with self._transaction() as db:
+            # A sealed ledger never admits another command, even if the seal
+            # bytes are malformed. Existing effects retain their normal drain
+            # and recovery paths; the seal itself asserts no quiescence.
+            if db.execute("SELECT 1 FROM control WHERE key='pair_drain_seal_v1'").fetchone() is not None:
+                return Admission(False, False, _make_response(request, state='held', reason='paused'))
             old = db.execute("SELECT payload,response FROM commands WHERE command_id=?",
                              (request.command_id,)).fetchone()
             if old:
@@ -1272,6 +1277,39 @@ class SQLiteLedger:
             db.execute("INSERT INTO control(key,value) VALUES('paused',?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        ("true" if paused else "false",))
+
+    def seal_pair_drain(self, pair_id: str, launch_binding: tuple, *, fresh_check) -> None:
+        """Permanently close command admission for one original supervisor pair.
+
+        This atomic seal does not wait for in-flight effects, certify a clean
+        ledger, stop a process, or authorize release/recovery. Never retry after
+        an uncertain result. The caller authenticates the supervisor channel.
+        It relies on exclusive trusted database ownership: deletion or restoring
+        an earlier database can remove the seal. Independent anti-rollback and
+        writer exclusion are required before relying on it across host changes.
+        """
+        self._check_open()
+        try:
+            if (type(pair_id) is not str or str(uuid.UUID(pair_id)) != pair_id
+                    or type(launch_binding) is not tuple or len(launch_binding) != 5
+                    or any(type(launch_binding[i]) is not str or str(uuid.UUID(launch_binding[i])) != launch_binding[i]
+                           for i in (0, 1))
+                    or any(type(launch_binding[i]) is not int or not 0 < launch_binding[i] < 2**63 for i in (2, 3))
+                    or type(launch_binding[4]) is not str or re.fullmatch(r'[0-9a-f]{64}', launch_binding[4]) is None
+                    or not callable(fresh_check)):
+                raise ValueError()
+            body = _canonical({'schema': 'engineering-hub.executor-pair-drain-seal.v1',
+                'pair_id': pair_id, 'launch_binding': list(launch_binding), 'manifest_digest': self._expected[0]})
+            mac = self._operation_mac(pair_id, pair_id, 'pair_drain_seal', 'sealed', body)
+            value = _canonical({'body': body, 'mac': mac})
+            with self._transaction() as db:
+                if db.execute("SELECT 1 FROM control WHERE key='pair_drain_seal_v1'").fetchone() is not None:
+                    raise PermissionError()
+                if fresh_check() is not True:
+                    raise PermissionError()
+                db.execute("INSERT INTO control(key,value) VALUES('pair_drain_seal_v1',?)", (value,))
+        except Exception:
+            raise PermissionError('executor pair seal unavailable') from None
 
     def is_paused(self) -> bool:
         self._check_open()
