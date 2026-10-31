@@ -188,8 +188,8 @@ def test_wrong_seed_pin_denied_before_helper_or_journal(monkeypatch):
     with pytest.raises(ValueError): init.initialize(task,storage,script='script',script_sha256='sha256:'+'0'*64,archive='archive',archive_sha256='sha256:'+'b'*64,client='client',helper_image_id=image,daemon_paths=('/program','/archive','/client'))
     assert (len(events),len(calls))==before and not task._seed_started
 
-@pytest.mark.parametrize('drift',[False,True])
-def test_fixed_helper_lifecycle_and_drift_denial(monkeypatch,drift):
+@pytest.mark.parametrize('style',['legacy','desktop','bad_cap','bad_readonly','drift'])
+def test_fixed_helper_lifecycle_and_drift_denial(monkeypatch,style):
     import scripts.hub_local_windows_initialization as init
     task,image,events,calls=fixture_task(); a,b,c=[str(uuid.uuid4()) for _ in range(3)]
     storage=provision_storage(task,helper_image_id=image,source_task_id=a,scratch_task_id=b,journal_task_id=c)
@@ -210,16 +210,19 @@ def test_fixed_helper_lifecycle_and_drift_denial(monkeypatch,drift):
                 d=dict(part.split('=',1) if '=' in part else (part,True) for part in args[n+1].split(','))
                 m={'Destination':d['dst'],'Type':d['type'],'RW':'readonly' not in d}
                 if d['type']=='volume': m.update(Name=d['src'],Source=task.docker_root+'/volumes/'+d['src']+'/_data')
-                else: m['Source']='C:\\wrong' if drift and d['dst']=='/seed/program' else d['src']
+                else: m['Source']='C:\\wrong' if style=='drift' and d['dst']=='/seed/program' else d['src']
                 mounts.append(m)
             cfg={'Image':image,'Labels':{'codex.owner':'inherited-image-label',LABEL:task.task_id},'User':user,'Entrypoint':['/opt/validation-venv/bin/python'],'Cmd':cmd}
             requested=[]
             for n,x in enumerate(args):
                 if x=='--mount':
                     d=dict(part.split('=',1) if '=' in part else (part,True) for part in args[n+1].split(',')); spec={'Type':d['type'],'Target':d['dst'],'Source':d['src'],'ReadOnly':'readonly' in d}
+                    if style=='desktop' and 'readonly' not in d: spec.pop('ReadOnly')
+                    if style=='bad_readonly' and d['dst']=='/seed/source': spec['ReadOnly']=None
                     if d['type']=='volume': spec['VolumeOptions']={'NoCopy':True}
                     requested.append(spec)
-            host={'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':['CHOWN'] if rw else None,'SecurityOpt':['no-new-privileges'],'CgroupnsMode':'private','NanoCpus':250000000,'Memory':268435456,'MemorySwap':268435456,'PidsLimit':32,'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'AutoRemove':False,'RestartPolicy':{'Name':'no'},'GroupAdd':None,'PidMode':'','IpcMode':'private','Tmpfs':None,'Binds':None,'Mounts':requested}
+            cap=(['CHOWN'] if style=='legacy' else ['CAP_CHOWN','CAP_SYS_ADMIN'] if style=='bad_cap' else ['CAP_CHOWN']) if rw else None
+            host={'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':cap,'SecurityOpt':['no-new-privileges'],'CgroupnsMode':'private','NanoCpus':250000000,'Memory':268435456,'MemorySwap':268435456,'PidsLimit':32,'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'AutoRemove':False,'RestartPolicy':{'Name':'no'},'GroupAdd':None,'PidMode':'','IpcMode':'private','Tmpfs':None,'Binds':None,'Mounts':requested}
             records[cid]={'Id':cid,'Name':'/'+name,'Config':cfg,'HostConfig':host,'State':{'Status':'created','Running':False,'Pid':0,'Paused':False,'Restarting':False,'Dead':False,'ExitCode':0},'Mounts':mounts}
             return cid
         if args[:2]==('container','inspect'): return json.dumps([records[args[-1]]])
@@ -231,7 +234,7 @@ def test_fixed_helper_lifecycle_and_drift_denial(monkeypatch,drift):
         return json.dumps({'source_digest':tree,'client_sha256':init.CLI,**({'archive_sha256':cmd[-3]} if mode=='seed' else {})})
     task.call=call; task.call_input=call_input
     binding=('C:\\probe\\program','sha256:'+'1'*64,'C:\\probe\\archive','sha256:'+'2'*64,'C:\\probe\\client',image,('C:\\probe\\program','C:\\probe\\archive','C:\\probe\\client'))
-    if drift:
+    if style in ('drift','bad_cap','bad_readonly'):
         with pytest.raises(ValueError): init._helper(task,storage,binding,'seed')
         assert not any(event=='seed-helper-start-intent' for event,_ in events)
         return

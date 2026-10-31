@@ -116,7 +116,7 @@ def _helper(task,storage,binding,mode):
         if (c['Id']!=cid or c['Name']!='/'+name or cfg['Image']!=helper_image or not _helper_labels(cfg.get('Labels'),labels,task.task_id,set(zip(daemon_paths,('/seed/program','/seed/archive','/seed/client'))))
             or cfg['User']!=user or cfg['Entrypoint']!=['/opt/validation-venv/bin/python'] or cfg['Cmd']!=cmd
             or h['NetworkMode']!='none' or h['ReadonlyRootfs'] is not True or h['Privileged'] is not False or h['CapDrop']!=['ALL']
-            or h.get('CapAdd')!=(['CHOWN'] if rw else None) or h['SecurityOpt']!=['no-new-privileges'] or h.get('CgroupnsMode')!='private'
+            or (h.get('CapAdd') not in (['CHOWN'],['CAP_CHOWN']) if rw else h.get('CapAdd') not in (None,[])) or h['SecurityOpt']!=['no-new-privileges'] or h.get('CgroupnsMode')!='private'
             or h['NanoCpus']!=250000000 or h['Memory']!=268435456 or h['MemorySwap']!=268435456 or h['PidsLimit']!=32
             or h['LogConfig']!={'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
             or h.get('Devices') not in (None,[]) or h.get('DeviceRequests') not in (None,[]) or h.get('VolumesFrom') not in (None,[])
@@ -130,7 +130,7 @@ def _helper(task,storage,binding,mode):
             found=[x for x in actual if x.get('Destination')==dst and x.get('Type')==kind and x.get('RW') is writable]
             if len(found)!=1 or (kind=='volume' and (found[0].get('Name')!=src or found[0].get('Source')!=task.docker_root+'/volumes/'+src+'/_data')): raise ValueError('Helper mounts mismatch')
             if kind=='bind' and found[0].get('Source')!=daemon_paths[('/seed/program','/seed/archive','/seed/client').index(dst)]: raise ValueError('Helper bind source mismatch')
-            spec=[x for x in requested if x.get('Type')==kind and x.get('Target')==dst and x.get('ReadOnly') is (not writable)]
+            spec=[x for x in requested if x.get('Type')==kind and x.get('Target')==dst and x.get('ReadOnly',False) is (not writable)]
             if len(spec)!=1 or (kind=='volume' and (spec[0].get('Source')!=src or spec[0].get('VolumeOptions',{}).get('NoCopy') is not True)):
                 raise ValueError('Helper requested mounts mismatch')
             if kind=='bind' and spec[0].get('Source')!=daemon_paths[('/seed/program','/seed/archive','/seed/client').index(dst)]: raise ValueError('Helper requested bind mismatch')
