@@ -38,6 +38,38 @@ pytestmark = [pytest.mark.asyncio,
               pytest.mark.skipif(sys.platform != 'linux', reason='Real Linux owner/native events')]
 
 
+def access_diagnostics(verifier, issued_at, expires_at):
+    """Record only fixed categories and fixture timing, never assertion contents."""
+    state = {'category': 'none'}
+    original = verifier.verify
+
+    async def observed(token):
+        state['category'] = 'checking'
+        try:
+            result = await original(token)
+            state['category'] = 'success'
+            return result
+        except access.AccessDenied:
+            state['category'] = 'denied'
+            raise
+        except access.AccessUnavailable:
+            state['category'] = 'unavailable'
+            raise
+        except Exception:
+            state['category'] = 'other'
+            raise
+
+    verifier.verify = observed
+
+    def describe(response):
+        now = time.time()
+        return (f"assertion_header_count={len(response.request.headers.get_list('cf-access-jwt-assertion'))} "
+                f"verifier_category={state['category']} "
+                f"now_minus_iat={now - issued_at:.3f} exp_minus_now={expires_at - now:.3f}")
+
+    return describe
+
+
 def signed_access(monkeypatch):
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
@@ -50,15 +82,41 @@ def signed_access(monkeypatch):
     monkeypatch.setattr(access, 'CloudflareAccessVerifier', lambda _: verifier)
     monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: verifier)
     now = int(time.time())
+    diagnostics = access_diagnostics(verifier, now - 1, now + 300)
     assertion = jwt.encode(dict(iss=config.cloudflare_issuer, aud=['fixture-hub'],
         sub='synthetic-human', email='beau@example.com', type='app', iat=now - 1, exp=now + 300),
         private, algorithm='RS256', headers={'kid': 'fixture-key'})
-    return config, assertion
+    return config, assertion, diagnostics
 
 
-def checked(response, expected=200):
-    assert response.status_code == expected, response.text
+def checked(response, expected=200, diagnostics=None):
+    assert response.status_code == expected, diagnostics(response) if diagnostics else response.text
     return response.json()
+
+
+async def test_access_diagnostics_redacts_assertion_and_exception():
+    class DenyingVerifier:
+        async def verify(self, token):
+            if token:
+                raise access.AccessDenied()
+            return 'verified'
+
+    verifier = DenyingVerifier()
+    diagnostics = access_diagnostics(verifier, 100, 400)
+    secret = 'synthetic-assertion-must-not-appear'
+    with pytest.raises(access.AccessDenied):
+        await verifier.verify(secret)
+    response = httpx.Response(401, request=httpx.Request('GET', ORIGIN,
+        headers={'cf-access-jwt-assertion': secret}), text=secret)
+    with pytest.raises(AssertionError) as error:
+        checked(response, diagnostics=diagnostics)
+    rendered = str(error.value)
+    assert 'assertion_header_count=1' in rendered
+    assert 'verifier_category=denied' in rendered
+    assert 'now_minus_iat=' in rendered and 'exp_minus_now=' in rendered
+    assert secret not in rendered
+    assert await verifier.verify('') == 'verified'
+    assert 'verifier_category=success' in diagnostics(response)
 
 
 @asynccontextmanager
@@ -98,7 +156,7 @@ async def test_public_human_agent_review_native_runtime_and_result(
         pytest.skip(reason)
     if failed_smoke:
         rig.client.outcomes['smoke_container'] = 'failed'
-    config, assertion = signed_access(monkeypatch)
+    config, assertion, diagnostics = signed_access(monkeypatch)
     auth = AuthSettings('test-hermes', 'test-codex', claude_token='test-claude',
                         allowed_ips=frozenset({'192.0.2.10'}))
     feed = NativeHubEventFeed(rig.repo.path)
@@ -184,7 +242,7 @@ async def test_public_human_agent_review_native_runtime_and_result(
                     'project': 'engineering-hub', 'title': 'Inspect result?', 'options': ['Yes', 'No']}), 201)
                 assert not checked(await browser.post(BASE + '/work/pause', json={'paused': False}))['paused']
                 await asyncio.wait_for(completed.wait(), 5)
-                result = checked(await browser.get(BASE + '/work/jobs/' + job['id']))
+                result = checked(await browser.get(BASE + '/work/jobs/' + job['id']), diagnostics=diagnostics)
                 assert result['state'] == ('failed' if failed_smoke else 'succeeded')
                 runs = checked(await browser.get(BASE + '/runs'))['items']
                 assert len(runs) == 1 and runs[0]['task_id'] == task_id
