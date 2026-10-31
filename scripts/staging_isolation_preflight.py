@@ -14,6 +14,72 @@ import stat
 import sys
 
 
+def parse_id_map(text):
+    rows = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or any(not field.isascii() or not field.isdigit() for field in fields):
+            raise ValueError('invalid namespace map')
+        inside, outside, count = map(int, fields)
+        if count <= 0 or inside + count > 2**32 - 1 or outside + count > 2**32 - 1:
+            raise ValueError('invalid namespace map')
+        rows.append((inside, outside, count))
+    if not rows:
+        raise ValueError('empty namespace map')
+    return rows
+
+
+def namespace_inventory(uid, gid, start, count, *, proc=Path('/proc')):
+    """Best-effort snapshot, never proof that namespace mappings stay absent."""
+    result = {'proc_view_identity_map_verified': False, 'host_proc_namespace_verified': False,
+              'inspected': None, 'proc_pid1_namespace_skipped': None,
+              'uid_overlaps': None, 'gid_overlaps': None, 'denied': None, 'exited': None,
+              'invalid_or_changed': None, 'other_errors': None}
+    try:
+        initial = (proc / '1/ns/user').stat()
+        own = (proc / 'self/ns/user').stat()
+        # Maps are relative to the reader's user namespace. Even a full map
+        # and PID1 match cannot establish host proc mount or visibility.
+        full = [(0, 0, 2**32 - 1)]
+        if ((initial.st_dev, initial.st_ino) != (own.st_dev, own.st_ino)
+                or parse_id_map((proc / 'self/uid_map').read_text()) != full
+                or parse_id_map((proc / 'self/gid_map').read_text()) != full):
+            return result
+        result['proc_view_identity_map_verified'] = True
+        entries = [p for p in proc.iterdir() if p.name.isascii() and p.name.isdigit()]
+        result.update(inspected=0, proc_pid1_namespace_skipped=0, uid_overlaps=0,
+                      gid_overlaps=0, denied=0, exited=0, invalid_or_changed=0, other_errors=0)
+    except (OSError, UnicodeError, ValueError):
+        return result
+    for entry in entries:
+        try:
+            before = (entry / 'ns/user').stat()
+            identity = before.st_dev, before.st_ino
+            if identity == (initial.st_dev, initial.st_ino):
+                result['proc_pid1_namespace_skipped'] += 1
+                continue
+            uid_map = parse_id_map((entry / 'uid_map').read_text())
+            gid_map = parse_id_map((entry / 'gid_map').read_text())
+            after = (entry / 'ns/user').stat()
+            if identity != (after.st_dev, after.st_ino):
+                raise ValueError('namespace changed')
+            for label, mapping, candidate in (('uid', uid_map, uid), ('gid', gid_map, gid)):
+                if any((outside <= candidate < outside + size or
+                        start < outside + size and outside < start + count)
+                       for _, outside, size in mapping):
+                    result[label + '_overlaps'] += 1
+            result['inspected'] += 1
+        except PermissionError:
+            result['denied'] += 1
+        except (FileNotFoundError, ProcessLookupError):
+            result['exited'] += 1
+        except (UnicodeError, ValueError):
+            result['invalid_or_changed'] += 1
+        except OSError:
+            result['other_errors'] += 1
+    return result
+
+
 def subordinate_conflicts(text, start, count):
     """Return conflict count; malformed entries mean the inventory is unknown."""
     end = start + count
@@ -39,9 +105,11 @@ def inspect_candidate(uid, gid, sub_start, sub_count, path, min_free):
         'account_access_and_credential_authorization',
         'actual_user_namespace_and_daemon_isolation',
         'nss_enumeration_completeness_and_active_namespace_maps',
+        'independent_host_proc_mount_and_namespace_visibility',
         'future_target_mount_identity_and_capacity',
     ]}
     checks = result['checks']
+    checks['active_user_namespace_maps'] = namespace_inventory(uid, gid, sub_start, sub_count)
     checks['candidate_uid_in_subid_range'] = sub_start <= uid < sub_start + sub_count
     checks['candidate_gid_in_subid_range'] = sub_start <= gid < sub_start + sub_count
     try:

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,3 +46,59 @@ def test_candidate_ids_in_subordinate_range_are_reported(tmp_path):
     assert result['checks']['candidate_uid_in_subid_range'] is True
     assert result['checks']['candidate_gid_in_subid_range'] is True
     assert 'nss_enumeration_completeness_and_active_namespace_maps' in result['incomplete']
+
+
+def test_namespace_map_scan_excludes_initial_and_reports_overlap_and_exited(tmp_path, monkeypatch):
+    for name in ('1', 'self', '20', '30'):
+        (tmp_path / name / 'ns').mkdir(parents=True)
+    initial = tmp_path / '1/ns/user'
+    initial.write_text('initial')
+    os.link(initial, tmp_path / 'self/ns/user')
+    (tmp_path / 'self/uid_map').write_text('0 0 4294967295\n')
+    (tmp_path / 'self/gid_map').write_text('0 0 4294967295\n')
+    (tmp_path / '20/ns/user').write_text('other')
+    (tmp_path / '20/uid_map').write_text('0 200000 100\n')
+    (tmp_path / '20/gid_map').write_text('0 400000 100\n')
+    result = module.namespace_inventory(12345, 400005, 200000, 100, proc=tmp_path)
+    assert result['proc_view_identity_map_verified'] is True
+    assert result['host_proc_namespace_verified'] is False
+    assert result['proc_pid1_namespace_skipped'] == 1 and result['inspected'] == 1
+    assert result['uid_overlaps'] == result['gid_overlaps'] == 1
+    assert result['exited'] == 1
+    original_iterdir = Path.iterdir
+    def no_enumeration(path):
+        if path == tmp_path:
+            raise PermissionError()
+        return original_iterdir(path)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, 'iterdir', no_enumeration)
+        unknown = module.namespace_inventory(1, 1, 2, 1, proc=tmp_path)
+        assert unknown['proc_view_identity_map_verified'] is True
+        assert unknown['inspected'] is None and unknown['uid_overlaps'] is None
+    original_read = Path.read_text
+    def denied(path, *args, **kwargs):
+        if path == tmp_path / '20/uid_map':
+            raise PermissionError()
+        return original_read(path, *args, **kwargs)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, 'read_text', denied)
+        assert module.namespace_inventory(1, 1, 2, 1, proc=tmp_path)['denied'] == 1
+    original_stat = Path.stat
+    calls = []
+    def changed(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if path == tmp_path / '20/ns/user':
+            calls.append(1)
+            if len(calls) == 2:
+                return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1)
+        return info
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, 'stat', changed)
+        assert module.namespace_inventory(1, 1, 2, 1, proc=tmp_path)['invalid_or_changed'] == 1
+    (tmp_path / '20/uid_map').write_text('broken')
+    result = module.namespace_inventory(12345, 400005, 200000, 100, proc=tmp_path)
+    assert result['invalid_or_changed'] == 1
+    (tmp_path / 'self/uid_map').write_text('0 1000 1\n')
+    unknown = module.namespace_inventory(1, 1, 2, 1, proc=tmp_path)
+    assert unknown['proc_view_identity_map_verified'] is False
+    assert unknown['uid_overlaps'] is None and unknown['inspected'] is None
