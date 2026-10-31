@@ -44,8 +44,8 @@ function statusBadge(item: MachineTarget, now: Date) {
   if (item.state === "unknown" || item.up === null) return <Badge tone="neutral">Unknown</Badge>;
   // An old result, failed or not, says nothing about now.
   if (item.state === "stale") return <Badge tone="amber">Out of date{seen}</Badge>;
-  if (!item.up) return <Badge tone="amber">Scrape failing{seen}</Badge>;
-  return <Badge tone="forest">Reporting{seen}</Badge>;
+  if (!item.up) return <Badge tone="amber">Scrape failing at snapshot{seen}</Badge>;
+  return <Badge tone="forest">Reporting at snapshot{seen}</Badge>;
 }
 function ago(value: string, now: Date): string {
   const seconds = Math.max(0, Math.round((now.getTime() - Date.parse(value)) / 1000));
@@ -104,7 +104,7 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
     setLoad(current => current.state === "loaded" ? current : { state: "loading" });
     readMetrics(controller.signal).then(value => {
       if (controller.signal.aborted) return;
-      setNow(new Date());
+      if (value !== null) setNow(new Date(value.generated_at));
       setLoad(value === null ? { state: "hidden" } : { state: "loaded", value });
     }).catch(error => {
       if (controller.signal.aborted) return;
@@ -126,6 +126,7 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
     <p className="panel-description">Read from Prometheus when you open this page or press Refresh. Values are what the exporters last reported.</p>
+    {metrics && <p className="panel-description">Snapshot generated <time dateTime={metrics.generated_at}>{new Date(metrics.generated_at).toLocaleString()}</time>. Refresh for current readings; elapsed scrape ages refer to this snapshot.</p>}
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {notice && <p className="notice" role="status">{notice}</p>}

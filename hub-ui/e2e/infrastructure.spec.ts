@@ -284,6 +284,18 @@ const metrics = (change: (value: any) => void = () => {}) => {
   const value = JSON.parse(JSON.stringify(metricsFixture)); change(value); return { status: 200, body: value };
 };
 
+test("machine health labels its fixed snapshot and scrape ages as snapshot-relative", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-10-30T17:00:00Z") });
+  const state = await fixture(page, { metrics: [metrics()] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel.locator('time')).toHaveAttribute('datetime', '2026-10-29T17:00:00Z');
+  await expect(panel).toContainText("elapsed scrape ages refer to this snapshot");
+  const desk = panel.getByRole("listitem").filter({ hasText: "desk" });
+  await expect(desk).toContainText("Reporting at snapshot · 10s ago");
+  expect(state.metrics).toBe(1);
+});
+
 test("machine health groups each machine's exporters, says what's missing and reads only when asked", async ({ page }) => {
   const state = await fixture(page, { metrics: [metrics()] });
   await page.goto("/#/infrastructure");
