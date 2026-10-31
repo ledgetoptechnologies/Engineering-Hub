@@ -120,7 +120,8 @@ def test_replaced_socket_is_rejected_without_removing_replacement(socket_rig):
     assert held and socket_path.read_text() == 'replacement'
 
 
-@pytest.mark.parametrize('fault', ['none', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation'])
+@pytest.mark.parametrize('fault', ['none', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation',
+                                   'daemon_pid', 'daemon_image', 'daemon_restart', 'daemon_changes_in_callback'])
 def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch, tmp_path, fault):
     supervisor, manifest, image, path, directory, held = socket_rig
     supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2)
@@ -177,9 +178,20 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
         expected.update(host_pid=child, process_start_ticks=ticks, manifest_digest=manifest.digest(),
             image_config_id=image.image_config_id, runnable_digest=image.runnable_reference,
             platform_manifest_digest=image.platform_manifest_digest, implementation_commit=image.source_commit)
+        changed = []
+        class SyntheticEngine:
+            def json(self, method, route, deadline):
+                assert method == 'GET' and route == '/containers/' + expected['container_id'] + '/json'
+                return 200, {'Id': expected['container_id'],
+                    'Image': 'sha256:' + '9' * 64 if fault == 'daemon_image' else image.image_config_id,
+                    'State': {'Running': True, 'Status': 'running', 'Paused': False,
+                        'Restarting': fault == 'daemon_restart', 'Dead': False,
+                        'Pid': child + 1 if fault == 'daemon_pid' or changed else child}}
+        supervisor._engine = SyntheticEngine()  # Real peer credentials, synthetic daemon response.
         if fault == 'wrong_manifest': expected['manifest_digest'] = 'sha256:' + '9' * 64
         def verify_app(_pins):
             if fault == 'during_callback': os.chmod(directory / 'controller.sock', 0o666)
+            if fault == 'daemon_changes_in_callback': changed.append(True)
             return True
         kwargs = dict(channel=channel, peer=peer,
             expected_without_nonce={k: v for k, v in expected.items() if k != 'nonce'},
@@ -193,7 +205,8 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
                     kwargs['expected_without_nonce']['manifest_digest'] = 'sha256:' + '9' * 64
                 return original_root_file(file_path, maximum)
             monkeypatch.setattr(launch, '_root_file', mutate_during_keyread)
-        if fault in ('during_callback', 'wrong_manifest'):
+        if fault in ('during_callback', 'wrong_manifest', 'daemon_pid', 'daemon_image', 'daemon_restart',
+                     'daemon_changes_in_callback'):
             with pytest.raises(launch.LaunchSupervisorError):
                 supervisor.serve_one_gate_start_enrollment(**kwargs)
             with supervisor._journal.transaction() as db:

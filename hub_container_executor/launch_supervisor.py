@@ -1390,6 +1390,30 @@ class LaunchSupervisor:
         finally:
             self._mutex.release()
 
+    def _gate_peer_engine_check(self, peer, pins, enrolled, deadline):
+        """Bind the accepted live peer to the pinned daemon's running container.
+
+        This establishes daemon accounting only; independent mount custody,
+        ledger fencing and the daemon's own integrity remain prerequisites.
+        """
+        container_id = pins.get('container_id') if type(pins) is dict else None
+        _require(type(container_id) is str and re.fullmatch(r'[0-9a-f]{64}', container_id)
+                 and type(pins.get('host_pid')) is int and pins['host_pid'] == peer.pid
+                 and type(pins.get('process_start_ticks')) is int
+                 and pins['process_start_ticks'] == peer.start
+                 and pins.get('image_config_id') == enrolled.image_config_id)
+        peer.check()
+        _, inspected = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+        _require(type(inspected) is dict and inspected.get('Id') == container_id
+                 and inspected.get('Image') == enrolled.image_config_id)
+        state = inspected.get('State')
+        _require(type(state) is dict and state.get('Running') is True
+                 and state.get('Status') == 'running' and state.get('Paused') is False
+                 and state.get('Restarting') is False and state.get('Dead') is False
+                 and type(state.get('Pid')) is int and state['Pid'] == peer.pid)
+        peer.check()
+        _remaining(deadline)
+
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
                                         verify_live, timeout_seconds):
@@ -1450,6 +1474,8 @@ class LaunchSupervisor:
 
                 def current(pins):
                     self._validate_live(deadline)
+                    if enrolled.schema == SOCKET_SCHEMA:
+                        self._gate_peer_engine_check(peer, pins, enrolled, deadline)
                     current_enrollment = load_application_gate_enrollment(enrollment_file,
                         manifest=manifest, image=image, supervisor=self)
                     _require(current_enrollment == enrolled and _root_file(key_path, 32)[1] == key_identity
@@ -1461,6 +1487,7 @@ class LaunchSupervisor:
                         and self._launch_id == supervisor_id and self._record() == record)
                     if enrolled.schema == SOCKET_SCHEMA:
                         self._gate_socket_check(enrolled)
+                        self._gate_peer_engine_check(peer, pins, enrolled, deadline)
                     _remaining(deadline)
                     return True
 
