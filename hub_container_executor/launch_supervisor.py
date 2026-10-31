@@ -461,6 +461,9 @@ def _unique(pairs):
 _GATE_ISSUANCE_SCHEMA = ('CREATE TABLE gate_issuance (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                          'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
                          'decision TEXT NOT NULL, digest TEXT NOT NULL)')
+_GATE_START_SCHEMA = ('CREATE TABLE gate_start (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                      'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
+                      'enrollment TEXT NOT NULL, digest TEXT NOT NULL)')
 
 
 class _Journal:
@@ -469,11 +472,15 @@ class _Journal:
     Restart can inspect retained rows but never adopts an earlier launch. The
     lock is held until close; no row or lock file is deleted on uncertainty.
     """
-    def __init__(self, path, *, create, gate_mode=False):
+    def __init__(self, path, *, create, gate_mode=False, start_mode=False):
         from engineering_hub.pilot_ownership import _local_filesystem
-        _require(type(create) is bool and type(gate_mode) is bool)
+        _require(type(create) is bool and type(gate_mode) is bool and type(start_mode) is bool
+                 and (gate_mode or not start_mode))
         self.gate_mode = gate_mode
+        self.start_mode = start_mode
         self._gate_fresh = gate_mode and create
+        self._start_fresh = start_mode and create
+        self._start_confirmed = False
         self._gate_lock = threading.Lock()
         self.path, self.pid = _path(path), os.getpid()
         self.parent = self.lock = None
@@ -505,13 +512,20 @@ class _Journal:
                                'state TEXT NOT NULL, receipt_digest TEXT)')
                     if gate_mode:
                         db.execute(_GATE_ISSUANCE_SCHEMA)
-                    db.execute('PRAGMA user_version=' + ('2' if gate_mode else '1'))
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == (2 if gate_mode else 1))
+                    if start_mode:
+                        db.execute(_GATE_START_SCHEMA)
+                    db.execute('PRAGMA user_version=' + ('3' if start_mode else '2' if gate_mode else '1'))
+                _require(db.execute('PRAGMA user_version').fetchone()[0] == (3 if start_mode else 2 if gate_mode else 1))
                 tables = {'launch', 'issuance'} | ({'gate_issuance'} if gate_mode else set())
+                if start_mode:
+                    tables.add('gate_start')
                 _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == tables)
                 if gate_mode:
                     _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_issuance'").fetchone()
                              == (_GATE_ISSUANCE_SCHEMA,))
+                if start_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_start'").fetchone()
+                             == (_GATE_START_SCHEMA,))
         except BaseException:
             self.close()
             raise
@@ -561,6 +575,43 @@ class _Journal:
             _require(db.execute('UPDATE issuance SET state=?,receipt_digest=? WHERE launch_id=?',
                                 (state, digest, identity)).rowcount == 1)
 
+    def reserve_gate_start(self, supervisor_id, supervisor_record, expected_without_nonce,
+                           bootstrap_digest, payload, digest):
+        """Durably reserve one start before sending; no cross-ledger atomicity."""
+        from .mount_gate_start_enrollment import PROTOCOL, AUDIENCE, _identity
+        from .mount_gate_protocol import IDENTITY_FIELDS
+        self._check()
+        with self._gate_lock:
+            try:
+                _require(self.start_mode and self._start_fresh and type(supervisor_id) is str
+                         and type(supervisor_record) is dict and type(expected_without_nonce) is dict
+                         and set(expected_without_nonce) == IDENTITY_FIELDS - {'nonce'}
+                         and type(payload) is dict and set(payload) == {'protocol', 'audience', 'identity',
+                             'bootstrap_digest', 'issued_at_ms', 'expires_at_ms'}
+                         and payload['protocol'] == PROTOCOL and payload['audience'] == AUDIENCE
+                         and type(bootstrap_digest) is str and _SHA.fullmatch(bootstrap_digest)
+                         and payload['bootstrap_digest'] == bootstrap_digest
+                         and type(digest) is str and _HEX.fullmatch(digest))
+                pins = payload['identity']; _identity(pins)
+                _require(all(type(pins[k]) is type(expected_without_nonce[k]) and pins[k] == expected_without_nonce[k]
+                             for k in expected_without_nonce))
+                issued, expires = payload['issued_at_ms'], payload['expires_at_ms']
+                _require(type(issued) is int and type(expires) is int and issued > 0
+                         and 0 < expires - issued <= 5000)
+                with self.transaction() as db:
+                    row = db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                    _require(row == ('running', _canonical(supervisor_record).decode()))
+                    db.execute('INSERT INTO gate_start VALUES (?,?,?,?,?,?)',
+                        (pins['operation_id'], pins['nonce'], pins['launch_id'], supervisor_id,
+                         _canonical(payload).decode(), digest))
+            except BaseException:
+                self._start_fresh = False
+                self._gate_fresh = False
+                raise
+            self._start_fresh = False
+            self._start_confirmed = True
+            return True
+
     def reserve_gate_issuance(self, supervisor_id, supervisor_record, expected, decision, digest):
         """One durable reservation in this journal; external authorities stay external.
 
@@ -587,6 +638,10 @@ class _Journal:
             with self.transaction() as db:
                 row = db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
                 _require(row == ('running', _canonical(supervisor_record).decode()))
+                if self.start_mode:
+                    _require(self._start_confirmed)
+                    started = db.execute('SELECT enrollment FROM gate_start WHERE supervisor_id=?', (supervisor_id,)).fetchone()
+                    _require(started is not None and json.loads(started[0])['identity'] == expected)
                 db.execute('INSERT INTO gate_issuance VALUES (?,?,?,?,?,?)',
                            (decision['operation_id'], decision['nonce'], decision['launch_id'], supervisor_id, encoded, digest))
         except BaseException:
@@ -616,10 +671,12 @@ class LaunchSupervisor:
     No automatic name adoption, POST retry, Docker stop/kill timeout, remove,
     cleanup of generations, key creation or restart recovery is implemented.
     """
-    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal, held_ranges_file=None):
+    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal,
+                 held_ranges_file=None, gate_start_mode=False):
         self._pid = os.getpid()
         self._held_path = self._held_identity = None
         self._mutex = threading.Lock()
+        self._gate_start_thread = None
         self._journal = self._engine = self._consumer = self._listener = None
         self._socket_parent = None
         self._socket_identity = None
@@ -632,7 +689,7 @@ class LaunchSupervisor:
         self._held = False
         self._source_pins = {}
         try:
-            _require(sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
+            _require(type(gate_start_mode) is bool and sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
                      and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'))
             self._enrollment_path, self._key_path = _path(enrollment_file), _path(signing_key_file)
             raw, self._enrollment_identity = _root_file(self._enrollment_path, 1024**2)
@@ -716,7 +773,8 @@ class LaunchSupervisor:
                 _require(not any(source == item or source in item.parents or item in source.parents for item in protected))
             _require(self._key_path != self._enrollment_path and self._key_path != _path(journal_file)
                      and self._enrollment_path != _path(journal_file))
-            self._journal = _Journal(journal_file, create=create_journal)
+            self._journal = _Journal(journal_file, create=create_journal,
+                                     gate_mode=gate_start_mode, start_mode=gate_start_mode)
             self._engine = _UnixEngine(self._daemon_pin)
         except BaseException:
             self.close()
@@ -1176,6 +1234,79 @@ class LaunchSupervisor:
     def serve_one_executor_handoff(self, channel):
         """Issue one measured-executor endpoint receipt; pair launch remains disabled."""
         return self._serve_one_role_handoff(channel, 'executor')
+
+    def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
+                                        manifest, image, enrollment_file, controller_key_file,
+                                        verify_live, timeout_seconds):
+        """Issue once through the v3 journal; trusted app/custody verification remains external.
+
+        The caller retains channel/peer ownership. No installed startup path
+        enables this method. A send is not a delivery acknowledgement; on any
+        error the supervisor holds, and an attempted reservation is never retried.
+        The callback must independently verify application identity, owner,
+        fence, mount custody and measured bootstrap under the host trust model.
+        It runs under the supervisor mutex and must not call any supervisor
+        method that acquires that mutex; recursive entry here is denied.
+        """
+        from .application_gate_enrollment import STATIC_SCHEMA, load_application_gate_enrollment
+        from .mount_gate_start_enrollment import MountGateStartEnrollmentController
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
+                 and getattr(self, '_gate_start_thread', None) != threading.get_ident())
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            self._gate_start_thread = threading.get_ident()
+            held = False
+            def hold(_pins=None):
+                nonlocal held
+                if not held:
+                    held = True
+                    self._hold()
+            try:
+                _require(self._journal.start_mode)
+                _remaining(deadline)
+                self._validate_live(deadline)
+                enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                    image=image, supervisor=self)
+                _require(enrolled.schema == STATIC_SCHEMA)
+                key_path = _path(controller_key_file)
+                key, key_identity = _root_file(key_path, 32)
+                _require(len(key) == 32)
+                signer = Ed25519PrivateKey.from_private_bytes(key)
+                del key
+                record = self._record()
+                supervisor_id = self._launch_id
+                _require(type(supervisor_id) is str)
+
+                def current(pins):
+                    self._validate_live(deadline)
+                    current_enrollment = load_application_gate_enrollment(enrollment_file,
+                        manifest=manifest, image=image, supervisor=self)
+                    _require(current_enrollment == enrolled and _root_file(key_path, 32)[1] == key_identity
+                             and self._launch_id == supervisor_id and self._record() == record
+                             and callable(verify_live) and verify_live(pins) is True)
+                    _remaining(deadline)
+                    return True
+
+                controller = MountGateStartEnrollmentController(channel=channel, peer=peer,
+                    expected_without_nonce=expected_without_nonce, bootstrap_digest=enrolled.bootstrap_digest,
+                    signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
+                    verify_live=current,
+                    reserve_start=lambda payload, digest: self._journal.reserve_gate_start(
+                        supervisor_id, record, expected_without_nonce, enrolled.bootstrap_digest, payload, digest),
+                    hold_uncertain=hold, timeout_seconds=min(timeout_seconds, _remaining(deadline)))
+                return controller.serve_once()
+            except BaseException:
+                if self._journal is not None:
+                    with self._journal._gate_lock:
+                        self._journal._gate_fresh = False
+                hold()
+                raise LaunchSupervisorError() from None
+        finally:
+            self._gate_start_thread = None
+            self._mutex.release()
 
     def serve_one_coordinator_handoff(self, channel):
         """Issue one measured-coordinator endpoint receipt; pair launch remains disabled."""
