@@ -177,6 +177,9 @@ class EffectJournal:
             raise Denied('broker cleanup is held')
         return tuple(self.db.execute("SELECT id,name FROM owned WHERE kind='container' ORDER BY id").fetchall())
 
+    def transfer_started(self):
+        return self.db.execute("SELECT 1 FROM effects WHERE kind='baseline_transfer_out' LIMIT 1").fetchone() is not None
+
     def seal(self):
         self.db.execute('BEGIN IMMEDIATE')
         try:
@@ -534,6 +537,7 @@ class LocalTestBroker:
                     snapshot.owner != self.owner or snapshot.daemon_id != self.volume.daemon_id or
                     snapshot.volume_name != self.volume.name or snapshot.volume_mount != self.volume.mountpoint or
                     snapshot.enrollment_digest != self._binding or
+                    self.journal.transfer_started() or
                     not hmac.compare_digest(self._binding, self._current_binding()) or
                     snapshot.containers != self.journal.sealed_inventory()):
                 raise Denied('broker cleanup boundary unavailable')
@@ -559,6 +563,81 @@ class LocalTestBroker:
                 raise Denied('cleanup journal changed; preserve resources')
             return CleanedBrokerSnapshot(snapshot.owner, snapshot.daemon_id, snapshot.volume_name,
                                          snapshot.volume_mount, snapshot.enrollment_digest, snapshot.containers)
+
+    def transfer_baseline_from(self, *, source, snapshot, manifest, rollback_image, provider):
+        """Transfer one exact baseline between sealed/bootstrap and run brokers.
+
+        Only same-process trusted fixture composition is supported. A protected
+        receipt remains a point-in-time observation, not host custody. A crash
+        or uncertainty in either journal holds both and is never auto-replayed.
+        """
+        from engineering_hub.container_pilot_manifest import PilotManifest
+        from hub_container_executor.adapter import HostAdapter
+        from hub_container_executor.backend import BaselineIdentity, ContainerPlan
+        from hub_container_executor.baseline_receipt import ProtectedBaselineProvider
+        from hub_container_executor.build_record import VerifiedImage
+        from hub_container_executor.daemon_backend import DockerEngineBackend
+        from hub_container_executor.runtime_profile import derive_runtime_profile, runtime_profile_digest
+        if (type(source) is not LocalTestBroker or source is self or type(snapshot) is not ClosedBrokerSnapshot or
+                type(manifest) is not PilotManifest or type(rollback_image) is not VerifiedImage or
+                rollback_image.role != 'rollback' or type(provider) is not ProtectedBaselineProvider or
+                source.journal is self.journal):
+            raise Denied('baseline transfer unavailable')
+        # The fixture owns both brokers and must call in this one fixed order.
+        with source._lock, self._lock:
+            if (not source._listener_closed or source._listener is None or source.journal.transfer_started() or
+                    source.owner != self.owner or source.volume != self.volume or source.version != self.version or
+                    source.socket_path != self.socket_path or source.socket_identity != self.socket_identity or
+                    source.images != self.images or source.exec_bodies != self.exec_bodies or
+                    not hmac.compare_digest(source._binding, source._current_binding()) or
+                    not hmac.compare_digest(self._binding, self._current_binding()) or
+                    snapshot.owner != source.owner or snapshot.daemon_id != source.volume.daemon_id or
+                    snapshot.volume_name != source.volume.name or snapshot.volume_mount != source.volume.mountpoint or
+                    snapshot.enrollment_digest != source._binding or
+                    snapshot.containers != source.journal.sealed_inventory() or len(snapshot.containers) != 1 or
+                    self.journal.is_sealed() or self.journal.db.execute('SELECT 1 FROM effects LIMIT 1').fetchone() or
+                    self.journal.db.execute('SELECT 1 FROM owned LIMIT 1').fetchone()):
+                raise Denied('baseline transfer boundary unavailable')
+            identity, name = snapshot.containers[0]
+            reserved = 'hub-pilot-' + uuid.UUID(self.owner).hex[:24] + '-00000000-000-rollback'
+            if (name != reserved or manifest.runtime.resource_name_prefix != 'hub-pilot-' + uuid.UUID(self.owner).hex[:24] or
+                    name not in source.creates or name not in self.creates or
+                    source.creates[name] != self.creates[name] or
+                    self.creates[name]['Image'] != rollback_image.runnable_reference or
+                    self.images.get(rollback_image.runnable_reference) !=
+                        (rollback_image.image_config_id, rollback_image.platform_manifest_digest) or
+                    manifest.rollback.image_config_id != rollback_image.image_config_id or
+                    manifest.rollback.source_commit != rollback_image.source_commit):
+                raise Denied('baseline transfer image mismatch')
+            baseline = provider.enrolled_baseline(manifest)
+            if (type(baseline) is not BaselineIdentity or provider.verify_baseline(baseline, manifest) is not True or
+                    baseline.container_id != identity or baseline.image_config_id != rollback_image.image_config_id or
+                    baseline.state_generation_id != Path(self.creates[name]['HostConfig']['Mounts'][0]['Source']).name):
+                raise Denied('baseline transfer receipt mismatch')
+            values = dict(item.split('=', 1) for item in self.creates[name]['Env'])
+            tokens = {key: values[key] for key in ('CODEX_TOKEN', 'HERMES_TOKEN', 'CLAUDE_TOKEN')}
+            profile = derive_runtime_profile(manifest, HostAdapter._defaults_from_record(rollback_image),
+                                             baseline.state_generation_id, tokens)
+            profile_digest = runtime_profile_digest(profile)
+            backend = object.__new__(DockerEngineBackend)
+            backend._gate_mount_verifier = None
+            plan = ContainerPlan(name, rollback_image, rollback_image.runnable_reference, False, profile)
+            source_path = Path(self.creates[name]['HostConfig']['Mounts'][0]['Source'])
+            if (provider._profile != profile_digest or
+                    backend._create_body(plan, source_path, profile.environment) != self.creates[name]):
+                raise Denied('baseline transfer profile mismatch')
+            source_ticket = source.journal.begin_cleanup('baseline_transfer_out', identity)
+            target_ticket = self.journal.begin('baseline_transfer_in', identity)
+            source._attest_volume(); self._attest_volume()
+            source._inspect_owned(identity, name, 'running')
+            self._inspect_owned(identity, name, 'running')
+            if (provider.verify_baseline(baseline, manifest) is not True or provider._profile != profile_digest or
+                    not hmac.compare_digest(source._binding, source._current_binding()) or
+                    not hmac.compare_digest(self._binding, self._current_binding())):
+                raise Denied('baseline transfer inputs changed')
+            source.journal.complete(source_ticket)
+            self.journal.complete(target_ticket, kind='container', identity=identity, name=name)
+            return baseline
 
     def _cleanup_effect(self, kind, identity, name):
         self._attest_volume()

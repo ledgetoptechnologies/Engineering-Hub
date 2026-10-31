@@ -19,17 +19,24 @@ certificates. Created-but-not-started containers are conservatively retained.
 
 `hub_local_native_binding.py` derives exact task names and state-generation
 identities from an already admitted native queue run. Its read-only snapshot is
-not a grant for host effects. The connected offline test exercises native
-events, queue, workflow, HostAdapter, SQLite generation copying, actual
-DockerEngineBackend code and broker Unix sockets against a **synthetic** Engine
-and synthetic image trust. It does not execute an application container or
-prove daemon, image provenance, protected-owner recovery, or staging custody.
+not a grant for host effects. The connected offline test prepares exact OCI
+fixture graphs with explicitly synthetic build assertions. A dedicated UID/GID
+10001 child holds its own PilotOwner while it creates and starts the baseline
+through the source broker, freezes its SQLite state and runs the actual
+BaselineObserver. The coordinator pins that observed draft, seals the source
+broker and transfers the exact baseline ID to the successor broker. Native
+events, queue, workflow, HostAdapter, SQLite generation copying and the actual
+DockerEngineBackend then exercise candidate failure and healthy rollback over
+broker Unix sockets against one **synthetic** Engine. This test uses legacy
+local reconciliation and does not execute an application container or prove
+daemon, image provenance, protected-owner recovery, or staging custody.
 
 There is **no real-daemon opt-in runner yet**. Before one can be reviewed, it
-still needs exact local OCI archive/manifest enrollment for both test images,
-an actual healthy task-owned baseline and frozen backup, a single lifecycle
-that connects the native admission to those resources, and verified aggregate
-budgets for the daemon, broker, controller, application containers and storage.
+still needs verified real OCI archives and independently supplied exact manifest
+digests for both test images, an actual healthy task-owned application baseline
+and frozen backup, and an operator-owned lifecycle connecting those real
+resources to native admission. Aggregate budgets for the daemon, broker,
+controller, application containers and storage also need verification.
 The existing archive helper requires an independently supplied exact manifest
 digest; a local Docker image ID is not that digest. A lost effect or any
 unverified cleanup retains the task resources for explicit inspection. Do not

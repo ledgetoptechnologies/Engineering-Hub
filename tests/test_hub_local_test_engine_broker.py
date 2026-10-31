@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import uuid
 
 import httpx
 import pytest
@@ -12,13 +13,14 @@ from hub_container_executor.daemon_backend import DockerEngineBackend, _PROBE_SC
 from scripts.hub_local_test_engine_broker import (CleanedBrokerSnapshot, Denied, EffectJournal,
                                                   LocalTestBroker, LocalTestSocketServer)
 from scripts.hub_local_test_volume import OwnedVolume
-from tests.test_hub_container_executor_daemon_backend import make_profile, packaged_hub_defaults, verified_image
+from tests.test_hub_container_executor_daemon_backend import make_profile, verified_image
 
 
 @pytest.fixture
 def rig(tmp_path):
     from dataclasses import replace
     _, image, _ = verified_image()
+    rollback_manifest, rollback_image, _ = verified_image('rollback')
     profile = replace(make_profile(image, secrets={'CODEX_TOKEN': 'synthetic-codex',
         'HERMES_TOKEN': 'synthetic-hermes', 'CLAUDE_TOKEN': 'synthetic-claude'}),
         cpu_millicores=300, pids_limit=80)
@@ -32,9 +34,14 @@ def rig(tmp_path):
     backend = object.__new__(DockerEngineBackend)
     backend._gate_mount_verifier = None
     body = backend._create_body(ContainerPlan(name, image, image.runnable_reference, False, profile), source, profile.environment)
-    second = json.loads(json.dumps(body)); second['Image'] = 'sha256:' + 'b' * 64
-    second['HostConfig']['Mounts'][0]['Source'] = volume + '/generations/rollback'
-    baseline_body = json.loads(json.dumps(second)); baseline_body['HostConfig']['Mounts'][0]['Source'] = volume + '/generations/baseline'
+    rollback_profile = replace(make_profile(rollback_image, generation_id='rollback', secrets={'CODEX_TOKEN': 'synthetic-codex',
+        'HERMES_TOKEN': 'synthetic-hermes', 'CLAUDE_TOKEN': 'synthetic-claude'}), cpu_millicores=300, pids_limit=80)
+    second = backend._create_body(ContainerPlan(other, rollback_image, rollback_image.runnable_reference, False, rollback_profile),
+                                  Path(volume) / 'generations' / 'rollback', rollback_profile.environment)
+    baseline_profile = replace(make_profile(rollback_image, generation_id='baseline-g1', secrets={'CODEX_TOKEN': 'synthetic-codex',
+        'HERMES_TOKEN': 'synthetic-hermes', 'CLAUDE_TOKEN': 'synthetic-claude'}), cpu_millicores=300, pids_limit=80)
+    baseline_body = backend._create_body(ContainerPlan(baseline, rollback_image, rollback_image.runnable_reference, False, baseline_profile),
+                                        Path(volume) / 'generations' / 'baseline-g1', baseline_profile.environment)
     probe = {'AttachStdin': False, 'AttachStdout': True, 'AttachStderr': False, 'Tty': False,
              'User': '10001:10001', 'Cmd': ['/usr/local/bin/python3', '-I', '-c', _PROBE_SCRIPT,
              'health_json', '/health', '200', 'probe', '1024', '1000', 'a' * 40]}
@@ -42,10 +49,12 @@ def rig(tmp_path):
     broker = LocalTestBroker(socket_path='/var/run/docker.sock', socket_identity=(1, 2), version='1.41',
                              owner=owner, volume=OwnedVolume(volume_name, owner, 'fixture-daemon', volume),
                              images={body['Image']: (image.image_config_id, image.platform_manifest_digest),
-                                     second['Image']: ('sha256:' + 'd' * 64, 'sha256:' + 'f' * 64)},
+                                     second['Image']: (rollback_image.image_config_id, rollback_image.platform_manifest_digest)},
                              creates={name: body, other: second, baseline: baseline_body}, exec_bodies=[probe], journal=journal)
     broker._attest_volume = lambda: None
     broker._read_bounded = lambda response, maximum: response.read(maximum + 1)
+    broker._fixture_rollback_manifest = rollback_manifest
+    broker._fixture_rollback_image = rollback_image
     yield broker, journal, name, body, probe
     journal.close()
 
@@ -312,6 +321,189 @@ def test_unknown_cleanup_stop_is_never_retried(rig, monkeypatch, tmp_path):
     assert journal.db.execute("SELECT state FROM effects WHERE kind='cleanup_stop'").fetchone() == ('pending',)
     with pytest.raises(Denied): broker.cleanup_owned(snapshot)
     assert [method for method, _ in calls].count('POST') == 1
+
+
+def _baseline_transfer_fixture(rig, tmp_path, monkeypatch):
+    import hashlib
+    from uuid import uuid4
+    from hub_container_executor.adapter import HostAdapter
+    from hub_container_executor.baseline_receipt import ProtectedBaselineProvider
+    from hub_container_executor.runtime_profile import derive_runtime_profile, probe_set_digest, runtime_profile_digest
+    from engineering_hub.container_pilot_manifest import PilotManifest
+    from tests.test_hub_container_executor_build_record import FakeStore
+    source, _, _, _, _ = rig
+    rollback = source._fixture_rollback_image
+    data = source._fixture_rollback_manifest.model_dump(mode='json', by_alias=True)
+    data['runtime']['resource_name_prefix'] = 'hub-pilot-' + uuid.UUID(source.owner).hex[:24]
+    data['runtime']['resources']['cpu_millicores'] = 300
+    data['runtime']['resources']['pids_limit'] = 80
+    manifest = PilotManifest.from_bytes(json.dumps(data).encode())
+    baseline_name = 'hub-pilot-' + uuid.UUID(source.owner).hex[:24] + '-00000000-000-rollback'
+    baseline_id = 'e' * 64
+    secrets = {'CODEX_TOKEN': 'synthetic-codex', 'HERMES_TOKEN': 'synthetic-hermes', 'CLAUDE_TOKEN': 'synthetic-claude'}
+    profile = derive_runtime_profile(manifest, HostAdapter._defaults_from_record(rollback), 'baseline-g1', secrets)
+    row = dict(schema='hub_baseline_receipt_v1', campaign_id=manifest.campaign_id, proof_id=str(uuid4()),
+        manifest_digest=manifest.digest(), baseline_id=manifest.state_policy.baseline_id,
+        runner=manifest.runner_binding.model_dump(mode='json'),
+        rollback=dict(runnable_reference=rollback.runnable_reference, runnable_media_type=rollback.runnable_media_type,
+            platform_manifest_digest=rollback.platform_manifest_digest, image_config_id=rollback.image_config_id,
+            source_commit=rollback.source_commit, record_digest=rollback.record_digest),
+        container_id=baseline_id, state_generation_id='baseline-g1',
+        backup=dict(digest=manifest.state_policy.baseline_backup_digest, size_bytes=4096),
+        runtime_profile_digest=runtime_profile_digest(profile), probe_set_digest=probe_set_digest(manifest.probes.rollback),
+        observation=dict(health='healthy', evidence_verified=True, observed_at=1700000000),
+        baseline_inventory=[dict(name='hub.sqlite3', size_bytes=4096, digest='sha256:' + 'a' * 64)])
+    raw = json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+    pin = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    store = FakeStore({pin: raw})
+    provider = ProtectedBaselineProvider(store, receipt_digest=pin, campaign_id=manifest.campaign_id,
+        verified_rollback=rollback, expected_runtime_profile_digest=row['runtime_profile_digest'])
+    source.journal.db.execute('INSERT INTO owned VALUES(?,?,?)', ('container', baseline_id, baseline_name))
+    tmp_path.chmod(0o700)
+    server = LocalTestSocketServer(str(tmp_path / 'bootstrap.sock'), source)
+    worker = threading.Thread(target=server.serve_forever); worker.start()
+    snapshot = source.seal(); server.shutdown(); worker.join(timeout=3); server.server_close()
+    assert not worker.is_alive()
+    creates = {name.replace('-bbbbbbbb-bbb-', '-cccccccc-ccc-'): body for name, body in source.creates.items()}
+    target_journal = EffectJournal(tmp_path / 'target.sqlite')
+    target = LocalTestBroker(socket_path=source.socket_path, socket_identity=source.socket_identity, version=source.version,
+        owner=source.owner, volume=source.volume, images=source.images, creates=creates,
+        exec_bodies=source.exec_bodies, journal=target_journal)
+    monkeypatch.setattr(source, '_attest_volume', lambda: None)
+    monkeypatch.setattr(target, '_attest_volume', lambda: None)
+    monkeypatch.setattr(source, '_inspect_owned', lambda *_: 'running')
+    monkeypatch.setattr(target, '_inspect_owned', lambda *_: 'running')
+    return source, target, target_journal, snapshot, manifest, rollback, provider, store, pin, baseline_name, baseline_id
+
+
+def test_exact_protected_baseline_transfers_once_and_source_cannot_cleanup(rig, tmp_path, monkeypatch):
+    source, target, journal, snapshot, manifest, image, provider, _, _, name, identity = _baseline_transfer_fixture(rig, tmp_path, monkeypatch)
+    try:
+        result = target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                               rollback_image=image, provider=provider)
+        assert result.container_id == identity and journal.owned('container', identity) == (name,)
+        assert source.journal.transfer_started()
+        with pytest.raises(Denied): source.cleanup_owned(snapshot)
+        with pytest.raises(Denied):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+        server = LocalTestSocketServer(str(tmp_path / 'run.sock'), target)
+        worker = threading.Thread(target=server.serve_forever)
+        worker.start()
+        try:
+            target_snapshot = target.seal()
+        finally:
+            try:
+                server.shutdown()
+            finally:
+                try:
+                    worker.join(timeout=3)
+                finally:
+                    server.server_close()
+        assert not worker.is_alive()
+        class Connection:
+            def close(self): pass
+        class Response:
+            status = 404
+        monkeypatch.setattr(target, '_request', lambda *_a, **_k: (Connection(), Response()))
+        monkeypatch.setattr(target, '_read_bounded', lambda *_: b'')
+        cleaned = target.cleanup_owned(target_snapshot)
+        assert type(cleaned) is CleanedBrokerSnapshot and cleaned.containers == ((identity, name),)
+    finally:
+        journal.close(); provider.close()
+
+
+def test_transfer_inspection_uncertainty_holds_both_journals(rig, tmp_path, monkeypatch):
+    source, target, journal, snapshot, manifest, image, provider, _, _, _, _ = _baseline_transfer_fixture(rig, tmp_path, monkeypatch)
+    def failure(*_): raise OSError('synthetic inspection lost')
+    monkeypatch.setattr(target, '_inspect_owned', failure)
+    try:
+        with pytest.raises(OSError):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+        assert source.journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_out'").fetchone() == ('pending',)
+        assert journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_in'").fetchone() == ('pending',)
+        with pytest.raises(Denied): source.cleanup_owned(snapshot)
+        with pytest.raises(Denied):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+    finally:
+        journal.close(); provider.close()
+
+
+def test_transfer_receipt_drift_after_intent_holds_both_journals(rig, tmp_path, monkeypatch):
+    source, target, journal, snapshot, manifest, image, provider, store, pin, _, _ = _baseline_transfer_fixture(rig, tmp_path, monkeypatch)
+    def drift(*_): store.values[pin] = b'changed receipt'
+    monkeypatch.setattr(target, '_inspect_owned', drift)
+    try:
+        with pytest.raises(Denied, match='inputs changed'):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+        assert source.journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_out'").fetchone() == ('pending',)
+        assert journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_in'").fetchone() == ('pending',)
+    finally:
+        journal.close(); provider.close()
+
+
+def test_transfer_failure_after_source_commit_keeps_target_held(rig, tmp_path, monkeypatch):
+    source, target, journal, snapshot, manifest, image, provider, _, _, _, _ = _baseline_transfer_fixture(rig, tmp_path, monkeypatch)
+    def failure(*_a, **_k): raise OSError('synthetic target commit loss')
+    monkeypatch.setattr(journal, 'complete', failure)
+    try:
+        with pytest.raises(OSError):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+        assert source.journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_out'").fetchone() == ('complete',)
+        assert journal.db.execute("SELECT state FROM effects WHERE kind='baseline_transfer_in'").fetchone() == ('pending',)
+        with pytest.raises(Denied): source.cleanup_owned(snapshot)
+        with pytest.raises(Denied):
+            target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                          rollback_image=image, provider=provider)
+    finally:
+        journal.close(); provider.close()
+
+
+def test_baseline_transfer_rechecks_both_brokers_through_synthetic_engine_uds(rig, tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler
+    import socketserver
+    from scripts.hub_local_test_engine_broker import UnixHTTPConnection
+    source, target, journal, snapshot, manifest, image, provider, _, _, name, identity = _baseline_transfer_fixture(rig, tmp_path, monkeypatch)
+    expected = source.creates[name]; mount = expected['HostConfig']['Mounts'][0]
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_): pass
+        def do_GET(self):
+            requests.append(self.path)
+            if self.path.endswith('/info'):
+                value = {'ID': source.volume.daemon_id, 'DockerRootDir': str(Path(source.mount).parents[2])}
+            elif '/volumes/' in self.path:
+                value = {'Name': source.volume.name, 'Driver': 'local', 'Scope': 'local', 'Mountpoint': source.mount,
+                         'Labels': {'engineering-hub.local-test-owner': source.owner}, 'Options': {}}
+            else:
+                assert self.path.endswith('/containers/' + identity + '/json')
+                value = {'Id': identity, 'Image': image.image_config_id, 'State': {'Status': 'running'},
+                         'Config': {'Image': expected['Image'], 'User': expected['User'], 'Env': expected['Env'],
+                                    'Labels': {'engineering-hub.local-test-owner': source.owner}},
+                         'HostConfig': expected['HostConfig'],
+                         'Mounts': [{'Type': 'bind', 'Source': mount['Source'], 'Destination': mount['Target'],
+                                     'RW': True, 'Mode': '', 'Propagation': 'rprivate'}]}
+            raw = json.dumps(value).encode(); self.send_response(200)
+            self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    path = str(tmp_path / 'synthetic-engine.sock')
+    upstream = socketserver.UnixStreamServer(path, Handler)
+    worker = threading.Thread(target=upstream.serve_forever); worker.start()
+    for broker in (source, target):
+        del broker._attest_volume; del broker._inspect_owned
+        if '_read_bounded' in broker.__dict__: del broker._read_bounded
+        monkeypatch.setattr(broker, '_connection', lambda timeout, total: UnixHTTPConnection(path, timeout, total))
+    try:
+        result = target.transfer_baseline_from(source=source, snapshot=snapshot, manifest=manifest,
+                                               rollback_image=image, provider=provider)
+        assert result.container_id == identity and journal.owned('container', identity) == (name,)
+        assert len(requests) == 6 and all(path.startswith('/v1.41/') for path in requests)
+    finally:
+        upstream.shutdown(); worker.join(timeout=3); upstream.server_close(); journal.close(); provider.close()
+    assert not worker.is_alive()
 
 
 def test_real_unix_socket_denies_unknown_path_and_removes_own_socket(rig, tmp_path):
