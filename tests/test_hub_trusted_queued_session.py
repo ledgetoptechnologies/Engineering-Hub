@@ -214,10 +214,28 @@ def test_independent_pilot_mode_mismatch_denied_before_transport(tmp_path, depen
 
 @pytest.mark.parametrize('mode', [None, 'legacy', 'other'])
 def test_v2_pilot_profile_requires_disjoint_mode(mode):
+    from engineering_hub.unified_pilot_startup import UnifiedPilotStartupError
     data = profile_document()
     data.update(schema='engineering-hub.unified-pilot.v2', profile_mode=mode)
-    with pytest.raises(Exception):
+    with pytest.raises(UnifiedPilotStartupError):
         parse_profile(encode(data))
+
+
+def test_v1_pilot_profile_rejects_v2_mode_field():
+    from engineering_hub.unified_pilot_startup import UnifiedPilotStartupError
+    data = profile_document()
+    data['profile_mode'] = 'disjoint-v3'
+    with pytest.raises(UnifiedPilotStartupError):
+        parse_profile(encode(data))
+
+
+def test_composition_rejects_forged_profile_mode_before_transport(tmp_path, dependencies):
+    parsed = parse_profile(encode(profile_document()))
+    forged = replace(parsed, profile_mode='forged')
+    with pytest.raises(module.TrustedSessionError):
+        module.TrustedQueuedSessionComposition(profile=forged, database=tmp_path / 'hub.sqlite3',
+            enrollment=module.parse_enrollment(encode(document())), ca_pem=b'ca', credential=b'credential')
+    assert dependencies.events == []
 
 
 @pytest.mark.asyncio
