@@ -238,6 +238,7 @@ class ExecutorLaunchProfile(_Closed):
     # Explicit new profile only; absent preserves every legacy profile digest.
     gate_channel: Literal['protected-socket-v1'] | None = None
     gate_completion: GateCompletionPolicy | None = None
+    gate_ledger_channel: Literal['supervisor-listener-v1'] | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -250,7 +251,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -283,6 +284,8 @@ class ExecutorLaunchProfile(_Closed):
             roles.add('gate_channel_directory')
         if self.gate_completion is not None:
             _require(self.gate_channel == 'protected-socket-v1' and self.daemon_policy is not None)
+        if self.gate_ledger_channel is not None:
+            _require(self.gate_completion is not None and self.gate_channel == 'protected-socket-v1')
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
@@ -314,7 +317,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel'):
             if value[name] is None:
                 del value[name]
         return value

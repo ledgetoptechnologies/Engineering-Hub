@@ -279,6 +279,21 @@ def test_executor_command_channel_is_a_signed_opt_in():
         core.ExecutorLaunchProfile.model_validate(without_policy)
 
 
+def test_ledger_handoff_requires_signed_completion_policy():
+    data = gate_profile()
+    legacy = core.ExecutorLaunchProfile.model_validate(data)
+    assert 'gate_ledger_channel' not in legacy.enrollment_value()
+    data['gate_ledger_channel'] = 'supervisor-listener-v1'
+    with pytest.raises((ValueError, RuntimeError)):
+        core.ExecutorLaunchProfile.model_validate(data)
+    data['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+    parsed = core.ExecutorLaunchProfile.model_validate(data)
+    assert parsed.gate_ledger_channel == 'supervisor-listener-v1'
+    assert parsed.digest() != legacy.digest()
+
+
 def _swap_mount(data, role, **fields):
     data['mounts'] = [dict(item, **fields) if item['role'] == role else item for item in data['mounts']]
 

@@ -35,7 +35,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from engineering_hub.container_pilot_manifest import Platform
-from engineering_hub.executor_launch_profile import LAUNCH_TARGETS
+from engineering_hub.executor_launch_profile import LAUNCH_TARGETS, MAX_PROFILE_BYTES
 from engineering_hub import current_executor_observation as current_observation
 from .build_record import VerifiedImage
 from .daemon_backend import _archive_metadata, _archive_image
@@ -49,6 +49,7 @@ _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
 GATE_MOUNT_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-mount-observation-request.v1'
+GATE_LEDGER_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-ledger-handoff-request.v1'
 _TARGETS = LAUNCH_TARGETS
 
 
@@ -523,6 +524,12 @@ _GATE_ISSUANCE_SCHEMA = ('CREATE TABLE gate_issuance (operation_id TEXT PRIMARY 
 _GATE_START_SCHEMA = ('CREATE TABLE gate_start (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                       'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
                       'enrollment TEXT NOT NULL, digest TEXT NOT NULL)')
+_LEDGER_HANDOFF_SCHEMA = ('CREATE TABLE ledger_handoff (supervisor_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                          'binding TEXT NOT NULL, digest TEXT NOT NULL)')
+_LEDGER_HANDOFF_FIELDS = frozenset({'protocol', 'audience', 'nonce', 'launch_id', 'boot_id',
+    'authenticated_host_pid', 'process_start_ticks', 'container_id', 'manifest_digest',
+    'launch_profile_digest', 'listener_device', 'listener_inode', 'path_device', 'path_inode',
+    'issued_at_ms', 'expires_at_ms'})
 
 
 class _Journal:
@@ -531,15 +538,18 @@ class _Journal:
     Restart can inspect retained rows but never adopts an earlier launch. The
     lock is held until close; no row or lock file is deleted on uncertainty.
     """
-    def __init__(self, path, *, create, gate_mode=False, start_mode=False):
+    def __init__(self, path, *, create, gate_mode=False, start_mode=False, ledger_mode=False):
         from engineering_hub.pilot_ownership import _local_filesystem
         _require(type(create) is bool and type(gate_mode) is bool and type(start_mode) is bool
-                 and (gate_mode or not start_mode))
+                 and type(ledger_mode) is bool and (gate_mode or not start_mode)
+                 and (start_mode or not ledger_mode))
         self.gate_mode = gate_mode
         self.start_mode = start_mode
+        self.ledger_mode = ledger_mode
         self._gate_fresh = gate_mode and create
         self._start_fresh = start_mode and create
         self._start_confirmed = False
+        self._ledger_fresh = ledger_mode and create
         self._gate_lock = threading.Lock()
         self.path, self.pid = _path(path), os.getpid()
         self.parent = self.lock = None
@@ -573,11 +583,15 @@ class _Journal:
                         db.execute(_GATE_ISSUANCE_SCHEMA)
                     if start_mode:
                         db.execute(_GATE_START_SCHEMA)
-                    db.execute('PRAGMA user_version=' + ('3' if start_mode else '2' if gate_mode else '1'))
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == (3 if start_mode else 2 if gate_mode else 1))
+                    if ledger_mode:
+                        db.execute(_LEDGER_HANDOFF_SCHEMA)
+                    db.execute('PRAGMA user_version=' + ('4' if ledger_mode else '3' if start_mode else '2' if gate_mode else '1'))
+                _require(db.execute('PRAGMA user_version').fetchone()[0] == (4 if ledger_mode else 3 if start_mode else 2 if gate_mode else 1))
                 tables = {'launch', 'issuance'} | ({'gate_issuance'} if gate_mode else set())
                 if start_mode:
                     tables.add('gate_start')
+                if ledger_mode:
+                    tables.add('ledger_handoff')
                 _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == tables)
                 if gate_mode:
                     _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_issuance'").fetchone()
@@ -585,6 +599,9 @@ class _Journal:
                 if start_mode:
                     _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_start'").fetchone()
                              == (_GATE_START_SCHEMA,))
+                if ledger_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='ledger_handoff'").fetchone()
+                             == (_LEDGER_HANDOFF_SCHEMA,))
         except BaseException:
             self.close()
             raise
@@ -628,6 +645,55 @@ class _Journal:
         with self.transaction() as db:
             _require(db.execute('SELECT state FROM launch WHERE id=?', (identity,)).fetchone() == ('running',))
             db.execute('INSERT INTO issuance VALUES (?,?,?,NULL)', (identity, nonce, 'reserved'))
+
+    def reserve_ledger_handoff(self, supervisor_id, supervisor_record, binding, digest):
+        """Reserve one handoff before descriptor send; ambiguity never permits retry.
+
+        Caller must validate live peer, signed envelope and protected listener;
+        this journal records those claims but does not establish their truth.
+        """
+        self._check()
+        with self._gate_lock:
+            try:
+                _require(self.ledger_mode and self._ledger_fresh and type(supervisor_id) is str
+                         and type(supervisor_record) is dict and type(binding) is dict
+                         and set(binding) == _LEDGER_HANDOFF_FIELDS and type(digest) is str
+                         and _HEX.fullmatch(digest))
+                snapshot = json.loads(_canonical(binding))
+                _require(snapshot['protocol'] == 'engineering-hub.gate-ledger-handoff.v1'
+                         and snapshot['audience'] == 'engineering-hub.container-executor-ledger'
+                         and snapshot['launch_id'] == supervisor_id
+                         and type(snapshot['boot_id']) is str and str(UUID(snapshot['boot_id'])) == snapshot['boot_id']
+                         and type(snapshot['container_id']) is str and _HEX.fullmatch(snapshot['container_id'])
+                         and all(type(snapshot[k]) is int and 0 < snapshot[k] < 2**63
+                                 for k in ('authenticated_host_pid', 'process_start_ticks', 'issued_at_ms', 'expires_at_ms'))
+                         and 0 < snapshot['expires_at_ms'] - snapshot['issued_at_ms'] <= 5000
+                         and type(supervisor_record.get('approval_expires_at_ms')) is int
+                         and snapshot['expires_at_ms'] <= supervisor_record['approval_expires_at_ms']
+                         and snapshot['boot_id'] == supervisor_record.get('boot_id')
+                         and snapshot['container_id'] == supervisor_record.get('container_id')
+                         and snapshot['authenticated_host_pid'] == supervisor_record.get('pid')
+                         and snapshot['process_start_ticks'] == supervisor_record.get('start_ticks')
+                         and snapshot['launch_profile_digest'] == supervisor_record.get('manifest')
+                         and type(snapshot['nonce']) is str and _HEX.fullmatch(snapshot['nonce'])
+                         and all(type(snapshot[k]) is str and _SHA.fullmatch(snapshot[k])
+                                 for k in ('manifest_digest', 'launch_profile_digest'))
+                         and all(type(snapshot[k]) is int and 0 <= snapshot[k] < 2**63
+                                 for k in ('listener_device', 'path_device'))
+                         and all(type(snapshot[k]) is int and 0 < snapshot[k] < 2**63
+                                 for k in ('listener_inode', 'path_inode')))
+                encoded = _canonical(snapshot).decode()
+                with self.transaction() as db:
+                    _require(db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                             == ('running', _canonical(supervisor_record).decode()))
+                    _require(db.execute('SELECT state FROM issuance WHERE launch_id=?', (supervisor_id,)).fetchone()
+                             == ('sent',))
+                    db.execute('INSERT INTO ledger_handoff VALUES (?,?,?,?)',
+                               (supervisor_id, snapshot['nonce'], encoded, digest))
+            finally:
+                # Even a raised commit/fsync can have committed. Never retry.
+                self._ledger_fresh = False
+            return True
 
     def issuance_state(self, identity, state, digest):
         with self.transaction() as db:
@@ -741,6 +807,8 @@ class LaunchSupervisor:
         self._gate_manifest = self._gate_image = self._gate_policy_path = None
         self._gate_accepted_channel = self._gate_accepted_peer = None
         self._gate_accept_used = False
+        self._ledger_handoff_parent = self._ledger_handoff_listener = None
+        self._ledger_handoff_directory = self._ledger_handoff_path_identity = None
         self._journal = self._engine = self._consumer = self._listener = None
         self._socket_parent = None
         self._socket_identity = None
@@ -839,7 +907,8 @@ class LaunchSupervisor:
             _require(self._key_path != self._enrollment_path and self._key_path != _path(journal_file)
                      and self._enrollment_path != _path(journal_file))
             self._journal = _Journal(journal_file, create=create_journal,
-                                     gate_mode=gate_start_mode, start_mode=gate_start_mode)
+                                     gate_mode=gate_start_mode, start_mode=gate_start_mode,
+                                     ledger_mode=self.profile.gate_ledger_channel is not None)
             self._engine = _UnixEngine(self._daemon_pin)
         except BaseException:
             self.close()
@@ -1261,6 +1330,7 @@ class LaunchSupervisor:
         _require((parsed.pair is not None) ==
                  (self.profile.command_channel == 'inherited-seqpacket-v1'))
         _require((parsed.gate_socket_directory is not None) == (self.profile.gate_channel is not None))
+        _require(parsed.gate_ledger_channel == (self.profile.gate_ledger_channel == 'supervisor-listener-v1'))
         if parsed.gate_socket_directory is not None:
             _require(self._mounts['gate_channel_directory'].source == parsed.gate_socket_directory)
         return parsed
@@ -1952,6 +2022,112 @@ class LaunchSupervisor:
         except _ObservationWaitExpired:
             return False
 
+    def _ledger_handoff_path_check(self):
+        """Check the retained root-only rendezvous, not app or signer custody."""
+        parent = self._ledger_handoff_parent
+        directory = self._ledger_handoff_directory
+        _require(parent is not None and directory is not None and self._ledger_handoff_path_identity is not None)
+        info = os.lstat(directory)
+        endpoint = os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+        _require(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                 and stat.S_IMODE(info.st_mode) == 0o711
+                 and _identity(info) == _identity(os.fstat(parent))
+                 and _identity(info) == self._source_pins['gate_channel_directory']
+                 and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == endpoint.st_gid == 0
+                 and stat.S_IMODE(endpoint.st_mode) == 0o600
+                 and _identity(endpoint) == self._ledger_handoff_path_identity)
+
+    def _issue_ledger_handoff_locked(self, peer, nonce, deadline):
+        """Reserve once and deliver one protected listener to the exact executor.
+
+        Delivery may be uncertain; the durable reservation is never retryable.
+        Host isolation and exclusive descriptor custody remain external gates.
+        """
+        from .gate_ledger_handoff import PROTOCOL, AUDIENCE, DOMAIN
+        try:
+            self._guard()
+            _require(self._receipt_served and not self._issuance_open and self._journal.ledger_mode
+                     and self.profile.gate_ledger_channel == 'supervisor-listener-v1'
+                     and self._ledger_handoff_parent is None and self._ledger_handoff_listener is None)
+            self._validate_live(deadline)
+            manifest = self._handoff_manifest_digest()
+            directory = _path(self._mounts['gate_channel_directory'].source)
+            parent = _root_parent(directory / 'ledger.sock', private=False)
+            self._ledger_handoff_parent, self._ledger_handoff_directory = parent, directory
+            info = os.fstat(parent)
+            _require(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                     and stat.S_IMODE(info.st_mode) == 0o711
+                     and _identity(info) == _identity(os.lstat(directory))
+                     and _identity(info) == self._source_pins['gate_channel_directory'])
+            try:
+                os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            self._ledger_handoff_listener = listener
+            endpoint = f'/proc/self/fd/{parent}/ledger.sock'
+            _require(len(endpoint.encode()) <= 107)
+            listener.bind(endpoint)
+            initial = os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(initial.st_mode))
+            self._ledger_handoff_path_identity = _identity(initial)
+            os.chmod('ledger.sock', 0o600, dir_fd=parent, follow_symlinks=False)
+            listener.listen(1)
+            self._ledger_handoff_path_check()
+            fd_info = os.fstat(listener.fileno())
+            _require(stat.S_ISSOCK(fd_info.st_mode))
+            now = int(time.time() * 1000)
+            expires = min(now + 5000, now + int(_remaining(self._expires) * 1000),
+                          self._approval_expires_at_ms)
+            _require(now < expires)
+            binding = {'protocol': PROTOCOL, 'audience': AUDIENCE, 'nonce': nonce,
+                'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
+                'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
+                'container_id': self._container_id, 'manifest_digest': manifest,
+                'launch_profile_digest': self.release.launch_profile_digest,
+                'listener_device': fd_info.st_dev, 'listener_inode': fd_info.st_ino,
+                'path_device': initial.st_dev, 'path_inode': initial.st_ino,
+                'issued_at_ms': now, 'expires_at_ms': expires}
+            signature = base64.urlsafe_b64encode(self._signer.sign(DOMAIN + _canonical(binding))).rstrip(b'=').decode()
+            raw = _canonical({'payload': binding, 'signature': signature})
+            profile_raw = _canonical(self.profile.enrollment_value())
+            _require(0 < len(raw) <= MAX_RECEIPT_BYTES and 0 < len(profile_raw) <= MAX_PROFILE_BYTES
+                     and 'sha256:' + hashlib.sha256(profile_raw).hexdigest() == self.release.launch_profile_digest)
+            record = json.loads(_canonical(self._record()))
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(self._handoff_manifest_digest() == manifest and int(time.time() * 1000) < expires)
+            self._journal.reserve_ledger_handoff(self._launch_id, record, binding, hashlib.sha256(raw).hexdigest())
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(self._handoff_manifest_digest() == manifest and int(time.time() * 1000) < expires)
+            frame = struct.pack('!I', len(raw)) + raw
+            peer.settimeout(_remaining(deadline))
+            _require(peer.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                       array.array('i', [listener.fileno()]))]) == len(frame))
+            peer.settimeout(_remaining(deadline))
+            peer.sendall(struct.pack('!I', len(profile_raw)) + profile_raw)
+            peer.shutdown(socket.SHUT_WR)
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(int(time.time() * 1000) < expires)
+            _remaining(deadline)
+            return True
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            if self._ledger_handoff_listener is not None:
+                try:
+                    self._ledger_handoff_listener.close()
+                except BaseException:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+                finally:
+                    self._ledger_handoff_listener = None
+
     def _serve_current_peer_until(self, deadline):
         with self._observation_mutex(deadline, wait_window=True):
             peer = None
@@ -1965,7 +2141,8 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] in (CURRENT_REQUEST_PROTOCOL, GATE_MOUNT_REQUEST_PROTOCOL)
+                         and request['protocol'] in (CURRENT_REQUEST_PROTOCOL, GATE_MOUNT_REQUEST_PROTOCOL,
+                                                     GATE_LEDGER_REQUEST_PROTOCOL)
                          and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
@@ -1978,6 +2155,8 @@ class LaunchSupervisor:
                     peer.close()
                 raise
             try:
+                if request['protocol'] == GATE_LEDGER_REQUEST_PROTOCOL:
+                    return self._issue_ledger_handoff_locked(peer, request['nonce'], deadline)
                 raw = (self._observe_gate_mount_locked(request['nonce'], deadline)
                        if request['protocol'] == GATE_MOUNT_REQUEST_PROTOCOL
                        else self._observe_current_launch_locked(request['nonce'], deadline))
@@ -2083,12 +2262,13 @@ class LaunchSupervisor:
         self._issuance_open = False
         self._closed = True
         failed = False
-        for name in ('_listener', '_socket_parent', '_gate_listener', '_gate_parent', '_gate_accepted_channel',
+        for name in ('_listener', '_socket_parent', '_gate_listener', '_gate_parent', '_ledger_handoff_listener',
+                     '_ledger_handoff_parent', '_gate_accepted_channel',
                      '_gate_accepted_peer', '_consumer', '_engine', '_journal'):
             value = getattr(self, name, None)
             if value is not None:
                 try:
-                    if name in ('_socket_parent', '_gate_parent'):
+                    if name in ('_socket_parent', '_gate_parent', '_ledger_handoff_parent'):
                         os.close(value)
                     else:
                         value.close()

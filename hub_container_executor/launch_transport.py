@@ -28,6 +28,7 @@ from .runtime_identity import MAX_RECEIPT_BYTES, RuntimeIdentityError
 REQUEST_PROTOCOL = "engineering-hub.executor-launch-request.v1"
 CURRENT_REQUEST_PROTOCOL = "engineering-hub.executor-current-observation-request.v1"
 GATE_MOUNT_REQUEST_PROTOCOL = "engineering-hub.executor-gate-mount-observation-request.v1"
+GATE_LEDGER_REQUEST_PROTOCOL = "engineering-hub.executor-gate-ledger-handoff-request.v1"
 MAX_REQUEST_BYTES = 256
 _NONCE = re.compile(r"[0-9a-f]{64}\Z")
 _LENGTH = struct.Struct("!I")
@@ -445,6 +446,7 @@ class UnixCurrentObservationTransport:
             self._lock = threading.Lock()
             self._closed = False
             self._busy = False
+            self._ledger_used = False
         except Exception:
             raise RuntimeIdentityError('Current launch issuer exchange unavailable') from None
 
@@ -453,6 +455,76 @@ class UnixCurrentObservationTransport:
 
     def observe_gate_mount(self, *, nonce, timeout_ms):
         return self._observe(nonce=nonce, timeout_ms=timeout_ms, protocol=GATE_MOUNT_REQUEST_PROTOCOL)
+
+    def issue_ledger_listener(self, *, verifier, manifest_digest, source_directory, timeout_ms):
+        """Receive one signed listener; caller owns the returned descriptor.
+
+        This one-shot exchange must be direct. Lost replies are uncertain and
+        must not be retried; all unexpected received rights are closed.
+        """
+        from .gate_ledger_handoff import verify_handoff
+        from engineering_hub.executor_launch_profile import MAX_PROFILE_BYTES, verify_profile_bytes
+        fds, admitted = [], False
+        try:
+            _require(os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
+                     and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
+            started, wall = time.monotonic(), int(time.time() * 1000)
+            deadline = started + timeout_ms / 1000
+            nonce = secrets.token_hex(32)
+            _require(self._lock.acquire(blocking=False))
+            try:
+                _require(not self._closed and not self._busy and not self._ledger_used)
+                self._ledger_used = True
+                self._busy = admitted = True
+            finally:
+                self._lock.release()
+            identity = _socket_leaf(self._path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(_remaining(deadline)); connection.connect(self._path)
+                peer_pid, uid, gid = _CREDENTIALS.unpack(connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _CREDENTIALS.size))
+                _require(peer_pid >= 0 and (uid, gid) == (self._uid, self._gid) and _socket_leaf(self._path) == identity)
+                request = _canonical({'protocol': GATE_LEDGER_REQUEST_PROTOCOL, 'nonce': nonce})
+                connection.sendall(_LENGTH.pack(len(request)) + request); connection.shutdown(socket.SHUT_WR)
+                result = bytearray()
+                while True:
+                    connection.settimeout(_remaining(deadline))
+                    part, controls, flags, _ = connection.recvmsg(65536,
+                        socket.CMSG_SPACE(64 * array.array('i').itemsize), socket.MSG_CMSG_CLOEXEC)
+                    bad = bool(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+                    for level, kind, data in controls:
+                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                            received = array.array('i'); received.frombytes(data[:len(data) - len(data) % received.itemsize])
+                            if result or not part or fds or len(data) % received.itemsize: bad = True
+                            fds.extend(received)
+                        else: bad = True
+                    _require(not bad and len(fds) <= 1)
+                    if not part: break
+                    result.extend(part); _require(len(result) <= MAX_RECEIPT_BYTES + MAX_PROFILE_BYTES + 8)
+                _require(len(fds) == 1 and len(result) >= 8)
+                size = _LENGTH.unpack(result[:4])[0]
+                end = size + 4
+                _require(0 < size <= MAX_RECEIPT_BYTES and len(result) >= end + 4
+                         and _socket_leaf(self._path) == identity)
+                profile_size = _LENGTH.unpack(result[end:end + 4])[0]
+                _require(0 < profile_size <= MAX_PROFILE_BYTES and len(result) == end + 4 + profile_size)
+                raw = _receipt_frame(bytes(result[4:end]))
+                profile_bytes = bytes(result[end + 4:])
+                verify_handoff(raw, fds[0], verifier=verifier, nonce=nonce, manifest_digest=manifest_digest,
+                               source_directory=source_directory, start_wall_ms=wall, start_monotonic=started)
+                profile = verify_profile_bytes(profile_bytes, verifier.launch_profile_digest())
+                _require(profile.gate_ledger_channel == 'supervisor-listener-v1' and profile.gate_completion is not None)
+                mount = next((m for m in profile.mounts if m.role == 'gate_channel_directory'), None)
+                _require(mount is not None and mount.source == mount.target == source_directory and mount.read_only)
+                _remaining(deadline)
+                return fds.pop(), raw, nonce, wall, started, profile_bytes
+        except Exception:
+            raise RuntimeIdentityError(_ERROR) from None
+        finally:
+            for fd in fds:
+                try: os.close(fd)
+                except OSError: pass
+            if admitted:
+                with self._lock: self._busy = False
 
     def _observe(self, *, nonce, timeout_ms, protocol):
         admitted = False

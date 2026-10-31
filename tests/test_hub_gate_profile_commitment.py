@@ -31,3 +31,23 @@ def test_v3_config_cannot_be_silently_used_with_legacy_profile():
     supervisor.profile = ExecutorLaunchProfile.model_validate(legacy)
     supervisor._mounts = {item.role: item for item in supervisor.profile.mounts}
     with pytest.raises(LaunchSupervisorError): supervisor._runner_configuration(canonical(data))
+
+
+def test_ledger_config_requires_matching_signed_profile():
+    data = gate_profile()
+    data['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+    data['gate_ledger_channel'] = 'supervisor-listener-v1'
+    supervisor = object.__new__(LaunchSupervisor)
+    supervisor.profile = ExecutorLaunchProfile.model_validate(data)
+    supervisor._mounts = {item.role: item for item in supervisor.profile.mounts}
+    config = configuration(); config['schema'] = installed_runner.GATE_LEDGER_SCHEMA
+    config['gate_socket_directory'] = supervisor._mounts['gate_channel_directory'].source
+    assert supervisor._runner_configuration(canonical(config)).gate_ledger_channel is True
+    config['schema'] = installed_runner.GATE_SCHEMA
+    with pytest.raises(LaunchSupervisorError): supervisor._runner_configuration(canonical(config))
+    data.pop('gate_ledger_channel')
+    supervisor.profile = ExecutorLaunchProfile.model_validate(data)
+    config['schema'] = installed_runner.GATE_LEDGER_SCHEMA
+    with pytest.raises(LaunchSupervisorError): supervisor._runner_configuration(canonical(config))

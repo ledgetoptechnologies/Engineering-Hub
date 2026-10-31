@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import socket
 import stat
 import sys
 from types import MappingProxyType
@@ -39,6 +40,7 @@ from engineering_hub.server import _signal_stop
 SCHEMA = 'engineering-hub.installed-executor.v1'
 PAIR_SCHEMA = 'engineering-hub.installed-executor.v2'
 GATE_SCHEMA = 'engineering-hub.installed-executor.v3'
+GATE_LEDGER_SCHEMA = 'engineering-hub.installed-executor.v5'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -117,6 +119,7 @@ class RunnerConfiguration:
     process_id: int
     pair: object = None
     gate_socket_directory: str | None = None
+    gate_ledger_channel: bool = False
 
 
 def parse_configuration(raw):
@@ -136,8 +139,8 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA))
-        extra = {'pair'} if value['schema'] == PAIR_SCHEMA else {'gate_socket_directory'} if value['schema'] == GATE_SCHEMA else set()
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA, GATE_LEDGER_SCHEMA))
+        extra = {'pair'} if value['schema'] == PAIR_SCHEMA else {'gate_socket_directory'} if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA) else set()
         _object(value, _ROOT_FIELDS | extra)
         _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
@@ -208,7 +211,7 @@ def parse_configuration(raw):
                  and socket_path != binding.unix_socket_path)
         pair = None
         gate_directory = None
-        if value['schema'] == GATE_SCHEMA:
+        if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA):
             gate_directory = _path(value['gate_socket_directory'])
             gate = PurePosixPath(gate_directory)
             others = [PurePosixPath(resources[name]) for name in _RESOURCE_PATHS]
@@ -229,7 +232,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid(), pair, gate_directory)
+            socket_path, bearer_slot, os.getpid(), pair, gate_directory, value['schema'] == GATE_LEDGER_SCHEMA)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -346,10 +349,40 @@ async def run_installed_executor(config):
             factory = partial(local_host_adapter_resources, manifest=config.manifest,
                 binding=config.binding, **config.resources, driver_identity_verifier=verifier,
                 **gate_options)
+            gate_worker_factory = None
+            if config.gate_ledger_channel:
+                from .gate_ledger_channel import OwnedGateLedgerService
+                from .gate_ledger_handoff import verify_handoff
+                handoff_transport = UnixCurrentObservationTransport(**config.transport)
+                owned.callback(handoff_transport.close)
+                fd, raw, nonce, wall, started, profile_bytes = handoff_transport.issue_ledger_listener(
+                    verifier=verifier, manifest_digest=config.manifest.digest(),
+                    source_directory=config.gate_socket_directory, timeout_ms=config.timeout_ms)
+                descriptor = [fd]
+                def close_listener():
+                    if descriptor[0] is not None:
+                        os.close(descriptor[0]); descriptor[0] = None
+                owned.callback(close_listener)
+                def gate_worker_factory(adapter):
+                    _require(descriptor[0] is not None)
+                    verify_handoff(raw, descriptor[0], verifier=verifier, nonce=nonce,
+                        manifest_digest=config.manifest.digest(), source_directory=config.gate_socket_directory,
+                        start_wall_ms=wall, start_monotonic=started)
+                    listener = socket.socket(fileno=descriptor[0]); descriptor[0] = None
+                    try:
+                        return OwnedGateLedgerService(listener=listener, ledger=adapter.ledger,
+                            supervisor_public_key=verifier.issuer_public_key(), launch_verifier=verifier,
+                            manifest_digest=config.manifest.digest(), hold_uncertain=adapter.ledger.hold_gate_uncertain,
+                            timeout_seconds=min(5, config.timeout_ms / 1000), completion_profile_bytes=profile_bytes,
+                            require_sender_liveness=True)
+                    except BaseException:
+                        listener.close()
+                        raise
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
                 socket_path=config.socket_path, current_observation_transport=observations,
-                current_observation_timeout_ms=config.timeout_ms)
+                current_observation_timeout_ms=config.timeout_ms,
+                **({'gate_worker_factory': gate_worker_factory} if gate_worker_factory is not None else {}))
     except Exception:
         raise InstalledRunnerError() from None
 
