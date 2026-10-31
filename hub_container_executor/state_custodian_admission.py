@@ -33,6 +33,7 @@ FIELDS = frozenset({'protocol', 'operation_id', 'command_id', 'run_id', 'target_
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 _SCHEMA = 'CREATE TABLE admissions (operation_id TEXT PRIMARY KEY, nonce TEXT NOT NULL UNIQUE, payload BLOB NOT NULL, signature BLOB NOT NULL)'
+_HOLD_SCHEMA = 'CREATE TABLE custody_holds (target_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, admission_digest TEXT NOT NULL, fence INTEGER NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL, host_uid INTEGER NOT NULL, host_gid INTEGER NOT NULL, owner_policy_digest TEXT NOT NULL)'
 _TRANSPORT = r'''
 import array, os, socket, struct, sys
 s = socket.socket(fileno=int(sys.argv[1]))
@@ -62,9 +63,10 @@ class CustodianAdmissionError(RuntimeError):
 class CustodianAdmissionJournal:
     """Consume signed observations once in a root-owned, single-owner journal.
 
-    Enrollment is canonical JSON containing schema=1, supervisor_public_key,
-    manifest_digest, source_backup_digest, provider_key_digest, provider_uid and provider_gid. Its file
-    and ancestors must satisfy the existing root-protected enrollment rules.
+    Enrollment is canonical root-protected JSON pinning supervisor public key,
+    manifest and backup digests, and provider identity. Schema 2 also pins the
+    exact journal path and is required for private ownership preparation; schema
+    1 never upgrades itself to ownership authority.
     Root and its administrators remain trusted; no anti-rollback storage is
     claimed. This module can copy a backup into root-private quarantine; it
     provides no network listener, ownership handoff or application publication.
@@ -81,9 +83,12 @@ class CustodianAdmissionJournal:
             enrollment_path, journal_path = Path(enrollment_path), Path(journal_path)
             raw, self._enrollment_pin = _root_file(enrollment_path, 4096)
             policy = json.loads(raw)
-            if (type(policy) is not dict or set(policy) != {'schema', 'supervisor_public_key', 'manifest_digest',
-                    'source_backup_digest', 'provider_key_digest', 'provider_uid', 'provider_gid'} or _canonical(policy) != raw
-                    or type(policy['schema']) is not int or policy['schema'] != 1
+            base = {'schema', 'supervisor_public_key', 'manifest_digest', 'source_backup_digest',
+                    'provider_key_digest', 'provider_uid', 'provider_gid'}
+            if (type(policy) is not dict or type(policy.get('schema')) is not int or policy['schema'] not in (1, 2)
+                    or set(policy) != base | ({'journal_path'} if policy['schema'] == 2 else set()) or _canonical(policy) != raw
+                    or (policy['schema'] == 2 and (type(policy['journal_path']) is not str
+                        or _path(policy['journal_path']) != journal_path))
                     or any(type(policy[k]) is not int or not 0 < policy[k] < 2**32 - 1 for k in ('provider_uid', 'provider_gid'))
                     or not _HEX.fullmatch(policy['supervisor_public_key'])
                     or any(not isinstance(policy[k], str) or not _SHA.fullmatch(policy[k])
@@ -111,18 +116,28 @@ class CustodianAdmissionJournal:
             if any(os.path.lexists(str(journal_path) + suffix) for suffix in ('-journal', '-wal', '-shm')):
                 raise ValueError()
             self._db = sqlite3.connect(str(journal_path), timeout=2, isolation_level=None)
+            self._holds_supported = create and policy['schema'] == 2
             if not create:
                 objects = self._db.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
                 indexes = self._db.execute("PRAGMA index_list('admissions')").fetchall()
-                if (objects != [('table', 'admissions', _SCHEMA)] or len(indexes) != 2
+                has_holds = ('table', 'custody_holds', _HOLD_SCHEMA) in objects
+                self._holds_supported = has_holds and policy['schema'] == 2
+                expected = [('table', 'admissions', _SCHEMA)] + ([('table', 'custody_holds', _HOLD_SCHEMA)] if has_holds else [])
+                if (sorted(objects) != sorted(expected) or len(indexes) != 2
                         or any(row[2] != 1 or row[3] not in ('pk', 'u') or row[4] != 0 for row in indexes)
                         or {tuple(item[2] for item in self._db.execute('PRAGMA index_info(' + repr(row[1]) + ')'))
                             for row in indexes} != {('operation_id',), ('nonce',)}):
                     raise ValueError()
+                if has_holds:
+                    holds = self._db.execute("PRAGMA index_list('custody_holds')").fetchall()
+                    if (len(holds) != 2 or any(row[2] != 1 or row[3] not in ('pk', 'u') or row[4] != 0 for row in holds)
+                            or {tuple(item[2] for item in self._db.execute('PRAGMA index_info(' + repr(row[1]) + ')'))
+                                for row in holds} != {('target_id',), ('operation_id',)}): raise ValueError()
             self._db.execute('PRAGMA journal_mode=DELETE')
             self._db.execute('PRAGMA synchronous=FULL')
             if create:
                 self._db.execute(_SCHEMA)
+                self._db.execute(_HOLD_SCHEMA)
             self._check()
         except Exception:
             self.close()
@@ -359,12 +374,16 @@ class CustodianAdmissionJournal:
         Trusted root/daemon administrators can override this boundary.
         Preparation leaves the file and a root-owned intent marker held; later
         copies may account for them but cannot adopt, retry or publish them.
+        A durable per-target hold is committed before ownership mutation and
+        never expires or automatically releases, including after owner death.
+        This protects only cooperating users of this enrolled journal; it does
+        not establish that other host writers or older databases are excluded.
         """
         stage_fd = file_fd = marker_fd = None
         peer = None
         try:
             self._check()
-            if type(operation_id) is not str or type(admission_digest) is not str: raise ValueError()
+            if type(operation_id) is not str or type(admission_digest) is not str or not self._holds_supported: raise ValueError()
             saved = self._staged.pop(operation_id, None)
             if saved is None or saved[0] != admission_digest: raise ValueError()
             _, stage, inode, digest, size, deadline, last_wall, last_mono, expires = saved
@@ -413,6 +432,30 @@ class CustodianAdmissionJournal:
                 if not block: break
                 hashed.update(block)
             if 'sha256:' + hashed.hexdigest() != digest or current() != (host_uid, host_gid): raise ValueError()
+            self._db.execute('BEGIN IMMEDIATE')
+            try:
+                row = self._db.execute('SELECT payload,signature FROM admissions WHERE operation_id=?', (operation_id,)).fetchone()
+                if row is None or hashlib.sha256(row[0]).hexdigest() != admission_digest: raise ValueError()
+                self._key.verify(row[1], DOMAIN + row[0])
+                admitted = json.loads(row[0])
+                if (type(admitted) is not dict or _canonical(admitted) != row[0]
+                        or admitted.get('operation_id') != operation_id
+                        or admitted.get('target_id') != 'engineering-hub:staging'
+                        or type(admitted.get('fencing_generation')) is not int
+                        or not 0 < admitted['fencing_generation'] < 2**63
+                        or current() != (host_uid, host_gid)):
+                    raise ValueError()
+                hold = (admitted['target_id'], operation_id, admission_digest,
+                        admitted['fencing_generation'], inode[0], inode[1], host_uid, host_gid, pin[1])
+                self._db.execute('INSERT INTO custody_holds VALUES (?,?,?,?,?,?,?,?,?)', hold)
+                self._db.execute('COMMIT')
+            except BaseException:
+                if self._db.in_transaction: self._db.execute('ROLLBACK')
+                raise
+            # From this point an interruption, failed check, or uncertain write
+            # leaves the target held; no automatic release or takeover exists.
+            if (self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (admitted['target_id'],)).fetchone() != hold
+                    or current() != (host_uid, host_gid)): raise ValueError()
             marker_fd = os.open(operation_id + '.ownership-intent', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
                                 os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=stage_fd)
             marker = _canonical({'operation_id': operation_id, 'admission_digest': admission_digest,
@@ -420,7 +463,8 @@ class CustodianAdmissionJournal:
                                  'size': size, 'digest': digest})
             if os.write(marker_fd, marker) != len(marker): raise ValueError()
             os.fsync(marker_fd); os.fsync(stage_fd)
-            if current() != (host_uid, host_gid): raise ValueError()
+            if (self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (admitted['target_id'],)).fetchone() != hold
+                    or current() != (host_uid, host_gid)): raise ValueError()
             os.fchown(file_fd, host_uid, host_gid)
             os.fsync(file_fd); os.fsync(stage_fd)
             after = os.fstat(file_fd)
@@ -428,6 +472,7 @@ class CustodianAdmissionJournal:
             if ((after.st_dev, after.st_ino) != inode or (named.st_dev, named.st_ino) != inode
                     or after.st_uid != host_uid or after.st_gid != host_gid or after.st_nlink != 1
                     or stat.S_IMODE(after.st_mode) != 0o600 or after.st_size != size
+                    or self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (admitted['target_id'],)).fetchone() != hold
                     or current() != (host_uid, host_gid)): raise ValueError()
             return {'operation_id': operation_id, 'admission_digest': admission_digest,
                     'state': 'private_owner_prepared', 'device': inode[0], 'inode': inode[1]}

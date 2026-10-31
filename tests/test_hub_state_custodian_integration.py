@@ -38,7 +38,7 @@ def test_supervisor_through_nonroot_transport_to_root_journal(tmp_path, monkeypa
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     provider_digest = 'sha256:' + hashlib.sha256(bytes.fromhex('1' * 64)).hexdigest()
     enrollment = tmp_path / 'enrollment.json'
-    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public,
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public,
         'manifest_digest': manifest.digest(), 'source_backup_digest': manifest.state_policy.baseline_backup_digest,
         'provider_key_digest': provider_digest, 'provider_uid': 200000, 'provider_gid': 200000}))
     enrollment.chmod(0o600)

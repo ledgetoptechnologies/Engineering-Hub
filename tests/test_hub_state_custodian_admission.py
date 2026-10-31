@@ -1,9 +1,11 @@
 import os
 import json
 import hashlib
+import multiprocessing
 import socket
 import sqlite3
 import struct
+import signal
 import subprocess
 import sys
 import threading
@@ -27,11 +29,14 @@ def test_signed_admission_is_durable_and_one_shot(tmp_path):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     digest = 'sha256:' + 'a' * 64
-    policy = {'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+    policy = {'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
               'source_backup_digest': digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001}
     enrollment = tmp_path / 'enrollment.json'
     enrollment.write_bytes(_canonical(policy)); enrollment.chmod(0o600)
     path = tmp_path / 'journal.sqlite'
+    with pytest.raises(CustodianAdmissionError):
+        CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'alternate.sqlite', create=True)
+    assert not (tmp_path / 'alternate.sqlite').exists()
     now = time.time_ns() // 1_000_000
     payload = {'protocol': PROTOCOL, 'operation_id': str(uuid4()), 'command_id': str(uuid4()),
                'run_id': str(uuid4()), 'target_id': 'engineering-hub:staging', 'fencing_generation': 1,
@@ -62,7 +67,7 @@ def test_exchange_uses_fresh_nonce_and_reserves(tmp_path, monkeypatch, late):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     digest = 'sha256:' + 'a' * 64
-    policy = {'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+    policy = {'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
               'source_backup_digest': digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001}
     enrollment = tmp_path / 'enrollment.json'
     enrollment.write_bytes(_canonical(policy)); enrollment.chmod(0o600)
@@ -121,7 +126,7 @@ def test_reopen_rejects_incomplete_journal_schema(tmp_path):
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     digest = 'sha256:' + 'a' * 64
     enrollment = tmp_path / 'enrollment.json'
-    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
         'source_backup_digest': digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
     path = tmp_path / 'journal.sqlite'
     db = sqlite3.connect(path)
@@ -131,12 +136,36 @@ def test_reopen_rejects_incomplete_journal_schema(tmp_path):
         CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=False)
 
 
+def test_legacy_enrollment_never_enables_ownership_on_reopen(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    digest = 'sha256:' + 'a' * 64
+    enrollment = tmp_path / 'legacy.json'
+    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public,
+        'manifest_digest': digest, 'source_backup_digest': digest, 'provider_key_digest': digest,
+        'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
+    path = tmp_path / 'journal.sqlite'
+    journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=True)
+    try:
+        assert journal._holds_supported is False
+    finally:
+        journal.close()
+    journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=False)
+    try:
+        assert journal._holds_supported is False
+        with pytest.raises(CustodianAdmissionError):
+            journal.prepare_private_owner(operation_id=str(uuid4()), admission_digest='a' * 64,
+                                          owner_policy_path=tmp_path / 'unused')
+    finally:
+        journal.close()
+
+
 def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     digest = 'sha256:' + 'a' * 64
     enrollment = tmp_path / 'enrollment.json'
-    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
         'source_backup_digest': digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
     now = time.time_ns() // 1_000_000
     payload = {'protocol': PROTOCOL, 'operation_id': str(uuid4()), 'command_id': str(uuid4()),
@@ -166,7 +195,7 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
     enrollment = tmp_path / 'enrollment.json'
-    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
         'source_backup_digest': backup_digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001}))
     enrollment.chmod(0o600)
     copy_policy = tmp_path / 'copy.json'
@@ -269,12 +298,82 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         assert fourth_result['digest'] == backup_digest
         assert (stage / (fourth['operation_id'] + '.quarantine')).exists()
         assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
+        with pytest.raises(CustodianAdmissionError):
+            journal.prepare_private_owner(operation_id=fourth['operation_id'], admission_digest=fourth_token,
+                                          owner_policy_path=owner_policy)
+        assert not (stage / (fourth['operation_id'] + '.ownership-intent')).exists()
+        assert journal._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (payload['operation_id'],)
     finally:
         journal.close()
     reopened = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=False)
     try:
+        assert reopened._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (payload['operation_id'],)
+        fifth = dict(payload, operation_id=str(uuid4()), nonce='2' * 64)
+        fifth_token = reopened.reserve(fifth, key.sign(DOMAIN + _canonical(fifth)))
+        reopened.stage_quarantined_backup(operation_id=fifth['operation_id'], admission_digest=fifth_token,
+                                          copy_policy_path=copy_policy, timeout_seconds=3)
+        with pytest.raises(CustodianAdmissionError):
+            reopened.prepare_private_owner(operation_id=fifth['operation_id'], admission_digest=fifth_token,
+                                            owner_policy_path=owner_policy)
+        assert not (stage / (fifth['operation_id'] + '.ownership-intent')).exists()
         with pytest.raises(CustodianAdmissionError):
             reopened.stage_quarantined_backup(operation_id=second['operation_id'], admission_digest=second_token,
                                               copy_policy_path=copy_policy, timeout_seconds=3)
     finally:
         reopened.close()
+
+
+def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path):
+    source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
+    stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
+    source = source_dir / 'backup.sqlite'
+    db = sqlite3.connect(source); db.execute('CREATE TABLE item (value TEXT)'); db.commit(); db.close(); source.chmod(0o600)
+    backup = 'sha256:' + hashlib.sha256(source.read_bytes()).hexdigest()
+    digest = 'sha256:' + 'a' * 64
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    enrollment = tmp_path / 'enrollment.json'; journal_path = tmp_path / 'journal.sqlite'
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(journal_path), 'supervisor_public_key': public,
+        'manifest_digest': digest, 'source_backup_digest': backup, 'provider_key_digest': digest,
+        'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
+    copy_policy = tmp_path / 'copy.json'
+    copy_policy.write_bytes(_canonical({'schema': 1, 'source': str(source), 'source_digest': backup,
+        'staging_directory': str(stage), 'maximum_bytes': 1024 * 1024,
+        'maximum_total_bytes': 4 * 1024 * 1024, 'minimum_free_bytes': 1024})); copy_policy.chmod(0o600)
+    operation = str(uuid4())
+    def child():
+        now = time.time_ns() // 1_000_000
+        payload = {'protocol': PROTOCOL, 'operation_id': operation, 'command_id': str(uuid4()),
+            'run_id': str(uuid4()), 'target_id': 'engineering-hub:staging', 'fencing_generation': 1,
+            'manifest_digest': digest, 'role': 'candidate', 'source_backup_digest': backup,
+            'provider_key_digest': digest, 'nonce': '9' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
+        journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=journal_path, create=True)
+        token = journal.reserve(payload, key.sign(DOMAIN + _canonical(payload)))
+        journal.stage_quarantined_backup(operation_id=operation, admission_digest=token, copy_policy_path=copy_policy, timeout_seconds=3)
+        owner = tmp_path / 'owner.json'
+        owner.write_bytes(_canonical({'schema': 1, 'boot_id': _boot_id(), 'daemon_pid': os.getpid(),
+            'daemon_start_ticks': _proc_start(os.getpid()), 'uid_map': open('/proc/self/uid_map').read(),
+            'gid_map': open('/proc/self/gid_map').read(), 'app_uid': 10002, 'app_gid': 10002})); owner.chmod(0o600)
+        original_open = os.open
+        def crash_on_marker(path, *args, **kwargs):
+            if str(path).endswith('.ownership-intent'): os.kill(os.getpid(), signal.SIGKILL)
+            return original_open(path, *args, **kwargs)
+        admission_module.os.open = crash_on_marker
+        journal.prepare_private_owner(operation_id=operation, admission_digest=token, owner_policy_path=owner)
+    process = multiprocessing.get_context('fork').Process(target=child)
+    process.start()
+    try:
+        process.join(timeout=8)
+        if process.is_alive():
+            process.kill(); process.join(timeout=3)
+            pytest.fail('owned synthetic child exceeded deadline')
+        assert process.exitcode == -signal.SIGKILL
+        journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=journal_path, create=False)
+        try:
+            assert journal._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (operation,)
+            assert not (stage / (operation + '.ownership-intent')).exists()
+        finally:
+            journal.close()
+    finally:
+        if process.is_alive(): process.kill(); process.join(timeout=3)
+        process.close()
