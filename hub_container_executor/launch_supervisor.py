@@ -296,7 +296,8 @@ def _mapped_id(raw, identifier):
 
 def _kernel_profile(profile, status, uid_map, gid_map, mountinfo, consumer_uid, consumer_gid):
     """Validate caller-observed /proc data, not Engine's desired configuration."""
-    _require(_mapped_id(uid_map, 10001) == consumer_uid and _mapped_id(gid_map, 10001) == consumer_gid)
+    identity = 10002 if profile.role == 'coordinator' else 10001
+    _require(_mapped_id(uid_map, identity) == consumer_uid and _mapped_id(gid_map, identity) == consumer_gid)
     _require([int(value) for value in status['Uid'].split()] == [consumer_uid] * 4
              and [int(value) for value in status['Gid'].split()] == [consumer_gid] * 4
              and status.get('NoNewPrivs') == '1'
@@ -639,11 +640,12 @@ class LaunchSupervisor:
                 _require(self._daemon_pin.uid == policy.daemon_uid and self._daemon_pin.gid == policy.daemon_gid
                          and self._daemon_pin.daemon_id == policy.engine_id
                          and _disjoint_from(policy.uid_map, held_uids) and _disjoint_from(policy.gid_map, held_gids))
-                # The executor's host identity is what the pinned map gives namespace 10001.
+                # Signed role selects the namespace account whose host identity is pinned.
+                identity = 10002 if self.profile.role == 'coordinator' else 10001
                 uid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.uid_map)
                 gid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.gid_map)
-                _require(_mapped_id(uid_text, 10001) == self._consumer_uid
-                         and _mapped_id(gid_text, 10001) == self._consumer_gid)
+                _require(_mapped_id(uid_text, identity) == self._consumer_uid
+                         and _mapped_id(gid_text, identity) == self._consumer_gid)
                 _require(len({self._held_path, self._enrollment_path, self._key_path, _path(journal_file)}) == 4)
             else:
                 self._held_path = self._held_identity = None
@@ -1094,6 +1096,11 @@ class LaunchSupervisor:
             _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info)
                      and _identity(os.lstat(path)) == _identity(info))
             raw = bytes(raw)
+            if self.profile.role == 'coordinator':
+                commitment = coordinator_configuration_commitment(raw)
+                _require(commitment.raw_digest == self._configuration_raw_digest
+                         and commitment.content_digest == mount.content_digest)
+                return commitment.manifest_digest
             commitment = configuration_commitment(raw)
             _require(commitment.raw_digest == self._configuration_raw_digest
                      and commitment.content_digest == mount.content_digest
@@ -1103,11 +1110,19 @@ class LaunchSupervisor:
             os.close(fd)
 
     def serve_one_executor_handoff(self, channel):
-        """One measured-executor FD receipt; pair launch remains hard-disabled.
+        """Issue one measured-executor endpoint receipt; pair launch remains disabled."""
+        return self._serve_one_role_handoff(channel, 'executor')
+
+    def serve_one_coordinator_handoff(self, channel):
+        """Issue one measured-coordinator endpoint receipt; pair launch remains disabled."""
+        return self._serve_one_role_handoff(channel, 'coordinator')
+
+    def _serve_one_role_handoff(self, channel, role):
+        """One measured single-role FD receipt; pair launch remains hard-disabled.
 
         Transfers ownership of an already connected channel to this method. The
         trusted pair supervisor must have created and retained both ends; this
-        executor-only step does not attest the other end, its owner, exclusive
+        single-role step does not attest the other end, its owner, exclusive
         custody, or pair identity and must never be treated as pair authentication
         or launch approval. Constructor launch gates remain unchanged.
         Its journal reservation is the same one-shot issuance as the ordinary
@@ -1123,7 +1138,7 @@ class LaunchSupervisor:
                 _require(type(channel) is socket.socket and channel.family == socket.AF_UNIX
                          and channel.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
                          and channel.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 0
-                         and getattr(self.profile, 'role', None) is None
+                         and (getattr(self.profile, 'role', None) or 'executor') == role
                          and getattr(self.profile, 'command_channel', None) == 'inherited-seqpacket-v1'
                          and self._issuance_open and time.monotonic() < self._expires)
                 channel.getpeername()
@@ -1139,7 +1154,8 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == 'engineering-hub.launch-channel-request.v1'
+                         and request['protocol'] == ('engineering-hub.launch-channel-request.v1' if role == 'executor'
+                             else 'engineering-hub.coordinator-channel-request.v1')
                          and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
@@ -1152,9 +1168,11 @@ class LaunchSupervisor:
                 now = int(time.time() * 1000)
                 remaining = int((self._expires - time.monotonic()) * 1000)
                 _require(remaining > 0)
-                payload = {'protocol': 'engineering-hub.launch-channel.v1',
-                    'audience': 'engineering-hub.container-executor', 'nonce': request['nonce'],
-                    'role': 'executor', 'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
+                payload = {'protocol': ('engineering-hub.launch-channel.v1' if role == 'executor'
+                                        else 'engineering-hub.coordinator-channel.v1'),
+                    'audience': ('engineering-hub.container-executor' if role == 'executor'
+                                 else 'engineering-hub.pilot-coordinator'), 'nonce': request['nonce'],
+                    'role': role, 'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
                     'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
                     'container_id': self._container_id, 'issuer_id': self.release.issuer_id,
                     'implementation_commit': self.release.implementation_commit,
@@ -1166,7 +1184,9 @@ class LaunchSupervisor:
                     'manifest_digest': manifest, 'channel_device': info.st_dev, 'channel_inode': info.st_ino,
                     'issued_at_ms': now, 'expires_at_ms': min(now + remaining, self._approval_expires_at_ms)}
                 _require(payload['expires_at_ms'] > now)
-                sig = self._signer.sign(b'engineering-hub-launch-channel-v1\x00' + _canonical(payload))
+                domain = (b'engineering-hub-launch-channel-v1\x00' if role == 'executor'
+                          else b'engineering-hub-coordinator-channel-v1\x00')
+                sig = self._signer.sign(domain + _canonical(payload))
                 signature = base64.urlsafe_b64encode(sig).rstrip(b'=').decode('ascii')
                 raw = _canonical({'payload': payload, 'signature': signature})
                 _require(len(raw) <= MAX_RECEIPT_BYTES)
@@ -1183,11 +1203,13 @@ class LaunchSupervisor:
                 # descriptor send: final confirmation delivery can be unknown.
                 reserved = False
                 self._validate_live(deadline)
-                commit = {'protocol': 'engineering-hub.launch-channel-commit.v1',
+                commit = {'protocol': ('engineering-hub.launch-channel-commit.v1' if role == 'executor'
+                                       else 'engineering-hub.coordinator-channel-commit.v1'),
                           'nonce': request['nonce'], 'launch_id': self._launch_id,
                           'receipt_digest': 'sha256:' + receipt_hash}
-                commit_sig = self._signer.sign(b'engineering-hub-launch-channel-commit-v1\x00'
-                                               + _canonical(commit))
+                commit_domain = (b'engineering-hub-launch-channel-commit-v1\x00' if role == 'executor'
+                                 else b'engineering-hub-coordinator-channel-commit-v1\x00')
+                commit_sig = self._signer.sign(commit_domain + _canonical(commit))
                 commit_raw = _canonical({'payload': commit, 'signature':
                     base64.urlsafe_b64encode(commit_sig).rstrip(b'=').decode('ascii')})
                 _require(len(commit_raw) <= MAX_RECEIPT_BYTES)

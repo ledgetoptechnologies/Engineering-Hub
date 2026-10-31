@@ -1894,3 +1894,98 @@ def test_handoff_manifest_is_derived_from_pinned_runner_config(short_root, root_
             assert requests == []
         finally:
             authority.close()
+
+
+def test_coordinator_channel_issuance_uses_role_specific_signed_receipt(synthetic_issuer):
+    """Actual kernel peer and FD exchange; Engine/launch measurement synthetic."""
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role='coordinator', command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    result = []
+    def serve():
+        try:
+            result.append(authority.serve_one_coordinator_handoff(issued))
+        except Exception as error:
+            result.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    fd = None
+    try:
+        fd = transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000, role='coordinator')
+        thread.join(5)
+        assert not thread.is_alive() and result == [authority._launch_id]
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        received = socket.socket(fileno=fd)
+        fd = None
+        try:
+            received.send(b'coordinator')
+            assert other.recv(16) == b'coordinator'
+        finally:
+            received.close()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_coordinator_profile_maps_its_own_distinct_kernel_uid():
+    from tests.test_executor_launch_profile import coordinator_profile
+    profile = launch.ExecutorLaunchProfile.model_validate(coordinator_profile())
+    mapped = 110002
+    status = {'Uid': '\t'.join([str(mapped)] * 4), 'Gid': '\t'.join([str(mapped)] * 4),
+              'Groups': str(mapped), 'NoNewPrivs': '1'}
+    status.update({name: '0000000000000000' for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')})
+    mapping = '0 10001 1\n1 100001 65536\n'
+    rows = ['1 0 0:1 / / ro - overlay overlay rw',
+            '2 1 0:2 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw']
+    for index, mount in enumerate(profile.mounts, 3):
+        rows.append(f'{index} 1 0:{index} / {mount.target} {"ro" if mount.read_only else "rw"} - ext4 fixture rw')
+    mounts = ('\n'.join(rows) + '\n').encode()
+    launch._kernel_profile(profile, status, mapping, mapping, mounts, mapped, mapped)
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._kernel_profile(profile, status, mapping, mapping, mounts, 110001, 110001)
+    # Even self-consistent /proc status for the executor UID cannot stand in
+    # for coordinator UID 10002 in the signed namespace map.
+    status['Uid'] = status['Gid'] = '\t'.join(['110001'] * 4)
+    status['Groups'] = '110001'
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._kernel_profile(profile, status, mapping, mapping, mounts, 110001, 110001)
+
+
+def test_coordinator_handoff_refuses_executor_role_request(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role='coordinator', command_channel='inherited-seqpacket-v1')
+    authority._handoff_manifest_digest = lambda: 'sha256:' + 'a' * 64
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    failures = []
+    def serve():
+        try:
+            authority.serve_one_coordinator_handoff(issued)
+        except Exception as error:
+            failures.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest='sha256:' + 'a' * 64,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000, role='executor')
+        thread.join(5)
+        assert not thread.is_alive() and len(failures) == 1 and issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone()[0] == 0
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)

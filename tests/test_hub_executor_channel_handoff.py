@@ -19,7 +19,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from engineering_hub.container_pilot_manifest import Platform
 from hub_container_executor.handoff_identity import (PROTOCOL, REQUEST_PROTOCOL, AUDIENCE,
-    SIGNATURE_DOMAIN, COMMIT_PROTOCOL, COMMIT_DOMAIN)
+    SIGNATURE_DOMAIN, COMMIT_PROTOCOL, COMMIT_DOMAIN, COORDINATOR_PROTOCOL,
+    COORDINATOR_REQUEST_PROTOCOL, COORDINATOR_AUDIENCE, COORDINATOR_DOMAIN,
+    COORDINATOR_COMMIT_PROTOCOL, COORDINATOR_COMMIT_DOMAIN)
 from hub_container_executor.launch_transport import UnixLaunchReceiptTransport, _canonical
 from hub_container_executor.runtime_identity import ExecutorReleaseEnrollment, RuntimeIdentityError
 
@@ -44,7 +46,7 @@ def test_handoff_real_socket_returns_exact_verified_connected_fd(tmp_path):
         original.close(); peer.close()
 
 
-def exercise_handoff(tmp_path, *, failure=None, precommit=None):
+def exercise_handoff(tmp_path, *, failure=None, precommit=None, role='executor'):
     path = str(tmp_path / 'issuer.sock')
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path); listener.listen(1)
@@ -66,10 +68,12 @@ def exercise_handoff(tmp_path, *, failure=None, precommit=None):
                 size = struct.unpack('!I', read(4))[0]
                 import json
                 request = json.loads(read(size))
-                assert request['protocol'] == REQUEST_PROTOCOL and connection.recv(1) == b''
+                assert request['protocol'] == (REQUEST_PROTOCOL if role == 'executor' else COORDINATOR_REQUEST_PROTOCOL)
+                assert connection.recv(1) == b''
                 info = os.fstat(original.fileno())
                 now = int(time.time()*1000)
-                payload = dict(protocol=PROTOCOL, audience=AUDIENCE, nonce=request['nonce'], role='executor',
+                payload = dict(protocol=(PROTOCOL if role == 'executor' else COORDINATOR_PROTOCOL),
+                    audience=(AUDIENCE if role == 'executor' else COORDINATOR_AUDIENCE), nonce=request['nonce'], role=role,
                     launch_id=str(uuid4()), boot_id=str(uuid4()), authenticated_host_pid=os.getpid(),
                     process_start_ticks=1, container_id='e'*64, issuer_id=release.issuer_id,
                     implementation_commit=release.implementation_commit, runnable_digest=release.runnable_digest,
@@ -77,13 +81,14 @@ def exercise_handoff(tmp_path, *, failure=None, precommit=None):
                     platform=release.platform.model_dump(mode='json'), launch_profile_digest=release.launch_profile_digest,
                     manifest_digest='sha256:'+'f'*64, channel_device=info.st_dev, channel_inode=info.st_ino,
                     issued_at_ms=now, expires_at_ms=now+10000)
-                if failure == 'role': payload['role'] = 'coordinator'
+                if failure == 'role': payload['role'] = 'coordinator' if role == 'executor' else 'executor'
                 if failure == 'nonce': payload['nonce'] = '0'*64
                 if failure == 'inode': payload['channel_inode'] += 1
                 if failure == 'manifest': payload['manifest_digest'] = 'sha256:' + '0'*64
                 if failure == 'expired': payload['expires_at_ms'] = now - 1
                 if failure == 'release': payload['implementation_commit'] = '0'*40
-                signature = key.sign(SIGNATURE_DOMAIN + _canonical(payload))
+                receipt_domain = SIGNATURE_DOMAIN if role == 'executor' or failure == 'wrong_domain' else COORDINATOR_DOMAIN
+                signature = key.sign(receipt_domain + _canonical(payload))
                 if failure == 'signature': signature = b'0'*64
                 envelope = _canonical({'payload': payload, 'signature': base64.urlsafe_b64encode(signature).rstrip(b'=').decode()})
                 rights = ([] if failure == 'missing' else
@@ -94,10 +99,12 @@ def exercise_handoff(tmp_path, *, failure=None, precommit=None):
                     precommit[0].set()
                     assert precommit[1].wait(3)
                 if failure != 'lost_commit':
-                    commit = dict(protocol=COMMIT_PROTOCOL, nonce=request['nonce'], launch_id=payload['launch_id'],
+                    commit = dict(protocol=(COMMIT_PROTOCOL if role == 'executor' else COORDINATOR_COMMIT_PROTOCOL),
+                                  nonce=request['nonce'], launch_id=payload['launch_id'],
                                   receipt_digest='sha256:' + hashlib.sha256(envelope).hexdigest())
                     if failure == 'commit_digest': commit['receipt_digest'] = 'sha256:' + '0'*64
-                    commit_signature = key.sign(COMMIT_DOMAIN + _canonical(commit))
+                    commit_domain = COMMIT_DOMAIN if role == 'executor' or failure == 'wrong_commit_domain' else COORDINATOR_COMMIT_DOMAIN
+                    commit_signature = key.sign(commit_domain + _canonical(commit))
                     if failure == 'commit_signature': commit_signature = b'0'*64
                     raw = _canonical({'payload': commit, 'signature': base64.urlsafe_b64encode(commit_signature).rstrip(b'=').decode()})
                     connection.sendall(struct.pack('!I', len(raw)) + raw)
@@ -113,13 +120,13 @@ def exercise_handoff(tmp_path, *, failure=None, precommit=None):
         if failure:
             with pytest.raises(RuntimeIdentityError):
                 transport.issue_verified_channel(enrollment=release, manifest_digest='sha256:'+'f'*64,
-                    max_receipt_lifetime_seconds=30, timeout_ms=2000)
+                    max_receipt_lifetime_seconds=30, timeout_ms=2000, role=role)
             with pytest.raises(RuntimeIdentityError):
                 transport.issue_verified_channel(enrollment=release, manifest_digest='sha256:'+'f'*64,
-                    max_receipt_lifetime_seconds=30, timeout_ms=2000)
+                    max_receipt_lifetime_seconds=30, timeout_ms=2000, role=role)
             return None, original, peer
         fd = transport.issue_verified_channel(enrollment=release, manifest_digest='sha256:'+'f'*64,
-            max_receipt_lifetime_seconds=30, timeout_ms=2000)
+            max_receipt_lifetime_seconds=30, timeout_ms=2000, role=role)
         return fd, original, peer
     finally:
         transport.close(); thread.join(4); listener.close()
@@ -157,3 +164,23 @@ def test_fd_remains_quarantined_until_signed_commit(tmp_path):
     finally:
         release.set()
         worker.join(4)
+
+
+def test_coordinator_handoff_accepts_its_own_domain_and_receipt(tmp_path):
+    received, original, peer = exercise_handoff(tmp_path, role='coordinator')
+    try:
+        assert os.fstat(received).st_ino == os.fstat(original.fileno()).st_ino
+    finally:
+        os.close(received)
+        original.close()
+        peer.close()
+
+
+@pytest.mark.parametrize('failure', ['role', 'wrong_domain', 'wrong_commit_domain',
+                                    'manifest', 'release', 'lost_commit', 'commit_signature'])
+def test_coordinator_refuses_cross_role_or_changed_authority_and_closes_fd(tmp_path, failure):
+    before = len(os.listdir('/proc/self/fd'))
+    _, original, peer = exercise_handoff(tmp_path, role='coordinator', failure=failure)
+    original.close()
+    peer.close()
+    assert len(os.listdir('/proc/self/fd')) == before

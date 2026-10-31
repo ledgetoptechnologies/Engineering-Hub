@@ -1,8 +1,8 @@
-"""Private verifier for the gated executor channel handoff protocol.
+"""Private verifier for the gated role-specific channel handoff protocol.
 
 The root supervisor must authenticate its exact consumer, validate the running
 container and independently approved manifest before signing. A receipt is not
-proof of isolation, coordinator launch or continuing integrity. This module
+proof of isolation, paired launch or continuing integrity. This module
 never provisions, issues, discovers keys or starts a service.
 """
 from __future__ import annotations
@@ -25,6 +25,12 @@ AUDIENCE = 'engineering-hub.container-executor'
 SIGNATURE_DOMAIN = b'engineering-hub-launch-channel-v1\x00'
 COMMIT_PROTOCOL = 'engineering-hub.launch-channel-commit.v1'
 COMMIT_DOMAIN = b'engineering-hub-launch-channel-commit-v1\x00'
+COORDINATOR_PROTOCOL = 'engineering-hub.coordinator-channel.v1'
+COORDINATOR_REQUEST_PROTOCOL = 'engineering-hub.coordinator-channel-request.v1'
+COORDINATOR_AUDIENCE = 'engineering-hub.pilot-coordinator'
+COORDINATOR_DOMAIN = b'engineering-hub-coordinator-channel-v1\x00'
+COORDINATOR_COMMIT_PROTOCOL = 'engineering-hub.coordinator-channel-commit.v1'
+COORDINATOR_COMMIT_DOMAIN = b'engineering-hub-coordinator-channel-commit-v1\x00'
 _FIELDS = frozenset({'protocol','audience','nonce','role','launch_id','boot_id',
     'authenticated_host_pid','process_start_ticks','container_id','issuer_id',
     'implementation_commit','runnable_digest','platform_manifest_digest','image_config_id',
@@ -41,7 +47,7 @@ def _require(value):
 
 
 def verify_channel_receipt(raw, fd, *, enrollment, nonce, manifest_digest,
-                           start_monotonic, start_wall_ms, max_lifetime_seconds):
+                           start_monotonic, start_wall_ms, max_lifetime_seconds, role='executor'):
     """Validate receipt and exact received FD; caller owns FD on all paths.
 
     The verifier authenticates the issuer's process mapping, not the mapping on
@@ -51,7 +57,7 @@ def verify_channel_receipt(raw, fd, *, enrollment, nonce, manifest_digest,
     remain mandatory; this function creates no such authority.
     """
     try:
-        _require(type(enrollment) is ExecutorReleaseEnrollment)
+        _require(type(enrollment) is ExecutorReleaseEnrollment and role in {'executor', 'coordinator'})
         enrolled = ExecutorReleaseEnrollment(**{name: getattr(enrollment, name)
             for name in ExecutorReleaseEnrollment.__dataclass_fields__})
         _require(type(nonce) is str and _HEX.fullmatch(nonce)
@@ -64,9 +70,11 @@ def verify_channel_receipt(raw, fd, *, enrollment, nonce, manifest_digest,
                  and _SIGNATURE.fullmatch(signature))
         decoded = base64.b64decode(signature + '==', altchars=b'-_', validate=True)
         _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b'=').decode() == signature)
-        Ed25519PublicKey.from_public_bytes(enrolled.public_key).verify(decoded, SIGNATURE_DOMAIN + _canonical(payload))
-        _require(payload['protocol'] == PROTOCOL and payload['audience'] == AUDIENCE
-                 and payload['nonce'] == nonce and payload['role'] == 'executor'
+        domain = SIGNATURE_DOMAIN if role == 'executor' else COORDINATOR_DOMAIN
+        Ed25519PublicKey.from_public_bytes(enrolled.public_key).verify(decoded, domain + _canonical(payload))
+        _require(payload['protocol'] == (PROTOCOL if role == 'executor' else COORDINATOR_PROTOCOL)
+                 and payload['audience'] == (AUDIENCE if role == 'executor' else COORDINATOR_AUDIENCE)
+                 and payload['nonce'] == nonce and payload['role'] == role
                  and payload['manifest_digest'] == manifest_digest)
         for name in ('launch_id','boot_id'):
             _require(type(payload[name]) is str and str(UUID(payload[name])) == payload[name])
@@ -102,20 +110,23 @@ def verify_channel_receipt(raw, fd, *, enrollment, nonce, manifest_digest,
         raise RuntimeIdentityError('Trusted channel handoff unavailable') from None
 
 
-def verify_channel_commit(raw, receipt, *, enrollment, nonce, launch_id):
+def verify_channel_commit(raw, receipt, *, enrollment, nonce, launch_id, role='executor'):
     """Verify signed confirmation of the exact durably committed receipt."""
     try:
-        _require(type(enrollment) is ExecutorReleaseEnrollment and type(receipt) is bytes)
+        _require(type(enrollment) is ExecutorReleaseEnrollment and type(receipt) is bytes
+                 and role in {'executor', 'coordinator'})
         envelope = _strict(raw)
         _require(type(envelope) is dict and set(envelope) == {'payload', 'signature'})
         payload, signature = envelope['payload'], envelope['signature']
         _require(type(payload) is dict and set(payload) == {'protocol', 'nonce', 'launch_id', 'receipt_digest'}
-                 and payload['protocol'] == COMMIT_PROTOCOL and payload['nonce'] == nonce
+                 and payload['protocol'] == (COMMIT_PROTOCOL if role == 'executor' else COORDINATOR_COMMIT_PROTOCOL)
+                 and payload['nonce'] == nonce
                  and payload['launch_id'] == launch_id
                  and payload['receipt_digest'] == 'sha256:' + hashlib.sha256(receipt).hexdigest()
                  and type(signature) is str and _SIGNATURE.fullmatch(signature))
         decoded = base64.b64decode(signature + '==', altchars=b'-_', validate=True)
         _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b'=').decode() == signature)
-        Ed25519PublicKey.from_public_bytes(enrollment.public_key).verify(decoded, COMMIT_DOMAIN + _canonical(payload))
+        Ed25519PublicKey.from_public_bytes(enrollment.public_key).verify(decoded,
+            (COMMIT_DOMAIN if role == 'executor' else COORDINATOR_COMMIT_DOMAIN) + _canonical(payload))
     except Exception:
         raise RuntimeIdentityError('Trusted channel handoff unavailable') from None

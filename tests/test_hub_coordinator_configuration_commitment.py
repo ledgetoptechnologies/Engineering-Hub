@@ -77,3 +77,24 @@ def test_signed_coordinator_profile_commits_config_and_manifest():
     assert changed.manifest_digest != first.manifest_digest
     next(mount for mount in profile['mounts'] if mount['role'] == 'config')['content_digest'] = changed.content_digest
     assert ExecutorLaunchProfile.model_validate(profile).digest() != digest
+
+
+def test_supervisor_derives_coordinator_manifest_from_pinned_config(tmp_path):
+    path = tmp_path / 'coordinator.json'
+    raw = canonical(configuration())
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    commitment = coordinator_configuration_commitment(raw)
+    authority = LaunchSupervisor.__new__(LaunchSupervisor)
+    authority.profile = SimpleNamespace(role='coordinator')
+    authority._configuration_raw_digest = commitment.raw_digest
+    authority._source_pins = {}
+    authority._mounts = {'config': SimpleNamespace(source=str(path), kind='file', uid=os.getuid(),
+        gid=os.getgid(), mode=0o600, content_digest=commitment.content_digest)}
+    authority._pin_sources()
+    assert authority._handoff_manifest_digest() == commitment.manifest_digest
+    changed = configuration()
+    changed['agent_port'] += 1
+    path.write_bytes(canonical(changed))
+    with pytest.raises(LaunchSupervisorError):
+        authority._handoff_manifest_digest()

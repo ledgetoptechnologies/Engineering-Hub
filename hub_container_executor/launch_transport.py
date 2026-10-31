@@ -161,8 +161,8 @@ class UnixLaunchReceiptTransport:
             raise RuntimeIdentityError(_ERROR) from None
 
     def issue_verified_channel(self, *, enrollment, manifest_digest,
-                               max_receipt_lifetime_seconds, timeout_ms):
-        """One gated executor-channel exchange; return only a verified owned FD.
+                               max_receipt_lifetime_seconds, timeout_ms, role='executor'):
+        """One gated role-specific channel exchange; return only a verified owned FD.
 
         Every received descriptor is closed on failure. A sent challenge is
         never retried, including on lost reply. Caller owns the returned FD.
@@ -171,11 +171,11 @@ class UnixLaunchReceiptTransport:
         and is not proof of a paired launch or state isolation.
         """
         from .handoff_identity import (REQUEST_PROTOCOL as HANDOFF_REQUEST,
-                                       verify_channel_receipt, verify_channel_commit)
+                                       COORDINATOR_REQUEST_PROTOCOL, verify_channel_receipt, verify_channel_commit)
         fds = []
         try:
             _require(os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
-                     and hasattr(socket, 'SCM_RIGHTS') and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
+                     and role in {'executor', 'coordinator'} and hasattr(socket, 'SCM_RIGHTS') and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
             started = time.monotonic()
             wall_started = int(time.time() * 1000)
             deadline = started + timeout_ms / 1000
@@ -184,7 +184,8 @@ class UnixLaunchReceiptTransport:
             with self._lock:
                 _require(os.getpid() == self._pid and not self._used and not self._closed)
                 self._used = True
-            request = _canonical({'protocol': HANDOFF_REQUEST, 'nonce': nonce})
+            request = _canonical({'protocol': HANDOFF_REQUEST if role == 'executor' else COORDINATOR_REQUEST_PROTOCOL,
+                                  'nonce': nonce})
             identity = _socket_leaf(self._path)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(_remaining(deadline))
@@ -231,8 +232,8 @@ class UnixLaunchReceiptTransport:
                 _remaining(deadline)
                 launch_id = verify_channel_receipt(raw, fds[0], enrollment=enrollment, nonce=nonce,
                     manifest_digest=manifest_digest, start_monotonic=started,
-                    start_wall_ms=wall_started, max_lifetime_seconds=max_receipt_lifetime_seconds)
-                verify_channel_commit(commit, raw, enrollment=enrollment, nonce=nonce, launch_id=launch_id)
+                    start_wall_ms=wall_started, max_lifetime_seconds=max_receipt_lifetime_seconds, role=role)
+                verify_channel_commit(commit, raw, enrollment=enrollment, nonce=nonce, launch_id=launch_id, role=role)
                 _remaining(deadline)
                 return fds.pop()
         except Exception:
