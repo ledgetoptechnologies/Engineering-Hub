@@ -13,6 +13,7 @@ import posixpath
 from pathlib import PurePosixPath
 import re
 from types import MappingProxyType
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -32,6 +33,7 @@ LAUNCH_TARGETS = MappingProxyType({
     'secrets': '/var/lib/engineering-hub/secrets',
 })
 _TARGETS = LAUNCH_TARGETS
+_BROKER_SOCKET_TARGET = "/run/engineering-hub/broker.sock"
 
 
 class LaunchProfileError(RuntimeError):
@@ -79,8 +81,10 @@ class ExecutorLaunchMount(_Closed):
 
     @model_validator(mode='after')
     def closed_role(self):
-        _require(self.role in _TARGETS)
-        if self.role == 'generations':
+        _require(self.role in _TARGETS or self.role == 'broker_socket')
+        if self.role == 'broker_socket':
+            _require(self.target == _BROKER_SOCKET_TARGET)
+        elif self.role == 'generations':
             # Engine bind sources are resolved in the daemon's host namespace;
             # the executor must see this exact absolute path, not an alias.
             _require(self.target == self.source)
@@ -96,6 +100,8 @@ class ExecutorLaunchMount(_Closed):
             _require(self.content_digest is None)
         if self.role == 'issuer_socket':
             _require(self.uid == 0 and self.mode == 0o660)
+        if self.role == 'broker_socket':
+            _require(self.uid == 0 and self.gid > 0 and self.mode == 0o660)
         return self
 
 
@@ -194,6 +200,8 @@ class ExecutorLaunchProfile(_Closed):
     runner_digest: str
     # Present only in v3 profiles. Absent keeps a legacy profile's exact digest.
     daemon_policy: DisjointDaemonPolicy | None = None
+    # Signed opt-in boundary only; the supervisor refuses it until implemented.
+    broker_mode: Literal['broker-v1'] | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -205,8 +213,10 @@ class ExecutorLaunchProfile(_Closed):
     @classmethod
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
-        if isinstance(value, dict) and 'daemon_policy' in value:
-            _require(value['daemon_policy'] is not None)
+        if isinstance(value, dict):
+            for name in ('daemon_policy', 'broker_mode'):
+                if name in value:
+                    _require(value[name] is not None)
         return value
 
     @model_validator(mode='after')
@@ -222,13 +232,17 @@ class ExecutorLaunchProfile(_Closed):
         _require(len(self.environment) <= 16 and len({item.split('=', 1)[0] for item in self.environment}) == len(self.environment)
                  and all(re.fullmatch(r'(PATH|LANG|LC_ALL|TZ|PYTHONDONTWRITEBYTECODE|PYTHONUNBUFFERED)=[^\x00\r\n]{1,512}', item)
                          for item in self.environment))
-        _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(_TARGETS)
-                 and {item.role for item in self.mounts} == set(_TARGETS))
+        roles = (set(_TARGETS) if self.broker_mode is None else
+                 (set(_TARGETS) - {'engine_socket', 'generations'}) | {'broker_socket'})
+        _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
+                 and {item.role for item in self.mounts} == roles)
+        if self.broker_mode is not None:
+            _require(self.daemon_policy is not None)
         fixture = _path(self.fixture_root)
         _require(re.fullmatch(r'hub-pilot-[a-z0-9][a-z0-9-]{0,63}', fixture.name))
         sources = [PurePosixPath(item.source) for item in self.mounts]
         _require(all(fixture in PurePosixPath(item.source).parents for item in self.mounts
-                     if item.role not in {'engine_socket', 'issuer_socket'}))
+                     if item.role not in {'engine_socket', 'issuer_socket', 'broker_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
         _path(self.runner_file)
@@ -243,6 +257,8 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
+        if value['broker_mode'] is None:
+            del value['broker_mode']
         return value
 
     def digest(self):

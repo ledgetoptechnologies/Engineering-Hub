@@ -1700,3 +1700,16 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
             child.terminate()  # Fixture teardown, NOT supervisor timeout escalation.
             child.wait(timeout=3)
         authority.close()
+
+
+def test_broker_profile_refused_before_journal_or_engine_access(short_root, root_journal):
+    from tests.test_executor_launch_profile import broker_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = broker_profile()
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()

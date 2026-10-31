@@ -501,3 +501,17 @@ def test_verified_absolute_wall_ceiling_clipped_to_original_report(tmp_path, dep
         assert proof.expires_monotonic <= composition._deadline
     finally:
         composition.close()
+
+
+def test_disjoint_enrollment_refuses_valid_broker_profile_before_transport(tmp_path, dependencies):
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import broker_profile
+    data = v2_document()
+    launch_profile = broker_profile()
+    launch_profile['daemon_policy']['engine_id'] = data['launch']['engine_id']
+    raw = canonical(launch_profile)
+    data['profile_json'] = raw.decode('utf-8')
+    data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    with pytest.raises(module.TrustedSessionError):
+        construct(tmp_path, data)
+    assert dependencies.events == []

@@ -144,3 +144,42 @@ def test_launch_targets_are_read_only():
     with pytest.raises(TypeError):
         del core.LAUNCH_TARGETS['config']
     assert core.LAUNCH_TARGETS['config'] == '/operator/runner.json'
+
+
+def broker_profile():
+    value = profile(daemon_policy=policy(), broker_mode='broker-v1')
+    value['mounts'] = [item for item in value['mounts']
+                       if item['role'] not in {'engine_socket', 'generations'}]
+    value['mounts'].append(dict(role='broker_socket', source='/run/test-broker/broker.sock',
+        target='/run/engineering-hub/broker.sock', kind='socket', read_only=True,
+        uid=0, gid=110001, mode=0o660, content_digest=None))
+    return value
+
+
+def test_broker_profile_is_signed_and_excludes_direct_authority():
+    data = broker_profile()
+    raw = core.canonical(data)
+    parsed = core.verify_profile_bytes(raw, digest_of(raw))
+    assert parsed.broker_mode == 'broker-v1'
+    assert {item.role for item in parsed.mounts} == (set(core.LAUNCH_TARGETS)
+        - {'engine_socket', 'generations'}) | {'broker_socket'}
+    assert core.canonical(parsed.enrollment_value()) == raw
+    assert parsed.digest() != core.ExecutorLaunchProfile.model_validate(profile(daemon_policy=policy())).digest()
+
+
+@pytest.mark.parametrize('change', ['engine', 'generation', 'missing_broker', 'no_policy', 'null', 'wrong_kind'])
+def test_broker_profile_rejects_direct_or_ambiguous_authority(change):
+    data = broker_profile()
+    if change in {'engine', 'generation'}:
+        role = 'engine_socket' if change == 'engine' else 'generations'
+        data['mounts'].append(next(item for item in profile()['mounts'] if item['role'] == role))
+    elif change == 'missing_broker':
+        data['mounts'] = [item for item in data['mounts'] if item['role'] != 'broker_socket']
+    elif change == 'no_policy':
+        del data['daemon_policy']
+    elif change == 'null':
+        data['broker_mode'] = None
+    else:
+        data['broker_mode'] = 'broker-v2'
+    with pytest.raises((ValueError, RuntimeError)):
+        core.ExecutorLaunchProfile.model_validate(data)

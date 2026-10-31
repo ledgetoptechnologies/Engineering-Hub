@@ -604,6 +604,9 @@ class LaunchSupervisor:
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw))
             self.profile = ExecutorLaunchProfile.model_validate(data['profile'])
             _require(self.profile.digest() == self.release.launch_profile_digest)
+            # Broker transport and independent enrollment are not implemented.
+            # Refuse before journal creation, socket binding or Engine access.
+            _require(self.profile.broker_mode is None)
             image = dict(data['image'])
             _require(set(image) == set(VerifiedImage.__dataclass_fields__))
             image['platform'] = Platform.model_validate(image['platform'])
