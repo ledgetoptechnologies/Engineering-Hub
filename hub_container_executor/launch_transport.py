@@ -160,6 +160,45 @@ class UnixLaunchReceiptTransport:
         except Exception:
             raise RuntimeIdentityError(_ERROR) from None
 
+    def issue_pair_enrollment(self, *, role, authority_public_key, own_enrollment, manifest_digest, timeout_ms):
+        """Fetch one independently signed, nonce-bound pair enrollment; no retry."""
+        from .handoff_identity import PAIR_ENROLLMENT_REQUEST, verify_pair_enrollment
+        try:
+            _require(os.getpid() == self._pid and role in {'executor', 'coordinator'}
+                     and type(timeout_ms) is int and 100 <= timeout_ms <= 10000)
+            start, wall = time.monotonic(), int(time.time() * 1000)
+            deadline = start + timeout_ms / 1000
+            nonce = secrets.token_hex(32)
+            with self._lock:
+                _require(not self._used and not self._closed and os.getpid() == self._pid)
+                self._used = True
+            request = _canonical({'protocol': PAIR_ENROLLMENT_REQUEST, 'role': role, 'nonce': nonce})
+            _require(len(request) <= MAX_REQUEST_BYTES)
+            identity = _socket_leaf(self._path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(_remaining(deadline))
+                connection.connect(self._path)
+                pid, uid, gid = _CREDENTIALS.unpack(connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, _CREDENTIALS.size))
+                _require(pid >= 0 and uid == self._uid and gid == self._gid
+                         and _socket_leaf(self._path) == identity)
+                connection.settimeout(_remaining(deadline))
+                connection.sendall(_LENGTH.pack(len(request)) + request)
+                connection.shutdown(socket.SHUT_WR)
+                size = _LENGTH.unpack(_read_exact(connection, _LENGTH.size, deadline))[0]
+                _require(0 < size <= MAX_RECEIPT_BYTES)
+                raw = _receipt_frame(_read_exact(connection, size, deadline))
+                connection.settimeout(_remaining(deadline))
+                _require(connection.recv(1) == b'' and _socket_leaf(self._path) == identity)
+                _remaining(deadline)
+                result = verify_pair_enrollment(raw, authority_public_key=authority_public_key, role=role,
+                    nonce=nonce, manifest_digest=manifest_digest, own_enrollment=own_enrollment,
+                    start_monotonic=start, start_wall_ms=wall)
+                _remaining(deadline)
+                return result
+        except Exception:
+            raise RuntimeIdentityError(_ERROR) from None
+
     def issue_verified_channel(self, *, enrollment, manifest_digest,
                                max_receipt_lifetime_seconds, timeout_ms, role='executor'):
         """One gated role-specific channel exchange; return only a verified owned FD.
@@ -248,7 +287,7 @@ class UnixLaunchReceiptTransport:
     def issue_verified_pair_channel(self, *, role, pair_id, manifest_digest,
                                     executor_launch_id, coordinator_launch_id, executor_enrollment,
                                     coordinator_enrollment, pair_authority_public_key,
-                                    max_receipt_lifetime_seconds, timeout_ms, _return_identity=False):
+                                    max_receipt_lifetime_seconds, timeout_ms, _return_identity=False, _prior_nonce=None):
         """Quarantine the FD until both role receipts and the pair commit verify.
 
         Pins must be independently enrolled. This API does not establish actual
@@ -266,7 +305,7 @@ class UnixLaunchReceiptTransport:
             wall_started = int(time.time() * 1000)
             deadline = started + timeout_ms / 1000
             nonce = secrets.token_hex(32)
-            _require(type(nonce) is str and _NONCE.fullmatch(nonce))
+            _require(type(nonce) is str and _NONCE.fullmatch(nonce) and nonce != _prior_nonce)
             with self._lock:
                 _require(os.getpid() == self._pid and not self._used and not self._closed)
                 self._used = True
@@ -341,6 +380,41 @@ class UnixLaunchReceiptTransport:
         if kwargs.get('role') != 'executor':
             raise RuntimeIdentityError(_ERROR)
         return self.issue_verified_pair_channel(_return_identity=True, **kwargs)
+
+    def issue_enrolled_pair_channel(self, *, enrollment, role, authority_public_key, own_enrollment,
+                                    manifest_digest, max_receipt_lifetime_seconds, timeout_ms):
+        """Use only a still-current independently verified pair enrollment."""
+        from .handoff_identity import VerifiedPairEnrollment, verify_pair_enrollment
+        _require(type(enrollment) is VerifiedPairEnrollment
+                 and authority_public_key == enrollment.authority_public_key and enrollment.role == role)
+        enrollment.check()
+        verified = verify_pair_enrollment(enrollment.signed_envelope, authority_public_key=authority_public_key,
+            role=role, nonce=enrollment.nonce, manifest_digest=manifest_digest, own_enrollment=own_enrollment,
+            start_monotonic=enrollment.start_monotonic, start_wall_ms=enrollment.start_wall_ms)
+        _require(verified.pair_id == enrollment.pair_id
+                 and verified.executor_launch_id == enrollment.executor_launch_id
+                 and verified.coordinator_launch_id == enrollment.coordinator_launch_id
+                 and verified.executor_enrollment == enrollment.executor_enrollment
+                 and verified.coordinator_enrollment == enrollment.coordinator_enrollment)
+        result = self.issue_verified_pair_channel(role=role, pair_id=verified.pair_id,
+            manifest_digest=verified.manifest_digest, executor_launch_id=verified.executor_launch_id,
+            coordinator_launch_id=verified.coordinator_launch_id, executor_enrollment=verified.executor_enrollment,
+            coordinator_enrollment=verified.coordinator_enrollment, pair_authority_public_key=authority_public_key,
+            max_receipt_lifetime_seconds=max_receipt_lifetime_seconds, timeout_ms=timeout_ms,
+            _return_identity=role == 'executor', _prior_nonce=enrollment.nonce)
+        try:
+            enrollment.check()
+            return result
+        except BaseException:
+            if role == 'executor':
+                fd, verifier = result
+                try:
+                    verifier.close()
+                finally:
+                    os.close(fd)
+            else:
+                os.close(result)
+            raise
 
     def close(self):
         """Revoke future use promptly, without cancelling an admitted exchange.

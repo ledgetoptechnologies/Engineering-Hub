@@ -17,6 +17,7 @@ import stat
 import time
 import threading
 from uuid import UUID
+from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from .runtime_identity import ExecutorReleaseEnrollment, RuntimeIdentityError, _strict, _canonical
@@ -147,6 +148,96 @@ _PAIR_COMMIT_FIELDS = frozenset({'protocol', 'pair_id', 'manifest_digest', 'exec
     'coordinator_launch_id', 'executor_receipt', 'coordinator_receipt',
     'executor_receipt_digest', 'coordinator_receipt_digest'})
 _PAIR_IDENTITY_KEY = object()
+
+# This authority is independently pinned in the consumer's approved profile.
+# Its root-protected policy is issued after both role profiles are fixed.
+PAIR_ENROLLMENT_PROTOCOL = 'engineering-hub.pair-enrollment.v1'
+PAIR_ENROLLMENT_REQUEST = 'engineering-hub.pair-enrollment-request.v1'
+PAIR_ENROLLMENT_DOMAIN = b'engineering-hub-pair-enrollment-v1\x00'
+_VERIFIED_PAIR_KEY = object()
+
+
+@dataclass(frozen=True)
+class VerifiedPairEnrollment:
+    _key: object = field(repr=False, compare=False)
+    authority_public_key: bytes
+    role: str
+    nonce: str
+    pair_id: str
+    manifest_digest: str
+    executor_launch_id: str
+    coordinator_launch_id: str
+    executor_enrollment: ExecutorReleaseEnrollment
+    coordinator_enrollment: ExecutorReleaseEnrollment
+    expires_at_ms: int
+    deadline: float
+    process_id: int
+    signed_envelope: bytes = field(repr=False)
+    start_monotonic: float = field(repr=False)
+    start_wall_ms: int = field(repr=False)
+    _clock: object = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        _require(self._key is _VERIFIED_PAIR_KEY)
+        object.__setattr__(self, '_clock', {'lock': threading.Lock(), 'closed': False,
+            'wall': int(time.time() * 1000), 'mono': time.monotonic()})
+
+    def check(self):
+        _require(os.getpid() == self.process_id)
+        with self._clock['lock']:
+            try:
+                now, wall = time.monotonic(), int(time.time() * 1000)
+                _require(not self._clock['closed'] and math.isfinite(now)
+                         and self._clock['mono'] <= now < self.deadline
+                         and self._clock['wall'] <= wall < self.expires_at_ms)
+                self._clock['wall'], self._clock['mono'] = wall, now
+            except Exception:
+                self._clock['closed'] = True
+                raise RuntimeIdentityError('Trusted pair enrollment unavailable') from None
+
+
+def verify_pair_enrollment(raw, *, authority_public_key, role, nonce, manifest_digest,
+                           own_enrollment, start_monotonic, start_wall_ms):
+    """Verify independent pair-authority enrollment, bound to this role and nonce."""
+    from engineering_hub.container_pilot_manifest import Platform
+    try:
+        _require(type(authority_public_key) is bytes and len(authority_public_key) == 32
+                 and role in {'executor', 'coordinator'} and type(nonce) is str and _HEX.fullmatch(nonce)
+                 and type(own_enrollment) is ExecutorReleaseEnrollment)
+        payload = _signature(_strict(raw), authority_public_key, PAIR_ENROLLMENT_DOMAIN)
+        _require(type(payload) is dict and set(payload) == {'protocol', 'role', 'nonce', 'pair_id',
+            'manifest_digest', 'executor_launch_id', 'coordinator_launch_id', 'executor_release',
+            'coordinator_release', 'issued_at_ms', 'expires_at_ms'}
+            and payload['protocol'] == PAIR_ENROLLMENT_PROTOCOL and payload['role'] == role
+            and payload['nonce'] == nonce and payload['manifest_digest'] == manifest_digest
+            and type(manifest_digest) is str and _SHA.fullmatch(manifest_digest))
+        for name in ('pair_id', 'executor_launch_id', 'coordinator_launch_id'):
+            _require(_canonical_uuid(payload[name]))
+        _require(payload['executor_launch_id'] != payload['coordinator_launch_id'])
+        releases = {}
+        for name in ('executor', 'coordinator'):
+            value = payload[name + '_release']
+            _require(type(value) is dict and set(value) == set(ExecutorReleaseEnrollment.__dataclass_fields__)
+                     and type(value['public_key']) is str and _HEX.fullmatch(value['public_key']))
+            value = dict(value)
+            value['public_key'] = bytes.fromhex(value['public_key'])
+            value['platform'] = Platform.model_validate(value['platform'])
+            releases[name] = ExecutorReleaseEnrollment(**value)
+        _require(releases[role] == own_enrollment)
+        issued, expires = payload['issued_at_ms'], payload['expires_at_ms']
+        now_wall, now_mono = int(time.time() * 1000), time.monotonic()
+        _require(type(issued) is int and type(expires) is int and type(start_wall_ms) is int
+                 and start_wall_ms - 5000 <= issued <= now_wall + 5000
+                 and 0 < expires - issued <= 10000 and now_wall < expires
+                 and start_monotonic <= now_mono < start_monotonic + (expires - start_wall_ms) / 1000)
+        deadline = min(start_monotonic + (expires - start_wall_ms) / 1000,
+                       start_monotonic + (expires - issued) / 1000)
+        _require(now_mono < deadline)
+        return VerifiedPairEnrollment(_VERIFIED_PAIR_KEY, authority_public_key, role, nonce, payload['pair_id'], manifest_digest, payload['executor_launch_id'],
+            payload['coordinator_launch_id'], releases['executor'], releases['coordinator'], expires, deadline, os.getpid(), raw,
+            start_monotonic, start_wall_ms)
+    except Exception:
+        raise RuntimeIdentityError('Trusted pair enrollment unavailable') from None
 
 
 class PairDriverIdentityVerifier:

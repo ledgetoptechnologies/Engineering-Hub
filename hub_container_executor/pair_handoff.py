@@ -169,6 +169,87 @@ class PairLaunchReservation:
                 self._journal = None
 
 
+def serve_pair_enrollment(reservation, *, role, timeout_seconds):
+    """Serve one role-specific enrollment from the protected, reserved policy.
+
+    The role nonce is reserved in the shared journal before any reply. An
+    ambiguous send cannot be retried. Host confinement and peer custody remain
+    external acceptance gates.
+    """
+    _require(type(reservation) is PairLaunchReservation and role in {'executor', 'coordinator'}
+             and type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 10
+             and reservation._pid == os.getpid())
+    deadline = time.monotonic() + timeout_seconds
+    peer = None
+    try:
+        with ExitStack() as stack:
+            for supervisor in reservation._supervisors.values():
+                _require(supervisor._mutex.acquire(timeout=_remaining(deadline)))
+                stack.callback(supervisor._mutex.release)
+                supervisor._guard()
+                supervisor._validate_live(deadline)
+            _require(reservation._lock.acquire(timeout=_remaining(deadline)))
+            stack.callback(reservation._lock.release)
+            reservation._pins_current()
+            _require(reservation._used == {'executor', 'coordinator'} and reservation._journal is not None)
+            policy, supervisors = reservation._policy, reservation._supervisors
+            _require(all(s._handoff_manifest_digest() == policy['manifest_digest']
+                         and s._launch_id == policy[name + '_launch_id']
+                         and _release_digest(s.release) == policy[name + '_release_digest']
+                         for name, s in supervisors.items()))
+            supervisor = supervisors[role]
+            supervisor._listener.settimeout(_remaining(deadline))
+            peer, _ = supervisor._listener.accept()
+            creds = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _require(creds == (supervisor._consumer.pid, supervisor._consumer_uid, supervisor._consumer_gid))
+            size = struct.unpack('!I', supervisor._receive(peer, 4, deadline))[0]
+            _require(0 < size <= MAX_REQUEST_BYTES)
+            request = _strict(supervisor._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+            _require(type(request) is dict and set(request) == {'protocol', 'role', 'nonce'}
+                     and request['protocol'] == h.PAIR_ENROLLMENT_REQUEST and request['role'] == role
+                     and type(request['nonce']) is str and h._HEX.fullmatch(request['nonce']))
+            peer.settimeout(_remaining(deadline))
+            _require(peer.recv(1) == b'')
+            for value in supervisors.values(): value._validate_live(deadline)
+            reservation._pins_current()
+            now = int(time.time() * 1000)
+            expires = min(now + 10000, *(s._approval_expires_at_ms for s in supervisors.values()),
+                          *(now + int((s._expires - time.monotonic()) * 1000) for s in supervisors.values()))
+            _require(now < expires)
+            def release_data(value):
+                data = {name: getattr(value, name) for name in value.__dataclass_fields__}
+                data['public_key'] = data['public_key'].hex()
+                data['platform'] = data['platform'].model_dump(mode='json')
+                return data
+            payload = {'protocol': h.PAIR_ENROLLMENT_PROTOCOL, 'role': role, 'nonce': request['nonce'],
+                'pair_id': policy['pair_id'], 'manifest_digest': policy['manifest_digest'],
+                'executor_launch_id': policy['executor_launch_id'], 'coordinator_launch_id': policy['coordinator_launch_id'],
+                'executor_release': release_data(supervisors['executor'].release),
+                'coordinator_release': release_data(supervisors['coordinator'].release),
+                'issued_at_ms': now, 'expires_at_ms': expires}
+            raw_key, identity = _root_file(reservation._key_path, 32)
+            _require(identity == reservation._key_identity and len(raw_key) == 32)
+            raw = _canonical(_envelope(Ed25519PrivateKey.from_private_bytes(raw_key), h.PAIR_ENROLLMENT_DOMAIN, payload))
+            _require(len(raw) <= MAX_RECEIPT_BYTES)
+            with reservation._journal.transaction() as db:
+                db.execute('INSERT INTO issuance VALUES (?,?,?,NULL)',
+                           (supervisor._launch_id, request['nonce'], 'enrollment_reserved'))
+            reservation._pins_current()
+            for value in supervisors.values(): value._validate_live(deadline)
+            peer.settimeout(_remaining(deadline))
+            peer.sendall(struct.pack('!I', len(raw)) + raw)
+            peer.shutdown(socket.SHUT_WR)
+            with reservation._journal.transaction() as db:
+                _require(db.execute("UPDATE issuance SET state='enrollment_sent',receipt_digest=? "
+                    "WHERE launch_id=? AND state='enrollment_reserved'", (hashlib.sha256(raw).hexdigest(),
+                    supervisor._launch_id)).rowcount == 1)
+    except BaseException:
+        raise LaunchSupervisorError() from None
+    finally:
+        if peer is not None:
+            peer.close()
+
+
 def serve_pair(executor, coordinator, *, pair_id, enrollment_file, signing_key_file, journal_file,
                timeout_seconds):
     """Issue a paired channel once; uncertainty is retained, never retried.
@@ -249,6 +330,10 @@ def serve_pair(executor, coordinator, *, pair_id, enrollment_file, signing_key_f
                          and reservation._key_identity == key_identity
                          and reservation._used == {'executor', 'coordinator'})
                 reservation._pins_current()
+                with reservation._journal.transaction() as db:
+                    rows = db.execute('SELECT launch_id,state FROM issuance').fetchall()
+                _require(set(rows) == {(executor._launch_id, 'enrollment_sent'),
+                                       (coordinator._launch_id, 'enrollment_sent')})
             _require(e.boot == c.boot and e.pid != c.pid and executor._container_id != coordinator._container_id
                      and executor._consumer_uid != coordinator._consumer_uid
                      and executor._consumer_gid != coordinator._consumer_gid

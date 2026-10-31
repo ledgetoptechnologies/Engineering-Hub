@@ -1,5 +1,6 @@
 """Real Unix sockets, synthetic supervisors; no Engine or host enrollment."""
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
@@ -235,7 +236,18 @@ def test_pair_issuer_commits_both_before_final_confirmation(tmp_path, monkeypatc
     if failure == 'close_during_handoff':
         reservation = pair.PairLaunchReservation.__new__(pair.PairLaunchReservation)
         reservation._pid, reservation._lock = os.getpid(), threading.Lock()
-        reservation._closed, reservation._journal = False, None
+        class EnrollmentJournal:
+            @contextmanager
+            def transaction(self):
+                class Database:
+                    def execute(self, statement):
+                        assert 'SELECT launch_id,state FROM issuance' in statement
+                        return self
+                    def fetchall(self):
+                        return [(s._launch_id, 'enrollment_sent') for s in supervisors]
+                yield Database()
+            def close(self): pass
+        reservation._closed, reservation._journal = False, EnrollmentJournal()
         reservation._policy_path, reservation._key_path = Path(policy_file), Path(key_file)
         reservation._policy_identity = fake_root_file(policy_file, 65536)[1]
         reservation._key_identity = fake_root_file(key_file, 32)[1]
