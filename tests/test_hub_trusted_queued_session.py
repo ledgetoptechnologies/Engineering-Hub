@@ -141,6 +141,57 @@ def construct(tmp_path, data=None):
         ca_pem=b'captured-ca', credential=b'captured-executor-credential')
 
 
+def v2_document():
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import profile as launch_profile, policy
+    data = document()
+    raw = canonical(launch_profile(daemon_policy=policy(engine_id=data['launch']['engine_id'])))
+    data.update(schema=module.SCHEMA_V2, profile_mode='disjoint-v3', profile_json=raw.decode())
+    data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    return data
+
+
+def test_v2_enrollment_roundtrip_and_composition(tmp_path, dependencies):
+    data = v2_document()
+    enrollment = module.parse_enrollment(encode(data))
+    assert module.parse_enrollment(module.enrollment_bytes(enrollment)) == enrollment
+    composition = construct(tmp_path, data)
+    composition.close()
+    assert dependencies.events == ['transport', 'observer', 'observer-close']
+
+
+@pytest.mark.parametrize('case', ['missing', 'null', 'mode', 'mutation', 'wrong-pin', 'wrong-engine', 'legacy'])
+def test_v2_refuses_invalid_profile_before_transport(tmp_path, dependencies, case):
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import profile as launch_profile
+    data = v2_document()
+    if case == 'missing': del data['profile_json']
+    elif case == 'null': data['profile_json'] = None
+    elif case == 'mode': data['profile_mode'] = 'legacy'
+    elif case == 'mutation': data['profile_json'] += ' '
+    elif case == 'wrong-pin': data['release']['launch_profile_digest'] = 'sha256:' + '0' * 64
+    elif case == 'wrong-engine':
+        data['launch']['engine_id'] = 'different-engine'
+        data['report']['executor']['engine_id'] = 'different-engine'
+    elif case == 'legacy':
+        raw = canonical(launch_profile())
+        data['profile_json'] = raw.decode()
+        data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    with pytest.raises(module.TrustedSessionError):
+        construct(tmp_path, data)
+    assert dependencies.events == []
+
+
+def test_v1_remains_legacy_and_rejects_v2_fields():
+    data = document()
+    parsed = module.parse_enrollment(encode(data))
+    assert parsed.schema == module.SCHEMA and parsed.profile_bytes is None
+    assert module.parse_enrollment(module.enrollment_bytes(parsed)) == parsed
+    data['profile_mode'] = 'disjoint-v3'
+    with pytest.raises(module.TrustedSessionError):
+        module.parse_enrollment(encode(data))
+
+
 @pytest.mark.parametrize('change', ['stale', 'future', 'expired', 'manifest', 'driver', 'engine'])
 def test_no_transport_before_fresh_independent_profile_binding(tmp_path, dependencies, change):
     data = document()

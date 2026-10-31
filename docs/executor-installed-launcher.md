@@ -63,6 +63,15 @@ table is read-only. The executor
 image's build-time import check includes this module, so an older core image
 without it fails the build rather than at launch.
 
+The explicitly selected manual-session enrollment supports a closed v2 form:
+`profile_mode` must be `disjoint-v3`, and `profile_json` contains the exact
+canonical profile as a UTF-8 JSON string. It must match the independently
+enrolled release digest and the launch and manifest Engine identities before
+transport construction. Legacy v1 enrollment retains its original behavior.
+This recognition is not proof of the held attestation or live isolation. The
+existing model trusts the protected file's owner; that owner can replace v2
+with v1, so this is not anti-rollback or an independent version authority.
+
 The policy's `held_ranges_digest` is the SHA-256 of the exact attestation bytes,
 and the supervisor refuses any other file. So the signed profile, and any verifier
 that pins it, records exactly which attestation the overlap check used. The digest

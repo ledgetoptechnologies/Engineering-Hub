@@ -24,6 +24,7 @@ from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconcilia
     StartupReconciliation)
 
 SCHEMA = 'engineering-hub.manual-staging-session.v1'
+SCHEMA_V2 = 'engineering-hub.manual-staging-session.v2'
 MAX_ENROLLMENT_BYTES = 32 * 1024
 MAX_REPORT_LIFETIME_MS = 600_000
 MAX_REPORT_AGE_MS = 300_000
@@ -70,6 +71,8 @@ class ManualSessionEnrollment:
     inventory_reconciled: bool
     writers_excluded: bool
     unresolved_effects_absent: bool
+    schema: str = SCHEMA
+    profile_bytes: bytes | None = None
 
 
 def parse_enrollment(raw):
@@ -85,8 +88,10 @@ def parse_enrollment(raw):
         def reject(_):
             raise TrustedSessionError()
         data = json.loads(raw, object_pairs_hook=unique, parse_float=reject, parse_constant=reject)
-        _object(data, {'schema', 'release', 'launch', 'operator_actor', 'report'})
-        _require(data['schema'] == SCHEMA)
+        _require(type(data) is dict and data.get('schema') in (SCHEMA, SCHEMA_V2))
+        schema = data['schema']
+        _object(data, {'schema', 'release', 'launch', 'operator_actor', 'report'} |
+                ({'profile_mode', 'profile_json'} if schema == SCHEMA_V2 else set()))
         release = dict(_object(data['release'],
             (set(CurrentExecutorReleasePins.__dataclass_fields__) - {'public_key'}) | {'public_key_hex'}))
         key = release.pop('public_key_hex')
@@ -95,6 +100,13 @@ def parse_enrollment(raw):
         release['platform'] = Platform.model_validate(release['platform'])
         release = CurrentExecutorReleasePins(**release)
         launch = CurrentLaunchPins(**_object(data['launch'], CurrentLaunchPins.__dataclass_fields__))
+        profile_bytes = None
+        if schema == SCHEMA_V2:
+            _require(data['profile_mode'] == 'disjoint-v3' and type(data['profile_json']) is str)
+            profile_bytes = data['profile_json'].encode('utf-8')
+            from .executor_launch_profile import verify_profile_bytes
+            recognized = verify_profile_bytes(profile_bytes, release.launch_profile_digest)
+            _require(recognized.daemon_policy is not None and recognized.daemon_policy.engine_id == launch.engine_id)
         actor = data['operator_actor']
         _require(type(actor) is str and re.fullmatch(r'human:cf:[0-9a-f]{64}', actor))
         report = _object(data['report'], {'target_id', 'manifest_digest', 'machine_id', 'source',
@@ -119,7 +131,7 @@ def parse_enrollment(raw):
         _require(all(value is True for value in claims.values()))
         return ManualSessionEnrollment(release, launch, actor, report['target_id'],
             report['manifest_digest'], report['machine_id'], report['source'], observed, expiry,
-            evidence, **claims)
+            evidence, **claims, schema=schema, profile_bytes=profile_bytes)
     except Exception:
         raise TrustedSessionError() from None
 
@@ -146,6 +158,12 @@ class TrustedQueuedSessionComposition:
                      and profile.manifest.driver.implementation_commit == e.release.implementation_commit
                      and profile.manifest.runner_binding.platform == e.release.platform
                      and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id)
+            if e.schema == SCHEMA_V2:
+                from .executor_launch_profile import verify_profile_bytes
+                recognized = verify_profile_bytes(e.profile_bytes, e.release.launch_profile_digest)
+                _require(recognized.daemon_policy is not None
+                         and recognized.daemon_policy.engine_id == e.launch.engine_id
+                         and recognized.daemon_policy.engine_id == profile.manifest.runner_binding.daemon_identity)
             self._database = Path(database)
             _require(self._database.is_absolute())
             self._manifest = e.manifest_digest
@@ -265,7 +283,9 @@ def enrollment_bytes(enrollment):
     release = {name: getattr(e.release, name) for name in CurrentExecutorReleasePins.__dataclass_fields__
                if name not in {'public_key', 'platform'}}
     release.update(public_key_hex=e.release.public_key.hex(), platform=e.release.platform.model_dump(mode='json'))
-    value = {'schema': SCHEMA, 'release': release,
+    _require(e.schema in (SCHEMA, SCHEMA_V2))
+    _require((e.profile_bytes is None) if e.schema == SCHEMA else type(e.profile_bytes) is bytes)
+    value = {'schema': e.schema, 'release': release,
         'launch': {name: getattr(e.launch, name) for name in CurrentLaunchPins.__dataclass_fields__},
         'operator_actor': e.operator_actor, 'report': {
             'target_id': e.target_id, 'manifest_digest': e.manifest_digest, 'machine_id': e.machine_id,
@@ -274,6 +294,8 @@ def enrollment_bytes(enrollment):
             'evidence': e.evidence, 'evidence_sha256': 'sha256:' + hashlib.sha256(e.evidence.encode()).hexdigest(),
             'attestations': {name: getattr(e, name) for name in (
                 'inventory_reconciled', 'writers_excluded', 'unresolved_effects_absent')}}}
+    if e.schema == SCHEMA_V2:
+        value.update(profile_mode='disjoint-v3', profile_json=e.profile_bytes.decode('utf-8'))
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
 
 
