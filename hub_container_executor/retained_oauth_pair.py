@@ -1,8 +1,9 @@
 """One retained, root-enrolled executor/coordinator/broker lifecycle.
 
 This composition does not enable supervisor roles or establish host custody.
-The caller transfers both supervisors, listener and broker enrollment to this
-owner and must retain it on uncertainty. No restart or adoption is attempted.
+The caller transfers the executor, listener and broker enrollment to this owner;
+the coordinator is created only after the pair journal is reserved. The caller
+must retain the owner on uncertainty. No restart or adoption is attempted.
 """
 import hashlib
 import json
@@ -31,34 +32,31 @@ def _require(value):
 
 class RetainedOAuthPair:
     """Single-use owner; failures hold all remaining processes and evidence."""
-    def __init__(self, *, executor, coordinator, pair_policy, config_raw, session_raw,
+    def __init__(self, *, executor, pair_policy, config_raw, session_raw,
                  admission_raw, broker_enrollment_fd, broker_listener):
         self._pid=os.getpid();self._thread=threading.get_ident();self._state='constructing'
-        self._executor=executor;self._coordinator=coordinator;self._broker=OwnedBrokerProcess()
+        self._executor=executor;self._coordinator=None;self._broker=OwnedBrokerProcess()
         self._listener=broker_listener;self._broker_fd=broker_enrollment_fd
         self._stop_observer=threading.Event();self._observer_failed=threading.Event();self._observer=None
-        self._journal=None;self._start_attempted=False;self._stop_attempted=False
+        self._journal=None;self._start_attempted=False;self._stop_attempted=False;self._construction_attempted=False
         self._last_wall=None;self._last_mono=None;self._fresh_deadline=None
         self._config=config_raw;self._session=session_raw;self._admission=admission_raw
         try:
-            _require(type(executor) is LaunchSupervisor and type(coordinator) is LaunchSupervisor and executor is not coordinator
-                     and executor._pid==coordinator._pid==self._pid and coordinator.profile.role=='supervised-local-coordinator-v3'
+            _require(type(executor) is LaunchSupervisor and executor._pid==self._pid
                      and executor.profile.role is None and executor.profile.executor_endpoint is not None
-                     and executor.profile.gate_ledger_channel=='pair-outcome-listener-v1'
-                     and executor._daemon_pin==coordinator._daemon_pin)
+                     and executor.profile.gate_ledger_channel=='pair-outcome-listener-v1')
             self._policy_path=_path(pair_policy);raw,self._policy_identity=_root_file(self._policy_path,16384)
             policy=_strict(raw,16384)
             fields={'schema','pair_id','journal_file','manifest_digest','executor_launch_id','coordinator_profile_digest',
-                    'session_digest','admission_digest','broker_enrollment_digest','broker_runtime_policy','broker_runtime_digest'}
-            _require(type(policy) is dict and set(policy)==fields and policy['schema']=='engineering-hub.retained-oauth-pair.v1')
+                    'session_digest','admission_digest','broker_enrollment_digest','broker_runtime_policy','broker_runtime_digest',
+                    'coordinator_supervisor_digest'}
+            _require(type(policy) is dict and set(policy)==fields and policy['schema']=='engineering-hub.retained-oauth-pair.v2')
             _require(type(policy['pair_id']) is str and str(UUID(policy['pair_id']))==policy['pair_id'] and UUID(policy['pair_id']).version==4)
             _require(all(type(policy[k]) is str and re.fullmatch(r'sha256:[0-9a-f]{64}',policy[k]) for k in
-                         ('manifest_digest','coordinator_profile_digest','session_digest','admission_digest','broker_enrollment_digest','broker_runtime_digest')))
+                         ('manifest_digest','coordinator_profile_digest','session_digest','admission_digest','broker_enrollment_digest','broker_runtime_digest','coordinator_supervisor_digest')))
             _require(type(policy['executor_launch_id']) is str and str(UUID(policy['executor_launch_id']))==policy['executor_launch_id'])
             self._policy=policy; self._runtime_path=_path(policy['broker_runtime_policy']);journal_path=_path(policy['journal_file'])
             _require(len({self._policy_path,self._runtime_path,journal_path})==3
-                     and coordinator.profile.digest()==policy['coordinator_profile_digest']
-                     and coordinator._admission_raw_digest==policy['admission_digest']
                      and hashlib.sha256(session_raw).hexdigest()==policy['session_digest'][7:]
                      and hashlib.sha256(admission_raw).hexdigest()==policy['admission_digest'][7:])
             runtime,self._runtime_identity=_root_file(self._runtime_path,16384)
@@ -67,19 +65,45 @@ class RetainedOAuthPair:
             broker_raw=json.dumps(broker,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
             _require('sha256:'+hashlib.sha256(broker_raw).hexdigest()==policy['broker_enrollment_digest'])
             self._validate_executor()
-            self._bind_endpoint()
-            _require(coordinator._launch_id is None and not coordinator._closed and not coordinator._held)
-            from .configuration_commitment import supervised_local_coordinator_commitment
-            supervised_local_coordinator_commitment(coordinator.profile,config_raw,session_raw,admission_raw,
-                root_raw_digest=policy['admission_digest'],independent_release=coordinator.release)
             self._pins()
             self._journal=_Journal(str(journal_path),create=True)
             self._journal.reserve(policy['pair_id'],{'policy_sha256':hashlib.sha256(raw).hexdigest(),
                 'executor_launch_id':policy['executor_launch_id'],'manifest_digest':policy['manifest_digest']})
-            self._state='prepared'
+            self._state='awaiting_coordinator'
         except BaseException:
             if self._journal is not None:self._journal.close()
             raise RetainedPairError() from None
+
+    def _authorize_coordinator_construction(self, supervisor, *, enrollment_raw, enrollment_digest):
+        """One owner-bound check called before coordinator journal/Engine setup."""
+        _require(self._state=='authorizing' and self._construction_attempted and self._coordinator is None
+                 and type(supervisor) is LaunchSupervisor and supervisor is not self._executor
+                 and enrollment_digest==self._policy['coordinator_supervisor_digest']
+                 and 'sha256:'+hashlib.sha256(enrollment_raw).hexdigest()==enrollment_digest)
+        self._pins();self._validate_executor()
+        _require(supervisor._pid==self._pid and supervisor.profile.role=='supervised-local-coordinator-v3'
+                 and supervisor.profile.digest()==self._policy['coordinator_profile_digest']
+                 and supervisor._admission_raw_digest==self._policy['admission_digest']
+                 and supervisor._daemon_pin==self._executor._daemon_pin
+                 and supervisor._launch_id is None and not supervisor._closed and not supervisor._held)
+        from .configuration_commitment import supervised_local_coordinator_commitment
+        supervised_local_coordinator_commitment(supervisor.profile,self._config,self._session,self._admission,
+            root_raw_digest=self._policy['admission_digest'],independent_release=supervisor.release)
+        self._coordinator=supervisor
+        self._bind_endpoint();self._pins();self._validate_executor()
+
+    def create_coordinator(self, *, enrollment_file, signing_key_file, journal_file, held_ranges_file):
+        """Attempt the exact root-enrolled supervisor constructor once."""
+        _require(self._state=='awaiting_coordinator' and not self._construction_attempted)
+        self._pins();self._construction_attempted=True;self._state='authorizing'
+        try:
+            self._record('coordinator_construction_reserved')
+            coordinator=LaunchSupervisor(enrollment_file=enrollment_file,signing_key_file=signing_key_file,
+                journal_file=journal_file,held_ranges_file=held_ranges_file,create_journal=True,retained_pair=self)
+            _require(coordinator is self._coordinator and not coordinator._closed and not coordinator._held)
+            self._pins();self._validate_executor();self._record('prepared');self._state='prepared'
+        except BaseException:
+            self._hold();raise RetainedPairError() from None
 
     def _pins(self):
         _require(self._pid==os.getpid() and self._thread==threading.get_ident())
@@ -176,7 +200,7 @@ class RetainedOAuthPair:
 
     def _record(self,state):
         self._pins();self._journal.state(self._policy['pair_id'],state,{'executor_launch_id':self._policy['executor_launch_id'],
-            'manifest_digest':self._policy['manifest_digest'],'coordinator_launch_id':self._coordinator._launch_id,
+            'manifest_digest':self._policy['manifest_digest'],'coordinator_launch_id':getattr(self._coordinator,'_launch_id',None),
             'broker_pid':self._broker.pid})
 
     def _observe(self):
@@ -200,8 +224,7 @@ class RetainedOAuthPair:
                 expected_enrollment_digest=self._policy['broker_enrollment_digest'])
             _require(not self._observer_failed.is_set() and self._broker_alive());self._validate_executor();self._bind_endpoint()
             self._executor.attest_executor_endpoint(timeout_ms=5000);self._record('coordinator_reserved')
-            _require(getattr(self._coordinator,'_retained_pair',None) is None)
-            self._coordinator._retained_pair=self
+            _require(getattr(self._coordinator,'_retained_pair',None) is self)
             self._coordinator.launch(retained_pair=self)
             _require(self._coordinator.wait_for_receipt_request(timeout_ms=60000,stop_requested=self._observer_failed.is_set)
                      and not self._observer_failed.is_set())

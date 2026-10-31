@@ -52,26 +52,32 @@ def test_endpoint_binds_exact_pinned_runner_bearer_digest(tmp_path):
     with pytest.raises(pair.RetainedPairError):instance._bind_endpoint()
 
 
-@pytest.mark.parametrize('failure',['none','broker_start','broker_stop','broker_exit','close'])
+@pytest.mark.parametrize('failure',['none','bad_construction','broker_start','broker_stop','broker_exit','close'])
 def test_pair_drains_in_order_and_holds_on_broker_failure(monkeypatch,failure):
     events=[];session=b'synthetic-session';admission=b'synthetic-admission';runtime=b'synthetic-runtime'
     alive=[True]
     sha=lambda raw:'sha256:'+hashlib.sha256(raw).hexdigest()
     enrollment={'synthetic':'broker'}
     broker_digest=sha(json.dumps(enrollment,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode())
-    policy={'schema':'engineering-hub.retained-oauth-pair.v1','pair_id':str(uuid4()),'journal_file':'/journal',
+    policy={'schema':'engineering-hub.retained-oauth-pair.v2','pair_id':str(uuid4()),'journal_file':'/journal',
         'manifest_digest':'sha256:'+'a'*64,'executor_launch_id':str(uuid4()),'coordinator_profile_digest':'sha256:'+'b'*64,
         'session_digest':sha(session),'admission_digest':sha(admission),'broker_enrollment_digest':broker_digest,
-        'broker_runtime_policy':'/runtime','broker_runtime_digest':sha(runtime)}
+        'broker_runtime_policy':'/runtime','broker_runtime_digest':sha(runtime),'coordinator_supervisor_digest':sha(b'coord-policy')}
     class Profile:
         def __init__(self,role):
             self.role=role;self.executor_endpoint=object();self.gate_ledger_channel='pair-outcome-listener-v1'
         def digest(self):return policy['coordinator_profile_digest']
     class Supervisor:
-        def __init__(self,role):
+        def __init__(self,role=None,**kwargs):
             import os
+            retained=kwargs.get('retained_pair')
+            if retained is not None:role='supervised-local-coordinator-v3'
             self._pid=os.getpid();self.profile=Profile(role);self._launch_id=None if role else policy['executor_launch_id']
             self._closed=False;self._held=False;self._admission_raw_digest=sha(admission);self.release=object();self._daemon_pin='same-daemon'
+            if retained is not None:
+                raw=b'other-policy' if failure=='bad_construction' else b'coord-policy'
+                retained._authorize_coordinator_construction(self,enrollment_raw=raw,enrollment_digest=sha(raw))
+                self._retained_pair=retained
         def attest_executor_endpoint(self,**kwargs):events.append('endpoint-observed')
         def wait_for_stop_with_observations(self,*,stop_requested,**kwargs):
             while not stop_requested():time.sleep(.01)
@@ -107,10 +113,18 @@ def test_pair_drains_in_order_and_holds_on_broker_failure(monkeypatch,failure):
     monkeypatch.setattr(pair.RetainedOAuthPair,'_validate_executor',lambda self:events.append('executor-validated'))
     monkeypatch.setattr(pair.RetainedOAuthPair,'_bind_endpoint',lambda self:events.append('endpoint-bound'))
     monkeypatch.setattr(configuration_commitment,'supervised_local_coordinator_commitment',lambda *a,**kw:events.append('commitment'))
-    executor=Supervisor(None);coordinator=Supervisor('supervised-local-coordinator-v3')
-    owned=pair.RetainedOAuthPair(executor=executor,coordinator=coordinator,pair_policy='/policy',config_raw=b'cfg',
+    executor=Supervisor(None)
+    owned=pair.RetainedOAuthPair(executor=executor,pair_policy='/policy',config_raw=b'cfg',
         session_raw=session,admission_raw=admission,broker_enrollment_fd=8,broker_listener=object())
     try:
+        if failure=='bad_construction':
+            with pytest.raises(pair.RetainedPairError):
+                owned.create_coordinator(enrollment_file='/coord',signing_key_file='/key',journal_file='/coord-journal',held_ranges_file='/held')
+            assert owned._state=='held' and 'coordinator_construction_reserved' in events and 'broker-start' not in events
+            with pytest.raises(pair.RetainedPairError):
+                owned.create_coordinator(enrollment_file='/coord',signing_key_file='/key',journal_file='/coord-journal',held_ranges_file='/held')
+            return
+        owned.create_coordinator(enrollment_file='/coord',signing_key_file='/key',journal_file='/coord-journal',held_ranges_file='/held')
         if failure=='broker_start':
             with pytest.raises(pair.RetainedPairError):owned.start()
             assert owned._state=='held' and 'coordinator-launch' not in events and not owned._observer.is_alive()

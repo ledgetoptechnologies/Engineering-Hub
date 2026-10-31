@@ -824,7 +824,7 @@ class LaunchSupervisor:
     cleanup of generations, key creation or restart recovery is implemented.
     """
     def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal,
-                 held_ranges_file=None, gate_start_mode=False):
+                 held_ranges_file=None, gate_start_mode=False, retained_pair=None):
         self._pid = os.getpid()
         self._held_path = self._held_identity = None
         self._mutex = threading.Lock()
@@ -856,10 +856,13 @@ class LaunchSupervisor:
             _require(len(key) == 32)
             self._signer = Ed25519PrivateKey.from_private_bytes(key)
             data = _strict(raw, 1024**2)
-            _require(type(data) is dict and set(data) == {'schema', 'release', 'image', 'profile', 'daemon',
+            _require(type(data) is dict)
+            coordinator_enrollment = data.get('schema') == 'coordinator_launch_supervisor_v4'
+            _require(set(data) == ({'schema', 'release', 'image', 'profile', 'daemon',
                 'socket_path', 'consumer_host_uid', 'consumer_host_gid', 'receipt_lifetime_seconds',
-                'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'})
-            _require(data['schema'] in ('executor_launch_supervisor_v2', 'executor_launch_supervisor_v3'))
+                'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'} |
+                ({'admission_raw_digest'} if coordinator_enrollment else set())))
+            _require(data['schema'] in ('executor_launch_supervisor_v2', 'executor_launch_supervisor_v3', 'coordinator_launch_supervisor_v4'))
             self._configuration_raw_digest = data['configuration_raw_digest']
             _require(type(self._configuration_raw_digest) is str
                      and _SHA.fullmatch(self._configuration_raw_digest))
@@ -867,16 +870,24 @@ class LaunchSupervisor:
             _require(type(release.get('public_key')) is str and _HEX.fullmatch(release['public_key']))
             release['public_key'] = bytes.fromhex(release['public_key'])
             release['platform'] = Platform.model_validate(release['platform'])
-            self.release = ExecutorReleaseEnrollment(**release)
+            self.release = (CoordinatorReleaseEnrollment if coordinator_enrollment else ExecutorReleaseEnrollment)(**release)
             _require(self.release.public_key == self._signer.public_key().public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw))
             self.profile = ExecutorLaunchProfile.model_validate(data['profile'])
             _require(self.profile.digest() == self.release.launch_profile_digest)
-            # Broker transport and independent enrollment are not implemented,
-            # nor are coordinator pair launch and inherited-channel handoff.
-            # Refuse before journal creation, socket binding or Engine access.
-            _require(self.profile.broker_mode is None and self.profile.role is None
-                     and self.profile.command_channel is None and self.profile.generation_isolation is None)
+            if coordinator_enrollment:
+                from .retained_oauth_pair import RetainedOAuthPair
+                _require(type(retained_pair) is RetainedOAuthPair
+                         and self.profile.role == 'supervised-local-coordinator-v3'
+                         and self.profile.broker_mode is None and self.profile.command_channel is None
+                         and self.profile.generation_isolation is None and not gate_start_mode
+                         and create_journal is True)
+                self._admission_raw_digest = data['admission_raw_digest']
+                _require(type(self._admission_raw_digest) is str and _SHA.fullmatch(self._admission_raw_digest))
+            else:
+                # Legacy and inherited-channel roles retain their prior refusal.
+                _require(retained_pair is None and self.profile.broker_mode is None and self.profile.role is None
+                         and self.profile.command_channel is None and self.profile.generation_isolation is None)
             _require(self.profile.gate_channel is None or gate_start_mode)
             image = dict(data['image'])
             _require(set(image) == set(VerifiedImage.__dataclass_fields__))
@@ -888,7 +899,7 @@ class LaunchSupervisor:
                      and self.image.platform == self.release.platform
                      and self.image.source_commit == self.release.implementation_commit)
             _require(type(data['daemon']) is dict and 'disjoint' not in data['daemon'])
-            disjoint = data['schema'] == 'executor_launch_supervisor_v3'
+            disjoint = data['schema'] in ('executor_launch_supervisor_v3', 'coordinator_launch_supervisor_v4')
             self._daemon_pin = _DaemonPin(**data['daemon'], disjoint=disjoint)
             self._socket_path = _path(data['socket_path'])
             self._consumer_uid, self._consumer_gid = data['consumer_host_uid'], data['consumer_host_gid']
@@ -922,17 +933,28 @@ class LaunchSupervisor:
                      and type(self._request_ms) is int and 100 <= self._request_ms <= 10000
                      and type(self._launch_ms) is int and 100 <= self._launch_ms <= 120000)
             self._mounts = {item.role: item for item in self.profile.mounts}
-            _require(self._mounts['issuer_socket'].source == str(self._socket_path)
-                     and self._mounts['issuer_socket'].gid == self._consumer_gid
-                     and self._mounts['config'].uid == self._consumer_uid
-                     and self._mounts['config'].gid == self._consumer_gid
-                     and self._mounts['engine_socket'].source == self._daemon_pin.socket_path)
+            if coordinator_enrollment:
+                _require(self._mounts['local_issuer_socket'].source == str(self._socket_path)
+                         and self._mounts['local_issuer_socket'].gid == self._consumer_gid
+                         and self._mounts['local_config'].uid == self._consumer_uid
+                         and self._mounts['local_config'].gid == self._consumer_gid)
+            else:
+                _require(self._mounts['issuer_socket'].source == str(self._socket_path)
+                         and self._mounts['issuer_socket'].gid == self._consumer_gid
+                         and self._mounts['config'].uid == self._consumer_uid
+                         and self._mounts['config'].gid == self._consumer_gid
+                         and self._mounts['engine_socket'].source == self._daemon_pin.socket_path)
             protected = (self._key_path.parent, self._enrollment_path.parent, _path(journal_file).parent)
             for mount in self.profile.mounts:
                 source = Path(mount.source)
                 _require(not any(source == item or source in item.parents or item in source.parents for item in protected))
             _require(self._key_path != self._enrollment_path and self._key_path != _path(journal_file)
                      and self._enrollment_path != _path(journal_file))
+            if coordinator_enrollment:
+                self._pin_trusted_local_inputs()
+                retained_pair._authorize_coordinator_construction(self, enrollment_raw=raw,
+                    enrollment_digest='sha256:' + hashlib.sha256(raw).hexdigest())
+                self._retained_pair = retained_pair
             self._journal = _Journal(journal_file, create=create_journal,
                                      gate_mode=gate_start_mode, start_mode=gate_start_mode,
                                      ledger_mode=self.profile.gate_ledger_channel is not None)

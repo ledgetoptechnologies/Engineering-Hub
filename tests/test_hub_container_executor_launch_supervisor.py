@@ -1388,6 +1388,44 @@ def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, roo
             authority.close()
 
 
+@pytest.mark.parametrize('mode', ['missing', 'denied', 'authorized'])
+def test_v4_coordinator_constructor_requires_exact_retained_owner_before_journal(short_root, root_journal, monkeypatch, mode):
+    from hub_container_executor.retained_oauth_pair import RetainedOAuthPair
+    from tests.test_executor_launch_profile import supervised_local_oauth_profile
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        data['schema'] = 'coordinator_launch_supervisor_v4'
+        data['admission_raw_digest'] = 'sha256:' + 'd'*64
+        data['profile'] = supervised_local_oauth_profile()
+        data['profile']['daemon_policy'] = disjoint_policy()
+        next(m for m in data['profile']['mounts'] if m['role'] == 'local_issuer_socket')['source'] = data['socket_path']
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        raw = launch._canonical(data); Path(kwargs['enrollment_file']).write_bytes(raw)
+        seen = []
+        monkeypatch.setattr(launch.LaunchSupervisor, '_pin_trusted_local_inputs', lambda self: seen.append('capture'))
+        def authorize(owner, supervisor, *, enrollment_raw, enrollment_digest):
+            assert enrollment_raw == raw and enrollment_digest == 'sha256:' + hashlib.sha256(raw).hexdigest()
+            assert not Path(kwargs['journal_file']).exists() and requests == []
+            seen.append('owner-authorized')
+            if mode == 'denied': raise ValueError('stale owner')
+        monkeypatch.setattr(RetainedOAuthPair, '_authorize_coordinator_construction', authorize, raising=False)
+        if mode == 'missing':
+            with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor(**kwargs)
+            assert seen == [] and not Path(kwargs['journal_file']).exists() and requests == []
+        elif mode == 'denied':
+            owner = object.__new__(RetainedOAuthPair)
+            with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor(**kwargs, retained_pair=owner)
+            assert seen == ['capture', 'owner-authorized'] and not Path(kwargs['journal_file']).exists() and requests == []
+        else:
+            owner = object.__new__(RetainedOAuthPair)
+            authority = launch.LaunchSupervisor(**kwargs, retained_pair=owner)
+            try:
+                assert seen == ['capture', 'owner-authorized']
+                assert isinstance(authority.release, launch.CoordinatorReleaseEnrollment)
+                assert authority._retained_pair is owner and requests == []
+            finally: authority.close()
+
+
 def test_supervisor_uses_the_one_shared_profile_parser():
     from engineering_hub import executor_launch_profile as core
     assert launch.ExecutorLaunchProfile is core.ExecutorLaunchProfile
