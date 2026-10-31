@@ -39,3 +39,27 @@ def configuration_commitment(raw: bytes) -> ConfigurationCommitment:
     return ConfigurationCommitment(
         'sha256:' + hashlib.sha256(DOMAIN + canonical).hexdigest(),
         'sha256:' + hashlib.sha256(raw).hexdigest(), parsed.release)
+
+
+COORDINATOR_DOMAIN = b'engineering-hub.coordinator-configuration-commitment.v1\x00'
+
+
+@dataclass(frozen=True)
+class CoordinatorConfigurationCommitment:
+    content_digest: str
+    raw_digest: str
+    manifest_digest: str
+
+
+def coordinator_configuration_commitment(raw: bytes) -> CoordinatorConfigurationCommitment:
+    """Commit the exact closed coordinator config, including its pilot manifest.
+
+    This is not enrollment or process proof. A trusted launch authority must pin
+    both digests in a signed profile and root policy, respectively. The current
+    supervisor continues to refuse coordinator launch until pair trust exists.
+    """
+    from .installed_coordinator import parse_configuration as parse_coordinator
+    parsed = parse_coordinator(raw)
+    return CoordinatorConfigurationCommitment(
+        'sha256:' + hashlib.sha256(COORDINATOR_DOMAIN + raw).hexdigest(),
+        'sha256:' + hashlib.sha256(raw).hexdigest(), parsed.manifest.digest())

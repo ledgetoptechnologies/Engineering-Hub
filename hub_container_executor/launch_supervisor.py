@@ -42,7 +42,7 @@ from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
                                SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES)
 from .launch_transport import REQUEST_PROTOCOL, MAX_REQUEST_BYTES
-from .configuration_commitment import configuration_commitment
+from .configuration_commitment import configuration_commitment, coordinator_configuration_commitment
 
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -728,11 +728,16 @@ class LaunchSupervisor:
                 try:
                     raw = os.read(fd, 65537)
                     _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info))
-                    commitment = configuration_commitment(raw)
-                    _require(commitment.raw_digest == self._configuration_raw_digest
-                             and commitment.content_digest == mount.content_digest
-                             and commitment.release == self.release
-                             and commitment.release.launch_profile_digest == self.profile.digest())
+                    if self.profile.role == 'coordinator':
+                        commitment = coordinator_configuration_commitment(raw)
+                        _require(commitment.raw_digest == self._configuration_raw_digest
+                                 and commitment.content_digest == mount.content_digest)
+                    else:
+                        commitment = configuration_commitment(raw)
+                        _require(commitment.raw_digest == self._configuration_raw_digest
+                                 and commitment.content_digest == mount.content_digest
+                                 and commitment.release == self.release
+                                 and commitment.release.launch_profile_digest == self.profile.digest())
                 finally:
                     os.close(fd)
             if role in self._source_pins:
