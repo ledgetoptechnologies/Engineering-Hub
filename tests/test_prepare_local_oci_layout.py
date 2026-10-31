@@ -120,3 +120,26 @@ def test_metadata_collision_does_not_replace_existing_file(tmp_path, monkeypatch
     with pytest.raises(FileExistsError):
         prepare(archive(rows), output, digest)
     assert (output / 'oci-layout').read_bytes() == b'preserve'
+
+
+@pytest.mark.parametrize('target', ['manifest', 'config', 'layer'])
+def test_same_size_blob_replacement_before_return_is_rejected(tmp_path, monkeypatch, target):
+    import os
+    rows, digest = fixture()
+    index = json.loads(rows[1][1])
+    image = json.loads(next(data for name, data in rows if name.endswith(digest[7:])))
+    selected = {'manifest': digest, 'config': image['config']['digest'],
+                'layer': image['layers'][0]['digest']}[target]
+    output = tmp_path / 'new'
+    original = os.open
+    def replace_before_index(path, flags, *args, **kwargs):
+        if path == 'index.json':
+            blob = output / 'blobs' / 'sha256' / selected[7:]
+            size = blob.stat().st_size
+            replacement = output / 'replacement'
+            replacement.write_bytes(b'x' * size)
+            os.replace(replacement, blob)
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, 'open', replace_before_index)
+    with pytest.raises(ValueError, match='blob changed'):
+        prepare(archive(rows), output, digest)

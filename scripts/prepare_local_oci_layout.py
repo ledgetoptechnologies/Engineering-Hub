@@ -3,6 +3,8 @@
 Integrity validation is not release provenance or deployment approval. On
 failure the exclusively created output is deliberately preserved for review.
 Layer decompression, diff IDs, and runtime behavior are not validated.
+The caller must exclusively control the output parent and layout throughout
+preparation and after return. Checks are not atomic against same-UID writers.
 """
 import argparse
 import hashlib
@@ -137,13 +139,39 @@ def _prepare(stream, output, requested, fds):
             raise ValueError('invalid descriptor')
         return row['digest']
 
+    def verify_blob(digest, *, collect=False):
+        stable()
+        fd = os.open(digest[7:], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sha_fd)
+        try:
+            before = os.fstat(fd)
+            named = os.stat(digest[7:], dir_fd=sha_fd, follow_symlinks=False)
+            if (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino):
+                raise ValueError('blob replaced')
+            h, count, content = hashlib.sha256(), 0, bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > sizes[digest]:
+                    raise ValueError('blob changed')
+                h.update(chunk)
+                if collect:
+                    content.extend(chunk)
+            after = os.fstat(fd)
+            named = os.stat(digest[7:], dir_fd=sha_fd, follow_symlinks=False)
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if (identity(before) != identity(after) or identity(after) != identity(named)
+                    or count != sizes[digest] or h.hexdigest() != digest[7:]):
+                raise ValueError('blob changed')
+            return bytes(content)
+        finally:
+            os.close(fd)
+
     def read_blob(digest):
         if sizes[digest] > MAX_META:
             raise ValueError('manifest too large')
-        stable()
-        fd = os.open(digest[7:], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sha_fd)
-        with os.fdopen(fd, 'rb') as source:
-            return _json(source.read(MAX_META + 1))
+        return _json(verify_blob(digest, collect=True))
 
     index = meta.get('index.json')
     if type(index) is not dict or index.get('schemaVersion') != 2 or type(index.get('manifests')) is not list:
@@ -190,6 +218,10 @@ def _prepare(stream, output, requested, fds):
         raise ValueError('invalid layers')
     for layer in layers:
         descriptor(layer, LAYER)
+    # Repeat every selected graph blob check immediately before publishing the
+    # index; exclusive caller control remains required after this check.
+    for digest in {requested, config_digest, *(layer['digest'] for layer in layers)}:
+        verify_blob(digest)
     # Write a minimal index for the exact selected graph. Existing files never replaced.
     stable()
     def write_exclusive(name, data):
@@ -202,6 +234,8 @@ def _prepare(stream, output, requested, fds):
     stable()
     write_exclusive('index.json', json.dumps(result, sort_keys=True, separators=(',', ':')).encode())
     stable()
+    for digest in {requested, config_digest, *(layer['digest'] for layer in layers)}:
+        verify_blob(digest)
     return {'manifest': requested, 'config': config_digest, 'layers': len(layers), 'blob_bytes': total}
 
 
