@@ -29,6 +29,45 @@ from tests.test_hub_container_executor_launch_supervisor import (
 from tests.test_hub_current_executor_transport import material, server, TOKEN
 
 
+@pytest.mark.asyncio
+async def test_actual_nginx_verified_clients_and_signed_observation(synthetic_issuer, material):
+    import hashlib
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from tests.test_hub_executor_nginx_wire import proxy_fixture, command, TOKEN as PROXY_TOKEN
+
+    authority, path, _ = synthetic_issuer
+    current_ready(authority)
+    release, launch = current_pins(authority)
+    relay = UnixCurrentObservationTransport(socket_path=str(path),
+        expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())
+    ca = material['ca_file'].read_bytes()
+    key = (material['ca_file'].parent / 'key.pem').read_bytes()
+    try:
+        with owned_supervisor_wait(authority):
+            async with proxy_fixture(current_observation_transport=relay,
+                                     certificate_material=(ca, key), proxy_uid=10001) as rig:
+                origin = 'https://127.0.0.1:' + str(rig['port'])
+                token = PROXY_TOKEN.encode()
+                transport = CurrentExecutorHTTPSTransport.from_captured_material(origin,
+                    ca_pem=ca, ca_sha256='sha256:' + hashlib.sha256(ca).hexdigest(),
+                    credential=token, credential_sha256='sha256:' + hashlib.sha256(token).hexdigest())
+                observer = CurrentExecutorObserver(release=release, launch=launch, transport=transport)
+                try:
+                    observed = await asyncio.to_thread(observer)
+                    assert observed.generation_id == launch.launch_id
+                    assert observed.artifact_digest == release.image_config_id
+                    async with ContainerPilotClient.for_verified_https(origin, PROXY_TOKEN, ca) as client:
+                        submitted = command()
+                        result = await client.submit_command(submitted)
+                        assert result.command_id == submitted.command_id
+                        assert result.state == 'held' and result.reason == 'daemon_unavailable'
+                    assert rig['adapter'].calls == [('submit', submitted.command_id)]
+                finally:
+                    observer.close()
+    finally:
+        relay.close()
+
+
 class NoCommands:
     def __init__(self):
         self.touched = []

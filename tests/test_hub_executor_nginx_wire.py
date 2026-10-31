@@ -76,19 +76,25 @@ class FixtureAdapter:
 
 
 @asynccontextmanager
-async def proxy_fixture(current_observation_transport=None):
+async def proxy_fixture(current_observation_transport=None, certificate_material=None, proxy_uid=None):
     nginx = nginx_command()
     with tempfile.TemporaryDirectory(prefix='eh-nx-', dir='/tmp') as directory:
         root = Path(directory)
         # The real proxy runs as this same nonroot account.  A private parent
         # and socket are part of the fixture, not ambient group permissions.
-        if os.geteuid() == 0:
+        if os.geteuid() == 0 and proxy_uid is None:
             pytest.skip('Socket-owner proxy profile requires a nonroot test UID')
-        assert root.stat().st_uid == os.geteuid()
+        if proxy_uid is not None:
+            assert os.geteuid() == 0 and proxy_uid > 0
+            os.chown(root, proxy_uid, proxy_uid)
+        owner = proxy_uid if proxy_uid is not None else os.geteuid()
+        assert root.stat().st_uid == owner
         assert stat.S_IMODE(root.stat().st_mode) == 0o700
-        ca, key = certificate()
+        ca, key = certificate_material or certificate()
         cert_path, key_path = root / 'server.pem', root / 'server.key'
         cert_path.write_bytes(ca); key_path.write_bytes(key); key_path.chmod(0o600)
+        if proxy_uid is not None:
+            os.chown(key_path, proxy_uid, proxy_uid)
         socket_path = root / 'executor.sock'
         adapter = FixtureAdapter()
         application = PilotASGI(adapter, TOKEN, current_observation_transport=current_observation_transport)
@@ -103,7 +109,9 @@ async def proxy_fixture(current_observation_transport=None):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path)); listener.setblocking(False)
         socket_path.chmod(0o600)
-        assert socket_path.stat().st_uid == os.geteuid()
+        if proxy_uid is not None:
+            os.chown(socket_path, proxy_uid, proxy_uid)
+        assert socket_path.stat().st_uid == owner
         assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
         server = uvicorn.Server(uvicorn.Config(observed, lifespan='off', interface='asgi3',
             loop='asyncio', http='h11', ws='none', access_log=False, proxy_headers=False,
@@ -135,11 +143,14 @@ async def proxy_fixture(current_observation_transport=None):
                 + '\n'.join(name + ' ' + str(root / name) + ';' for name in (
                     'client_body_temp_path', 'proxy_temp_path', 'fastcgi_temp_path', 'uwsgi_temp_path', 'scgi_temp_path'))
                 + '\n' + rendered + '\n}\n')
+            identity = ({'user': proxy_uid, 'group': proxy_uid, 'extra_groups': ()}
+                        if proxy_uid is not None else {})
             syntax = subprocess.run([*nginx, '-e', 'stderr', '-p', str(root) + '/', '-c', str(config), '-t'],
-                                    capture_output=True, text=True, timeout=10)
+                                    capture_output=True, text=True, timeout=10, **identity)
             assert syntax.returncode == 0, syntax.stderr
             process = await asyncio.create_subprocess_exec(*nginx, '-e', 'stderr', '-p', str(root) + '/',
-                '-c', str(config), '-g', 'daemon off;', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                '-c', str(config), '-g', 'daemon off;', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True, **identity)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.load_verify_locations(cadata=ca.decode())
             async with asyncio.timeout(5):
@@ -148,19 +159,32 @@ async def proxy_fixture(current_observation_transport=None):
                         pytest.fail('Synthetic nginx exited before readiness')
                     try:
                         reader, writer = await asyncio.open_connection('127.0.0.1', port,
-                            ssl=context, server_hostname='localhost')
+                            ssl=context, server_hostname='127.0.0.1' if certificate_material else 'localhost')
                         writer.close(); await writer.wait_closed()
                         break
                     except ConnectionRefusedError:
                         await asyncio.sleep(0.001)
             yield dict(port=port, context=context, adapter=adapter, state=state, ca=ca)
         finally:
-            if process is not None and process.returncode is None:
-                process.send_signal(signal.SIGQUIT)
-                await asyncio.wait_for(process.communicate(), 8)
-            server.should_exit = True
-            await asyncio.wait_for(backend, 8)
-            listener.close()
+            try:
+                if process is not None and process.returncode is None:
+                    process.send_signal(signal.SIGQUIT)
+                    try:
+                        await asyncio.wait_for(process.communicate(), 8)
+                    except asyncio.TimeoutError:
+                        # The child created its own session, so its PID is the
+                        # task-owned process-group ID. Include its workers.
+                        if process.returncode is not None or os.getpgid(process.pid) != process.pid:
+                            raise RuntimeError('NGINX process group identity lost')
+                        os.killpg(process.pid, signal.SIGKILL)
+                        await asyncio.wait_for(process.communicate(), 8)
+                        raise
+            finally:
+                server.should_exit = True
+                try:
+                    await asyncio.wait_for(backend, 8)
+                finally:
+                    listener.close()
 
 
 async def raw_request(rig, method, path, *, auth=(TOKEN,), body=b'', extra_headers=(), source='127.0.0.1'):
