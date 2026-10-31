@@ -329,6 +329,51 @@ def test_a_failing_state_callback_fails_the_source_closed(tmp_path, failing):
         events.stop()
 
 
+@pytest.mark.parametrize("outcome", ["accept", "raise"])
+def test_never_healthy_until_the_resume_callback_is_accepted(tmp_path, outcome):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    gate, entered = threading.Event(), threading.Event()
+    healthy_seen = []
+
+    def on_state(state):
+        recorder.states.append(state)
+        if state == "resumed":
+            entered.set()
+            gate.wait(5)
+            if outcome == "raise":
+                raise RuntimeError("consumer refused the transition")
+
+    events = SQLiteEventSource(path, HubOutboxCursorReader(), recorder.deliver, busy_timeout_ms=200,
+                               on_error=recorder.errors.append, on_state=on_state,
+                               transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        insert_outbox(holder)
+        poke(holder)
+        assert wait_until(lambda: events.stats["suspended"])
+        holder.commit()
+        assert entered.wait(5)
+        # The callback is blocked: the changes were read, but nothing may look healthy yet.
+        for _ in range(10):
+            healthy_seen.append(events.healthy)
+            time.sleep(0.02)
+        assert healthy_seen == [False] * 10 and events.stats["cursor"] == 1
+        gate.set()
+        if outcome == "accept":
+            assert wait_until(lambda: events.healthy)
+            assert events.failure is None and recorder.errors == []
+        else:
+            assert wait_until(lambda: events.failure is not None)
+            assert isinstance(events.failure, WatcherFailed) and not events.healthy
+            assert len(recorder.errors) == 1
+    finally:
+        gate.set()
+        holder.close()
+        events.stop()
+
+
 @pytest.mark.parametrize("options", [
     {"transient_busy_seconds": -1}, {"transient_busy_seconds": 3601}, {"transient_busy_seconds": True},
     {"transient_busy_seconds": math.nan}, {"transient_busy_seconds": "1"},

@@ -708,6 +708,11 @@ class SQLiteEventSource:
         self._next_retry = now + _RETRY_INTERVAL_SECONDS
 
     def _check_bound(self, now: float | None = None) -> None:
+        """The bound limits how long the barrier may stay unacquired.
+
+        A reconcile that acquires it within the bound still reads and delivers
+        afterwards, so that work can finish shortly past the bound.
+        """
         if self._suspended_since is None:
             return
         if (time.monotonic() if now is None else now) - self._suspended_since > self.transient_busy_seconds:
@@ -724,13 +729,16 @@ class SQLiteEventSource:
         self._barrier.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         self._suspended_since = None
         with self._condition:
-            self._stats["healthy"] = True
             self._stats["suspended"] = False
             self._stats["failure_stage"] = None
             self._stats["sqlite_errorcode"] = None
             self._stats["sqlite_errorname"] = None
             self._condition.notify_all()
+        # Healthy only once the consumer has accepted the transition: a callback
+        # that blocks keeps the source not-healthy, and one that raises fails it
+        # closed without a healthy moment in between.
         self._notify_state("resumed")
+        self._set_stat("healthy", True)
 
     def _notify_state(self, state: str) -> None:
         # A consumer that missed a transition could keep serving a stale stream,

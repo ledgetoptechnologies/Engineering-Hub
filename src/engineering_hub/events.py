@@ -208,9 +208,12 @@ class NativeHubEventFeed:
             # A suspension happened, so no viewer may keep its old stream: end any
             # stragglers, then reopen under a new epoch at the caught-up head.
             # The pending cursor is already included in that head.
+            # The source reports healthy only after this callback was accepted,
+            # so its health isn't checked here. The feed stays unavailable
+            # until it is, because available also requires a healthy source.
             source = self._source
             self.broker.fail()
-            if source is not None and source.healthy:
+            if source is not None:
                 self.broker.activate(int(source.stats["cursor"]))
                 self.reason = "native_source_active"
         elif cursor is not None:
