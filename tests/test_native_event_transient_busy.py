@@ -516,6 +516,37 @@ async def test_a_transition_reported_during_a_drain_keeps_the_gate_shut(tmp_path
     await feed.stop()
 
 
+async def test_an_error_during_a_pending_transition_leaves_the_feed_failed(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    fake.on_state("suspended")
+    fake.on_state("resumed")
+    fake.on_error(RuntimeError("private detail"))
+    assert not feed.available
+    await asyncio.sleep(0)
+    # The error outranks the resume: no reopened epoch, and the gate's clearing
+    # can't make a failed broker available.
+    assert not feed.available and not feed.broker.available
+    assert feed.status["reason"] == "native_source_failed"
+    await feed.stop()
+
+
+async def test_stop_during_a_pending_transition_leaves_nothing_available(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    fake.on_state("suspended")
+    fake.on_state("resumed")
+    assert not feed.available
+    await feed.stop()
+    await asyncio.sleep(0)   # the drain queued before stop must not reopen anything
+    assert not feed.available and not feed.broker.available
+    assert feed.status["reason"] == "stopped"
+
+
 @pytest.mark.parametrize("value", [-1, 3601, True, math.nan, "5"])
 def test_feed_option_is_validated(tmp_path, value):
     with pytest.raises(ValueError):
