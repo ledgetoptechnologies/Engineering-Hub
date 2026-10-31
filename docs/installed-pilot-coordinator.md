@@ -17,10 +17,15 @@ or repaired. A valid file or canonical JSON is not approval of its contents.
 `validate` reads only the configuration and validates its data/model shape.
 It does not open secrets, sockets, providers or the database, contact an
 identity provider, or establish host readiness. It does not validate an actual
-supervisor's drain behavior. `serve` separately resolves four distinct TEST
-credentials and calls the owned queue service. A missing required core Unix
-client API is rejected before secrets or owner state are touched. That check
-is compatibility evidence, not authentication of the core artifact.
+supervisor's drain behavior. The standalone `serve` CLI currently fails closed
+before reading secrets: it does not supply the required reconciliation factory.
+An explicit Python composition must provide that factory; the separately
+documented [trusted local coordinator](trusted-local-coordinator.md) is one
+such composition for an explicitly approved disposable TEST VM. Once supplied,
+the runner resolves four distinct TEST credentials and calls the owned queue
+service. A missing required core Unix client API is rejected before secrets or
+owner state are touched. That check is compatibility evidence, not
+authentication of the core artifact.
 
 The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 
