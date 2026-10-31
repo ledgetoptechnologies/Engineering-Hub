@@ -472,6 +472,50 @@ async def test_suspend_then_resume_before_drain_still_forces_reconnect(tmp_path)
     await feed.stop()
 
 
+@pytest.mark.parametrize("transitions", [["suspended"], ["suspended", "resumed"]])
+async def test_feed_is_unavailable_until_the_loop_has_moved_the_broker(tmp_path, transitions):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    epoch = feed.broker.observer_epoch
+    assert feed.available
+    # The event loop hasn't run yet: the broker still holds the old epoch and
+    # the source reports healthy, yet the reported transition shuts the gate.
+    for state in transitions:
+        fake.on_state(state)
+    assert fake.healthy and feed.broker.available and feed.broker.observer_epoch == epoch
+    assert not feed.available and not feed.status["available"]
+    await asyncio.sleep(0)
+    if transitions[-1] == "resumed":
+        assert feed.available and feed.broker.observer_epoch != epoch
+    else:
+        assert not feed.available and feed.status["reason"] == "native_source_suspended"
+    await feed.stop()
+
+
+async def test_a_transition_reported_during_a_drain_keeps_the_gate_shut(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    original = feed._apply
+
+    def apply_then_report_again(cursor, error, state):
+        original(cursor, error, state)
+        if state == "resumed":
+            fake.on_state("suspended")   # lands after the snapshot, before the gate clears
+
+    feed._apply = apply_then_report_again
+    fake.on_state("suspended")
+    fake.on_state("resumed")
+    await asyncio.sleep(0)
+    assert not feed.available           # the later suspension still holds the gate
+    await asyncio.sleep(0)
+    assert not feed.available and feed.status["reason"] == "native_source_suspended"
+    await feed.stop()
+
+
 @pytest.mark.parametrize("value", [-1, 3601, True, math.nan, "5"])
 def test_feed_option_is_validated(tmp_path, value):
     with pytest.raises(ValueError):

@@ -155,11 +155,17 @@ class NativeHubEventFeed:
         self._pending_cursor = None
         self._pending_error = False
         self._pending_state = None
+        # Set by the watcher thread the moment a suspend or resume is reported,
+        # cleared only once the event loop has moved the broker over. Until then
+        # the old epoch's streams may still be live, so nothing is available.
+        self._transition_pending = False
+        self._transition_seq = 0
         self.reason = "not_started"
 
     @property
     def available(self):
-        return self.broker.available and self._source is not None and self._source.healthy
+        return (self.broker.available and not self._transition_pending
+                and self._source is not None and self._source.healthy)
 
     @property
     def status(self):
@@ -188,6 +194,8 @@ class NativeHubEventFeed:
             self._pending_error |= error
             if state is not None:
                 self._pending_state = state
+                self._transition_pending = True
+                self._transition_seq += 1
             if not self._scheduled:
                 self._scheduled = True
                 self._loop.call_soon_threadsafe(self._drain)
@@ -195,8 +203,19 @@ class NativeHubEventFeed:
     def _drain(self):
         with self._lock:
             cursor, error, state = self._pending_cursor, self._pending_error, self._pending_state
+            seq = self._transition_seq
             self._pending_cursor = self._pending_state = None
             self._pending_error = self._scheduled = False
+        try:
+            self._apply(cursor, error, state)
+        finally:
+            with self._lock:
+                # A transition reported after the snapshot keeps the gate shut
+                # until its own drain has moved the broker.
+                if self._transition_seq == seq:
+                    self._transition_pending = False
+
+    def _apply(self, cursor, error, state):
         if error:
             self.reason = "native_source_failed"
             self.broker.fail()
@@ -262,5 +281,5 @@ class NativeHubEventFeed:
         with self._lock:
             self._loop = None
             self._pending_cursor = self._pending_state = None
-            self._pending_error = self._scheduled = False
+            self._pending_error = self._scheduled = self._transition_pending = False
         self.reason = "stopped"
