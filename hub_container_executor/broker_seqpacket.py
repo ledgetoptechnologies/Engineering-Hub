@@ -60,6 +60,10 @@ class BrokerPeerReset(BrokerChannelClosed):
     """The peer closed its end while packets sent to it were still unread (ECONNRESET)."""
 
 
+class BrokerDrainRequested(BrokerTransportError):
+    """Authenticated channel requested admission closure; cleanup is not yet complete."""
+
+
 def _require(value):
     if not value:
         raise BrokerTransportError()
@@ -453,15 +457,17 @@ class _InheritedChannel:
 
 class InheritedCommandBroker(_InheritedChannel):
     """Executor side: reads one request and sends its one reply per serve_once."""
-    def __init__(self, fd, adapter, peer, *, admission=None):
-        if type(adapter) is not HostAdapter or not (admission is None or callable(admission)):
+    def __init__(self, fd, adapter, peer, *, admission=None, allow_drain=False):
+        if (type(adapter) is not HostAdapter or not (admission is None or callable(admission))
+                or type(allow_drain) is not bool):
             _adopt(fd).close()
             raise BrokerTransportError()
         super().__init__(fd, peer)
-        self.adapter, self._admission = adapter, admission
+        self.adapter, self._admission, self._allow_drain = adapter, admission, allow_drain
+        self._drain_deadline = None
 
     def serve_once(self, timeout_seconds, *, read_timeout_seconds=None):
-        self._enter(type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125
+        self._enter(self._drain_deadline is None and type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125
                     and (read_timeout_seconds is None or (type(read_timeout_seconds) in (int, float)
                                                           and 0 < read_timeout_seconds <= timeout_seconds)))
         try:
@@ -479,6 +485,8 @@ class InheritedCommandBroker(_InheritedChannel):
                 argument = ContainerPilotRequest.model_validate(payload)
             elif action in {'get', 'reconcile'}:
                 argument = _uuid(payload)
+            elif action == 'drain' and self._allow_drain and payload is None:
+                argument = None
             else:
                 raise BrokerTransportError()
             _require(time.monotonic() < deadline and not self._closed)
@@ -489,13 +497,16 @@ class InheritedCommandBroker(_InheritedChannel):
             # One that gives up after this check still leaves an unknown outcome.
             if not self._peer_open():
                 raise BrokerChannelClosed()
+            if action == 'drain':
+                self._drain_deadline = deadline
+                raise BrokerDrainRequested()
             result = getattr(self.adapter, action)(argument)
             _require(result is None or type(result) is ContainerPilotResponse)
             _require(time.monotonic() < deadline)
             _set_deadline(self._socket, deadline)
             _send(self._socket, {'protocol': _CHANNEL_PROTOCOL, 'sequence': self._sequence,
                                  'result': None if result is None else result.model_dump(mode='json')})
-        except BrokerReadTimeout:
+        except (BrokerReadTimeout, BrokerDrainRequested):
             raise
         except (BrokerAdmissionClosed, BrokerChannelClosed):
             self._poison()
@@ -504,6 +515,16 @@ class InheritedCommandBroker(_InheritedChannel):
             self._poison()
             raise BrokerTransportError() from None
         finally:
+            self._busy.release()
+
+    def finish_drain(self):
+        """Acknowledge only after the owner has drained and closed its resources."""
+        self._enter(self._drain_deadline is not None)
+        try:
+            _set_deadline(self._socket, self._drain_deadline)
+            _send(self._socket, {'protocol': _CHANNEL_PROTOCOL, 'sequence': self._sequence, 'drained': True})
+        finally:
+            self._poison()
             self._busy.release()
 
 
@@ -548,3 +569,24 @@ class InheritedCommandClient(_InheritedChannel):
 
     def reconcile(self, command, timeout_seconds=125):
         return self._call('reconcile', command, timeout_seconds)
+
+    def drain(self, timeout_seconds=125):
+        """Close remote admission and await its owned cleanup; uncertainty closes the channel."""
+        self._enter(type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125)
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            _require(not self._readable(time.monotonic()))
+            sequence = self._sequence + 1
+            _set_deadline(self._socket, deadline)
+            _send(self._socket, {'protocol': _CHANNEL_PROTOCOL, 'sequence': sequence,
+                                 'action': 'drain', 'payload': None})
+            self._sequence = sequence
+            _require(self._readable(deadline))
+            reply = self._receive_value(deadline)
+            _require(reply == {'protocol': _CHANNEL_PROTOCOL, 'sequence': sequence, 'drained': True})
+            self._poison()
+        except Exception:
+            self._poison()
+            raise BrokerTransportError() from None
+        finally:
+            self._busy.release()

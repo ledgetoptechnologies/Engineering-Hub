@@ -328,6 +328,26 @@ class ContainerPilotClient:
                             self.__broker_pin.close()
         await finish_owned(close_broker())
 
+    async def drain_inherited_broker(self):
+        """Request authenticated remote admission closure and wait for cleanup."""
+        from .lifecycle import finish_owned
+        from hub_container_executor.broker_seqpacket import InheritedCommandClient
+        if type(self.__broker) is not InheritedCommandClient:
+            raise ContainerPilotClientError('Inherited broker drain unavailable')
+        if self.__broker_closed or self.__broker_closing or self.__broker_lock.locked():
+            raise ContainerPilotClientError('Inherited broker drain unavailable')
+        async with self.__broker_lock:
+            if self.__broker_closed or self.__broker_closing:
+                raise ContainerPilotClientError('Inherited broker drain unavailable')
+            try:
+                await finish_owned(asyncio.to_thread(self.__broker.drain, self.__timeout_seconds))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise ContainerPilotClientError('Inherited broker drain unverified') from None
+            finally:
+                self.__broker_closed = True
+
     async def _command(self, method: str, path: str, expected: ContainerPilotRequest,
                        *, submit: bool = False) -> ContainerPilotResponse:
         if type(expected) is not ContainerPilotRequest:
