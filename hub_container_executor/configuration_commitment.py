@@ -72,11 +72,15 @@ def trusted_local_coordinator_commitment(profile, config_raw: bytes, enrollment_
     This pure validation is not wired to the refused supervisor launch path and
     does not prove host custody, mount identity or operator approval.
     """
+    return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,'trusted-local-coordinator-v1')
+
+
+def _trusted_local_coordinator_commitment(profile, config_raw, enrollment_raw, expected_role):
     from engineering_hub.executor_launch_profile import (ExecutorLaunchProfile,
         TRUSTED_LOCAL_COORDINATOR_TARGETS, verify_profile_bytes)
     from engineering_hub.trusted_queued_session import parse_enrollment, SCHEMA_V3
     from .installed_coordinator import parse_configuration as parse_coordinator
-    if type(profile) is not ExecutorLaunchProfile or profile.role != 'trusted-local-coordinator-v1':
+    if type(profile) is not ExecutorLaunchProfile or profile.role != expected_role:
         raise ValueError('trusted local coordinator commitment invalid')
     try:
         if ExecutorLaunchProfile.model_validate(profile.enrollment_value()) != profile:
@@ -112,3 +116,33 @@ def trusted_local_coordinator_commitment(profile, config_raw: bytes, enrollment_
         return coordinator_configuration_commitment(config_raw)
     except Exception:
         raise ValueError('trusted local coordinator commitment invalid') from None
+
+
+def supervised_local_coordinator_commitment(profile, config_raw: bytes, enrollment_raw: bytes,
+                                             admission_raw: bytes, *, root_raw_digest: str,
+                                             independent_release):
+    """Bind all captured coordinator inputs to independently protected pins.
+
+    This pure check grants no launch authority or mount custody. The root-owned
+    supervisor policy must independently supply the raw digest and complete
+    coordinator release; neither may come from the admission being checked.
+    """
+    from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
+    from .coordinator_admission import admission_commitment, parse_admission
+    from .runtime_identity import CoordinatorReleaseEnrollment
+    try:
+        if (type(profile) is not ExecutorLaunchProfile or profile.role != 'supervised-local-coordinator-v2'
+            or type(independent_release) is not CoordinatorReleaseEnrollment): raise ValueError()
+        expected=CoordinatorReleaseEnrollment(**{name:getattr(independent_release,name)
+                    for name in CoordinatorReleaseEnrollment.__dataclass_fields__})
+        commitment,raw_digest=admission_commitment(admission_raw)
+        admission=parse_admission(admission_raw)
+        mounts={mount.role:mount for mount in profile.mounts}
+        if (type(root_raw_digest) is not str or raw_digest!=root_raw_digest
+            or mounts['local_admission'].content_digest!=commitment
+            or admission.release!=expected or expected.launch_profile_digest!=profile.digest()
+            or admission.config_digest!='sha256:'+hashlib.sha256(config_raw).hexdigest()
+            or admission.session_digest!='sha256:'+hashlib.sha256(enrollment_raw).hexdigest()): raise ValueError()
+        return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,'supervised-local-coordinator-v2')
+    except Exception:
+        raise ValueError('supervised local coordinator commitment invalid') from None

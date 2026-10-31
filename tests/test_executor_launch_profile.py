@@ -316,6 +316,73 @@ def trusted_local_profile():
     return data
 
 
+def supervised_local_profile():
+    data=trusted_local_profile(); data['role']='supervised-local-coordinator-v2'; data['command']=['--supervised']
+    data['mounts'] += [
+        dict(role='local_admission',source='/operator/hub-pilot-local/admission',
+             target='/operator-admission/admission.json',kind='file',read_only=True,
+             uid=110001,gid=110001,mode=0o600,content_digest='sha256:'+'b'*64),
+        dict(role='local_issuer_socket',source='/run/owned-coordinator-issuer.sock',
+             target='/run/engineering-hub/coordinator-issuer.sock',kind='socket',read_only=True,
+             uid=0,gid=110001,mode=0o660,content_digest=None)]
+    return data
+
+
+def test_supervised_local_profile_is_new_closed_shape_and_legacy_unchanged():
+    legacy=trusted_local_profile(); before=core.canonical(legacy)
+    data=supervised_local_profile()
+    signed=core.ExecutorLaunchProfile.model_validate(data)
+    assert signed.enrollment_value()==data
+    assert core.verify_profile_bytes(core.canonical(data),signed.digest()).enrollment_value()==data
+    assert core.canonical(core.ExecutorLaunchProfile.model_validate(legacy).enrollment_value())==before
+    for role,changes in [('local_issuer_socket',{'uid':110001}),('local_issuer_socket',{'mode':0o600}),
+                         ('local_admission',{'read_only':False}),('local_admission',{'content_digest':None})]:
+        bad=dict(data);bad['mounts']=[dict(item) for item in data['mounts']]
+        _swap_mount(bad,role,**changes)
+        with pytest.raises((ValueError,RuntimeError)): core.ExecutorLaunchProfile.model_validate(bad)
+    for changes in ({'command':['--config','/operator/coordinator.json']},{'supplementary_groups':[1]},
+                    {'gate_channel':'protected-socket-v1'}):
+        with pytest.raises((ValueError,RuntimeError)): core.ExecutorLaunchProfile.model_validate(dict(data,**changes))
+
+
+def test_supervised_commitment_requires_independent_raw_and_complete_release_pins():
+    pytest.importorskip('fcntl')
+    from hub_container_executor.configuration_commitment import supervised_local_coordinator_commitment, trusted_local_coordinator_commitment
+    from hub_container_executor.coordinator_admission import admission_commitment, parse_admission
+    from tests.test_hub_coordinator_admission import document
+    from tests.test_hub_container_executor_installed_coordinator import github_configuration, canonical
+    from tests.test_hub_trusted_queued_session import v2_document, encode
+    from tests.test_hub_unified_pilot_startup import profile_document
+    from engineering_hub.trusted_queued_session import SCHEMA_V3
+    config=github_configuration();config['manifest']=profile_document()['manifest']
+    config.update(database_path='/var/lib/engineering-hub/local-coordinator/hub.sqlite',
+        coordinator_socket_path='/run/hub-browser/hub.sock',executor_socket_path='/run/hub-executor/executor.sock',
+        secret_root='/var/lib/engineering-hub/local-secrets')
+    enrollment=v2_document();enrollment.update(schema=SCHEMA_V3,operator_actor='human:123')
+    config_raw,enrollment_raw=canonical(config),encode(enrollment)
+    data=trusted_local_profile();data['role']='supervised-local-coordinator-v2';data['command']=['--supervised']
+    data['daemon_policy']['engine_id']=enrollment['launch']['engine_id']
+    _swap_mount(data,'local_config',content_digest=digest_of(config_raw))
+    _swap_mount(data,'local_enrollment',content_digest=digest_of(enrollment_raw))
+    adm=document(config_raw,enrollment_raw);normalized,_=admission_commitment(canonical(adm))
+    data['mounts'] += [dict(role='local_admission',source='/operator/hub-pilot-local/admission',target='/operator-admission/admission.json',
+        kind='file',read_only=True,uid=110001,gid=110001,mode=0o600,content_digest=normalized),
+        dict(role='local_issuer_socket',source='/run/owned-coordinator-issuer.sock',target='/run/engineering-hub/coordinator-issuer.sock',
+        kind='socket',read_only=True,uid=0,gid=110001,mode=0o660,content_digest=None)]
+    profile=core.ExecutorLaunchProfile.model_validate(data)
+    adm['release']['launch_profile_digest']=profile.digest(); raw=canonical(adm)
+    commitment,raw_pin=admission_commitment(raw); assert commitment==normalized
+    release=parse_admission(raw).release
+    supervised_local_coordinator_commitment(profile,config_raw,enrollment_raw,raw,root_raw_digest=raw_pin,independent_release=release)
+    with pytest.raises(ValueError): trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw)
+    with pytest.raises(ValueError): supervised_local_coordinator_commitment(profile,config_raw,enrollment_raw,raw,root_raw_digest='sha256:'+'0'*64,independent_release=release)
+    from dataclasses import replace
+    with pytest.raises(ValueError): supervised_local_coordinator_commitment(profile,config_raw,enrollment_raw,raw,root_raw_digest=raw_pin,independent_release=replace(release,issuer_id='other'))
+    changed=dict(adm);changed['release']=dict(adm['release'],launch_profile_digest='sha256:'+'f'*64);changed_raw=canonical(changed)
+    assert admission_commitment(changed_raw)[0]==normalized
+    with pytest.raises(ValueError): supervised_local_coordinator_commitment(profile,config_raw,enrollment_raw,changed_raw,root_raw_digest=admission_commitment(changed_raw)[1],independent_release=release)
+
+
 def test_trusted_local_profile_is_distinct_closed_and_preserves_old_bytes():
     previous = coordinator_profile()
     assert core.ExecutorLaunchProfile.model_validate(previous).enrollment_value() == previous
