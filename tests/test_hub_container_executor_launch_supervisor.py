@@ -1673,6 +1673,54 @@ def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, 
             authority.close()
 
 
+def test_paired_runner_cannot_use_legacy_signed_profile(short_root, root_journal):
+    from hub_container_executor.installed_runner import PAIR_SCHEMA
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        mount = next(m for m in data['profile']['mounts'] if m['role'] == 'config')
+        path = Path(mount['source'])
+        runner = json.loads(path.read_bytes())
+        runner['schema'] = PAIR_SCHEMA
+        runner['pair'] = {'authority_public_key_hex': 'b' * 64, 'peer_uid': 10002, 'peer_gid': 10002}
+        mount['content_digest'] = configuration_commitment(launch._canonical(runner)).content_digest
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        assert profile.command_channel is None
+        data['release']['launch_profile_digest'] = runner['release_enrollment']['launch_profile_digest'] = profile.digest()
+        raw = launch._canonical(runner)
+        path.write_bytes(raw)
+        data['configuration_raw_digest'] = configuration_commitment(raw).raw_digest
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            # Exercise the independent manifest-reading path even if a caller
+            # had previously captured this exact file's identity.
+            authority._source_pins['config'] = launch._identity(path.lstat())
+            with pytest.raises(RuntimeError):
+                authority._handoff_manifest_digest()
+            assert requests == [] and authority._consumer is None and authority._listener is None
+        finally:
+            authority.close()
+
+
+def test_legacy_runner_cannot_use_inherited_channel_profile(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (_, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            # Exercise the executor mode guard directly: this synthetic profile
+            # does not authorize launch and is never sent to the Engine.
+            authority.profile = authority.profile.model_copy(update={'command_channel': 'inherited-seqpacket-v1'})
+            path = Path(authority._mounts['config'].source)
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            authority._source_pins['config'] = launch._identity(path.lstat())
+            with pytest.raises(RuntimeError):
+                authority._handoff_manifest_digest()
+            assert requests == [] and authority._consumer is None
+        finally:
+            authority.close()
+
+
 @pytest.mark.parametrize('terminate', [True, False])
 @pytest.mark.parametrize('accounting_lag', [0, 2])
 def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(

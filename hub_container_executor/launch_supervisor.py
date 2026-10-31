@@ -737,6 +737,7 @@ class LaunchSupervisor:
                                  and commitment.content_digest == mount.content_digest)
                     else:
                         commitment = configuration_commitment(raw)
+                        self._runner_configuration(raw)
                         _require(commitment.raw_digest == self._configuration_raw_digest
                                  and commitment.content_digest == mount.content_digest
                                  and commitment.release == self.release
@@ -1080,9 +1081,17 @@ class LaunchSupervisor:
                 if peer is not None:
                     peer.close()
 
+    def _runner_configuration(self, raw):
+        from .installed_runner import parse_configuration
+        parsed = parse_configuration(raw)
+        # Paired runners consume an inherited channel. A legacy signed launch
+        # profile cannot authorize that different entrypoint behavior.
+        _require((parsed.pair is not None) ==
+                 (self.profile.command_channel == 'inherited-seqpacket-v1'))
+        return parsed
+
     def _handoff_manifest_digest(self):
         """Derive only from the already pinned canonical runner configuration."""
-        from .installed_runner import parse_configuration
         mount = self._mounts['config']
         path = _path(mount.source)
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
@@ -1111,7 +1120,7 @@ class LaunchSupervisor:
             _require(commitment.raw_digest == self._configuration_raw_digest
                      and commitment.content_digest == mount.content_digest
                      and commitment.release == self.release)
-            return parse_configuration(raw).manifest.digest()
+            return self._runner_configuration(raw).manifest.digest()
         finally:
             os.close(fd)
 

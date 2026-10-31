@@ -109,6 +109,17 @@ submit only a never-reserved next phase. IDs, fence, manifest and independent
 review stay bound; candidate failure increments the lifetime repair count once.
 Historical smoke receipts do not establish current host health.
 
+Executor create operations recorded before authenticated `create_context` was
+introduced lack the original profile commitment needed by the current adapter.
+Reconciliation leaves those legacy candidate or rollback create operations
+held, including completed or terminal-failed operations; a dependent rollback
+cannot be assumed available automatically. Preserve the original ledger,
+journal, container and operation evidence for independent operator inspection.
+Do not synthesize or backfill the missing context from current daemon metadata,
+replay a create, or clear the hold to force progress. Any recovery requires a
+separately designed and reviewed authority and an explicitly authorized plan;
+some legacy records may not contain enough evidence to recover automatically.
+
 Pause allows inspection evidence but no reactivation/release. Repeated explicit
 inspections get distinct occurrences. Ordinary local validation/CAS errors mark
 only their own inspection claim held, allowing a corrected retry; cancellation
