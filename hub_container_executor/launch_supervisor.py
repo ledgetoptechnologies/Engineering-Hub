@@ -295,6 +295,9 @@ class DisjointDaemonPolicy(_Closed):
     daemon_gid: int
     uid_map: tuple[tuple[int, int, int], ...]
     gid_map: tuple[tuple[int, int, int], ...]
+    # SHA-256 of the exact held-range attestation bytes compared against. It
+    # identifies which attestation was used; it doesn't make it complete or sourced.
+    held_ranges_digest: str
 
     @field_validator('uid_map', 'gid_map', mode='before')
     @classmethod
@@ -305,6 +308,7 @@ class DisjointDaemonPolicy(_Closed):
     def closed_policy(self):
         _require(self.kind == 'disjoint-v1'
                  and re.fullmatch(r'[A-Za-z0-9:_.-]{1,128}', self.engine_id)
+                 and _SHA.fullmatch(self.held_ranges_digest)
                  and all(0 < value < 2**32 - 1 and value not in _UNUSABLE_DAEMON_IDS
                          for value in (self.daemon_uid, self.daemon_gid)))
         # Rootless convention: namespace root is exactly the daemon account.
@@ -810,6 +814,8 @@ class LaunchSupervisor:
             if disjoint:
                 self._held_path = _path(held_ranges_file)
                 held_raw, self._held_identity = _root_file(self._held_path, 65536)
+                # Only the exact attestation the signed profile names may be compared against.
+                _require('sha256:' + hashlib.sha256(held_raw).hexdigest() == policy.held_ranges_digest)
                 held_uids, held_gids = _held_ranges(held_raw)
                 _require(self._daemon_pin.uid == policy.daemon_uid and self._daemon_pin.gid == policy.daemon_gid
                          and self._daemon_pin.daemon_id == policy.engine_id

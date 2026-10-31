@@ -50,6 +50,11 @@ overlap check is only as good as that attestation, so a reviewer must confirm th
 ranges against the retained hold record. The installed launcher takes it as
 `--held-ranges-file`; legacy invocations are unchanged.
 
+The policy's `held_ranges_digest` is the SHA-256 of the exact attestation bytes,
+and the supervisor refuses any other file. So the signed profile, and any verifier
+that pins it, records exactly which attestation the overlap check used. The digest
+identifies those bytes; it doesn't make them complete or show where they came from.
+
 Before binding the issuer socket or making any Engine request, `launch()` reads the
 pinned daemon process's `/proc/<pid>/uid_map` and `gid_map` and requires exact row
 equality with the policy; `_validate_live` repeats this and also requires the

@@ -1268,26 +1268,34 @@ def test_protected_enrollment_rejects_invalid_daemon_policy(short_root, root_jou
 DISJOINT_MAP = [[0, 10002, 1], [1, 100001, 65536]]
 
 
-def disjoint_policy(**changes):
-    return {'kind': 'disjoint-v1', 'engine_id': 'test-daemon', 'daemon_uid': 10002, 'daemon_gid': 10002,
-            'uid_map': deepcopy(DISJOINT_MAP), 'gid_map': deepcopy(DISJOINT_MAP), **changes}
-
-
 def held_ranges(**changes):
-    # Synthetic stand-in for independently retained evidence about the held account.
+    # Synthetic stand-in for an operator attestation about the held account.
     return {'schema': launch.HELD_RANGES_SCHEMA, 'uid_ranges': [[10001, 1], [200000, 65536]],
             'gid_ranges': [[10001, 1], [200000, 65536]], 'evidence_sha256': 'c' * 64, **changes}
 
 
+def held_digest(held=None):
+    return 'sha256:' + hashlib.sha256(launch._canonical(held_ranges() if held is None else held)).hexdigest()
+
+
+def disjoint_policy(**changes):
+    return {'kind': 'disjoint-v1', 'engine_id': 'test-daemon', 'daemon_uid': 10002, 'daemon_gid': 10002,
+            'uid_map': deepcopy(DISJOINT_MAP), 'gid_map': deepcopy(DISJOINT_MAP),
+            'held_ranges_digest': held_digest(), **changes}
+
+
 @contextmanager
-def v3_constructor(short_root, root_journal, *, policy=None, held=None, daemon=None):
-    with root_file_constructor_fixture(short_root, root_journal,
-                                       daemon_policy=disjoint_policy() if policy is None else policy) as (data, kwargs, requests):
+def v3_constructor(short_root, root_journal, *, policy=None, held=None, daemon=None, pinned_digest=None):
+    held = held_ranges() if held is None else held
+    # The signed profile names the exact attestation bytes placed below, unless a test pins other bytes.
+    policy = disjoint_policy() if policy is None else policy
+    policy = {**policy, 'held_ranges_digest': pinned_digest or held_digest(held)}
+    with root_file_constructor_fixture(short_root, root_journal, daemon_policy=policy) as (data, kwargs, requests):
         data['schema'] = 'executor_launch_supervisor_v3'
         data['daemon'].update({'uid': 10002, 'gid': 10002, **(daemon or {})})
         Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
         held_path = Path(kwargs['enrollment_file']).parent / 'held-ranges.json'
-        held_path.write_bytes(launch._canonical(held_ranges() if held is None else held))
+        held_path.write_bytes(launch._canonical(held))
         held_path.chmod(0o600)
         yield data, dict(kwargs, held_ranges_file=str(held_path)), requests
 
@@ -1337,6 +1345,25 @@ def test_policy_is_part_of_the_signed_profile_digest():
     assert disjoint != legacy
     moved = disjoint_policy(uid_map=[[0, 10002, 1], [1, 100002, 65536]])
     assert launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': moved}).digest() != disjoint
+    # Naming a different held attestation is a different signed profile.
+    other = disjoint_policy(held_ranges_digest=held_digest(held_ranges(evidence_sha256='d' * 64)))
+    assert launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': other}).digest() != disjoint
+
+
+def test_policy_must_name_its_held_attestation():
+    policy = disjoint_policy()
+    del policy['held_ranges_digest']
+    with pytest.raises((RuntimeError, ValueError)):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': policy})
+
+
+def test_v3_constructor_refuses_held_bytes_the_profile_does_not_name(short_root, root_journal):
+    # Equally valid, non-overlapping attestation, but not the one the signed profile pinned.
+    with v3_constructor(short_root, root_journal,
+                        pinned_digest=held_digest(held_ranges(evidence_sha256='d' * 64))) as (data, kwargs, requests):
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
 
 
 @pytest.mark.parametrize('change', [
@@ -1352,6 +1379,7 @@ def test_policy_is_part_of_the_signed_profile_digest():
     {'uid_map': [[0, 10002, 1]]}, {'uid_map': [[0, 10002, 1]] + [[i, 100000 + i, 1] for i in range(1, 9)]},
     {'uid_map': [[0, 10002, 1], [1, 100001, True]]}, {'uid_map': [[0, 10002, 1], [1, 100001]]},
     {'uid_map': [[0, 10002, 1], [1, 2**32 - 10, 65536]]}, {'extra': 1},
+    {'held_ranges_digest': 'c' * 64}, {'held_ranges_digest': 'sha256:' + 'C' * 64}, {'held_ranges_digest': None},
 ])
 def test_policy_refuses_unsafe_or_ambiguous_maps(change):
     # LaunchSupervisorError is a RuntimeError; pydantic's ValidationError is a ValueError.
