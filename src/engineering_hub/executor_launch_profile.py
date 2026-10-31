@@ -128,7 +128,7 @@ def _proc_map_rows(raw):
     rows = []
     for line in raw.splitlines():
         fields = line.split()
-        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]+', value) for value in fields))
+        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]{1,10}', value) for value in fields))
         rows.append(tuple(int(value) for value in fields))
     return _map_rows(sorted(rows))
 

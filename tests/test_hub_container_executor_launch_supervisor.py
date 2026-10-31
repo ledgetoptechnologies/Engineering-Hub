@@ -1335,13 +1335,19 @@ def test_supervisor_uses_the_one_shared_profile_parser():
         assert core.verify_profile_bytes(raw, expected).digest() == launch.ExecutorLaunchProfile.model_validate(value).digest()
 
 
-@pytest.mark.parametrize('bad', ['garbage\n', '0 10002 1\n', ''])
+@pytest.mark.parametrize('bad', ['garbage\n', '0 10002 1\n', '',
+    # Over Python's int-string limit: must refuse closed, never raise a raw ValueError.
+    '0 10002 1\n1 ' + '9' * 5000 + ' 65536\n', '0 10002 1\n1 10000000000 65536\n'])
 def test_supervisor_map_errors_keep_the_supervisor_error_type(bad):
     policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
     exact = '0 10002 1\n1 100001 65536\n'
     with pytest.raises(launch.LaunchSupervisorError) as caught:
         launch._live_maps(policy, bad, exact)
     assert type(caught.value) is launch.LaunchSupervisorError
+    # The legacy single-id mapper refuses the same oversized fields closed.
+    if '9' * 20 in bad or '10000000000' in bad:
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch._mapped_id(bad, 10001)
 
 
 def test_legacy_profile_digest_bytes_are_unchanged():

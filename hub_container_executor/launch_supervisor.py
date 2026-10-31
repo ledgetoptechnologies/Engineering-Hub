@@ -282,7 +282,7 @@ def _mapped_id(raw, identifier):
     rows = []
     for line in raw.splitlines():
         fields = line.split()
-        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]+', value) for value in fields))
+        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]{1,10}', value) for value in fields))
         inside, outside, length = map(int, fields)
         _require(length > 0 and inside + length <= 2**32 and outside + length <= 2**32)
         _require(all(inside + length <= old[0] or old[0] + old[2] <= inside for old in rows))

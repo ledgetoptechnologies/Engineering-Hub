@@ -132,6 +132,12 @@ def test_lone_surrogate_escape_fails_closed_without_leaking():
     assert 'SECRET' not in str(caught.value)
 
 
+@pytest.mark.parametrize('text', ['0 10002 1\n1 ' + '9' * 5000 + ' 65536\n', '0 10002 1\n1 10000000000 65536\n'])
+def test_oversized_map_numbers_refuse_closed(text):
+    with pytest.raises(core.LaunchProfileError):
+        core._proc_map_rows(text)
+
+
 def test_launch_targets_are_read_only():
     with pytest.raises(TypeError):
         core.LAUNCH_TARGETS['config'] = '/tmp/elsewhere'
