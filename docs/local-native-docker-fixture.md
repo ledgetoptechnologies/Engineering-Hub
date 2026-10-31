@@ -80,7 +80,19 @@ uncompressed Git archive whose SHA-256 and commit association are independently
 established by the caller. It requires exclusive control of the archive and
 output parent, creates a new bounded tree with read-only modes, and returns the
 tree digest consumed by the launcher. Its focused tests use synthetic archives.
-The operator has not yet integrated this preparer or verified that its output
-path is visible at the same absolute path to Docker Desktop. Separate bounded
-scratch storage and authenticated cleanup after the operator exits also remain
-unresolved; this helper supplies neither lifecycle nor custody proof.
+The Windows parent instead seeds task-owned named volumes from independently
+pinned archive and Docker CLI bytes. A fixed helper extracts the archive, then
+a separate read-only helper measures the tree before the operator can start.
+The parent journals one-shot effects, retains uncertain resources, and checks
+the exact operator and inner task have gone before its storage cleanup. It
+retains the journal volume as evidence. File fsync provides process-crash
+evidence; Windows directory-entry durability after power loss is not proven.
+
+Local probes have confirmed current read-only aliases for empty ordinary named
+volumes and writable aliases for a bounded tmpfs while its keeper is live.
+Those probes do not establish the full operator path, nested socket binding,
+source provenance, post-restart database inventory, or native rollback. The
+Windows parent and cleanup have only synthetic transport tests; do not treat
+them as acceptance of a shared-daemon run. The CLI digest pins observed local
+bytes and is not an independently verified publisher checksum. All of these
+tools assume an exclusive, trusted local operator and daemon.
