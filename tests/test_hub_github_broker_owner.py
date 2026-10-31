@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 pytest.importorskip('fcntl')
@@ -54,6 +55,123 @@ def test_changed_enrollment_is_rejected_before_spawn(monkeypatch):
         owner.OwnedBrokerProcess().start(runtime_policy='/unused',enrollment_fd=3,listener=listener,
                                          _expected_enrollment={'peer_uid':1})
     assert listener.fileno()==-1
+
+
+def test_supervised_broker_denies_missing_cgroup_before_spawn(monkeypatch):
+    from hub_container_executor.github_broker_service import BrokerServiceError
+    monkeypatch.setattr(owner,'_runtime',lambda _: {'source_root':'/unused','python_path':'/unused'})
+    monkeypatch.setattr(owner,'read_enrollment',lambda _: pytest.fail('unexpected enrollment read'))
+    monkeypatch.setattr(owner.subprocess,'Popen',lambda *a,**k: pytest.fail('unexpected spawn'))
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    with pytest.raises(BrokerServiceError):
+        owner.OwnedBrokerProcess().start(runtime_policy='/unused',enrollment_fd=3,listener=listener,_require_cgroup=True)
+    assert listener.fileno()==-1
+
+
+@pytest.mark.skipif(os.getuid()!=0,reason='requires root-owned protected policy fixture')
+def test_v2_runtime_policy_requires_and_pins_explicit_cgroup(monkeypatch):
+    import scripts.hub_local_test_launcher as launcher
+    root=Path(tempfile.mkdtemp(prefix='eh-broker-runtime-',dir='/root'));source=root/'source';source.mkdir()
+    python=Path(sys.executable).resolve();digest='sha256:'+hashlib.sha256(python.read_bytes()).hexdigest()
+    source_digest='sha256:'+'a'*64;seen=[]
+    class SyntheticCgroup:
+        def __init__(self,path):seen.append(str(path))
+        def close(self):seen.append('closed')
+    monkeypatch.setattr(owner,'_BrokerCgroup',SyntheticCgroup)
+    monkeypatch.setattr(owner.os,'fstatvfs',lambda _:SimpleNamespace(f_flag=os.ST_RDONLY))
+    monkeypatch.setattr(launcher,'source_tree_digest',lambda path,**kw:source_digest)
+    policy={'schema':'engineering-hub.github-broker-runtime.v2','source_root':str(source),
+            'source_digest':source_digest,'python_path':str(python),'python_digest':digest,
+            'cgroup_path':'/sys/fs/cgroup/hub-synthetic'}
+    path=root/'policy';path.write_bytes(launch_canonical(policy));path.chmod(0o600)
+    runtime=None
+    try:
+        runtime=owner._runtime(str(path))
+        assert type(runtime['_cgroup']) is SyntheticCgroup and seen==['/sys/fs/cgroup/hub-synthetic']
+    finally:
+        if runtime:
+            runtime['_cgroup'].close()
+            for pin in reversed(runtime['_pins']):pin.close()
+        shutil.rmtree(root)
+
+
+def launch_canonical(value):
+    import json
+    return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
+
+
+@pytest.mark.skipif(os.getuid()!=0,reason='requires private root-owned synthetic cgroup fixture')
+def test_cgroup_leaf_refuses_changed_limits_members_or_children(monkeypatch):
+    from hub_container_executor.github_broker_service import BrokerServiceError
+    root=Path(tempfile.mkdtemp(prefix='eh-broker-cgroup-',dir='/root'));leaf=root/'leaf';leaf.mkdir()
+    values={**owner._LIMITS,'cgroup.procs':'','cgroup.threads':'','cgroup.subtree_control':'',
+            'cgroup.events':'populated 0\nfrozen 0','cpu.max.burst':'0'}
+    for name,value in values.items(): (leaf/name).write_text(value+'\n')
+    for name in ('cgroup.procs','cgroup.threads'):(root/name).write_text('')
+    monkeypatch.setattr(owner,'_CGROUP_ROOT',root);monkeypatch.setattr(owner,'_cgroup_v2',lambda _:True)
+    group=None
+    try:
+        (leaf/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+        with pytest.raises(BrokerServiceError):owner._BrokerCgroup(leaf)
+        (leaf/'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        group=owner._BrokerCgroup(leaf)
+        original=group._control
+        def synthetic_control(name,**kwargs):
+            result=original(name,**kwargs)
+            if name=='cgroup.procs' and kwargs.get('write') is not None:
+                (leaf/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+            return result
+        group._control=synthetic_control;group.attach(12345);group.check(12345)
+        (leaf/'cpu.max.burst').write_text('100\n')
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (leaf/'cpu.max.burst').write_text('0\n')
+        (leaf/'cgroup.events').write_text('populated 0\nfrozen 0\n')
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (leaf/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+        (root/'cgroup.procs').chmod(0o666)
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (root/'cgroup.procs').chmod(0o644)
+        (leaf/'cgroup.threads').chmod(0o666)
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (leaf/'cgroup.threads').chmod(0o644)
+        (leaf/'memory.max').write_text('max\n')
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (leaf/'memory.max').write_text(values['memory.max']+'\n')
+        (leaf/'cgroup.procs').write_text('12345\n12346\n')
+        with pytest.raises(BrokerServiceError):group.check(12345)
+        (leaf/'cgroup.procs').write_text('12345\n');(leaf/'unexpected-child').mkdir()
+        with pytest.raises(BrokerServiceError):group.check(12345)
+    finally:
+        if group is not None:group.close()
+        shutil.rmtree(root)
+
+
+@pytest.mark.skipif(os.getuid()!=0,reason='requires root to create owned synthetic nonroot child')
+def test_failed_cgroup_attach_closes_gate_before_child_work(monkeypatch):
+    from hub_container_executor.github_broker_service import BrokerServiceError
+    root=Path(tempfile.mkdtemp(prefix='eh-broker-barrier-'));root.chmod(0o777)
+    marker=root/'unexpected';listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    events=[]
+    class SyntheticCgroup:
+        def attach(self,pid):events.append('attach');raise BrokerServiceError()
+        def close(self):events.append('close')
+    group=SyntheticCgroup();monkeypatch.setattr(owner,'_BrokerCgroup',SyntheticCgroup)
+    monkeypatch.setattr(owner,'_runtime',lambda _: {'source_root':str(root),'python_path':sys.executable,'_cgroup':group})
+    monkeypatch.setattr(owner,'read_enrollment',lambda _: {'service_uid':12345,'service_gid':12346})
+    monkeypatch.setattr(owner,'_BOOT',"""import os,sys
+gate=int(sys.argv[2])
+if os.read(gate,2)!=b'G':raise SystemExit(2)
+open(sys.argv[1]+'/unexpected','w').close()
+""")
+    fd=os.open('/dev/null',os.O_RDONLY);process=owner.OwnedBrokerProcess()
+    try:
+        with pytest.raises(BrokerServiceError):
+            process.start(runtime_policy='/unused',enrollment_fd=fd,listener=listener,timeout_seconds=5,_require_cgroup=True)
+        assert process.wait(timeout_seconds=5)==2 and not marker.exists()
+        assert events==['attach','close'] and listener.fileno()==-1
+    finally:
+        if process._process is not None and process._process.poll() is None:process.wait(timeout_seconds=5)
+        os.close(fd);listener.close();shutil.rmtree(root)
 
 
 def test_pipe_cleanup_attempts_every_close_after_error(monkeypatch):
@@ -155,7 +273,8 @@ def test_coordinator_binding_precedes_broker_launch(tmp_path,monkeypatch):
 
 
 @pytest.mark.skipif(os.getuid()!=0,reason='requires root to create owned synthetic nonroot children')
-def test_owned_nonroot_broker_process_exchanges_and_drains(monkeypatch):
+@pytest.mark.parametrize('bounded',[False,True])
+def test_owned_nonroot_broker_process_exchanges_and_drains(monkeypatch,bounded):
     root=Path(tempfile.mkdtemp(prefix='eh-broker-process-'));root.chmod(0o755)
     listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); fd=None
     process=owner.OwnedBrokerProcess()
@@ -167,11 +286,19 @@ def test_owned_nonroot_broker_process_exchanges_and_drains(monkeypatch):
                     secret_digest='sha256:'+hashlib.sha256(b'synthetic').hexdigest())
         fd=fd_for(root,data)
         checkout=str(Path(__file__).resolve().parent.parent)
-        monkeypatch.setattr(owner,'_runtime',lambda _: {'source_root':checkout,'python_path':sys.executable})
+        group_events=[]
+        class SyntheticCgroup:
+            def attach(self,pid):group_events.append(('attached',pid))
+            def check(self,pid):group_events.append(('checked',pid))
+            def close(self):group_events.append(('closed',None))
+        monkeypatch.setattr(owner,'_BrokerCgroup',SyntheticCgroup)
+        runtime={'source_root':checkout,'python_path':sys.executable}
+        if bounded:runtime['_cgroup']=SyntheticCgroup()
+        monkeypatch.setattr(owner,'_runtime',lambda _:runtime)
         # Child uses the real service/UDS protocol with only its test secret and
         # fixed GitHub HTTP transport substituted. No network is available.
-        monkeypatch.setattr(owner,'_BOOT',"""import sys
-root=sys.argv[1];sys.path[:0]=[root,root+'/src']
+        monkeypatch.setattr(owner,'_BOOT',"""import os,sys
+root=sys.argv[1];gate=int(sys.argv[2]);assert os.read(gate,2)==b'G';os.close(gate);sys.path[:0]=[root,root+'/src']
 import httpx
 import hub_container_executor.github_broker_service as s
 from engineering_hub.github_oauth_broker import GitHubOAuthBroker
@@ -185,9 +312,10 @@ async def response(request):
  return httpx.Response(200,json={'access_token':'synthetic'} if request.method=='POST' else {'id':123})
 s.GitHubOAuthBroker=lambda **kw: GitHubOAuthBroker(**kw,transport=httpx.MockTransport(response))
 from hub_container_executor.github_broker_process import main
-raise SystemExit(main(sys.argv[2:]))
+raise SystemExit(main(sys.argv[3:]))
 """)
-        process.start(runtime_policy='/unused-test-policy',enrollment_fd=fd,listener=listener,timeout_seconds=10)
+        process.start(runtime_policy='/unused-test-policy',enrollment_fd=fd,listener=listener,timeout_seconds=10,_require_cgroup=bounded)
+        assert process.is_live()
         client="""import asyncio,sys
 root=sys.argv[1];sys.path[:0]=[root,root+'/src']
 from engineering_hub.github_oauth_broker import GitHubOAuthUnixClient
@@ -200,6 +328,9 @@ print(asyncio.run(c.exchange('synthetic-code','a'*43)))
         assert result.stdout==b'123\n'
         process.stop(timeout_seconds=10)
         assert process._process.poll()==0
+        if bounded:
+            assert group_events[0]==('attached',process.pid) and ('checked',process.pid) in group_events
+            assert group_events[-1]==('closed',None)
     finally:
         if process._process is not None and process._process.poll() is None:
             process.stop(timeout_seconds=10)

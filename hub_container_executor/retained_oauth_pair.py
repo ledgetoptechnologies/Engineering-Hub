@@ -188,8 +188,7 @@ class RetainedOAuthPair:
         finally:os.close(fd)
 
     def _broker_alive(self):
-        process=self._broker._process
-        return process is not None and process.poll() is None
+        return self._broker.is_live()
 
     def _hold(self):
         self._state='held';self._stop_observer.set()

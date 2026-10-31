@@ -95,6 +95,7 @@ def test_pair_drains_in_order_and_holds_on_broker_failure(monkeypatch,failure):
     class Broker:
         pid=123
         _process=SimpleNamespace(poll=lambda:None if alive[0] else 1)
+        def is_live(self): return alive[0]
         def start_for_coordinator(self,**kwargs):
             events.append('broker-start')
             if failure=='broker_start':raise RuntimeError()
