@@ -257,8 +257,14 @@ class MetricsReader:
                     values.setdefault(name,[]).append(_bytes(value))
             return {name:found[0] for name,found in values.items() if len(found)==1 and found[0] is not None}
         sizes,free=by('disk_size'),by('disk_free')
-        disks=[{'mount':name,'size_bytes':size,'free_bytes':free.get(name)} for name,size in sizes.items() if size>0]
-        disks=[disk for disk in disks if disk['free_bytes'] is None or disk['free_bytes']<=disk['size_bytes']]
+        # Size and free are separate instant queries. A stale or inconsistent
+        # free sample must not hide an independently valid size observation.
+        disks=[]
+        for name,size in sizes.items():
+            if size<=0:continue
+            available=free.get(name)
+            disks.append({'mount':name,'size_bytes':size,
+                          'free_bytes':available if available is None or available<=size else None})
         return sorted(disks,key=lambda disk:disk['mount'])[:MAX_DISKS]
 
     def _processes(self,results,mapping):

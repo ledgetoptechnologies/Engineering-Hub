@@ -259,6 +259,18 @@ async def test_huge_and_inconsistent_values_are_dropped_not_crashing(service,mon
 
 
 @pytest.mark.asyncio
+async def test_inconsistent_free_does_not_hide_valid_disk_size(service,monkeypatch):
+    series={**SERIES,'disk_size':[sample('100',**W,volume='C:'),sample('200',**W,volume='D:')],
+            'disk_free':[sample('101',**W,volume='C:'),sample('50',**W,volume='D:')]}
+    monkeypatch.setattr(sys.modules[__name__],'SERIES',series)
+    result=await reader(service,handler_for(),[MAPPINGS[0]]).read('human:1')
+    assert result['devices'][0]['disks']==[
+        {'mount':'C:','size_bytes':100,'free_bytes':None},
+        {'mount':'D:','size_bytes':200,'free_bytes':50},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_capability_revoked_during_read_returns_nothing(service):
     principal=InfrastructurePrincipal('human','human:1')
     base=handler_for()
