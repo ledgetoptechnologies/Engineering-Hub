@@ -19,6 +19,10 @@ object with `target_id`, `operation_id`, `run_id`, `manifest_digest`,
 obtained independently; do not copy unverified report values into the config.
 The command uses the protected provider signing key and emits only verified
 held metadata. It reports quiescence as unknown and cannot release the hold.
+`private_preparation_recorded` means only that a protected historical record of
+the private ownership step is present and matches the held identity. It does
+not prove the prior caller received success, establish current ownership or
+writer exclusion, or authorize a mount, handoff, rollback or release.
 It opens the journal read-only, refuses SQLite sidecars or WAL mode, and must
 obtain the journal's exclusive owner lock; it is unavailable while a cooperating
 owner is active and is not a concurrent health check. Root, the host and the

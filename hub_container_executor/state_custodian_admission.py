@@ -30,6 +30,8 @@ PROTOCOL = 'engineering-hub.state-custodian-admission.v1'
 DOMAIN = b'engineering-hub.state-custodian-admission.v1\x00'
 HOLD_OBSERVATION = 'engineering-hub.state-custodian-held-observation.v1'
 HOLD_DOMAIN = b'engineering-hub.state-custodian-held-observation.v1\x00'
+HOLD_OBSERVATION_V2 = 'engineering-hub.state-custodian-held-observation.v2'
+HOLD_DOMAIN_V2 = b'engineering-hub.state-custodian-held-observation.v2\x00'
 FIELDS = frozenset({'protocol', 'operation_id', 'command_id', 'run_id', 'target_id',
                     'fencing_generation', 'manifest_digest', 'role', 'source_backup_digest',
                     'provider_key_digest', 'nonce', 'issued_at_ms', 'expires_at_ms'})
@@ -165,6 +167,31 @@ class CustodianAdmissionJournal:
                 or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
             raise ValueError()
 
+    @staticmethod
+    def _private_preparation(marker, admission, hold):
+        """Canonical historical evidence; it is never a publish authority."""
+        return {'protocol': 'engineering-hub.private-owner-observed.v1',
+                'operation_id': hold[1], 'admission_digest': hold[2],
+                'target_id': hold[0], 'run_id': admission['run_id'],
+                'manifest_digest': admission['manifest_digest'], 'fencing_generation': hold[3],
+                'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7],
+                'owner_policy_digest': hold[8], 'size': marker['size'], 'digest': marker['digest'],
+                'intent_digest': hashlib.sha256(_canonical(marker)).hexdigest()}
+
+    def _read_private_preparation(self, stage_fd, operation, marker, admission, hold):
+        fd = os.open(operation + '.ownership-observed', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
+        try:
+            info = os.fstat(fd)
+            raw = os.read(fd, 4097)
+            named = os.stat(operation + '.ownership-observed', dir_fd=stage_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600 or len(raw) != info.st_size or len(raw) > 4096
+                    or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+                    or raw != _canonical(self._private_preparation(marker, admission, hold))):
+                raise ValueError()
+        finally:
+            os.close(fd)
+
     def reserve(self, payload, signature):
         """Verify and durably reserve; every repeated ID or nonce is rejected."""
         try:
@@ -278,10 +305,11 @@ class CustodianAdmissionJournal:
             if header[:16] != b'SQLite format 3\x00' or header[18:20] != b'\x01\x01': raise ValueError()
             used = 0
             inventory = {}
+            verified_markers = {}
             with os.scandir(stage_fd) as entries:
                 for entry in entries:
                     current()
-                    suffix = next((s for s in ('.quarantine', '.ownership-intent') if entry.name.endswith(s)), None)
+                    suffix = next((s for s in ('.quarantine', '.ownership-intent', '.ownership-observed') if entry.name.endswith(s)), None)
                     if suffix is None: raise ValueError()
                     operation = entry.name.removesuffix(suffix)
                     if str(UUID(operation)) != operation: raise ValueError()
@@ -315,8 +343,17 @@ class CustodianAdmissionJournal:
                     record = self._db.execute('SELECT payload,signature FROM admissions WHERE operation_id=?', (operation,)).fetchone()
                     if (record is None or hashlib.sha256(record[0]).hexdigest() != evidence['admission_digest']): raise ValueError()
                     self._key.verify(record[1], DOMAIN + record[0])
+                    verified_markers[operation] = (evidence, json.loads(record[0]))
                 elif item.st_uid != 0 and name.removesuffix('.quarantine') + '.ownership-intent' not in inventory:
                     raise ValueError()
+            for name in inventory:
+                if name.endswith('.ownership-observed'):
+                    operation = name.removesuffix('.ownership-observed')
+                    if operation not in verified_markers: raise ValueError()
+                    evidence, admitted = verified_markers[operation]
+                    hold = self._db.execute('SELECT * FROM custody_holds WHERE operation_id=?', (operation,)).fetchone()
+                    if hold is None or hold[2] != evidence['admission_digest']: raise ValueError()
+                    self._read_private_preparation(stage_fd, operation, evidence, admitted, hold)
             space = os.fstatvfs(stage_fd)
             if used + info.st_size > policy['maximum_total_bytes'] or space.f_bavail * space.f_frsize < info.st_size + policy['minimum_free_bytes']:
                 raise ValueError()
@@ -393,7 +430,7 @@ class CustodianAdmissionJournal:
         This protects only cooperating users of this enrolled journal; it does
         not establish that other host writers or older databases are excluded.
         """
-        stage_fd = file_fd = marker_fd = None
+        stage_fd = file_fd = marker_fd = record_fd = None
         peer = None
         try:
             self._check()
@@ -489,13 +526,26 @@ class CustodianAdmissionJournal:
                     or stat.S_IMODE(after.st_mode) != 0o600 or after.st_size != size
                     or self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (admitted['target_id'],)).fetchone() != hold
                     or current() != (host_uid, host_gid)): raise ValueError()
+            record_fd = os.open(operation_id + '.ownership-observed', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=stage_fd)
+            record = _canonical(self._private_preparation(json.loads(marker), admitted, hold))
+            view = memoryview(record)
+            while view:
+                current()
+                written = os.write(record_fd, view)
+                if written <= 0: raise ValueError()
+                view = view[written:]
+            os.fsync(record_fd); os.fsync(stage_fd)
+            if (self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (admitted['target_id'],)).fetchone() != hold
+                    or current() != (host_uid, host_gid)
+                    or (os.fstat(file_fd).st_dev, os.fstat(file_fd).st_ino) != inode): raise ValueError()
             return {'operation_id': operation_id, 'admission_digest': admission_digest,
                     'state': 'private_owner_prepared', 'device': inode[0], 'inode': inode[1]}
         except Exception:
             raise CustodianAdmissionError() from None
         finally:
             failed = False
-            for fd in (marker_fd, file_fd, stage_fd):
+            for fd in (record_fd, marker_fd, file_fd, stage_fd):
                 if fd is not None:
                     try: os.close(fd)
                     except OSError: failed = True
@@ -504,7 +554,8 @@ class CustodianAdmissionJournal:
                 except OSError: failed = True
             if failed: raise CustodianAdmissionError() from None
 
-    def observe_held(self, *, target_id, nonce, owner_policy_path, copy_policy_path, provider_key_path, timeout_seconds):
+    def observe_held(self, *, target_id, nonce, owner_policy_path, copy_policy_path, provider_key_path, timeout_seconds,
+                     include_preparation=False):
         """Sign a read-only held observation; it never establishes quiescence.
 
         The provider key is independently root-enrolled. This verifies the
@@ -514,7 +565,7 @@ class CustodianAdmissionJournal:
         stage_fd = file_fd = None
         try:
             self._check()
-            if (not self._holds_supported or target_id != 'engineering-hub:staging'
+            if (type(include_preparation) is not bool or not self._holds_supported or target_id != 'engineering-hub:staging'
                     or type(nonce) is not str or not _HEX.fullmatch(nonce)
                     or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
@@ -574,6 +625,11 @@ class CustodianAdmissionJournal:
                                 or marker['size'] != info.st_size or marker['digest'] != admission['source_backup_digest']): raise ValueError()
                     finally:
                         os.close(marker_fd)
+                preparation_recorded = False
+                if include_preparation and os.path.lexists(str(stage / (hold[1] + '.ownership-observed'))):
+                    if not marker_present: raise ValueError()
+                    self._read_private_preparation(stage_fd, hold[1], marker, admission, hold)
+                    preparation_recorded = True
                 self._check()
                 if (_root_file(owner_path, 16384)[1] != owner_pin or _root_file(copy_path, 4096)[1] != copy_pin
                         or _root_file(key_path, 32)[1] != key_pin
@@ -581,13 +637,14 @@ class CustodianAdmissionJournal:
                     raise ValueError()
                 now = time.time_ns() // 1_000_000; elapsed = time.monotonic() - started
                 if not 0 <= elapsed < timeout_seconds or now < wall_start: raise ValueError()
-                payload = {'protocol': HOLD_OBSERVATION, 'nonce': nonce, 'target_id': target_id,
+                payload = {'protocol': HOLD_OBSERVATION_V2 if include_preparation else HOLD_OBSERVATION, 'nonce': nonce, 'target_id': target_id,
                     'operation_id': hold[1], 'run_id': admission['run_id'], 'manifest_digest': admission['manifest_digest'],
                     'admission_digest': hold[2], 'fencing_generation': hold[3],
                     'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7],
                     'owner_policy_digest': hold[8], 'marker_present': marker_present, 'quiescence': 'unknown',
                     'issued_at_ms': now, 'expires_at_ms': now + min(5000, max(1, int((timeout_seconds - elapsed) * 1000)))}
-                signature = signer.sign(HOLD_DOMAIN + _canonical(payload)).hex()
+                if include_preparation: payload['private_preparation_recorded'] = preparation_recorded
+                signature = signer.sign((HOLD_DOMAIN_V2 if include_preparation else HOLD_DOMAIN) + _canonical(payload)).hex()
                 end_info = os.fstat(file_fd)
                 if (not now <= time.time_ns() // 1_000_000 < payload['expires_at_ms']
                         or not 0 <= time.monotonic() - started < timeout_seconds

@@ -6,7 +6,7 @@ import time
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from .state_custodian_admission import HOLD_DOMAIN, HOLD_OBSERVATION, _canonical
+from .state_custodian_admission import HOLD_DOMAIN, HOLD_OBSERVATION, HOLD_DOMAIN_V2, HOLD_OBSERVATION_V2, _canonical
 
 IDENTITY = frozenset({'target_id', 'operation_id', 'run_id', 'manifest_digest', 'admission_digest',
                       'fencing_generation', 'device', 'inode', 'host_uid', 'host_gid', 'owner_policy_digest'})
@@ -38,11 +38,15 @@ def verify_held_observation(raw, *, provider_public_key, nonce, expected, start_
             raise ValueError()
         envelope = json.loads(raw)
         if (type(envelope) is not dict or set(envelope) != {'payload', 'signature'} or _canonical(envelope) != raw
-                or type(envelope['payload']) is not dict or set(envelope['payload']) != FIELDS
+                or type(envelope['payload']) is not dict
                 or type(envelope['signature']) is not str or not re.fullmatch(r'[0-9a-f]{128}', envelope['signature'])):
             raise ValueError()
         p = envelope['payload']
-        if (p['protocol'] != HOLD_OBSERVATION or p['nonce'] != nonce or p['quiescence'] != 'unknown'
+        v2 = p.get('protocol') == HOLD_OBSERVATION_V2
+        if (set(p) != (FIELDS | {'private_preparation_recorded'} if v2 else FIELDS)
+                or p['protocol'] not in (HOLD_OBSERVATION, HOLD_OBSERVATION_V2)
+                or (v2 and type(p['private_preparation_recorded']) is not bool)
+                or p['nonce'] != nonce or p['quiescence'] != 'unknown'
                 or type(p['marker_present']) is not bool or p['target_id'] != 'engineering-hub:staging'
                 or any(type(p[k]) is not type(expected[k]) or p[k] != expected[k] for k in IDENTITY)
                 or any(type(p[k]) is not int or p[k] < 0 or p[k] >= 2**63
@@ -58,7 +62,8 @@ def verify_held_observation(raw, *, provider_public_key, nonce, expected, start_
                 or not start_wall_ms <= p['issued_at_ms'] < p['expires_at_ms'] <= p['issued_at_ms'] + 5000
                 or not start_monotonic <= tick or (tick - start_monotonic) * 1000 >= p['expires_at_ms'] - start_wall_ms):
             raise ValueError()
-        Ed25519PublicKey.from_public_bytes(provider_public_key).verify(bytes.fromhex(envelope['signature']), HOLD_DOMAIN + _canonical(p))
+        Ed25519PublicKey.from_public_bytes(provider_public_key).verify(bytes.fromhex(envelope['signature']),
+            (HOLD_DOMAIN_V2 if v2 else HOLD_DOMAIN) + _canonical(p))
         final_wall = time.time_ns() // 1_000_000; final_tick = time.monotonic()
         if (not wall <= final_wall < p['expires_at_ms'] or not tick <= final_tick
                 or (final_tick - start_monotonic) * 1000 >= p['expires_at_ms'] - start_wall_ms):

@@ -43,7 +43,7 @@ def main(argv=None):
                                             journal_path=paths['journal_path'], create=False, read_only=True)
         report = journal.observe_held(target_id=enrollment['expected']['target_id'], nonce=nonce,
             owner_policy_path=paths['owner_policy'], copy_policy_path=paths['copy_policy'],
-            provider_key_path=paths['provider_key_path'], timeout_seconds=5)
+            provider_key_path=paths['provider_key_path'], timeout_seconds=5, include_preparation=True)
         verified = verify_held_observation(_canonical(report), provider_public_key=public, nonce=nonce,
             expected=enrollment['expected'], start_wall_ms=start_wall, start_monotonic=start_mono)
         if _root_file(enrollment_path, 16384)[1] != pin: raise ValueError()
@@ -52,7 +52,9 @@ def main(argv=None):
             expected=enrollment['expected'], start_wall_ms=start_wall, start_monotonic=start_mono)
         print(json.dumps({'status': 'held', 'quiescence': 'unknown', 'operation_id': verified['operation_id'],
                           'fencing_generation': verified['fencing_generation'],
-                          'marker_present': verified['marker_present']}, sort_keys=True, separators=(',', ':')))
+                          'marker_present': verified['marker_present'],
+                          'private_preparation_recorded': verified['private_preparation_recorded']},
+                         sort_keys=True, separators=(',', ':')))
         return 0
     except Exception:
         print('Custodian hold inspection unavailable', file=sys.stderr)

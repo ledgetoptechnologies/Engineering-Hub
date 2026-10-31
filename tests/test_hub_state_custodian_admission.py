@@ -205,7 +205,7 @@ def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
         journal.close()
 
 
-@pytest.mark.parametrize('uncertain_chown', [False, True, 'late'])
+@pytest.mark.parametrize('uncertain_chown', [False, True, 'late', 'record_write', 'record_fsync'])
 def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, uncertain_chown):
     source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
     stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
@@ -278,7 +278,26 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
             'gid_map': open('/proc/self/gid_map').read(), 'app_uid': 10002, 'app_gid': 10002}))
         owner_policy.chmod(0o600)
         with monkeypatch.context() as hooks:
-            if uncertain_chown == 'late':
+            if uncertain_chown in ('record_write', 'record_fsync'):
+                original_open, original_write, original_fsync = os.open, os.write, os.fsync
+                record_fds = set()
+                def track_record(path, *args, **kwargs):
+                    fd = original_open(path, *args, **kwargs)
+                    if str(path).endswith('.ownership-observed'): record_fds.add(fd)
+                    return fd
+                def fail_record(fd, data):
+                    if fd in record_fds and uncertain_chown == 'record_write': raise OSError('synthetic incomplete preparation record')
+                    return original_write(fd, data)
+                def fail_record_sync(fd):
+                    original_fsync(fd)
+                    if fd in record_fds and uncertain_chown == 'record_fsync': raise OSError('synthetic uncertain record sync')
+                hooks.setattr(admission_module.os, 'open', track_record)
+                hooks.setattr(admission_module.os, 'write', fail_record)
+                hooks.setattr(admission_module.os, 'fsync', fail_record_sync)
+                with pytest.raises(CustodianAdmissionError):
+                    journal.prepare_private_owner(operation_id=payload['operation_id'], admission_digest=token,
+                                                  owner_policy_path=owner_policy)
+            elif uncertain_chown == 'late':
                 root_file = admission_module._root_file
                 monotonic = time.monotonic
                 def delayed_policy(path, maximum):
@@ -305,6 +324,7 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
                 assert prepared['state'] == 'private_owner_prepared'
         assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
         assert (stage / (payload['operation_id'] + '.ownership-intent')).exists()
+        assert (stage / (payload['operation_id'] + '.ownership-observed')).exists() is (uncertain_chown in (False, 'record_write', 'record_fsync'))
         start_wall = time.time_ns() // 1_000_000; start_mono = time.monotonic()
         observed = journal.observe_held(target_id=payload['target_id'], nonce='4' * 64,
             owner_policy_path=owner_policy, copy_policy_path=copy_policy, provider_key_path=provider_path, timeout_seconds=3)
@@ -312,6 +332,19 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         assert observed['payload']['operation_id'] == payload['operation_id']
         assert observed['payload']['quiescence'] == 'unknown' and observed['payload']['marker_present'] is True
         assert observed['payload']['run_id'] == payload['run_id'] and observed['payload']['manifest_digest'] == digest
+        record_path = stage / (payload['operation_id'] + '.ownership-observed')
+        if uncertain_chown in (False, 'record_fsync'):
+            v2 = journal.observe_held(target_id=payload['target_id'], nonce='6' * 64,
+                owner_policy_path=owner_policy, copy_policy_path=copy_policy, provider_key_path=provider_path,
+                timeout_seconds=3, include_preparation=True)
+            assert v2['payload']['private_preparation_recorded'] is True
+            old_record = record_path.read_bytes(); record_path.write_bytes(b'corrupt'); record_path.chmod(0o600)
+            with pytest.raises(CustodianAdmissionError):
+                journal.observe_held(target_id=payload['target_id'], nonce='6' * 64,
+                    owner_policy_path=owner_policy, copy_policy_path=copy_policy, provider_key_path=provider_path,
+                    timeout_seconds=3, include_preparation=True)
+            assert journal._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (payload['operation_id'],)
+            record_path.write_bytes(old_record); record_path.chmod(0o600)
         info = output.stat()
         expected = {'target_id': payload['target_id'], 'operation_id': payload['operation_id'], 'run_id': payload['run_id'],
                     'manifest_digest': digest, 'admission_digest': token, 'fencing_generation': payload['fencing_generation'],
@@ -341,9 +374,13 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
             result = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src',
                 '--enrollment', str(cli_enrollment)], capture_output=True, text=True, timeout=8, cwd='/',
                 env={'LANG': 'C.UTF-8'})
-            assert result.returncode == 0 and result.stderr == ''
-            assert json.loads(result.stdout) == {'status': 'held', 'quiescence': 'unknown',
-                'operation_id': payload['operation_id'], 'fencing_generation': 1, 'marker_present': True}
+            if uncertain_chown == 'record_write':
+                assert result.returncode == 2 and result.stdout == '' and result.stderr == 'Custodian hold inspection unavailable\n'
+            else:
+                assert result.returncode == 0 and result.stderr == ''
+                assert json.loads(result.stdout) == {'status': 'held', 'quiescence': 'unknown',
+                    'operation_id': payload['operation_id'], 'fencing_generation': 1, 'marker_present': True,
+                    'private_preparation_recorded': uncertain_chown in (False, 'record_fsync')}
             assert provider_raw.hex() not in result.stdout and provider_raw.hex() not in result.stderr
             assert hashlib.sha256((tmp_path / 'journal.sqlite').read_bytes()).digest() == before
             assert set(os.listdir(tmp_path)) == before_names
@@ -396,10 +433,15 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         copy_policy.write_bytes(_canonical(policy)); copy_policy.chmod(0o600)
         fourth = dict(payload, operation_id=str(uuid4()), nonce='1' * 64)
         fourth_token = journal.reserve(fourth, key.sign(DOMAIN + _canonical(fourth)))
-        fourth_result = journal.stage_quarantined_backup(operation_id=fourth['operation_id'], admission_digest=fourth_token,
-                                                         copy_policy_path=copy_policy, timeout_seconds=3)
-        assert fourth_result['digest'] == backup_digest
-        assert (stage / (fourth['operation_id'] + '.quarantine')).exists()
+        if uncertain_chown == 'record_write':
+            with pytest.raises(CustodianAdmissionError):
+                journal.stage_quarantined_backup(operation_id=fourth['operation_id'], admission_digest=fourth_token,
+                                                 copy_policy_path=copy_policy, timeout_seconds=3)
+        else:
+            fourth_result = journal.stage_quarantined_backup(operation_id=fourth['operation_id'], admission_digest=fourth_token,
+                                                             copy_policy_path=copy_policy, timeout_seconds=3)
+            assert fourth_result['digest'] == backup_digest
+            assert (stage / (fourth['operation_id'] + '.quarantine')).exists()
         assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
         with pytest.raises(CustodianAdmissionError):
             journal.prepare_private_owner(operation_id=fourth['operation_id'], admission_digest=fourth_token,
@@ -413,8 +455,13 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         assert reopened._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (payload['operation_id'],)
         fifth = dict(payload, operation_id=str(uuid4()), nonce='2' * 64)
         fifth_token = reopened.reserve(fifth, key.sign(DOMAIN + _canonical(fifth)))
-        reopened.stage_quarantined_backup(operation_id=fifth['operation_id'], admission_digest=fifth_token,
-                                          copy_policy_path=copy_policy, timeout_seconds=3)
+        if uncertain_chown == 'record_write':
+            with pytest.raises(CustodianAdmissionError):
+                reopened.stage_quarantined_backup(operation_id=fifth['operation_id'], admission_digest=fifth_token,
+                                                  copy_policy_path=copy_policy, timeout_seconds=3)
+        else:
+            reopened.stage_quarantined_backup(operation_id=fifth['operation_id'], admission_digest=fifth_token,
+                                              copy_policy_path=copy_policy, timeout_seconds=3)
         with pytest.raises(CustodianAdmissionError):
             reopened.prepare_private_owner(operation_id=fifth['operation_id'], admission_digest=fifth_token,
                                             owner_policy_path=owner_policy)
@@ -426,7 +473,8 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
         reopened.close()
 
 
-def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path):
+@pytest.mark.parametrize('crashpoint', ['before_marker', 'record_fsync'])
+def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path, crashpoint):
     source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
     stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
     source = source_dir / 'backup.sqlite'
@@ -457,11 +505,18 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path):
         owner.write_bytes(_canonical({'schema': 1, 'boot_id': _boot_id(), 'daemon_pid': os.getpid(),
             'daemon_start_ticks': _proc_start(os.getpid()), 'uid_map': open('/proc/self/uid_map').read(),
             'gid_map': open('/proc/self/gid_map').read(), 'app_uid': 10002, 'app_gid': 10002})); owner.chmod(0o600)
-        original_open = os.open
+        original_open, original_fsync = os.open, os.fsync
+        record_fds = set()
         def crash_on_marker(path, *args, **kwargs):
-            if str(path).endswith('.ownership-intent'): os.kill(os.getpid(), signal.SIGKILL)
-            return original_open(path, *args, **kwargs)
+            if crashpoint == 'before_marker' and str(path).endswith('.ownership-intent'): os.kill(os.getpid(), signal.SIGKILL)
+            fd = original_open(path, *args, **kwargs)
+            if str(path).endswith('.ownership-observed'): record_fds.add(fd)
+            return fd
+        def crash_on_record_sync(fd):
+            if crashpoint == 'record_fsync' and fd in record_fds: os.kill(os.getpid(), signal.SIGKILL)
+            return original_fsync(fd)
         admission_module.os.open = crash_on_marker
+        admission_module.os.fsync = crash_on_record_sync
         journal.prepare_private_owner(operation_id=operation, admission_digest=token, owner_policy_path=owner)
     process = multiprocessing.get_context('fork').Process(target=child)
     process.start()
@@ -474,7 +529,7 @@ def test_owner_crash_after_durable_hold_keeps_target_reserved(tmp_path):
         journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=journal_path, create=False)
         try:
             assert journal._db.execute('SELECT operation_id FROM custody_holds').fetchone() == (operation,)
-            assert not (stage / (operation + '.ownership-intent')).exists()
+            assert (stage / (operation + '.ownership-intent')).exists() is (crashpoint == 'record_fsync')
         finally:
             journal.close()
     finally:
