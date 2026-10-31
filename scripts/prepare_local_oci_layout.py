@@ -5,6 +5,8 @@ failure the exclusively created output is deliberately preserved for review.
 Layer decompression, diff IDs, and runtime behavior are not validated.
 The caller must exclusively control the output parent and layout throughout
 preparation and after return. Checks are not atomic against same-UID writers.
+Run on Linux with a private filesystem. Buildx must access the resulting layout
+on the same client filesystem; a path inside another container is not enough.
 """
 import argparse
 import hashlib
@@ -13,6 +15,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import tarfile
+import sys
 
 MAX_META = 1024 * 1024
 MAX_TOTAL = 3 * 1024**3
@@ -23,6 +26,15 @@ INDEX = {'application/vnd.oci.image.index.v1+json', 'application/vnd.docker.dist
 CONFIG = {'application/vnd.oci.image.config.v1+json', 'application/vnd.docker.container.image.v1+json'}
 LAYER = {'application/vnd.oci.image.layer.v1.tar', 'application/vnd.oci.image.layer.v1.tar+gzip',
          'application/vnd.docker.image.rootfs.diff.tar.gzip'}
+_DIR_FD_FUNCTIONS = frozenset((os.open, os.mkdir, os.stat))
+_STAT_FUNCTION = os.stat
+
+
+def _preflight():
+    if (sys.platform != 'linux' or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY')
+            or not _DIR_FD_FUNCTIONS.issubset(os.supports_dir_fd)
+            or _STAT_FUNCTION not in os.supports_follow_symlinks):
+        raise RuntimeError('Linux with no-follow directory-relative filesystem support required; no output created')
 
 
 class _BoundedReader:
@@ -240,6 +252,7 @@ def _prepare(stream, output, requested, fds):
 
 
 def prepare(stream, output, requested):
+    _preflight()
     fds = []
     try:
         return _prepare(stream, output, requested, fds)
@@ -254,7 +267,6 @@ def main():
     p.add_argument('--output', required=True, help='new path in a caller-controlled parent')
     p.add_argument('--manifest', required=True, help='exact linux/amd64 image manifest sha256')
     args = p.parse_args()
-    import sys
     if args.archive == '-':
         print(json.dumps(prepare(sys.stdin.buffer, args.output, args.manifest)))
     else:

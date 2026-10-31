@@ -51,6 +51,22 @@ def test_prepares_exact_manifest(tmp_path):
     assert index['manifests'][0]['digest'] == digest
 
 
+@pytest.mark.parametrize('unsupported', ['platform', 'dir_fd', 'nofollow'])
+def test_unsupported_capabilities_fail_before_output_creation(tmp_path, monkeypatch, unsupported):
+    from scripts import prepare_local_oci_layout as helper
+    rows, digest = fixture()
+    if unsupported == 'platform':
+        monkeypatch.setattr(helper.sys, 'platform', 'win32')
+    elif unsupported == 'dir_fd':
+        monkeypatch.setattr(helper.os, 'supports_dir_fd', set())
+    else:
+        monkeypatch.delattr(helper.os, 'O_NOFOLLOW')
+    output = tmp_path / 'new'
+    with pytest.raises(RuntimeError, match='no output created'):
+        prepare(archive(rows), output, digest)
+    assert not output.exists()
+
+
 @pytest.mark.parametrize('change', ['traversal', 'duplicate', 'symlink', 'hardlink', 'corrupt', 'missing', 'wrong_digest'])
 def test_rejects_untrusted_archive_and_preserves_partial_output(tmp_path, change):
     rows, digest = fixture()
