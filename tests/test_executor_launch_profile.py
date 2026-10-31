@@ -183,3 +183,108 @@ def test_broker_profile_rejects_direct_or_ambiguous_authority(change):
         data['broker_mode'] = 'broker-v2'
     with pytest.raises((ValueError, RuntimeError)):
         core.ExecutorLaunchProfile.model_validate(data)
+
+
+def coordinator_profile(**changes):
+    mounts = []
+    for role, target in core.COORDINATOR_TARGETS.items():
+        socket_role = role == 'issuer_socket'
+        kind = 'socket' if socket_role else 'file' if role == 'config' else 'directory'
+        mounts.append(dict(role=role, source='/run/test-issuer/issuer.sock' if socket_role
+                           else '/operator/hub-pilot-coordinator/' + role,
+            target=target, kind=kind, read_only=role != 'state',
+            uid=0 if socket_role else 110002, gid=110002,
+            mode=0o660 if kind == 'socket' else 0o600 if kind == 'file' else 0o700,
+            content_digest='sha256:' + 'f' * 64 if kind == 'file' else None))
+    value = profile(root='/operator/hub-pilot-coordinator', daemon_policy=policy(),
+                    role='coordinator', command_channel='inherited-seqpacket-v1')
+    value.update(user='10002:10002', mounts=mounts,
+        entrypoint=['/opt/venv/bin/python', '-I', '-m', 'hub_container_executor.installed_coordinator'],
+        command=['serve', '--config', '/operator/coordinator.json'],
+        runner_file='/opt/venv/lib/python3.12/site-packages/hub_container_executor/installed_coordinator.py')
+    value.update(changes)
+    return value
+
+
+def channel_profile():
+    return profile(daemon_policy=policy(), command_channel='inherited-seqpacket-v1')
+
+
+def test_new_keys_leave_legacy_and_v3_bytes_unchanged():
+    for data in (profile(), profile(daemon_policy=policy())):
+        value = core.ExecutorLaunchProfile.model_validate(data).enrollment_value()
+        assert 'role' not in value and 'command_channel' not in value
+        assert core.canonical(value) == core.canonical(data)
+
+
+def test_coordinator_profile_is_signed_and_has_no_engine_authority():
+    raw = core.canonical(coordinator_profile())
+    parsed = core.verify_profile_bytes(raw, digest_of(raw))
+    assert parsed.role == 'coordinator' and parsed.command_channel == 'inherited-seqpacket-v1'
+    assert {item.role for item in parsed.mounts} == {'issuer_socket', 'config', 'state', 'secrets'}
+    assert core.canonical(parsed.enrollment_value()) == raw
+
+
+def test_executor_command_channel_is_a_signed_opt_in():
+    raw = core.canonical(channel_profile())
+    parsed = core.verify_profile_bytes(raw, digest_of(raw))
+    assert parsed.role is None and parsed.command_channel == 'inherited-seqpacket-v1'
+    assert parsed.digest() != core.ExecutorLaunchProfile.model_validate(profile(daemon_policy=policy())).digest()
+    without_policy = channel_profile()
+    del without_policy['daemon_policy']
+    with pytest.raises((ValueError, RuntimeError)):
+        core.ExecutorLaunchProfile.model_validate(without_policy)
+
+
+def _swap_mount(data, role, **fields):
+    data['mounts'] = [dict(item, **fields) if item['role'] == role else item for item in data['mounts']]
+
+
+@pytest.mark.parametrize('change', [
+    'executor_user', 'executor_entrypoint', 'no_serve', 'executor_runner', 'engine_socket', 'generations',
+    'executor_config_target', 'executor_state_target', 'missing_secrets', 'no_channel', 'null_channel',
+    'null_role', 'executor_role', 'no_policy', 'broker', 'unmapped_coordinator',
+])
+def test_coordinator_profile_refuses_executor_authority_or_ambiguity(change):
+    data = coordinator_profile()
+    if change == 'executor_user':
+        data['user'] = '10001:10001'
+    elif change == 'executor_entrypoint':
+        data['entrypoint'] = profile()['entrypoint']
+    elif change == 'no_serve':
+        data['command'] = ['--config', '/operator/coordinator.json']
+    elif change == 'executor_runner':
+        data['runner_file'] = profile()['runner_file']
+    elif change in {'engine_socket', 'generations'}:
+        data['mounts'].append(next(item for item in profile()['mounts'] if item['role'] == change))
+    elif change == 'executor_config_target':
+        _swap_mount(data, 'config', target='/operator/runner.json')
+    elif change == 'executor_state_target':
+        _swap_mount(data, 'state', target=core.LAUNCH_TARGETS['state'])
+    elif change == 'missing_secrets':
+        data['mounts'] = [item for item in data['mounts'] if item['role'] != 'secrets']
+    elif change == 'no_channel':
+        del data['command_channel']
+    elif change == 'null_channel':
+        data['command_channel'] = None
+    elif change == 'null_role':
+        data['role'] = None
+    elif change == 'executor_role':
+        data['role'] = 'executor'
+    elif change == 'no_policy':
+        del data['daemon_policy']
+    elif change == 'broker':
+        data['broker_mode'] = 'broker-v1'
+    else:
+        # Maps the executor's 10001 inside, but not the coordinator's 10002.
+        rows = [[0, 10002, 1], [1, 100001, 10001]]
+        data['daemon_policy'] = policy(uid_map=rows, gid_map=rows)
+    with pytest.raises((ValueError, RuntimeError)):
+        core.ExecutorLaunchProfile.model_validate(data)
+
+
+def test_executor_profile_refuses_coordinator_targets():
+    data = profile()
+    _swap_mount(data, 'config', target='/operator/coordinator.json')
+    with pytest.raises((ValueError, RuntimeError)):
+        core.ExecutorLaunchProfile.model_validate(data)

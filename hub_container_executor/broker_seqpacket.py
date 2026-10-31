@@ -5,6 +5,11 @@ never binds a socket, discovers identities or enables a launcher. It does not
 establish state/daemon isolation. Every new connection carries one bounded packet
 and one reply, with kernel SCM_CREDENTIALS checked on both packets. Effects have
 no automatic retry. Timeouts do not cancel an admitted adapter operation.
+
+The inherited mode instead uses one already connected descriptor handed to each
+side at launch. A descriptor can be delegated, so it identifies no process:
+every packet is still checked against the expected kernel sender account, and
+any fault, timeout or out-of-sequence packet closes the channel for good.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ from .adapter import HostAdapter
 _MAX_PACKET = 32768
 _CREDS = struct.Struct('=iII')
 _PROTOCOL = 'engineering-hub.pilot-command.seqpacket.v1'
+_CHANNEL_PROTOCOL = 'engineering-hub.pilot-command.inherited-seqpacket.v1'
 
 
 class BrokerTransportError(RuntimeError):
@@ -44,6 +50,14 @@ class BrokerReadTimeout(BrokerTransportError):
 
 class BrokerAdmissionClosed(BrokerTransportError):
     """A validated request was denied before adapter dispatch."""
+
+
+class BrokerChannelClosed(BrokerTransportError):
+    """The inherited channel is closed for good; only a relaunch replaces it."""
+
+
+class BrokerPeerReset(BrokerChannelClosed):
+    """The peer closed its end while packets sent to it were still unread (ECONNRESET)."""
 
 
 def _require(value):
@@ -111,7 +125,11 @@ class PeerPin:
             self.fd = None
 
 
-def _receive(connection, peer):
+def _read_packet(connection, *, allow_eof=False):
+    """One bounded packet and its kernel credentials; passed descriptors are closed and refused.
+
+    With allow_eof, an orderly peer close returns (None, []).
+    """
     # Reserve ancillary capacity for credentials plus bounded malicious FDs;
     # close any received rights before rejecting, including on truncation.
     raw, controls, flags, _ = connection.recvmsg(_MAX_PACKET + 1,
@@ -132,8 +150,16 @@ def _receive(connection, peer):
             credentials.append(_CREDS.unpack(data))
         else:
             invalid = True
+    if allow_eof and not raw and not controls and not invalid and not flags:
+        return None, []
     _require(not invalid and not flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
-             and 0 < len(raw) <= _MAX_PACKET and credentials == [(peer.pid, peer.uid, peer.gid)])
+             and 0 < len(raw) <= _MAX_PACKET)
+    return raw, credentials
+
+
+def _receive(connection, peer):
+    raw, credentials = _read_packet(connection)
+    _require(credentials == [(peer.pid, peer.uid, peer.gid)])
     peer.check()
     return _parse(raw)
 
@@ -307,3 +333,218 @@ class PilotCommandClient:
             self._closed = True
         finally:
             self._busy.release()
+
+
+class PeerAccount:
+    """Expected kernel sender account on an inherited channel; not a process identity.
+
+    A descriptor can be delegated, so any process of this uid/gid that holds it
+    passes. A sender of any other account is refused and the channel closed.
+    The sender pid is not compared: the kernel reports it as 0 when the sender's
+    PID namespace isn't visible from the receiver's. A holder with CAP_SETUID or
+    CAP_SETGID over its user namespace may claim any mapped account, so this
+    refusal holds only for holders without those capabilities.
+    """
+    def __init__(self, *, uid, gid):
+        _require(type(uid) is int and type(gid) is int and 0 <= uid < 2**32 - 1 and 0 <= gid < 2**32 - 1)
+        self.uid, self.gid = uid, gid
+
+
+def _adopt(fd):
+    """Own an inherited connected SOCK_SEQPACKET descriptor; a refused one is closed too."""
+    channel = None
+    try:
+        _require(sys.platform == 'linux' and hasattr(socket, 'SO_PASSCRED') and hasattr(socket, 'SCM_CREDENTIALS')
+                 and type(fd) is int and fd >= 0)
+        _require(stat.S_ISSOCK(os.fstat(fd).st_mode))
+        channel = socket.socket(fileno=fd)
+        _require(channel.family == socket.AF_UNIX
+                 and channel.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
+                 and channel.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 0)
+        channel.getpeername()   # refuses an unconnected socket
+        channel.set_inheritable(False)
+        channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        return channel
+    except BaseException:
+        try:
+            if channel is not None:
+                channel.close()
+            elif type(fd) is int and fd >= 0:
+                os.close(fd)
+        except OSError:
+            pass
+        raise BrokerTransportError() from None
+
+
+class _InheritedChannel:
+    """One owned descriptor carrying strictly sequenced request/reply packets.
+
+    Sequence numbers start at 1 and only ever advance by one, so a replayed or
+    duplicated packet is refused. Every refusal, a timeout once a request was
+    sent or read, and a peer close all close the channel for good.
+    """
+    def __init__(self, fd, peer):
+        self._pid, self._closed, self._busy, self._sequence = os.getpid(), False, threading.Lock(), 0
+        if type(peer) is not PeerAccount:
+            _adopt(fd).close()
+            raise BrokerTransportError()
+        self._socket, self.peer = _adopt(fd), peer
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def _poison(self):
+        self._closed = True
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
+    def _readable(self, deadline):
+        remaining = max(0.0, deadline - time.monotonic())
+        return bool(select.select([self._socket], [], [], remaining)[0])
+
+    def _peer_open(self):
+        """False once the peer has closed its end; queued packets don't change that."""
+        hangup = select.POLLHUP | getattr(select, 'POLLRDHUP', 0)
+        poller = select.poll()
+        poller.register(self._socket, hangup)
+        return not any(events & hangup for _, events in poller.poll(0))
+
+    def _receive_value(self, deadline):
+        # Readiness is only a hint: another holder of the descriptor can take the
+        # packet first. Never block here; a vanished packet fails the channel closed.
+        self._socket.setblocking(False)
+        try:
+            raw, credentials = _read_packet(self._socket, allow_eof=True)
+        except ConnectionResetError:
+            # Linux reports a peer that closed with our packets unread as a reset,
+            # not an orderly EOF: the peer is gone and never read what we sent.
+            raise BrokerPeerReset() from None
+        if raw is None:
+            raise BrokerChannelClosed()
+        _require(time.monotonic() < deadline)
+        _require(len(credentials) == 1 and credentials[0][1:] == (self.peer.uid, self.peer.gid))
+        return _parse(raw)
+
+    def _enter(self, valid):
+        """Take the call slot; a refused call leaves the channel as it was."""
+        acquired = False
+        try:
+            _require(os.getpid() == self._pid and not self._closed and valid)
+            acquired = self._busy.acquire(blocking=False)
+            _require(acquired and not self._closed)
+        except Exception:
+            if acquired:
+                self._busy.release()
+            raise BrokerTransportError() from None
+
+    def close(self):
+        """Close when idle; a busy call must finish first. Owns and closes the descriptor."""
+        _require(os.getpid() == self._pid)
+        acquired = self._busy.acquire(blocking=False)
+        _require(acquired)
+        try:
+            self._poison()
+        finally:
+            self._busy.release()
+
+
+class InheritedCommandBroker(_InheritedChannel):
+    """Executor side: reads one request and sends its one reply per serve_once."""
+    def __init__(self, fd, adapter, peer, *, admission=None):
+        if type(adapter) is not HostAdapter or not (admission is None or callable(admission)):
+            _adopt(fd).close()
+            raise BrokerTransportError()
+        super().__init__(fd, peer)
+        self.adapter, self._admission = adapter, admission
+
+    def serve_once(self, timeout_seconds, *, read_timeout_seconds=None):
+        self._enter(type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125
+                    and (read_timeout_seconds is None or (type(read_timeout_seconds) in (int, float)
+                                                          and 0 < read_timeout_seconds <= timeout_seconds)))
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            if not self._readable(min(deadline, time.monotonic() + (read_timeout_seconds or timeout_seconds))):
+                # Nothing was read, so nothing was admitted; the channel stays usable.
+                raise BrokerReadTimeout()
+            request = self._receive_value(deadline)
+            _require(set(request) == {'protocol', 'sequence', 'action', 'payload'}
+                     and request['protocol'] == _CHANNEL_PROTOCOL
+                     and type(request['sequence']) is int and request['sequence'] == self._sequence + 1)
+            self._sequence = request['sequence']
+            action, payload = request['action'], request['payload']
+            if action == 'submit':
+                argument = ContainerPilotRequest.model_validate(payload)
+            elif action in {'get', 'reconcile'}:
+                argument = _uuid(payload)
+            else:
+                raise BrokerTransportError()
+            _require(time.monotonic() < deadline and not self._closed)
+            if self._admission is not None and self._admission(deadline) is not True:
+                raise BrokerAdmissionClosed()
+            _require(time.monotonic() < deadline and not self._closed)
+            # A sender that already gave up (timed out or exited) gets no dispatch.
+            # One that gives up after this check still leaves an unknown outcome.
+            if not self._peer_open():
+                raise BrokerChannelClosed()
+            result = getattr(self.adapter, action)(argument)
+            _require(result is None or type(result) is ContainerPilotResponse)
+            _require(time.monotonic() < deadline)
+            _set_deadline(self._socket, deadline)
+            _send(self._socket, {'protocol': _CHANNEL_PROTOCOL, 'sequence': self._sequence,
+                                 'result': None if result is None else result.model_dump(mode='json')})
+        except BrokerReadTimeout:
+            raise
+        except (BrokerAdmissionClosed, BrokerChannelClosed):
+            self._poison()
+            raise
+        except Exception:
+            self._poison()
+            raise BrokerTransportError() from None
+        finally:
+            self._busy.release()
+
+
+class InheritedCommandClient(_InheritedChannel):
+    """Coordinator side; any failure is an unknown outcome and closes the channel."""
+    def _call(self, action, command, timeout_seconds):
+        self._enter(type(command) is ContainerPilotRequest
+                    and type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125)
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            # Anything already waiting is unsolicited: a late, replayed or injected packet.
+            _require(not self._readable(time.monotonic()))
+            sequence = self._sequence + 1
+            payload = command.model_dump(mode='json') if action == 'submit' else command.command_id
+            _set_deadline(self._socket, deadline)
+            _send(self._socket, {'protocol': _CHANNEL_PROTOCOL, 'sequence': sequence,
+                                 'action': action, 'payload': payload})
+            self._sequence = sequence
+            _require(self._readable(deadline))
+            reply = self._receive_value(deadline)
+            _require(time.monotonic() < deadline and set(reply) == {'protocol', 'sequence', 'result'}
+                     and reply['protocol'] == _CHANNEL_PROTOCOL and type(reply['sequence']) is int
+                     and reply['sequence'] == sequence)
+            if reply['result'] is None:
+                _require(action != 'submit')
+                return None
+            result = ContainerPilotResponse.model_validate(reply['result'])
+            _require(all(getattr(result, name) == getattr(command, name)
+                         for name in ContainerPilotRequest.model_fields))
+            return result
+        except Exception:
+            self._poison()
+            raise BrokerTransportError() from None
+        finally:
+            self._busy.release()
+
+    def submit(self, command, timeout_seconds=125):
+        return self._call('submit', command, timeout_seconds)
+
+    def get(self, command, timeout_seconds=125):
+        return self._call('get', command, timeout_seconds)
+
+    def reconcile(self, command, timeout_seconds=125):
+        return self._call('reconcile', command, timeout_seconds)

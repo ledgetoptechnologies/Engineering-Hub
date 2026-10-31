@@ -1713,3 +1713,18 @@ def test_broker_profile_refused_before_journal_or_engine_access(short_root, root
             launch.LaunchSupervisor(**kwargs)
         assert requests == []
         assert not Path(kwargs['journal_file']).exists()
+
+
+@pytest.mark.parametrize('variant', ['coordinator', 'command_channel'])
+def test_coordinator_and_inherited_channel_profiles_refused_before_journal_or_engine_access(
+        short_root, root_journal, variant):
+    from tests.test_executor_launch_profile import channel_profile, coordinator_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = coordinator_profile() if variant == 'coordinator' else channel_profile()
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()
