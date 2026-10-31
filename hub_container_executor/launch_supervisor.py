@@ -100,15 +100,16 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
-def _measure_gate_process(peer, pins, executable_digest, deadline, *, proc_root=Path('/proc')):
+def _measure_gate_process(peer, pins, executable_digest, deadline, *, proc_root=Path('/proc'), bootstrap=False):
     """Measure a pinned process and mount now; this is not continuing custody."""
-    _require(type(pins) is dict and type(executable_digest) is str and _SHA.fullmatch(executable_digest)
+    _require(type(bootstrap) is bool and type(pins) is dict and type(executable_digest) is str and _SHA.fullmatch(executable_digest)
              and type(pins.get('expected_device')) is int and type(pins.get('expected_inode')) is int
              and type(pins.get('mount_flags')) is list)
     peer.check(); _remaining(deadline)
     base = proc_root / str(peer.pid)
-    expected_argv = [b'/opt/venv/bin/python', b'-I', b'-B', b'-m', b'engineering_hub',
-                     b'--host', b'0.0.0.0', b'--port', b'8770']
+    expected_argv = ([b'/usr/local/libexec/hub-application-gate'] if bootstrap else
+                     [b'/opt/venv/bin/python', b'-I', b'-B', b'-m', b'engineering_hub',
+                      b'--host', b'0.0.0.0', b'--port', b'8770'])
     with (base / 'cmdline').open('rb') as stream:
         _require(stream.read(1025) == b'\x00'.join(expected_argv) + b'\x00')
     fd = os.open(base / 'exe', os.O_RDONLY | os.O_CLOEXEC)
@@ -1712,6 +1713,262 @@ class LaunchSupervisor:
                                            lookup_only=True) as client:
             return client.invoke('lookup_completion_v5', {'identity': identity})
 
+    def finish_pending_gate(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+        """Observe health readiness, then attempt one fully rechecked acceptance.
+
+        None means no authenticated health receipt yet, not healthy or accepted.
+        An uncertain acceptance must be reconciled with lookup, never repeated.
+        """
+        from .runtime_profile import probe_set_digest
+        _require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        pins = json.loads(_canonical(pins))
+        probes = manifest.probes.candidate if image.role == 'candidate' else manifest.probes.rollback
+        with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+            readiness = client.invoke('health_ready_v5', {'identity': pins, 'probe_digest': probe_set_digest(probes)},
+                                      deadline_monotonic=deadline)
+        _require(type(readiness) is dict and set(readiness) == {'ready'} and type(readiness['ready']) is bool)
+        if not readiness['ready']: return None
+        return self.accept_gate_completion(peer=peer, pins=pins, manifest=manifest, image=image,
+                                           enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+
+    def pending_gate_context(self, *, role, manifest_digest, timeout_seconds):
+        """Read one fenced pending create from the enrolled ledger owner."""
+        _require(role in ('candidate', 'rollback'))
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('pending_gate_v5', {'role': role})
+
+    def observe_pending_gate_runtime(self, *, manifest, image, enrollment_file, timeout_seconds):
+        """Bind the current fenced create to the live bootstrap and host source.
+
+        A missing create or a not-yet-started container returns None. This is
+        point-in-time evidence: independent exclusive writer custody is still a
+        host prerequisite. A subsequent admission must recheck all bindings.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .broker_seqpacket import PeerPin, _start
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        peer = None
+        fds = []
+        try:
+            context = self.pending_gate_context(role=image.role, manifest_digest=manifest.digest(),
+                                                timeout_seconds=_remaining(deadline))
+            if context is None: return None
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                                                            image=image, supervisor=self)
+                _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment
+                         and context['role'] == image.role
+                         and context['image_config_id'] == enrolled.image_config_id
+                         and context['runnable_digest'] == enrolled.runnable_digest
+                         and context['platform_manifest_digest'] == enrolled.platform_manifest_digest)
+                _, info = self._engine.json('GET', '/containers/' + context['container_id'] + '/json', deadline)
+                _require(type(info) is dict and info.get('Id') == context['container_id']
+                         and info.get('Image') == enrolled.image_config_id and type(info.get('State')) is dict)
+                state = info['State']
+                if state.get('Running') is False and state.get('Status') == 'created':
+                    _remaining(deadline)
+                    return None
+                _require(state.get('Running') is True and state.get('Status') == 'running'
+                         and state.get('Paused') is False and state.get('Restarting') is False
+                         and state.get('Dead') is False and type(state.get('Pid')) is int and state['Pid'] > 0)
+                pid = state['Pid']
+                peer = PeerPin(pid=pid, uid=enrolled.consumer_host_uid, gid=enrolled.consumer_host_gid,
+                               start_ticks=_start(pid))
+                root = _path(self._mounts['generations'].source)
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC); fds.append(root_fd)
+                _require(_identity(os.fstat(root_fd)) == self._source_pins['generations']
+                         and _identity(os.lstat(root)) == self._source_pins['generations'])
+                generation = context['generation_id']
+                _require(type(generation) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', generation))
+                source = os.open(generation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd); fds.append(source)
+                source_info = os.fstat(source)
+                _require(_identity(source_info) == _identity(os.stat(generation, dir_fd=root_fd, follow_symlinks=False)))
+                root_app = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC); fds.append(root_app)
+                parent = root_app
+                for part in ('var', 'lib', 'hub'):
+                    parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                    fds.append(parent)
+                _require(_identity(os.fstat(parent)) == _identity(source_info))
+                bits = os.fstatvfs(parent).f_flag
+                flags = sorted(name for name, bit in (('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC), ('nosuid', os.ST_NOSUID)) if bits & bit)
+                if not bits & os.ST_RDONLY: flags.append('rw')
+                _require('rw' in flags)
+                pins = {'launch_id': str(uuid4()), 'operation_id': context['operation_id'], 'run_id': context['run_id'],
+                        'fence': context['fence'], 'manifest_digest': manifest.digest(), 'image_config_id': enrolled.image_config_id,
+                        'generation_id': generation, 'expected_device': source_info.st_dev, 'expected_inode': source_info.st_ino,
+                        'boot_id': self._consumer.boot, 'container_id': context['container_id'], 'host_pid': pid,
+                        'process_start_ticks': peer.start, 'mount_target': '/var/lib/hub', 'mount_flags': flags,
+                        'runnable_digest': enrolled.runnable_digest, 'platform_manifest_digest': enrolled.platform_manifest_digest,
+                        'implementation_commit': enrolled.source_commit}
+                self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                _require(_identity(os.fstat(source)) == _identity(os.stat(generation, dir_fd=root_fd, follow_symlinks=False))
+                         and _identity(os.fstat(root_fd)) == self._source_pins['generations'])
+                self._validate_live(deadline); self._gate_socket_check(enrolled); _remaining(deadline)
+                return pins
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+        finally:
+            for fd in reversed(fds): os.close(fd)
+            if peer is not None: peer.close()
+
+    def serve_pending_gate_bootstrap(self, *, manifest, image, enrollment_file, controller_key_file, timeout_seconds):
+        """One fenced bootstrap exchange, or None while the create is pending.
+
+        A caller owns repeated readiness waits and later health acceptance.
+        Every effect after accepting an app peer is one-shot and any uncertain
+        phase holds. Host-exclusive writer and nondelegated descriptor custody
+        are independently enforced prerequisites, not established here.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .mount_gate_controller import MountGateController
+        from .mount_gate_consume_protocol import MountGateConsumeController
+        from .mount_gate_protocol import issue_decision
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            if self._gate_listener is None:
+                self.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                                         timeout_seconds=_remaining(deadline))
+            base = self.observe_pending_gate_runtime(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                                                     timeout_seconds=_remaining(deadline))
+            if base is None: return None
+            channel, peer = self.accept_gate_channel(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                host_pid=base['host_pid'], process_start_ticks=base['process_start_ticks'],
+                timeout_seconds=_remaining(deadline))
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest, image=image, supervisor=self)
+            _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment)
+            key_path = _path(controller_key_file)
+            key, key_identity = _root_file(key_path, 32)
+            _require(len(key) == 32)
+            signer = Ed25519PrivateKey.from_private_bytes(key); del key
+            _require(signer.public_key().public_bytes(serialization.Encoding.Raw,
+                     serialization.PublicFormat.Raw) == enrolled.controller_public_key)
+
+            def source_current(pins):
+                root = _path(self._mounts['generations'].source)
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                source = None
+                try:
+                    _require(_identity(os.fstat(root_fd)) == self._source_pins['generations']
+                             and _identity(os.lstat(root)) == self._source_pins['generations'])
+                    name = pins['generation_id']
+                    _require(type(name) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', name))
+                    source = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+                    _require(_identity(os.fstat(source)) == _identity(os.stat(name, dir_fd=root_fd, follow_symlinks=False))
+                             == (pins['expected_device'], pins['expected_inode']))
+                    peer.check(); _remaining(deadline)
+                finally:
+                    if source is not None: os.close(source)
+                    os.close(root_fd)
+                return True
+
+            started = self.serve_one_gate_start_enrollment(channel=channel, peer=peer,
+                expected_without_nonce=base, manifest=manifest, image=image, enrollment_file=enrollment_file,
+                controller_key_file=controller_key_file, verify_live=source_current,
+                timeout_seconds=_remaining(deadline))
+            pins = started['identity']
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                _require(client.invoke('reserve', pins, deadline_monotonic=deadline) is True)
+
+            def current_locked(candidate):
+                self._validate_live(deadline)
+                _require(load_application_gate_enrollment(enrollment_file, manifest=manifest, image=image, supervisor=self) == enrolled
+                         and _root_file(key_path, 32)[1] == key_identity and candidate == pins)
+                self._gate_socket_check(enrolled); self._gate_peer_engine_check(peer, candidate, enrolled, deadline)
+                source_current(candidate)
+                _measure_gate_process(peer, candidate, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                self._validate_live(deadline); _remaining(deadline)
+                return True
+            def current(candidate):
+                with self._observation_mutex(deadline): return current_locked(candidate)
+            def hold(_candidate):
+                self._held, self._issuance_open, self._hold_persisted = True, False, False
+                if self._mutex.acquire(blocking=False):
+                    try: self._hold()
+                    finally: self._mutex.release()
+            wire = []
+            def reserve(decision, digest):
+                with self._observation_mutex(deadline):
+                    current_locked(pins)
+                    self._journal.reserve_gate_issuance(self._launch_id, self._record(), pins, decision, digest)
+                    encoded = issue_decision(decision, signer)
+                    _require(hashlib.sha256(encoded).hexdigest() == digest)
+                    wire.append(encoded)
+                    return True
+            wall, tick = int(time.time() * 1000), time.monotonic()
+            decision = MountGateController(channel=channel, peer=peer, expected=pins, signing_key=signer,
+                verify_live=current, reserve_issuance=reserve, hold_uncertain=hold,
+                timeout_seconds=_remaining(deadline))
+            _require(decision.serve_once() == 'sent_unconfirmed' and len(wire) == 1)
+            def consume(value):
+                with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                    return client.invoke('consume', value, deadline_monotonic=deadline)
+            consumer = MountGateConsumeController(channel=channel, peer=peer, expected=pins,
+                decision_wire=wire[0], signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
+                consume_challenge=consume, verify_live=current, hold_uncertain=hold,
+                exchange_wall_ms=wall, exchange_monotonic=tick, timeout_seconds=_remaining(deadline))
+            _require(consumer.serve_once() == 'sent_unconfirmed')
+            _remaining(deadline)
+            return pins
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def run_gate_operation(self, *, manifest, image, enrollment_file, controller_key_file,
+                           timeout_seconds, stop_requested):
+        """Own one role-specific bootstrap and accepted health sequence.
+
+        All waits are bounded and observational. A timeout, stop, lost response
+        or failed effect holds original evidence; acceptance is never replayed.
+        The caller must retain supervisor lifetime and independently enforce the
+        enrolled host's exclusive-writer and direct-channel custody conditions.
+        """
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 120
+                 and callable(stop_requested))
+        deadline = time.monotonic() + timeout_seconds
+        def wait():
+            stopped = stop_requested()
+            _require(type(stopped) is bool and not stopped)
+            remaining = _remaining(deadline)
+            time.sleep(min(.1, remaining))
+        try:
+            pins = None
+            while pins is None:
+                _require(stop_requested() is False)
+                pins = self.serve_pending_gate_bootstrap(manifest=manifest, image=image,
+                    enrollment_file=enrollment_file, controller_key_file=controller_key_file,
+                    timeout_seconds=min(5, _remaining(deadline)))
+                if pins is None: wait()
+            while True:
+                _require(stop_requested() is False and self._gate_accepted_peer is not None)
+                accepted = self.finish_pending_gate(peer=self._gate_accepted_peer, pins=pins, manifest=manifest,
+                    image=image, enrollment_file=enrollment_file, timeout_seconds=min(5, _remaining(deadline)))
+                if accepted is not None:
+                    _remaining(deadline)
+                    return {'identity': pins, 'acceptance': accepted}
+                wait()
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
                                         verify_live, timeout_seconds):
@@ -1774,6 +2031,8 @@ class LaunchSupervisor:
                     self._validate_live(deadline)
                     if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
                         self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                    if enrolled.schema == COMPLETION_SCHEMA:
+                        _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
                     current_enrollment = load_application_gate_enrollment(enrollment_file,
                         manifest=manifest, image=image, supervisor=self)
                     _require(current_enrollment == enrolled and _root_file(key_path, 32)[1] == key_identity
@@ -1786,6 +2045,8 @@ class LaunchSupervisor:
                     if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
                         self._gate_socket_check(enrolled)
                         self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                    if enrolled.schema == COMPLETION_SCHEMA:
+                        _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
                     _remaining(deadline)
                     return True
 

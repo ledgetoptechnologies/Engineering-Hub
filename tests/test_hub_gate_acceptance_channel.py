@@ -65,6 +65,11 @@ def test_signed_acceptance_and_authenticated_read_leave_finish_held(completed):
             client.close(); server.close(); thread.join(4); peer.close()
             assert not thread.is_alive()
     try:
+        pending = exchange('pending_gate_v5', {'role': 'candidate'})
+        assert pending['operation_id'] == pins['operation_id'] and pending['run_id'] == pins['run_id']
+        assert pending['fence'] == pins['fence'] and pending['container_id'] == pins['container_id']
+        assert pending['generation_id'] == pins['generation_id'] and pending['role'] == 'candidate'
+        assert exchange('health_ready_v5', {'identity': pins, 'probe_digest': PROBE}) == {'ready': True}
         assert exchange('accept_completion_v5', value) == value
         assert exchange('lookup_completion_v5', {'identity': pins}) == value
         result = ledger.finish(command.command_id, state='succeeded', reason=None, evidence=evidence())

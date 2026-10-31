@@ -261,6 +261,9 @@ class HostAdapter:
                         or observed.probe.health != 'healthy' or observed.probe.evidence_verified is not True):
                     raise _Held('inspect_required')
             evidence = self._evidence(container_id, image.image_config_id, "unknown", True)
+            if self.gate_socket_directory is not None:
+                if not self.ledger.wait_for_gate_acceptance(request.command_id, min(deadline, time.monotonic() + 5.0)):
+                    raise _Held('inspect_required')
             self._timeout(deadline, self.manifest.timeouts.total_command_ms)
             return self.ledger.finish(request.command_id, state="succeeded", reason=None,
                                       evidence=evidence, generation_id=state.generation_id)

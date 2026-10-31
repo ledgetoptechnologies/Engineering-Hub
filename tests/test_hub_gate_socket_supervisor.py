@@ -202,14 +202,23 @@ def test_replaced_socket_is_rejected_without_removing_replacement(socket_rig):
     assert held and socket_path.read_text() == 'replacement'
 
 
-@pytest.mark.parametrize('fault', ['none', 'v4', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation',
+@pytest.mark.parametrize('fault', ['none', 'v4', 'v4_bootstrap_bad', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation',
                                    'daemon_pid', 'daemon_image', 'daemon_restart', 'daemon_changes_in_callback'])
 def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch, tmp_path, fault):
     supervisor, manifest, image, path, directory, held = socket_rig
-    if fault == 'v4':
+    if fault in ('v4', 'v4_bootstrap_bad'):
         data = json.loads(Path(path).read_bytes())
         v4_policy(supervisor, data)
         Path(path).write_bytes(raw(data))
+        # The peer below is a Python fixture, not the enrolled static binary.
+        # Filesystem/executable measurement is exercised separately.
+        measurements = []
+        def synthetic_bootstrap(peer, pins, digest, deadline, *, bootstrap=False):
+            assert bootstrap and digest == data['bootstrap_digest']
+            measurements.append(peer.pid)
+            if fault == 'v4_bootstrap_bad': raise launch.LaunchSupervisorError()
+            return {}
+        monkeypatch.setattr(launch, '_measure_gate_process', synthetic_bootstrap)
     supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2)
     expected = pins(tmp_path)
     ready_read, ready_write = os.pipe(); release_read, release_write = os.pipe()
@@ -291,7 +300,7 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
                     kwargs['expected_without_nonce']['manifest_digest'] = 'sha256:' + '9' * 64
                 return original_root_file(file_path, maximum)
             monkeypatch.setattr(launch, '_root_file', mutate_during_keyread)
-        if fault in ('during_callback', 'wrong_manifest', 'daemon_pid', 'daemon_image', 'daemon_restart',
+        if fault in ('during_callback', 'wrong_manifest', 'daemon_pid', 'daemon_image', 'daemon_restart', 'v4_bootstrap_bad',
                      'daemon_changes_in_callback'):
             with pytest.raises(launch.LaunchSupervisorError):
                 supervisor.serve_one_gate_start_enrollment(**kwargs)
@@ -301,6 +310,7 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
             channel.close()
             return
         result = supervisor.serve_one_gate_start_enrollment(**kwargs)
+        if fault == 'v4': assert len(measurements) == 4
         assert result == {'identity': expected, 'delivery': 'sent_unconfirmed'} and not held
         assert select.select([ready_read], [], [], 2)[0] and os.read(ready_read, 1) == b'R'
         with supervisor._journal.transaction() as db:

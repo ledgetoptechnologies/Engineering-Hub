@@ -189,3 +189,98 @@ def test_acceptance_concurrent_one_winner_and_reopen(completed, tmp_path):
         assert reopened.get(command.command_id).state == 'held'
     finally:
         reopened.close()
+
+
+def test_fenced_acceptance_enables_finish_and_lost_reply_lookup(completed):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    from engineering_hub.container_pilot_client import ContainerPilotEvidence
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    accepted = ledger.accept_gate_completion(pins, role='candidate', executable_digest='sha256:' + '3' * 64,
+        health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+        health_receipt_digest=snapshot['health_receipt_digest'], decision_payload_digest=snapshot['decision_payload_digest'])
+    assert ledger.wait_for_gate_acceptance(command.command_id, time.monotonic() + 1)
+    ev = ContainerPilotEvidence(container_id=pins['container_id'], image_config_id=pins['image_config_id'],
+                                health='unknown', evidence_verified=True)
+    result = ledger.finish(command.command_id, state='succeeded', reason=None, evidence=ev,
+                           generation_id=pins['generation_id'])
+    assert result.state == 'succeeded'
+    assert ledger.lookup_gate_completion(pins) == accepted
+
+
+def test_wait_timeout_and_racing_held_are_conservative(completed):
+    ledger, command, pins, _, _ = completed
+    assert not ledger.wait_for_gate_acceptance(command.command_id, time.monotonic() + .05)
+    assert ledger.finish(command.command_id, state='succeeded', reason=None, evidence=evidence()).state == 'held'
+    with pytest.raises(PermissionError):
+        ledger.gate_completion_snapshot(pins, PROBE)
+
+
+@pytest.mark.parametrize('fault', ['stale_fence', 'bad_mac', 'wrong_container'])
+def test_committed_acceptance_never_bypasses_changed_authority(completed, fault):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    from engineering_hub.container_pilot_client import ContainerPilotEvidence
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    ledger.accept_gate_completion(pins, role='candidate', executable_digest='sha256:' + '3' * 64,
+        health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+        health_receipt_digest=snapshot['health_receipt_digest'], decision_payload_digest=snapshot['decision_payload_digest'])
+    if fault in {'stale_fence', 'bad_mac'}:
+        with ledger._transaction() as db:
+            if fault == 'stale_fence': db.execute('UPDATE targets SET fence=fence+1')
+            else: db.execute("UPDATE gate_acceptances SET record_mac='bad'")
+    ev = ContainerPilotEvidence(container_id=('f' * 64 if fault == 'wrong_container' else pins['container_id']),
+        image_config_id=pins['image_config_id'], health='unknown', evidence_verified=True)
+    result = ledger.finish(command.command_id, state='succeeded', reason=None, evidence=ev,
+                           generation_id=pins['generation_id'])
+    assert result.state == 'held'
+
+
+def test_lost_reply_hold_after_commit_cannot_revoke_acceptance(completed):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    from engineering_hub.container_pilot_client import ContainerPilotEvidence
+    ledger, command, pins, _, _ = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    accepted = ledger.accept_gate_completion(pins, role='candidate', executable_digest='sha256:' + '3' * 64,
+        health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+        health_receipt_digest=snapshot['health_receipt_digest'], decision_payload_digest=snapshot['decision_payload_digest'])
+    ledger.hold_gate_uncertain(pins)  # Response was lost after commit.
+    ev = ContainerPilotEvidence(container_id=pins['container_id'], image_config_id=pins['image_config_id'],
+                                health='unknown', evidence_verified=True)
+    assert ledger.finish(command.command_id, state='succeeded', reason=None, evidence=ev,
+                         generation_id=pins['generation_id']).state == 'succeeded'
+    assert ledger.lookup_gate_completion(pins) == accepted
+
+
+@pytest.mark.parametrize('deadline', [float('inf'), float('-inf'), float('nan'), True])
+def test_wait_rejects_invalid_deadlines(completed, deadline):
+    ledger, command, _, _, _ = completed
+    with pytest.raises(ValueError):
+        ledger.wait_for_gate_acceptance(command.command_id, deadline)
+
+
+def test_health_readiness_requires_bound_consumed_gate_and_authenticated_health(completed):
+    ledger, _, pins, health_id, receipt = completed
+    assert ledger.gate_health_ready(pins, PROBE) == {'ready': True}
+    with ledger._transaction() as db:
+        db.execute('DELETE FROM operations WHERE operation_id=?', (health_id,))
+    assert ledger.gate_health_ready(pins, PROBE) == {'ready': False}
+    with ledger._transaction() as db:
+        db.execute("UPDATE mount_gate_challenges SET decision_mac='bad'")
+    with pytest.raises(PermissionError): ledger.gate_health_ready(pins, PROBE)
+
+
+def test_health_readiness_rejects_invalid_health_and_stale_fence(completed):
+    ledger, _, pins, health_id, _ = completed
+    with ledger._transaction() as db:
+        db.execute("UPDATE operations SET receipt_mac='bad' WHERE operation_id=?", (health_id,))
+    with pytest.raises(PermissionError): ledger.gate_health_ready(pins, PROBE)
+    with ledger._transaction() as db: db.execute('UPDATE targets SET fence=fence+1')
+    with pytest.raises(PermissionError): ledger.gate_health_ready(pins, PROBE)
+
+
+def test_health_readiness_intent_is_pending(completed):
+    ledger, _, pins, health_id, _ = completed
+    with ledger._transaction() as db:
+        db.execute("UPDATE operations SET status='intent',receipt=NULL,receipt_mac=NULL WHERE operation_id=?", (health_id,))
+    assert ledger.gate_health_ready(pins, PROBE) == {'ready': False}

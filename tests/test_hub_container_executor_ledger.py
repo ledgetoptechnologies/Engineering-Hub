@@ -786,3 +786,39 @@ def test_context_rejects_untrusted_bytes_before_parsing(tmp_path, monkeypatch, r
     monkeypatch.setattr(ledger_module.json, "loads", refuse_parse)
     assert ledger.create_context(operation) is None
     ledger.close()
+
+
+def test_pending_gate_context_returns_only_fenced_nonsecret_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        assert ledger.pending_gate_context(role='candidate') is None
+        command, _, pins = gate_fixture(ledger)
+        ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        result = ledger.pending_gate_context(role='candidate')
+        expected = {name: pins[name] for name in ('operation_id', 'run_id', 'fence', 'generation_id',
+                    'container_id', 'image_config_id', 'runnable_digest', 'platform_manifest_digest')}
+        assert result == dict(expected, role='candidate')
+        with pytest.raises(PermissionError): ledger.pending_gate_context(role='rollback')
+        with ledger._transaction() as db: db.execute('UPDATE targets SET fence=fence+1')
+        with pytest.raises(PermissionError): ledger.pending_gate_context(role='candidate')
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize('fault', ['requirement_mac', 'context_mac', 'receipt_mac', 'held'])
+def test_pending_gate_context_rejects_tampered_or_held(tmp_path, monkeypatch, fault):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    try:
+        command, _, pins = gate_fixture(ledger)
+        ledger.require_gate_outcome(command.command_id, pins['operation_id'])
+        if fault == 'held': ledger.hold_gate_uncertain(pins)
+        else:
+            with ledger._transaction() as db:
+                if fault == 'requirement_mac': db.execute("UPDATE gate_required SET state_mac='bad'")
+                elif fault == 'context_mac': db.execute("UPDATE create_contexts SET context_mac='bad'")
+                else: db.execute("UPDATE operations SET receipt_mac='bad' WHERE operation_id=?", (pins['operation_id'],))
+        with pytest.raises(PermissionError): ledger.pending_gate_context(role='candidate')
+    finally:
+        ledger.close()
