@@ -269,6 +269,24 @@ def test_default_missing_trusted_verifier_fails_before_any_effect(tmp_path):
     adapter.close()
 
 
+def test_gated_deploy_holds_before_effect_if_rollback_image_is_ungated(tmp_path, monkeypatch):
+    from hub_container_executor.application_gate_enrollment import STATIC_ENTRYPOINT
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    adapter.gate_socket_directory = '/synthetic/gate'
+    inspect_defaults = adapter._image_defaults
+    def defaults(image, deadline):
+        value = inspect_defaults(image, deadline)
+        return replace(value, entrypoint=STATIC_ENTRYPOINT, command=()) if image.role == 'candidate' else value
+    monkeypatch.setattr(adapter, '_image_defaults', defaults)
+    try:
+        response = adapter.submit(command(manifest, 'deploy_container'))
+        assert response.state == 'held' and response.reason == 'image_unavailable'
+        assert state.calls == []
+        assert not any(event in {'create', 'start', 'stop', 'probe'} for event in backend.events)
+    finally:
+        adapter.close()
+
+
 def test_fake_engine_candidate_failure_requires_separate_rollback_smoke(tmp_path):
     adapter, backend, state, manifest = make_fixture(tmp_path)
     run_id = str(uuid.uuid4())

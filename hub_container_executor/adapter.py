@@ -224,6 +224,10 @@ class HostAdapter:
             baseline = self._get_baseline()
             rollback_image = image if role == "rollback" else self._verified_image("rollback")
             rollback_defaults = defaults if role == "rollback" else self._image_defaults(rollback_image, deadline)
+            if self.gate_socket_directory is not None:
+                from .application_gate_enrollment import STATIC_ENTRYPOINT
+                if rollback_defaults.entrypoint != STATIC_ENTRYPOINT or rollback_defaults.command != ():
+                    raise _Held('image_unavailable')
             self._verify_baseline_container(baseline, rollback_image, rollback_defaults, secrets, deadline)
             method = (self.state_provisioner.prepare_candidate if role == "candidate"
                       else self.state_provisioner.prepare_rollback)
