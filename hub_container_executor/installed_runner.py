@@ -71,6 +71,11 @@ def _require(value):
         raise InstalledRunnerError()
 
 
+def _require_supported_gate_runtime(config):
+    """Fail closed until independent installed-host gate acceptance exists."""
+    _require(config.gate_socket_directory is None)
+
+
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=False, allow_nan=False).encode('utf-8')
@@ -287,7 +292,7 @@ async def run_installed_executor(config):
         _require(type(config) is RunnerConfiguration and config.process_id == os.getpid())
         # Until the supervisor supplies a fresh authenticated gate-mount
         # observation, v3 configuration is parseable but cannot start effects.
-        _require(config.gate_socket_directory is None)
+        _require_supported_gate_runtime(config)
         with ExitStack() as owned:
             if config.pair is not None:
                 stop, report = asyncio.Event(), BrokerCleanupReport()

@@ -1978,6 +1978,10 @@ class LaunchSupervisor:
             remaining = _remaining(deadline)
             time.sleep(min(.1, remaining))
         try:
+            while not self._gate_ledger_handoff_ready(deadline):
+                _require(stop_requested() is False)
+                _check_gate_authority(authority_check); _remaining(deadline)
+                wait()
             pins = None
             while pins is None:
                 _require(stop_requested() is False)
@@ -2002,6 +2006,23 @@ class LaunchSupervisor:
                 try: self._hold()
                 finally: self._mutex.release()
             raise LaunchSupervisorError() from None
+
+    def _gate_ledger_handoff_ready(self, deadline):
+        """Observe the completed one-shot handoff before opening its socket."""
+        with self._observation_mutex(deadline):
+            self._validate_live(deadline)
+            if self._ledger_handoff_parent is None:
+                return False
+            self._ledger_handoff_path_check()
+            with self._journal.transaction() as db:
+                row = db.execute('SELECT binding FROM ledger_handoff WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+            _require(row is not None)
+            binding = _strict(row[0].encode(), MAX_RECEIPT_BYTES)
+            _require(binding['launch_id'] == self._launch_id
+                     and binding['launch_profile_digest'] == self.release.launch_profile_digest
+                     and (binding['path_device'], binding['path_inode']) == self._ledger_handoff_path_identity)
+            self._validate_live(deadline); self._ledger_handoff_path_check(); _remaining(deadline)
+            return True
 
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
