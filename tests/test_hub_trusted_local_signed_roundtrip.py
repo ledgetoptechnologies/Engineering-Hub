@@ -224,5 +224,3 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
                         assert not thread.is_alive()
                 finally:
                     listener.close()
-
-
