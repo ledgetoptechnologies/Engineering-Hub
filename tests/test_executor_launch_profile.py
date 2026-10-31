@@ -474,6 +474,25 @@ def test_executor_command_channel_is_a_signed_opt_in():
         core.ExecutorLaunchProfile.model_validate(without_policy)
 
 
+def test_executor_endpoint_is_explicit_private_and_preserves_existing_bytes():
+    previous = profile(daemon_policy=policy())
+    assert core.ExecutorLaunchProfile.model_validate(previous).enrollment_value() == previous
+    data = profile(daemon_policy=policy(), executor_endpoint='protected-uds-v1')
+    data['mounts'].append(dict(role='executor_endpoint_directory', source=data['fixture_root']+'/endpoint',
+        target=core.EXECUTOR_ENDPOINT_TARGET, kind='directory', read_only=False,
+        uid=110001, gid=110001, mode=0o700, content_digest=None))
+    assert core.ExecutorLaunchProfile.model_validate(data).enrollment_value() == data
+    for role, changes in [('executor_endpoint_directory', {'read_only': True}),
+                          ('executor_endpoint_directory', {'uid': 10001}),
+                          ('executor_endpoint_directory', {'target': '/run/other'})]:
+        bad = dict(data); bad['mounts'] = [dict(item) for item in data['mounts']]
+        _swap_mount(bad, role, **changes)
+        with pytest.raises((ValueError, RuntimeError)): core.ExecutorLaunchProfile.model_validate(bad)
+    for bad in (dict(data, executor_endpoint=None), dict(data, executor_endpoint='other'),
+                dict(data, command_channel='inherited-seqpacket-v1')):
+        with pytest.raises((ValueError, RuntimeError)): core.ExecutorLaunchProfile.model_validate(bad)
+
+
 def test_ledger_handoff_requires_signed_completion_policy():
     data = gate_profile()
     legacy = core.ExecutorLaunchProfile.model_validate(data)

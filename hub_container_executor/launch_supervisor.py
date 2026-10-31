@@ -1012,6 +1012,54 @@ class LaunchSupervisor:
                 _require(self._source_pins[role] == _identity(info))
             else:
                 self._source_pins[role] = _identity(info)
+        if getattr(self.profile, 'executor_endpoint', None) is not None:
+            self._check_executor_endpoint_directory()
+
+    def _check_executor_endpoint_directory(self):
+        """Pin a dedicated endpoint without adopting preexisting entries."""
+        mount = self._mounts['executor_endpoint_directory']
+        name = self._executor_endpoint_name
+        path = _path(mount.source)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            def check_directory():
+                info, named = os.fstat(fd), os.lstat(path)
+                _require(stat.S_ISDIR(info.st_mode) and stat.S_ISDIR(named.st_mode)
+                         and _identity(info) == self._source_pins['executor_endpoint_directory'] == _identity(named)
+                         and info.st_uid == named.st_uid == mount.uid and info.st_gid == named.st_gid == mount.gid
+                         and stat.S_IMODE(info.st_mode) == stat.S_IMODE(named.st_mode) == 0o700)
+            def bounded_names():
+                with os.scandir(fd) as entries:
+                    first = next(entries, None)
+                    _require(next(entries, None) is None)
+                    return [] if first is None else [first.name]
+            check_directory()
+            names = bounded_names()
+            _require(bounded_names() == names)
+            check_directory()
+            previous = getattr(self, '_executor_endpoint_identity', None)
+            if self._launch_id is None:
+                _require(not names and previous is None)
+                return
+            _require(not names or names == [name])
+            if not names:
+                _require(previous is None)
+                return
+            socket_info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            _require(stat.S_ISSOCK(socket_info.st_mode) and socket_info.st_uid == mount.uid
+                     and socket_info.st_gid == mount.gid and stat.S_IMODE(socket_info.st_mode) == 0o600
+                     and socket_info.st_nlink == 1)
+            identity = _identity(socket_info)
+            _require(previous is None or previous == identity)
+            after = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            _require(_identity(after) == identity and stat.S_ISSOCK(after.st_mode)
+                     and after.st_uid == mount.uid and after.st_gid == mount.gid
+                     and stat.S_IMODE(after.st_mode) == 0o600 and after.st_nlink == 1
+                     and bounded_names() == names)
+            check_directory()
+            self._executor_endpoint_identity = identity
+        finally:
+            os.close(fd)
 
     def _pin_trusted_local_inputs(self):
         """Capture and bind both exact protected inputs; no launch authority is inferred."""
@@ -1417,6 +1465,7 @@ class LaunchSupervisor:
 
     def _runner_configuration(self, raw):
         from .installed_runner import parse_configuration
+        from engineering_hub.executor_launch_profile import EXECUTOR_ENDPOINT_TARGET
         parsed = parse_configuration(raw)
         # Paired runners consume an inherited channel. A legacy signed launch
         # profile cannot authorize that different entrypoint behavior.
@@ -1424,6 +1473,12 @@ class LaunchSupervisor:
                  (self.profile.command_channel == 'inherited-seqpacket-v1'))
         _require((parsed.gate_socket_directory is not None) == (self.profile.gate_channel is not None))
         _require(parsed.gate_ledger_channel == (self.profile.gate_ledger_channel == 'supervisor-listener-v1'))
+        if self.profile.executor_endpoint is not None:
+            _require(Path(parsed.socket_path).parent == Path(EXECUTOR_ENDPOINT_TARGET))
+            name = Path(parsed.socket_path).name
+            prior = getattr(self, '_executor_endpoint_name', None)
+            _require(prior is None or prior == name)
+            self._executor_endpoint_name = name
         if parsed.gate_socket_directory is not None:
             _require(self._mounts['gate_channel_directory'].source == parsed.gate_socket_directory)
         return parsed

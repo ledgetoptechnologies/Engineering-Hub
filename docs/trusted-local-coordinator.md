@@ -38,6 +38,21 @@ config/enrollment capture and cross-check, but complete mount custody,
 pre-admission handshake and coordinator/executor lifecycle binding still
 need to be implemented and verified before that guard can be reconsidered.
 
+An executor profile may explicitly select `executor_endpoint` as
+`protected-uds-v1`: it adds a dedicated writable mode-0700 endpoint directory
+at `/run/hub-executor`, and the runner's configured socket must be inside that
+directory. The supervisor refuses existing entries before launch and pins the
+created socket when observed. Sharing the executor state directory instead does
+not provide this separation. Actual pairing still requires independently
+binding both mounts to the same source and retaining the executor through
+coordinator drain.
+
+Supervisor-launched containers currently use `NetworkMode=none`; GitHub's real
+OAuth token exchange and identity lookup require egress. The synthetic OAuth
+tests do not establish that route. An independently enrolled, restricted
+egress broker and external routing would require implementation and review;
+this profile does not configure either or relax the network policy.
+
 Run the following as the independently launched container's PID 1, using paths
 that already exist inside its approved mounts:
 

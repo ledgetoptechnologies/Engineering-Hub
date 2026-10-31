@@ -34,6 +34,7 @@ LAUNCH_TARGETS = MappingProxyType({
 })
 _TARGETS = LAUNCH_TARGETS
 _BROKER_SOCKET_TARGET = "/run/engineering-hub/broker.sock"
+EXECUTOR_ENDPOINT_TARGET = '/run/hub-executor'
 # A coordinator-role profile's closed mounts. It never gets the Engine socket,
 # generations, records, metadata or baseline; the issuer socket only carries
 # its receipt and inherited command channel.
@@ -109,6 +110,12 @@ class ExecutorLaunchMount(_Closed):
 
     @model_validator(mode='after')
     def closed_role(self):
+        if self.role == 'executor_endpoint_directory':
+            _require(self.target == EXECUTOR_ENDPOINT_TARGET)
+            _path(self.source)
+            _require(self.kind == 'directory' and self.read_only is False and self.uid > 0
+                     and self.gid > 0 and self.mode == 0o700 and self.content_digest is None)
+            return self
         if self.role == 'local_issuer_socket':
             _require(self.target == SUPERVISED_LOCAL_COORDINATOR_TARGETS[self.role])
             _path(self.source)
@@ -319,6 +326,8 @@ class ExecutorLaunchProfile(_Closed):
     generation_isolation: GenerationIsolationPolicy | None = None
     # Host-side signed expectations only. Existing runtime guard remains closed.
     custodian_control: CustodianControlPolicy | None = None
+    # Dedicated shared Unix endpoint; absent preserves all earlier profile bytes.
+    executor_endpoint: Literal['protected-uds-v1'] | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -331,7 +340,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control', 'executor_endpoint'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -376,6 +385,16 @@ class ExecutorLaunchProfile(_Closed):
             roles = set(_TARGETS)
         else:
             roles = (set(_TARGETS) - {'engine_socket', 'generations'}) | {'broker_socket'}
+        if self.executor_endpoint is not None:
+            _require(self.role is None and self.daemon_policy is not None and self.broker_mode is None
+                     and self.command_channel is None)
+            roles.add('executor_endpoint_directory')
+            host_uid = next(outside + _EXECUTOR_ID - inside for inside, outside, count in self.daemon_policy.uid_map
+                            if inside <= _EXECUTOR_ID < inside + count)
+            host_gid = next(outside + _EXECUTOR_ID - inside for inside, outside, count in self.daemon_policy.gid_map
+                            if inside <= _EXECUTOR_ID < inside + count)
+            endpoint = [item for item in self.mounts if item.role == 'executor_endpoint_directory']
+            _require(len(endpoint) == 1 and endpoint[0].uid == host_uid and endpoint[0].gid == host_gid)
         if self.gate_channel is not None:
             _require(not coordinator and self.broker_mode is None and self.command_channel is None
                      and self.daemon_policy is not None)
@@ -396,7 +415,7 @@ class ExecutorLaunchProfile(_Closed):
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
-                         if item.role not in {'generations', 'broker_socket', 'gate_channel_directory'}))
+                         if item.role not in {'generations', 'broker_socket', 'gate_channel_directory', 'executor_endpoint_directory'}))
         if self.broker_mode is not None or self.command_channel is not None or coordinator:
             _require(self.daemon_policy is not None)
         if coordinator:
@@ -429,7 +448,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation', 'custodian_control', 'executor_endpoint'):
             if value[name] is None:
                 del value[name]
         return value

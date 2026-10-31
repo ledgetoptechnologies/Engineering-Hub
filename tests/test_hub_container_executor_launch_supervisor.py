@@ -1839,6 +1839,23 @@ def test_coordinator_and_inherited_channel_profiles_refused_before_journal_or_en
         assert not Path(kwargs['journal_file']).exists()
 
 
+def test_dedicated_executor_endpoint_binds_runner_socket_parent(monkeypatch):
+    from tests.test_executor_launch_profile import profile, policy
+    from hub_container_executor import installed_runner
+    value = profile(daemon_policy=policy(), executor_endpoint='protected-uds-v1')
+    value['mounts'].append(dict(role='executor_endpoint_directory',source=value['fixture_root']+'/endpoint',
+        target='/run/hub-executor',kind='directory',read_only=False,uid=110001,gid=110001,mode=0o700,content_digest=None))
+    signed = launch.ExecutorLaunchProfile.model_validate(value)
+    subject = SimpleNamespace(profile=signed, _mounts={m.role:m for m in signed.mounts})
+    parsed = SimpleNamespace(pair=None,gate_socket_directory=None,gate_ledger_channel=False,
+                             socket_path='/run/hub-executor/executor.sock')
+    monkeypatch.setattr(installed_runner, 'parse_configuration', lambda raw: parsed)
+    assert launch.LaunchSupervisor._runner_configuration(subject, b'fixture') is parsed
+    parsed.socket_path = '/elsewhere/executor.sock'
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch.LaunchSupervisor._runner_configuration(subject, b'fixture')
+
+
 def test_executor_channel_issuance_real_rights_and_durable_once(synthetic_issuer):
     """Synthetic launch authority; real kernel stream, signature, pidfd and FD."""
     authority, path, _ = synthetic_issuer

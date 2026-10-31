@@ -116,3 +116,48 @@ def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path):
         subject._request_ms = 2000
         subject._admission_raw_digest = 'sha256:'+'0'*64
         with pytest.raises(ValueError): launch.LaunchSupervisor._pin_sources(subject)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason='Synthetic mapped-owner capture requires isolated root')
+def test_dedicated_executor_endpoint_refuses_preexisting_and_replaced_socket(tmp_path):
+    directory = tmp_path / 'endpoint'; directory.mkdir(mode=0o700); os.chown(directory, 110001, 110001)
+    info = directory.stat()
+    subject = SimpleNamespace(_mounts={'executor_endpoint_directory': SimpleNamespace(
+        source=str(directory), uid=110001, gid=110001)}, _executor_endpoint_name='executor.sock',
+        _source_pins={'executor_endpoint_directory': (info.st_dev, info.st_ino)}, _launch_id=None)
+    launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+    (directory / 'extra-a').touch(); (directory / 'extra-b').touch()
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+    (directory / 'extra-a').unlink(); (directory / 'extra-b').unlink()
+    path = directory / 'executor.sock'
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as first:
+        first.bind(str(path)); os.chmod(path, 0o600); os.chown(path, 110001, 110001)
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+        subject._launch_id = 'admitted'
+        launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+        path.unlink()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+            second.bind(str(path)); os.chmod(path, 0o600); os.chown(path, 110001, 110001)
+            with pytest.raises(launch.LaunchSupervisorError):
+                launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason='Synthetic mapped-owner capture requires isolated root')
+def test_endpoint_inventory_waits_for_config_independent_of_mount_order(tmp_path, monkeypatch):
+    directory = tmp_path / 'endpoint'; directory.mkdir(mode=0o700); os.chown(directory, 110001, 110001)
+    config = tmp_path / 'config'; config.write_bytes(b'fixture'); os.chmod(config, 0o600); os.chown(config, 110001, 110001)
+    endpoint = SimpleNamespace(role='executor_endpoint_directory',source=str(directory),kind='directory',uid=110001,gid=110001,mode=0o700)
+    config_mount = SimpleNamespace(role='config',source=str(config),kind='file',uid=110001,gid=110001,mode=0o600,content_digest='content')
+    release = SimpleNamespace(launch_profile_digest='profile')
+    subject = SimpleNamespace(profile=SimpleNamespace(role=None,executor_endpoint='protected-uds-v1',digest=lambda:'profile'),
+        _mounts={'executor_endpoint_directory':endpoint, 'config':config_mount}, _source_pins={}, _launch_id=None,
+        _configuration_raw_digest='raw', release=release)
+    monkeypatch.setattr(launch, 'configuration_commitment', lambda raw: SimpleNamespace(
+        raw_digest='raw',content_digest='content',release=release))
+    # _pin_sources must not inspect the endpoint until the later config was parsed.
+    subject._runner_configuration = lambda raw: setattr(subject, '_executor_endpoint_name', 'executor.sock')
+    subject._check_executor_endpoint_directory = lambda: launch.LaunchSupervisor._check_executor_endpoint_directory(subject)
+    launch.LaunchSupervisor._pin_sources(subject)
+    assert subject._executor_endpoint_name == 'executor.sock'
