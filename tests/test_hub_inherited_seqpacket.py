@@ -19,7 +19,7 @@ pytest.importorskip('fcntl')
 
 from hub_container_executor.broker_seqpacket import (
     BrokerChannelClosed, BrokerReadTimeout, BrokerTransportError, InheritedCommandBroker,
-    InheritedCommandClient, PeerAccount, _CHANNEL_PROTOCOL, _canonical,
+    InheritedCommandClient, PeerAccount, _CHANNEL_PROTOCOL, _canonical, _read_packet,
 )
 from tests.test_hub_container_executor_adapter import make_fixture, command
 
@@ -404,3 +404,66 @@ def test_peer_account_rejects_malformed_ids():
     for uid, gid in ((-1, 0), (0, 2**32 - 1), (True, 0), (0, '0'), (None, 0)):
         with pytest.raises(BrokerTransportError):
             PeerAccount(uid=uid, gid=gid)
+
+
+def _root_only():
+    return pytest.mark.skipif(not hasattr(os, 'geteuid') or os.geteuid() != 0, reason='needs root')
+
+
+@_root_only()
+@pytest.mark.skipif(not hasattr(os, 'unshare') or not hasattr(os, 'CLONE_NEWPID'), reason='needs os.unshare')
+def test_a_receiver_in_a_child_pid_namespace_sees_pid_0_and_still_checks_the_account():
+    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    report_read, report_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        status = 1
+        try:
+            coordinator_end.close()
+            os.close(report_read)
+            os.unshare(os.CLONE_NEWPID)
+            grandchild = os.fork()
+            if grandchild == 0:
+                code = 1
+                try:
+                    channel = InheritedCommandClient(executor_end.detach(), me())
+                    assert select.select([channel._socket], [], [], 5)[0]
+                    _, credentials = _read_packet(channel._socket)
+                    accepted = len(credentials) == 1 and credentials[0][1:] == (os.getuid(), os.getgid())
+                    os.write(report_write, b'%d %d' % (credentials[0][0], accepted))
+                    code = 0
+                finally:
+                    os._exit(code)
+            _, waited = os.waitpid(grandchild, 0)
+            status = 0 if os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0 else 1
+        finally:
+            os._exit(status)
+    executor_end.close()
+    os.close(report_write)
+    with raw_end(coordinator_end) as raw:
+        raw.send(b'{}')
+        _, waited = os.waitpid(child, 0)
+    report = os.read(report_read, 64)
+    os.close(report_read)
+    assert os.WIFEXITED(waited) and os.WEXITSTATUS(waited) == 0
+    assert report == b'0 1'   # the sender's pid isn't visible there; the account still matches
+
+
+@_root_only()
+def test_a_privileged_holder_can_claim_the_expected_account(rig):
+    # Pins the documented limit: CAP_SETUID/CAP_SETGID lets a holder attach
+    # credentials of another mapped account, so the profile must drop them.
+    backend, manifest, broker, client = rig
+    other = PeerAccount(uid=65534, gid=65534)
+    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    claimed = InheritedCommandBroker(executor_end.detach(), broker.adapter, other)
+    try:
+        with raw_end(coordinator_end) as raw:
+            creds = array.array('i', [os.getpid(), 65534, 65534])
+            raw.sendmsg([request_packet(manifest)],
+                        [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, creds.tobytes())])
+            claimed.serve_once(5)
+            assert raw.recv(65536)
+        assert backend.events.count('create') == 1
+    finally:
+        claimed.close()

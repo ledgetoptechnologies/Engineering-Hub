@@ -337,7 +337,9 @@ class PeerAccount:
     A descriptor can be delegated, so any process of this uid/gid that holds it
     passes. A sender of any other account is refused and the channel closed.
     The sender pid is not compared: the kernel reports it as 0 when the sender's
-    PID namespace isn't visible from the receiver's.
+    PID namespace isn't visible from the receiver's. A holder with CAP_SETUID or
+    CAP_SETGID over its user namespace may claim any mapped account, so this
+    refusal holds only for holders without those capabilities.
     """
     def __init__(self, *, uid, gid):
         _require(type(uid) is int and type(gid) is int and 0 <= uid < 2**32 - 1 and 0 <= gid < 2**32 - 1)
