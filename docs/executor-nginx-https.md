@@ -26,6 +26,28 @@ No custom proxy runtime is needed. Ordinary Hub startup stays unchanged.
   source expects a private executor socket; no `chmod 666`, generic Docker socket,
   group-wide privilege or fabricated mapping is acceptable. If the current
   private topology cannot support that worker, stop for explicit design approval.
+- On a dedicated, trusted VM, one workable profile runs the NGINX master and
+  workers directly as the socket's **host-visible owner UID/GID**, using an
+  unprivileged port and private writable PID/temp directories. Do not start a
+  root master or rely on NGINX's `user` directive to change identity. The UDS
+  parent remains owner-only 0700 and the socket 0600. Measure the actual
+  rootless user-namespace mapping: the UID inside the executor need not equal
+  its host-visible socket owner. Verify this UID has no access (including ACLs
+  and supplementary groups) to the daemon socket or its private directories.
+  Sharing the UID also shares that UID's file authority; this profile therefore
+  assumes the proxy and executor are mutually trusted, and is unsuitable if
+  they require isolation from each other. If the checks cannot all be met,
+  leave the route disabled rather than widening socket permissions.
+  Start it under that already-selected account with a dedicated full config,
+  for example `nginx -p /private/proxy/ -c /private/proxy/nginx.conf -g
+  'daemon off;'`; the main config must select one worker and private PID and
+  temporary paths. Use a port above 1023, no capabilities, and an explicit
+  supervisor that drains on shutdown. Keep the TLS key outside the executor's
+  mount namespace and all executor-writable paths. Same UID alone does not
+  establish that isolation or prevent access through another exposed path.
+  Host administrators and anyone controlling the container daemon can access
+  or arrange access to that key; this profile trusts those authorities unless
+  a stronger isolation boundary is independently established and verified.
 - Keep the TLS private key outside executor/agent-writable content. Provisioning
   certificates, identity mappings, firewall/service rules or socket mounts is
   separate authorized work, not an effect of this template.

@@ -5,6 +5,8 @@ the official Docker Library binary+private libraries; no application proxy is
 installed by these tests. This is not installed-host/NAS acceptance.
 """
 import asyncio
+import os
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 import shutil
@@ -78,6 +80,12 @@ async def proxy_fixture(current_observation_transport=None):
     nginx = nginx_command()
     with tempfile.TemporaryDirectory(prefix='eh-nx-', dir='/tmp') as directory:
         root = Path(directory)
+        # The real proxy runs as this same nonroot account.  A private parent
+        # and socket are part of the fixture, not ambient group permissions.
+        if os.geteuid() == 0:
+            pytest.skip('Socket-owner proxy profile requires a nonroot test UID')
+        assert root.stat().st_uid == os.geteuid()
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
         ca, key = certificate()
         cert_path, key_path = root / 'server.pem', root / 'server.key'
         cert_path.write_bytes(ca); key_path.write_bytes(key); key_path.chmod(0o600)
@@ -95,6 +103,8 @@ async def proxy_fixture(current_observation_transport=None):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path)); listener.setblocking(False)
         socket_path.chmod(0o600)
+        assert socket_path.stat().st_uid == os.geteuid()
+        assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
         server = uvicorn.Server(uvicorn.Config(observed, lifespan='off', interface='asgi3',
             loop='asyncio', http='h11', ws='none', access_log=False, proxy_headers=False,
             log_config=None, timeout_graceful_shutdown=None))
