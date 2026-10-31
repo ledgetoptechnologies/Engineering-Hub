@@ -35,7 +35,7 @@ def rig(tmp_path, monkeypatch):
     private = tmp_path / 'private'
     private.mkdir(mode=0o700)
     owner = PilotOwner(private / 'hub.db', allow_ephemeral_test_storage=True)
-    config, assertion = signed_access(monkeypatch)
+    config, assertion, _diagnostics = signed_access(monkeypatch)
     settings = Settings(private / 'hub.db', AuthSettings('test-hermes', 'test-codex',
         claude_token='test-claude', allowed_ips=frozenset({'127.0.0.1'})), config,
         staging_machine_id=MACHINE)
@@ -118,6 +118,51 @@ def options(rig, **changes):
         browser_host='127.0.0.1', browser_port=0, install_signals=False)
     result.update(changes)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['default', 'incomplete', 'cf-optin', 'callback-only', 'not-bool'])
+async def test_github_requires_complete_explicit_bound_enrollment_before_owner_or_bind(rig, monkeypatch, case):
+    from dataclasses import replace
+    from engineering_hub.auth import AuthConfig
+    config = AuthConfig('https://hub.example', human_auth_mode='github',
+        github_client_id='fixture-client', github_client_secret='fixture-secret', beau_github_id=42)
+    if case == 'incomplete': config = replace(config, github_client_secret='')
+    settings = rig.settings if case == 'cf-optin' else replace(rig.settings, auth_config=config)
+    allow = False if case == 'default' else 1 if case == 'not-bool' else True
+    monkeypatch.setattr(rig.owner, 'assert_active', lambda *_: pytest.fail('owner checked before auth admission'))
+    monkeypatch.setattr(service, '_bind', lambda *_a, **_k: pytest.fail('listener acquired'))
+    with pytest.raises(ValueError, match='^Explicit pre-enrolled unified queued pilot configuration required$'):
+        await service.serve_owned_unified_queued_pilot(settings, rig.manifest, rig.client_factory,
+            **options(rig, allow_github=allow))
+    assert not rig.clients and rig.owner.close_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mismatch', ['machine', 'manifest'])
+async def test_github_bound_enrollment_cannot_select_other_machine_or_manifest(rig, monkeypatch, mismatch):
+    from dataclasses import replace
+    from engineering_hub.auth import AuthConfig
+    from engineering_hub import trusted_queued_session as sessions
+    from tests.test_hub_trusted_queued_session import v2_document, encode
+    data = v2_document()
+    data.update(schema=sessions.SCHEMA_V3, operator_actor='human:42')
+    data['report']['manifest_digest'] = rig.manifest.digest() if mismatch == 'machine' else 'sha256:' + '0' * 64
+    # Unit-isolate routing admission, without constructing observation transports.
+    composition = object.__new__(sessions.TrustedQueuedSessionComposition)
+    composition._enrollment = sessions.parse_enrollment(encode(data))
+    monkeypatch.setattr(sessions.TrustedQueuedSessionComposition, '_fresh', lambda _: None)
+    settings = replace(rig.settings, staging_machine_id=MACHINE if mismatch == 'machine' else 'staging-pc',
+        auth_config=AuthConfig('https://hub.example', github_client_id='fixture',
+                              github_client_secret='fixture-secret', beau_github_id=42))
+    monkeypatch.setattr(rig.owner, 'assert_active', lambda *_: pytest.fail('owner acquired for mismatched enrollment'))
+    monkeypatch.setattr(service, '_bind', lambda *_a, **_k: pytest.fail('listener acquired'))
+    with pytest.raises(ValueError, match='^Explicit pre-enrolled unified queued pilot configuration required$'):
+        await service.serve_owned_unified_queued_pilot(settings, rig.manifest, rig.client_factory,
+            **options(rig, allow_github=True, machine_id=settings.staging_machine_id,
+                reconciliation_factory=composition.reconciliation_factory,
+                session_acceptance_factory=composition.session_acceptance_factory))
+    assert not rig.clients and rig.owner.close_count == 0
 
 
 async def start(rig, **changes):

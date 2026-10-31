@@ -390,3 +390,33 @@ async def test_invalid_acceptance_factory_denied_before_configuration_owner_or_c
     with pytest.raises(startup.UnifiedPilotStartupError):
         await startup.serve_configuration('/not-read/config', '/not-read/profile',
             reconciliation_factory=synthetic_reconciliation, session_acceptance_factory=factory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['missing-session', 'legacy-profile', 'cf-enrollment', 'wrong-owner', 'missing-secret'])
+async def test_github_selector_denies_without_matching_v3_before_owner_credentials(monkeypatch, case):
+    from types import SimpleNamespace
+    from dataclasses import replace
+    from engineering_hub.app import Settings
+    from engineering_hub.auth import AuthConfig
+    from tests.test_hub_trusted_queued_session import v2_document
+    from engineering_hub import trusted_queued_session as sessions
+    profile = replace(startup.parse_profile(encode(profile_document())), profile_mode='disjoint-v3')
+    if case == 'legacy-profile': profile = replace(profile, profile_mode='legacy')
+    config = AuthConfig('https://hub.example', human_auth_mode='github', beau_github_id=123,
+        github_client_id='fixture-client', github_client_secret='' if case == 'missing-secret' else 'fixture-secret')
+    monkeypatch.setattr(startup, 'validate_configuration', lambda *_: (object(), profile))
+    monkeypatch.setattr(Settings, 'from_env', lambda *_: SimpleNamespace(auth_config=config))
+    def forbidden(*_a, **_k): pytest.fail('owner or credential accessed before GitHub enrollment admission')
+    monkeypatch.setattr(startup, 'PilotOwner', forbidden)
+    data = v2_document()
+    if case != 'cf-enrollment':
+        data.update(schema=sessions.SCHEMA_V3, operator_actor='human:999' if case == 'wrong-owner' else 'human:123')
+    def read(path, **_):
+        assert str(path) == '/operator/session.json'
+        return encode(data)
+    monkeypatch.setattr(startup, 'read_protected_file', read)
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration('/config', '/pilot',
+            **({'reconciliation_factory': synthetic_reconciliation} if case == 'missing-session'
+               else {'session_enrollment_path': '/operator/session.json'}))

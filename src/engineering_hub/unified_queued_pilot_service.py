@@ -67,7 +67,8 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                                          browser_host='0.0.0.0', browser_port=8771,
                                          stop_event=None, on_ready=None,
                                          install_signals=True, generation_id=None,
-                                         on_generation_ready=None, session_acceptance_factory=None):
+                                         on_generation_ready=None, session_acceptance_factory=None,
+                                         allow_github=False):
     """Bind first, then transfer one pre-enrolled owner and dedicated client.
 
     Failed listener binding leaves the caller's owner untouched. Once the pair
@@ -85,8 +86,13 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
             validate_existing_boundary(settings.database, shared_paths=tuple(bus_paths.values()))
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
-                or settings.auth_config.cloudflare_config is None
+                or type(allow_github) is not bool
+                or (not allow_github and (settings.auth_config.human_auth_mode != 'cloudflare_access'
+                    or settings.auth_config.cloudflare_config is None))
+                or (allow_github and (settings.auth_config.human_auth_mode != 'github'
+                    or not settings.auth_config.secure or not settings.auth_config.github_client_id
+                    or not settings.auth_config.github_client_secret
+                    or settings.auth_config.beau_github_id is None))
                 or type(owner) is not PilotOwner
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
@@ -101,6 +107,24 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
                 or generation_id is not None and not _canonical_uuid(generation_id)
                 or on_generation_ready is not None and not _synchronous(on_generation_ready)):
             raise ValueError()
+        if allow_github:
+            from .trusted_queued_session import (TrustedQueuedSessionComposition,
+                parse_enrollment, enrollment_bytes, SCHEMA_V3)
+            composition = getattr(reconciliation_factory, '__self__', None)
+            if (type(composition) is not TrustedQueuedSessionComposition
+                    or getattr(reconciliation_factory, '__func__', None) is not
+                        TrustedQueuedSessionComposition.reconciliation_factory
+                    or getattr(session_acceptance_factory, '__self__', None) is not composition
+                    or getattr(session_acceptance_factory, '__func__', None) is not
+                        TrustedQueuedSessionComposition.session_acceptance_factory):
+                raise ValueError()
+            composition._fresh()
+            enrolled = parse_enrollment(enrollment_bytes(composition._enrollment))
+            if (enrolled.schema != SCHEMA_V3 or enrolled.machine_id != machine_id
+                    or enrolled.manifest_digest != manifest.digest()
+                    or enrolled.operator_actor !=
+                    f'human:{settings.auth_config.beau_github_id}'):
+                raise ValueError()
         owner.assert_active(settings.database)
         _key(action_key)
         target = ContainerPilotTarget.from_manifest(manifest)
@@ -171,13 +195,14 @@ async def serve_owned_unified_queued_pilot(settings, manifest, client_factory, *
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         if generation_id is not None:
             generation_drain = runtime.bind_generation_drain(owner, generation_id)
-        bus = _create_unified_bus(settings, bus_paths=bus_paths)
+        bus = (_create_unified_bus(settings, bus_paths=bus_paths, allow_github=True) if allow_github
+               else _create_unified_bus(settings, bus_paths=bus_paths))
         core = create_app(settings, repository=repo, event_feed=feed,
                           work_queue=queue, queued_pilot_runtime=runtime, bus_app=bus, shared_staging=shared)
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core)
+        return HubFrontends(core, allow_github=True) if allow_github else HubFrontends(core)
 
     async def cleanup():
         failed = False

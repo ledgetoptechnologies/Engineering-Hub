@@ -127,6 +127,12 @@ class Settings:
             alternate_origins=tuple(value.strip() for value in
                 os.environ.get("HUB_ALTERNATE_ORIGINS", "").split(",") if value.strip()),
         )
+        if deployment is not None and auth_config.human_auth_mode == 'github':
+            # Versioned deployment config carries only public OAuth metadata.
+            # Reuse the established secure environment secret; never infer an
+            # owner/client from environment or fall back to another provider.
+            auth_config = replace(auth_config,
+                github_client_secret=os.environ.get('HUB_GITHUB_CLIENT_SECRET', ''))
         return cls(path, agent_auth, auth_config,
                    Path(os.environ["HUB_UI_DIRECTORY"]) if os.environ.get("HUB_UI_DIRECTORY") else None,
                    ingress_mode=os.environ.get("HUB_INGRESS_MODE", "combined"),

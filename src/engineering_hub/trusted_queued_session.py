@@ -26,6 +26,7 @@ from .startup_reconciliation import (ExecutorSessionIdentity, OperatorReconcilia
 
 SCHEMA = 'engineering-hub.manual-staging-session.v1'
 SCHEMA_V2 = 'engineering-hub.manual-staging-session.v2'
+SCHEMA_V3 = 'engineering-hub.manual-staging-session.v3'
 MAX_ENROLLMENT_BYTES = 32 * 1024
 MAX_REPORT_LIFETIME_MS = 600_000
 MAX_REPORT_AGE_MS = 300_000
@@ -89,10 +90,10 @@ def parse_enrollment(raw):
         def reject(_):
             raise TrustedSessionError()
         data = json.loads(raw, object_pairs_hook=unique, parse_float=reject, parse_constant=reject)
-        _require(type(data) is dict and data.get('schema') in (SCHEMA, SCHEMA_V2))
+        _require(type(data) is dict and data.get('schema') in (SCHEMA, SCHEMA_V2, SCHEMA_V3))
         schema = data['schema']
         _object(data, {'schema', 'release', 'launch', 'operator_actor', 'report'} |
-                ({'profile_mode', 'profile_json'} if schema == SCHEMA_V2 else set()))
+                ({'profile_mode', 'profile_json'} if schema in (SCHEMA_V2, SCHEMA_V3) else set()))
         release = dict(_object(data['release'],
             (set(CurrentExecutorReleasePins.__dataclass_fields__) - {'public_key'}) | {'public_key_hex'}))
         key = release.pop('public_key_hex')
@@ -102,7 +103,7 @@ def parse_enrollment(raw):
         release = CurrentExecutorReleasePins(**release)
         launch = CurrentLaunchPins(**_object(data['launch'], CurrentLaunchPins.__dataclass_fields__))
         profile_bytes = None
-        if schema == SCHEMA_V2:
+        if schema in (SCHEMA_V2, SCHEMA_V3):
             _require(data['profile_mode'] == 'disjoint-v3' and type(data['profile_json']) is str)
             profile_bytes = data['profile_json'].encode('utf-8')
             recognized = verify_profile_bytes(profile_bytes, release.launch_profile_digest)
@@ -110,7 +111,8 @@ def parse_enrollment(raw):
                      and recognized.command_channel is None and recognized.daemon_policy is not None
                      and recognized.daemon_policy.engine_id == launch.engine_id)
         actor = data['operator_actor']
-        _require(type(actor) is str and re.fullmatch(r'human:cf:[0-9a-f]{64}', actor))
+        _require(type(actor) is str and re.fullmatch(
+            r'human:[1-9][0-9]{0,19}' if schema == SCHEMA_V3 else r'human:cf:[0-9a-f]{64}', actor))
         report = _object(data['report'], {'target_id', 'manifest_digest', 'machine_id', 'source',
             'observed_at_ms', 'expires_at_ms', 'executor', 'evidence', 'evidence_sha256', 'attestations'})
         _require(report['target_id'] == 'engineering-hub:staging' and report['machine_id'] == 'staging-pc'
@@ -156,13 +158,13 @@ class TrustedQueuedSessionComposition:
             self._enrollment = parse_enrollment(enrollment_bytes(enrollment))
             e = self._enrollment
             _require((profile.profile_mode == 'legacy' and e.schema == SCHEMA)
-                     or (profile.profile_mode == 'disjoint-v3' and e.schema == SCHEMA_V2))
+                     or (profile.profile_mode == 'disjoint-v3' and e.schema in (SCHEMA_V2, SCHEMA_V3)))
             _require(profile.manifest.digest() == e.manifest_digest
                      and profile.manifest.target_id == e.target_id and profile.machine_id == e.machine_id
                      and profile.manifest.driver.implementation_commit == e.release.implementation_commit
                      and profile.manifest.runner_binding.platform == e.release.platform
                      and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id)
-            if e.schema == SCHEMA_V2:
+            if e.schema in (SCHEMA_V2, SCHEMA_V3):
                 recognized = verify_profile_bytes(e.profile_bytes, e.release.launch_profile_digest)
                 _require(recognized.broker_mode is None and recognized.role is None
                          and recognized.command_channel is None and recognized.daemon_policy is not None
@@ -248,8 +250,12 @@ class TrustedQueuedSessionComposition:
                      and Path(repo.path).absolute() == self._database.absolute()
                      and repo.pilot_owner is owner and target.manifest_digest == self._manifest
                      and target.target_id == self._enrollment.target_id)
-            self._audit = OwnedSessionAcceptanceAudit(repo)
             e = self._enrollment
+            if e.schema == SCHEMA_V3:
+                auth = core.state.settings.auth_config
+                _require(auth.human_auth_mode == 'github' and type(auth.beau_github_id) is int
+                         and auth.beau_github_id > 0 and e.operator_actor == 'human:' + str(auth.beau_github_id))
+            self._audit = OwnedSessionAcceptanceAudit(repo)
             # Original source time is preserved and shown; fresh challenge/epoch
             # binding is NOT a new observation of inventory or writer exclusion.
             evidence = (f'Operator-attested source: {e.source}\n'
@@ -294,7 +300,7 @@ def enrollment_bytes(enrollment):
     release = {name: getattr(e.release, name) for name in CurrentExecutorReleasePins.__dataclass_fields__
                if name not in {'public_key', 'platform'}}
     release.update(public_key_hex=e.release.public_key.hex(), platform=e.release.platform.model_dump(mode='json'))
-    _require(e.schema in (SCHEMA, SCHEMA_V2))
+    _require(e.schema in (SCHEMA, SCHEMA_V2, SCHEMA_V3))
     _require((e.profile_bytes is None) if e.schema == SCHEMA else type(e.profile_bytes) is bytes)
     value = {'schema': e.schema, 'release': release,
         'launch': {name: getattr(e.launch, name) for name in CurrentLaunchPins.__dataclass_fields__},
@@ -305,7 +311,7 @@ def enrollment_bytes(enrollment):
             'evidence': e.evidence, 'evidence_sha256': 'sha256:' + hashlib.sha256(e.evidence.encode()).hexdigest(),
             'attestations': {name: getattr(e, name) for name in (
                 'inventory_reconciled', 'writers_excluded', 'unresolved_effects_absent')}}}
-    if e.schema == SCHEMA_V2:
+    if e.schema in (SCHEMA_V2, SCHEMA_V3):
         value.update(profile_mode='disjoint-v3', profile_json=e.profile_bytes.decode('utf-8'))
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
 

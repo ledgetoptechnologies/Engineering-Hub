@@ -137,7 +137,7 @@ def dependencies(monkeypatch):
 def construct(tmp_path, data=None):
     selected = document() if data is None else data
     profile_data = profile_document()
-    if selected.get('schema') == module.SCHEMA_V2:
+    if selected.get('schema') in (module.SCHEMA_V2, module.SCHEMA_V3):
         profile_data.update(schema='engineering-hub.unified-pilot.v2', profile_mode='disjoint-v3')
     profile = parse_profile(encode(profile_data))
     return module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
@@ -532,3 +532,72 @@ def test_disjoint_enrollment_refuses_valid_broker_profile_before_transport(tmp_p
     with pytest.raises(module.TrustedSessionError):
         construct(tmp_path, data)
     assert dependencies.events == []
+
+
+def test_v3_github_actor_roundtrip_is_versioned():
+    data = v2_document(); data.update(schema=module.SCHEMA_V3, operator_actor='human:123')
+    enrollment = module.parse_enrollment(encode(data))
+    assert module.parse_enrollment(module.enrollment_bytes(enrollment)) == enrollment
+    for actor in ('human:0', 'human:0123', 'human:cf:' + 'c' * 64, 'claude'):
+        data['operator_actor'] = actor
+        with pytest.raises(module.TrustedSessionError): module.parse_enrollment(encode(data))
+    data.update(schema=module.SCHEMA_V2, operator_actor='human:123')
+    with pytest.raises(module.TrustedSessionError): module.parse_enrollment(encode(data))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('auth_mode,configured_id,allowed', [
+    ('github', 123, True), ('github', 124, False), ('github', None, False),
+    ('cloudflare_access', None, False),
+])
+async def test_v3_acceptance_is_bound_to_actual_github_allowlist(tmp_path, dependencies, auth_mode, configured_id, allowed):
+    from urllib.parse import parse_qs, urlsplit
+    import httpx
+    data = v2_document(); data.update(schema=module.SCHEMA_V3, operator_actor='human:123')
+    tmp_path.chmod(0o700)
+    composition = construct(tmp_path, data)
+    class GitHub:
+        async def exchange(self, code, verifier):
+            assert code == 'synthetic-code' and verifier
+            return 123
+    with PilotOwner(tmp_path / 'hub.sqlite3', allow_ephemeral_test_storage=True) as owner:
+        try:
+            repo = HubRepository(tmp_path / 'hub.sqlite3', execution_principal='executor:container-pilot', pilot_owner=owner)
+            target = ContainerPilotTarget.from_manifest(parse_profile(encode(profile_document())).manifest)
+            gate = composition.reconciliation_factory(owner, target)
+            workflow = ContainerPilotWorkflow(repo, DistinctContainerClient(), [target], pilot_owner=owner)
+            queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project='engineering-hub')})
+            bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=gate)
+            feed = NativeHubEventFeed(repo.path); runtime = QueuedPilotRuntime(bridge, feed)
+            if auth_mode == 'github':
+                auth = AuthConfig('https://hub.example', 'client', 'secret', configured_id)
+            else:
+                auth = AuthConfig('https://hub.example', human_auth_mode='cloudflare_access',
+                    cloudflare_issuer='https://fixture.cloudflareaccess.com', cloudflare_audience='fixture',
+                    cloudflare_allowed_emails=('beau@example.test',))
+            core = create_app(Settings(repo.path, AuthSettings('h', 'c', claude_token='cl'), auth,
+                staging_machine_id=MACHINE), repository=repo, event_feed=feed, work_queue=queue,
+                queued_pilot_runtime=runtime, github_client=GitHub())
+            if not allowed:
+                with pytest.raises(module.TrustedSessionError):
+                    composition.session_acceptance_factory(core, owner, repo, target, gate)
+                return
+            composition.session_acceptance_factory(core, owner, repo, target, gate)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core), base_url=auth.origin,
+                                         follow_redirects=False) as browser:
+                login = await browser.get('/api/hub/v1/auth/login')
+                assert login.status_code == 302
+                state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+                callback = await browser.get('/api/hub/v1/auth/callback', params={'state': state, 'code': 'synthetic-code'})
+                assert callback.status_code == 303
+                me = (await browser.get('/api/hub/v1/auth/me')).json()
+                assert me['authenticated'] is True and me['actor'] == 'human:123'
+                snapshot = await browser.get('/api/hub/v1/staging/session-reconciliation')
+                assert snapshot.status_code == 200
+                headers = {'Origin': auth.origin, 'X-Hub-CSRF': me['csrf_token']}
+                decision = {'request_id': snapshot.json()['request_id'], 'expected_revision': snapshot.json()['revision'],
+                            'action': 'accept'}
+                response = await browser.post('/api/hub/v1/staging/session-reconciliation', headers=headers, json=decision)
+                assert response.status_code == 200 and gate.admission_state == 'accepted'
+        finally:
+            composition.close()

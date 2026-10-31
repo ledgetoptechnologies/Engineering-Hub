@@ -7,6 +7,27 @@ from fastapi.testclient import TestClient
 from engineering_hub.auth import AuthConfig, SessionStore, build_auth_router, require_human
 
 
+@pytest.mark.parametrize('identity', [True, 0, -1, 2**63, 10**100, '123'])
+def test_github_identity_rejected_before_session_mutation(tmp_path, identity):
+    with pytest.raises(ValueError):
+        AuthConfig('https://hub.example', beau_github_id=identity)
+    store = SessionStore(tmp_path / 'hub.db')
+    original = store.create_session(123)
+    with pytest.raises(ValueError, match='^Invalid GitHub identity$'):
+        store.create_session(identity)
+    assert store.session_for(original['cookie_token'])['github_id'] == 123
+    with store._read_db() as db:
+        assert db.execute('SELECT COUNT(*) FROM auth_sessions').fetchone()[0] == 1
+
+
+def test_maximum_sqlite_github_identity_roundtrips(tmp_path):
+    identity = 2**63 - 1
+    assert AuthConfig('https://hub.example', beau_github_id=identity).beau_github_id == identity
+    store = SessionStore(tmp_path / 'hub.db')
+    session = store.create_session(identity)
+    assert store.session_for(session['cookie_token'])['github_id'] == identity
+
+
 class FakeGitHub:
     def __init__(self, user=123):
         self.user = user

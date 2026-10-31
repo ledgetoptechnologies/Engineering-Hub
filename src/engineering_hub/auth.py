@@ -44,7 +44,8 @@ class AuthConfig:
             raise ValueError("Hub base URL must be an absolute origin")
         if url.scheme != "https" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("Hub base URL requires HTTPS except on loopback")
-        if self.beau_github_id is not None and (type(self.beau_github_id) is not int or self.beau_github_id <= 0):
+        if self.beau_github_id is not None and (type(self.beau_github_id) is not int
+                                               or not 0 < self.beau_github_id < 2**63):
             raise ValueError("Allowlisted GitHub identity must be a positive numeric ID")
         if self.human_auth_mode not in {"github", "cloudflare_access"}:
             raise ValueError("Unknown human authentication mode")
@@ -168,6 +169,10 @@ class SessionStore:
         return row[0] if row and row[1] > self.clock() else None
 
     def create_session(self, github_id: int):
+        # SQLite INTEGER has a signed-64-bit binding range. Validate before any
+        # expired-session cleanup or randomness, including direct store callers.
+        if type(github_id) is not int or not 0 < github_id < 2**63:
+            raise ValueError('Invalid GitHub identity')
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
         with self._db() as db:
             db.execute("DELETE FROM auth_sessions WHERE expires <= ?", (self.clock(),))

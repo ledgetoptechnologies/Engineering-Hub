@@ -95,11 +95,11 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
         if type(document) is not dict or type(document.get('schema_version')) is not int:
             raise ValueError(_ERROR)
         version = document['schema_version']
-        common = ('schema_version', 'base_url', 'cloudflare_access',
+        common = ('schema_version', 'base_url', 'github' if version == 3 else 'cloudflare_access',
                   'agent_allowed_hosts', 'agent_allowed_ips')
         if version == 1:
             _keys(document, common)
-        elif version == 2:
+        elif version in (2, 3):
             _keys(document, (*common, 'storage'))
             _keys(document['storage'], ('layout',))
             if document['storage']['layout'] != 'protected-ledger-v1':
@@ -110,18 +110,32 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
                 raise ValueError(_ERROR)
         else:
             raise ValueError(_ERROR)
-        access = document["cloudflare_access"]
-        _keys(access, ("issuer", "audience", "allowed_emails"))
-        for value in (document["base_url"], access["issuer"], access["audience"]):
-            if type(value) is not str or not value:
+        if version == 3:
+            github = document['github']
+            _keys(github, ('client_id', 'allowed_user_id'))
+            client_id = github['client_id']
+            if (type(client_id) is not str or not 1 <= len(client_id) <= 128
+                    or not client_id.isascii() or not all(c.isalnum() or c in '_-' for c in client_id)
+                    or type(github['allowed_user_id']) is not int
+                    or not 0 < github['allowed_user_id'] < 2**63):
                 raise ValueError(_ERROR)
-        emails = _strings(access["allowed_emails"])
-        auth = AuthConfig(document["base_url"], human_auth_mode="cloudflare_access",
-                          cloudflare_issuer=access["issuer"],
-                          cloudflare_audience=access["audience"],
-                          cloudflare_allowed_emails=emails)
-        if auth.cloudflare_config is None:
-            raise ValueError(_ERROR)
+            auth = AuthConfig(document['base_url'], human_auth_mode='github',
+                              github_client_id=client_id, beau_github_id=github['allowed_user_id'])
+            if not auth.secure:
+                raise ValueError(_ERROR)
+        else:
+            access = document["cloudflare_access"]
+            _keys(access, ("issuer", "audience", "allowed_emails"))
+            for value in (document["base_url"], access["issuer"], access["audience"]):
+                if type(value) is not str or not value:
+                    raise ValueError(_ERROR)
+            emails = _strings(access["allowed_emails"])
+            auth = AuthConfig(document["base_url"], human_auth_mode="cloudflare_access",
+                              cloudflare_issuer=access["issuer"],
+                              cloudflare_audience=access["audience"],
+                              cloudflare_allowed_emails=emails)
+            if auth.cloudflare_config is None:
+                raise ValueError(_ERROR)
         hosts = _strings(document["agent_allowed_hosts"])
         validate_agent_hosts(hosts)
         ips = _strings(document["agent_allowed_ips"])
@@ -130,7 +144,7 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
                 raise ValueError(_ERROR)
         if len(set(ips)) != len(ips):
             raise ValueError(_ERROR)
-        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips), version == 2)
+        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips), version in (2, 3))
     except (OSError, ValueError, TypeError, RecursionError):
         # Do not echo paths, parser fragments, rejected keys, or file contents.
         raise ValueError(_ERROR) from None
