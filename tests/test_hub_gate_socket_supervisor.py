@@ -16,11 +16,13 @@ from engineering_hub import pilot_ownership
 from hub_container_executor import application_gate_enrollment as gate
 from hub_container_executor import launch_supervisor as launch
 from hub_container_executor.broker_seqpacket import _start
+from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
 from hub_container_executor.mount_gate_start_enrollment import REQUEST
 from tests.test_hub_application_mount_gate import pins
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from tests.test_hub_application_gate_enrollment import vector, raw
+from tests.test_executor_launch_profile import gate_profile
 from tests.test_hub_container_executor_launch_supervisor import short_root
 
 
@@ -30,12 +32,16 @@ def socket_rig(short_root, monkeypatch):
     monkeypatch.setattr(pilot_ownership, '_local_filesystem', lambda _: None)
     short_root.chmod(0o711)
     private = short_root / 'private'; private.mkdir(mode=0o700)
-    directory = short_root / 'gate'; directory.mkdir(mode=0o711)
+    fixture_root = short_root / 'hub-pilot-fixture'; fixture_root.mkdir(mode=0o711)
+    directory = fixture_root / 'gate-control'; directory.mkdir(mode=0o711)
     manifest, image, supervisor, data = vector()
+    supervisor.profile = ExecutorLaunchProfile.model_validate(gate_profile(str(fixture_root)))
+    supervisor.release = replace(supervisor.release, launch_profile_digest=supervisor.profile.digest())
     image = replace(image, image_config={'config': {'Entrypoint': list(gate.STATIC_ENTRYPOINT), 'Cmd': []}})
     signer = Ed25519PrivateKey.generate()
     data.update(schema=gate.SOCKET_SCHEMA, socket_source_directory=str(directory),
-                consumer_host_uid=10001, consumer_host_gid=10001,
+                consumer_host_uid=110001, consumer_host_gid=110001,
+                supervisor_profile_digest=supervisor.profile.digest(),
                 controller_public_key=signer.public_key().public_bytes(
                     serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex())
     path = private / 'policy'; path.write_bytes(raw(data)); path.chmod(0o600)
@@ -44,7 +50,7 @@ def socket_rig(short_root, monkeypatch):
         serialization.PrivateFormat.Raw, serialization.NoEncryption())); signing_key.chmod(0o600)
     supervisor._pid, supervisor._mutex = os.getpid(), threading.Lock()
     supervisor._enrollment_path, supervisor._key_path = private / 'supervisor', private / 'key'
-    supervisor._mounts = {}
+    supervisor._mounts = {mount.role: mount for mount in supervisor.profile.mounts}
     supervisor._journal = launch._Journal(str(private / 'journal'), create=True, gate_mode=True, start_mode=True)
     supervisor._launch_id = str(uuid4())
     record = {'fixture': True}
@@ -52,6 +58,7 @@ def socket_rig(short_root, monkeypatch):
     supervisor._journal.reserve(supervisor._launch_id, record)
     supervisor._journal.state(supervisor._launch_id, 'running', record)
     supervisor._validate_live = lambda _: None  # Synthetic executor liveness, not a host claim.
+    supervisor._handoff_manifest_digest = lambda: manifest.digest()
     held = []; supervisor._hold = lambda: held.append(True)
     supervisor._gate_listener = supervisor._gate_parent = None
     supervisor._gate_directory = supervisor._gate_socket_identity = supervisor._gate_enrollment = None
@@ -82,7 +89,7 @@ def test_listener_rejects_wrong_kernel_peer_and_never_reaccepts(socket_rig):
     assert supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2) == str(directory)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
-        client.connect(str(directory / 'controller.sock'))  # root, not enrolled UID 10001
+        client.connect(str(directory / 'controller.sock'))  # root, not enrolled UID 110001
         with pytest.raises(launch.LaunchSupervisorError):
             supervisor.accept_gate_channel(manifest=manifest, image=image, enrollment_file=path,
                 host_pid=os.getpid(), process_start_ticks=_start(os.getpid()), timeout_seconds=1)
@@ -92,6 +99,14 @@ def test_listener_rejects_wrong_kernel_peer_and_never_reaccepts(socket_rig):
                 host_pid=os.getpid(), process_start_ticks=_start(os.getpid()), timeout_seconds=1)
     finally:
         client.close()
+
+
+def test_policy_manifest_must_match_committed_runner_before_bind(socket_rig):
+    supervisor, manifest, image, path, directory, held = socket_rig
+    supervisor._handoff_manifest_digest = lambda: 'sha256:' + '9' * 64
+    with pytest.raises(launch.LaunchSupervisorError):
+        supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2)
+    assert held and not (directory / 'controller.sock').exists()
 
 
 def test_replaced_socket_is_rejected_without_removing_replacement(socket_rig):
@@ -115,7 +130,7 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
     if child == 0:
         try:
             os.close(ready_read); os.close(release_write)
-            os.setgid(10001); os.setuid(10001)
+            os.setgid(110001); os.setuid(110001)
             client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             client.connect(str(directory / 'controller.sock'))
             request = json.dumps({'protocol': REQUEST, 'nonce': expected['nonce']}, sort_keys=True,
@@ -139,8 +154,10 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
             if str(self) == f'/proc/{child}/status':
                 text = '\n'.join(('NSpid:\t' + str(child) + '\t1') if line.startswith('NSpid:')
                                  else line for line in text.splitlines()) + '\n'
+            elif str(self) in {f'/proc/{child}/uid_map', f'/proc/{child}/gid_map'}:
+                text = '0 10002 1\n1 100001 65536\n'
             return text
-        # Actual credential/pidfd and UID maps are real; NSpid=1 is synthetic.
+        # Actual credentials and pidfd are real; NSpid and uid/gid maps are synthetic.
         monkeypatch.setattr(Path, 'read_text', synthetic_nspid)
         checks = []
         def verify_live(_deadline):
@@ -156,7 +173,7 @@ def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch,
             return
         channel, peer = supervisor.accept_gate_channel(manifest=manifest, image=image, enrollment_file=path,
             host_pid=child, process_start_ticks=ticks, timeout_seconds=2)
-        assert peer.pid == child and peer.uid == peer.gid == 10001
+        assert peer.pid == child and peer.uid == peer.gid == 110001
         expected.update(host_pid=child, process_start_ticks=ticks, manifest_digest=manifest.digest(),
             image_config_id=image.image_config_id, runnable_digest=image.runnable_reference,
             platform_manifest_digest=image.platform_manifest_digest, implementation_commit=image.source_commit)

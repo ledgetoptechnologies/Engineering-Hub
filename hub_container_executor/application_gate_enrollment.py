@@ -142,7 +142,23 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
                 raise ValueError()
             protected_paths = [supervisor._enrollment_path, supervisor._key_path,
                                supervisor._journal.path]
-            protected_paths.extend(_path(mount.source) for mount in supervisor._mounts.values())
+            gate_mount = supervisor._mounts.get('gate_channel_directory')
+            if (supervisor.profile.gate_channel != 'protected-socket-v1' or gate_mount is None
+                    or gate_mount.source != source_directory or gate_mount.target != source_directory):
+                raise ValueError()
+            policy = supervisor.profile.daemon_policy
+            if policy is None:
+                raise ValueError()
+            def translated(rows):
+                matches = [outside + 10001 - inside for inside, outside, length in rows
+                           if inside <= 10001 < inside + length]
+                if len(matches) != 1:
+                    raise ValueError()
+                return matches[0]
+            if translated(policy.uid_map) != uid or translated(policy.gid_map) != gid:
+                raise ValueError()
+            protected_paths.extend(_path(mount.source) for role, mount in supervisor._mounts.items()
+                                   if role != 'gate_channel_directory')
             if any(source == other or source in other.parents or other in source.parents
                    for other in protected_paths):
                 raise ValueError()

@@ -34,6 +34,36 @@ def policy(**changes):
             'held_ranges_digest': 'sha256:' + 'a' * 64, **changes}
 
 
+def gate_profile(root='/operator/hub-pilot-synthetic'):
+    data = profile(root, daemon_policy=policy(), gate_channel='protected-socket-v1')
+    source = root + '/gate-control'
+    data['mounts'].append(dict(role='gate_channel_directory', source=source, target=source,
+        kind='directory', read_only=True, uid=0, gid=0, mode=0o711, content_digest=None))
+    return data
+
+
+def test_gate_profile_is_explicit_and_preserves_legacy_digest():
+    legacy = profile()
+    assert core.ExecutorLaunchProfile.model_validate(legacy).digest() == digest_of(core.canonical(legacy))
+    gate = gate_profile()
+    parsed = core.ExecutorLaunchProfile.model_validate(gate)
+    assert parsed.gate_channel == 'protected-socket-v1'
+    assert parsed.digest() == digest_of(core.canonical(gate))
+    assert parsed.digest() != core.ExecutorLaunchProfile.model_validate(legacy).digest()
+
+
+@pytest.mark.parametrize('change', ['missing_mode', 'writable', 'wrong_owner', 'alias', 'missing_policy', 'extra_mount'])
+def test_gate_profile_denies_unbound_mount(change):
+    data = gate_profile(); mount = data['mounts'][-1]
+    if change == 'missing_mode': data.pop('gate_channel')
+    if change == 'writable': mount['read_only'] = False
+    if change == 'wrong_owner': mount['uid'] = 10001
+    if change == 'alias': mount['target'] = '/run/hub-gate'
+    if change == 'missing_policy': data.pop('daemon_policy')
+    if change == 'extra_mount': data['mounts'].append(dict(mount))
+    with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(data)
+
+
 def digest_of(raw):
     return 'sha256:' + hashlib.sha256(raw).hexdigest()
 

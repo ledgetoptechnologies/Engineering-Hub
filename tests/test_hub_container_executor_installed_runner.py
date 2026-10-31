@@ -68,6 +68,31 @@ def pair_configuration():
     return data
 
 
+def test_gate_v3_config_is_closed_and_source_changes_commitment():
+    from hub_container_executor.configuration_commitment import configuration_commitment
+    data = configuration(); data['schema'] = module.GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.gate_socket_directory == '/fixture/gate-control' and parsed.pair is None
+    first = configuration_commitment(canonical(data)).content_digest
+    data['gate_socket_directory'] = '/fixture/other-gate'
+    assert configuration_commitment(canonical(data)).content_digest != first
+    data['gate_socket_directory'] = '/fixture/secrets/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+
+
+@pytest.mark.asyncio
+async def test_gate_v3_dispatch_denied_before_identity_or_provider_effects(monkeypatch):
+    data = configuration(); data['schema'] = module.GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    config = module.parse_configuration(canonical(data))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    def forbidden(*_args, **_kwargs): pytest.fail('v3 entered provider or issuer')
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', forbidden)
+    monkeypatch.setattr(module, 'local_host_adapter_resources', forbidden)
+    with pytest.raises(module.InstalledRunnerError): await module.run_installed_executor(config)
+
+
 def test_pair_configuration_has_only_independent_authority_and_peer_pins():
     data = pair_configuration()
     parsed = module.parse_configuration(canonical(data))

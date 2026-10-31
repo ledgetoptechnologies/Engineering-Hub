@@ -94,7 +94,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
         journal_database, journal_create, record_root, metadata_root,
         baseline_receipt_root, secret_root, secret_bindings, build_enrollments,
         baseline_receipt_digest, baseline_runtime_profile_digest, frozen_backup,
-        reservation_root, state_reservations_create, driver_identity_verifier):
+        reservation_root, state_reservations_create, driver_identity_verifier,
+        gate_socket_directory=None, gate_mount_verifier=None):
     """Yield one freshly constructed exact HostAdapter with concrete providers.
 
     All directories must already exist, be canonical and pairwise nonnested;
@@ -151,6 +152,17 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
             secret_root=secret_root, frozen_backup=frozen_backup,
             reservation_root=reservation_root,
         )
+        if gate_socket_directory is not None:
+            from .gate_mount_observation import GateMountVerifier
+            if (type(gate_mount_verifier) is not GateMountVerifier
+                    or gate_mount_verifier.source_directory != gate_socket_directory):
+                raise LocalResourcesError('Authenticated gate authority required')
+            gate = _path(gate_socket_directory, directory=True)
+            if (any(_overlap(gate, root) for root in roots)
+                    or _overlap(gate, backup) or _overlap(gate, _path(binding.unix_socket_path))):
+                raise LocalResourcesError('Separate gate directory required')
+        elif gate_mount_verifier is not None:
+            raise LocalResourcesError('Unexpected gate authority')
         verifier = OperatorEnrolledBuildVerifier(enrollments=build_enrollments)
         with ExitStack() as resources:
             records = PrivateContentStore(roots[2], maximum_bytes=65536)
@@ -184,13 +196,18 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
             resources.callback(state.close)
             journal = SQLiteOperationJournal(journal_path, create=journal_create)
             resources.callback(journal.close)
-            backend = DockerEngineBackend(binding, operation_journal=journal)
+            backend_options = ({'gate_mount_verifier': gate_mount_verifier}
+                               if gate_mount_verifier is not None else {})
+            adapter_options = ({'gate_socket_directory': gate_socket_directory}
+                               if gate_socket_directory is not None else {})
+            backend = DockerEngineBackend(binding, operation_journal=journal, **backend_options)
             resources.callback(backend.close)
             adapter = HostAdapter(
                 adapter_path, manifest, record_store=records, metadata_store=metadata,
                 provenance_verifier=verifier, backend=backend,
                 baseline_provider=baseline, state_provisioner=state,
                 secret_resolver=secrets, driver_identity_verifier=driver_identity_verifier,
+                **adapter_options,
             )
             resources.callback(adapter.close)
             yield adapter

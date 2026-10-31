@@ -92,10 +92,10 @@ class ExecutorLaunchMount(_Closed):
 
     @model_validator(mode='after')
     def closed_role(self):
-        _require(self.role in _TARGETS or self.role == 'broker_socket')
+        _require(self.role in _TARGETS or self.role in {'broker_socket', 'gate_channel_directory'})
         if self.role == 'broker_socket':
             _require(self.target == _BROKER_SOCKET_TARGET)
-        elif self.role == 'generations':
+        elif self.role in {'generations', 'gate_channel_directory'}:
             # Engine bind sources are resolved in the daemon's host namespace;
             # the executor must see this exact absolute path, not an alias.
             _require(self.target == self.source)
@@ -114,6 +114,8 @@ class ExecutorLaunchMount(_Closed):
             _require(self.uid == 0 and self.mode == 0o660)
         if self.role == 'broker_socket':
             _require(self.uid == 0 and self.gid > 0 and self.mode == 0o660)
+        if self.role == 'gate_channel_directory':
+            _require(self.uid == 0 and self.gid == 0 and self.mode == 0o711 and self.read_only is True)
         return self
 
 
@@ -220,6 +222,8 @@ class ExecutorLaunchProfile(_Closed):
     # Signed opt-in: commands arrive on a descriptor handed over at launch
     # instead of a path socket. The supervisor refuses it until implemented.
     command_channel: Literal['inherited-seqpacket-v1'] | None = None
+    # Explicit new profile only; absent preserves every legacy profile digest.
+    gate_channel: Literal['protected-socket-v1'] | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -232,7 +236,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -259,10 +263,14 @@ class ExecutorLaunchProfile(_Closed):
             roles = set(_TARGETS)
         else:
             roles = (set(_TARGETS) - {'engine_socket', 'generations'}) | {'broker_socket'}
+        if self.gate_channel is not None:
+            _require(not coordinator and self.broker_mode is None and self.command_channel is None
+                     and self.daemon_policy is not None)
+            roles.add('gate_channel_directory')
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
-                         if item.role not in {'generations', 'broker_socket'}))
+                         if item.role not in {'generations', 'broker_socket', 'gate_channel_directory'}))
         if self.broker_mode is not None or self.command_channel is not None or coordinator:
             _require(self.daemon_policy is not None)
         if coordinator:
@@ -290,7 +298,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel'):
             if value[name] is None:
                 del value[name]
         return value

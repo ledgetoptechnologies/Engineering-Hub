@@ -27,6 +27,7 @@ from .runtime_identity import MAX_RECEIPT_BYTES, RuntimeIdentityError
 
 REQUEST_PROTOCOL = "engineering-hub.executor-launch-request.v1"
 CURRENT_REQUEST_PROTOCOL = "engineering-hub.executor-current-observation-request.v1"
+GATE_MOUNT_REQUEST_PROTOCOL = "engineering-hub.executor-gate-mount-observation-request.v1"
 MAX_REQUEST_BYTES = 256
 _NONCE = re.compile(r"[0-9a-f]{64}\Z")
 _LENGTH = struct.Struct("!I")
@@ -448,6 +449,12 @@ class UnixCurrentObservationTransport:
             raise RuntimeIdentityError('Current launch issuer exchange unavailable') from None
 
     def observe_current_launch(self, *, nonce, timeout_ms):
+        return self._observe(nonce=nonce, timeout_ms=timeout_ms, protocol=CURRENT_REQUEST_PROTOCOL)
+
+    def observe_gate_mount(self, *, nonce, timeout_ms):
+        return self._observe(nonce=nonce, timeout_ms=timeout_ms, protocol=GATE_MOUNT_REQUEST_PROTOCOL)
+
+    def _observe(self, *, nonce, timeout_ms, protocol):
         admitted = False
         try:
             _require(os.getpid() == self._pid)
@@ -463,7 +470,7 @@ class UnixCurrentObservationTransport:
                 self._busy = admitted = True
             finally:
                 self._lock.release()
-            request = _canonical({'protocol': CURRENT_REQUEST_PROTOCOL, 'nonce': nonce})
+            request = _canonical({'protocol': protocol, 'nonce': nonce})
             _require(0 < len(request) <= MAX_REQUEST_BYTES)
             identity = _socket_leaf(self._path)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:

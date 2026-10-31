@@ -11,7 +11,7 @@ import json
 from .backend import EffectiveProfile
 
 
-def derive_runtime_profile(manifest, defaults, generation_id, secrets):
+def derive_runtime_profile(manifest, defaults, generation_id, secrets, *, gate_socket_directory=None):
     runtime = manifest.runtime
     environment = {}
     for item in defaults.environment:
@@ -23,6 +23,12 @@ def derive_runtime_profile(manifest, defaults, generation_id, secrets):
     tmp = runtime.tmpfs.tmp
     # Manifest digits 1777 describe octal permissions, not decimal chmod bits.
     tmp_mode = int(str(tmp.mode), 8)
+    mounts = (('state_generation', runtime.state_mount.container_destination,
+               runtime.state_mount.mode, generation_id),
+              ('tmpfs', '/tmp', 'rw', f'size={tmp.size_bytes}',
+               f'mode={tmp_mode:o}', 'noexec', 'nosuid'))
+    if gate_socket_directory is not None:
+        mounts += (('gate_channel_directory', '/run/hub-gate', 'ro', gate_socket_directory),)
     return EffectiveProfile(
         uid=runtime.user.uid, gid=runtime.user.gid,
         supplementary_groups=tuple(runtime.user.supplementary_groups),
@@ -35,10 +41,7 @@ def derive_runtime_profile(manifest, defaults, generation_id, secrets):
         cpu_millicores=runtime.resources.cpu_millicores,
         pids_limit=runtime.resources.pids_limit,
         tmpfs=(('/tmp', tmp.size_bytes, tmp_mode, tmp.noexec, tmp.nosuid),),
-        mounts=(('state_generation', runtime.state_mount.container_destination,
-                 runtime.state_mount.mode, generation_id),
-                ('tmpfs', '/tmp', 'rw', f'size={tmp.size_bytes}',
-                 f'mode={tmp_mode:o}', 'noexec', 'nosuid')),
+        mounts=mounts,
         state_destination=runtime.state_mount.container_destination,
         state_mode=runtime.state_mount.mode, state_generation_id=generation_id,
         environment=tuple(sorted(environment.items())),

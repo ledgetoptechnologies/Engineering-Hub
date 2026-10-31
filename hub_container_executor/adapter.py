@@ -75,9 +75,15 @@ class HostAdapter:
                  provenance_verifier: TrustedBuildVerifier | None = None,
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
-                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None):
+                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
+                 gate_socket_directory: str | None = None):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
+        if gate_socket_directory is not None:
+            from .daemon_backend import DockerEngineBackend
+            if (type(backend) is not DockerEngineBackend or backend._gate_mount_verifier is None
+                    or backend._gate_mount_verifier.source_directory != gate_socket_directory):
+                raise ValueError('authenticated gate mount authority required')
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
         self.manifest_digest = self.manifest.digest()
@@ -89,6 +95,7 @@ class HostAdapter:
         self.state_provisioner = state_provisioner
         self.secret_resolver = secret_resolver
         self.driver_identity_verifier = driver_identity_verifier
+        self.gate_socket_directory = gate_socket_directory
         self._owner_pid = os.getpid()
         self._lifecycle = threading.Condition()
         self._active_operations = 0
@@ -207,6 +214,10 @@ class HostAdapter:
         image = self._verified_image(role)
         self._check_runner(deadline)
         defaults = self._image_defaults(image, deadline)
+        if self.gate_socket_directory is not None:
+            from .application_gate_enrollment import STATIC_ENTRYPOINT
+            if defaults.entrypoint != STATIC_ENTRYPOINT or defaults.command != ():
+                raise _Held('image_unavailable')
         secrets = self._resolve_secrets()
 
         if request.action in {"deploy_container", "rollback_container"}:
@@ -358,8 +369,9 @@ class HostAdapter:
         return result
 
     def _profile(self, image: VerifiedImage, defaults: ImageDefaults, generation_id: str,
-                 secrets: dict[str, str]) -> EffectiveProfile:
-        return derive_runtime_profile(self.manifest, defaults, generation_id, secrets)
+                 secrets: dict[str, str], *, gate=True) -> EffectiveProfile:
+        return derive_runtime_profile(self.manifest, defaults, generation_id, secrets,
+            gate_socket_directory=getattr(self, 'gate_socket_directory', None) if gate else None)
 
     def _get_baseline(self) -> BaselineIdentity:
         try:
@@ -386,7 +398,7 @@ class HostAdapter:
 
     def _verify_baseline_container(self, baseline: BaselineIdentity, image: VerifiedImage,
                                    defaults: ImageDefaults, secrets: dict[str, str], deadline: float):
-        profile = self._profile(image, defaults, baseline.state_generation_id, secrets)
+        profile = self._profile(image, defaults, baseline.state_generation_id, secrets, gate=False)
         self._inspect_container(baseline.container_id, image, profile,
                                 baseline.state_generation_id, {"running"}, deadline)
 

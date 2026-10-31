@@ -48,6 +48,7 @@ from .configuration_commitment import configuration_commitment, coordinator_conf
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
+GATE_MOUNT_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-mount-observation-request.v1'
 _TARGETS = LAUNCH_TARGETS
 
 
@@ -679,6 +680,7 @@ class LaunchSupervisor:
         self._gate_start_thread = None
         self._gate_listener = self._gate_parent = None
         self._gate_directory = self._gate_socket_identity = self._gate_enrollment = None
+        self._gate_manifest = self._gate_image = self._gate_policy_path = None
         self._gate_accepted_channel = self._gate_accepted_peer = None
         self._gate_accept_used = False
         self._journal = self._engine = self._consumer = self._listener = None
@@ -722,6 +724,7 @@ class LaunchSupervisor:
             # Refuse before journal creation, socket binding or Engine access.
             _require(self.profile.broker_mode is None and self.profile.role is None
                      and self.profile.command_channel is None)
+            _require(self.profile.gate_channel is None or gate_start_mode)
             image = dict(data['image'])
             _require(set(image) == set(VerifiedImage.__dataclass_fields__))
             image['platform'] = Platform.model_validate(image['platform'])
@@ -1199,6 +1202,9 @@ class LaunchSupervisor:
         # profile cannot authorize that different entrypoint behavior.
         _require((parsed.pair is not None) ==
                  (self.profile.command_channel == 'inherited-seqpacket-v1'))
+        _require((parsed.gate_socket_directory is not None) == (self.profile.gate_channel is not None))
+        if parsed.gate_socket_directory is not None:
+            _require(self._mounts['gate_channel_directory'].source == parsed.gate_socket_directory)
         return parsed
 
     def _handoff_manifest_digest(self):
@@ -1258,7 +1264,8 @@ class LaunchSupervisor:
             self._validate_live(deadline)
             enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=self)
-            _require(enrolled.schema == SOCKET_SCHEMA)
+            _require(enrolled.schema == SOCKET_SCHEMA
+                     and self._handoff_manifest_digest() == enrolled.manifest_digest)
             directory = _path(enrolled.socket_source_directory)
             path = directory / 'controller.sock'
             parent = _root_parent(path, private=False)
@@ -1292,6 +1299,7 @@ class LaunchSupervisor:
                      and current.st_gid == enrolled.consumer_host_gid and stat.S_IMODE(current.st_mode) == 0o660)
             listener.listen(1)
             self._gate_enrollment = enrolled
+            self._gate_manifest, self._gate_image, self._gate_policy_path = manifest, image, enrollment_file
             self._validate_live(deadline)
             _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=self) == enrolled)
@@ -1658,6 +1666,50 @@ class LaunchSupervisor:
             self._hold()
             raise LaunchSupervisorError() from None
 
+    def _observe_gate_mount_locked(self, nonce, deadline):
+        """Fresh signed gate-mount facts from this retained supervisor session."""
+        from .application_gate_enrollment import load_application_gate_enrollment
+        from .gate_mount_observation import DOMAIN, PROTOCOL
+        try:
+            self._guard()
+            _require(self._receipt_served and not self._issuance_open and self._gate_enrollment is not None)
+            deadline = min(deadline, self._expires)
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(self._gate_policy_path, manifest=self._gate_manifest,
+                image=self._gate_image, supervisor=self)
+            _require(enrolled == self._gate_enrollment)
+            self._gate_socket_check(enrolled)
+            directory = os.fstat(self._gate_parent)
+            endpoint = os.stat('controller.sock', dir_fd=self._gate_parent, follow_symlinks=False)
+            now = int(time.time() * 1000)
+            _require(type(self._approval_expires_at_ms) is int and 0 < now < self._approval_expires_at_ms)
+            expires = min(now + min(5000, int(_remaining(self._expires) * 1000)), self._approval_expires_at_ms)
+            _require(now < expires)
+            payload = {'protocol': PROTOCOL, 'nonce': nonce, 'launch_id': self._launch_id,
+                'boot_id': self._consumer.boot, 'authenticated_host_pid': self._consumer.pid,
+                'process_start_ticks': self._consumer.start, 'container_id': self._container_id,
+                'manifest_digest': enrolled.manifest_digest, 'launch_profile_digest': self.release.launch_profile_digest,
+                'socket_source_directory': enrolled.socket_source_directory,
+                'policy_digest': 'sha256:' + enrolled.identity[1],
+                'directory_device': directory.st_dev, 'directory_inode': directory.st_ino,
+                'socket_device': endpoint.st_dev, 'socket_inode': endpoint.st_ino,
+                'role': enrolled.role, 'runnable_digest': enrolled.runnable_digest,
+                'platform_manifest_digest': enrolled.platform_manifest_digest,
+                'image_config_id': enrolled.image_config_id, 'source_commit': enrolled.source_commit,
+                'bootstrap_digest': enrolled.bootstrap_digest, 'issued_at_ms': now, 'expires_at_ms': expires}
+            raw = _canonical({'payload': payload, 'signature': self._signer.sign(DOMAIN + _canonical(payload)).hex()})
+            _require(len(raw) <= 8192)
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(self._gate_policy_path, manifest=self._gate_manifest,
+                image=self._gate_image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
+            _require(int(time.time() * 1000) < expires)
+            _remaining(deadline)
+            return raw
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+
     def observe_current_launch(self, *, nonce, timeout_ms):
         """Fresh signed current identity; no create/start/stop or approval renewal.
 
@@ -1703,7 +1755,7 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == CURRENT_REQUEST_PROTOCOL
+                         and request['protocol'] in (CURRENT_REQUEST_PROTOCOL, GATE_MOUNT_REQUEST_PROTOCOL)
                          and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
@@ -1716,7 +1768,9 @@ class LaunchSupervisor:
                     peer.close()
                 raise
             try:
-                raw = self._observe_current_launch_locked(request['nonce'], deadline)
+                raw = (self._observe_gate_mount_locked(request['nonce'], deadline)
+                       if request['protocol'] == GATE_MOUNT_REQUEST_PROTOCOL
+                       else self._observe_current_launch_locked(request['nonce'], deadline))
                 # A disconnected requester is not proof of a broken launch.
                 try:
                     peer.settimeout(_remaining(deadline))

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from functools import partial
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
@@ -32,11 +32,13 @@ from .runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVe
 from .service import serve_owned_host_executor_unix
 from .broker_seqpacket import PeerAccount
 from .broker_service import BrokerCleanupReport, serve_owned_inherited_broker
+from .gate_mount_observation import GateMountVerifier
 from engineering_hub.server import _signal_stop
 
 
 SCHEMA = 'engineering-hub.installed-executor.v1'
 PAIR_SCHEMA = 'engineering-hub.installed-executor.v2'
+GATE_SCHEMA = 'engineering-hub.installed-executor.v3'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -114,6 +116,7 @@ class RunnerConfiguration:
     bearer_slot: tuple
     process_id: int
     pair: object = None
+    gate_socket_directory: str | None = None
 
 
 def parse_configuration(raw):
@@ -133,8 +136,9 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA))
-        _object(value, _ROOT_FIELDS | ({'pair'} if value['schema'] == PAIR_SCHEMA else set()))
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA))
+        extra = {'pair'} if value['schema'] == PAIR_SCHEMA else {'gate_socket_directory'} if value['schema'] == GATE_SCHEMA else set()
+        _object(value, _ROOT_FIELDS | extra)
         _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         binding_data = dict(_object(value['docker_binding'], DockerEngineBinding.__dataclass_fields__))
@@ -203,6 +207,14 @@ def parse_configuration(raw):
                  and socket_path != transport['socket_path']
                  and socket_path != binding.unix_socket_path)
         pair = None
+        gate_directory = None
+        if value['schema'] == GATE_SCHEMA:
+            gate_directory = _path(value['gate_socket_directory'])
+            gate = PurePosixPath(gate_directory)
+            others = [PurePosixPath(resources[name]) for name in _RESOURCE_PATHS]
+            others.extend((PurePosixPath(binding.unix_socket_path), PurePosixPath(binding.generation_root),
+                           PurePosixPath(transport['socket_path']), PurePosixPath(socket_path)))
+            _require(all(gate != other and gate not in other.parents and other not in gate.parents for other in others))
         if value['schema'] == PAIR_SCHEMA:
             pair = dict(_object(value['pair'], {'authority_public_key_hex', 'peer_uid', 'peer_gid'}))
             key = pair.pop('authority_public_key_hex')
@@ -217,7 +229,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid(), pair)
+            socket_path, bearer_slot, os.getpid(), pair, gate_directory)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -270,6 +282,9 @@ async def run_installed_executor(config):
     try:
         _process()
         _require(type(config) is RunnerConfiguration and config.process_id == os.getpid())
+        # Until the supervisor supplies a fresh authenticated gate-mount
+        # observation, v3 configuration is parseable but cannot start effects.
+        _require(config.gate_socket_directory is None)
         with ExitStack() as owned:
             if config.pair is not None:
                 stop, report = asyncio.Event(), BrokerCleanupReport()
@@ -317,11 +332,20 @@ async def run_installed_executor(config):
                      == config.manifest.driver.implementation_commit)
             observations = UnixCurrentObservationTransport(**config.transport)
             owned.callback(observations.close)
+            gate_options = {}
+            if config.gate_socket_directory is not None:
+                gate_verifier = GateMountVerifier(release=config.release, launch_verifier=verifier,
+                    transport=observations, manifest_digest=config.manifest.digest(),
+                    source_directory=config.gate_socket_directory)
+                owned.callback(gate_verifier.close)
+                gate_options = {'gate_socket_directory': config.gate_socket_directory,
+                                'gate_mount_verifier': gate_verifier}
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)
             factory = partial(local_host_adapter_resources, manifest=config.manifest,
-                binding=config.binding, **config.resources, driver_identity_verifier=verifier)
+                binding=config.binding, **config.resources, driver_identity_verifier=verifier,
+                **gate_options)
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
                 socket_path=config.socket_path, current_observation_transport=observations,

@@ -223,6 +223,19 @@ class LaunchReceiptIdentityVerifier:
         except Exception:
             raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
 
+    def launch_binding(self):
+        """Return immutable fields from the original verified live receipt."""
+        try:
+            _require(os.getpid() == self._pid)
+            with self._lock:
+                now = time.monotonic()
+                _require(os.getpid() == self._pid and not self._closed and math.isfinite(now)
+                         and self._not_before <= now < self._deadline)
+                return tuple(self._receipt[name] for name in (
+                    'launch_id', 'boot_id', 'authenticated_host_pid', 'process_start_ticks', 'container_id'))
+        except Exception:
+            raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
+
     def close(self):
         """Revoke this verifier only; never close or call the caller's transport."""
         _require(os.getpid() == self._pid)

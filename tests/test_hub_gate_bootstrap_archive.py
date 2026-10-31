@@ -12,9 +12,11 @@ import pytest
 
 from hub_container_executor import application_gate_enrollment as gate
 from hub_container_executor.backend import ImageDefaults
+from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
 from hub_container_executor.daemon_backend import DaemonBackendError, DockerEngineBackend, _static_gate_archive
 from tests.test_hub_application_gate_enrollment import raw, vector
 from tests.test_hub_container_executor_daemon_backend import binding, container_inspect, make_profile, safe_generation
+from tests.test_executor_launch_profile import gate_profile
 
 
 def elf(*, machine=62, segment=1):
@@ -63,12 +65,15 @@ def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp
     image = replace(image, image_config={'config': {'Entrypoint': list(gate.STATIC_ENTRYPOINT), 'Cmd': [], 'Env': []}})
     policy.update(schema=gate.STATIC_SCHEMA, bootstrap_digest=digest(binary))
     if fault == 'v3':
-        policy.update(schema=gate.SOCKET_SCHEMA, socket_source_directory='/operator/gate-channel',
+        supervisor.profile = ExecutorLaunchProfile.model_validate(gate_profile())
+        supervisor.release = replace(supervisor.release, launch_profile_digest=supervisor.profile.digest())
+        policy.update(schema=gate.SOCKET_SCHEMA, socket_source_directory='/operator/hub-pilot-synthetic/gate-control',
+                      supervisor_profile_digest=supervisor.profile.digest(),
                       consumer_host_uid=110001, consumer_host_gid=110001)
         supervisor._enrollment_path = Path('/operator/protected/enrollment')
         supervisor._key_path = Path('/operator/protected/key')
         supervisor._journal = SimpleNamespace(path=Path('/operator/protected/journal'))
-        supervisor._mounts = {}
+        supervisor._mounts = {mount.role: mount for mount in supervisor.profile.mounts}
     if fault == 'old_schema': policy['schema'] = 'engineering-hub.application-gate-enrollment.v1'
     def root_file(*_):
         if fault == 'missing_enrollment': raise FileNotFoundError()
