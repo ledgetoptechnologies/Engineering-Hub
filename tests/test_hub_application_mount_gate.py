@@ -209,4 +209,3 @@ def test_received_rights_are_closed_and_channel_is_cloexec(tmp_path, monkeypatch
         assert len(os.listdir('/proc/self/fd')) == baseline
     finally:
         thread.join(5); client.close(); server.close(); os.close(read_fd); os.close(write_fd)
-
