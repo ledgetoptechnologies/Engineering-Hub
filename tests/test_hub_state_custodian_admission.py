@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import fcntl
 import multiprocessing
 import socket
 import sqlite3
@@ -17,10 +18,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hub_container_executor.state_custodian_admission import (
-    CustodianAdmissionError, CustodianAdmissionJournal, DOMAIN, PROTOCOL, _canonical,
+    CustodianAdmissionError, CustodianAdmissionJournal, DOMAIN, HOLD_DOMAIN, PROTOCOL, _canonical,
 )
 import hub_container_executor.state_custodian_admission as admission_module
 from hub_container_executor.launch_supervisor import _boot_id, _proc_start
+from hub_container_executor.state_custodian_observation import verify_held_observation, HeldObservationError
 
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='requires synthetic root-owned enrollment')
 
@@ -160,6 +162,26 @@ def test_legacy_enrollment_never_enables_ownership_on_reopen(tmp_path):
         journal.close()
 
 
+@pytest.mark.parametrize('condition', ['wal_header', 'dangling_sidecar'])
+def test_read_only_reopen_rejects_wal_and_sidecars_without_mutation(tmp_path, condition):
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    digest = 'sha256:' + 'a' * 64
+    path = tmp_path / 'journal.sqlite'; enrollment = tmp_path / 'enrollment.json'
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(path), 'supervisor_public_key': public,
+        'manifest_digest': digest, 'source_backup_digest': digest, 'provider_key_digest': digest,
+        'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
+    journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=True); journal.close()
+    if condition == 'wal_header':
+        db = sqlite3.connect(path); assert db.execute('PRAGMA journal_mode=WAL').fetchone() == ('wal',); db.close()
+    else:
+        os.symlink('missing', str(path) + '-wal')
+    before = hashlib.sha256(path.read_bytes()).digest(); names = set(os.listdir(tmp_path))
+    with pytest.raises(CustodianAdmissionError):
+        CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=False, read_only=True)
+    assert hashlib.sha256(path.read_bytes()).digest() == before and set(os.listdir(tmp_path)) == names
+
+
 def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
@@ -194,9 +216,14 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
     digest = 'sha256:' + 'a' * 64
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    provider_key = Ed25519PrivateKey.generate()
+    provider_raw = provider_key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    provider_public = provider_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    provider_digest = 'sha256:' + hashlib.sha256(provider_public).hexdigest()
+    provider_path = tmp_path / 'provider.key'; provider_path.write_bytes(provider_raw); provider_path.chmod(0o600)
     enrollment = tmp_path / 'enrollment.json'
     enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(tmp_path / 'journal.sqlite'), 'supervisor_public_key': public, 'manifest_digest': digest,
-        'source_backup_digest': backup_digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001}))
+        'source_backup_digest': backup_digest, 'provider_key_digest': provider_digest, 'provider_uid': 10001, 'provider_gid': 10001}))
     enrollment.chmod(0o600)
     copy_policy = tmp_path / 'copy.json'
     copy_policy.write_bytes(_canonical({'schema': 1, 'source': str(source), 'source_digest': backup_digest,
@@ -206,7 +233,7 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
     payload = {'protocol': PROTOCOL, 'operation_id': str(uuid4()), 'command_id': str(uuid4()),
         'run_id': str(uuid4()), 'target_id': 'engineering-hub:staging', 'fencing_generation': 1,
         'manifest_digest': digest, 'role': 'candidate', 'source_backup_digest': backup_digest,
-        'provider_key_digest': digest, 'nonce': 'c' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
+        'provider_key_digest': provider_digest, 'nonce': 'c' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
     journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=True)
     try:
         token = journal.reserve(payload, key.sign(DOMAIN + _canonical(payload)))
@@ -278,6 +305,82 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, unc
                 assert prepared['state'] == 'private_owner_prepared'
         assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
         assert (stage / (payload['operation_id'] + '.ownership-intent')).exists()
+        start_wall = time.time_ns() // 1_000_000; start_mono = time.monotonic()
+        observed = journal.observe_held(target_id=payload['target_id'], nonce='4' * 64,
+            owner_policy_path=owner_policy, copy_policy_path=copy_policy, provider_key_path=provider_path, timeout_seconds=3)
+        provider_key.public_key().verify(bytes.fromhex(observed['signature']), HOLD_DOMAIN + _canonical(observed['payload']))
+        assert observed['payload']['operation_id'] == payload['operation_id']
+        assert observed['payload']['quiescence'] == 'unknown' and observed['payload']['marker_present'] is True
+        assert observed['payload']['run_id'] == payload['run_id'] and observed['payload']['manifest_digest'] == digest
+        info = output.stat()
+        expected = {'target_id': payload['target_id'], 'operation_id': payload['operation_id'], 'run_id': payload['run_id'],
+                    'manifest_digest': digest, 'admission_digest': token, 'fencing_generation': payload['fencing_generation'],
+                    'device': info.st_dev, 'inode': info.st_ino, 'host_uid': 10002, 'host_gid': 10002,
+                    'owner_policy_digest': hashlib.sha256(owner_policy.read_bytes()).hexdigest()}
+        assert verify_held_observation(_canonical(observed), provider_public_key=provider_public, nonce='4' * 64,
+            expected=expected, start_wall_ms=start_wall, start_monotonic=start_mono)['quiescence'] == 'unknown'
+        with pytest.raises(HeldObservationError):
+            verify_held_observation(_canonical(observed), provider_public_key=provider_public, nonce='5' * 64,
+                expected=expected, start_wall_ms=start_wall, start_monotonic=start_mono)
+        with pytest.raises(HeldObservationError):
+            verify_held_observation(_canonical(observed), provider_public_key=provider_public, nonce='4' * 64,
+                expected=dict(expected, fencing_generation=True), start_wall_ms=start_wall, start_monotonic=start_mono)
+        installed = os.environ.get('EH_INSTALLED_EXECUTOR_PATH')
+        if installed:
+            cli_enrollment = tmp_path / 'inspect.json'
+            cli_enrollment.write_bytes(_canonical({'schema': 1, 'journal_enrollment': str(enrollment),
+                'journal_path': str(tmp_path / 'journal.sqlite'), 'owner_policy': str(owner_policy),
+                'copy_policy': str(copy_policy), 'provider_key_path': str(provider_path),
+                'provider_public_key': provider_public.hex(), 'expected': expected})); cli_enrollment.chmod(0o600)
+            journal.close()
+            before = hashlib.sha256((tmp_path / 'journal.sqlite').read_bytes()).digest()
+            before_names = set(os.listdir(tmp_path))
+            invoke = ("import runpy,sys; sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)]; "
+                "import hub_container_executor; assert hub_container_executor.__file__.startswith(sys.path[0]); "
+                "runpy.run_module('hub_container_executor.state_custodian_inspect',run_name='__main__')")
+            result = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src',
+                '--enrollment', str(cli_enrollment)], capture_output=True, text=True, timeout=8, cwd='/',
+                env={'LANG': 'C.UTF-8'})
+            assert result.returncode == 0 and result.stderr == ''
+            assert json.loads(result.stdout) == {'status': 'held', 'quiescence': 'unknown',
+                'operation_id': payload['operation_id'], 'fencing_generation': 1, 'marker_present': True}
+            assert provider_raw.hex() not in result.stdout and provider_raw.hex() not in result.stderr
+            assert hashlib.sha256((tmp_path / 'journal.sqlite').read_bytes()).digest() == before
+            assert set(os.listdir(tmp_path)) == before_names
+            invalid = json.loads(cli_enrollment.read_bytes())
+            invalid['expected']['fencing_generation'] += 1
+            bad_enrollment = tmp_path / 'inspect-invalid.json'
+            bad_enrollment.write_bytes(_canonical(invalid)); bad_enrollment.chmod(0o600)
+            rejected = subprocess.run([sys.executable, '-I', '-c', invoke, installed, '/src/src',
+                '--enrollment', str(bad_enrollment)], capture_output=True, text=True, timeout=8, cwd='/',
+                env={'LANG': 'C.UTF-8'})
+            assert rejected.returncode == 2 and rejected.stdout == ''
+            assert rejected.stderr == 'Custodian hold inspection unavailable\n'
+            assert hashlib.sha256((tmp_path / 'journal.sqlite').read_bytes()).digest() == before
+            read_only = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite',
+                                                  create=False, read_only=True)
+            try:
+                assert fcntl.fcntl(read_only._fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+                assert read_only._db.execute('PRAGMA query_only').fetchone() == (1,)
+                with pytest.raises(sqlite3.OperationalError):
+                    read_only._db.execute('DELETE FROM custody_holds')
+                with pytest.raises(CustodianAdmissionError):
+                    read_only.reserve(payload, key.sign(DOMAIN + _canonical(payload)))
+            finally:
+                read_only.close()
+            journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=False)
+        other_key = tmp_path / 'other.key'; other_key.write_bytes(os.urandom(32)); other_key.chmod(0o600)
+        with pytest.raises(CustodianAdmissionError):
+            journal.observe_held(target_id=payload['target_id'], nonce='4' * 64, owner_policy_path=owner_policy,
+                copy_policy_path=copy_policy, provider_key_path=other_key, timeout_seconds=3)
+        with pytest.raises(CustodianAdmissionError):
+            journal.observe_held(target_id=payload['target_id'], nonce='bad', owner_policy_path=owner_policy,
+                copy_policy_path=copy_policy, provider_key_path=provider_path, timeout_seconds=3)
+        journal._db.execute('UPDATE custody_holds SET fence=fence+1')
+        with pytest.raises(CustodianAdmissionError):
+            journal.observe_held(target_id=payload['target_id'], nonce='4' * 64, owner_policy_path=owner_policy,
+                copy_policy_path=copy_policy, provider_key_path=provider_path, timeout_seconds=3)
+        journal._db.execute('UPDATE custody_holds SET fence=fence-1')
         denied = subprocess.run([sys.executable, '-c', 'import sys; open(sys.argv[1], "rb")', str(output)],
             user=10002, group=10002, extra_groups=(), env={'LANG': 'C.UTF-8'}, cwd='/',
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)

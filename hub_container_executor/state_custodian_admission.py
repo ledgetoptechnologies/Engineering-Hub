@@ -22,11 +22,14 @@ import stat
 import time
 from uuid import UUID
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from .launch_supervisor import _canonical, _root_file, _root_parent, _path, _Process, _boot_id, _mapped_id
 
 PROTOCOL = 'engineering-hub.state-custodian-admission.v1'
 DOMAIN = b'engineering-hub.state-custodian-admission.v1\x00'
+HOLD_OBSERVATION = 'engineering-hub.state-custodian-held-observation.v1'
+HOLD_DOMAIN = b'engineering-hub.state-custodian-held-observation.v1\x00'
 FIELDS = frozenset({'protocol', 'operation_id', 'command_id', 'run_id', 'target_id',
                     'fencing_generation', 'manifest_digest', 'role', 'source_backup_digest',
                     'provider_key_digest', 'nonce', 'issued_at_ms', 'expires_at_ms'})
@@ -71,15 +74,16 @@ class CustodianAdmissionJournal:
     claimed. This module can copy a backup into root-private quarantine; it
     provides no network listener, ownership handoff or application publication.
     """
-    def __init__(self, *, enrollment_path, journal_path, create):
+    def __init__(self, *, enrollment_path, journal_path, create, read_only=False):
         self._fd = None
         self._db = None
         self._pid = os.getpid()
         self._fresh = {}
         self._staged = {}
         try:
-            if os.geteuid() != 0 or type(create) is not bool:
+            if os.geteuid() != 0 or type(create) is not bool or type(read_only) is not bool or (create and read_only):
                 raise ValueError()
+            self._read_only = read_only
             enrollment_path, journal_path = Path(enrollment_path), Path(journal_path)
             raw, self._enrollment_pin = _root_file(enrollment_path, 4096)
             policy = json.loads(raw)
@@ -98,7 +102,7 @@ class CustodianAdmissionJournal:
             self._key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(policy['supervisor_public_key']))
             parent = _root_parent(journal_path, private=True)
             try:
-                flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_CREAT | os.O_EXCL if create else 0)
+                flags = (os.O_RDONLY if read_only else os.O_RDWR) | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_CREAT | os.O_EXCL if create else 0)
                 self._fd = os.open(journal_path.name, flags, 0o600, dir_fd=parent)
                 info = os.fstat(self._fd)
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
@@ -115,7 +119,11 @@ class CustodianAdmissionJournal:
             self._journal_pin = (info.st_dev, info.st_ino)
             if any(os.path.lexists(str(journal_path) + suffix) for suffix in ('-journal', '-wal', '-shm')):
                 raise ValueError()
-            self._db = sqlite3.connect(str(journal_path), timeout=2, isolation_level=None)
+            if read_only:
+                header = os.pread(self._fd, 20, 0)
+                if header[:16] != b'SQLite format 3\x00' or header[18:20] != b'\x01\x01': raise ValueError()
+            self._db = sqlite3.connect(journal_path.as_uri() + '?mode=ro' if read_only else str(journal_path),
+                                       timeout=2, isolation_level=None, uri=read_only)
             self._holds_supported = create and policy['schema'] == 2
             if not create:
                 objects = self._db.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
@@ -133,8 +141,12 @@ class CustodianAdmissionJournal:
                     if (len(holds) != 2 or any(row[2] != 1 or row[3] not in ('pk', 'u') or row[4] != 0 for row in holds)
                             or {tuple(item[2] for item in self._db.execute('PRAGMA index_info(' + repr(row[1]) + ')'))
                                 for row in holds} != {('target_id',), ('operation_id',)}): raise ValueError()
-            self._db.execute('PRAGMA journal_mode=DELETE')
-            self._db.execute('PRAGMA synchronous=FULL')
+            if read_only:
+                if self._db.execute('PRAGMA journal_mode').fetchone() != ('delete',): raise ValueError()
+                self._db.execute('PRAGMA query_only=ON')
+            else:
+                self._db.execute('PRAGMA journal_mode=DELETE')
+                self._db.execute('PRAGMA synchronous=FULL')
             if create:
                 self._db.execute(_SCHEMA)
                 self._db.execute(_HOLD_SCHEMA)
@@ -158,6 +170,7 @@ class CustodianAdmissionJournal:
         try:
             started = time.monotonic()
             self._check()
+            if self._read_only: raise ValueError()
             if type(payload) is not dict or set(payload) != FIELDS or type(signature) is not bytes or len(signature) != 64:
                 raise ValueError()
             payload = json.loads(_canonical(payload))
@@ -218,6 +231,7 @@ class CustodianAdmissionJournal:
         source_fd = output_fd = source_parent = stage_fd = None
         try:
             self._check()
+            if self._read_only: raise ValueError()
             if (type(operation_id) is not str or str(UUID(operation_id)) != operation_id
                     or type(admission_digest) is not str or not _HEX.fullmatch(admission_digest)
                     or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 120):
@@ -383,6 +397,7 @@ class CustodianAdmissionJournal:
         peer = None
         try:
             self._check()
+            if self._read_only: raise ValueError()
             if type(operation_id) is not str or type(admission_digest) is not str or not self._holds_supported: raise ValueError()
             saved = self._staged.pop(operation_id, None)
             if saved is None or saved[0] != admission_digest: raise ValueError()
@@ -489,6 +504,117 @@ class CustodianAdmissionJournal:
                 except OSError: failed = True
             if failed: raise CustodianAdmissionError() from None
 
+    def observe_held(self, *, target_id, nonce, owner_policy_path, copy_policy_path, provider_key_path, timeout_seconds):
+        """Sign a read-only held observation; it never establishes quiescence.
+
+        The provider key is independently root-enrolled. This verifies the
+        original signed admission, hold, policy and private inode but cannot
+        prove absence of external daemon/app writers or authorize a release.
+        """
+        stage_fd = file_fd = None
+        try:
+            self._check()
+            if (not self._holds_supported or target_id != 'engineering-hub:staging'
+                    or type(nonce) is not str or not _HEX.fullmatch(nonce)
+                    or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 5):
+                raise ValueError()
+            started = time.monotonic(); wall_start = time.time_ns() // 1_000_000
+            deadline = started + timeout_seconds
+            owner_path, copy_path, key_path = map(lambda p: _path(str(p)),
+                                                  (owner_policy_path, copy_policy_path, provider_key_path))
+            owner_raw, owner_pin = _root_file(owner_path, 16384)
+            copy_raw, copy_pin = _root_file(copy_path, 4096)
+            key_raw, key_pin = _root_file(key_path, 32)
+            if len(key_raw) != 32: raise ValueError()
+            signer = Ed25519PrivateKey.from_private_bytes(key_raw)
+            public = signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            if 'sha256:' + hashlib.sha256(public).hexdigest() != self._policy['provider_key_digest']: raise ValueError()
+            copy = json.loads(copy_raw)
+            if (type(copy) is not dict or _canonical(copy) != copy_raw
+                    or copy.get('source_digest') != self._policy['source_backup_digest']
+                    or type(copy.get('staging_directory')) is not str): raise ValueError()
+            stage = _path(copy['staging_directory'])
+            stage_fd = _root_parent(stage / 'entry', private=True)
+            fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._db.execute('BEGIN' if self._read_only else 'BEGIN IMMEDIATE')
+            try:
+                hold = self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (target_id,)).fetchone()
+                if hold is None or len(hold) != 9 or hold[8] != owner_pin[1]: raise ValueError()
+                row = self._db.execute('SELECT payload,signature FROM admissions WHERE operation_id=?', (hold[1],)).fetchone()
+                if row is None or hashlib.sha256(row[0]).hexdigest() != hold[2]: raise ValueError()
+                self._key.verify(row[1], DOMAIN + row[0])
+                admission = json.loads(row[0])
+                if (type(admission) is not dict or set(admission) != FIELDS or _canonical(admission) != row[0]
+                        or admission.get('target_id') != target_id or admission.get('operation_id') != hold[1]
+                        or admission.get('manifest_digest') != self._policy['manifest_digest']
+                        or admission.get('fencing_generation') != hold[3]): raise ValueError()
+                name = hold[1] + '.quarantine'
+                file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
+                info = os.fstat(file_fd); named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                        or (info.st_dev, info.st_ino) != (hold[4], hold[5])
+                        or (named.st_dev, named.st_ino) != (hold[4], hold[5])
+                        or (info.st_uid, info.st_gid) not in ((0, 0), (hold[6], hold[7]))): raise ValueError()
+                marker_name = hold[1] + '.ownership-intent'
+                marker_present = os.path.lexists(str(stage / marker_name))
+                if marker_present:
+                    marker_fd = os.open(marker_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
+                    try:
+                        marker_info = os.fstat(marker_fd)
+                        marker_raw = os.read(marker_fd, 4097)
+                        marker = json.loads(marker_raw)
+                        if (not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != 0 or marker_info.st_nlink != 1
+                                or stat.S_IMODE(marker_info.st_mode) != 0o600 or len(marker_raw) > 4096
+                                or type(marker) is not dict or set(marker) != {'operation_id', 'admission_digest', 'device', 'inode', 'host_uid', 'host_gid', 'size', 'digest'}
+                                or any(type(marker[k]) is not int for k in ('device', 'inode', 'host_uid', 'host_gid', 'size'))
+                                or _canonical(marker) != marker_raw or marker.get('operation_id') != hold[1]
+                                or marker.get('admission_digest') != hold[2]
+                                or (marker.get('device'), marker.get('inode')) != (hold[4], hold[5])
+                                or (marker.get('host_uid'), marker.get('host_gid')) != (hold[6], hold[7])
+                                or marker['size'] != info.st_size or marker['digest'] != admission['source_backup_digest']): raise ValueError()
+                    finally:
+                        os.close(marker_fd)
+                self._check()
+                if (_root_file(owner_path, 16384)[1] != owner_pin or _root_file(copy_path, 4096)[1] != copy_pin
+                        or _root_file(key_path, 32)[1] != key_pin
+                        or self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (target_id,)).fetchone() != hold):
+                    raise ValueError()
+                now = time.time_ns() // 1_000_000; elapsed = time.monotonic() - started
+                if not 0 <= elapsed < timeout_seconds or now < wall_start: raise ValueError()
+                payload = {'protocol': HOLD_OBSERVATION, 'nonce': nonce, 'target_id': target_id,
+                    'operation_id': hold[1], 'run_id': admission['run_id'], 'manifest_digest': admission['manifest_digest'],
+                    'admission_digest': hold[2], 'fencing_generation': hold[3],
+                    'device': hold[4], 'inode': hold[5], 'host_uid': hold[6], 'host_gid': hold[7],
+                    'owner_policy_digest': hold[8], 'marker_present': marker_present, 'quiescence': 'unknown',
+                    'issued_at_ms': now, 'expires_at_ms': now + min(5000, max(1, int((timeout_seconds - elapsed) * 1000)))}
+                signature = signer.sign(HOLD_DOMAIN + _canonical(payload)).hex()
+                end_info = os.fstat(file_fd)
+                if (not now <= time.time_ns() // 1_000_000 < payload['expires_at_ms']
+                        or not 0 <= time.monotonic() - started < timeout_seconds
+                        or self._db.execute('SELECT * FROM custody_holds WHERE target_id=?', (target_id,)).fetchone() != hold
+                        or (end_info.st_dev, end_info.st_ino, end_info.st_mode, end_info.st_uid, end_info.st_gid, end_info.st_nlink, end_info.st_size, end_info.st_mtime_ns, end_info.st_ctime_ns)
+                           != (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                        or (os.stat(name, dir_fd=stage_fd, follow_symlinks=False).st_dev,
+                            os.stat(name, dir_fd=stage_fd, follow_symlinks=False).st_ino) != (hold[4], hold[5])):
+                    raise ValueError()
+                self._db.execute('ROLLBACK')
+                self._check()
+                if (not now <= time.time_ns() // 1_000_000 < payload['expires_at_ms']
+                        or not 0 <= time.monotonic() - started < timeout_seconds): raise ValueError()
+                return {'payload': payload, 'signature': signature}
+            except BaseException:
+                if self._db.in_transaction: self._db.execute('ROLLBACK')
+                raise
+        except Exception:
+            raise CustodianAdmissionError() from None
+        finally:
+            failed = False
+            for fd in (file_fd, stage_fd):
+                if fd is not None:
+                    try: os.close(fd)
+                    except OSError: failed = True
+            if failed: raise CustodianAdmissionError() from None
+
     def exchange(self, channel, *, operation_id, timeout_seconds, provider_uid, provider_gid):
         """Request and reserve one observation on an owned connected seqpacket.
 
@@ -498,7 +624,7 @@ class CustodianAdmissionJournal:
         """
         child = None
         try:
-            if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
+            if (self._read_only or type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
                     or type(operation_id) is not str or str(UUID(operation_id)) != operation_id
                     or not os.path.isabs(sys.executable)

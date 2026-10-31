@@ -6,6 +6,25 @@ perform effects. The disposable prototype measured an actual bind mount and
 blocked a synthetic effect on mismatch; it did not establish this contract's
 authority, isolation, recovery or delivery guarantees.
 
+An explicit source-level hold inspection command is available for an installed
+executor package: `python -m hub_container_executor.state_custodian_inspect --enrollment /absolute/root-private/inspection.json`.
+The enrollment is a
+root-owned mode-0600 canonical JSON file beneath a root-owned mode-0700 parent.
+It contains `schema: 1`, absolute `journal_enrollment`, `journal_path`,
+`owner_policy`, `copy_policy`, and `provider_key_path` paths, an independently
+enrolled 32-byte `provider_public_key` as lowercase hex, and an `expected`
+object with `target_id`, `operation_id`, `run_id`, `manifest_digest`,
+`admission_digest`, `fencing_generation`, `device`, `inode`, `host_uid`,
+`host_gid` and `owner_policy_digest`. These pins must be
+obtained independently; do not copy unverified report values into the config.
+The command uses the protected provider signing key and emits only verified
+held metadata. It reports quiescence as unknown and cannot release the hold.
+It opens the journal read-only, refuses SQLite sidecars or WAL mode, and must
+obtain the journal's exclusive owner lock; it is unavailable while a cooperating
+owner is active and is not a concurrent health check. Root, the host and the
+protected enrollment remain trusted. This source command has not been deployed
+or accepted on the staging host.
+
 The current pilot requires the verified image's default entrypoint and command
 (`container_pilot_manifest.py`, `daemon_backend.py`). Docker's create/inspect
 response describes configured mount paths and flags; it does not prove the inode
