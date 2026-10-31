@@ -152,6 +152,16 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
             check()
             return max(1, min(manifest.timeouts.inspect_ms, int((deadline_monotonic-time.monotonic())*1000)))
         check()
+        # Refuse a reused later-stage ID before creating any container. This
+        # is a preflight under the fixture's exclusive-operator assumption;
+        # each journal begin remains the authoritative one-shot reservation.
+        operation_ids = (create_id, start_id, observe_id) + (
+            (preflight_probe_id, stop_id, restart_id) if quiescent else ())
+        for operation_id in operation_ids:
+            check()
+            if backend.operation_journal.inspect(operation_id) is not None:
+                raise RuntimeError('Baseline operation identity already used')
+            check()
         _preflight_snapshot(generation_root, source_generation_id, frozen_leaf, maximum_bytes, deadline_monotonic,
                             initialize_empty=initialize_empty)
         check()

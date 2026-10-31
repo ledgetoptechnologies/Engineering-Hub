@@ -16,6 +16,7 @@ from hub_container_executor.operation_journal import SQLiteOperationJournal
 
 def args(monkeypatch):
     monkeypatch.setattr(b.os,'getuid',lambda:10001); monkeypatch.setattr(b.os,'getgid',lambda:10001)
+    monkeypatch.setattr(SQLiteOperationJournal,'inspect',lambda self, operation_id:None)
     backend=object.__new__(DockerEngineBackend); backend.operation_journal=object.__new__(SQLiteOperationJournal)
     backend.binding=types.SimpleNamespace(generation_root='/owned/generations')
     return dict(owner_database='/owned/hub.sqlite3',backend=backend,
@@ -41,6 +42,30 @@ def test_duplicate_operation_denied_before_owner(monkeypatch):
     a=args(monkeypatch); a['start_id']=a['create_id']
     monkeypatch.setattr(b,'PilotOwner',lambda *x,**y:pytest.fail('owner opened'))
     with pytest.raises(ValueError): b.bootstrap_baseline(**a)
+
+
+@pytest.mark.parametrize('used', ['create_id', 'start_id', 'observe_id',
+                                  'preflight_probe_id', 'stop_id', 'restart_id'])
+def test_used_operation_denied_before_snapshot_or_docker(monkeypatch, used):
+    a=args(monkeypatch)
+    a.update(quiescent=True, preflight_probe_id='6f665c4c-98d7-4715-b909-645411bc30f7',
+             stop_id='d80c95ff-ec54-4bf9-85bf-69e15f589010',
+             restart_id='24a60394-13b0-4d4c-a61f-152629e7c1a5')
+    visited=[]; closed=[]
+    class Owner:
+        def __init__(self,*args,**kwargs): pass
+        def assert_active(self,*args): pass
+        def close(self): closed.append(True)
+    monkeypatch.setattr(b,'PilotOwner',Owner)
+    def inspect(self, operation_id):
+        visited.append(operation_id)
+        return object() if operation_id == a[used] else None
+    monkeypatch.setattr(SQLiteOperationJournal,'inspect',inspect)
+    monkeypatch.setattr(b,'_preflight_snapshot',lambda *a,**k:pytest.fail('snapshot preflight reached'))
+    monkeypatch.setattr(DockerEngineBackend,'create_container',lambda *a,**k:pytest.fail('Docker create reached'))
+    with pytest.raises(RuntimeError, match='identity already used'):
+        b.bootstrap_baseline(**a)
+    assert a[used] in visited and closed == [True]
 
 def test_final_manifest_preserves_aliases_and_updates_only_backup():
     manifest=PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode())
