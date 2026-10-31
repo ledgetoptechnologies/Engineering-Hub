@@ -865,7 +865,7 @@ class LaunchSupervisor:
             # nor are coordinator pair launch and inherited-channel handoff.
             # Refuse before journal creation, socket binding or Engine access.
             _require(self.profile.broker_mode is None and self.profile.role is None
-                     and self.profile.command_channel is None)
+                     and self.profile.command_channel is None and self.profile.generation_isolation is None)
             _require(self.profile.gate_channel is None or gate_start_mode)
             image = dict(data['image'])
             _require(set(image) == set(VerifiedImage.__dataclass_fields__))

@@ -41,6 +41,7 @@ SCHEMA = 'engineering-hub.installed-executor.v1'
 PAIR_SCHEMA = 'engineering-hub.installed-executor.v2'
 GATE_SCHEMA = 'engineering-hub.installed-executor.v3'
 GATE_LEDGER_SCHEMA = 'engineering-hub.installed-executor.v5'
+BASELINE_GATE_SCHEMA = 'engineering-hub.installed-executor.v6'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -125,6 +126,7 @@ class RunnerConfiguration:
     pair: object = None
     gate_socket_directory: str | None = None
     gate_ledger_channel: bool = False
+    baseline_gate: object = None
 
 
 def parse_configuration(raw):
@@ -144,8 +146,10 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA, GATE_LEDGER_SCHEMA))
-        extra = {'pair'} if value['schema'] == PAIR_SCHEMA else {'gate_socket_directory'} if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA) else set()
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA, GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA))
+        extra = ({'pair'} if value['schema'] == PAIR_SCHEMA else
+                 {'gate_socket_directory', 'baseline_gate'} if value['schema'] == BASELINE_GATE_SCHEMA else
+                 {'gate_socket_directory'} if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA) else set())
         _object(value, _ROOT_FIELDS | extra)
         _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
@@ -216,13 +220,43 @@ def parse_configuration(raw):
                  and socket_path != binding.unix_socket_path)
         pair = None
         gate_directory = None
-        if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA):
+        if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA):
             gate_directory = _path(value['gate_socket_directory'])
             gate = PurePosixPath(gate_directory)
             others = [PurePosixPath(resources[name]) for name in _RESOURCE_PATHS]
             others.extend((PurePosixPath(binding.unix_socket_path), PurePosixPath(binding.generation_root),
                            PurePosixPath(transport['socket_path']), PurePosixPath(socket_path)))
             _require(all(gate != other and gate not in other.parents and other not in gate.parents for other in others))
+        baseline_gate = None
+        if value['schema'] == BASELINE_GATE_SCHEMA:
+            baseline_gate = dict(_object(value['baseline_gate'], {'issuer_id', 'issuer_public_key_hex',
+                'receipt_public_key_hex', 'socket_source_directory', 'launch_transport'}))
+            for name in ('issuer_public_key_hex', 'receipt_public_key_hex'):
+                _require(type(baseline_gate[name]) is str and _HEX_KEY.fullmatch(baseline_gate[name])
+                         and baseline_gate[name] != '0' * 64)
+            baseline_release = ExecutorReleaseEnrollment(issuer_id=baseline_gate['issuer_id'],
+                public_key=bytes.fromhex(baseline_gate['issuer_public_key_hex']),
+                implementation_commit=release.implementation_commit, runnable_digest=release.runnable_digest,
+                platform_manifest_digest=release.platform_manifest_digest, image_config_id=release.image_config_id,
+                platform=release.platform, launch_profile_digest=release.launch_profile_digest)
+            baseline_transport = dict(_object(baseline_gate['launch_transport'],
+                {'socket_path', 'expected_issuer_uid', 'expected_issuer_gid'}))
+            _path(baseline_transport['socket_path'])
+            _require(len(os.fsencode(baseline_transport['socket_path'])) < 108)
+            for name in ('expected_issuer_uid', 'expected_issuer_gid'):
+                _integer(baseline_transport[name], 0, 2**32 - 2)
+            _require(not any(ord(c) < 32 or ord(c) == 127 for c in baseline_gate['socket_source_directory']))
+            baseline_dir = PurePosixPath(_path(baseline_gate['socket_source_directory']))
+            others = [PurePosixPath(resources[name]) for name in _RESOURCE_PATHS]
+            others.extend((PurePosixPath(binding.unix_socket_path), PurePosixPath(binding.generation_root),
+                           PurePosixPath(transport['socket_path']), PurePosixPath(socket_path), gate,
+                           PurePosixPath(baseline_transport['socket_path'])))
+            _require(all(baseline_dir != other and baseline_dir not in other.parents
+                         and other not in baseline_dir.parents for other in others))
+            _require(baseline_transport['socket_path'] not in (transport['socket_path'], socket_path, binding.unix_socket_path))
+            baseline_gate = MappingProxyType({'release': baseline_release,
+                'public_key': bytes.fromhex(baseline_gate['receipt_public_key_hex']),
+                'source_directory': str(baseline_dir), 'transport': MappingProxyType(baseline_transport)})
         if value['schema'] == PAIR_SCHEMA:
             pair = dict(_object(value['pair'], {'authority_public_key_hex', 'peer_uid', 'peer_gid'}))
             key = pair.pop('authority_public_key_hex')
@@ -237,7 +271,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid(), pair, gate_directory, value['schema'] == GATE_LEDGER_SCHEMA)
+            socket_path, bearer_slot, os.getpid(), pair, gate_directory, value['schema'] in (GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA), baseline_gate)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -348,6 +382,21 @@ async def run_installed_executor(config):
                 owned.callback(gate_verifier.close)
                 gate_options = {'gate_socket_directory': config.gate_socket_directory,
                                 'gate_mount_verifier': gate_verifier}
+            if config.baseline_gate is not None:
+                baseline_transport = UnixLaunchReceiptTransport(**config.baseline_gate['transport'])
+                owned.callback(baseline_transport.close)
+                baseline_launch = LaunchReceiptIdentityVerifier(enrollment=config.baseline_gate['release'],
+                    issuer_transport=baseline_transport, max_receipt_lifetime_seconds=config.lifetime_seconds,
+                    exchange_timeout_ms=config.timeout_ms)
+                owned.callback(baseline_launch.close)
+                baseline_observations = UnixCurrentObservationTransport(**config.baseline_gate['transport'])
+                owned.callback(baseline_observations.close)
+                baseline_mount = GateMountVerifier(release=config.baseline_gate['release'],
+                    launch_verifier=baseline_launch, transport=baseline_observations,
+                    manifest_digest=config.manifest.digest(), source_directory=config.baseline_gate['source_directory'])
+                owned.callback(baseline_mount.close)
+                gate_options.update(baseline_gate_public_key=config.baseline_gate['public_key'],
+                                    baseline_gate_mount_verifier=baseline_mount)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)

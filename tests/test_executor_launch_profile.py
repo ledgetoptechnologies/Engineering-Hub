@@ -65,6 +65,28 @@ def test_gate_completion_policy_is_explicit_and_bound_to_profile():
     with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(data)
 
 
+def test_generation_isolation_is_signed_and_rejects_overlapping_accounts():
+    data = gate_profile()
+    data['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+    data['gate_ledger_channel'] = 'supervisor-listener-v1'
+    old = core.ExecutorLaunchProfile.model_validate(data).digest()
+    data['generation_isolation'] = dict(kind='separate-provider-v1', app_uid=10002,
+        app_gid=10002, provider_host_uid=200000, provider_host_gid=200000,
+        provider_public_key='1' * 64)
+    parsed = core.ExecutorLaunchProfile.model_validate(data)
+    assert parsed.digest() != old
+    assert parsed.digest() == digest_of(core.canonical(data))
+    for key, value in [('app_uid', 10001), ('app_gid', 10001),
+                       ('provider_host_uid', 110001), ('provider_host_gid', 110001),
+                       ('provider_public_key', '0' * 64)]:
+        invalid = dict(data, generation_isolation=dict(data['generation_isolation'], **{key: value}))
+        with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(invalid)
+    with pytest.raises(Exception):
+        core.ExecutorLaunchProfile.model_validate(dict(data, generation_isolation=None))
+
+
 @pytest.mark.parametrize('change', ['missing_mode', 'writable', 'wrong_owner', 'alias', 'missing_policy', 'extra_mount'])
 def test_gate_profile_denies_unbound_mount(change):
     data = gate_profile(); mount = data['mounts'][-1]

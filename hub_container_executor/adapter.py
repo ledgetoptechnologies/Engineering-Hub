@@ -440,10 +440,13 @@ class HostAdapter:
         if (backend is None or backend.source_directory != baseline.gate_socket_directory):
             raise _Held('recovery_required')
         try:
+            authority = backend.verify_authority(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
             observed_defaults = backend.inspect_image(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
             if observed_defaults != defaults:
                 raise ValueError()
             actual = backend.inspect_container(baseline.container_id, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+            if backend.verify_authority(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms)) != authority:
+                raise ValueError()
         except Exception:
             raise _Held('daemon_unavailable') from None
         self._timeout(deadline, self.manifest.timeouts.inspect_ms)

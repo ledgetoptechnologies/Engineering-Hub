@@ -1797,6 +1797,31 @@ def test_broker_profile_refused_before_journal_or_engine_access(short_root, root
         assert not Path(kwargs['journal_file']).exists()
 
 
+def test_generation_isolation_refused_before_journal_socket_or_engine(short_root, root_journal, monkeypatch):
+    from tests.test_executor_launch_profile import gate_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = gate_profile()
+        data['profile']['gate_completion'] = {
+            'candidate_executable_digest': 'sha256:' + 'a' * 64,
+            'rollback_executable_digest': 'sha256:' + 'b' * 64,
+            'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+        data['profile']['gate_ledger_channel'] = 'supervisor-listener-v1'
+        data['profile']['generation_isolation'] = {
+            'kind': 'separate-provider-v1', 'app_uid': 10002, 'app_gid': 10002,
+            'provider_host_uid': 200000, 'provider_host_gid': 200000,
+            'provider_public_key': '1' * 64}
+        parsed = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = parsed.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        bind_calls = []
+        monkeypatch.setattr(socket.socket, 'bind', lambda *args: bind_calls.append(args))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs, gate_start_mode=True)
+        assert bind_calls == []
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()
+
+
 @pytest.mark.parametrize('variant', ['coordinator', 'command_channel'])
 def test_coordinator_and_inherited_channel_profiles_refused_before_journal_or_engine_access(
         short_root, root_journal, variant):

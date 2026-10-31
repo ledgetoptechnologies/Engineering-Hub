@@ -210,6 +210,26 @@ class GateCompletionPolicy(_Closed):
         return self
 
 
+class GenerationIsolationPolicy(_Closed):
+    """Enrolled identities only; it does not prove custody or provision state."""
+    kind: Literal['separate-provider-v1']
+    app_uid: int
+    app_gid: int
+    provider_host_uid: int
+    provider_host_gid: int
+    provider_public_key: str
+
+    @model_validator(mode='after')
+    def closed_identities(self):
+        _require(all(type(value) is int and 0 < value < 2**32 - 1 for value in
+                     (self.app_uid, self.app_gid, self.provider_host_uid, self.provider_host_gid))
+                 and self.app_uid != _EXECUTOR_ID and self.app_gid != _EXECUTOR_ID
+                 and type(self.provider_public_key) is str
+                 and re.fullmatch(r'[0-9a-f]{64}', self.provider_public_key)
+                 and self.provider_public_key != '0' * 64)
+        return self
+
+
 class ExecutorLaunchProfile(_Closed):
     """Exact independently enrolled executor or pilot-coordinator profile, NOT an app profile."""
     user: str
@@ -239,6 +259,7 @@ class ExecutorLaunchProfile(_Closed):
     gate_channel: Literal['protected-socket-v1'] | None = None
     gate_completion: GateCompletionPolicy | None = None
     gate_ledger_channel: Literal['supervisor-listener-v1'] | None = None
+    generation_isolation: GenerationIsolationPolicy | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -251,7 +272,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -286,6 +307,13 @@ class ExecutorLaunchProfile(_Closed):
             _require(self.gate_channel == 'protected-socket-v1' and self.daemon_policy is not None)
         if self.gate_ledger_channel is not None:
             _require(self.gate_completion is not None and self.gate_channel == 'protected-socket-v1')
+        if self.generation_isolation is not None:
+            isolation, daemon = self.generation_isolation, self.daemon_policy
+            _require(self.gate_ledger_channel is not None and daemon is not None
+                     and _covers_inside(daemon.uid_map, isolation.app_uid)
+                     and _covers_inside(daemon.gid_map, isolation.app_gid)
+                     and not _covers(daemon.uid_map, isolation.provider_host_uid)
+                     and not _covers(daemon.gid_map, isolation.provider_host_gid))
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
@@ -317,7 +345,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion', 'gate_ledger_channel', 'generation_isolation'):
             if value[name] is None:
                 del value[name]
         return value

@@ -796,7 +796,8 @@ def test_enrolled_baseline_uses_separate_read_only_inspector(tmp_path, monkeypat
                                      gate_socket_directory=baseline.gate_socket_directory)
     selection = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest, image.image_config_id, image.platform)
     real = object.__new__(DockerEngineBackend)
-    real._gate_mount_verifier = SimpleNamespace(source_directory=baseline.gate_socket_directory)
+    real._gate_mount_verifier = SimpleNamespace(source_directory=baseline.gate_socket_directory,
+                                                verify_current=lambda *_, **__: 'sha256:' + 'a' * 64)
     real.binding = object()
     monkeypatch.setattr(real, 'inspect_image', lambda *_: defaults)
     monkeypatch.setattr(real, 'inspect_container', lambda *_: ContainerObservation(

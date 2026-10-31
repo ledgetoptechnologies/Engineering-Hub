@@ -11,6 +11,9 @@ class BaselineInspectionBackend:
         self.binding = backend.binding
         self.source_directory = backend._gate_mount_verifier.source_directory
 
+    def verify_authority(self, image, timeout_ms):
+        return self.__backend._gate_mount_verifier.verify_current(image, timeout_ms=timeout_ms)
+
     def inspect_image(self, image, timeout_ms):
         return self.__backend.inspect_image(image, timeout_ms)
 

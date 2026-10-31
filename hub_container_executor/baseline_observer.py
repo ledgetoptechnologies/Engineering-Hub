@@ -221,10 +221,19 @@ class BaselineObserver:
             expected_image = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
                                                   image.image_config_id, image.platform)
             def container():
+                authority = None
+                if gate is not None:
+                    authority = self.backend._gate_mount_verifier.verify_current(
+                        image, timeout_ms=self._budget(deadline, self.manifest.timeouts.inspect_ms))
+                    self._scope(deadline)
                 actual = self._call(deadline, self.backend.inspect_container, self.container_id)
                 _require(type(actual) is ContainerObservation and actual.container_id == self.container_id
                          and actual.selected_image == expected_image and actual.profile == profile
                          and actual.state_generation_id == self.generation_id and actual.status == 'running')
+                if gate is not None:
+                    _require(self.backend._gate_mount_verifier.verify_current(
+                        image, timeout_ms=self._budget(deadline, self.manifest.timeouts.inspect_ms)) == authority)
+                    self._scope(deadline)
             container()
             _require(self._storage(root_fd, root_identity, generation_fd, generation_identity, deadline) == frozen_identity)
             probes = self.manifest.probes.rollback

@@ -483,3 +483,23 @@ def test_cli_invalid_arguments_sanitized_before_io(monkeypatch, capsys, argument
     assert module.main(arguments) == 2
     output = capsys.readouterr()
     assert output.out == '' and output.err == 'Installed executor unavailable\n'
+
+
+def test_v6_baseline_authority_is_signed_config_bound_and_gate_remains_disabled():
+    from hub_container_executor.configuration_commitment import configuration_commitment
+    data = configuration(); data['schema'] = module.BASELINE_GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    data['baseline_gate'] = dict(issuer_id='baseline-issuer', issuer_public_key_hex='b' * 64,
+        receipt_public_key_hex='c' * 64, socket_source_directory='/fixture/baseline-gate',
+        launch_transport=dict(socket_path='/run/fixture/baseline-issuer.sock', expected_issuer_uid=65533,
+                              expected_issuer_gid=65533))
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.baseline_gate['source_directory'] == '/fixture/baseline-gate'
+    assert parsed.baseline_gate['public_key'] == bytes.fromhex('c' * 64)
+    assert parsed.gate_ledger_channel is True
+    with pytest.raises(module.InstalledRunnerError): module._require_supported_gate_runtime(parsed)
+    old = configuration_commitment(canonical(data)).content_digest
+    data['baseline_gate']['receipt_public_key_hex'] = 'd' * 64
+    assert configuration_commitment(canonical(data)).content_digest != old
+    data['baseline_gate']['socket_source_directory'] = '/fixture/gate-control/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
