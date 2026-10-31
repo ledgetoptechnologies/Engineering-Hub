@@ -26,6 +26,7 @@ from .runtime_identity import MAX_RECEIPT_BYTES, RuntimeIdentityError
 
 
 REQUEST_PROTOCOL = "engineering-hub.executor-launch-request.v1"
+COORDINATOR_REQUEST_PROTOCOL = "engineering-hub.coordinator-launch-request.v1"
 CURRENT_REQUEST_PROTOCOL = "engineering-hub.executor-current-observation-request.v1"
 GATE_MOUNT_REQUEST_PROTOCOL = "engineering-hub.executor-gate-mount-observation-request.v1"
 GATE_LEDGER_REQUEST_PROTOCOL = "engineering-hub.executor-gate-ledger-handoff-request.v1"
@@ -125,7 +126,11 @@ class UnixLaunchReceiptTransport:
             raise RuntimeIdentityError(_ERROR) from None
 
     def issue_receipt(self, *, nonce, timeout_ms):
+        return self._issue_receipt(nonce=nonce, timeout_ms=timeout_ms, protocol=REQUEST_PROTOCOL)
+
+    def _issue_receipt(self, *, nonce, timeout_ms, protocol):
         try:
+            _require(protocol in (REQUEST_PROTOCOL, COORDINATOR_REQUEST_PROTOCOL))
             # A child cannot wait on a lock inherited from another parent thread.
             _require(os.getpid() == self._pid)
             _require(type(nonce) is str and _NONCE.fullmatch(nonce)
@@ -138,7 +143,7 @@ class UnixLaunchReceiptTransport:
                 self._used = True  # Unknown outcomes must never trigger replay.
             # Only admission is serialized. A duplicate call or close() must not
             # wait behind filesystem/socket I/O belonging to the admitted call.
-            request = _canonical({"protocol": REQUEST_PROTOCOL, "nonce": nonce})
+            request = _canonical({"protocol": protocol, "nonce": nonce})
             _require(0 < len(request) <= MAX_REQUEST_BYTES)
             identity = _socket_leaf(self._path)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -426,6 +431,21 @@ class UnixLaunchReceiptTransport:
         _require(os.getpid() == self._pid)
         with self._lock:
             self._closed = True
+
+
+class CoordinatorUnixLaunchReceiptTransport:
+    """One-shot direct coordinator request; no executor pair or gate methods."""
+
+    def __init__(self, *, socket_path, expected_issuer_uid, expected_issuer_gid):
+        self._transport = UnixLaunchReceiptTransport(socket_path=socket_path,
+            expected_issuer_uid=expected_issuer_uid, expected_issuer_gid=expected_issuer_gid)
+
+    def issue_receipt(self, *, nonce, timeout_ms):
+        return self._transport._issue_receipt(nonce=nonce, timeout_ms=timeout_ms,
+                                             protocol=COORDINATOR_REQUEST_PROTOCOL)
+
+    def close(self):
+        self._transport.close()
 
 
 class UnixCurrentObservationTransport:

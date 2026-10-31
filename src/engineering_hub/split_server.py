@@ -125,7 +125,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
                                     agent_host='0.0.0.0', agent_port=8770,
                                     stop_event=None, on_ready=None,
                                     install_signals=True, recover_socket=False,
-                                    allow_github=False):
+                                    allow_github=False, admission_verifier=None):
     """Bind agent TCP and protected browser UDS before constructing one owner.
 
     ``on_ready(agent_sockname, private_sockname)`` is an optional notification,
@@ -139,6 +139,10 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     rejection of every existing socket; no environment flag enables recovery.
     """
     _options(pair_factory, (agent_port,), stop_event, on_ready, install_signals)
+    if admission_verifier is not None:
+        from hub_container_executor.runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+        if type(admission_verifier) is not CoordinatorLaunchReceiptIdentityVerifier:
+            raise ValueError('Coordinator startup admission required')
     # The public-only process must not import the private application factory
     # or its database/executor dependencies merely to own a browser listener.
     from .frontends import HubFrontends
@@ -155,15 +159,18 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     async def operation():
         if stop.is_set():
             return
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         with ExitStack() as stack:
             agent = stack.enter_context(_bind(agent_host, agent_port))
             socket_context = private_browser_socket
             if recover_socket:
                 from .recoverable_browser_socket import recoverable_browser_socket
                 socket_context = recoverable_browser_socket
+            if admission_verifier is not None: admission_verifier.implementation_commit()
             browser = stack.enter_context(socket_context(socket_path))
             if install_signals:
                 stack.enter_context(_signal_stop(stop))
+            if admission_verifier is not None: admission_verifier.implementation_commit()
             pair = pair_factory()
             if (type(pair) is not HubFrontends or pair.state != 'new'
                     or pair.settings.ingress_mode != 'combined'

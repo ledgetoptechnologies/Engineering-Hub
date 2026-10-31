@@ -225,10 +225,14 @@ def target_allowed(config, actor, action_key, environment, target):
 
 
 async def run_installed_coordinator(config, *, reconciliation_factory=None,
-                                     session_acceptance_factory=None):
+                                     session_acceptance_factory=None, admission_verifier=None):
     try:
         _process()
         _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
+        if admission_verifier is not None:
+            from .runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+            _require(type(admission_verifier) is CoordinatorLaunchReceiptIdentityVerifier)
+            admission_verifier.implementation_commit()
         from engineering_hub.queued_pilot_service import _synchronous
         # Fixed JSON/CLI input cannot impersonate the missing trusted operator
         # channel. An explicit Python composition must supply that dependency.
@@ -257,7 +261,11 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         # or permission to substitute an unapproved core artifact.
         _require(callable(getattr(ContainerPilotClient, 'for_private_unix', None)))
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as secrets:
-            tokens = {name: secrets.resolve_test_secret(*slot) for name, slot in config.roles.items()}
+            tokens = {}
+            for name, slot in config.roles.items():
+                if admission_verifier is not None: admission_verifier.implementation_commit()
+                tokens[name] = secrets.resolve_test_secret(*slot)
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         _require(len(set(tokens.values())) == len(config.roles) and all(
             type(token) is str and token and all(33 <= ord(char) <= 126 for char in token)
             for token in tokens.values()))
@@ -277,12 +285,13 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         def policy(actor, action_key, environment, target):
             return target_allowed(config, actor, action_key, environment, target)
 
+        options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
         await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port, **({'allow_github': True} if github else {}))
+            agent_host='127.0.0.1', agent_port=config.port, **({'allow_github': True} if github else {}), **options)
     except Exception:
         raise InstalledCoordinatorError() from None
 

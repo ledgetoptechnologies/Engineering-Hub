@@ -33,6 +33,9 @@ AUDIENCE = "engineering-hub.container-executor"
 MAX_RECEIPT_BYTES = 8192
 ISSUANCE_SKEW_MS = 5000
 SIGNATURE_DOMAIN = b"engineering-hub-launch-receipt-v1\x00"
+COORDINATOR_PROTOCOL = "engineering-hub.coordinator-launch.v1"
+COORDINATOR_AUDIENCE = "engineering-hub.private-coordinator"
+COORDINATOR_SIGNATURE_DOMAIN = b"engineering-hub-coordinator-launch-receipt-v1\x00"
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -119,6 +122,11 @@ class ExecutorReleaseEnrollment:
             raise RuntimeIdentityError("Invalid independent executor release enrollment") from None
 
 
+@dataclass(frozen=True)
+class CoordinatorReleaseEnrollment(ExecutorReleaseEnrollment):
+    """Separately enrolled coordinator pins; never inferred from executor pins."""
+
+
 class LaunchReceiptIdentityVerifier:
     """Accept exactly one nonce-bound Ed25519 receipt, without later issuer I/O.
 
@@ -137,8 +145,16 @@ class LaunchReceiptIdentityVerifier:
     def __init__(self, *, enrollment, issuer_transport,
                  max_receipt_lifetime_seconds, exchange_timeout_ms):
         try:
-            _require(type(enrollment) is ExecutorReleaseEnrollment)
-            enrolled = ExecutorReleaseEnrollment(**{
+            if type(self) is LaunchReceiptIdentityVerifier:
+                enrollment_type=ExecutorReleaseEnrollment
+                protocol,audience,domain=PROTOCOL,AUDIENCE,SIGNATURE_DOMAIN
+            elif type(self) is CoordinatorLaunchReceiptIdentityVerifier:
+                enrollment_type=CoordinatorReleaseEnrollment
+                protocol,audience,domain=COORDINATOR_PROTOCOL,COORDINATOR_AUDIENCE,COORDINATOR_SIGNATURE_DOMAIN
+            else:
+                raise RuntimeIdentityError("Invalid launch identity verifier")
+            _require(type(enrollment) is enrollment_type)
+            enrolled = enrollment_type(**{
                 name: getattr(enrollment, name)
                 for name in ExecutorReleaseEnrollment.__dataclass_fields__})
             _require(type(max_receipt_lifetime_seconds) is int
@@ -175,8 +191,8 @@ class LaunchReceiptIdentityVerifier:
             decoded = base64.b64decode(signature + "==", altchars=b"-_", validate=True)
             _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") == signature)
             Ed25519PublicKey.from_public_bytes(enrolled.public_key).verify(
-                decoded, SIGNATURE_DOMAIN + _canonical(payload))
-            _require(payload["protocol"] == PROTOCOL and payload["audience"] == AUDIENCE
+                decoded, domain + _canonical(payload))
+            _require(payload["protocol"] == protocol and payload["audience"] == audience
                      and payload["nonce"] == nonce)
             for name in ("receipt_id", "launch_id", "boot_id"):
                 value = payload[name]
@@ -266,3 +282,11 @@ class LaunchReceiptIdentityVerifier:
         _require(os.getpid() == self._pid)
         with self._lock:
             self._closed = True
+
+
+class CoordinatorLaunchReceiptIdentityVerifier(LaunchReceiptIdentityVerifier):
+    """One-shot coordinator receipt under independently enrolled coordinator pins.
+
+    This verifies a signed observation, not peer custody or ongoing integrity.
+    A distinct trusted issuer must authenticate the actual coordinator launch.
+    """

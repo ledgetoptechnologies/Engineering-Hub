@@ -23,6 +23,11 @@ from .installed_coordinator import CoordinatorConfiguration, load_configuration,
 from .local_providers import ImmutableTestSecretResolver
 from engineering_hub.unified_pilot_startup import read_protected_file
 
+_SUPERVISED_ADMISSION = '/operator-admission/admission.json'
+_SUPERVISED_CONFIG = '/operator/coordinator.json'
+_SUPERVISED_SESSION = '/operator-evidence/session.json'
+_SUPERVISED_ISSUER = '/run/engineering-hub/coordinator-issuer.sock'
+
 
 class TrustedLocalQueuedSession(TrustedQueuedSessionComposition):
     """Local counterpart to the HTTPS composition; explicit owner closes it."""
@@ -88,7 +93,7 @@ class TrustedLocalQueuedSession(TrustedQueuedSessionComposition):
         if failed: raise TrustedSessionError()
 
 
-async def serve_trusted_local_coordinator(config, *, enrollment):
+async def serve_trusted_local_coordinator(config, *, enrollment, admission_verifier=None):
     """Compose one local session under explicit dedicated-VM host trust.
 
     The operator must ensure exclusive authority to mutate the executor socket
@@ -99,6 +104,10 @@ async def serve_trusted_local_coordinator(config, *, enrollment):
     """
     session = None
     try:
+        if admission_verifier is not None:
+            from .runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+            _require(type(admission_verifier) is CoordinatorLaunchReceiptIdentityVerifier)
+            admission_verifier.implementation_commit()
         _require(type(config) is CoordinatorConfiguration and type(enrollment) is ManualSessionEnrollment)
         enrolled = parse_enrollment(enrollment_bytes(enrollment))
         _require(enrolled.schema == (SCHEMA_V3 if config.auth.human_auth_mode == 'github' else SCHEMA_V2)
@@ -109,10 +118,12 @@ async def serve_trusted_local_coordinator(config, *, enrollment):
                       or enrolled.operator_actor == f'human:{config.auth.beau_github_id}'))
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as resolver:
             token = resolver.resolve_test_secret(*config.roles['executor'])
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         _require(type(token) is str and token.isascii())
         session = TrustedLocalQueuedSession(config=config, enrollment=enrollment, credential=token.encode('ascii'))
+        options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
         await run_installed_coordinator(config, reconciliation_factory=session.reconciliation_factory,
-                                        session_acceptance_factory=session.session_acceptance_factory)
+                                        session_acceptance_factory=session.session_acceptance_factory, **options)
     except Exception:
         raise TrustedSessionError() from None
     finally:
@@ -149,13 +160,111 @@ class _Parser(argparse.ArgumentParser):
         raise TrustedSessionError()
 
 
+def _read_supervised_input(path, maximum):
+    """Capture one private regular file on a read-only mount, without following links."""
+    from engineering_hub.private_browser_socket import _trusted_ancestor
+    from engineering_hub.unified_pilot_startup import _file_identity
+    parent = fd = None
+    try:
+        source = Path(path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent = os.open('/', flags)
+        _trusted_ancestor(os.fstat(parent))
+        for component in source.parent.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=parent)
+            try:
+                opened = os.fstat(next_fd)
+                _trusted_ancestor(opened)
+                named = os.stat(component, dir_fd=parent, follow_symlinks=False)
+                _require((opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino))
+            except BaseException:
+                os.close(next_fd)
+                raise
+            os.close(parent)
+            parent = next_fd
+        parent_info = os.fstat(parent)
+        fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+        before = _file_identity(os.fstat(fd), private=True)
+        _require(0 < before[2] <= maximum and os.fstatvfs(fd).f_flag & os.ST_RDONLY)
+        _require(_file_identity(os.stat(source.name, dir_fd=parent, follow_symlinks=False), private=True) == before)
+        raw = bytearray()
+        while len(raw) <= maximum:
+            part = os.read(fd, min(65536, maximum + 1 - len(raw)))
+            if not part: break
+            raw.extend(part)
+        _require(len(raw) == before[2] and _file_identity(os.fstat(fd), private=True) == before
+                 and _file_identity(os.stat(source.name, dir_fd=parent, follow_symlinks=False), private=True) == before
+                 and os.fstatvfs(fd).f_flag & os.ST_RDONLY)
+        named_parent = os.stat(source.parent, follow_symlinks=False)
+        _trusted_ancestor(named_parent)
+        _require(source.parent.resolve(strict=True) == source.parent
+                 and (parent_info.st_dev, parent_info.st_ino) == (named_parent.st_dev, named_parent.st_ino))
+        return bytes(raw)
+    finally:
+        try:
+            if fd is not None: os.close(fd)
+        finally:
+            if parent is not None: os.close(parent)
+
+
+def run_supervised_local_coordinator():
+    """Authenticate this coordinator before reading its config or credentials.
+
+    The launch supervisor must independently enforce the signed profile and
+    exact raw admission input. A receipt is not a lease or socket-custody proof.
+    """
+    from .coordinator_admission import MAX_BYTES, parse_admission
+    from .launch_transport import CoordinatorUnixLaunchReceiptTransport
+    from .runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+    from .installed_coordinator import MAX_CONFIG_BYTES, parse_configuration, _process
+    admission = parse_admission(_read_supervised_input(_SUPERVISED_ADMISSION, MAX_BYTES))
+    transport = verifier = None
+    try:
+        transport = CoordinatorUnixLaunchReceiptTransport(socket_path=_SUPERVISED_ISSUER,
+            expected_issuer_uid=admission.issuer_uid, expected_issuer_gid=admission.issuer_gid)
+        verifier = CoordinatorLaunchReceiptIdentityVerifier(enrollment=admission.release,
+            issuer_transport=transport, max_receipt_lifetime_seconds=admission.lifetime_seconds,
+            exchange_timeout_ms=admission.timeout_ms)
+        verifier.implementation_commit()
+        config_raw = _read_supervised_input(_SUPERVISED_CONFIG, MAX_CONFIG_BYTES)
+        session_raw = _read_supervised_input(_SUPERVISED_SESSION, MAX_ENROLLMENT_BYTES)
+        _require(hmac.compare_digest('sha256:' + hashlib.sha256(config_raw).hexdigest(), admission.config_digest)
+                 and hmac.compare_digest('sha256:' + hashlib.sha256(session_raw).hexdigest(), admission.session_digest))
+        _process()
+        config = parse_configuration(config_raw)
+        config_path, session_path = Path(_SUPERVISED_CONFIG), Path(_SUPERVISED_SESSION)
+        _require(config_path.parent != Path(config.database).parent
+                 and Path(config.database).parent not in config_path.parents)
+        for root in (Path(config.database).parent, Path(config.secret_root)):
+            _require(session_path.parent != root and root not in session_path.parents and session_path not in root.parents)
+        enrollment = parse_enrollment(session_raw)
+        _require(enrollment.schema == (SCHEMA_V3 if config.auth.human_auth_mode == 'github' else SCHEMA_V2)
+                 and (enrollment.schema != SCHEMA_V3
+                      or enrollment.operator_actor == f'human:{config.auth.beau_github_id}'))
+        _require(_read_supervised_input(_SUPERVISED_CONFIG, MAX_CONFIG_BYTES) == config_raw
+                 and _read_supervised_input(_SUPERVISED_SESSION, MAX_ENROLLMENT_BYTES) == session_raw)
+        verifier.implementation_commit()
+        asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment, admission_verifier=verifier))
+    finally:
+        try:
+            if verifier is not None: verifier.close()
+        finally:
+            if transport is not None: transport.close()
+
+
 def main(argv=None):
     """Start only an explicitly selected, independently enrolled local session."""
     try:
         parser = _Parser(description='Explicit trusted local staging coordinator', allow_abbrev=False)
-        parser.add_argument('--config', required=True, action='append')
-        parser.add_argument('--enrollment', required=True, action='append')
+        parser.add_argument('--config', action='append')
+        parser.add_argument('--enrollment', action='append')
+        parser.add_argument('--supervised', action='store_true')
         args = parser.parse_args(argv)
+        if args.supervised:
+            _require(args.config is None and args.enrollment is None)
+            run_supervised_local_coordinator()
+            return 0
+        _require(args.config is not None and args.enrollment is not None)
         _require(len(args.config) == len(args.enrollment) == 1)
         config = load_configuration(args.config[0])
         enrollment = load_local_enrollment(args.enrollment[0], config=config)

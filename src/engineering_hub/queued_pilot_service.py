@@ -56,7 +56,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
                                  session_acceptance_factory=None, access_verifier=None,
-                                 inherited_broker=False, allow_github=False):
+                                 inherited_broker=False, allow_github=False, admission_verifier=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -93,6 +93,10 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
             raise ValueError()
         _key(action_key)
+        if admission_verifier is not None:
+            from hub_container_executor.runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+            if type(admission_verifier) is not CoordinatorLaunchReceiptIdentityVerifier: raise ValueError()
+            admission_verifier.implementation_commit()
         target = ContainerPilotTarget.from_manifest(manifest)
         if target.target_id != 'engineering-hub:staging':
             raise ValueError()
@@ -156,6 +160,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, remote_cleanup_reserved
         if constructed:
             raise QueuedPilotServiceError()
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         constructed = True
         owner = PilotOwner(settings.database)
         reconciliation = _reconciliation(reconciliation_factory, owner, target,
@@ -250,7 +255,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             await serve_private_coordinator(pair_factory, socket_path=socket_path,
                 agent_host=agent_host, agent_port=agent_port, stop_event=stop,
                 on_ready=on_ready, install_signals=install_signals,
-                recover_socket=recover_socket, allow_github=allow_github)
+                recover_socket=recover_socket, allow_github=allow_github,
+                **({} if admission_verifier is None else {'admission_verifier': admission_verifier}))
         finally:
             if owner is not None or client is not None:
                 await cleanup()
