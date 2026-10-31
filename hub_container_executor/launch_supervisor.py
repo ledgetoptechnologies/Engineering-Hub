@@ -575,6 +575,7 @@ class LaunchSupervisor:
         self._socket_parent = None
         self._socket_identity = None
         self._launch_id = self._container_id = None
+        self._pair_reservation = None
         self._closed = False
         self._issuance_open = False
         self._receipt_served = False
@@ -847,24 +848,27 @@ class LaunchSupervisor:
             _require(state['Pid'] == self._consumer.pid)
             time.sleep(min(0.05, _remaining(deadline)))
 
-    def launch(self):
+    def launch(self, *, pair_reservation=None):
         """One bounded real create/start. Any uncertain effect stays held forever."""
         _require(self._pid == os.getpid())
         with self._mutex:
             try:
                 self._guard()
                 _require(self._launch_id is None)
+                _require(pair_reservation is getattr(self, '_pair_reservation', None))
                 deadline = time.monotonic() + self._launch_ms / 1000
                 # Before any socket bind or Engine request: wrong live maps mean no effect at all.
                 self._check_daemon_maps()
-                self._bind_issuer()
+                if pair_reservation is None:
+                    self._bind_issuer()
                 self._pin_sources()
                 defaults = self._engine.image(self.image, deadline)
                 _require(not defaults.get('Volumes') and not defaults.get('Healthcheck') and not defaults.get('OnBuild')
                          and tuple(defaults.get('Entrypoint') or ()) == self.profile.entrypoint
                          and tuple(defaults.get('Cmd') or ()) == self.profile.command
                          and tuple(defaults.get('Env') or ()) == self.profile.environment)
-                launch_id = str(uuid4())
+                launch_id = (str(uuid4()) if pair_reservation is None else
+                             pair_reservation._claim(self))
                 self._origin = time.monotonic()
                 wall = time.time()
                 _require(type(self._origin) in (int, float) and math.isfinite(self._origin)
@@ -876,6 +880,8 @@ class LaunchSupervisor:
                     'image': self.image.runnable_reference,
                     'request_digest': 'sha256:' + hashlib.sha256(_canonical(self._create_body())).hexdigest()})
                 self._launch_id = launch_id
+                if pair_reservation is not None:
+                    pair_reservation._check_launch(self)
                 _, created = self._engine.json('POST', '/containers/create?name=eh-executor-' + launch_id,
                     deadline, body=self._create_body(), statuses=(201,))
                 _require(type(created) is dict and set(created) <= {'Id', 'Warnings'}

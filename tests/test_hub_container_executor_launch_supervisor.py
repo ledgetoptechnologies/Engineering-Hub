@@ -902,6 +902,40 @@ def test_launcher_reserves_exact_single_create_and_start_before_fake_engine_effe
         authority.close()
 
 
+def test_launcher_consumes_enrolled_pair_id_before_create(root_journal):
+    authority, events = synthetic_launcher(root_journal)
+    identity = str(uuid4())
+    class ReservedPair:
+        def _claim(self, supervisor):
+            assert supervisor is authority
+            assert not authority._engine.effect_calls
+            events.append('pair-claim')
+            return identity
+        def _check_launch(self, supervisor):
+            assert supervisor._launch_id == identity
+            assert not supervisor._engine.effect_calls
+    reservation = ReservedPair()
+    authority._pair_reservation = reservation
+    try:
+        assert authority.launch(pair_reservation=reservation) == 'a' * 64
+        assert authority._launch_id == identity
+        assert 'bind-fixture' not in events  # already bound by pair preflight
+        assert 'pair-claim' in events
+        assert any(identity in route for method, route in authority._engine.effect_calls if method == 'POST')
+    finally:
+        authority.close()
+
+
+def test_launcher_rejects_unenrolled_pair_reservation_before_effect(root_journal):
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.launch(pair_reservation=object())
+        assert authority._engine.effect_calls == []
+    finally:
+        authority.close()
+
+
 @pytest.mark.parametrize('failure', ['ambiguous-create', 'ambiguous-start', 'privileged-inspect',
                                    'tag-config', 'wrong-tmpfs', 'invented-tmpfs-entry'])
 def test_fake_effect_ambiguity_or_wrong_effective_profile_holds_without_retry_or_adoption(root_journal, failure):
