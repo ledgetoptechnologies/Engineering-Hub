@@ -231,6 +231,8 @@ async def _serve_owned_executor(resource_factory, *, bearer_token, listener_fact
                 try:
                     if adapter is not None:
                         await finish_owned(asyncio.to_thread(adapter.begin_drain))
+                    if gate_worker is not None:
+                        await finish_owned(asyncio.to_thread(gate_worker.post_drain_exchange))
                 finally:
                     try:
                         if gate_worker is not None:

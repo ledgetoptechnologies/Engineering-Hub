@@ -66,7 +66,7 @@ def read_enrollment(fd):
     except Exception: raise BrokerServiceError() from None
 
 
-async def serve_enrolled_broker(*, enrollment_fd, listener, stop_event):
+async def serve_enrolled_broker(*, enrollment_fd, listener, stop_event, on_ready=None):
     """Take ownership of a prebound listener until all admitted requests drain."""
     broker=None
     try:
@@ -95,7 +95,7 @@ async def serve_enrolled_broker(*, enrollment_fd, listener, stop_event):
         broker=GitHubOAuthBroker(client_id=data['client_id'],client_secret=secret,secret_sha256=data['secret_digest'],
                                  origin=data['origin'],peer_uid=data['peer_uid'],peer_gid=data['peer_gid'])
         secret=None
-        await serve_github_oauth_broker(listener,broker,stop_event)
+        await serve_github_oauth_broker(listener,broker,stop_event,on_ready=on_ready)
     except asyncio.CancelledError: raise
     except Exception: raise BrokerServiceError() from None
     finally:

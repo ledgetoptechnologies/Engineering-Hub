@@ -87,6 +87,61 @@ async def test_opt_in_gate_worker_drains_before_adapter_close(owned, tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_sealed_service_retains_gate_until_authenticated_post_drain_ack(owned, tmp_path):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from engineering_hub.executor_launch_profile import GateCompletionPolicy
+    from hub_container_executor.broker_seqpacket import PeerPin, _start
+    from hub_container_executor.gate_ledger_channel import OwnedGateLedgerService, SupervisorLedgerClient
+    from tests.test_hub_gate_ledger_channel import verified_launch
+    from cryptography.hazmat.primitives import serialization
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    verifier = verified_launch(key, public)
+    path, pair, workers = str(tmp_path / 'gate.sock'), str(uuid4()), []
+    def factory(adapter):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener.bind(path); listener.listen(1)
+        worker = OwnedGateLedgerService(listener=listener, ledger=adapter.ledger, supervisor_public_key=public,
+            launch_verifier=verifier, manifest_digest=adapter.manifest.digest(), hold_uncertain=lambda _: None,
+            timeout_seconds=3, require_sender_liveness=True)
+        worker._completion_policy = GateCompletionPolicy(candidate_executable_digest='sha256:'+'a'*64,
+            rollback_executable_digest='sha256:'+'b'*64, health_contract='engineering-hub.health-json-build-commit.v1')
+        workers.append(worker)
+        return worker
+    stop, task, _ = await start(owned, gate_worker_factory=factory)
+    adapter = owned.adapter
+    adapter.ledger.seal_pair_drain(pair, verifier.launch_binding(), fresh_check=lambda: True)
+    stop.set()
+    try:
+        deadline = time.monotonic() + 3
+        while not workers[0]._post_drain and time.monotonic() < deadline:
+            await asyncio.sleep(.01)
+        assert workers[0]._post_drain and not task.done()
+        def query():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+                channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                channel.connect(path)
+                peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+                try:
+                    client = SupervisorLedgerClient(channel=channel, peer=peer, signing_key=key,
+                        launch_binding=verifier.launch_binding(), manifest_digest=adapter.manifest.digest(), timeout_seconds=2)
+                    result = client.invoke('pair_outcome_v1', {'pair_id': pair})
+                    client.confirm_pair_outcome()
+                    return result
+                finally: peer.close()
+        result = await asyncio.to_thread(query)
+        assert result['invalid_receipts'] == 0
+        await asyncio.wait_for(task, 5)
+        assert_closed(owned)
+    finally:
+        stop.set()
+        if not task.done():
+            try: await asyncio.wait_for(task, 5)
+            except Exception: pass
+        verifier.close()
+
+
+@pytest.mark.asyncio
 async def test_wrong_ledger_gate_worker_is_closed_on_rejection(owned, tmp_path):
     from hub_container_executor.gate_ledger_channel import OwnedGateLedgerService
     second_root = tmp_path / 'wrong-ledger'; second_root.mkdir(mode=0o700)

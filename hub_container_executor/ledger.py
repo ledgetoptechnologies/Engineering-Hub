@@ -1317,6 +1317,45 @@ class SQLiteLedger:
             row = db.execute("SELECT value FROM control WHERE key='paused'").fetchone()
         return bool(row and row["value"] == "true")
 
+    def has_pair_drain_seal(self):
+        self._check_open()
+        with self._connection() as db:
+            return db.execute("SELECT 1 FROM control WHERE key='pair_drain_seal_v1'").fetchone() is not None
+
+    def pair_drain_outcome(self, pair_id, binding, *, fresh_check):
+        """Observe raw grouped states and invalid receipt count under a sealed DB.
+
+        Grouped command/run/target states are not individually authenticated and
+        do not prove inventory completeness. This cannot establish external
+        quiescence, authorize release, or resist deletion/database rollback.
+        """
+        try:
+            body = _canonical({'schema': 'engineering-hub.executor-pair-drain-seal.v1',
+                'pair_id': pair_id, 'launch_binding': list(binding), 'manifest_digest': self._expected[0]})
+            mac = self._operation_mac(pair_id, pair_id, 'pair_drain_seal', 'sealed', body)
+            expected = _canonical({'body': body, 'mac': mac})
+            with self._transaction() as db:
+                row = db.execute("SELECT value FROM control WHERE key='pair_drain_seal_v1'").fetchone()
+                if row is None or not hmac.compare_digest(row['value'], expected) or fresh_check() is not True:
+                    raise ValueError()
+                # A count is deliberately not a release decision. Unknown states,
+                # outstanding intents and all targets remain visible to the owner.
+                result = {}
+                for table in ('commands', 'runs', 'targets', 'operations'):
+                    column = 'status' if table == 'operations' else 'state'
+                    rows = db.execute(f'SELECT {column}, COUNT(*) AS n FROM {table} GROUP BY {column} LIMIT 65').fetchall()
+                    if len(rows) > 64 or any(type(r[column]) is not str or type(r['n']) is not int for r in rows):
+                        raise ValueError()
+                    result[table] = {r[column]: r['n'] for r in rows}
+                operations = db.execute('SELECT operation_id,command_id,kind,status,intent,receipt,receipt_mac '
+                                        'FROM operations LIMIT 4097').fetchall()
+                if len(operations) > 4096: raise ValueError()
+                result['invalid_receipts'] = sum(self._format_operation(row)['status'] == 'invalid' for row in operations)
+                if fresh_check() is not True: raise ValueError()
+                return result
+        except Exception:
+            raise PermissionError('executor pair outcome unavailable') from None
+
     def target_snapshot(self, target_id: str = TARGET_ID) -> dict | None:
         self._check_open()
         with self._connection() as db:

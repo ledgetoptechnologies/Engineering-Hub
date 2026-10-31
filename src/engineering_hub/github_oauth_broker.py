@@ -139,7 +139,7 @@ class GitHubOAuthBroker:
         self._closed=True;self._secret='';self._used.clear()
 
 
-async def serve_github_oauth_broker(listener, broker, stop_event):
+async def serve_github_oauth_broker(listener, broker, stop_event, *, on_ready=None):
     """Own one enrolled listener, stop admission and drain accepted exchanges.
 
     Listener ownership transfers here. The caller must establish and retain
@@ -151,7 +151,7 @@ async def serve_github_oauth_broker(listener, broker, stop_event):
         or listener.getsockopt(socket.SOL_SOCKET,socket.SO_TYPE)!=socket.SOCK_STREAM
         or listener.getsockopt(socket.SOL_SOCKET,socket.SO_ACCEPTCONN)!=1
         or type(broker) is not GitHubOAuthBroker or broker._pid!=os.getpid()
-        or type(stop_event) is not asyncio.Event): raise OAuthBrokerError()
+        or type(stop_event) is not asyncio.Event or (on_ready is not None and not callable(on_ready))): raise OAuthBrokerError()
     active=set()
     stopping=False
     def accepted(reader,writer):
@@ -163,6 +163,7 @@ async def serve_github_oauth_broker(listener, broker, stop_event):
         server=None
         try:
             server=await asyncio.start_unix_server(accepted,sock=listener)
+            if on_ready is not None: on_ready()
             await stop_event.wait()
         finally:
             stopping=True

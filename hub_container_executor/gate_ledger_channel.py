@@ -63,7 +63,7 @@ def _sender_packet(channel):
         if os.readlink('/proc/self/fd/' + str(fd)) != 'anon_inode:[pidfd]' or select.select([fd], [], [], 0)[0]:
             raise ValueError()
         received.remove(fd)
-        return raw, fd
+        return raw, fd, credentials[0]
     finally:
         for fd in received:
             try: os.close(fd)
@@ -98,7 +98,7 @@ class GateLedgerWorker:
     """
     def __init__(self, *, channel, ledger, supervisor_public_key, launch_verifier,
                  manifest_digest, hold_uncertain, timeout_seconds, completion_policy=None,
-                 require_sender_liveness=False, lookup_only=False):
+                 require_sender_liveness=False, lookup_only=False, post_drain_only=False):
         try:
             if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -110,7 +110,7 @@ class GateLedgerWorker:
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
                     or (completion_policy is not None and type(completion_policy) is not GateCompletionPolicy)
                     or type(require_sender_liveness) is not bool
-                    or type(lookup_only) is not bool
+                    or type(lookup_only) is not bool or type(post_drain_only) is not bool
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
             channel.getpeername()
@@ -124,6 +124,7 @@ class GateLedgerWorker:
                 if channel.getsockopt(socket.SOL_SOCKET, _SO_PASSPIDFD) != 1: raise ValueError()
             self._require_sender_liveness = require_sender_liveness
             self._lookup_only = lookup_only
+            self._post_drain_only = post_drain_only
             self._timeout, self._pid, self._used, self._lock = timeout_seconds, os.getpid(), False, threading.Lock()
         except Exception:
             raise GateLedgerChannelError() from None
@@ -155,7 +156,7 @@ class GateLedgerWorker:
             if self._channel.send(request) != len(request): raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if self._require_sender_liveness:
-                raw, sender_fd = _sender_packet(self._channel)
+                raw, sender_fd, sender_credentials = _sender_packet(self._channel)
             else:
                 raw, credentials = _read_observation(self._channel)
                 if len(credentials) != 1: raise ValueError()
@@ -172,7 +173,7 @@ class GateLedgerWorker:
             if (payload['protocol'] != REQUEST or payload['challenge'] != challenge
                     or type(payload['launch_binding']) is not list or payload['launch_binding'] != list(binding)
                     or any(type(a) is not type(b) for a, b in zip(payload['launch_binding'], binding))
-                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1')
+                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1', 'pair_outcome_v1')
                     or type(issued) is not int or type(expires) is not int or not 0 < expires - issued <= 5000
                     or now < wall or issued < wall - 5000 or not issued <= now < expires
                     or expires <= wall or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
@@ -184,12 +185,14 @@ class GateLedgerWorker:
             is_ready = payload['action'] == 'health_ready_v5'
             is_state = payload['action'] == 'pending_state_v1'
             is_pair_seal = payload['action'] == 'seal_pair_drain_v1'
+            is_pair_outcome = payload['action'] == 'pair_outcome_v1'
+            if self._post_drain_only and not is_pair_outcome: raise ValueError()
             if self._lookup_only and not is_lookup: raise ValueError()
-            if (is_accept or is_lookup or is_pending or is_ready or is_state or is_pair_seal) and (not self._require_sender_liveness or self._completion_policy is None):
+            if (is_accept or is_lookup or is_pending or is_ready or is_state or is_pair_seal or is_pair_outcome) and (not self._require_sender_liveness or self._completion_policy is None):
                 raise ValueError()
             is_snapshot = payload['action'] in ('inspect_completion', 'inspect_completion_v4')
             identity = value.get('identity') if (is_snapshot or is_accept or is_lookup or is_ready) else value
-            if not (is_pending or is_state or is_pair_seal) and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
+            if not (is_pending or is_state or is_pair_seal or is_pair_outcome) and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
             last_wall = [now]
             def fresh_decision():
                 current = int(time.time() * 1000)
@@ -208,7 +211,7 @@ class GateLedgerWorker:
                     raise ValueError()
                 last_wall[0] = current
                 return True
-            if is_pair_seal:
+            if is_pair_seal or is_pair_outcome:
                 if (set(value) != {'pair_id'} or type(value['pair_id']) is not str
                         or str(UUID(value['pair_id'])) != value['pair_id']): raise ValueError()
             elif is_state:
@@ -251,7 +254,7 @@ class GateLedgerWorker:
                     or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
             last_wall[0] = current
             if payload['action'] == 'consume': fresh_decision()
-            scope(); attempted = not (is_snapshot or is_lookup or is_pending or is_ready or is_state)
+            scope(); attempted = not (is_snapshot or is_lookup or is_pending or is_ready or is_state or is_pair_outcome)
             if payload['action'] == 'reserve':
                 self._ledger.reserve_mount_gate_challenge(value)
             elif payload['action'] == 'consume' and self._ledger.consume_mount_gate_challenge(value) is not True:
@@ -268,6 +271,10 @@ class GateLedgerWorker:
                 snapshot = self._ledger.pending_state_context(value['operation_id'])
             elif is_pair_seal:
                 self._ledger.seal_pair_drain(value['pair_id'], binding, fresh_check=fresh_seal)
+            elif is_pair_outcome:
+                inventory = self._ledger.pair_drain_outcome(value['pair_id'], binding, fresh_check=fresh_seal)
+                snapshot = ({'phase': 'draining'} if not self._post_drain_only else
+                    {'phase': 'observed', 'inventory': inventory})
             elif is_snapshot:
                 snapshot = self._ledger.gate_completion_snapshot(identity, value['probe_digest'])
                 if payload['action'] == 'inspect_completion_v4' and snapshot['role'] != value['role']:
@@ -281,13 +288,24 @@ class GateLedgerWorker:
             response = _canonical({'protocol': RESPONSE, 'challenge': challenge,
                                    'action': payload['action'],
                                    **({'outcome': 'observed', 'snapshot': snapshot}
-                                      if (is_snapshot or is_lookup or is_pending or is_ready or is_state) else
+                                      if (is_snapshot or is_lookup or is_pending or is_ready or is_state or is_pair_outcome) else
                                       {'outcome': 'committed', 'snapshot': snapshot} if is_accept else {'outcome': 'committed'})})
             if len(response) > MAX_BYTES: raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if payload['action'] == 'consume': fresh_decision()
             if not last_wall[0] <= int(time.time() * 1000) < expires: raise ValueError()
             if self._channel.send(response) != len(response): raise ValueError()
+            if is_pair_outcome and self._post_drain_only:
+                scope(); self._channel.settimeout(deadline - time.monotonic())
+                ack_fd = None
+                try:
+                    raw_ack, ack_fd, ack_credentials = _sender_packet(self._channel)
+                    if (ack_credentials != sender_credentials
+                            or raw_ack != _canonical({'protocol': 'engineering-hub.pair-outcome-ack.v1', 'challenge': challenge})):
+                        raise ValueError()
+                    scope()
+                finally:
+                    if ack_fd is not None: os.close(ack_fd)
             scope()
             sent = True
             return 'sent_unconfirmed'
@@ -330,6 +348,7 @@ class SupervisorLedgerClient:
             self._channel, self._peer, self._key = channel, peer, signing_key
             self._binding, self._manifest, self._timeout = launch_binding, manifest_digest, timeout_seconds
             self._lookup_only = lookup_only
+            self._outcome_ack = None
             self._pid, self._used, self._lock = os.getpid(), False, threading.Lock()
         except Exception:
             raise GateLedgerChannelError() from None
@@ -355,7 +374,7 @@ class SupervisorLedgerClient:
             if credentials != [(self._peer.pid, self._peer.uid, self._peer.gid)]: raise ValueError()
             scope(); return _parse(raw)
         try:
-            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1') or type(value) is not dict: raise ValueError()
+            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1', 'pair_outcome_v1') or type(value) is not dict: raise ValueError()
             if self._lookup_only and action != 'lookup_completion_v5': raise ValueError()
             snapshot = json.loads(_canonical(value))
             challenge = receive()
@@ -379,9 +398,23 @@ class SupervisorLedgerClient:
             is_pending = action == 'pending_gate_v5'
             is_ready = action == 'health_ready_v5'
             is_state = action == 'pending_state_v1'
+            is_pair_outcome = action == 'pair_outcome_v1'
             expected = {'protocol': RESPONSE, 'challenge': challenge['challenge'], 'action': action,
-                        'outcome': 'observed' if (is_snapshot or is_lookup or is_pending or is_ready or is_state) else 'committed'}
-            if is_state:
+                        'outcome': 'observed' if (is_snapshot or is_lookup or is_pending or is_ready or is_state or is_pair_outcome) else 'committed'}
+            if is_pair_outcome:
+                if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
+                        or any(response[k] != v for k, v in expected.items())
+                        or set(snapshot) != {'pair_id'} or str(UUID(snapshot['pair_id'])) != snapshot['pair_id']): raise ValueError()
+                result = response['snapshot']
+                if result == {'phase': 'draining'}:
+                    result = None
+                elif type(result) is dict and set(result) == {'phase', 'inventory'} and result['phase'] == 'observed':
+                    result = result['inventory']
+                else: raise ValueError()
+                if result is not None and (type(result) is not dict or set(result) != {'commands', 'runs', 'targets', 'operations', 'invalid_receipts'}
+                        or type(result['invalid_receipts']) is not int or result['invalid_receipts'] < 0
+                        or any(type(result[name]) is not dict or len(result[name]) > 64 or any(type(k) is not str or type(n) is not int or n <= 0 for k, n in result[name].items()) for name in ('commands', 'runs', 'targets', 'operations'))): raise ValueError()
+            elif is_state:
                 if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
                         or any(response[k] != v for k, v in expected.items())
                         or set(snapshot) != {'operation_id'}): raise ValueError()
@@ -459,7 +492,21 @@ class SupervisorLedgerClient:
             elif response != expected: raise ValueError()
             if not issued <= int(time.time() * 1000) < issued + ttl: raise ValueError()
             scope()
-            return response['snapshot'] if (is_snapshot or is_accept or is_lookup or is_pending or is_ready or is_state) else True
+            if is_pair_outcome and result is not None:
+                self._outcome_ack = (challenge['challenge'], deadline)
+            return result if is_pair_outcome else response['snapshot'] if (is_snapshot or is_accept or is_lookup or is_pending or is_ready or is_state) else True
+        except Exception:
+            raise GateLedgerChannelError() from None
+
+    def confirm_pair_outcome(self):
+        if self._outcome_ack is None: return
+        try:
+            challenge, deadline = self._outcome_ack
+            self._outcome_ack = None
+            self._peer.check()
+            self._channel.settimeout(deadline - time.monotonic())
+            raw = _canonical({'protocol': 'engineering-hub.pair-outcome-ack.v1', 'challenge': challenge})
+            if self._channel.send(raw) != len(raw): raise ValueError()
         except Exception:
             raise GateLedgerChannelError() from None
 
@@ -500,6 +547,7 @@ class OwnedGateLedgerService:
             self._completion_policy = completion_policy
             self._require_sender_liveness = require_sender_liveness
             self._lookup_only = False
+            self._phase_lock, self._post_drain, self._outcome_sent = threading.Lock(), False, threading.Event()
             self._pid, self._lock, self._stopping, self._thread, self._failed = os.getpid(), threading.Lock(), False, None, False
             listener.settimeout(.1)
         except Exception:
@@ -530,15 +578,18 @@ class OwnedGateLedgerService:
                     with self._lock:
                         if self._stopping: break
                     channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-                    worker = GateLedgerWorker(channel=channel, ledger=self.ledger, supervisor_public_key=self._key,
-                        launch_verifier=self._launch, manifest_digest=self._manifest, hold_uncertain=self._hold,
-                        timeout_seconds=self._timeout, completion_policy=self._completion_policy,
-                        require_sender_liveness=self._require_sender_liveness, lookup_only=self._lookup_only)
-                    try:
-                        worker.serve_once()
-                    except GateLedgerAcceptanceUnknown:
-                        # Preserve only the authenticated reconciliation path.
-                        self._lookup_only = True
+                    with self._phase_lock:
+                        if self._post_drain and self._outcome_sent.is_set(): raise GateLedgerChannelError()
+                        worker = GateLedgerWorker(channel=channel, ledger=self.ledger, supervisor_public_key=self._key,
+                            launch_verifier=self._launch, manifest_digest=self._manifest, hold_uncertain=self._hold,
+                            timeout_seconds=self._timeout, completion_policy=self._completion_policy,
+                            require_sender_liveness=self._require_sender_liveness, lookup_only=self._lookup_only,
+                            post_drain_only=self._post_drain)
+                        try:
+                            worker.serve_once()
+                            if self._post_drain: self._outcome_sent.set()
+                        except GateLedgerAcceptanceUnknown:
+                            self._lookup_only = True
         except BaseException:
             failed = True
         finally:
@@ -546,6 +597,15 @@ class OwnedGateLedgerService:
                 with self._lock: self._failed = True
                 try: self._on_failure()
                 except Exception: pass
+
+    def post_drain_exchange(self):
+        """If sealed, permit only one authenticated observation before shutdown."""
+        if os.getpid() != self._pid: raise GateLedgerChannelError()
+        with self._phase_lock:
+            if not self.ledger.has_pair_drain_seal(): return
+            if self._lookup_only or self._post_drain: raise GateLedgerChannelError()
+            self._post_drain = True
+        if not self._outcome_sent.wait(self._timeout): raise GateLedgerChannelError()
 
     def close(self):
         try:

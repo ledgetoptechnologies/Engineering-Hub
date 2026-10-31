@@ -2977,6 +2977,7 @@ class LaunchSupervisor:
                 if lookup_only: self._validate_live(deadline, allow_held=True)
                 else: self._validate_live(deadline)
                 self._ledger_handoff_path_check(); peer.check(); _remaining(deadline)
+                client.confirm_pair_outcome()
         except BaseException:
             self._held, self._issuance_open, self._hold_persisted = True, False, False
             if self._mutex.acquire(blocking=False):
@@ -3247,6 +3248,49 @@ class LaunchSupervisor:
                 self._wait_stopped(deadline, require_exit_zero=True)
                 self._journal.state(self._launch_id, 'stopped', self._record())
                 self._remove_owned_socket()
+        except BaseException:
+            with self._mutex:
+                self._hold()
+            raise LaunchSupervisorError() from None
+
+    def graceful_stop_sealed_executor(self, *, pair_id, manifest_digest, timeout_ms):
+        """Stop once and retain authenticated post-drain ledger observations.
+
+        The result does not establish application or external writer quiescence,
+        resolve held effects, authorize release, or resist database rollback.
+        Any lost exchange or uncertain stop holds the original launch.
+        The original launch verifier must remain fresh through the exchange;
+        an expired approval fails held rather than being renewed.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1000 <= timeout_ms <= 86_415_000
+                 and type(pair_id) is str and str(UUID(pair_id)) == pair_id)
+        deadline = time.monotonic() + timeout_ms / 1000
+        try:
+            # Verify the exact existing seal before the first stop effect.
+            with self.open_gate_ledger_client(manifest_digest=manifest_digest,
+                    timeout_seconds=min(5, _remaining(deadline))) as client:
+                _require(client.invoke('pair_outcome_v1', {'pair_id': pair_id}) is None)
+            with self._mutex:
+                self._guard()
+                _require(self.profile.gate_ledger_channel == 'supervisor-listener-v1')
+                self._validate_live(deadline)
+                self._journal.state(self._launch_id, 'term_reserved', self._record())
+                self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
+                                  deadline, statuses=(204,))
+            outcome = None
+            while outcome is None:
+                with self.open_gate_ledger_client(manifest_digest=manifest_digest,
+                        timeout_seconds=min(5, _remaining(deadline))) as client:
+                    outcome = client.invoke('pair_outcome_v1', {'pair_id': pair_id})
+                if outcome is None:
+                    time.sleep(min(.05, _remaining(deadline)))
+            with self._mutex:
+                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                self._wait_stopped(deadline, require_exit_zero=True)
+                record = dict(self._record(), pair_id=pair_id, pair_outcome=outcome)
+                self._journal.state(self._launch_id, 'stopped', record)
+                self._remove_owned_socket()
+            return outcome
         except BaseException:
             with self._mutex:
                 self._hold()
