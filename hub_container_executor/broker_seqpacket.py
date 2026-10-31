@@ -56,6 +56,10 @@ class BrokerChannelClosed(BrokerTransportError):
     """The inherited channel is closed for good; only a relaunch replaces it."""
 
 
+class BrokerPeerReset(BrokerChannelClosed):
+    """The peer closed its end while packets sent to it were still unread (ECONNRESET)."""
+
+
 def _require(value):
     if not value:
         raise BrokerTransportError()
@@ -412,7 +416,12 @@ class _InheritedChannel:
         # Readiness is only a hint: another holder of the descriptor can take the
         # packet first. Never block here; a vanished packet fails the channel closed.
         self._socket.setblocking(False)
-        raw, credentials = _read_packet(self._socket, allow_eof=True)
+        try:
+            raw, credentials = _read_packet(self._socket, allow_eof=True)
+        except ConnectionResetError:
+            # Linux reports a peer that closed with our packets unread as a reset,
+            # not an orderly EOF: the peer is gone and never read what we sent.
+            raise BrokerPeerReset() from None
         if raw is None:
             raise BrokerChannelClosed()
         _require(time.monotonic() < deadline)

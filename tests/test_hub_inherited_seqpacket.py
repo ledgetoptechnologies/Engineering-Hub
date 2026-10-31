@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Linux seqpacket
 pytest.importorskip('fcntl')
 
 from hub_container_executor.broker_seqpacket import (
-    BrokerChannelClosed, BrokerReadTimeout, BrokerTransportError, InheritedCommandBroker,
+    BrokerChannelClosed, BrokerPeerReset, BrokerReadTimeout, BrokerTransportError, InheritedCommandBroker,
     InheritedCommandClient, PeerAccount, _CHANNEL_PROTOCOL, _canonical, _read_packet,
 )
 from tests.test_hub_container_executor_adapter import make_fixture, command
@@ -201,7 +201,8 @@ def test_a_same_account_delegated_holder_is_not_distinguished_but_desyncs_closed
     with pytest.raises(BrokerTransportError):
         client.get(command(manifest, 'deploy_container'), 5)   # the unread reply is unsolicited
     assert client.closed
-    with pytest.raises(BrokerChannelClosed):
+    # The client closed with that reply unread, which Linux reports as a reset.
+    with pytest.raises(BrokerPeerReset):
         broker.serve_once(5)
     assert broker.closed
 
@@ -300,7 +301,19 @@ def test_an_unsolicited_packet_closes_the_client_before_it_sends(parts):
         with pytest.raises(BrokerTransportError):
             client.get(command(manifest, 'deploy_container'), 5)
         assert client.closed
-        assert select.select([raw], [], [], 1)[0] and raw.recv(65536) == b''   # nothing was sent
+        # The client closed with our packet unread, so Linux may report a reset
+        # rather than EOF; either way no request may have been sent first.
+        received = []
+        assert select.select([raw], [], [], 1)[0]
+        try:
+            while True:
+                data = raw.recv(65536)
+                if not data:
+                    break
+                received.append(data)
+        except ConnectionResetError:
+            pass
+        assert received == []
 
 
 @pytest.mark.parametrize('reply_sequence', [2, 0])
@@ -554,3 +567,16 @@ def test_a_peer_exit_wakes_a_waiting_coordinator_promptly(parts):
         client.get(command(manifest, 'deploy_container'), 30)
     os.waitpid(child, 0)
     assert time.monotonic() - started < 5 and client.closed
+
+
+def test_a_peer_closing_with_unread_packets_is_reported_as_a_reset(parts):
+    adapter, backend, manifest = parts
+    executor_end, coordinator_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    broker = InheritedCommandBroker(executor_end.detach(), adapter, me())
+    with raw_end(coordinator_end) as raw:
+        raw.send(request_packet(manifest))
+        broker.serve_once(5)
+        # The reply stays unread when the coordinator end closes.
+    with pytest.raises(BrokerPeerReset):
+        broker.serve_once(5)
+    assert broker.closed and backend.events.count('create') == 1
