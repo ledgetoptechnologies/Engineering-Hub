@@ -25,6 +25,8 @@ _KEY = re.compile(r'[0-9a-f]{64}\Z')
 _SOCKET_TARGET = '/run/hub-gate/controller.sock'
 _ENTRYPOINT = ('/opt/venv/bin/python', '-I', '-B', '-m',
                'hub_container_executor.application_mount_gate')
+STATIC_ENTRYPOINT = ('/usr/local/libexec/hub-application-gate',)
+STATIC_SCHEMA = 'engineering-hub.application-gate-enrollment.v2'
 _FIELDS = frozenset({'schema', 'manifest_digest', 'supervisor_profile_digest', 'role',
     'runnable_digest', 'platform_manifest_digest', 'image_config_id', 'source_commit',
     'build_record_digest', 'bootstrap_digest', 'controller_public_key',
@@ -58,6 +60,7 @@ class ApplicationGateEnrollment:
     controller_public_key: bytes
     socket_target: str
     request_timeout_ms: int
+    schema: str = 'engineering-hub.application-gate-enrollment.v1'
 
     def check(self):
         try:
@@ -88,7 +91,7 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
         raw, identity = _root_file(_path(path), 65536)
         data = _strict(raw, 65536)
         if (type(data) is not dict or set(data) != _FIELDS
-                or data['schema'] != 'engineering-hub.application-gate-enrollment.v1'
+                or data['schema'] not in ('engineering-hub.application-gate-enrollment.v1', STATIC_SCHEMA)
                 or data['role'] not in ('candidate', 'rollback')
                 or data['role'] != image.role
                 or data['manifest_digest'] != manifest.digest()
@@ -117,7 +120,8 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
         # An image-default gate is a distinct image contract; a command override
         # or a legacy Hub image cannot satisfy this versioned enrollment.
         config = image.image_config.get('config')
-        if (type(config) is not dict or config.get('Entrypoint') != list(_ENTRYPOINT)
+        expected_entrypoint = STATIC_ENTRYPOINT if data['schema'] == STATIC_SCHEMA else _ENTRYPOINT
+        if (type(config) is not dict or config.get('Entrypoint') != list(expected_entrypoint)
                 or config.get('Cmd') not in ([], None)):
             raise ValueError()
         supervisor._guard()
@@ -127,6 +131,6 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
             data['supervisor_profile_digest'], data['role'], data['runnable_digest'],
             data['platform_manifest_digest'], data['image_config_id'], data['source_commit'],
             data['build_record_digest'], data['bootstrap_digest'],
-            bytes.fromhex(data['controller_public_key']), data['socket_target'], data['request_timeout_ms'])
+            bytes.fromhex(data['controller_public_key']), data['socket_target'], data['request_timeout_ms'], data['schema'])
     except Exception:
         raise ApplicationGateEnrollmentError() from None

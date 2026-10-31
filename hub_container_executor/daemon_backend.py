@@ -11,6 +11,8 @@ import json
 import os
 import re
 import stat
+import struct
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +65,48 @@ _MAX_DESCRIPTORS = 64
 _MAX_PROBES = 3
 _MAX_EXEC_OUTPUT = 64 * 1024
 _FIXED_TMPFS_SIZE_MAX = 256 * 1024**2
+_MAX_GATE_BINARY = 8 * 1024**2
+
+
+def _static_gate_archive(raw, expected_digest, architecture):
+    """Validate one bounded USTAR regular file and a non-interpreted 64-bit ELF."""
+    try:
+        if (type(raw) is not bytes or len(raw) < 1536 or len(raw) % 512
+                or len(raw) > _MAX_GATE_BINARY + 65536
+                or raw[257:263] != b'ustar\0' or raw[263:265] != b'00'):
+            raise ValueError()
+        member = tarfile.TarInfo.frombuf(raw[:512], encoding='utf-8', errors='strict')
+        if (member.name != 'hub-application-gate' or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                or member.linkname or member.pax_headers or not 64 <= member.size <= _MAX_GATE_BINARY
+                or member.mode != 0o755):
+            raise ValueError()
+        end = 512 + member.size
+        padded = (end + 511) // 512 * 512
+        if padded + 1024 > len(raw) or any(raw[end:]):
+            raise ValueError()
+        binary = raw[512:end]
+        if 'sha256:' + hashlib.sha256(binary).hexdigest() != expected_digest:
+            raise ValueError()
+        header = struct.unpack_from('<16sHHIQQQIHHHHHH', binary)
+        ident, kind, machine, version, entry, phoff = header[:6]
+        phentsize, phnum = header[9], header[10]
+        if (ident[:7] != b'\x7fELF\x02\x01\x01' or kind not in (2, 3)
+                or machine != {'amd64': 62, 'arm64': 183}.get(architecture)
+                or version != 1 or header[8] != 64 or phentsize != 56
+                or not 1 <= phnum <= 128 or phoff < 64 or phoff + phentsize * phnum > len(binary)):
+            raise ValueError()
+        executable_entry = False
+        for index in range(phnum):
+            ptype, flags, offset, vaddr, _paddr, filesz, memsz, _align = struct.unpack_from(
+                '<IIQQQQQQ', binary, phoff + index * phentsize)
+            if ptype in (2, 3) or filesz > memsz or offset + filesz > len(binary):
+                raise ValueError()
+            if ptype == 1 and flags & 1 and vaddr <= entry < vaddr + memsz:
+                executable_entry = True
+        if not executable_entry:
+            raise ValueError()
+    except (ValueError, TypeError, struct.error, tarfile.TarError, OverflowError):
+        raise DaemonBackendError('application gate bootstrap unavailable') from None
 
 
 class ArchiveMetadataError(ValueError):
@@ -1332,6 +1376,50 @@ class DockerEngineBackend:
         self._container_generations.setdefault(container_id, generation_id)
         return ContainerObservation(container_id, expected_image, profile,
                                     generation_id, status)
+
+    def inspect_created_gate_bootstrap(self, container_id, *, manifest, image, supervisor,
+                                       enrollment_file, timeout_ms):
+        """Read exact created-container bootstrap under protected v2 enrollment.
+
+        This method has no caller in the enabled launch path. A successful
+        observation is not image provenance, host/daemon writer exclusion,
+        atomic check-to-exec, or permission to start. The owner must hold the
+        existing operation on any error or uncertain outcome, without retry.
+        """
+        from .application_gate_enrollment import (
+            STATIC_ENTRYPOINT, STATIC_SCHEMA, load_application_gate_enrollment,
+        )
+        try:
+            deadline = self._deadline(timeout_ms)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=supervisor)
+            if (enrolled.schema != STATIC_SCHEMA or type(container_id) is not str
+                    or not CONTAINER_ID_RE.fullmatch(container_id)
+                    or self._container_images.get(container_id) != image
+                    or container_id not in self._container_profiles
+                    or container_id not in self._container_generations):
+                raise ValueError()
+            self._assert_runner(deadline)
+            before = self._known_container(container_id, 'created', deadline)
+            if (before.selected_image != ActualImageSelection(image.runnable_reference,
+                    image.platform_manifest_digest, image.image_config_id, image.platform)
+                    or before.profile.entrypoint != STATIC_ENTRYPOINT or before.profile.command != ()):
+                raise ValueError()
+            raw = self._read_response('GET', self._route('/containers/' + container_id + '/archive'),
+                deadline, expected_status=200, params={'path': STATIC_ENTRYPOINT[0]},
+                body_limit=_MAX_GATE_BINARY + 65536)
+            _static_gate_archive(raw, enrolled.bootstrap_digest, image.platform.architecture)
+            self._assert_runner(deadline)
+            after = self._known_container(container_id, 'created', deadline)
+            if after != before:
+                raise ValueError()
+            current = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=supervisor)
+            if current != enrolled:
+                raise ValueError()
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError('application gate bootstrap unavailable; hold original operation') from None
 
     def inspect_container(self, container_id: str, timeout_ms: int) -> ContainerObservation | None:
         if type(container_id) is not str or not CONTAINER_ID_RE.fullmatch(container_id):
