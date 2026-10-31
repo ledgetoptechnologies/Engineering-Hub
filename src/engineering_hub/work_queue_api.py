@@ -115,7 +115,7 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
     target = WorkTarget(**payload.target.model_dump())
     existing = queue.existing_submission(actor=principal, request_id=payload.request_id,
         action_key=payload.action_key, environment=payload.environment,
-        target=target, approval_id=payload.approval_id)
+        target=target, approval_id=payload.approval_id, require_task_owner=True)
     if existing is not None:
         return existing
     if (task.get('status') != 'verified' or task.get('candidate_commit') != payload.target.source_commit
@@ -125,7 +125,7 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
         raise HubError('review_required', 409)
     return queue.submit(actor=principal, request_id=payload.request_id,
                         action_key=payload.action_key, environment=payload.environment,
-                        target=target, approval_id=payload.approval_id)
+                        target=target, approval_id=payload.approval_id, require_task_owner=True)
 
 
 def _authorization(request):

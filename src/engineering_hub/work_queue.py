@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import json
 import hashlib
 import inspect
+from agent_message_bus import session_hub_context as session_context
 import math
 import os
 import re
@@ -317,23 +318,40 @@ class WorkQueue:
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
         return action, target_json, fingerprint
 
-    def existing_submission(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+    def _assert_submission_owner(self, db, *, actor, action, target):
+        task = self.repo._get(db, target.task_id, 'task')
+        if task.get('owner') != actor or not session_context.continuation_allowed(task, actor):
+            raise HubError('forbidden', 403)
+        if task.get('project') != action.project:
+            raise HubError('work_project_mismatch', 403)
+
+    def existing_submission(self, *, actor, request_id, action_key, environment, target, approval_id=None,
+                            require_task_owner=False):
         """Read one actor's exact prior request; never create or admit work."""
-        _, _, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
+        if type(require_task_owner) is not bool:
+            raise HubError('invalid_work_target')
+        action, _, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
             action_key=action_key, environment=environment, target=target, approval_id=approval_id)
         with self.repo._connection() as db:
+            db.execute('BEGIN')
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
+            if old is not None and require_task_owner:
+                self._assert_submission_owner(db, actor=actor, action=action, target=target)
         if old is None:
             return None
         if old['fingerprint'] != fingerprint:
             raise HubError('work_request_conflict', 409)
         return self._public(old)
 
-    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None,
+               require_task_owner=False):
+        if type(require_task_owner) is not bool:
+            raise HubError('invalid_work_target')
         action, target_json, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
             action_key=action_key, environment=environment, target=target, approval_id=approval_id)
         existing = self.existing_submission(actor=actor, request_id=request_id, action_key=action_key,
-            environment=environment, target=target, approval_id=approval_id)
+            environment=environment, target=target, approval_id=approval_id,
+            require_task_owner=require_task_owner)
         if existing is not None:
             return existing
         # The verifier stays outside the SQLite write transaction and still
@@ -341,6 +359,8 @@ class WorkQueue:
         # which committed while this verifier was running.
         target_verified = self._target_verified(actor, action_key, environment, target)
         with self.repo._transaction() as db:
+            if require_task_owner:
+                self._assert_submission_owner(db, actor=actor, action=action, target=target)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
                 if old['fingerprint'] != fingerprint:

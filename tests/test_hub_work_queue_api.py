@@ -1,4 +1,5 @@
 """ASGI queue endpoints with real local repository/auth and synthetic tokens."""
+import json
 from uuid import uuid4
 
 import pytest
@@ -212,6 +213,53 @@ def test_submit_retry_preserves_session_ownership_guard(rig, monkeypatch):
     assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
     monkeypatch.setattr(work_queue_api.session_context, 'continuation_allowed', lambda *_: False)
     assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+
+
+def test_submit_retry_rechecks_owner_after_initial_task_read(rig, monkeypatch):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    original = queue.existing_submission
+    def transfer_then_lookup(**kwargs):
+        with repo._transaction() as db:
+            task = repo._get(db, payload['target']['task_id'], 'task')
+            task['owner'] = 'hermes'
+            db.execute('UPDATE hub_entities SET data=? WHERE id=? AND kind=?',
+                       (json.dumps(task), task['id'], 'task'))
+        return original(**kwargs)
+    monkeypatch.setattr(queue, 'existing_submission', transfer_then_lookup)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+
+
+def test_submit_retry_rechecks_session_after_initial_task_read(rig, monkeypatch):
+    from engineering_hub import work_queue_api
+    client, _, _, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    checks = []
+    def changed_session(*_):
+        checks.append(True)
+        return len(checks) == 1
+    monkeypatch.setattr(work_queue_api.session_context, 'continuation_allowed', changed_session)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+    assert len(checks) == 2
+
+
+def test_new_submit_rechecks_owner_in_write_transaction(rig, monkeypatch):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    original = queue._target_verified
+    def verify_then_transfer(*args):
+        valid = original(*args)
+        with repo._transaction() as db:
+            task = repo._get(db, payload['target']['task_id'], 'task')
+            task['owner'] = 'hermes'
+            db.execute('UPDATE hub_entities SET data=? WHERE id=? AND kind=?',
+                       (json.dumps(task), task['id'], 'task'))
+        return valid
+    monkeypatch.setattr(queue, '_target_verified', verify_then_transfer)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+    assert not queue.status()['jobs']
 
 
 @pytest.mark.parametrize('evidence', [None, 'untrusted-evidence'])
