@@ -109,6 +109,7 @@ class HostAdapter:
         self._active_operations = 0
         self._active_threads = {}
         self._closing = False
+        self._finish_requested = False
         self._finalizing_close = False
         self._closed = False
         self.ledger = SQLiteLedger(
@@ -139,7 +140,7 @@ class HostAdapter:
                     self._active_threads[thread_id] = remaining
                 else:
                     del self._active_threads[thread_id]
-                if (self._closing and self._active_operations == 0
+                if (self._finish_requested and self._active_operations == 0
                         and not self._finalizing_close):
                     self._finalizing_close = True
                     finalize = True
@@ -156,6 +157,23 @@ class HostAdapter:
                 self._finalizing_close = False
                 self._lifecycle.notify_all()
 
+    def begin_drain(self):
+        """Reject new adapter calls and wait for accepted calls, retaining the ledger.
+
+        This is a local lifecycle boundary, not evidence that external effects or
+        writers are quiescent. The owner must subsequently call close().
+        """
+        if os.getpid() != self._owner_pid:
+            raise InheritedLedgerUse("adapter authority is bound to its creating process")
+        with self._lifecycle:
+            if self._active_threads.get(threading.get_ident(), 0):
+                raise RuntimeError("cannot drain from an active adapter call")
+            self._closing = True
+            while self._active_operations or self._finalizing_close:
+                self._lifecycle.wait()
+            if self._closed or self._finish_requested:
+                raise LedgerClosed("adapter is closed")
+
     def close(self):
         if os.getpid() != self._owner_pid:
             self._closed = True
@@ -166,6 +184,7 @@ class HostAdapter:
             if self._closed:
                 return
             self._closing = True
+            self._finish_requested = True
             # A callback may request shutdown reentrantly. Defer descriptor close
             # until its outer submit/reconcile lease has finished all ledger writes.
             if self._active_threads.get(thread_id, 0):

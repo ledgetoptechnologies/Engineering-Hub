@@ -525,6 +525,39 @@ def test_only_typed_terminal_effect_failure_can_be_failed_and_rollback_can_follo
     adapter.close()
 
 
+def test_begin_drain_waits_and_retains_ledger_until_close(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    original = backend.create_container
+    def blocked(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(5)
+        return result
+    backend.create_container = blocked
+    worker = threading.Thread(target=lambda: adapter.submit(command(manifest, 'deploy_container')))
+    drainer = threading.Thread(target=lambda: (adapter.begin_drain(), drained.set()))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        drainer.start()
+        assert not drained.wait(.05)
+        release.set()
+        assert drained.wait(5)
+        assert adapter.ledger.is_paused() is False
+        with pytest.raises(LedgerClosed):
+            adapter.set_paused(True)
+    finally:
+        release.set()
+        worker.join(10)
+        if drainer.ident is not None:
+            drainer.join(10)
+        adapter.close()
+    assert not worker.is_alive() and not drainer.is_alive()
+    with pytest.raises(LedgerClosed):
+        adapter.ledger.is_paused()
+
+
 def test_close_waits_for_inflight_effect_and_keeps_owner_exclusive(tmp_path):
     adapter, backend, _state, manifest = make_fixture(tmp_path)
     request = command(manifest, "deploy_container")

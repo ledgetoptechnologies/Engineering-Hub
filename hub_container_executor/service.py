@@ -229,14 +229,18 @@ async def _serve_owned_executor(resource_factory, *, bearer_token, listener_fact
                     gate.close_admission()
             finally:
                 try:
-                    if gate_worker is not None:
-                        await finish_owned(asyncio.to_thread(gate_worker.close))
+                    if adapter is not None:
+                        await finish_owned(asyncio.to_thread(adapter.begin_drain))
                 finally:
                     try:
-                        if adapter is not None:
-                            await finish_owned(asyncio.to_thread(adapter.close))
+                        if gate_worker is not None:
+                            await finish_owned(asyncio.to_thread(gate_worker.close))
                     finally:
-                        await finish_owned(asyncio.to_thread(_exit_context, manager, sys.exc_info()))
+                        try:
+                            if adapter is not None:
+                                await finish_owned(asyncio.to_thread(adapter.close))
+                        finally:
+                            await finish_owned(asyncio.to_thread(_exit_context, manager, sys.exc_info()))
 
     try:
         # Initial scheduling precedes resource construction. This retained task

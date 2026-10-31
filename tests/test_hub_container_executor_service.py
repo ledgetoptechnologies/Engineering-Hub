@@ -65,7 +65,10 @@ async def test_opt_in_gate_worker_drains_before_adapter_close(owned, tmp_path, m
             timeout_seconds=2)
         close = worker.close
         def close_worker():
-            try: close()
+            try:
+                assert adapter._closing and adapter._active_operations == 0
+                assert adapter.ledger.is_paused() is False
+                close()
             finally: owned.events.append('worker-close')
         worker.close = close_worker
         return worker
