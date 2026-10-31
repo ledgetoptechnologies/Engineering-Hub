@@ -7,6 +7,19 @@ not enable itself from import, environment, Hub startup, or a listener.
 
 ## Implemented source boundary
 
+Installed executor configuration `engineering-hub.installed-executor.v7` may
+explicitly enroll `pair_ledger_directory` with the signed profile mode
+`pair-outcome-listener-v1`. This separate listener accepts only authenticated
+pair seal and post-drain outcome requests. Its one-shot FD handoff has a
+distinct protocol and binds the original launch, manifest, signed profile,
+listener and filesystem socket identities. The root-controlled directory and
+direct peer custody remain independently enforced host prerequisites. This
+mode does not enable the guarded gate-mount runtime or generation isolation.
+The sealed outcome reports raw ledger state; it does not establish external
+writer quiescence, authorize release, or protect against database rollback.
+Uncertain handoff or stop remains held. Actual host launch and paired lifecycle
+acceptance are still pending.
+
 - `ledger.py`: private local SQLite admission/run/target/phase/operation records,
   stable payload replay, target/fence reservation, exact phase ordering, pause
   checks before each effect intent, a separate private HMAC key for operation

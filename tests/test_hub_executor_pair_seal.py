@@ -167,7 +167,7 @@ def test_post_drain_signed_outcome_requires_original_seal_and_ack(tmp_path, monk
         verifier.close(); ledger.close()
 
 
-@pytest.mark.parametrize('scenario', ['valid', 'wrong_key', 'expired_in_transaction'])
+@pytest.mark.parametrize('scenario', ['valid', 'wrong_key', 'expired_in_transaction', 'pair_only', 'cross_domain'])
 def test_signed_live_supervisor_channel_commits_one_seal(tmp_path, monkeypatch, scenario):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     ledger = open_ledger(tmp_path)
@@ -181,11 +181,12 @@ def test_signed_live_supervisor_channel_commits_one_seal(tmp_path, monkeypatch, 
     peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
     worker = GateLedgerWorker(channel=server, ledger=ledger, supervisor_public_key=public,
         launch_verifier=verifier, manifest_digest=MANIFEST, hold_uncertain=lambda _: None,
-        timeout_seconds=3, completion_policy=policy, require_sender_liveness=True)
+        timeout_seconds=3, completion_policy=None if scenario in ('pair_only', 'cross_domain') else policy,
+        require_sender_liveness=True, pair_only=scenario in ('pair_only', 'cross_domain'))
     supervisor = SupervisorLedgerClient(channel=client, peer=peer,
         signing_key=Ed25519PrivateKey.generate() if scenario == 'wrong_key' else key,
         launch_binding=verifier.launch_binding(), manifest_digest=MANIFEST,
-        timeout_seconds=1 if scenario == 'expired_in_transaction' else 3)
+        timeout_seconds=1 if scenario == 'expired_in_transaction' else 3, pair_only=scenario == 'pair_only')
     original_transaction = ledger._transaction
     if scenario == 'expired_in_transaction':
         @contextmanager
@@ -200,7 +201,7 @@ def test_signed_live_supervisor_channel_commits_one_seal(tmp_path, monkeypatch, 
         except Exception as error: results.append(error)
     thread = threading.Thread(target=serve); thread.start()
     try:
-        if scenario != 'valid':
+        if scenario not in ('valid', 'pair_only'):
             with pytest.raises(GateLedgerChannelError): supervisor.invoke('seal_pair_drain_v1', {'pair_id':str(uuid4())})
             thread.join(4); assert not thread.is_alive() and isinstance(results[0], GateLedgerChannelError)
             monkeypatch.setattr(ledger, '_transaction', original_transaction)

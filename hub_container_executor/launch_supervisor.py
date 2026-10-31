@@ -54,6 +54,7 @@ _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
 GATE_MOUNT_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-mount-observation-request.v1'
 GATE_LEDGER_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-ledger-handoff-request.v1'
+PAIR_LEDGER_REQUEST_PROTOCOL = 'engineering-hub.executor-pair-outcome-handoff-request.v1'
 _TARGETS = LAUNCH_TARGETS
 
 
@@ -1314,7 +1315,17 @@ class LaunchSupervisor:
             _require(state['Pid'] == self._consumer.pid)
             time.sleep(min(0.05, _remaining(deadline)))
 
-    def launch(self, *, pair_reservation=None):
+    def _check_retained_pair(self, retained_pair):
+        """Require the exact retained owner at each supervised v3 effect."""
+        if getattr(getattr(self, 'profile', None), 'role', None) == 'supervised-local-coordinator-v3':
+            from .retained_oauth_pair import RetainedOAuthPair
+            _require(type(retained_pair) is RetainedOAuthPair and getattr(self, '_retained_pair', None) is retained_pair
+                     and retained_pair._coordinator is self)
+            retained_pair._check_authority()
+        else:
+            _require(retained_pair is None)
+
+    def launch(self, *, pair_reservation=None, retained_pair=None):
         """One bounded real create/start. Any uncertain effect stays held forever."""
         _require(self._pid == os.getpid())
         with self._mutex:
@@ -1326,6 +1337,8 @@ class LaunchSupervisor:
                 # Before any socket bind or Engine request: wrong live maps mean no effect at all.
                 self._check_daemon_maps()
                 if pair_reservation is None:
+                    self._check_retained_pair(retained_pair)
+                    _remaining(deadline)
                     self._bind_issuer()
                 self._pin_sources()
                 defaults = self._engine.image(self.image, deadline)
@@ -1348,6 +1361,8 @@ class LaunchSupervisor:
                 self._launch_id = launch_id
                 if pair_reservation is not None:
                     pair_reservation._check_launch(self)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 _, created = self._engine.json('POST', '/containers/create?name=eh-executor-' + launch_id,
                     deadline, body=self._create_body(), statuses=(201,))
                 _require(type(created) is dict and set(created) <= {'Id', 'Warnings'}
@@ -1357,6 +1372,8 @@ class LaunchSupervisor:
                 self._journal.state(launch_id, 'created', self._record())
                 self._inspect(deadline, running=False)
                 self._journal.state(launch_id, 'start_reserved', self._record())
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 self._engine.json('POST', '/containers/' + self._container_id + '/start', deadline, statuses=(204,))
                 state = self._inspect(deadline, running=True)
                 self._consumer = _Process(state['Pid'])
@@ -1481,7 +1498,7 @@ class LaunchSupervisor:
                 self._hold()
             raise LaunchSupervisorError() from None
 
-    def serve_one_receipt(self):
+    def serve_one_receipt(self, *, retained_pair=None):
         """One direct init-peer exchange; caller explicitly chooses to serve it."""
         _require(self._pid == os.getpid())
         with self._mutex:
@@ -1513,6 +1530,8 @@ class LaunchSupervisor:
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')  # One frame plus explicit SHUT_WR, no trailing data.
                 self._validate_live(deadline)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 self._journal.reserve_issuance(self._launch_id, request['nonce'])
                 reserved = True
                 self._issuance_open = False
@@ -1535,6 +1554,8 @@ class LaunchSupervisor:
                 raw = _canonical({'payload': payload, 'signature': signature})
                 _require(len(raw) <= MAX_RECEIPT_BYTES)
                 self._validate_live(deadline)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 peer.settimeout(_remaining(deadline))
                 peer.sendall(struct.pack('!I', len(raw)) + raw)
                 peer.shutdown(socket.SHUT_WR)
@@ -1649,6 +1670,7 @@ class LaunchSupervisor:
                  (self.profile.command_channel == 'inherited-seqpacket-v1'))
         _require((parsed.gate_socket_directory is not None) == (self.profile.gate_channel is not None))
         _require(parsed.gate_ledger_channel == (self.profile.gate_ledger_channel == 'supervisor-listener-v1'))
+        _require((parsed.pair_ledger_directory is not None) == (self.profile.gate_ledger_channel == 'pair-outcome-listener-v1'))
         if self.profile.executor_endpoint is not None:
             _require(Path(parsed.socket_path).parent == Path(EXECUTOR_ENDPOINT_TARGET))
             name = Path(parsed.socket_path).name
@@ -1657,6 +1679,8 @@ class LaunchSupervisor:
             self._executor_endpoint_name = name
         if parsed.gate_socket_directory is not None:
             _require(self._mounts['gate_channel_directory'].source == parsed.gate_socket_directory)
+        if parsed.pair_ledger_directory is not None:
+            _require(self._mounts['gate_channel_directory'].source == parsed.pair_ledger_directory)
         return parsed
 
     def _handoff_manifest_digest(self):
@@ -2946,7 +2970,7 @@ class LaunchSupervisor:
                     _require(not self._held or self._hold_persisted)
                 else:
                     self._guard(); self._validate_live(deadline)
-                _require(self.profile.gate_ledger_channel == 'supervisor-listener-v1'
+                _require(self.profile.gate_ledger_channel in ('supervisor-listener-v1', 'pair-outcome-listener-v1')
                          and self._journal.ledger_mode and self._handoff_manifest_digest() == manifest_digest
                          and self._consumer is not None)
                 self._ledger_handoff_path_check()
@@ -2971,7 +2995,7 @@ class LaunchSupervisor:
                     launch_binding=(self._launch_id, self._consumer.boot, self._consumer.pid,
                                     self._consumer.start, self._container_id),
                     manifest_digest=manifest_digest, timeout_seconds=min(timeout_seconds, _remaining(deadline)),
-                    lookup_only=lookup_only)
+                    lookup_only=lookup_only, pair_only=self.profile.gate_ledger_channel == 'pair-outcome-listener-v1')
             yield client
             with self._observation_mutex(deadline):
                 if lookup_only: self._validate_live(deadline, allow_held=True)
@@ -2988,17 +3012,17 @@ class LaunchSupervisor:
             if peer is not None: peer.close()
             if channel is not None: channel.close()
 
-    def _issue_ledger_handoff_locked(self, peer, nonce, deadline):
+    def _issue_ledger_handoff_locked(self, peer, nonce, deadline, *, pair_only=False):
         """Reserve once and deliver one protected listener to the exact executor.
 
         Delivery may be uncertain; the durable reservation is never retryable.
         Host isolation and exclusive descriptor custody remain external gates.
         """
-        from .gate_ledger_handoff import PROTOCOL, AUDIENCE, DOMAIN
+        from .gate_ledger_handoff import PROTOCOL, AUDIENCE, DOMAIN, PAIR_PROTOCOL, PAIR_AUDIENCE, PAIR_DOMAIN
         try:
             self._guard()
             _require(self._receipt_served and not self._issuance_open and self._journal.ledger_mode
-                     and self.profile.gate_ledger_channel == 'supervisor-listener-v1'
+                     and self.profile.gate_ledger_channel == ('pair-outcome-listener-v1' if pair_only else 'supervisor-listener-v1')
                      and self._ledger_handoff_parent is None and self._ledger_handoff_listener is None)
             self._validate_live(deadline)
             manifest = self._handoff_manifest_digest()
@@ -3033,7 +3057,7 @@ class LaunchSupervisor:
             expires = min(now + 5000, now + int(_remaining(self._expires) * 1000),
                           self._approval_expires_at_ms)
             _require(now < expires)
-            binding = {'protocol': PROTOCOL, 'audience': AUDIENCE, 'nonce': nonce,
+            binding = {'protocol': PAIR_PROTOCOL if pair_only else PROTOCOL, 'audience': PAIR_AUDIENCE if pair_only else AUDIENCE, 'nonce': nonce,
                 'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
                 'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
                 'container_id': self._container_id, 'manifest_digest': manifest,
@@ -3041,7 +3065,7 @@ class LaunchSupervisor:
                 'listener_device': fd_info.st_dev, 'listener_inode': fd_info.st_ino,
                 'path_device': initial.st_dev, 'path_inode': initial.st_ino,
                 'issued_at_ms': now, 'expires_at_ms': expires}
-            signature = base64.urlsafe_b64encode(self._signer.sign(DOMAIN + _canonical(binding))).rstrip(b'=').decode()
+            signature = base64.urlsafe_b64encode(self._signer.sign((PAIR_DOMAIN if pair_only else DOMAIN) + _canonical(binding))).rstrip(b'=').decode()
             raw = _canonical({'payload': binding, 'signature': signature})
             profile_raw = _canonical(self.profile.enrollment_value())
             _require(0 < len(raw) <= MAX_RECEIPT_BYTES and 0 < len(profile_raw) <= MAX_PROFILE_BYTES
@@ -3093,7 +3117,7 @@ class LaunchSupervisor:
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
                          and request['protocol'] in (CURRENT_REQUEST_PROTOCOL, GATE_MOUNT_REQUEST_PROTOCOL,
-                                                     GATE_LEDGER_REQUEST_PROTOCOL)
+                                                     GATE_LEDGER_REQUEST_PROTOCOL, PAIR_LEDGER_REQUEST_PROTOCOL)
                          and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
@@ -3108,6 +3132,8 @@ class LaunchSupervisor:
             try:
                 if request['protocol'] == GATE_LEDGER_REQUEST_PROTOCOL:
                     return self._issue_ledger_handoff_locked(peer, request['nonce'], deadline)
+                if request['protocol'] == PAIR_LEDGER_REQUEST_PROTOCOL:
+                    return self._issue_ledger_handoff_locked(peer, request['nonce'], deadline, pair_only=True)
                 raw = (self._observe_gate_mount_locked(request['nonce'], deadline)
                        if request['protocol'] == GATE_MOUNT_REQUEST_PROTOCOL
                        else self._observe_current_launch_locked(request['nonce'], deadline))
@@ -3272,7 +3298,7 @@ class LaunchSupervisor:
                 _require(client.invoke('pair_outcome_v1', {'pair_id': pair_id}) is None)
             with self._mutex:
                 self._guard()
-                _require(self.profile.gate_ledger_channel == 'supervisor-listener-v1')
+                _require(self.profile.gate_ledger_channel in ('supervisor-listener-v1', 'pair-outcome-listener-v1'))
                 self._validate_live(deadline)
                 self._journal.state(self._launch_id, 'term_reserved', self._record())
                 self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',

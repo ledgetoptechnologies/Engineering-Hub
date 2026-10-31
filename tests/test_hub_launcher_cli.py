@@ -115,6 +115,30 @@ def test_listener_join_error_does_not_abandon_live_thread(module):
     assert isinstance(errors[0], RuntimeError) and len(calls) == 2
 
 
+@pytest.mark.parametrize('role', ['supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'])
+def test_launcher_dispatches_coordinator_wait_and_drain(module, monkeypatch, role):
+    calls = []
+    class Supervisor:
+        def __init__(self, **_):
+            self.profile = SimpleNamespace(role=role)
+            self._coordinator_stop_grace = 1120
+            self._coordinator_admission = SimpleNamespace(timeout_ms=2000)
+        def launch(self): calls.append('launch')
+        def wait_for_receipt_request(self, **_): return True
+        def serve_one_receipt(self): calls.append('receipt')
+        def wait_for_coordinator_stop(self, **_): calls.append('wait-coordinator'); return True
+        def wait_for_stop_with_observations(self, **_): raise AssertionError('executor observation path')
+        def graceful_stop_coordinator(self, **_): calls.append('drain-coordinator')
+        def graceful_stop(self): raise AssertionError('executor stop path')
+        def close(self): calls.append('close')
+    monkeypatch.setattr(module, '_host_available', lambda: True)
+    monkeypatch.setattr(module, '_load_supervisor', lambda: Supervisor)
+    monkeypatch.setattr(module, '_install_handlers', lambda _: [])
+    monkeypatch.setattr(module, '_restore_handlers', lambda _: None)
+    assert module.main(ARGS + ['--execute', '--create-journal']) == 0
+    assert calls == ['launch', 'receipt', 'wait-coordinator', 'drain-coordinator', 'close']
+
+
 def test_launcher_preflights_and_drains_custodian_before_supervisor_stop(module, monkeypatch):
     calls = []; state = SimpleNamespace(stop=None)
     worker_started = threading.Event(); worker_release = threading.Event()

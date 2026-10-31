@@ -18,9 +18,12 @@ def coordinator(authority, role='supervised-local-coordinator-v2'):
 
 
 @pytest.mark.parametrize('role', ['supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'])
-def test_coordinator_issuer_signs_role_specific_receipt_and_never_serves_executor_observations(synthetic_issuer, role):
+def test_coordinator_issuer_signs_role_specific_receipt_and_never_serves_executor_observations(synthetic_issuer, role, monkeypatch):
     authority, path, checks = synthetic_issuer
     coordinator(authority, role)
+    if role=='supervised-local-coordinator-v3':
+        # Protocol test only; retained-owner authorization is tested separately.
+        monkeypatch.setattr(authority,'_check_retained_pair',lambda _:None)
     thread, result = serve_fixture(authority)
     transport = CoordinatorUnixLaunchReceiptTransport(socket_path=str(path),
         expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())
@@ -38,6 +41,43 @@ def test_coordinator_issuer_signs_role_specific_receipt_and_never_serves_executo
         if verifier is not None: verifier.close()
         transport.close()
         thread.join(3); assert not thread.is_alive()
+
+
+def test_v3_issuer_rejects_missing_retained_owner(synthetic_issuer):
+    authority,_,_=synthetic_issuer
+    coordinator(authority,'supervised-local-coordinator-v3')
+    with pytest.raises(launch.LaunchSupervisorError): authority._check_retained_pair(None)
+
+
+def test_v3_issuer_accepts_only_exact_installed_retained_owner(synthetic_issuer,monkeypatch):
+    from hub_container_executor.retained_oauth_pair import RetainedOAuthPair
+    authority,_,_=synthetic_issuer
+    coordinator(authority,'supervised-local-coordinator-v3')
+    owned=object.__new__(RetainedOAuthPair);owned._coordinator=authority
+    calls=[];monkeypatch.setattr(RetainedOAuthPair,'_check_authority',lambda self:calls.append(self))
+    authority._retained_pair=owned
+    authority._check_retained_pair(owned);assert calls==[owned]
+    with pytest.raises(launch.LaunchSupervisorError):authority._check_retained_pair(object())
+
+
+def test_v3_pair_hook_consuming_receipt_deadline_denies_reservation(synthetic_issuer,monkeypatch):
+    import time as real_time
+    authority,path,_=synthetic_issuer
+    coordinator(authority,'supervised-local-coordinator-v3')
+    clock=SimpleNamespace(offset=0)
+    monkeypatch.setattr(launch,'time',SimpleNamespace(monotonic=lambda:real_time.monotonic()+clock.offset,
+                                                     time=real_time.time,sleep=real_time.sleep))
+    monkeypatch.setattr(authority,'_check_retained_pair',lambda _:setattr(clock,'offset',5))
+    thread,result=serve_fixture(authority)
+    transport=CoordinatorUnixLaunchReceiptTransport(socket_path=str(path),
+        expected_issuer_uid=os.geteuid(),expected_issuer_gid=os.getegid())
+    try:
+        with pytest.raises(identity.RuntimeIdentityError):transport.issue_receipt(nonce='a'*64,timeout_ms=1000)
+        thread.join(3);assert not thread.is_alive() and isinstance(result[0],launch.LaunchSupervisorError)
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone()==(0,)
+    finally:
+        transport.close();thread.join(3);assert not thread.is_alive()
 
 
 def test_coordinator_issuer_rejects_executor_request(synthetic_issuer):

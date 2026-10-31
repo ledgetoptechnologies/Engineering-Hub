@@ -18,6 +18,9 @@ from .runtime_identity import LaunchReceiptIdentityVerifier, _canonical, _strict
 PROTOCOL = 'engineering-hub.gate-ledger-handoff.v1'
 AUDIENCE = 'engineering-hub.container-executor-ledger'
 DOMAIN = b'engineering-hub-gate-ledger-handoff-v1\x00'
+PAIR_PROTOCOL = 'engineering-hub.pair-outcome-handoff.v1'
+PAIR_AUDIENCE = 'engineering-hub.container-executor-pair-outcome'
+PAIR_DOMAIN = b'engineering-hub-pair-outcome-handoff-v1\x00'
 FIELDS = frozenset({'protocol', 'audience', 'nonce', 'launch_id', 'boot_id',
     'authenticated_host_pid', 'process_start_ticks', 'container_id', 'manifest_digest',
     'launch_profile_digest', 'listener_device', 'listener_inode', 'path_device', 'path_inode',
@@ -28,7 +31,7 @@ class GateLedgerHandoffError(RuntimeError):
     def __init__(self): super().__init__('gate ledger handoff unavailable')
 
 
-def verify_handoff(raw, fd, *, verifier, nonce, manifest_digest, source_directory, start_wall_ms, start_monotonic):
+def verify_handoff(raw, fd, *, verifier, nonce, manifest_digest, source_directory, start_wall_ms, start_monotonic, pair_only=False):
     """Reverify signed bytes and the exact borrowed listener on every use."""
     try:
         if (type(verifier) is not LaunchReceiptIdentityVerifier or type(raw) is not bytes
@@ -38,7 +41,8 @@ def verify_handoff(raw, fd, *, verifier, nonce, manifest_digest, source_director
                 or type(source_directory) is not str or not source_directory.startswith('/')
                 or os.path.normpath(source_directory) != source_directory or source_directory.startswith('//')
                 or type(start_wall_ms) is not int or start_wall_ms <= 0
-                or type(start_monotonic) not in (int, float) or not math.isfinite(start_monotonic)):
+                or type(start_monotonic) not in (int, float) or not math.isfinite(start_monotonic)
+                or type(pair_only) is not bool):
             raise ValueError()
         binding = verifier.launch_binding()
         profile = verifier.launch_profile_digest()
@@ -50,11 +54,11 @@ def verify_handoff(raw, fd, *, verifier, nonce, manifest_digest, source_director
             raise ValueError()
         signature = base64.b64decode(sig + '==', altchars=b'-_', validate=True)
         if len(signature) != 64 or base64.urlsafe_b64encode(signature).rstrip(b'=').decode() != sig: raise ValueError()
-        Ed25519PublicKey.from_public_bytes(key).verify(signature, DOMAIN + _canonical(payload))
+        Ed25519PublicKey.from_public_bytes(key).verify(signature, (PAIR_DOMAIN if pair_only else DOMAIN) + _canonical(payload))
         observed = tuple(payload[k] for k in ('launch_id', 'boot_id', 'authenticated_host_pid',
                                               'process_start_ticks', 'container_id'))
         if (any(type(a) is not type(b) or a != b for a, b in zip(observed, binding))
-                or payload['protocol'] != PROTOCOL or payload['audience'] != AUDIENCE
+                or payload['protocol'] != (PAIR_PROTOCOL if pair_only else PROTOCOL) or payload['audience'] != (PAIR_AUDIENCE if pair_only else AUDIENCE)
                 or payload['nonce'] != nonce or payload['manifest_digest'] != manifest_digest
                 or payload['launch_profile_digest'] != profile): raise ValueError()
         if any(type(payload[k]) is not int or payload[k] < (1 if k.endswith('inode') else 0)

@@ -326,7 +326,7 @@ class ExecutorLaunchProfile(_Closed):
     # Explicit new profile only; absent preserves every legacy profile digest.
     gate_channel: Literal['protected-socket-v1'] | None = None
     gate_completion: GateCompletionPolicy | None = None
-    gate_ledger_channel: Literal['supervisor-listener-v1'] | None = None
+    gate_ledger_channel: Literal['supervisor-listener-v1', 'pair-outcome-listener-v1'] | None = None
     generation_isolation: GenerationIsolationPolicy | None = None
     # Host-side signed expectations only. Existing runtime guard remains closed.
     custodian_control: CustodianControlPolicy | None = None
@@ -407,8 +407,14 @@ class ExecutorLaunchProfile(_Closed):
             roles.add('gate_channel_directory')
         if self.gate_completion is not None:
             _require(self.gate_channel == 'protected-socket-v1' and self.daemon_policy is not None)
-        if self.gate_ledger_channel is not None:
+        if self.gate_ledger_channel == 'supervisor-listener-v1':
             _require(self.gate_completion is not None and self.gate_channel == 'protected-socket-v1')
+        if self.gate_ledger_channel == 'pair-outcome-listener-v1':
+            _require(self.role is None and self.broker_mode is None and self.command_channel is None
+                     and self.daemon_policy is not None and self.gate_channel is None
+                     and self.gate_completion is None and self.generation_isolation is None
+                     and self.custodian_control is None)
+            roles.add('gate_channel_directory')
         if self.generation_isolation is not None:
             isolation, daemon = self.generation_isolation, self.daemon_policy
             _require(self.gate_ledger_channel is not None and daemon is not None

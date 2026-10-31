@@ -42,6 +42,7 @@ PAIR_SCHEMA = 'engineering-hub.installed-executor.v2'
 GATE_SCHEMA = 'engineering-hub.installed-executor.v3'
 GATE_LEDGER_SCHEMA = 'engineering-hub.installed-executor.v5'
 BASELINE_GATE_SCHEMA = 'engineering-hub.installed-executor.v6'
+PAIR_LEDGER_SCHEMA = 'engineering-hub.installed-executor.v7'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -127,6 +128,7 @@ class RunnerConfiguration:
     gate_socket_directory: str | None = None
     gate_ledger_channel: bool = False
     baseline_gate: object = None
+    pair_ledger_directory: str | None = None
 
 
 def parse_configuration(raw):
@@ -146,10 +148,11 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA, GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA))
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA, GATE_SCHEMA, GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA, PAIR_LEDGER_SCHEMA))
         extra = ({'pair'} if value['schema'] == PAIR_SCHEMA else
                  {'gate_socket_directory', 'baseline_gate'} if value['schema'] == BASELINE_GATE_SCHEMA else
-                 {'gate_socket_directory'} if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA) else set())
+                 {'gate_socket_directory'} if value['schema'] in (GATE_SCHEMA, GATE_LEDGER_SCHEMA) else
+                 {'pair_ledger_directory'} if value['schema'] == PAIR_LEDGER_SCHEMA else set())
         _object(value, _ROOT_FIELDS | extra)
         _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
@@ -227,6 +230,14 @@ def parse_configuration(raw):
             others.extend((PurePosixPath(binding.unix_socket_path), PurePosixPath(binding.generation_root),
                            PurePosixPath(transport['socket_path']), PurePosixPath(socket_path)))
             _require(all(gate != other and gate not in other.parents and other not in gate.parents for other in others))
+        pair_ledger_directory = None
+        if value['schema'] == PAIR_LEDGER_SCHEMA:
+            pair_ledger_directory = _path(value['pair_ledger_directory'])
+            ledger_dir = PurePosixPath(pair_ledger_directory)
+            others = [PurePosixPath(resources[name]) for name in _RESOURCE_PATHS]
+            others.extend((PurePosixPath(binding.unix_socket_path), PurePosixPath(binding.generation_root),
+                           PurePosixPath(transport['socket_path']), PurePosixPath(socket_path)))
+            _require(all(ledger_dir != other and ledger_dir not in other.parents and other not in ledger_dir.parents for other in others))
         baseline_gate = None
         if value['schema'] == BASELINE_GATE_SCHEMA:
             baseline_gate = dict(_object(value['baseline_gate'], {'issuer_id', 'issuer_public_key_hex',
@@ -271,7 +282,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid(), pair, gate_directory, value['schema'] in (GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA), baseline_gate)
+            socket_path, bearer_slot, os.getpid(), pair, gate_directory, value['schema'] in (GATE_LEDGER_SCHEMA, BASELINE_GATE_SCHEMA), baseline_gate, pair_ledger_directory)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -404,14 +415,16 @@ async def run_installed_executor(config):
                 binding=config.binding, **config.resources, driver_identity_verifier=verifier,
                 **gate_options)
             gate_worker_factory = None
-            if config.gate_ledger_channel:
+            if config.gate_ledger_channel or config.pair_ledger_directory is not None:
                 from .gate_ledger_channel import OwnedGateLedgerService
                 from .gate_ledger_handoff import verify_handoff
                 handoff_transport = UnixCurrentObservationTransport(**config.transport)
                 owned.callback(handoff_transport.close)
+                pair_only = config.pair_ledger_directory is not None
+                ledger_directory = config.pair_ledger_directory if pair_only else config.gate_socket_directory
                 fd, raw, nonce, wall, started, profile_bytes = handoff_transport.issue_ledger_listener(
                     verifier=verifier, manifest_digest=config.manifest.digest(),
-                    source_directory=config.gate_socket_directory, timeout_ms=config.timeout_ms)
+                    source_directory=ledger_directory, timeout_ms=config.timeout_ms, pair_only=pair_only)
                 descriptor = [fd]
                 def close_listener():
                     if descriptor[0] is not None:
@@ -420,15 +433,15 @@ async def run_installed_executor(config):
                 def gate_worker_factory(adapter):
                     _require(descriptor[0] is not None)
                     verify_handoff(raw, descriptor[0], verifier=verifier, nonce=nonce,
-                        manifest_digest=config.manifest.digest(), source_directory=config.gate_socket_directory,
-                        start_wall_ms=wall, start_monotonic=started)
+                        manifest_digest=config.manifest.digest(), source_directory=ledger_directory,
+                        start_wall_ms=wall, start_monotonic=started, pair_only=pair_only)
                     listener = socket.socket(fileno=descriptor[0]); descriptor[0] = None
                     try:
                         return OwnedGateLedgerService(listener=listener, ledger=adapter.ledger,
                             supervisor_public_key=verifier.issuer_public_key(), launch_verifier=verifier,
                             manifest_digest=config.manifest.digest(), hold_uncertain=adapter.ledger.hold_gate_uncertain,
                             timeout_seconds=min(5, config.timeout_ms / 1000), completion_profile_bytes=profile_bytes,
-                            require_sender_liveness=True)
+                            require_sender_liveness=True, pair_only=pair_only)
                     except BaseException:
                         listener.close()
                         raise

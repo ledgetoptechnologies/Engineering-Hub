@@ -902,6 +902,39 @@ def test_launcher_reserves_exact_single_create_and_start_before_fake_engine_effe
         authority.close()
 
 
+@pytest.mark.parametrize('deny_at', [1, 2, 3])
+def test_v3_pair_authority_checked_before_bind_create_and_start(root_journal, monkeypatch, deny_at):
+    authority,events=synthetic_launcher(root_journal)
+    authority.profile=authority.profile.model_copy(update={'role':'supervised-local-coordinator-v3'})
+    checks=[]
+    def check(_):
+        checks.append(len(authority._engine.effect_calls))
+        if len(checks)==deny_at: raise launch.LaunchSupervisorError()
+    monkeypatch.setattr(authority,'_check_retained_pair',check)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError): authority.launch(retained_pair=object())
+        effects=[route for method,route in authority._engine.effect_calls if method=='POST']
+        assert len(checks)==deny_at
+        assert len(effects)==(1 if deny_at==3 else 0)
+        if effects: assert '/create?' in effects[0]
+        if deny_at==1: assert 'bind-fixture' not in events
+    finally:authority.close()
+
+
+def test_v3_pair_hook_consuming_launch_deadline_denies_bind(root_journal,monkeypatch):
+    import time as real_time
+    authority,events=synthetic_launcher(root_journal)
+    authority.profile=authority.profile.model_copy(update={'role':'supervised-local-coordinator-v3'})
+    clock=SimpleNamespace(offset=0)
+    monkeypatch.setattr(launch,'time',SimpleNamespace(monotonic=lambda:real_time.monotonic()+clock.offset,
+                                                     time=real_time.time,sleep=real_time.sleep))
+    monkeypatch.setattr(authority,'_check_retained_pair',lambda _:setattr(clock,'offset',2))
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):authority.launch(retained_pair=object())
+        assert 'bind-fixture' not in events and authority._engine.effect_calls==[]
+    finally:authority.close()
+
+
 def test_launcher_consumes_enrolled_pair_id_before_create(root_journal):
     authority, events = synthetic_launcher(root_journal)
     identity = str(uuid4())
@@ -1848,7 +1881,7 @@ def test_dedicated_executor_endpoint_binds_runner_socket_parent(monkeypatch):
         target='/run/hub-executor',kind='directory',read_only=False,uid=110001,gid=110001,mode=0o700,content_digest=None))
     signed = launch.ExecutorLaunchProfile.model_validate(value)
     subject = SimpleNamespace(profile=signed, _mounts={m.role:m for m in signed.mounts})
-    parsed = SimpleNamespace(pair=None,gate_socket_directory=None,gate_ledger_channel=False,
+    parsed = SimpleNamespace(pair=None,gate_socket_directory=None,gate_ledger_channel=False,pair_ledger_directory=None,
                              socket_path='/run/hub-executor/executor.sock')
     monkeypatch.setattr(installed_runner, 'parse_configuration', lambda raw: parsed)
     assert launch.LaunchSupervisor._runner_configuration(subject, b'fixture') is parsed

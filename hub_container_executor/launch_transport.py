@@ -30,6 +30,7 @@ COORDINATOR_REQUEST_PROTOCOL = "engineering-hub.coordinator-launch-request.v1"
 CURRENT_REQUEST_PROTOCOL = "engineering-hub.executor-current-observation-request.v1"
 GATE_MOUNT_REQUEST_PROTOCOL = "engineering-hub.executor-gate-mount-observation-request.v1"
 GATE_LEDGER_REQUEST_PROTOCOL = "engineering-hub.executor-gate-ledger-handoff-request.v1"
+PAIR_LEDGER_REQUEST_PROTOCOL = "engineering-hub.executor-pair-outcome-handoff-request.v1"
 MAX_REQUEST_BYTES = 256
 _NONCE = re.compile(r"[0-9a-f]{64}\Z")
 _LENGTH = struct.Struct("!I")
@@ -476,7 +477,7 @@ class UnixCurrentObservationTransport:
     def observe_gate_mount(self, *, nonce, timeout_ms):
         return self._observe(nonce=nonce, timeout_ms=timeout_ms, protocol=GATE_MOUNT_REQUEST_PROTOCOL)
 
-    def issue_ledger_listener(self, *, verifier, manifest_digest, source_directory, timeout_ms):
+    def issue_ledger_listener(self, *, verifier, manifest_digest, source_directory, timeout_ms, pair_only=False):
         """Receive one signed listener; caller owns the returned descriptor.
 
         This one-shot exchange must be direct. Lost replies are uncertain and
@@ -486,7 +487,7 @@ class UnixCurrentObservationTransport:
         from engineering_hub.executor_launch_profile import MAX_PROFILE_BYTES, verify_profile_bytes
         fds, admitted = [], False
         try:
-            _require(os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
+            _require(os.getpid() == self._pid and type(pair_only) is bool and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
                      and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
             started, wall = time.monotonic(), int(time.time() * 1000)
             deadline = started + timeout_ms / 1000
@@ -503,7 +504,7 @@ class UnixCurrentObservationTransport:
                 connection.settimeout(_remaining(deadline)); connection.connect(self._path)
                 peer_pid, uid, gid = _CREDENTIALS.unpack(connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _CREDENTIALS.size))
                 _require(peer_pid >= 0 and (uid, gid) == (self._uid, self._gid) and _socket_leaf(self._path) == identity)
-                request = _canonical({'protocol': GATE_LEDGER_REQUEST_PROTOCOL, 'nonce': nonce})
+                request = _canonical({'protocol': PAIR_LEDGER_REQUEST_PROTOCOL if pair_only else GATE_LEDGER_REQUEST_PROTOCOL, 'nonce': nonce})
                 connection.sendall(_LENGTH.pack(len(request)) + request); connection.shutdown(socket.SHUT_WR)
                 result = bytearray()
                 while True:
@@ -530,9 +531,10 @@ class UnixCurrentObservationTransport:
                 raw = _receipt_frame(bytes(result[4:end]))
                 profile_bytes = bytes(result[end + 4:])
                 verify_handoff(raw, fds[0], verifier=verifier, nonce=nonce, manifest_digest=manifest_digest,
-                               source_directory=source_directory, start_wall_ms=wall, start_monotonic=started)
+                               source_directory=source_directory, start_wall_ms=wall, start_monotonic=started, pair_only=pair_only)
                 profile = verify_profile_bytes(profile_bytes, verifier.launch_profile_digest())
-                _require(profile.gate_ledger_channel == 'supervisor-listener-v1' and profile.gate_completion is not None)
+                _require((profile.gate_ledger_channel == 'pair-outcome-listener-v1' and profile.gate_completion is None)
+                         if pair_only else (profile.gate_ledger_channel == 'supervisor-listener-v1' and profile.gate_completion is not None))
                 mount = next((m for m in profile.mounts if m.role == 'gate_channel_directory'), None)
                 _require(mount is not None and mount.source == mount.target == source_directory and mount.read_only)
                 _remaining(deadline)

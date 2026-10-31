@@ -106,6 +106,34 @@ def test_real_ledger_reservation_and_consumption(context):
         assert state(ledger) == [expected]
 
 
+@pytest.mark.parametrize('action', ['reserve', 'consume', 'accept_completion_v5', 'lookup_completion_v5',
+                                    'pending_gate_v5', 'health_ready_v5', 'pending_state_v1'])
+def test_pair_only_worker_rejects_signed_gate_actions(context, action):
+    from hub_container_executor.gate_ledger_channel import PAIR_REQUEST, PAIR_DOMAIN
+    ledger, _, pins, key, public, launch = context
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    worker = GateLedgerWorker(channel=server, ledger=ledger, supervisor_public_key=public,
+        launch_verifier=launch, manifest_digest=pins['manifest_digest'], hold_uncertain=lambda _: None,
+        timeout_seconds=2, require_sender_liveness=True, pair_only=True)
+    results = []
+    def serve():
+        try: results.append(worker.serve_once())
+        except Exception as error: results.append(error)
+    thread = threading.Thread(target=serve); thread.start()
+    try:
+        challenge = json.loads(client.recv(8192))['challenge']; now = int(time.time()*1000)
+        payload = dict(protocol=PAIR_REQUEST, challenge=challenge, launch_binding=list(launch.launch_binding()),
+            manifest_digest=pins['manifest_digest'], action=action, value=pins,
+            issued_at_ms=now, expires_at_ms=now+1000)
+        client.send(canonical({'payload':payload, 'signature':key.sign(PAIR_DOMAIN+canonical(payload)).hex()}))
+        thread.join(3)
+        assert not thread.is_alive() and len(results) == 1 and isinstance(results[0], GateLedgerChannelError)
+        assert state(ledger) == []
+    finally:
+        client.close(); server.close(); thread.join(3)
+
+
 @pytest.mark.parametrize('fault', ['wrong_key', 'expired', 'replayed_challenge', 'wrong_manifest', 'bool_fence'])
 def test_invalid_request_denied_before_ledger_effect(context, fault):
     signer = Ed25519PrivateKey.generate() if fault == 'wrong_key' else None

@@ -81,6 +81,105 @@ def test_gate_v3_config_is_closed_and_source_changes_commitment():
     with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
 
 
+def test_pair_ledger_v7_is_explicit_disjoint_and_preserves_gate_guard():
+    data = configuration(); data['schema'] = module.PAIR_LEDGER_SCHEMA
+    data['pair_ledger_directory'] = '/fixture/pair-ledger'
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.pair_ledger_directory == '/fixture/pair-ledger'
+    assert parsed.gate_socket_directory is None and not parsed.gate_ledger_channel
+    module._require_supported_gate_runtime(parsed)
+    data['pair_ledger_directory'] = '/fixture/secrets/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+    gate = configuration(); gate['schema'] = module.GATE_LEDGER_SCHEMA
+    gate['gate_socket_directory'] = '/fixture/gate-control'
+    with pytest.raises(module.InstalledRunnerError): module._require_supported_gate_runtime(module.parse_configuration(canonical(gate)))
+
+
+@pytest.mark.asyncio
+async def test_installed_pair_ledger_constructs_real_owned_worker(tmp_path, monkeypatch):
+    """Actual runner and signed FD verification; synthetic issuer and service owner."""
+    import base64, socket, threading, time
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
+    from hub_container_executor import gate_ledger_handoff as handoff, ledger as ledger_module
+    from hub_container_executor.broker_seqpacket import PeerPin, _start
+    from hub_container_executor.gate_ledger_channel import SupervisorLedgerClient
+    from tests.test_executor_launch_profile import gate_profile
+    from tests.test_hub_container_executor_runtime_identity import Issuer
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    fixture_root = tmp_path / 'hub-pilot-fixture'; fixture_root.mkdir(mode=0o700)
+    directory = fixture_root / 'ledger-channel'; directory.mkdir(mode=0o700)
+    data = configuration(); data['schema'] = module.PAIR_LEDGER_SCHEMA; data['pair_ledger_directory'] = str(directory)
+    profile_data = gate_profile(str(fixture_root)); del profile_data['gate_channel']
+    profile_data['gate_ledger_channel'] = 'pair-outcome-listener-v1'
+    mount = next(m for m in profile_data['mounts'] if m['role'] == 'gate_channel_directory')
+    mount['source'] = mount['target'] = str(directory)
+    profile = ExecutorLaunchProfile.model_validate(profile_data)
+    data['release_enrollment']['public_key_hex'] = public.hex()
+    data['release_enrollment']['launch_profile_digest'] = profile.digest()
+    config = module.parse_configuration(canonical(data))
+    profile_raw = canonical(profile.enrollment_value())
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(directory / 'ledger.sock')); listener.listen(1)
+    info, leaf = os.fstat(listener.fileno()), os.lstat(directory / 'ledger.sock')
+    ledger_root = tmp_path / 'db'; ledger_root.mkdir(mode=0o700)
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = ledger_module.SQLiteLedger(str(ledger_root / 'ledger.sqlite'), manifest_digest=config.manifest.digest(),
+        candidate_commit=config.manifest.candidate.source_commit, policy_revision=config.manifest.policy_revision)
+    clock = SimpleNamespace(wall=time.time(), mono=time.monotonic())
+    monkeypatch.setattr(module, '_process', lambda: None)
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', lambda **_: Issuer(config.release, key, clock))
+    class Observations:
+        def __init__(self, **_): pass
+        def close(self): pass
+        def issue_ledger_listener(self, *, verifier, manifest_digest, source_directory, timeout_ms, pair_only):
+            assert pair_only and source_directory == str(directory)
+            wall, tick, nonce = int(time.time()*1000), time.monotonic(), 'a'*64
+            binding = verifier.launch_binding()
+            payload = dict(zip(('launch_id','boot_id','authenticated_host_pid','process_start_ticks','container_id'), binding))
+            payload.update(protocol=handoff.PAIR_PROTOCOL, audience=handoff.PAIR_AUDIENCE, nonce=nonce,
+                manifest_digest=manifest_digest, launch_profile_digest=profile.digest(), listener_device=info.st_dev,
+                listener_inode=info.st_ino, path_device=leaf.st_dev, path_inode=leaf.st_ino,
+                issued_at_ms=wall, expires_at_ms=wall+4000)
+            signature = base64.urlsafe_b64encode(key.sign(handoff.PAIR_DOMAIN+canonical(payload))).rstrip(b'=').decode()
+            return os.dup(listener.fileno()), canonical({'payload':payload,'signature':signature}), nonce, wall, tick, profile_raw
+    class Secrets:
+        def __init__(self, *_, **__): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def resolve_test_secret(self, *_): return 'synthetic-bearer'
+    monkeypatch.setattr(module, 'UnixCurrentObservationTransport', Observations)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', Secrets)
+    seen = []
+    async def service(_factory, **kwargs):
+        worker = kwargs['gate_worker_factory'](SimpleNamespace(ledger=ledger))
+        worker.start(on_failure=lambda: seen.append('failed'))
+        def exchange():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+                channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1); channel.connect(str(directory / 'ledger.sock'))
+                peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+                try:
+                    client = SupervisorLedgerClient(channel=channel, peer=peer, signing_key=key,
+                        launch_binding=worker._launch.launch_binding(), manifest_digest=config.manifest.digest(),
+                        timeout_seconds=2, pair_only=True)
+                    assert client.invoke('seal_pair_drain_v1', {'pair_id':str(uuid4())}) is True
+                finally: peer.close()
+        try:
+            await asyncio.to_thread(exchange)
+            seen.append('sealed')
+        finally:
+            await asyncio.to_thread(worker.close)
+    monkeypatch.setattr(module, 'serve_owned_host_executor_unix', service)
+    try:
+        await module.run_installed_executor(config)
+        assert seen == ['sealed'] and ledger.has_pair_drain_seal()
+    finally:
+        listener.close(); ledger.close()
+
+
 @pytest.mark.asyncio
 async def test_gate_v3_dispatch_denied_before_identity_or_provider_effects(monkeypatch):
     data = configuration(); data['schema'] = module.GATE_SCHEMA

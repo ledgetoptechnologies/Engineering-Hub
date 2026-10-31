@@ -120,7 +120,7 @@ class OwnedBrokerProcess:
 
     def start_for_coordinator(self, *, profile, config_raw, session_raw, admission_raw,
                               admission_raw_digest, independent_release, runtime_policy,
-                              enrollment_fd, listener, timeout_seconds=10):
+                              enrollment_fd, listener, timeout_seconds=10, expected_enrollment_digest=None):
         """Bind the broker to a protected v3 coordinator before starting it.
 
         The caller owns independent release/raw-admission authorization and
@@ -136,6 +136,9 @@ class OwnedBrokerProcess:
                 root_raw_digest=admission_raw_digest,independent_release=independent_release)
             admission=parse_admission(admission_raw); broker=admission.oauth_broker
             enrollment=read_enrollment(enrollment_fd)
+            encoded=json.dumps(enrollment,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+            if expected_enrollment_digest is not None and 'sha256:'+hashlib.sha256(encoded).hexdigest()!=expected_enrollment_digest:
+                raise ValueError()
             mounts=[item for item in profile.mounts if item.role=='local_oauth_socket']
             if len(mounts)!=1 or broker is None: raise ValueError()
             mount=mounts[0]

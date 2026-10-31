@@ -29,6 +29,9 @@ from engineering_hub.executor_launch_profile import GateCompletionPolicy, verify
 REQUEST = 'engineering-hub.gate-ledger-request.v1'
 RESPONSE = 'engineering-hub.gate-ledger-response.v1'
 DOMAIN = b'engineering-hub-gate-ledger-request-v1\x00'
+PAIR_REQUEST = 'engineering-hub.pair-outcome-request.v1'
+PAIR_RESPONSE = 'engineering-hub.pair-outcome-response.v1'
+PAIR_DOMAIN = b'engineering-hub-pair-outcome-request-v1\x00'
 _HEX = re.compile(r'[0-9a-f]{128}\Z')
 # Linux generic socket ABI (the supported installed profiles are x86-64/arm64).
 _SO_PASSPIDFD = 76
@@ -98,7 +101,7 @@ class GateLedgerWorker:
     """
     def __init__(self, *, channel, ledger, supervisor_public_key, launch_verifier,
                  manifest_digest, hold_uncertain, timeout_seconds, completion_policy=None,
-                 require_sender_liveness=False, lookup_only=False, post_drain_only=False):
+                 require_sender_liveness=False, lookup_only=False, post_drain_only=False, pair_only=False):
         try:
             if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -110,7 +113,7 @@ class GateLedgerWorker:
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
                     or (completion_policy is not None and type(completion_policy) is not GateCompletionPolicy)
                     or type(require_sender_liveness) is not bool
-                    or type(lookup_only) is not bool or type(post_drain_only) is not bool
+                    or type(lookup_only) is not bool or type(post_drain_only) is not bool or type(pair_only) is not bool
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
             channel.getpeername()
@@ -125,6 +128,7 @@ class GateLedgerWorker:
             self._require_sender_liveness = require_sender_liveness
             self._lookup_only = lookup_only
             self._post_drain_only = post_drain_only
+            self._pair_only = pair_only
             self._timeout, self._pid, self._used, self._lock = timeout_seconds, os.getpid(), False, threading.Lock()
         except Exception:
             raise GateLedgerChannelError() from None
@@ -167,10 +171,10 @@ class GateLedgerWorker:
                       'value', 'issued_at_ms', 'expires_at_ms'}
             if (type(payload) is not dict or set(payload) != fields or type(signature) is not str
                     or not _HEX.fullmatch(signature)): raise ValueError()
-            self._key.verify(bytes.fromhex(signature), DOMAIN + _canonical(payload))
+            self._key.verify(bytes.fromhex(signature), (PAIR_DOMAIN if self._pair_only else DOMAIN) + _canonical(payload))
             issued, expires = payload['issued_at_ms'], payload['expires_at_ms']
             now = int(time.time() * 1000)
-            if (payload['protocol'] != REQUEST or payload['challenge'] != challenge
+            if (payload['protocol'] != (PAIR_REQUEST if self._pair_only else REQUEST) or payload['challenge'] != challenge
                     or type(payload['launch_binding']) is not list or payload['launch_binding'] != list(binding)
                     or any(type(a) is not type(b) for a, b in zip(payload['launch_binding'], binding))
                     or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1', 'pair_outcome_v1')
@@ -186,9 +190,10 @@ class GateLedgerWorker:
             is_state = payload['action'] == 'pending_state_v1'
             is_pair_seal = payload['action'] == 'seal_pair_drain_v1'
             is_pair_outcome = payload['action'] == 'pair_outcome_v1'
+            if self._pair_only and not (is_pair_seal or is_pair_outcome): raise ValueError()
             if self._post_drain_only and not is_pair_outcome: raise ValueError()
             if self._lookup_only and not is_lookup: raise ValueError()
-            if (is_accept or is_lookup or is_pending or is_ready or is_state or is_pair_seal or is_pair_outcome) and (not self._require_sender_liveness or self._completion_policy is None):
+            if (is_accept or is_lookup or is_pending or is_ready or is_state or is_pair_seal or is_pair_outcome) and (not self._require_sender_liveness or (self._completion_policy is None and not (self._pair_only and (is_pair_seal or is_pair_outcome)))):
                 raise ValueError()
             is_snapshot = payload['action'] in ('inspect_completion', 'inspect_completion_v4')
             identity = value.get('identity') if (is_snapshot or is_accept or is_lookup or is_ready) else value
@@ -285,7 +290,7 @@ class GateLedgerWorker:
             if (self._launch.launch_binding() != binding or not last_wall[0] <= current < expires
                     or (time.monotonic() - started) * 1000 >= expires - wall):
                 raise ValueError()
-            response = _canonical({'protocol': RESPONSE, 'challenge': challenge,
+            response = _canonical({'protocol': PAIR_RESPONSE if self._pair_only else RESPONSE, 'challenge': challenge,
                                    'action': payload['action'],
                                    **({'outcome': 'observed', 'snapshot': snapshot}
                                       if (is_snapshot or is_lookup or is_pending or is_ready or is_state or is_pair_outcome) else
@@ -331,7 +336,7 @@ class SupervisorLedgerClient:
     The channel and peer are borrowed; the owner closes them after this call.
     """
     def __init__(self, *, channel, peer, signing_key, launch_binding, manifest_digest, timeout_seconds,
-                 lookup_only=False):
+                 lookup_only=False, pair_only=False):
         try:
             if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -342,12 +347,13 @@ class SupervisorLedgerClient:
                     or any(type(launch_binding[i]) is not int or launch_binding[i] <= 0 for i in (2, 3))
                     or type(manifest_digest) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
                     or type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
-                    or type(lookup_only) is not bool
+                    or type(lookup_only) is not bool or type(pair_only) is not bool
                     or not 0 < timeout_seconds <= 5): raise ValueError()
             channel.getpeername(); peer.check()
             self._channel, self._peer, self._key = channel, peer, signing_key
             self._binding, self._manifest, self._timeout = launch_binding, manifest_digest, timeout_seconds
             self._lookup_only = lookup_only
+            self._pair_only = pair_only
             self._outcome_ack = None
             self._pid, self._used, self._lock = os.getpid(), False, threading.Lock()
         except Exception:
@@ -376,6 +382,7 @@ class SupervisorLedgerClient:
         try:
             if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1', 'seal_pair_drain_v1', 'pair_outcome_v1') or type(value) is not dict: raise ValueError()
             if self._lookup_only and action != 'lookup_completion_v5': raise ValueError()
+            if self._pair_only and action not in ('seal_pair_drain_v1', 'pair_outcome_v1'): raise ValueError()
             snapshot = json.loads(_canonical(value))
             challenge = receive()
             if (type(challenge) is not dict or set(challenge) != {'protocol', 'challenge'}
@@ -384,10 +391,10 @@ class SupervisorLedgerClient:
                     or not re.fullmatch(r'[0-9a-f]{64}', challenge['challenge'])): raise ValueError()
             issued = int(time.time() * 1000); ttl = min(5000, int((deadline - time.monotonic()) * 1000))
             if issued <= 0 or ttl <= 0: raise ValueError()
-            payload = {'protocol': REQUEST, 'challenge': challenge['challenge'], 'launch_binding': list(self._binding),
+            payload = {'protocol': PAIR_REQUEST if self._pair_only else REQUEST, 'challenge': challenge['challenge'], 'launch_binding': list(self._binding),
                        'manifest_digest': self._manifest, 'action': action, 'value': snapshot,
                        'issued_at_ms': issued, 'expires_at_ms': issued + ttl}
-            raw = _canonical({'payload': payload, 'signature': self._key.sign(DOMAIN + _canonical(payload)).hex()})
+            raw = _canonical({'payload': payload, 'signature': self._key.sign((PAIR_DOMAIN if self._pair_only else DOMAIN) + _canonical(payload)).hex()})
             if len(raw) > MAX_BYTES: raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if self._channel.send(raw) != len(raw): raise ValueError()
@@ -399,7 +406,7 @@ class SupervisorLedgerClient:
             is_ready = action == 'health_ready_v5'
             is_state = action == 'pending_state_v1'
             is_pair_outcome = action == 'pair_outcome_v1'
-            expected = {'protocol': RESPONSE, 'challenge': challenge['challenge'], 'action': action,
+            expected = {'protocol': PAIR_RESPONSE if self._pair_only else RESPONSE, 'challenge': challenge['challenge'], 'action': action,
                         'outcome': 'observed' if (is_snapshot or is_lookup or is_pending or is_ready or is_state or is_pair_outcome) else 'committed'}
             if is_pair_outcome:
                 if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
@@ -521,7 +528,7 @@ class OwnedGateLedgerService:
     """
     def __init__(self, *, listener, ledger, supervisor_public_key, launch_verifier,
                  manifest_digest, hold_uncertain, timeout_seconds, completion_profile_bytes=None,
-                 require_sender_liveness=False):
+                 require_sender_liveness=False, pair_only=False):
         try:
             if (type(listener) is not socket.socket or listener.family != socket.AF_UNIX
                     or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -531,7 +538,7 @@ class OwnedGateLedgerService:
                     or not _sync(hold_uncertain)
                     or type(manifest_digest) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
-                    or type(require_sender_liveness) is not bool
+                    or type(require_sender_liveness) is not bool or type(pair_only) is not bool
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5): raise ValueError()
             self.ledger = ledger
             if not hmac.compare_digest(launch_verifier.issuer_public_key(), supervisor_public_key):
@@ -539,13 +546,18 @@ class OwnedGateLedgerService:
             completion_policy = None
             if completion_profile_bytes is not None:
                 profile = verify_profile_bytes(completion_profile_bytes, launch_verifier.launch_profile_digest())
-                if profile.gate_completion is None: raise ValueError()
-                if require_sender_liveness and profile.gate_ledger_channel != 'supervisor-listener-v1': raise ValueError()
+                if pair_only:
+                    if profile.gate_completion is not None or profile.gate_ledger_channel != 'pair-outcome-listener-v1' or not require_sender_liveness: raise ValueError()
+                else:
+                    if profile.gate_completion is None: raise ValueError()
+                    if require_sender_liveness and profile.gate_ledger_channel != 'supervisor-listener-v1': raise ValueError()
                 completion_policy = profile.gate_completion
+            elif pair_only: raise ValueError()
             self._listener, self._key, self._launch = listener, supervisor_public_key, launch_verifier
             self._manifest, self._hold, self._timeout, self._on_failure = manifest_digest, hold_uncertain, timeout_seconds, None
             self._completion_policy = completion_policy
             self._require_sender_liveness = require_sender_liveness
+            self._pair_only = pair_only
             self._lookup_only = False
             self._phase_lock, self._post_drain, self._outcome_sent = threading.Lock(), False, threading.Event()
             self._pid, self._lock, self._stopping, self._thread, self._failed = os.getpid(), threading.Lock(), False, None, False
@@ -584,7 +596,7 @@ class OwnedGateLedgerService:
                             launch_verifier=self._launch, manifest_digest=self._manifest, hold_uncertain=self._hold,
                             timeout_seconds=self._timeout, completion_policy=self._completion_policy,
                             require_sender_liveness=self._require_sender_liveness, lookup_only=self._lookup_only,
-                            post_drain_only=self._post_drain)
+                            post_drain_only=self._post_drain, pair_only=self._pair_only)
                         try:
                             worker.serve_once()
                             if self._post_drain: self._outcome_sent.set()

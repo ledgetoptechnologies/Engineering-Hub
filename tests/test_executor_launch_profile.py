@@ -52,6 +52,18 @@ def test_gate_profile_is_explicit_and_preserves_legacy_digest():
     assert parsed.digest() != core.ExecutorLaunchProfile.model_validate(legacy).digest()
 
 
+def test_pair_ledger_profile_is_explicit_and_excludes_gate_authority():
+    old = profile(); old_bytes = core.canonical(old)
+    data = gate_profile(); del data['gate_channel']
+    data['gate_ledger_channel'] = 'pair-outcome-listener-v1'
+    parsed = core.ExecutorLaunchProfile.model_validate(data)
+    assert parsed.gate_channel is None and parsed.gate_completion is None
+    assert parsed.gate_ledger_channel == 'pair-outcome-listener-v1'
+    assert core.canonical(core.ExecutorLaunchProfile.model_validate(old).enrollment_value()) == old_bytes
+    for extra in ({'gate_channel': 'protected-socket-v1'}, {'generation_isolation': {}}, {'gate_completion': {}}):
+        with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(dict(data, **extra))
+
+
 def test_gate_completion_policy_is_explicit_and_bound_to_profile():
     data = gate_profile()
     before = core.ExecutorLaunchProfile.model_validate(data).digest()

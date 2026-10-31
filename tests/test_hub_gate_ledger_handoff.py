@@ -20,7 +20,8 @@ from hub_container_executor.launch_transport import UnixCurrentObservationTransp
 from types import SimpleNamespace
 
 
-def test_signed_handoff_binds_launch_nonce_and_listener(tmp_path, monkeypatch):
+@pytest.mark.parametrize('pair_only', [False, True])
+def test_signed_handoff_binds_launch_nonce_and_listener(tmp_path, monkeypatch, pair_only):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     verifier = verified_launch(key, public)
@@ -33,15 +34,17 @@ def test_signed_handoff_binds_launch_nonce_and_listener(tmp_path, monkeypatch):
         binding = verifier.launch_binding()
         wall, tick = int(time.time() * 1000), time.monotonic()
         payload = dict(zip(('launch_id', 'boot_id', 'authenticated_host_pid', 'process_start_ticks', 'container_id'), binding))
-        payload.update(protocol=handoff.PROTOCOL, audience=handoff.AUDIENCE, nonce='a' * 64,
+        payload.update(protocol=handoff.PAIR_PROTOCOL if pair_only else handoff.PROTOCOL, audience=handoff.PAIR_AUDIENCE if pair_only else handoff.AUDIENCE, nonce='a' * 64,
             manifest_digest='sha256:' + 'b' * 64, launch_profile_digest=verifier.launch_profile_digest(),
             listener_device=info.st_dev, listener_inode=info.st_ino, path_device=leaf.st_dev,
             path_inode=leaf.st_ino, issued_at_ms=wall, expires_at_ms=wall + 4000)
-        signature = base64.urlsafe_b64encode(key.sign(handoff.DOMAIN + canonical(payload))).rstrip(b'=').decode()
+        signature = base64.urlsafe_b64encode(key.sign((handoff.PAIR_DOMAIN if pair_only else handoff.DOMAIN) + canonical(payload))).rstrip(b'=').decode()
         raw = canonical({'payload': payload, 'signature': signature})
         options = dict(verifier=verifier, nonce='a' * 64, manifest_digest='sha256:' + 'b' * 64,
-                       source_directory=str(tmp_path), start_wall_ms=wall, start_monotonic=tick)
+                       source_directory=str(tmp_path), start_wall_ms=wall, start_monotonic=tick, pair_only=pair_only)
         assert handoff.verify_handoff(raw, listener.fileno(), **options)
+        with pytest.raises(handoff.GateLedgerHandoffError):
+            handoff.verify_handoff(raw, listener.fileno(), **dict(options, pair_only=not pair_only))
         with pytest.raises(handoff.GateLedgerHandoffError):
             handoff.verify_handoff(raw, other.fileno(), **options)
         options['nonce'] = 'b' * 64
@@ -75,7 +78,8 @@ def test_signed_handoff_binds_launch_nonce_and_listener(tmp_path, monkeypatch):
         listener.close(); other.close(); verifier.close()
 
 
-def test_transport_receives_one_listener_and_independently_pinned_profile(tmp_path):
+@pytest.mark.parametrize('pair_only', [False, True])
+def test_transport_receives_one_listener_and_independently_pinned_profile(tmp_path, pair_only):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     fixture_root = tmp_path / 'hub-pilot-fixture'; fixture_root.mkdir()
@@ -85,6 +89,9 @@ def test_transport_receives_one_listener_and_independently_pinned_profile(tmp_pa
         'rollback_executable_digest': 'sha256:' + 'b' * 64,
         'health_contract': 'engineering-hub.health-json-build-commit.v1'}
     data['gate_ledger_channel'] = 'supervisor-listener-v1'
+    if pair_only:
+        del data['gate_channel']; del data['gate_completion']
+        data['gate_ledger_channel'] = 'pair-outcome-listener-v1'
     profile = ExecutorLaunchProfile.model_validate(data)
     profile_bytes = canonical(profile.enrollment_value())
     enrollment = ExecutorReleaseEnrollment('test-issuer', public, 'c' * 40, 'sha256:' + '1' * 64,
@@ -108,13 +115,14 @@ def test_transport_receives_one_listener_and_independently_pinned_profile(tmp_pa
                 size = struct.unpack('!I', connection.recv(4))[0]
                 import json
                 request = json.loads(connection.recv(size))
+                assert request['protocol'] == ('engineering-hub.executor-pair-outcome-handoff-request.v1' if pair_only else 'engineering-hub.executor-gate-ledger-handoff-request.v1')
                 binding = verifier.launch_binding(); now = int(time.time() * 1000)
                 payload = dict(zip(('launch_id', 'boot_id', 'authenticated_host_pid', 'process_start_ticks', 'container_id'), binding))
-                payload.update(protocol=handoff.PROTOCOL, audience=handoff.AUDIENCE, nonce=request['nonce'],
+                payload.update(protocol=handoff.PAIR_PROTOCOL if pair_only else handoff.PROTOCOL, audience=handoff.PAIR_AUDIENCE if pair_only else handoff.AUDIENCE, nonce=request['nonce'],
                     manifest_digest='sha256:' + 'b' * 64, launch_profile_digest=profile.digest(),
                     listener_device=info.st_dev, listener_inode=info.st_ino, path_device=leaf.st_dev,
                     path_inode=leaf.st_ino, issued_at_ms=now, expires_at_ms=now + 4000)
-                signature = base64.urlsafe_b64encode(key.sign(handoff.DOMAIN + canonical(payload))).rstrip(b'=').decode()
+                signature = base64.urlsafe_b64encode(key.sign((handoff.PAIR_DOMAIN if pair_only else handoff.DOMAIN) + canonical(payload))).rstrip(b'=').decode()
                 raw = canonical({'payload': payload, 'signature': signature})
                 wire = struct.pack('!I', len(raw)) + raw + struct.pack('!I', len(profile_bytes)) + profile_bytes
                 assert connection.sendmsg([wire], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [listener.fileno()]))]) == len(wire)
@@ -125,7 +133,7 @@ def test_transport_receives_one_listener_and_independently_pinned_profile(tmp_pa
     fd = None
     try:
         fd, _, _, _, _, got_profile = transport.issue_ledger_listener(verifier=verifier,
-            manifest_digest='sha256:' + 'b' * 64, source_directory=str(gate_dir), timeout_ms=2000)
+            manifest_digest='sha256:' + 'b' * 64, source_directory=str(gate_dir), timeout_ms=2000, pair_only=pair_only)
         assert got_profile == profile_bytes and os.fstat(fd).st_ino == info.st_ino
         with pytest.raises(Exception):
             transport.issue_ledger_listener(verifier=verifier, manifest_digest='sha256:' + 'b' * 64,
