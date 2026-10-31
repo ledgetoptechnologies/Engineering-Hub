@@ -100,6 +100,82 @@ test("reservation remains checking until its response arrives", async ({ page })
   } finally { release(); }
 });
 
+test("a slow reservation does not hide another machine's held state", async ({ page }) => {
+  const state = await fixture(page);
+  Object.assign(state.body.actions, { "other.validate": { machine_id: "slow-pc", environments: ["staging"] } });
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/work/machines/slow-pc", async route => {
+    await pending;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      machine_id: "slow-pc", queue_reservation: "active", requires_reconciliation: false }) });
+  });
+  try {
+    await page.goto("/#/staging");
+    const panel = page.getByRole("region", { name: "Software validation queue" });
+    await expect(panel.getByText("slow-pc: Checking reservation…")).toBeVisible();
+    await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+    release();
+    await expect(panel.getByText("slow-pc: Active queue reservation")).toBeVisible();
+    expect(state.writes).toBe(0);
+  } finally { release(); }
+});
+
+test("authorization failure clears the workspace while another reservation is pending", async ({ page }) => {
+  const state = await fixture(page);
+  Object.assign(state.body.actions, { "other.validate": { machine_id: "slow-pc", environments: ["staging"] } });
+  state.reservationStatus = 401;
+  let release!: () => void, notifyStarted!: () => void, slowStarted = false;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { notifyStarted = resolve; });
+  await page.route("**/api/hub/v1/work/machines/staging-pc", async route => {
+    state.reservationReads++;
+    await started;
+    await route.fulfill({ status: 401, contentType: "application/json", body: "{}" }).catch(() => {});
+  });
+  await page.route("**/api/hub/v1/work/machines/slow-pc", async route => {
+    slowStarted = true;
+    notifyStarted();
+    await pending;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      machine_id: "slow-pc", queue_reservation: "held", requires_reconciliation: true }) }).catch(() => {});
+  });
+  try {
+    await page.goto("/#/staging");
+    await expect.poll(() => slowStarted).toBe(true);
+    await expect.poll(() => state.reservationReads).toBe(1);
+    await expect(page.getByRole("region", { name: "Software validation queue" })).toHaveCount(0);
+    release();
+    await expect(page.getByText("slow-pc: Held — reconciliation required")).toHaveCount(0);
+    expect(state.writes).toBe(0);
+  } finally { notifyStarted(); release(); }
+});
+
+test("a late reservation from an older check cannot replace the latest result", async ({ page }) => {
+  await fixture(page);
+  let release!: () => void, reads = 0, oldFinished = false;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  await page.route("**/api/hub/v1/work/machines/staging-pc", async route => {
+    const first = ++reads === 1;
+    if (first) await pending;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      machine_id: "staging-pc", queue_reservation: first ? "not_reserved" : "held",
+      requires_reconciliation: !first }) }).catch(() => {});
+    if (first) oldFinished = true;
+  });
+  try {
+    await page.goto("/#/staging");
+    const panel = page.getByRole("region", { name: "Software validation queue" });
+    await expect(panel.getByText("staging-pc: Checking reservation…")).toBeVisible();
+    await expect.poll(() => reads).toBe(1);
+    await panel.getByRole("button", { name: "Check queue" }).click();
+    await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+    release();
+    await expect.poll(() => oldFinished).toBe(true);
+    await expect(panel.getByText("staging-pc: No reservation in this queue")).toHaveCount(0);
+  } finally { release(); }
+});
+
 test("reservation authentication failure clears the private workspace", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/#/staging");

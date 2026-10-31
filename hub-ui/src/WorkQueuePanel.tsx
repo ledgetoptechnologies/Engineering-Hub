@@ -30,19 +30,18 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
       if (generation.current === current && !controller.signal.aborted) {
         setSnapshot(value); setState("loaded");
         // Bound fan-out; the normal queue refresh or explicit Check repeats it.
-        void Promise.all(value.stagingMachines.slice(0, 8).map(async machine => {
-          try { return [machine, await readMachineReservation(machine, controller.signal)] as const; }
-          catch (error) {
-            if (error instanceof HubApiError && [401, 403].includes(error.status)) throw error;
-            return [machine, "unavailable"] as const;
-          }
-        })).then(entries => {
-          if (generation.current === current && !controller.signal.aborted) setReservations(Object.fromEntries(entries));
-        }).catch(error => {
-          if (generation.current === current && !controller.signal.aborted && error instanceof HubApiError && [401, 403].includes(error.status)) {
-            setSnapshot(null); setReservations({}); setState("unauthorized"); unauthorized.current();
-          }
-        });
+        for (const machine of value.stagingMachines.slice(0, 8)) {
+          void readMachineReservation(machine, controller.signal).then(reservation => {
+            if (generation.current === current && !controller.signal.aborted)
+              setReservations(previous => ({ ...previous, [machine]: reservation }));
+          }).catch(error => {
+            if (generation.current !== current || controller.signal.aborted) return;
+            if (error instanceof HubApiError && [401, 403].includes(error.status)) {
+              controller.abort();
+              setSnapshot(null); setReservations({}); setState("unauthorized"); unauthorized.current();
+            } else setReservations(previous => ({ ...previous, [machine]: "unavailable" }));
+          });
+        }
       }
     }).catch(error => {
       if (generation.current !== current || controller.signal.aborted) return;
