@@ -188,14 +188,21 @@ class TrustedQueuedSessionComposition:
             raise
 
     def _fresh(self):
-        _require(os.getpid() == self._pid and not self._closed)
-        mono, wall = _clock()
-        e = self._enrollment
-        _require(self._last_mono <= mono < self._deadline
-                 and self._last_wall <= wall < e.expires_at_ms
-                 and 0 <= wall - e.observed_at_ms <= MAX_REPORT_LIFETIME_MS)
-        self._last_mono, self._last_wall = mono, wall
-        return mono
+        _require(os.getpid() == self._pid)
+        try:
+            _require(not self._closed)
+            mono, wall = _clock()
+            e = self._enrollment
+            _require(self._last_mono <= mono < self._deadline
+                     and self._last_wall <= wall < e.expires_at_ms
+                     and 0 <= wall - e.observed_at_ms <= MAX_REPORT_LIFETIME_MS)
+            self._last_mono, self._last_wall = mono, wall
+            return mono
+        except Exception:
+            # Once the report's clock or freshness is uncertain, a later clock
+            # recovery cannot restore authority to the same operator evidence.
+            self._closed = True
+            raise TrustedSessionError() from None
 
     def _current_verified(self):
         self._fresh()

@@ -280,6 +280,23 @@ def test_typed_enrollment_cannot_bypass_false_claims(tmp_path, dependencies):
     assert dependencies.events == []
 
 
+@pytest.mark.parametrize('failure', ['wall_regression', 'monotonic_regression', 'wall_expiry', 'monotonic_expiry'])
+def test_session_freshness_failure_cannot_revive_after_clock_recovery(tmp_path, dependencies, monkeypatch, failure):
+    session = construct(tmp_path)
+    try:
+        initial_mono, initial_wall = session._last_mono, session._last_wall
+        mono = (initial_mono - 1 if failure == 'monotonic_regression' else
+                session._deadline if failure == 'monotonic_expiry' else initial_mono)
+        wall = (initial_wall - 1 if failure == 'wall_regression' else
+                session._enrollment.expires_at_ms if failure == 'wall_expiry' else initial_wall)
+        monkeypatch.setattr(module, '_clock', lambda: (mono, wall))
+        with pytest.raises(module.TrustedSessionError): session._fresh()
+        monkeypatch.setattr(module, '_clock', lambda: (initial_mono, initial_wall))
+        with pytest.raises(module.TrustedSessionError): session._fresh()
+    finally:
+        session.close()
+
+
 @contextmanager
 def composed(tmp_path, dependencies):
     tmp_path.chmod(0o700)
