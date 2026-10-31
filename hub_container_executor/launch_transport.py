@@ -245,6 +245,93 @@ class UnixLaunchReceiptTransport:
                 except OSError:
                     pass
 
+    def issue_verified_pair_channel(self, *, role, pair_id, manifest_digest,
+                                    executor_launch_id, coordinator_launch_id, executor_enrollment,
+                                    coordinator_enrollment, pair_authority_public_key,
+                                    max_receipt_lifetime_seconds, timeout_ms):
+        """Quarantine the FD until both role receipts and the pair commit verify.
+
+        Pins must be independently enrolled. This API does not establish actual
+        process or opposite-FD custody, state isolation, or launch authorization.
+        A failed or ambiguous exchange is one-shot and closes all received FDs.
+        """
+        from .handoff_identity import (PAIR_EXECUTOR_REQUEST_PROTOCOL,
+                                       PAIR_COORDINATOR_REQUEST_PROTOCOL, verify_pair_channel_receipts)
+        fds = []
+        try:
+            _require(os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
+                     and role in {'executor', 'coordinator'} and hasattr(socket, 'SCM_RIGHTS') and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
+            started = time.monotonic()
+            wall_started = int(time.time() * 1000)
+            deadline = started + timeout_ms / 1000
+            nonce = secrets.token_hex(32)
+            _require(type(nonce) is str and _NONCE.fullmatch(nonce))
+            with self._lock:
+                _require(os.getpid() == self._pid and not self._used and not self._closed)
+                self._used = True
+            request = _canonical({'protocol': PAIR_EXECUTOR_REQUEST_PROTOCOL if role == 'executor' else PAIR_COORDINATOR_REQUEST_PROTOCOL,
+                                  'nonce': nonce})
+            identity = _socket_leaf(self._path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(_remaining(deadline))
+                connection.connect(self._path)
+                peer_pid, uid, gid = _CREDENTIALS.unpack(connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, _CREDENTIALS.size))
+                _require(peer_pid >= 0 and uid == self._uid and gid == self._gid
+                         and _socket_leaf(self._path) == identity)
+                connection.settimeout(_remaining(deadline))
+                connection.sendall(_LENGTH.pack(len(request)) + request)
+                connection.shutdown(socket.SHUT_WR)
+                result = bytearray()
+                while True:
+                    connection.settimeout(_remaining(deadline))
+                    part, controls, flags, _ = connection.recvmsg(
+                        MAX_RECEIPT_BYTES + _LENGTH.size + 1,
+                        socket.CMSG_SPACE(64 * array.array('i').itemsize), socket.MSG_CMSG_CLOEXEC)
+                    bad = bool(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+                    for level, kind, data in controls:
+                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                            received = array.array('i')
+                            received.frombytes(data[:len(data) - len(data) % received.itemsize])
+                            if result or not part or fds:
+                                bad = True  # Rights belong only to first reply bytes.
+                            fds.extend(received)
+                            if len(data) % received.itemsize:
+                                bad = True
+                        else:
+                            bad = True
+                    _require(not bad and len(fds) <= 1)
+                    if not part:
+                        break
+                    result.extend(part)
+                    _require(len(result) <= 2 * (MAX_RECEIPT_BYTES + _LENGTH.size))
+                _require(len(fds) == 1 and len(result) >= 2 * _LENGTH.size)
+                size = _LENGTH.unpack(result[:_LENGTH.size])[0]
+                _require(0 < size <= MAX_RECEIPT_BYTES and len(result) >= size + 2 * _LENGTH.size)
+                end = _LENGTH.size + size
+                raw = _receipt_frame(bytes(result[_LENGTH.size:end]))
+                commit_size = _LENGTH.unpack(result[end:end + _LENGTH.size])[0]
+                _require(0 < commit_size <= MAX_RECEIPT_BYTES and len(result) == end + _LENGTH.size + commit_size)
+                commit = _receipt_frame(bytes(result[end + _LENGTH.size:]))
+                _require(os.getpid() == self._pid and _socket_leaf(self._path) == identity)
+                _remaining(deadline)
+                verify_pair_channel_receipts(raw, commit, fds[0], role=role, nonce=nonce, pair_id=pair_id,
+                    manifest_digest=manifest_digest, executor_launch_id=executor_launch_id,
+                    coordinator_launch_id=coordinator_launch_id, executor_enrollment=executor_enrollment,
+                    coordinator_enrollment=coordinator_enrollment, pair_authority_public_key=pair_authority_public_key,
+                    start_monotonic=started, start_wall_ms=wall_started,
+                    max_lifetime_seconds=max_receipt_lifetime_seconds)
+                _remaining(deadline)
+                return fds.pop()
+        except Exception:
+            raise RuntimeIdentityError(_ERROR) from None
+        finally:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     def close(self):
         """Revoke future use promptly, without cancelling an admitted exchange.
 
