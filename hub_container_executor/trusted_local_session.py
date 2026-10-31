@@ -5,19 +5,23 @@ captured dedicated credential used by the command client. No enrollment or
 operator acceptance is inferred from a socket response.
 """
 import os
+import argparse
+import asyncio
 import hashlib
 import hmac
 from pathlib import Path
+import sys
 
 from engineering_hub.current_executor_observation import CurrentExecutorObserver
 from engineering_hub.current_executor_unix_transport import CurrentExecutorUnixTransport
 from engineering_hub.executor_launch_profile import verify_profile_bytes
 from engineering_hub.startup_reconciliation import ExecutorSessionIdentity
 from engineering_hub.trusted_queued_session import (TrustedQueuedSessionComposition,
-    ManualSessionEnrollment, TrustedSessionError, SCHEMA_V2, MAX_REPORT_AGE_MS,
+    ManualSessionEnrollment, TrustedSessionError, SCHEMA_V2, MAX_REPORT_AGE_MS, MAX_ENROLLMENT_BYTES,
     _clock, _require, enrollment_bytes, parse_enrollment)
-from .installed_coordinator import CoordinatorConfiguration, run_installed_coordinator
+from .installed_coordinator import CoordinatorConfiguration, load_configuration, run_installed_coordinator
 from .local_providers import ImmutableTestSecretResolver
+from engineering_hub.unified_pilot_startup import read_protected_file
 
 
 class TrustedLocalQueuedSession(TrustedQueuedSessionComposition):
@@ -95,3 +99,53 @@ async def serve_trusted_local_coordinator(config, *, enrollment):
     finally:
         if session is not None:
             session.close()
+
+
+def load_local_enrollment(path, *, config):
+    """Capture pre-existing operator attestation; protected bytes grant no approval.
+
+    The leaf is current-UID 0600 under a trusted private 0700 parent. The
+    independent operator is responsible for the file's provenance and facts.
+    """
+    try:
+        _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid()
+                 and type(path) is str and path.startswith('/') and os.path.normpath(path) == path
+                 and not path.startswith('//'))
+        source = Path(path)
+        # Enrollment cannot be inside the writable database or secret trees.
+        for root in (Path(config.database).parent, Path(config.secret_root)):
+            _require(source.parent != root and root not in source.parents and source not in root.parents)
+        raw = read_protected_file(source, maximum_bytes=MAX_ENROLLMENT_BYTES)
+        result = parse_enrollment(raw)
+        _require(result.schema == SCHEMA_V2)
+        return result
+    except Exception:
+        raise TrustedSessionError() from None
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise TrustedSessionError()
+
+
+def main(argv=None):
+    """Start only an explicitly selected, independently enrolled local session."""
+    try:
+        parser = _Parser(description='Explicit trusted local staging coordinator', allow_abbrev=False)
+        parser.add_argument('--config', required=True, action='append')
+        parser.add_argument('--enrollment', required=True, action='append')
+        args = parser.parse_args(argv)
+        _require(len(args.config) == len(args.enrollment) == 1)
+        config = load_configuration(args.config[0])
+        enrollment = load_local_enrollment(args.enrollment[0], config=config)
+        asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment))
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        print('Trusted local staging coordinator unavailable', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

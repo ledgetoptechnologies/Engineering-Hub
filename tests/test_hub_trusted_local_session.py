@@ -1,6 +1,7 @@
 """Local session binding tests with synthetic operator evidence and providers."""
 import pytest
 import hashlib
+import os
 pytest.importorskip('fcntl')
 from hub_container_executor import trusted_local_session as local
 from hub_container_executor.installed_coordinator import parse_configuration
@@ -62,3 +63,40 @@ async def test_explicit_local_coordinator_composition_drains_before_session_clos
     monkeypatch.setattr(local, 'run_installed_coordinator', serve)
     await local.serve_trusted_local_coordinator(config, enrollment=enrollment)
     assert events == ['secret-close', 'session', 'coordinator-drained', 'session-close']
+
+
+def test_local_enrollment_reads_only_protected_existing_disjoint_attestation(tmp_path):
+    config = parse_configuration(canonical(configuration()))
+    os.chmod(tmp_path, 0o700)
+    path = tmp_path / 'operator.json'
+    path.write_bytes(encode(v2_document())); os.chmod(path, 0o600)
+    enrollment = local.load_local_enrollment(str(path), config=config)
+    assert enrollment.schema == local.SCHEMA_V2
+    os.chmod(path, 0o644)
+    with pytest.raises(TrustedSessionError): local.load_local_enrollment(str(path), config=config)
+    os.chmod(path, 0o600)
+    alias = tmp_path / 'alias.json'
+    alias.symlink_to(path)
+    with pytest.raises(TrustedSessionError): local.load_local_enrollment(str(alias), config=config)
+    path.write_bytes(encode(document()))
+    with pytest.raises(TrustedSessionError): local.load_local_enrollment(str(path), config=config)
+    with pytest.raises(TrustedSessionError):
+        local.load_local_enrollment('/pilot/controller/operator.json', config=config)
+    with pytest.raises(TrustedSessionError):
+        local.load_local_enrollment('/pilot/secrets/operator.json', config=config)
+
+
+def test_cli_uses_explicit_protected_inputs_and_sanitizes_failures(monkeypatch, capsys):
+    config = parse_configuration(canonical(configuration()))
+    enrollment = parse_enrollment(encode(v2_document()))
+    events = []
+    monkeypatch.setattr(local, 'load_configuration', lambda path: events.append(('config', path)) or config)
+    monkeypatch.setattr(local, 'load_local_enrollment', lambda path, *, config: events.append(('enrollment', path)) or enrollment)
+    async def serve(actual, *, enrollment):
+        assert actual is config
+        events.append(('serve', enrollment))
+    monkeypatch.setattr(local, 'serve_trusted_local_coordinator', serve)
+    assert local.main(['--config', '/config', '--enrollment', '/operator']) == 0
+    assert events == [('config', '/config'), ('enrollment', '/operator'), ('serve', enrollment)]
+    assert local.main(['--config', '/secret-value', '--config', '/other', '--enrollment', '/operator']) == 2
+    assert '/secret-value' not in capsys.readouterr().err
