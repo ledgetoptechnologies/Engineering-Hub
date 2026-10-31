@@ -1061,6 +1061,74 @@ class LaunchSupervisor:
         finally:
             os.close(fd)
 
+    def attest_executor_endpoint(self, *, timeout_ms):
+        """Observe the configured UDS peer against this retained executor.
+
+        This sends no HTTP data and grants no pair authority. Same-UID/root
+        mutation remains inside the separately approved dedicated-host trust.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 100 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        if not self._mutex.acquire(timeout=_remaining(deadline)):
+            raise LaunchSupervisorError()
+        try:
+            directory = connection = None
+            try:
+                _remaining(deadline)
+                self._guard()
+                _require(self.profile.role is None and self.profile.executor_endpoint == 'protected-uds-v1'
+                         and self._receipt_served and not self._issuance_open and self._consumer is not None)
+                expected = getattr(self, '_executor_endpoint_identity', None)
+                _require(expected is not None)
+                self._validate_live(deadline)
+                self._check_executor_endpoint_directory()
+                _require(self._executor_endpoint_identity == expected)
+                mount = self._mounts['executor_endpoint_directory']
+                directory = os.open(mount.source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                _require(_identity(os.fstat(directory)) == self._source_pins['executor_endpoint_directory'])
+                before = os.stat(self._executor_endpoint_name, dir_fd=directory, follow_symlinks=False)
+                _require(stat.S_ISSOCK(before.st_mode) and _identity(before) == expected)
+                address = f'/proc/self/fd/{directory}/{self._executor_endpoint_name}'
+                _require(len(os.fsencode(address)) < 108)
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(_remaining(deadline))
+                connection.connect(address)
+                credentials = struct.unpack('=iII', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._consumer.check()
+                self._validate_live(deadline)
+                after = os.stat(self._executor_endpoint_name, dir_fd=directory, follow_symlinks=False)
+                _require(stat.S_ISSOCK(after.st_mode) and _identity(after) == expected
+                         and after.st_uid == mount.uid and after.st_gid == mount.gid
+                         and stat.S_IMODE(after.st_mode) == 0o600 and after.st_nlink == 1
+                         and _identity(os.fstat(directory)) == self._source_pins['executor_endpoint_directory'])
+                self._check_executor_endpoint_directory()
+                _remaining(deadline)
+                return (self._launch_id, self._container_id, self._consumer.boot, self._consumer.pid,
+                        self._consumer.start, self._source_pins['executor_endpoint_directory'], expected)
+            except BaseException:
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                failed = False
+                for resource in (connection, directory):
+                    if resource is not None:
+                        try:
+                            if type(resource) is int: os.close(resource)
+                            else: resource.close()
+                        except BaseException:
+                            failed = True
+                if failed:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+                try:
+                    _remaining(deadline)
+                except BaseException:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
     def _pin_trusted_local_inputs(self):
         """Capture and bind both exact protected inputs; no launch authority is inferred."""
         from .installed_coordinator import MAX_CONFIG_BYTES
