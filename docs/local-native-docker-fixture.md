@@ -74,3 +74,13 @@ digest; a local Docker image ID is not that digest. A lost effect or any
 unverified cleanup retains the task resources for explicit inspection. Do not
 point these components at a shared daemon until the complete fixture and its
 ownership/cleanup handling have been independently reviewed.
+
+`hub_local_operator_storage.prepare_source` prepares a source tree from an
+uncompressed Git archive whose SHA-256 and commit association are independently
+established by the caller. It requires exclusive control of the archive and
+output parent, creates a new bounded tree with read-only modes, and returns the
+tree digest consumed by the launcher. Its focused tests use synthetic archives.
+The operator has not yet integrated this preparer or verified that its output
+path is visible at the same absolute path to Docker Desktop. Separate bounded
+scratch storage and authenticated cleanup after the operator exits also remain
+unresolved; this helper supplies neither lifecycle nor custody proof.
