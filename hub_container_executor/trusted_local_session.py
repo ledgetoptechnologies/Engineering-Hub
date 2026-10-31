@@ -122,7 +122,7 @@ async def serve_trusted_local_coordinator(config, *, enrollment, admission_verif
         _require(type(token) is str and token.isascii())
         session = TrustedLocalQueuedSession(config=config, enrollment=enrollment, credential=token.encode('ascii'))
         options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
-        await run_installed_coordinator(config, reconciliation_factory=session.reconciliation_factory,
+        return await run_installed_coordinator(config, reconciliation_factory=session.reconciliation_factory,
                                         session_acceptance_factory=session.session_acceptance_factory, **options)
     except Exception:
         raise TrustedSessionError() from None
@@ -226,6 +226,7 @@ def run_supervised_local_coordinator():
             issuer_transport=transport, max_receipt_lifetime_seconds=admission.lifetime_seconds,
             exchange_timeout_ms=admission.timeout_ms)
         verifier.implementation_commit()
+        binding = verifier.launch_binding()
         config_raw = _read_supervised_input(_SUPERVISED_CONFIG, MAX_CONFIG_BYTES)
         session_raw = _read_supervised_input(_SUPERVISED_SESSION, MAX_ENROLLMENT_BYTES)
         _require(hmac.compare_digest('sha256:' + hashlib.sha256(config_raw).hexdigest(), admission.config_digest)
@@ -244,7 +245,13 @@ def run_supervised_local_coordinator():
         _require(_read_supervised_input(_SUPERVISED_CONFIG, MAX_CONFIG_BYTES) == config_raw
                  and _read_supervised_input(_SUPERVISED_SESSION, MAX_ENROLLMENT_BYTES) == session_raw)
         verifier.implementation_commit()
-        asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment, admission_verifier=verifier))
+        result = asyncio.run(serve_trusted_local_coordinator(config, enrollment=enrollment, admission_verifier=verifier))
+        from .coordinator_drain import LocalCoordinatorDrain, report_local_drain
+        _require(type(result) is LocalCoordinatorDrain and result.manifest_digest == config.manifest.digest())
+        report_local_drain(socket_path=_SUPERVISED_ISSUER, issuer_uid=admission.issuer_uid,
+            issuer_gid=admission.issuer_gid, release=admission.release, binding=binding,
+            owner_epoch=result.owner_epoch, config_digest=admission.config_digest, session_digest=admission.session_digest,
+            timeout_ms=admission.timeout_ms)
     finally:
         try:
             if verifier is not None: verifier.close()

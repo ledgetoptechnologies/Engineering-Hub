@@ -307,7 +307,11 @@ def _execute(options):
                     if gate_failed.is_set(): raise RuntimeError('gate unavailable')
                 if requested:
                     # Explicit signal only. Caller must already have drained.
-                    supervisor.graceful_stop()
+                    if getattr(getattr(supervisor, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2':
+                        supervisor.graceful_stop_coordinator(timeout_ms=(supervisor._coordinator_stop_grace * 1000
+                            + supervisor._coordinator_admission.timeout_ms + 5000))
+                    else:
+                        supervisor.graceful_stop()
                     code, phase = 0, 'stopped'
                 else:
                     phase = 'wait_expired_preserve_evidence'

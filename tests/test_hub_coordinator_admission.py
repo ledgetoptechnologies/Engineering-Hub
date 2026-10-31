@@ -10,6 +10,7 @@ pytest.importorskip('fcntl')
 from hub_container_executor import coordinator_admission as admission
 from hub_container_executor import trusted_local_session as local
 from hub_container_executor import installed_coordinator, launch_transport, runtime_identity
+from hub_container_executor import coordinator_drain
 
 
 def canonical(value):
@@ -60,26 +61,30 @@ def test_receipt_precedes_config_and_verifier_owned_until_drain(monkeypatch, fai
             events.append('receipt')
             if fail_receipt: raise ValueError('denied')
         def implementation_commit(self): events.append('check'); return 'a'*40
+        def launch_binding(self): return ('a','b',1,2,'c')
         def close(self): events.append('verifier-close')
     monkeypatch.setattr(launch_transport, 'CoordinatorUnixLaunchReceiptTransport', Transport)
     monkeypatch.setattr(runtime_identity, 'CoordinatorLaunchReceiptIdentityVerifier', Verifier)
     monkeypatch.setattr(installed_coordinator, '_process', lambda: events.append('process'))
     config = SimpleNamespace(database='/var/lib/test/hub.db', secret_root='/var/lib/secrets',
-                             auth=SimpleNamespace(human_auth_mode='github', beau_github_id=123))
+                             auth=SimpleNamespace(human_auth_mode='github', beau_github_id=123),
+                             manifest=SimpleNamespace(digest=lambda:'manifest'))
     session = SimpleNamespace(schema=local.SCHEMA_V3, operator_actor='human:123')
     monkeypatch.setattr(installed_coordinator, 'parse_configuration', lambda raw: events.append(('config-parse', raw)) or config)
     monkeypatch.setattr(local, 'parse_enrollment', lambda raw: events.append(('session-parse', raw)) or session)
     monkeypatch.setattr(local, 'load_configuration', lambda path: pytest.fail('must parse captured bytes'))
     monkeypatch.setattr(local, 'load_local_enrollment', lambda *args, **kwargs: pytest.fail('must parse captured bytes'))
-    async def serve(config, *, enrollment, admission_verifier): events.append('drained')
+    async def serve(config, *, enrollment, admission_verifier):
+        events.append('drained'); return coordinator_drain.LocalCoordinatorDrain('epoch', 'manifest')
     monkeypatch.setattr(local, 'serve_trusted_local_coordinator', serve)
+    monkeypatch.setattr(coordinator_drain, 'report_local_drain', lambda **kwargs: events.append('reported'))
     if fail_receipt:
         with pytest.raises(ValueError): local.run_supervised_local_coordinator()
         assert events == [('read', local._SUPERVISED_ADMISSION), 'transport', 'receipt', 'transport-close']
     else:
         local.run_supervised_local_coordinator()
         assert events.index('receipt') < events.index(('read', local._SUPERVISED_CONFIG))
-        assert events.index('drained') < events.index('verifier-close') < events.index('transport-close')
+        assert events.index('drained') < events.index('reported') < events.index('verifier-close') < events.index('transport-close')
 
 
 @pytest.mark.asyncio
@@ -137,12 +142,15 @@ def test_real_signed_coordinator_receipt_drives_bootstrap(monkeypatch):
     monkeypatch.setattr(local, '_read_supervised_input', lambda path, maximum: files[path])
     monkeypatch.setattr(installed_coordinator, '_process', lambda: None)
     config = SimpleNamespace(database='/var/lib/test/hub.db', secret_root='/var/lib/secrets',
-                             auth=SimpleNamespace(human_auth_mode='github', beau_github_id=123))
+                             auth=SimpleNamespace(human_auth_mode='github', beau_github_id=123),
+                             manifest=SimpleNamespace(digest=lambda:'manifest'))
     monkeypatch.setattr(installed_coordinator, 'parse_configuration', lambda raw: events.append('parse') or config)
     monkeypatch.setattr(local, 'parse_enrollment', lambda raw: SimpleNamespace(schema=local.SCHEMA_V3, operator_actor='human:123'))
-    async def serve(config, *, enrollment, admission_verifier): events.append('drained')
+    async def serve(config, *, enrollment, admission_verifier):
+        events.append('drained'); return coordinator_drain.LocalCoordinatorDrain('epoch', 'manifest')
     monkeypatch.setattr(local, 'serve_trusted_local_coordinator', serve)
+    monkeypatch.setattr(coordinator_drain, 'report_local_drain', lambda **kwargs: events.append('reported'))
     with issuer(handle) as (path, state):
         monkeypatch.setattr(local, '_SUPERVISED_ISSUER', path)
         local.run_supervised_local_coordinator()
-    assert events == ['signed', 'parse', 'drained']
+    assert events == ['signed', 'parse', 'drained', 'reported']

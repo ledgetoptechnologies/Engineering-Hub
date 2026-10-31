@@ -35,7 +35,8 @@ def owned_resources():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('tamper_observation', [False, True])
-async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources, tamper_observation):
+@pytest.mark.parametrize(('supervised', 'cleanup_failure'), [(False, False), (True, False), (True, True)])
+async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources, tamper_observation, supervised, cleanup_failure):
     import engineering_hub.pilot_ownership as ownership
     synthetic_filesystem=ownership._local_filesystem
     monkeypatch.setattr(ownership,'_local_filesystem',lambda fd, **_:synthetic_filesystem(fd))
@@ -80,6 +81,13 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
     monkeypatch.setattr(installed,'ImmutableTestSecretResolver',Secrets)
     # The test owns this process; it is not an installed UID10001/PID1 service.
     monkeypatch.setattr(installed,'_process',lambda:None)
+    admission_verifier = None
+    if supervised:
+        from hub_container_executor import runtime_identity
+        class TestAdmission:
+            def implementation_commit(self): return 'a'*40
+        monkeypatch.setattr(runtime_identity, 'CoordinatorLaunchReceiptIdentityVerifier', TestAdmission)
+        admission_verifier = TestAdmission()
     async def exchange(self, code, verifier):
         assert code=='synthetic-code' and verifier
         return 123
@@ -143,7 +151,8 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
     try:
         thread.start()
         serving=asyncio.create_task(installed.run_installed_coordinator(config,reconciliation_factory=session.reconciliation_factory,
-                                               session_acceptance_factory=session.session_acceptance_factory))
+                                               session_acceptance_factory=session.session_acceptance_factory,
+                                               admission_verifier=admission_verifier))
         done,_=await asyncio.wait({ready,serving},timeout=10,return_when=asyncio.FIRST_COMPLETED)
         if serving in done: await serving
         assert ready in done
@@ -218,13 +227,25 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
         assert len(adapter.commands)==2
         assert observations and all(status==200 for status in observations) and checks and not errors
     finally:
+        if cleanup_failure:
+            from engineering_hub.queued_pilot_runtime import QueuedPilotRuntime
+            original_stop = QueuedPilotRuntime.stop
+            async def failed_stop(runtime):
+                await original_stop(runtime)
+                raise RuntimeError('synthetic cleanup failure')
+            monkeypatch.setattr(QueuedPilotRuntime, 'stop', failed_stop)
         stop.set()
         try:
             if serving is not None:
                 import sys
                 active_error=sys.exc_info()[1]
                 outcome=await asyncio.wait_for(asyncio.gather(serving,return_exceptions=True),10)
-                if active_error is None and isinstance(outcome[0],BaseException): raise outcome[0]
+                if active_error is None and cleanup_failure:
+                    assert isinstance(outcome[0], BaseException)
+                elif active_error is None and isinstance(outcome[0],BaseException): raise outcome[0]
+                if active_error is None and supervised and not cleanup_failure:
+                    from hub_container_executor.coordinator_drain import LocalCoordinatorDrain
+                    assert type(outcome[0]) is LocalCoordinatorDrain and outcome[0].manifest_digest == manifest.digest()
         finally:
             stop_thread.set()
             if thread.ident is not None: thread.join(4); assert not thread.is_alive()

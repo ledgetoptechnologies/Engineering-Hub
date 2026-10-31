@@ -286,7 +286,7 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             return target_allowed(config, actor, action_key, environment, target)
 
         options = {} if admission_verifier is None else {'admission_verifier': admission_verifier}
-        await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
+        return await serve_owned_queued_pilot(settings, config.manifest, fresh_client,
             action_key=ACTION, machine_id='staging-pc', target_verifier=policy,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,

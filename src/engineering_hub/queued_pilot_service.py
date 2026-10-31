@@ -138,6 +138,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             raise ValueError('explicit_access_verifier_binding_required')
 
     owner = client = reconciliation = acceptance_broker = None
+    local_runtime = None
     shared = staging_draft = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
@@ -157,7 +158,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, remote_cleanup_reserved
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, remote_cleanup_reserved, local_runtime
         if constructed:
             raise QueuedPilotServiceError()
         if admission_verifier is not None: admission_verifier.implementation_commit()
@@ -197,6 +198,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             staging_draft.policies.install()
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
+        local_runtime = runtime
         if staging_draft is not None:
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
@@ -266,6 +268,15 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         # after cancellation. The existing helper requests stop and drains this
         # same task through repeated caller cancellation, including client close.
         await _owned_service(operation, stop)
+        if admission_verifier is not None:
+            if (not constructed or owner is None or not owner._closed or local_runtime is None
+                    or local_runtime.status['state'] != 'stopped' or local_runtime._source_failed
+                    or local_runtime._task is None or not local_runtime._task.done()
+                    or local_runtime._task.cancelled() or local_runtime._task.exception() is not None
+                    or local_runtime._active is not None):
+                raise QueuedPilotServiceError()
+            from hub_container_executor.coordinator_drain import LocalCoordinatorDrain
+            return LocalCoordinatorDrain(owner.epoch, manifest.digest())
     except Exception:
         raise QueuedPilotServiceError() from None
 

@@ -660,6 +660,13 @@ class _Journal:
             _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=?',
                 (state, _canonical(data).decode(), identity)).rowcount == 1)
 
+    def record_coordinator_drain(self, identity, record):
+        """One local-drain report after the original stop intent; never replay."""
+        with self.transaction() as db:
+            _require(db.execute('SELECT state FROM issuance WHERE launch_id=?', (identity,)).fetchone() == ('sent',))
+            _require(db.execute("UPDATE launch SET state='drain_recorded',data=? WHERE id=? AND state='term_reserved'",
+                (_canonical(record).decode(), identity)).rowcount == 1)
+
     def reserve_issuance(self, identity, nonce):
         with self.transaction() as db:
             _require(db.execute('SELECT state FROM launch WHERE id=?', (identity,)).fetchone() == ('running',))
@@ -965,7 +972,7 @@ class LaunchSupervisor:
                 pass
 
     def _record(self):
-        return {'container_id': self._container_id, 'manifest': self.release.launch_profile_digest,
+        result = {'container_id': self._container_id, 'manifest': self.release.launch_profile_digest,
                 'approval_expires_at_ms': getattr(self, '_approval_expires_at_ms', None),
                 'engine_id': getattr(getattr(self, '_daemon_pin', None), 'daemon_id', None),
                 'engine_pid': getattr(getattr(self, '_daemon_pin', None), 'pid', None),
@@ -973,6 +980,9 @@ class LaunchSupervisor:
                 'boot_id': None if self._consumer is None else self._consumer.boot,
                 'pid': None if self._consumer is None else self._consumer.pid,
                 'start_ticks': None if self._consumer is None else self._consumer.start}
+        if getattr(self, '_coordinator_drain', None) is not None:
+            result['local_drain'] = self._coordinator_drain
+        return result
 
     def _pin_sources(self):
         if self.profile.role in {'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2'}:
@@ -1131,7 +1141,7 @@ class LaunchSupervisor:
 
     def _pin_trusted_local_inputs(self):
         """Capture and bind both exact protected inputs; no launch authority is inferred."""
-        from .installed_coordinator import MAX_CONFIG_BYTES
+        from .installed_coordinator import MAX_CONFIG_BYTES, parse_configuration
         from .coordinator_admission import MAX_BYTES as MAX_ADMISSION_BYTES, parse_admission
         from engineering_hub.trusted_queued_session import MAX_ENROLLMENT_BYTES
         def capture(role, maximum):
@@ -1190,6 +1200,15 @@ class LaunchSupervisor:
                      for role, pin in pins.items()))
         self._trusted_local_input_pins = pins
         self._source_pins.update({role: pin[0] for role, pin in pins.items()})
+        if self.profile.role == 'supervised-local-coordinator-v2':
+            previous = getattr(self, '_coordinator_admission', None)
+            _require(previous is None or previous == admission_policy)
+            self._coordinator_admission = admission_policy
+            grace = parse_configuration(config).stop_grace
+            _require(1120 <= grace <= 86400)
+            previous_grace = getattr(self, '_coordinator_stop_grace', None)
+            _require(previous_grace is None or previous_grace == grace)
+            self._coordinator_stop_grace = grace
 
     def _bind_issuer(self):
         self._socket_parent = _root_parent(self._socket_path, private=False)
@@ -1272,13 +1291,14 @@ class LaunchSupervisor:
                      and info.get('Args') == list((*self.profile.entrypoint[1:], *self.profile.command)))
         return state
 
-    def _wait_stopped(self, deadline):
+    def _wait_stopped(self, deadline, *, require_exit_zero=False):
         """Reconcile Engine accounting after kernel exit, without another effect.
 
         A readable pidfd can precede Docker's terminal state. Only the exact
         validated profile still reporting our original PID is worth waiting
         for. Changed profiles, malformed states and GET failures fail closed.
         """
+        _require(type(require_exit_zero) is bool)
         while True:
             _remaining(deadline)
             self._guard(allow_held=True)
@@ -1287,6 +1307,9 @@ class LaunchSupervisor:
             if not state['Running']:
                 _require(state.get('Status') == 'exited'
                          and type(state.get('Pid')) is int and state['Pid'] == 0)
+                if require_exit_zero:
+                    _require(type(state.get('ExitCode')) is int and state['ExitCode'] == 0
+                             and state.get('OOMKilled') is False and state.get('Error') in ('', None))
                 return
             _require(state['Pid'] == self._consumer.pid)
             time.sleep(min(0.05, _remaining(deadline)))
@@ -1530,6 +1553,91 @@ class LaunchSupervisor:
             finally:
                 if peer is not None:
                     peer.close()
+
+    def _serve_one_coordinator_drain(self, deadline):
+        """Record an exact live coordinator's local drain before acknowledging it."""
+        from .coordinator_drain import REQUEST, RESPONSE, AUDIENCE as DRAIN_AUDIENCE, DOMAIN, MAX_BYTES
+        try:
+            while True:
+                remaining = _remaining(deadline)
+                if not self._mutex.acquire(timeout=min(.1, remaining)):
+                    continue
+                try:
+                    self._guard()
+                    _require(self.profile.role == 'supervised-local-coordinator-v2'
+                             and self._receipt_served and not self._issuance_open
+                             and getattr(self, '_coordinator_stop_requested', False)
+                             and getattr(self, '_coordinator_drain', None) is None)
+                    listener, consumer = self._listener, self._consumer
+                    _require(type(listener) is socket.socket and consumer is not None)
+                    consumer.check()
+                finally:
+                    self._mutex.release()
+                ready, _, _ = select.select([listener, consumer.fd], [], [], min(.1, _remaining(deadline)))
+                _require(consumer.fd not in ready)
+                if listener in ready: break
+        except BaseException:
+            with self._mutex: self._hold()
+            raise LaunchSupervisorError() from None
+        with self._observation_mutex(deadline):
+            peer = None
+            try:
+                self._guard()
+                _require(self.profile.role == 'supervised-local-coordinator-v2'
+                         and self._receipt_served and not self._issuance_open
+                         and getattr(self, '_coordinator_stop_requested', False)
+                         and getattr(self, '_coordinator_drain', None) is None
+                         and self._listener is listener and self._consumer is consumer)
+                self._consumer.check()
+                deadline = min(deadline, time.monotonic() + self._coordinator_admission.timeout_ms / 1000)
+                self._listener.settimeout(_remaining(deadline))
+                peer, _ = self._listener.accept()
+                credentials = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._validate_live(deadline)
+                size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+                _require(0 < size <= MAX_BYTES)
+                raw_request = self._receive(peer, size, deadline)
+                request = _strict(raw_request, MAX_BYTES)
+                fields = {'protocol', 'nonce', 'launch_id', 'boot_id', 'authenticated_host_pid',
+                    'process_start_ticks', 'container_id', 'owner_epoch', 'launch_profile_digest',
+                    'config_digest', 'session_digest'}
+                _require(type(request) is dict and set(request) == fields and request['protocol'] == REQUEST
+                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce'])
+                         and type(request['owner_epoch']) is str
+                         and str(UUID(request['owner_epoch'])) == request['owner_epoch']
+                         and request['launch_id'] == self._launch_id and request['boot_id'] == self._consumer.boot
+                         and type(request['authenticated_host_pid']) is int and request['authenticated_host_pid'] == self._consumer.pid
+                         and type(request['process_start_ticks']) is int and request['process_start_ticks'] == self._consumer.start
+                         and request['container_id'] == self._container_id
+                         and request['launch_profile_digest'] == self.release.launch_profile_digest
+                         and request['config_digest'] == self._coordinator_admission.config_digest
+                         and request['session_digest'] == self._coordinator_admission.session_digest)
+                peer.settimeout(_remaining(deadline)); _require(peer.recv(1) == b'')
+                self._validate_live(deadline)
+                payload = dict(request, protocol=RESPONSE, audience=DRAIN_AUDIENCE)
+                signature = base64.urlsafe_b64encode(self._signer.sign(DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                response = _canonical({'payload': payload, 'signature': signature})
+                _require(len(response) <= MAX_BYTES)
+                evidence = {'request_sha256': hashlib.sha256(raw_request).hexdigest(),
+                            'owner_epoch': request['owner_epoch']}
+                record = dict(self._record(), local_drain=evidence)
+                self._journal.record_coordinator_drain(self._launch_id, record)
+                self._coordinator_drain = evidence
+                self._validate_live(deadline)
+                peer.settimeout(_remaining(deadline))
+                peer.sendall(struct.pack('!I', len(response)) + response)
+                peer.shutdown(socket.SHUT_WR)
+                _remaining(deadline)
+            except BaseException:
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                if peer is not None:
+                    try: peer.close()
+                    except BaseException:
+                        self._hold()
+                        raise LaunchSupervisorError() from None
 
     def _runner_configuration(self, raw):
         from .installed_runner import parse_configuration
@@ -3099,6 +3207,40 @@ class LaunchSupervisor:
             except BaseException:
                 self._hold()
                 raise LaunchSupervisorError() from None
+
+    def graceful_stop_coordinator(self, *, timeout_ms):
+        """Request one stop, record local drain while peer lives, then await exit.
+
+        Timeout/lost acknowledgment holds the original launch. This does not
+        authorize executor stop, retry, release, or a new owner.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int
+                 and 1000 <= timeout_ms <= 86_415_000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        try:
+            with self._mutex:
+                self._guard()
+                _require(self.profile.role == 'supervised-local-coordinator-v2'
+                         and self._receipt_served and not self._issuance_open
+                         and not getattr(self, '_coordinator_stop_requested', False)
+                         and timeout_ms >= (self._coordinator_stop_grace * 1000
+                                            + self._coordinator_admission.timeout_ms + 5000))
+                self._validate_live(deadline)
+                self._journal.state(self._launch_id, 'term_reserved', self._record())
+                self._coordinator_stop_requested = True
+                self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
+                                  deadline, statuses=(204,))
+            self._serve_one_coordinator_drain(deadline)
+            with self._mutex:
+                _require(self._coordinator_drain is not None)
+                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                self._wait_stopped(deadline, require_exit_zero=True)
+                self._journal.state(self._launch_id, 'stopped', self._record())
+                self._remove_owned_socket()
+        except BaseException:
+            with self._mutex:
+                self._hold()
+            raise LaunchSupervisorError() from None
 
     def _remove_owned_socket(self):
         _require(self._socket_parent is not None and self._socket_identity is not None
