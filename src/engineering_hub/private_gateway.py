@@ -125,6 +125,7 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
+                or method == 'GET' and re.fullmatch(r'/api/hub/v1/work/machines/' + _TOPIC, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None

@@ -89,6 +89,26 @@ async def test_image_version_status_is_read_only_through_closed_gateway():
         assert len(calls) == 1
 
 
+async def test_machine_reservation_route_is_exact_get_only():
+    calls = []
+    async def upstream(request):
+        calls.append((request.method, request.url.path))
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, json={'machine_id': request.url.path.rsplit('/', 1)[-1]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = PublicBrowserGateway(client)
+        valid = ['staging-pc', 'A', 'x' * 128, 'a.b_c:d-1']
+        for machine in valid:
+            response = await exchange(gateway, BASE + '/work/machines/' + machine)
+            assert status(response) == 200
+        assert calls == [('GET', BASE + '/work/machines/' + machine) for machine in valid]
+        for method in ('HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'):
+            assert status(await exchange(gateway, BASE + '/work/machines/staging-pc', method=method)) == 403
+        for suffix in ('', '/x', 'x/', 'x/y', '-bad', '.bad', 'x' * 129, 'bad%2fpath', 'bad path'):
+            assert status(await exchange(gateway, BASE + '/work/machines/' + suffix)) in {400, 403}
+        assert len(calls) == len(valid)
+
+
 async def test_runtime_inventory_reaches_owner_through_read_only_browser_gateway():
     calls = []
     async def upstream(request):

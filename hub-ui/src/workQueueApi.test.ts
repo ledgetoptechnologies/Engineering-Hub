@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parseQueueSnapshot, readQueueSnapshot } from "./workQueueApi";
+import { parseQueueSnapshot, readMachineReservation, readQueueSnapshot } from "./workQueueApi";
 
 const id = "12345678-1234-1234-1234-123456789012";
 function fixture() { return {
@@ -13,6 +13,35 @@ const response = (value: unknown, status = 200) => new Response(JSON.stringify(v
   status, headers: { "Content-Type": "application/json" },
 });
 describe("read-only software queue", () => {
+  it("derives unique staging machines from registered actions", () => {
+    const value = fixture();
+    value.actions = { a: { machine_id: "pc-one", environments: ["staging"] },
+      b: { machine_id: "pc-one", environments: ["staging", "production"] },
+      c: { machine_id: "pc-two", environments: ["production"] } };
+    expect(parseQueueSnapshot(value).stagingMachines).toEqual(["pc-one"]);
+  });
+  it.each(["not_reserved", "active", "held", "unknown"] as const)("reads exact %s reservation", async state => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ machine_id: "pc-one", queue_reservation: state,
+      requires_reconciliation: state === "unknown" ? null : state === "held" }));
+    expect(await readMachineReservation("pc-one", new AbortController().signal, fetchImpl)).toBe(state);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+  it("rejects mismatched identity and inconsistent reservation, and does not treat 423 as clear", async () => {
+    for (const payload of [{ machine_id: "other", queue_reservation: "active", requires_reconciliation: false },
+      { machine_id: "pc-one", queue_reservation: "held", requires_reconciliation: false }]) {
+      await expect(readMachineReservation("pc-one", new AbortController().signal,
+        vi.fn<typeof fetch>().mockResolvedValue(response(payload)))).rejects.toThrow();
+    }
+    await expect(readMachineReservation("pc-one", new AbortController().signal,
+      vi.fn<typeof fetch>().mockResolvedValue(response({}, 423)))).rejects.toMatchObject({ status: 423 });
+  });
+  it("uses canonical unescaped paths for validated colon machine IDs", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response({ machine_id: "staging:pc", queue_reservation: "held", requires_reconciliation: true }));
+    await readMachineReservation("staging:pc", new AbortController().signal, fetchImpl);
+    expect(fetchImpl.mock.calls[0][0]).toBe("/api/hub/v1/work/machines/staging:pc");
+    await expect(readMachineReservation("staging/pc", new AbortController().signal, fetchImpl)).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
   it("projects only displayed fields, preserving closed admission and exact target", () => {
     const result = parseQueueSnapshot(fixture());
     expect(result.claim_admission_state).toBe("unconfigured");

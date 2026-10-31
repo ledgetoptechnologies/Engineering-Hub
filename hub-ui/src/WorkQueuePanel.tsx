@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { HubApiError, type HubMode } from "./api";
-import { readQueueSnapshot, type QueueSnapshot } from "./workQueueApi";
+import { readMachineReservation, readQueueSnapshot, type QueueSnapshot, type Reservation } from "./workQueueApi";
 
 export interface WorkQueuePanelProps {
   mode: HubMode;
@@ -12,6 +12,7 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [state, setState] = useState("loading");
   const [revision, setRevision] = useState(0);
+  const [reservations, setReservations] = useState<Record<string, Reservation | "unavailable">>({});
   const generation = useRef(0);
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
@@ -19,6 +20,7 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
     const current = ++generation.current;
     const controller = new AbortController();
     setSnapshot(null);
+    setReservations({});
     if (mode === "demo") {
       setState("demo");
       return () => { generation.current++; controller.abort(); };
@@ -27,6 +29,20 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
     void readQueueSnapshot(controller.signal).then(value => {
       if (generation.current === current && !controller.signal.aborted) {
         setSnapshot(value); setState("loaded");
+        // Bound fan-out; the normal queue refresh or explicit Check repeats it.
+        void Promise.all(value.stagingMachines.slice(0, 8).map(async machine => {
+          try { return [machine, await readMachineReservation(machine, controller.signal)] as const; }
+          catch (error) {
+            if (error instanceof HubApiError && [401, 403].includes(error.status)) throw error;
+            return [machine, "unavailable"] as const;
+          }
+        })).then(entries => {
+          if (generation.current === current && !controller.signal.aborted) setReservations(Object.fromEntries(entries));
+        }).catch(error => {
+          if (generation.current === current && !controller.signal.aborted && error instanceof HubApiError && [401, 403].includes(error.status)) {
+            setSnapshot(null); setReservations({}); setState("unauthorized"); unauthorized.current();
+          }
+        });
       }
     }).catch(error => {
       if (generation.current !== current || controller.signal.aborted) return;
@@ -57,6 +73,15 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
         : snapshot.claim_admission_state === "worker_policy" ? "Worker-specific policy — runtime not verified here"
         : "Trusted local composition — runtime not verified here"}.</p>
       <p>Queued: {snapshot.counts.queued ?? 0} · Claimed: {snapshot.counts.claimed ?? 0} · Held: {snapshot.counts.held ?? 0}</p>
+      {snapshot.stagingMachines.length > 0 && <div aria-label="Staging queue reservations">
+        <strong>Staging queue reservations</strong>
+        {snapshot.stagingMachines.slice(0, 8).map(machine => <p key={machine}>{machine}: {({
+          not_reserved: "No reservation in this queue", active: "Active queue reservation",
+          held: "Held — reconciliation required", unknown: "Reservation unknown", unavailable: "Reservation unavailable",
+        } as const)[reservations[machine] ?? "unavailable"]}</p>)}
+        {snapshot.stagingMachines.length > 8 && <p>Additional machines are not shown.</p>}
+        <p className="panel-footnote">Queue records only; this does not establish physical machine availability or exclude other writers.</p>
+      </div>}
       <p className="panel-footnote">Totals cover all jobs; showing the latest {snapshot.jobs.length}, up to 50. Eligibility is advisory, never executor readiness or production authorization.</p>
       {snapshot.jobs.length === 0 && <p>No recorded queue jobs.</p>}
       <div className="project-list">{snapshot.jobs.map(job => <article key={job.id} style={{ padding: "12px 0", borderBottom: "1px solid var(--line)", overflowWrap: "anywhere" }}>

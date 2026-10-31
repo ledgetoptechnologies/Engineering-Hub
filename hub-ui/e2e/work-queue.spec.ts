@@ -4,7 +4,8 @@ import { createDemoOverview, createDemoTopic } from "../src/mocks";
 const jobId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 function snapshot() {
   return { paused: false, queue_paused: false, master_paused: false,
-    claim_admission_state: "unconfigured", counts: { held: 1 }, jobs: [{
+    claim_admission_state: "unconfigured", counts: { held: 1 },
+    actions: { "engineering-hub.validate": { machine_id: "staging-pc", environments: ["staging"] } }, jobs: [{
       id: jobId, machine_id: "staging-pc", action_key: "engineering-hub.validate",
       environment: "staging", state: "held", blocked_reason: "requires_reconciliation",
       requires_reconciliation: true, eligible: false, eligible_requires_worker_admission: false,
@@ -14,7 +15,8 @@ function snapshot() {
 }
 
 async function fixture(page: Page) {
-  const state = { reads: 0, writes: 0, queueStatus: 200, body: snapshot() };
+  const state = { reads: 0, writes: 0, queueStatus: 200, reservationStatus: 200,
+    reservation: "held" as "held" | "unknown" | "active" | "not_reserved", reservationReads: 0, body: snapshot() };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
     const respond = (body: unknown, status = 200) => route.fulfill({ status,
@@ -32,6 +34,13 @@ async function fixture(page: Page) {
       expect(new URL(request.url()).searchParams.get("limit")).toBe("50");
       return respond(state.queueStatus === 200 ? state.body : { detail: { code: "fixture-denial" } }, state.queueStatus);
     }
+    if (path.endsWith("/work/machines/staging-pc")) {
+      state.reservationReads++;
+      expect(request.headers()["authorization"]).toBeUndefined();
+      return respond(state.reservationStatus === 200 ? { machine_id: "staging-pc",
+        queue_reservation: state.reservation, requires_reconciliation: state.reservation === "unknown" ? null : state.reservation === "held" }
+        : { detail: { code: "fixture-denial" } }, state.reservationStatus);
+    }
     return respond({}, 404);
   });
   return state;
@@ -43,6 +52,8 @@ test("held queue is visible without implying executor readiness; explicit refres
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Not configured — claims are closed", { exact: false })).toBeVisible();
   await expect(panel.getByText("Reconciliation required — machine reservation remains held.", { exact: true })).toBeVisible();
+  await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+  await expect(panel.getByText("Queue records only;", { exact: false })).toBeVisible();
   await panel.getByText("Exact task and artifact", { exact: true }).click();
   await expect(panel.getByText("Artifact: sha256:" + "b".repeat(64), { exact: true })).toBeVisible();
   await page.screenshot({ path: test.info().outputPath("software-queue.png"), fullPage: true });
@@ -52,6 +63,32 @@ test("held queue is visible without implying executor readiness; explicit refres
   await expect(panel.getByText("Held: 1", { exact: false })).toBeVisible();
   expect(state.writes).toBe(0);
   await expect(panel.getByRole("button")).toHaveCount(1);
+});
+
+test("reservation refresh shows unknown and unavailable without asserting machine is free", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+  state.reservation = "unknown";
+  await panel.getByRole("button", { name: "Check queue" }).click();
+  await expect(panel.getByText("staging-pc: Reservation unknown")).toBeVisible();
+  state.reservationStatus = 423;
+  await panel.getByRole("button", { name: "Check queue" }).click();
+  await expect(panel.getByText("staging-pc: Reservation unavailable")).toBeVisible();
+  await expect(panel.getByText("No reservation in this queue", { exact: false })).toHaveCount(0);
+  expect(state.writes).toBe(0);
+});
+
+test("reservation authentication failure clears the private workspace", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText("staging-pc: Held — reconciliation required")).toBeVisible();
+  state.reservationStatus = 401;
+  await panel.getByRole("button", { name: "Check queue" }).click();
+  await expect(panel).toHaveCount(0);
+  expect(state.writes).toBe(0);
 });
 
 test("queue becoming unavailable clears old rows instead of showing an empty healthy queue", async ({ page }) => {
