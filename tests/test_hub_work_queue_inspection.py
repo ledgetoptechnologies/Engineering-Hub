@@ -1,5 +1,6 @@
 """No live database/mounts. Linux fixtures simulate only the RO mount reading."""
 import os
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -152,3 +153,44 @@ def test_lease_expiring_during_snapshot_read_is_held(wal_database, monkeypatch):
     monkeypatch.setattr(module.sqlite3, 'connect', connect)
     result = module.inspect_work_queue(str(path), machine_id='staging-pc')
     assert result['queue_reservation'] == 'held' and result['observed_at'] == 10
+
+
+def test_cli_uses_only_explicit_bindings_and_sanitized_json(monkeypatch, capsys):
+    calls = []
+    def inspect(path, **kwargs):
+        calls.append((path, kwargs))
+        return {'machine_id': 'staging-pc', 'queue_reservation': 'held',
+                'requires_reconciliation': True, 'queue_only': True, 'observed_at': 100}
+    monkeypatch.setattr(module, 'inspect_work_queue', inspect)
+    assert module.main(['--database', '/explicit/queue.db', '--machine-id', 'staging-pc',
+                        '--timeout-ms', '750']) == 0
+    output = capsys.readouterr()
+    assert output.err == '' and '/explicit/queue.db' not in output.out
+    assert json.loads(output.out) == {'status': 'observed', 'machine_id': 'staging-pc',
+        'queue_reservation': 'held', 'requires_reconciliation': True, 'queue_only': True, 'observed_at': 100}
+    assert calls == [('/explicit/queue.db', {'machine_id': 'staging-pc', 'timeout_seconds': .75})]
+
+
+@pytest.mark.parametrize('args', [[], ['--database', 'secret-sentinel'],
+    ['--database', '/explicit/queue.db', '--machine-id', 'staging-pc'],
+    ['--database', '/explicit/queue.db', '--machine-id', 'staging-pc', '--timeout-ms', '0200'],
+    ['--database', '/explicit/queue.db', '--machine-id', 'staging-pc', '--timeout-ms', '2001'],
+    ['--database', '/explicit/queue.db', '--database', 'secret-sentinel', '--machine-id', 'staging-pc', '--timeout-ms', '100'],
+    ['--dat', 'secret-sentinel', '--machine-id', 'staging-pc', '--timeout-ms', '100'],
+])
+def test_cli_missing_duplicate_invalid_bindings_never_inspect(args, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(module, 'inspect_work_queue', lambda *a, **k: calls.append(True))
+    assert module.main(args) == 2
+    output = capsys.readouterr()
+    assert output.out == '{"queue_only":true,"status":"unavailable"}\n' and output.err == ''
+    assert calls == []
+
+
+def test_cli_inspection_failure_never_echoes_exception(monkeypatch, capsys):
+    def inspect(*args, **kwargs):
+        raise RuntimeError('secret-sentinel')
+    monkeypatch.setattr(module, 'inspect_work_queue', inspect)
+    assert module.main(['--database', '/secret-sentinel', '--machine-id', 'staging-pc', '--timeout-ms', '100']) == 2
+    output = capsys.readouterr()
+    assert output.out == '{"queue_only":true,"status":"unavailable"}\n' and output.err == ''

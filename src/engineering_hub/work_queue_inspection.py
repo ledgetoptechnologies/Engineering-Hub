@@ -6,6 +6,8 @@ is one SQLite snapshot of this queue, not host availability or reconciliation.
 The caller must independently select/authorize the exact database and machine.
 """
 from contextlib import contextmanager
+import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -191,3 +193,45 @@ def inspect_work_queue(path, *, machine_id, timeout_seconds=1):
                 db.close()
             except Exception:
                 raise QueueInspectionUnavailable() from None
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # Never echo an invalid argument: it could contain credential material.
+        raise QueueInspectionUnavailable()
+
+
+def main(argv=None):
+    """Explicit one-shot CLI; provision a read-only view separately first.
+
+    python -m engineering_hub.work_queue_inspection --database /explicit/queue.db
+        --machine-id staging-pc --timeout-ms 1000
+
+    This makes no mount, changes no owner, and never reports host availability.
+    """
+    try:
+        parser = _Parser(description='Inspect one queue reservation on an existing read-only view',
+                         allow_abbrev=False)
+        parser.add_argument('--database', required=True, action='append')
+        parser.add_argument('--machine-id', required=True, action='append')
+        parser.add_argument('--timeout-ms', required=True, action='append')
+        options = parser.parse_args(argv)
+        if any(len(value) != 1 for value in (options.database, options.machine_id, options.timeout_ms)):
+            raise QueueInspectionUnavailable()
+        timeout = options.timeout_ms[0]
+        if not re.fullmatch(r'[1-9][0-9]{2,3}', timeout) or not 100 <= int(timeout) <= 2000:
+            raise QueueInspectionUnavailable()
+        result = inspect_work_queue(options.database[0], machine_id=options.machine_id[0],
+                                    timeout_seconds=int(timeout) / 1000)
+        raw = json.dumps(dict(status='observed', **result), sort_keys=True, separators=(',', ':'), allow_nan=False)
+        if len(raw.encode('utf-8')) > 1024:
+            raise QueueInspectionUnavailable()
+        print(raw)
+        return 0
+    except Exception:
+        print('{"queue_only":true,"status":"unavailable"}')
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
