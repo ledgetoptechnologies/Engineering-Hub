@@ -261,6 +261,7 @@ class SQLiteEventSource:
         self.on_state = on_state
         # Set while a runtime reconcile is owed because another writer held the lock.
         self._suspended_since: float | None = None
+        self._next_retry = 0.0
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -464,11 +465,9 @@ class SQLiteEventSource:
             while True:
                 self._stage = "wait_native_event"
                 # Idle sources still block indefinitely. Only an owed reconcile
-                # after a transient lock wakes on a short timer to retry.
-                ready = self._epoll.poll(-1 if self._suspended_since is None else _RETRY_INTERVAL_SECONDS)
+                # after a transient lock wakes on a timer, for its retry or its bound.
+                ready = self._epoll.poll(self._wait_seconds())
                 should_stop = False
-                if not ready and self._suspended_since is not None:
-                    self._reconcile(reason="retry")
                 for fd, _mask in ready:
                     if fd == self._inotify_fd:
                         self._stage = "read_native_event"
@@ -483,6 +482,12 @@ class SQLiteEventSource:
                         should_stop = self._run_commands()
                 if should_stop or self.failure is not None:
                     break
+                # Other readiness, however frequent, never postpones the owed
+                # retry or the bound: both run on their own clock.
+                if self._suspended_since is not None:
+                    self._check_bound()
+                    if time.monotonic() >= self._next_retry:
+                        self._reconcile(reason="retry")
         except BaseException as exc:
             self._fail(exc)
         finally:
@@ -622,6 +627,8 @@ class SQLiteEventSource:
         began = False
         try:
             self._stage = "acquire_write_barrier"
+            # Past the bound, no attempt may start, so a late success can't resume.
+            self._check_bound()
             try:
                 self._barrier.execute("BEGIN IMMEDIATE")
             except sqlite3.OperationalError as exc:
@@ -631,6 +638,8 @@ class SQLiteEventSource:
                     return
                 raise
             began = True
+            # The barrier wait itself may have crossed the bound; that is also too late.
+            self._check_bound()
             self._stage = "read_committed_cursor"
             recipients, next_cursor = self.read_after(self._reader, self._cursor)
             self._stage = "validate_cursor"
@@ -691,8 +700,20 @@ class SQLiteEventSource:
                 self._stats.update(_sqlite_error_details(exc))
                 self._condition.notify_all()
             self._notify_state("suspended")
-        elif now - self._suspended_since > self.transient_busy_seconds:
-            raise WatcherFailed("SQLite write lock was held longer than the transient bound") from exc
+        self._check_bound(now)
+        self._next_retry = now + _RETRY_INTERVAL_SECONDS
+
+    def _check_bound(self, now: float | None = None) -> None:
+        if self._suspended_since is None:
+            return
+        if (time.monotonic() if now is None else now) - self._suspended_since > self.transient_busy_seconds:
+            raise WatcherFailed("SQLite write lock was held longer than the transient bound")
+
+    def _wait_seconds(self) -> float:
+        if self._suspended_since is None:
+            return -1
+        wake = min(self._next_retry, self._suspended_since + self.transient_busy_seconds)
+        return max(0.0, wake - time.monotonic())
 
     def _resume(self) -> None:
         assert self._barrier is not None
@@ -708,11 +729,13 @@ class SQLiteEventSource:
         self._notify_state("resumed")
 
     def _notify_state(self, state: str) -> None:
+        # A consumer that missed a transition could keep serving a stale stream,
+        # so a failing callback fails the source closed instead of being ignored.
         if self.on_state is not None:
             try:
                 self.on_state(state)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise WatcherFailed(f"native source state callback failed during {state}") from exc
 
     def _fail(self, exc: BaseException) -> None:
         with self._condition:

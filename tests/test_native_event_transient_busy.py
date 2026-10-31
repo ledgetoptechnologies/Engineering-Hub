@@ -9,6 +9,7 @@ from functools import partial
 import math
 import os
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -159,6 +160,141 @@ def test_stop_is_prompt_while_suspended(tmp_path):
         stats = events.stop(timeout=5)
         assert time.monotonic() - began < 2
         assert stats["watcher_stopped"] and events.failure is None
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_release_after_the_bound_never_resumes_or_delivers(tmp_path, monkeypatch):
+    from agent_message_bus import sqlite_events
+    # Retries are rarer than the bound, so only the bound's own clock can end this.
+    monkeypatch.setattr(sqlite_events, "_RETRY_INTERVAL_SECONDS", 3.0)
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=0.5)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        insert_outbox(holder)
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        time.sleep(0.8)
+        holder.commit()
+        assert wait_until(lambda: events.failure is not None, timeout=4)
+        time.sleep(0.5)
+        assert recorder.deliveries == [] and recorder.states == ["suspended"]
+        assert events.stats["cursor"] == 0 and not events.healthy
+    finally:
+        holder.close()
+        events.stop()
+
+
+class Flood:
+    """Unrelated directory churn: native readiness that never marks the ledger dirty."""
+
+    def __init__(self, directory):
+        self.directory, self.running = directory, True
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        index = 0
+        while self.running:
+            noise = self.directory / f"noise-{index % 4}"
+            noise.write_bytes(b"x")
+            noise.unlink()
+            index += 1
+            time.sleep(0.002)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.running = False
+        self.thread.join(timeout=5)
+
+
+def test_readiness_flood_cannot_postpone_the_bound(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=0.6)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        with Flood(tmp_path):
+            began = time.monotonic()
+            assert wait_until(lambda: events.failure is not None, timeout=4)
+            assert time.monotonic() - began < 2
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_readiness_flood_cannot_postpone_the_retry(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        insert_outbox(holder)
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        with Flood(tmp_path):
+            holder.commit()
+            assert wait_until(lambda: events.healthy and events.stats["cursor"] == 1, timeout=3)
+            assert recorder.states == ["suspended", "resumed"] and events.failure is None
+            began = time.monotonic()
+            events.stop(timeout=5)
+            assert time.monotonic() - began < 2
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_stop_is_prompt_while_suspended_under_a_flood(tmp_path):
+    path = ledger(tmp_path)
+    events = source(path, Recorder(), transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        with Flood(tmp_path):
+            began = time.monotonic()
+            events.stop(timeout=5)
+            assert time.monotonic() - began < 2 and events.failure is None
+    finally:
+        holder.close()
+        events.stop()
+
+
+@pytest.mark.parametrize("failing", ["suspended", "resumed"])
+def test_a_failing_state_callback_fails_the_source_closed(tmp_path, failing):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+
+    def on_state(state):
+        recorder.states.append(state)
+        if state == failing:
+            raise RuntimeError("consumer could not record the transition")
+
+    events = SQLiteEventSource(path, HubOutboxCursorReader(), recorder.deliver, busy_timeout_ms=200,
+                               on_error=recorder.errors.append, on_state=on_state,
+                               transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        insert_outbox(holder)
+        poke(path)
+        if failing == "resumed":
+            assert wait_until(lambda: events.stats["suspended"])
+            holder.commit()
+        assert wait_until(lambda: events.failure is not None)
+        assert isinstance(events.failure, WatcherFailed) and not events.healthy
+        assert len(recorder.errors) == 1 and recorder.states[-1] == failing
     finally:
         holder.close()
         events.stop()
