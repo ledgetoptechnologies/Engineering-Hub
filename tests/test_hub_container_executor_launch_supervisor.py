@@ -1335,6 +1335,15 @@ def test_supervisor_uses_the_one_shared_profile_parser():
         assert core.verify_profile_bytes(raw, expected).digest() == launch.ExecutorLaunchProfile.model_validate(value).digest()
 
 
+@pytest.mark.parametrize('bad', ['garbage\n', '0 10002 1\n', ''])
+def test_supervisor_map_errors_keep_the_supervisor_error_type(bad):
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    exact = '0 10002 1\n1 100001 65536\n'
+    with pytest.raises(launch.LaunchSupervisorError) as caught:
+        launch._live_maps(policy, bad, exact)
+    assert type(caught.value) is launch.LaunchSupervisorError
+
+
 def test_legacy_profile_digest_bytes_are_unchanged():
     raw = profile_data()
     # The digest every existing v2 enrollment, receipt and verifier already pins.

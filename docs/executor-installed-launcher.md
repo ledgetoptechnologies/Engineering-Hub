@@ -55,7 +55,11 @@ The profile model, the v3 policy and the digest live in the pure core module
 them, so there is one parser. Hub-side verifiers can use
 `verify_profile_bytes(raw, expected_digest)` to accept only exact canonical
 profile bytes whose digest equals one they already pin independently. That shows
-the bytes are that profile, not that the profile was approved. The executor
+the bytes are that profile, not that the profile was approved, and it is not
+admission: the caller must still require the version it expects and bind the
+policy's Engine and daemon identity to its own independent pins. Path checks use
+POSIX rules on every host, every failure is one sanitized error, and the target
+table is read-only. The executor
 image's build-time import check includes this module, so an older core image
 without it fails the build rather than at launch.
 

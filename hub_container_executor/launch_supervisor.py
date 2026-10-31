@@ -195,8 +195,8 @@ class _Process:
 
 
 from engineering_hub.executor_launch_profile import (  # re-exported; one parser for supervisor and verifiers
-    DisjointDaemonPolicy, ExecutorLaunchMount, ExecutorLaunchProfile, _HELD_HOST_IDS, _UNUSABLE_DAEMON_IDS,
-    _covers, _covers_inside, _map_rows, _proc_map_rows)
+    DisjointDaemonPolicy, ExecutorLaunchMount, ExecutorLaunchProfile, LaunchProfileError, _HELD_HOST_IDS,
+    _UNUSABLE_DAEMON_IDS, _covers, _covers_inside, _map_rows, _proc_map_rows)
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,12 @@ def _disjoint_from(rows, ranges):
 
 def _live_maps(policy, uid_map, gid_map):
     """Exact equality between kernel-reported maps and the profile-pinned policy."""
-    _require(_proc_map_rows(uid_map) == policy.uid_map and _proc_map_rows(gid_map) == policy.gid_map)
+    try:
+        rows = _proc_map_rows(uid_map), _proc_map_rows(gid_map)
+    except LaunchProfileError:
+        # Callers of the supervisor see only its own sanitized error type.
+        raise LaunchSupervisorError() from None
+    _require(rows == (policy.uid_map, policy.gid_map))
 
 
 def _mapped_id(raw, identifier):

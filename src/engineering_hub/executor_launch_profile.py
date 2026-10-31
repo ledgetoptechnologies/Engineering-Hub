@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-from pathlib import Path
+import posixpath
+from pathlib import PurePosixPath
 import re
+from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 MAX_PROFILE_BYTES = 1024**2
-LAUNCH_TARGETS = {
+# Read-only: the supervisor aliases this exact mapping, so nothing may change it.
+LAUNCH_TARGETS = MappingProxyType({
     'engine_socket': '/run/engineering-hub/docker.sock',
     'issuer_socket': '/run/engineering-hub/issuer.sock',
     'config': '/operator/runner.json',
@@ -28,7 +30,7 @@ LAUNCH_TARGETS = {
     'metadata': '/var/lib/engineering-hub/metadata',
     'baseline': '/var/lib/engineering-hub/baseline',
     'secrets': '/var/lib/engineering-hub/secrets',
-}
+})
 _TARGETS = LAUNCH_TARGETS
 
 
@@ -55,9 +57,9 @@ _canonical = canonical
 
 def _path(value):
     _require(type(value) is str and value.startswith('/') and value != '/'
-             and os.path.normpath(value) == value and not value.startswith('//')
+             and posixpath.normpath(value) == value and not value.startswith('//')
              and not any(ord(char) < 32 or ord(char) == 127 for char in value))
-    return Path(value)
+    return PurePosixPath(value)
 
 
 class _Closed(BaseModel):
@@ -224,14 +226,14 @@ class ExecutorLaunchProfile(_Closed):
                  and {item.role for item in self.mounts} == set(_TARGETS))
         fixture = _path(self.fixture_root)
         _require(re.fullmatch(r'hub-pilot-[a-z0-9][a-z0-9-]{0,63}', fixture.name))
-        sources = [Path(item.source) for item in self.mounts]
-        _require(all(fixture in Path(item.source).parents for item in self.mounts
+        sources = [PurePosixPath(item.source) for item in self.mounts]
+        _require(all(fixture in PurePosixPath(item.source).parents for item in self.mounts
                      if item.role not in {'engine_socket', 'issuer_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
         _path(self.runner_file)
         _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
-                 and not any(self.runner_file == item.target or Path(item.target) in Path(self.runner_file).parents
+                 and not any(self.runner_file == item.target or PurePosixPath(item.target) in PurePosixPath(self.runner_file).parents
                          for item in self.mounts) and type(self.runner_digest) is str and _SHA.fullmatch(self.runner_digest))
         return self
 
@@ -252,6 +254,12 @@ def verify_profile_bytes(raw, expected_digest):
 
     The expected digest must come from evidence the caller already trusts; this
     only shows these bytes are that profile, not that the profile was approved.
+    It is not admission: a caller still has to require the version it expects
+    (for example that a v3 policy is present) and bind the policy's Engine and
+    daemon identity to its own independent pins.
+
+    Every failure is the one sanitized LaunchProfileError; validation messages,
+    which can quote input, never escape.
     """
     _require(type(raw) is bytes and 0 < len(raw) <= MAX_PROFILE_BYTES
              and type(expected_digest) is str and _SHA.fullmatch(expected_digest))
@@ -265,11 +273,13 @@ def verify_profile_bytes(raw, expected_digest):
         raise LaunchProfileError()
     try:
         data = json.loads(raw.decode('utf-8'), object_pairs_hook=pairs, parse_float=reject, parse_constant=reject)
+        # A JSON escape can decode to a lone surrogate; re-encoding it fails here, closed.
+        _require(canonical(data) == raw)
+        profile = ExecutorLaunchProfile.model_validate(data)
+        _require(canonical(profile.enrollment_value()) == raw and profile.digest() == expected_digest)
     except LaunchProfileError:
         raise
-    except (ValueError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
+        # Includes pydantic's ValidationError and UnicodeEncodeError, both ValueErrors.
         raise LaunchProfileError() from None
-    _require(canonical(data) == raw)
-    profile = ExecutorLaunchProfile.model_validate(data)
-    _require(canonical(profile.enrollment_value()) == raw and profile.digest() == expected_digest)
     return profile

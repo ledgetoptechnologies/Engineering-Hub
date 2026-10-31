@@ -101,5 +101,40 @@ def test_refusals_never_echo_values():
 def test_core_module_has_no_host_or_executor_access():
     text = Path(core.__file__).read_text(encoding='utf-8')
     for forbidden in ('import fcntl', 'import socket', 'import subprocess', 'import sqlite3',
-                      'hub_container_executor import', 'from hub_container_executor', 'open('):
+                      'hub_container_executor import', 'from hub_container_executor', 'open(',
+                      # Host path semantics would reject POSIX profile paths on Windows.
+                      'os.path', 'import os\n', 'from pathlib import Path\n'):
         assert forbidden not in text, forbidden
+
+
+def test_posix_paths_validate_the_same_under_windows_path_rules(monkeypatch):
+    import ntpath
+    import os
+    raw = core.canonical(profile(daemon_policy=policy()))
+    # If the parser consulted the host's path module, Windows rules would rewrite '/' paths and refuse them.
+    monkeypatch.setattr(os, 'path', ntpath)
+    assert core.verify_profile_bytes(raw, digest_of(raw)).fixture_root == '/operator/hub-pilot-synthetic'
+
+
+def test_validation_errors_are_sanitized():
+    raw = core.canonical({**profile(), 'memory_bytes': 'SECRETVALUE'})
+    with pytest.raises(core.LaunchProfileError) as caught:
+        core.verify_profile_bytes(raw, digest_of(raw))
+    assert type(caught.value) is core.LaunchProfileError
+    assert 'SECRETVALUE' not in str(caught.value) and caught.value.__cause__ is None
+
+
+def test_lone_surrogate_escape_fails_closed_without_leaking():
+    raw = core.canonical(profile()).replace(b'"PATH=/usr/bin:/bin"', b'"PATH=\\ud800SECRET"')
+    assert b'\\ud800' in raw
+    with pytest.raises(core.LaunchProfileError) as caught:
+        core.verify_profile_bytes(raw, digest_of(raw))
+    assert 'SECRET' not in str(caught.value)
+
+
+def test_launch_targets_are_read_only():
+    with pytest.raises(TypeError):
+        core.LAUNCH_TARGETS['config'] = '/tmp/elsewhere'
+    with pytest.raises(TypeError):
+        del core.LAUNCH_TARGETS['config']
+    assert core.LAUNCH_TARGETS['config'] == '/operator/runner.json'
