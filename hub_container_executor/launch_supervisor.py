@@ -1766,6 +1766,81 @@ class LaunchSupervisor:
         with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
             return client.invoke('pending_state_v1', {'operation_id': operation_id})
 
+    def serve_state_custodian_admission(self, *, channel, manifest, timeout_seconds):
+        """Serve one peer-challenged intent observation, not a live effect lease.
+
+        The accepted socket and its listener are owned by the caller. The
+        custodian must independently pin this issuer, reserve the signed nonce
+        and operation durably, and establish live custody before any effect.
+        Direct channel custody and the host's trusted root are prerequisites.
+        """
+        from engineering_hub.container_pilot_manifest import PilotManifest
+        from .broker_seqpacket import PeerPin, _start
+        from .mount_gate_controller import _read_observation
+        from .state_custodian_admission import DOMAIN, PROTOCOL
+        peer = None
+        try:
+            _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                     and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
+                     and type(channel) is socket.socket and channel.family == socket.AF_UNIX
+                     and channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_SEQPACKET
+                     and channel.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 1
+                     and type(manifest) is PilotManifest)
+            deadline = time.monotonic() + timeout_seconds
+            start_wall = int(time.time() * 1000)
+            profile = self.profile
+            policy = profile.generation_isolation
+            _require(policy is not None and profile.digest() == self.release.launch_profile_digest)
+            # Revalidate the supplied model, then bind its digest to the exact
+            # independently enrolled read-only runner configuration.
+            manifest = PilotManifest.model_validate_json(manifest.canonical_bytes())
+            digest = manifest.digest()
+            _require(digest == self._handoff_manifest_digest())
+            channel.settimeout(_remaining(deadline))
+            raw, credentials = _read_observation(channel)
+            request = _strict(raw, MAX_RECEIPT_BYTES)
+            _require(type(request) is dict and set(request) == {'protocol', 'operation_id', 'nonce'}
+                     and _canonical(request) == raw
+                     and request['protocol'] == 'engineering-hub.state-custodian-request.v1'
+                     and type(request['operation_id']) is str
+                     and str(UUID(request['operation_id'])) == request['operation_id']
+                     and type(request['nonce']) is str and _HEX.fullmatch(request['nonce'])
+                     and len(credentials) == 1)
+            pid, uid, gid = credentials[0]
+            _require(uid == policy.provider_host_uid and gid == policy.provider_host_gid)
+            peer = PeerPin(pid=pid, uid=uid, gid=gid, start_ticks=_start(pid))
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                peer.check()
+            context = self.pending_state_context(operation_id=request['operation_id'],
+                manifest_digest=digest, timeout_seconds=_remaining(deadline))
+            # A second independent read narrows, but cannot eliminate, the
+            # interval in which a fence can change after this observation.
+            _require(context == self.pending_state_context(operation_id=request['operation_id'],
+                manifest_digest=digest, timeout_seconds=_remaining(deadline)))
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                peer.check()
+                _require(digest == self._handoff_manifest_digest()
+                         and profile.digest() == self.release.launch_profile_digest)
+                now = int(time.time() * 1000)
+                _require(now >= start_wall and _remaining(deadline) > 0)
+                payload = dict(context, protocol=PROTOCOL,
+                    source_backup_digest=manifest.state_policy.baseline_backup_digest,
+                    provider_key_digest='sha256:' + hashlib.sha256(bytes.fromhex(policy.provider_public_key)).hexdigest(),
+                    nonce=request['nonce'], issued_at_ms=now,
+                    expires_at_ms=now + min(5000, max(1, int(_remaining(deadline) * 1000))))
+                response = _canonical({'payload': payload, 'signature': self._signer.sign(DOMAIN + _canonical(payload)).hex()})
+                peer.check(); channel.settimeout(_remaining(deadline))
+                _require(channel.send(response) == len(response))
+                peer.check(); _remaining(deadline)
+            return 'sent_unconfirmed'
+        except Exception:
+            raise LaunchSupervisorError() from None
+        finally:
+            if peer is not None:
+                peer.close()
+
     def observe_pending_gate_runtime(self, *, manifest, image, enrollment_file, timeout_seconds):
         """Bind the current fenced create to the live bootstrap and host source.
 
