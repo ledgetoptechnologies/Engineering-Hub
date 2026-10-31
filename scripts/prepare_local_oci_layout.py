@@ -2,6 +2,7 @@
 
 Integrity validation is not release provenance or deployment approval. On
 failure the exclusively created output is deliberately preserved for review.
+Layer decompression, diff IDs, and runtime behavior are not validated.
 """
 import argparse
 import hashlib
@@ -22,6 +23,30 @@ LAYER = {'application/vnd.oci.image.layer.v1.tar', 'application/vnd.oci.image.la
          'application/vnd.docker.image.rootfs.diff.tar.gzip'}
 
 
+class _BoundedReader:
+    def __init__(self, stream):
+        self.stream, self.remaining = stream, MAX_TOTAL + 64 * 1024**2
+
+    def read(self, size=-1):
+        if size < 0 or size > self.remaining:
+            raise ValueError('raw archive limit')
+        data = self.stream.read(size)
+        self.remaining -= len(data)
+        return data
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    def _proc_pax(self, archive):
+        if self.size > MAX_META:
+            raise ValueError('archive extension too large')
+        return super()._proc_pax(archive)
+
+    def _proc_gnulong(self, archive):
+        if self.size > MAX_META:
+            raise ValueError('archive extension too large')
+        return super()._proc_gnulong(archive)
+
+
 def _json(raw):
     def pairs(items):
         out = {}
@@ -33,16 +58,33 @@ def _json(raw):
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
 
 
-def prepare(stream, output, requested):
+def _prepare(stream, output, requested, fds):
     if not isinstance(requested, str) or not DIGEST.fullmatch(requested):
         raise ValueError('exact manifest digest required')
     output = Path(output)
     # Parent must be controlled by the caller. Never adopt an existing directory.
     output.mkdir(mode=0o700)
-    (output / 'blobs').mkdir(mode=0o700)
-    (output / 'blobs' / 'sha256').mkdir(mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(output, flags)
+    fds.append(root_fd)
+    os.mkdir('blobs', 0o700, dir_fd=root_fd)
+    blob_fd = os.open('blobs', flags, dir_fd=root_fd)
+    fds.append(blob_fd)
+    os.mkdir('sha256', 0o700, dir_fd=blob_fd)
+    sha_fd = os.open('sha256', flags, dir_fd=blob_fd)
+    fds.append(sha_fd)
+    root_identity = os.fstat(root_fd)
+    def stable():
+        named = os.stat(output, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (root_identity.st_dev, root_identity.st_ino):
+            raise ValueError('output directory replaced')
+        for parent, name, child in ((root_fd, 'blobs', blob_fd), (blob_fd, 'sha256', sha_fd)):
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            actual = os.fstat(child)
+            if (named.st_dev, named.st_ino) != (actual.st_dev, actual.st_ino):
+                raise ValueError('output directory replaced')
     names, sizes, meta, total = set(), {}, {}, 0
-    with tarfile.open(fileobj=stream, mode='r|*') as archive:
+    with tarfile.open(fileobj=_BoundedReader(stream), mode='r|*', tarinfo=_BoundedTarInfo) as archive:
         for number, member in enumerate(archive, 1):
             if number > MAX_MEMBERS:
                 raise ValueError('invalid archive member')
@@ -72,7 +114,9 @@ def prepare(stream, output, requested):
             source = archive.extractfile(member)
             h = hashlib.sha256()
             count = 0
-            with open(output / name, 'xb') as dest:
+            stable()
+            fd = os.open(digest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=sha_fd)
+            with os.fdopen(fd, 'wb') as dest:
                 while True:
                     chunk = source.read(1024 * 1024)
                     if not chunk:
@@ -96,7 +140,10 @@ def prepare(stream, output, requested):
     def read_blob(digest):
         if sizes[digest] > MAX_META:
             raise ValueError('manifest too large')
-        return _json((output / 'blobs' / 'sha256' / digest[7:]).read_bytes())
+        stable()
+        fd = os.open(digest[7:], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sha_fd)
+        with os.fdopen(fd, 'rb') as source:
+            return _json(source.read(MAX_META + 1))
 
     index = meta.get('index.json')
     if type(index) is not dict or index.get('schemaVersion') != 2 or type(index.get('manifests')) is not list:
@@ -104,7 +151,7 @@ def prepare(stream, output, requested):
     # Only traverse available index branches; selected digest must be advertised
     # with linux/amd64, or be the index's single platform-unspecified image.
     selected = []
-    def visit(rows, depth=0):
+    def visit(rows, depth=0, ancestors=()):
         if depth > 4 or len(rows) > 256:
             raise ValueError('index limit')
         for row in rows:
@@ -112,16 +159,20 @@ def prepare(stream, output, requested):
                 continue  # Docker saves may omit other platforms.
             kind = row.get('mediaType')
             digest = descriptor(row, IMAGE | INDEX)
+            platform = row.get('platform')
+            if platform is not None and (type(platform) is not dict or platform.get('os') != 'linux'
+                                         or platform.get('architecture') != 'amd64'):
+                if digest == requested:
+                    raise ValueError('wrong platform')
+                continue
             if kind in INDEX:
                 child = read_blob(digest)
                 if child.get('schemaVersion') != 2 or type(child.get('manifests')) is not list:
                     raise ValueError('invalid nested index')
-                visit(child['manifests'], depth + 1)
+                visit(child['manifests'], depth + 1, ancestors + (len(rows),))
             elif digest == requested:
-                platform = row.get('platform')
-                if platform is not None and (type(platform) is not dict or platform.get('os') != 'linux'
-                                             or platform.get('architecture') != 'amd64'):
-                    raise ValueError('wrong platform')
+                if platform is None and (len(rows) != 1 or any(n != 1 for n in ancestors)):
+                    raise ValueError('ambiguous unspecified platform')
                 selected.append(row)
     visit(index['manifests'])
     if len(selected) != 1:
@@ -140,11 +191,27 @@ def prepare(stream, output, requested):
     for layer in layers:
         descriptor(layer, LAYER)
     # Write a minimal index for the exact selected graph. Existing files never replaced.
-    (output / 'oci-layout').write_bytes(b'{"imageLayoutVersion":"1.0.0"}')
+    stable()
+    def write_exclusive(name, data):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
+        with os.fdopen(fd, 'wb') as target:
+            target.write(data)
+    write_exclusive('oci-layout', b'{"imageLayoutVersion":"1.0.0"}')
     result = {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json',
               'manifests': [chosen]}
-    (output / 'index.json').write_text(json.dumps(result, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+    stable()
+    write_exclusive('index.json', json.dumps(result, sort_keys=True, separators=(',', ':')).encode())
+    stable()
     return {'manifest': requested, 'config': config_digest, 'layers': len(layers), 'blob_bytes': total}
+
+
+def prepare(stream, output, requested):
+    fds = []
+    try:
+        return _prepare(stream, output, requested, fds)
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
 
 
 def main():

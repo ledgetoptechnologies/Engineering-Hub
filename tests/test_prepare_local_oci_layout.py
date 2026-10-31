@@ -75,3 +75,48 @@ def test_never_adopts_existing_output(tmp_path):
     with pytest.raises(FileExistsError):
         prepare(archive(rows), tmp_path, digest)
     assert marker.read_text() == 'keep'
+
+
+def test_unspecified_platform_among_multiple_entries_is_rejected(tmp_path):
+    rows, digest = fixture()
+    index = json.loads(rows[1][1])
+    index['manifests'].append(dict(index['manifests'][0], digest='sha256:' + '0' * 64))
+    rows[1] = ('index.json', encoded(index))
+    with pytest.raises(ValueError):
+        prepare(archive(rows), tmp_path / 'new', digest)
+
+
+def test_conflicting_ancestor_platform_is_rejected(tmp_path):
+    rows, digest = fixture()
+    nested = rows[1][1]
+    nested_digest = 'sha256:' + hashlib.sha256(nested).hexdigest()
+    rows[1] = ('index.json', encoded({'schemaVersion': 2, 'manifests': [{
+        'mediaType': 'application/vnd.oci.image.index.v1+json', 'digest': nested_digest,
+        'size': len(nested), 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}))
+    rows.append(('blobs/sha256/' + nested_digest[7:], nested))
+    with pytest.raises(ValueError):
+        prepare(archive(rows), tmp_path / 'new', digest)
+
+
+def test_oversized_pax_header_rejected_before_payload_read(tmp_path):
+    info = tarfile.TarInfo('extension')
+    info.type = tarfile.XHDTYPE
+    info.size = 1024 * 1024 + 1
+    raw = io.BytesIO(info.tobuf() + b'x' * 1024)
+    with pytest.raises(ValueError, match='extension too large'):
+        prepare(raw, tmp_path / 'new', 'sha256:' + '0' * 64)
+
+
+def test_metadata_collision_does_not_replace_existing_file(tmp_path, monkeypatch):
+    import os
+    rows, digest = fixture()
+    output = tmp_path / 'new'
+    original = os.open
+    def inject(path, flags, *args, **kwargs):
+        if path == 'oci-layout':
+            (output / 'oci-layout').write_bytes(b'preserve')
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, 'open', inject)
+    with pytest.raises(FileExistsError):
+        prepare(archive(rows), output, digest)
+    assert (output / 'oci-layout').read_bytes() == b'preserve'
