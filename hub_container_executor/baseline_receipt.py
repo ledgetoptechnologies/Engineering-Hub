@@ -78,7 +78,7 @@ class ProtectedBaselineProvider:
     """
 
     def __init__(self, store, *, receipt_digest, campaign_id, verified_rollback,
-                 expected_runtime_profile_digest):
+                 expected_runtime_profile_digest, baseline_gate_public_key=None):
         try:
             _require(callable(getattr(store, 'get', None)) and _sha(receipt_digest)
                      and _uuid(campaign_id) and _sha(expected_runtime_profile_digest)
@@ -98,6 +98,8 @@ class ProtectedBaselineProvider:
                                  record_digest=image.record_digest)
             self._platform = _strict(_canonical(image.platform.model_dump(mode='json')))
             self._store, self._receipt_digest, self._campaign = store, receipt_digest, campaign_id
+            _require(baseline_gate_public_key is None or (type(baseline_gate_public_key) is bytes and len(baseline_gate_public_key) == 32))
+            self._gate_key = baseline_gate_public_key
             self._profile = expected_runtime_profile_digest
             self._closed, self._pid = False, os.getpid()
         except Exception:
@@ -116,8 +118,8 @@ class ProtectedBaselineProvider:
             _require(type(raw) is bytes and 1 <= len(raw) <= 65536
                      and 'sha256:' + hashlib.sha256(raw).hexdigest() == self._receipt_digest)
             row = _strict(raw)
-            _require(type(row) is dict and set(row) == _FIELDS
-                     and row['schema'] == 'hub_baseline_receipt_v1'
+            _require(type(row) is dict and ((set(row) == _FIELDS and row.get('schema') == 'hub_baseline_receipt_v1' and self._gate_key is None)
+                     or (set(row) == _FIELDS | {'gate_enrollment'} and row.get('schema') == 'hub_baseline_receipt_v2' and self._gate_key is not None))
                      and row['campaign_id'] == self._campaign and _uuid(row['proof_id'])
                      and row['manifest_digest'] == manifest.digest()
                      and row['baseline_id'] == manifest.state_policy.baseline_id
@@ -127,6 +129,14 @@ class ProtectedBaselineProvider:
                      and type(row['state_generation_id']) is str and _OPAQUE.fullmatch(row['state_generation_id']) is not None
                      and row['runtime_profile_digest'] == self._profile
                      and row['probe_set_digest'] == probe_set_digest(manifest.probes.rollback))
+            if row['schema'] == 'hub_baseline_receipt_v2':
+                from .baseline_gate_enrollment import verify_baseline_gate_enrollment
+                gate = verify_baseline_gate_enrollment(row['gate_enrollment'], self._gate_key)
+                _require(gate['manifest_digest'] == manifest.digest()
+                         and gate['image_config_id'] == row['rollback']['image_config_id']
+                         and gate['container_id'] == row['container_id']
+                         and gate['generation_id'] == row['state_generation_id']
+                         and gate['runtime_profile_digest'] == row['runtime_profile_digest'])
             backup, observation, inventory = row['backup'], row['observation'], row['baseline_inventory']
             maximum = manifest.retention.max_storage_bytes
             now = time.time()
@@ -155,7 +165,8 @@ class ProtectedBaselineProvider:
     @staticmethod
     def _identity(row):
         return BaselineIdentity(row['baseline_id'], row['backup']['digest'], row['container_id'],
-                                row['rollback']['image_config_id'], row['state_generation_id'], True, row['proof_id'])
+                                row['rollback']['image_config_id'], row['state_generation_id'], True, row['proof_id'],
+                                row['gate_enrollment']['payload']['gate_socket_directory'] if row['schema'] == 'hub_baseline_receipt_v2' else None)
 
     def enrolled_baseline(self, manifest):
         return self._identity(self._read(manifest))

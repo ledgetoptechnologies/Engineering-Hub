@@ -780,3 +780,33 @@ def test_completed_create_restores_again_after_later_inspection_fails(tmp_path):
     assert len(restores) == 2 and len(calls) == 2
     assert backend.events.count("create") == 1 and backend.events.count("probe") == 0
     adapter.close()
+
+
+def test_enrolled_baseline_uses_separate_read_only_inspector(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hub_container_executor.daemon_backend import DockerEngineBackend
+    from hub_container_executor.baseline_inspection import BaselineInspectionBackend
+    from hub_container_executor.runtime_profile import derive_runtime_profile
+    adapter, backend, _, _ = make_fixture(tmp_path)
+    baseline = replace(adapter.baseline_provider.baseline, gate_socket_directory='/run/baseline-gate')
+    image = verify_image_record(adapter.manifest, 'rollback', adapter.record_store, adapter.metadata_store, FakeTrust())
+    defaults = adapter._defaults_from_record(image)
+    secrets = dict(adapter.secret_resolver.values)
+    profile = derive_runtime_profile(adapter.manifest, defaults, baseline.state_generation_id, secrets,
+                                     gate_socket_directory=baseline.gate_socket_directory)
+    selection = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest, image.image_config_id, image.platform)
+    real = object.__new__(DockerEngineBackend)
+    real._gate_mount_verifier = SimpleNamespace(source_directory=baseline.gate_socket_directory)
+    real.binding = object()
+    monkeypatch.setattr(real, 'inspect_image', lambda *_: defaults)
+    monkeypatch.setattr(real, 'inspect_container', lambda *_: ContainerObservation(
+        baseline.container_id, selection, profile, baseline.state_generation_id, 'running'))
+    adapter.baseline_inspection_backend = BaselineInspectionBackend(real)
+    try:
+        adapter._verify_baseline_container(baseline, image, defaults, secrets, time.monotonic() + 5)
+        adapter.baseline_inspection_backend.source_directory = '/run/wrong-gate'
+        with pytest.raises(adapter_module._Held):
+            adapter._verify_baseline_container(baseline, image, defaults, secrets, time.monotonic() + 5)
+        assert not any(event in {'create', 'start', 'stop'} for event in backend.events)
+    finally:
+        adapter.close()

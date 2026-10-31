@@ -119,6 +119,7 @@ class BaselineIdentity:
     state_generation_id: str
     healthy_at_enrollment: bool
     proof_id: str
+    gate_socket_directory: str | None = None
 
 
 @dataclass(frozen=True)

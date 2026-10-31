@@ -77,7 +77,7 @@ class HostAdapter:
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
                  driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
-                 gate_socket_directory: str | None = None):
+                 gate_socket_directory: str | None = None, baseline_inspection_backend=None):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
         if gate_socket_directory is not None:
@@ -85,6 +85,13 @@ class HostAdapter:
             if (type(backend) is not DockerEngineBackend or backend._gate_mount_verifier is None
                     or backend._gate_mount_verifier.source_directory != gate_socket_directory):
                 raise ValueError('authenticated gate mount authority required')
+        if baseline_inspection_backend is not None:
+            from .daemon_backend import DockerEngineBackend
+            from .baseline_inspection import BaselineInspectionBackend
+            if (type(backend) is not DockerEngineBackend or type(baseline_inspection_backend) is not BaselineInspectionBackend
+                    or baseline_inspection_backend.binding != backend.binding):
+                raise ValueError('separately enrolled baseline inspection backend required')
+        self.baseline_inspection_backend = baseline_inspection_backend
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
         self.manifest_digest = self.manifest.digest()
@@ -421,9 +428,31 @@ class HostAdapter:
 
     def _verify_baseline_container(self, baseline: BaselineIdentity, image: VerifiedImage,
                                    defaults: ImageDefaults, secrets: dict[str, str], deadline: float):
-        profile = self._profile(image, defaults, baseline.state_generation_id, secrets, gate=False)
-        self._inspect_container(baseline.container_id, image, profile,
-                                baseline.state_generation_id, {"running"}, deadline)
+        profile = derive_runtime_profile(self.manifest, defaults, baseline.state_generation_id, secrets,
+                                         gate_socket_directory=baseline.gate_socket_directory)
+        if self.gate_socket_directory is not None and baseline.gate_socket_directory is None:
+            raise _Held('recovery_required')
+        if baseline.gate_socket_directory is None:
+            self._inspect_container(baseline.container_id, image, profile,
+                                    baseline.state_generation_id, {"running"}, deadline)
+            return
+        backend = self.baseline_inspection_backend
+        if (backend is None or backend.source_directory != baseline.gate_socket_directory):
+            raise _Held('recovery_required')
+        try:
+            observed_defaults = backend.inspect_image(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+            if observed_defaults != defaults:
+                raise ValueError()
+            actual = backend.inspect_container(baseline.container_id, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+        except Exception:
+            raise _Held('daemon_unavailable') from None
+        self._timeout(deadline, self.manifest.timeouts.inspect_ms)
+        expected = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
+                                        image.image_config_id, image.platform)
+        if (type(actual) is not ContainerObservation or actual.container_id != baseline.container_id
+                or actual.selected_image != expected or actual.profile != profile
+                or actual.state_generation_id != baseline.state_generation_id or actual.status != 'running'):
+            raise _Held('evidence_mismatch')
 
     def _validate_generation(self, state, baseline: BaselineIdentity):
         if (type(state) is not StateGeneration

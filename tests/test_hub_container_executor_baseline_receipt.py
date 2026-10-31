@@ -261,3 +261,52 @@ def test_protected_reader_feeds_actual_state_provider_without_unbound_inventory(
             assert live.read_bytes() == frozen.read_bytes() == before
         finally:
             state.close()
+
+
+def test_v2_gate_enrollment_requires_independent_signature_and_exact_identity(rig):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    from hub_container_executor.baseline_gate_enrollment import DOMAIN
+    manifest, image, original, _ = rig
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    row = deepcopy(original)
+    row['schema'] = 'hub_baseline_receipt_v2'
+    payload = dict(schema='hub_baseline_gate_v1', manifest_digest=manifest.digest(),
+                   image_config_id=image.image_config_id, container_id=row['container_id'],
+                   generation_id=row['state_generation_id'], runtime_profile_digest=PROFILE,
+                   gate_socket_directory='/run/private-baseline-gate')
+    row['gate_enrollment'] = dict(payload=payload, signature=key.sign(DOMAIN + canonical(payload)).hex())
+    raw = canonical(row); pin = digest(raw)
+    provider = ProtectedBaselineProvider(FakeStore({pin: raw}), receipt_digest=pin, campaign_id=manifest.campaign_id,
+        verified_rollback=image, expected_runtime_profile_digest=PROFILE, baseline_gate_public_key=public)
+    baseline = provider.enrolled_baseline(manifest)
+    assert baseline.gate_socket_directory == '/run/private-baseline-gate'
+    assert provider.verify_baseline(baseline, manifest)
+    row['gate_enrollment']['payload']['gate_socket_directory'] = '/run/attacker'
+    raw = canonical(row); pin = digest(raw)
+    bad = ProtectedBaselineProvider(FakeStore({pin: raw}), receipt_digest=pin, campaign_id=manifest.campaign_id,
+        verified_rollback=image, expected_runtime_profile_digest=PROFILE, baseline_gate_public_key=public)
+    with pytest.raises(BaselineReceiptError): bad.enrolled_baseline(manifest)
+
+
+@pytest.mark.parametrize('path', ['/', '//server/path', '/run/../escape', '/run//gap', '/run/new\nline', '/run/zero\x00byte'])
+def test_signed_gate_enrollment_rejects_unsafe_paths(rig, path):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    from hub_container_executor.baseline_gate_enrollment import DOMAIN, verify_baseline_gate_enrollment
+    manifest, image, row, _ = rig
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    payload = dict(schema='hub_baseline_gate_v1', manifest_digest=manifest.digest(), image_config_id=image.image_config_id,
+        container_id=row['container_id'], generation_id=row['state_generation_id'], runtime_profile_digest=PROFILE,
+        gate_socket_directory=path)
+    envelope = dict(payload=payload, signature=key.sign(DOMAIN + canonical(payload)).hex())
+    with pytest.raises(ValueError): verify_baseline_gate_enrollment(envelope, public)
+
+
+def test_baseline_inspection_facade_has_no_mutation_api():
+    from hub_container_executor.baseline_inspection import BaselineInspectionBackend
+    assert not hasattr(BaselineInspectionBackend, 'create_container')
+    assert not hasattr(BaselineInspectionBackend, 'start_container')
+    assert not hasattr(BaselineInspectionBackend, 'stop_container')
