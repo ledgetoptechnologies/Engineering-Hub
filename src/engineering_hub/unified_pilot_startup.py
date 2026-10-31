@@ -246,6 +246,10 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
                      and isinstance(session_enrollment_path, (str, Path))
                      and Path(session_enrollment_path).is_absolute())
         deployment, profile = validate_configuration(config_path, profile_path)
+        # Only the fixed protected-enrollment path supplies mandatory v3
+        # recognition. Arbitrary trusted callbacks have no equivalent contract.
+        _require(type(profile) is PilotProfile and profile.profile_mode in ('legacy', 'disjoint-v3'))
+        _require(profile.profile_mode != 'disjoint-v3' or session_enrollment_path is not None)
         from .app import Settings
         settings = Settings.from_env(deployment)
         # Must precede credentials, TLS transport allocation and listener binds.

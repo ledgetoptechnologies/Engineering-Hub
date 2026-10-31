@@ -220,6 +220,21 @@ def test_v2_pilot_profile_requires_disjoint_mode(mode):
         parse_profile(encode(data))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['disjoint-v3', 'forged-mode'])
+async def test_alternate_factories_cannot_bypass_v3_before_owner_or_credentials(monkeypatch, mode):
+    from engineering_hub import unified_pilot_startup as startup
+    from engineering_hub.app import Settings
+    parsed = parse_profile(encode(profile_document()))
+    forged = replace(parsed, profile_mode=mode)
+    monkeypatch.setattr(startup, 'validate_configuration', lambda *_: (object(), forged))
+    monkeypatch.setattr(Settings, 'from_env', lambda *_: pytest.fail('settings accessed'))
+    monkeypatch.setattr(startup, 'PilotOwner', lambda *_a, **_k: pytest.fail('owner accessed'))
+    monkeypatch.setattr(startup, 'read_protected_file', lambda *_a, **_k: pytest.fail('credential accessed'))
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration('/config', '/pilot', reconciliation_factory=lambda *_: None)
+
+
 @pytest.mark.parametrize('change', ['stale', 'future', 'expired', 'manifest', 'driver', 'engine'])
 def test_no_transport_before_fresh_independent_profile_binding(tmp_path, dependencies, change):
     data = document()
