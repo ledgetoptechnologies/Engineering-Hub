@@ -110,6 +110,7 @@ def verifier(enrolled, clock, **issuer_options):
 
 def test_real_signature_exact_independent_enrollment_and_no_refresh(enrolled, clock):
     result, issuer = verifier(enrolled, clock)
+    assert result.issuer_public_key() == enrolled[0].public_key
     assert result.implementation_commit() == enrolled[0].implementation_commit
     assert result.implementation_commit() == enrolled[0].implementation_commit
     assert len(issuer.calls) == 1
@@ -121,6 +122,8 @@ def test_real_signature_exact_independent_enrollment_and_no_refresh(enrolled, cl
     assert not issuer.closed  # Transport lifetime belongs to caller, not verifier.
     with pytest.raises(identity.RuntimeIdentityError):
         result.implementation_commit()
+    with pytest.raises(identity.RuntimeIdentityError):
+        result.issuer_public_key()
     assert len(issuer.calls) == 1
 
 
@@ -388,6 +391,8 @@ def test_monotonic_expiry_survives_wall_clock_rollback(enrolled, clock):
     clock.mono += 31
     with pytest.raises(identity.RuntimeIdentityError):
         result.implementation_commit()
+    with pytest.raises(identity.RuntimeIdentityError):
+        result.issuer_public_key()
     assert len(issuer.calls) == 1
     result.close()
 

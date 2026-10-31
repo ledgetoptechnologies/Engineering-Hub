@@ -202,6 +202,7 @@ class LaunchReceiptIdentityVerifier:
             _require(os.getpid() == self._pid and math.isfinite(now) and after <= now < deadline
                      and now < start + exchange_timeout_ms / 1000)
             self._commit = enrolled.implementation_commit
+            self._issuer_public_key = enrolled.public_key
             self._deadline = deadline
             self._not_before = start
             # Store no mutable receipt object or transport capability for effects.
@@ -233,6 +234,18 @@ class LaunchReceiptIdentityVerifier:
                          and self._not_before <= now < self._deadline)
                 return tuple(self._receipt[name] for name in (
                     'launch_id', 'boot_id', 'authenticated_host_pid', 'process_start_ticks', 'container_id'))
+        except Exception:
+            raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
+
+    def issuer_public_key(self):
+        """Return the independently enrolled issuer key while this receipt is live."""
+        try:
+            _require(os.getpid() == self._pid)
+            with self._lock:
+                now = time.monotonic()
+                _require(os.getpid() == self._pid and not self._closed and math.isfinite(now)
+                         and self._not_before <= now < self._deadline)
+                return self._issuer_public_key
         except Exception:
             raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
 

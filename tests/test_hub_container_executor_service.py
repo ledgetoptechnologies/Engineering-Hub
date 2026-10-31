@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -30,6 +31,83 @@ from tests.test_hub_container_executor_adapter import make_fixture, command
 
 TOKEN = 'synthetic-host-service-token'
 COMMANDS = '/v1/container-pilot/commands'
+
+
+def gate_launch_identity():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from engineering_hub.container_pilot_manifest import Platform
+    from hub_container_executor.runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVerifier
+    from tests.test_hub_container_executor_runtime_identity import Issuer
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    release = ExecutorReleaseEnrollment(issuer_id='synthetic', public_key=public, implementation_commit='c'*40,
+        runnable_digest='sha256:'+'1'*64, platform_manifest_digest='sha256:'+'2'*64,
+        image_config_id='sha256:'+'3'*64, platform=Platform(os='linux', architecture='amd64', variant=None),
+        launch_profile_digest='sha256:'+'4'*64)
+    clock = SimpleNamespace(wall=time.time(), mono=time.monotonic())
+    verifier = LaunchReceiptIdentityVerifier(enrollment=release, issuer_transport=Issuer(release, private, clock),
+                                             max_receipt_lifetime_seconds=60, exchange_timeout_ms=1000)
+    return public, verifier
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('malformed', [False, True])
+async def test_opt_in_gate_worker_drains_before_adapter_close(owned, tmp_path, malformed):
+    from hub_container_executor.gate_ledger_channel import OwnedGateLedgerService
+    key, launch = gate_launch_identity()
+    path = str(tmp_path / 'gate.sock')
+    def factory(adapter):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener.bind(path); listener.listen(1)
+        worker = OwnedGateLedgerService(listener=listener, ledger=adapter.ledger, supervisor_public_key=key,
+            launch_verifier=launch, manifest_digest=adapter.manifest.digest(), hold_uncertain=lambda _: None,
+            timeout_seconds=2)
+        close = worker.close
+        def close_worker():
+            try: close()
+            finally: owned.events.append('worker-close')
+        worker.close = close_worker
+        return worker
+    stop, task, _ = await start(owned, gate_worker_factory=factory)
+    if malformed:
+        def send_bad():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                client.settimeout(2); client.connect(path); client.recv(8192); client.send(b'{}')
+        await asyncio.to_thread(send_bad)
+        with pytest.raises(owned.module.HostExecutorServiceError):
+            await asyncio.wait_for(task, 5)
+    else:
+        stop.set(); await asyncio.wait_for(task, 5)
+    assert owned.events[-3:] == ['worker-close', 'adapter-close', 'providers-close']
+    assert_closed(owned)
+
+
+@pytest.mark.asyncio
+async def test_wrong_ledger_gate_worker_is_closed_on_rejection(owned, tmp_path):
+    from hub_container_executor.gate_ledger_channel import OwnedGateLedgerService
+    second_root = tmp_path / 'wrong-ledger'; second_root.mkdir(mode=0o700)
+    other, _, _, _ = make_fixture(second_root)
+    key, launch = gate_launch_identity()
+    closed = []
+    def factory(adapter):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener.bind(str(tmp_path / 'wrong-gate.sock')); listener.listen(1)
+        worker = OwnedGateLedgerService(listener=listener, ledger=other.ledger, supervisor_public_key=key,
+            launch_verifier=launch, manifest_digest=other.manifest.digest(), hold_uncertain=lambda _: None,
+            timeout_seconds=2)
+        close = worker.close
+        def record_close():
+            close(); closed.append(listener.fileno())
+        worker.close = record_close
+        return worker
+    try:
+        with pytest.raises(owned.module.HostExecutorServiceError):
+            await owned.module.serve_owned_host_executor(owned.factory, **options(gate_worker_factory=factory))
+        assert closed == [-1]
+        assert_closed(owned)
+    finally:
+        other.close()
 
 
 @pytest.fixture
