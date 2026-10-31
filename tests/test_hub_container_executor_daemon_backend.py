@@ -1286,9 +1286,11 @@ class FakePrivateJournal:
 
     def __init__(self):
         self.rows = {}
+        self.kinds = {}
         self.events = []
 
     def begin(self, operation_id, kind):
+        self.kinds[operation_id] = kind
         self.events.append(("begin", operation_id, kind))
         self.rows[operation_id] = OperationObservation(operation_id, "pending", False)
 
@@ -1299,6 +1301,11 @@ class FakePrivateJournal:
         )
 
     def inspect(self, operation_id):
+        return self.rows.get(operation_id)
+
+    def inspect_create(self, operation_id, kind):
+        if self.kinds.get(operation_id) != kind:
+            return None
         return self.rows.get(operation_id)
 
 
@@ -1619,3 +1626,100 @@ def test_adapter_holds_lost_create_response_and_reconcile_does_not_repeat_effect
     finally:
         adapter.close()
         driver.close()
+
+
+def test_restore_completed_context_is_read_only_and_verifies_original(tmp_path):
+    journal = FakePrivateJournal()
+    operation = "4c96d3f7-19c5-5ff4-a29e-302f6f661009"
+    journal.rows[operation] = OperationObservation(operation, "completed", True, "c" * 64)
+    journal.kinds[operation] = "create_candidate"
+    backend, _, _, plan, requests = create_transcript(tmp_path, operation_journal=journal)
+    try:
+        actual = backend.restore_container_context(plan, operation, "c" * 64, 5000)
+        assert actual.profile == plan.profile
+        assert actual.state_generation_id == plan.profile.state_generation_id
+        assert requests and all(method == "GET" for method, _ in requests)
+        assert backend._container_profiles["c" * 64] == plan.profile
+        assert not journal.events
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("receipt", [None, "pending", "other", "wrong_kind"])
+def test_restore_refuses_ambiguous_journal_before_daemon_io(tmp_path, receipt):
+    journal = FakePrivateJournal()
+    operation = "4c96d3f7-19c5-5ff4-a29e-302f6f661009"
+    journal.kinds[operation] = "start" if receipt == "wrong_kind" else "create_candidate"
+    if receipt == "wrong_kind":
+        journal.rows[operation] = OperationObservation(operation, "completed", True, "c" * 64)
+    if receipt == "pending":
+        journal.rows[operation] = OperationObservation(operation, "pending", False, None)
+    elif receipt == "other":
+        journal.rows[operation] = OperationObservation(operation, "completed", True, "d" * 64)
+    backend, _, _, plan, requests = create_transcript(tmp_path, operation_journal=journal)
+    try:
+        with pytest.raises(DaemonBackendError):
+            backend.restore_container_context(plan, operation, "c" * 64, 5000)
+        assert requests == []
+        assert backend._container_profiles == {} and backend._container_generations == {}
+    finally:
+        backend.close()
+
+
+def test_restore_profile_mismatch_clears_container_context(tmp_path):
+    journal = FakePrivateJournal()
+    operation = "4c96d3f7-19c5-5ff4-a29e-302f6f661009"
+    journal.rows[operation] = OperationObservation(operation, "completed", True, "c" * 64)
+    journal.kinds[operation] = "create_candidate"
+    backend, _, _, plan, requests = create_transcript(tmp_path, operation_journal=journal, bad_profile=True)
+    try:
+        with pytest.raises(DaemonBackendError):
+            backend.restore_container_context(plan, operation, "c" * 64, 5000)
+        assert all(method == "GET" for method, _ in requests)
+        assert backend._container_images == {} and backend._container_profiles == {}
+        assert backend._container_generations == {}
+    finally:
+        backend.close()
+
+
+def test_restore_matching_cache_rechecks_and_preserves_it_on_failed_retry(tmp_path):
+    journal = FakePrivateJournal()
+    operation = "4c96d3f7-19c5-5ff4-a29e-302f6f661009"
+    journal.rows[operation] = OperationObservation(operation, "completed", True, "c" * 64)
+    journal.kinds[operation] = "create_candidate"
+    backend, _, _, plan, requests = create_transcript(tmp_path, operation_journal=journal)
+    try:
+        assert backend.restore_container_context(plan, operation, "c" * 64, 5000).profile == plan.profile
+        first_count = len(requests)
+        assert backend.restore_container_context(plan, operation, "c" * 64, 5000).profile == plan.profile
+        assert len(requests) == first_count * 2
+        original_inspect = backend.inspect_container
+        backend.inspect_container = lambda *args: (_ for _ in ()).throw(DaemonBackendError("injected"))
+        with pytest.raises(DaemonBackendError):
+            backend.restore_container_context(plan, operation, "c" * 64, 5000)
+        backend.inspect_container = original_inspect
+        assert backend._container_images["c" * 64] == plan.image
+        assert backend._container_profiles["c" * 64] == plan.profile
+        assert backend._container_generations["c" * 64] == plan.profile.state_generation_id
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("cache", ["partial", "conflicting"])
+def test_restore_refuses_partial_or_conflicting_cache_before_daemon_io(tmp_path, cache):
+    from dataclasses import replace
+    journal = FakePrivateJournal()
+    operation = "4c96d3f7-19c5-5ff4-a29e-302f6f661009"
+    journal.rows[operation] = OperationObservation(operation, "completed", True, "c" * 64)
+    journal.kinds[operation] = "create_candidate"
+    backend, _, _, plan, requests = create_transcript(tmp_path, operation_journal=journal)
+    backend._container_images["c" * 64] = plan.image
+    if cache == "conflicting":
+        backend._container_profiles["c" * 64] = replace(plan.profile, network_mode="bridge")
+        backend._container_generations["c" * 64] = plan.profile.state_generation_id
+    try:
+        with pytest.raises(DaemonBackendError):
+            backend.restore_container_context(plan, operation, "c" * 64, 5000)
+        assert requests == []
+    finally:
+        backend.close()

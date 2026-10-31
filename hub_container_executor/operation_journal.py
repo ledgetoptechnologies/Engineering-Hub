@@ -241,6 +241,19 @@ class SQLiteOperationJournal:
                 return None
             return OperationObservation(operation_id, row[2], row[2] == "completed", row[3])
 
+    def inspect_create(self, operation_id: str, kind: str) -> OperationObservation | None:
+        """Read an exact create-kind receipt; never infer kind from its ID."""
+        _operation(operation_id)
+        if type(kind) is not str or kind not in {"create_candidate", "create_rollback"}:
+            raise OperationJournalError("Exact create kind required")
+        with self._transaction() as db:
+            row = db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal WHERE operation_id=?",
+                             (operation_id,)).fetchone()
+            _row(row)
+            if row is None or row[1] != kind:
+                return None
+            return OperationObservation(operation_id, row[2], row[2] == "completed", row[3])
+
     def close(self):
         # A forked child must not acquire an inherited thread mutex. PilotOwner
         # closes only its inherited FDs and never unlocks its parent's flock.

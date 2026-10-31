@@ -224,6 +224,7 @@ class TrustedPrivateOperationJournal(Protocol):
                   container_id: str | None = None) -> None: ...
 
     def inspect(self, operation_id: str) -> OperationObservation | None: ...
+    def inspect_create(self, operation_id: str, kind: str) -> OperationObservation | None: ...
 
 
 class _ChunkReader:
@@ -1029,6 +1030,70 @@ class DockerEngineBackend:
             raise DaemonBackendError("created container effective profile differs from preflight")
         self._remaining(deadline)
         return container_id
+
+    def restore_container_context(self, plan: ContainerPlan, operation_id: str,
+                                  container_id: str, timeout_ms: int) -> ContainerObservation:
+        """Read-only verification for an independently authenticated create context.
+
+        The caller must authenticate the original plan and ledger receipt. A
+        terminal journal receipt must independently identify the same container.
+        This never resolves a held command or replays an effect.
+        """
+        deadline = self._deadline(timeout_ms)
+        self._operation_id(operation_id)
+        self._static_profile_check(plan)
+        if type(container_id) is not str or not CONTAINER_ID_RE.fullmatch(container_id):
+            raise DaemonBackendError("invalid container identity")
+        mappings = (self._container_images, self._container_profiles, self._container_generations)
+        present = tuple(container_id in mapping for mapping in mappings)
+        if any(present) and (not all(present) or
+                (self._container_images[container_id], self._container_profiles[container_id],
+                 self._container_generations[container_id]) !=
+                (plan.image, plan.profile, plan.profile.state_generation_id)):
+            raise DaemonBackendError("container context conflicts with authenticated plan")
+        already_cached = all(present)
+        try:
+            self._remaining(deadline)
+            receipt = self.operation_journal.inspect_create(operation_id, "create_" + plan.image.role)
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError("exact completed create receipt required") from None
+        if (type(receipt) is not OperationObservation or receipt.operation_id != operation_id
+                or receipt.state != "completed" or receipt.terminal is not True
+                or receipt.container_id != container_id):
+            raise DaemonBackendError("exact completed create receipt required")
+        self._assert_runner(deadline)
+        defaults = self.inspect_image(plan.image, self._remaining_ms(deadline))
+        cached = self._images.get(plan.image.runnable_reference)
+        if cached is None:
+            raise DaemonBackendError("verified daemon image metadata is unavailable")
+        generation, _ = self._validate_profile(
+            plan, cached[1].get("config") or {},
+            {"Entrypoint": defaults.entrypoint, "Cmd": defaults.command,
+             "Env": defaults.environment,
+             "Volumes": (cached[1].get("config") or {}).get("Volumes")},
+        )
+        self._resolve_generation(generation, deadline)
+        self._container_images[container_id] = plan.image
+        self._container_profiles[container_id] = plan.profile
+        self._container_generations[container_id] = generation
+        try:
+            actual = self.inspect_container(container_id, self._remaining_ms(deadline))
+            expected = ActualImageSelection(plan.image.runnable_reference,
+                    plan.image.platform_manifest_digest, plan.image.image_config_id,
+                    plan.image.platform)
+            if (type(actual) is not ContainerObservation or actual.container_id != container_id
+                    or actual.selected_image != expected or actual.profile != plan.profile
+                    or actual.state_generation_id != generation):
+                raise DaemonBackendError("container differs from authenticated create context")
+            self._remaining(deadline)
+            return actual
+        except BaseException:
+            if not already_cached:
+                self._container_images.pop(container_id, None)
+                self._container_profiles.pop(container_id, None)
+                self._container_generations.pop(container_id, None)
+            raise
 
     def _safe_port_bindings(self, value):
         if value in (None, {}):

@@ -645,3 +645,67 @@ def test_create_profile_commitment_is_keyed_and_stable_after_reopen(tmp_path):
     assert not first.ledger.matches_profile_commitment(
         replace(profile, environment=profile.environment + (("OTHER", "changed"),)), commitment)
     first.close()
+
+
+def test_completed_create_reconcile_uses_authenticated_context_without_replay(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    def fail_start(*args):
+        raise TimeoutError("synthetic lost start")
+    backend.start_container = fail_start
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    adapter = reopen_adapter(adapter)
+    calls = []
+    def restore(plan, operation, container, timeout):
+        calls.append((plan, operation, container))
+        return backend.containers[container]
+    backend.restore_container_context = restore
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert len(calls) == 1 and calls[0][2] == "c" * 64
+    assert calls[0][0].profile == backend.containers["c" * 64].profile
+    assert not any(event in backend.events for event in ("create", "start", "probe"))
+    adapter.close()
+
+
+def test_completed_create_bad_receipt_never_restores(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    backend.start_container = lambda *args: (_ for _ in ()).throw(TimeoutError())
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    operation = next(row for row in adapter.ledger.operation_rows(request.command_id)
+                     if row["kind"] == "create_candidate")
+    with adapter.ledger._connection() as db:
+        db.execute("UPDATE operations SET receipt_mac=? WHERE operation_id=?", ("0" * 64, operation["operation_id"]))
+    adapter = reopen_adapter(adapter)
+    calls = []
+    backend.restore_container_context = lambda *args: calls.append(args)
+    backend.events.clear()
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert calls == [] and backend.events == []
+    adapter.close()
+
+
+def test_completed_create_restores_again_after_later_inspection_fails(tmp_path):
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    backend.start_container = lambda *args: (_ for _ in ()).throw(TimeoutError())
+    request = command(manifest, "deploy_container")
+    assert adapter.submit(request).state == "held"
+    adapter = reopen_adapter(adapter)
+    restores = []
+    def restore(plan, operation, container, timeout):
+        restores.append(operation)
+        return backend.containers[container]
+    backend.restore_container_context = restore
+    calls = []
+    def transient_inspect(operation, timeout):
+        calls.append(operation)
+        if len(calls) == 1:
+            raise TimeoutError()
+        return OperationObservation(operation, "pending", False, None)
+    backend.inspect_operation = transient_inspect
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert adapter.reconcile(request.command_id).state == "held"
+    assert len(restores) == 2 and len(calls) == 2
+    assert backend.events.count("create") == 1 and backend.events.count("probe") == 0
+    adapter.close()

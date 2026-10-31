@@ -321,3 +321,19 @@ def test_child_close_drops_inherited_fds_without_unlocking_parent_or_stranding_l
         os.close(release_write)
         reaped, status = os.waitpid(child, 0)
         assert reaped == child and os.waitstatus_to_exitcode(status) == 0
+
+
+@LINUX
+def test_inspect_create_requires_exact_kind_and_survives_reopen(path):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.begin(identity, "create_candidate")
+        assert store.inspect_create(identity, "create_candidate").state == "pending"
+        assert store.inspect_create(identity, "create_rollback") is None
+        store.completed(identity, "create_candidate", CID)
+        with pytest.raises(OperationJournalError):
+            store.inspect_create(identity, "start")
+    with journal(path, create=False) as store:
+        receipt = store.inspect_create(identity, "create_candidate")
+        assert receipt.state == "completed" and receipt.terminal and receipt.container_id == CID
+        assert store.inspect_create(identity, "create_rollback") is None

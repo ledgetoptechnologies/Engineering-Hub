@@ -546,6 +546,8 @@ class HostAdapter:
         if not snapshot:
             return response
         for operation in snapshot["operations"]:
+            if operation["status"] == "invalid":
+                return response
             if operation["kind"] in {"create_candidate", "create_rollback"}:
                 try:
                     context = self.ledger.create_context(operation["operation_id"])
@@ -584,6 +586,30 @@ class HostAdapter:
                 return response
             if operation["status"] == "completed":
                 receipt = operation.get("receipt") or {}
+                if operation["kind"] in {"create_candidate", "create_rollback"}:
+                    if (operation.get("receipt_authentic") is not True
+                            or type(receipt) is not dict or set(receipt) != {"container_id"}
+                            or type(receipt["container_id"]) is not str
+                            or not _CONTAINER_ID.fullmatch(receipt["container_id"])):
+                        return response
+                    try:
+                        plan = ContainerPlan(
+                            resource_name=f"{self.manifest.runtime.resource_name_prefix}-{context['run_id'][:12]}-{role}",
+                            image=image, immutable_reference=image.runnable_reference,
+                            pull=False, profile=profile)
+                        actual = self.backend.restore_container_context(
+                            plan, operation["operation_id"], receipt["container_id"],
+                            self.manifest.timeouts.inspect_ms)
+                        expected = ActualImageSelection(image.runnable_reference,
+                            image.platform_manifest_digest, image.image_config_id, image.platform)
+                        if (type(actual) is not ContainerObservation
+                                or actual.container_id != receipt["container_id"]
+                                or actual.selected_image != expected or actual.profile != profile
+                                or actual.state_generation_id != context["generation_id"]):
+                            return response
+                    except Exception:
+                        return response
+                    continue
                 container_id = receipt.get("container_id") if isinstance(receipt, dict) else None
                 if isinstance(container_id, str) and _CONTAINER_ID.fullmatch(container_id):
                     try:
