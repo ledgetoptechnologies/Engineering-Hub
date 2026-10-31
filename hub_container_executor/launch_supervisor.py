@@ -1246,7 +1246,9 @@ class LaunchSupervisor:
         The callback must independently verify application identity, owner,
         fence, mount custody and measured bootstrap under the host trust model.
         It runs under the supervisor mutex and must not call any supervisor
-        method that acquires that mutex; recursive entry here is denied.
+        method that acquires that mutex; recursive entry here is denied. It
+        must be bounded and synchronous: a blocked callback cannot be canceled
+        by this deadline, and the owner must hold the operation until it exits.
         """
         from .application_gate_enrollment import STATIC_SCHEMA, load_application_gate_enrollment
         from .mount_gate_start_enrollment import MountGateStartEnrollmentController
@@ -1276,7 +1278,8 @@ class LaunchSupervisor:
                 _require(len(key) == 32)
                 signer = Ed25519PrivateKey.from_private_bytes(key)
                 del key
-                record = self._record()
+                record = json.loads(_canonical(self._record()))
+                base = json.loads(_canonical(expected_without_nonce))
                 supervisor_id = self._launch_id
                 _require(type(supervisor_id) is str)
 
@@ -1291,11 +1294,11 @@ class LaunchSupervisor:
                     return True
 
                 controller = MountGateStartEnrollmentController(channel=channel, peer=peer,
-                    expected_without_nonce=expected_without_nonce, bootstrap_digest=enrolled.bootstrap_digest,
+                    expected_without_nonce=base, bootstrap_digest=enrolled.bootstrap_digest,
                     signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
                     verify_live=current,
                     reserve_start=lambda payload, digest: self._journal.reserve_gate_start(
-                        supervisor_id, record, expected_without_nonce, enrolled.bootstrap_digest, payload, digest),
+                        supervisor_id, record, base, enrolled.bootstrap_digest, payload, digest),
                     hold_uncertain=hold, timeout_seconds=min(timeout_seconds, _remaining(deadline)))
                 return controller.serve_once()
             except BaseException:

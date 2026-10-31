@@ -136,6 +136,19 @@ def test_recursive_callback_is_rejected_without_deadlock(rig):
         assert db.execute('SELECT count(*) FROM gate_start').fetchone() == (0,)
 
 
+def test_caller_mutation_cannot_change_reserved_start_identity(rig):
+    journal, supervisor, client, expected, kwargs, _record = rig
+    def mutate(_pins):
+        kwargs['expected_without_nonce']['fence'] += 1
+        return True
+    request(client, expected['nonce'])
+    result = supervisor.serve_one_gate_start_enrollment(**{**kwargs, 'verify_live': mutate})
+    assert result['identity'] == expected
+    with journal.transaction() as db:
+        encoded = db.execute('SELECT enrollment FROM gate_start').fetchone()[0]
+    assert json.loads(encoded)['identity'] == expected
+
+
 def test_late_commit_failure_holds_and_cannot_issue_later_decision(rig, monkeypatch):
     journal, supervisor, client, expected, kwargs, record = rig
     request(client, expected['nonce'])
