@@ -1321,6 +1321,20 @@ def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, roo
             authority.close()
 
 
+def test_supervisor_uses_the_one_shared_profile_parser():
+    from engineering_hub import executor_launch_profile as core
+    assert launch.ExecutorLaunchProfile is core.ExecutorLaunchProfile
+    assert launch.ExecutorLaunchMount is core.ExecutorLaunchMount
+    assert launch.DisjointDaemonPolicy is core.DisjointDaemonPolicy
+    assert launch._TARGETS is core.LAUNCH_TARGETS
+    for value in (profile_data(), {**profile_data(), 'daemon_policy': disjoint_policy()}):
+        # The supervisor's own canonical form must stay byte-identical to the shared one.
+        assert launch._canonical(value) == core.canonical(value)
+        raw = core.canonical(value)
+        expected = 'sha256:' + hashlib.sha256(raw).hexdigest()
+        assert core.verify_profile_bytes(raw, expected).digest() == launch.ExecutorLaunchProfile.model_validate(value).digest()
+
+
 def test_legacy_profile_digest_bytes_are_unchanged():
     raw = profile_data()
     # The digest every existing v2 enrollment, receipt and verifier already pins.

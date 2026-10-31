@@ -50,6 +50,15 @@ overlap check is only as good as that attestation, so a reviewer must confirm th
 ranges against the retained hold record. The installed launcher takes it as
 `--held-ranges-file`; legacy invocations are unchanged.
 
+The profile model, the v3 policy and the digest live in the pure core module
+`engineering_hub.executor_launch_profile`; the supervisor imports and re-exports
+them, so there is one parser. Hub-side verifiers can use
+`verify_profile_bytes(raw, expected_digest)` to accept only exact canonical
+profile bytes whose digest equals one they already pin independently. That shows
+the bytes are that profile, not that the profile was approved. The executor
+image's build-time import check includes this module, so an older core image
+without it fails the build rather than at launch.
+
 The policy's `held_ranges_digest` is the SHA-256 of the exact attestation bytes,
 and the supervisor refuses any other file. So the signed profile, and any verifier
 that pins it, records exactly which attestation the overlap check used. The digest

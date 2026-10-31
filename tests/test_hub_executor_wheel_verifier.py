@@ -264,6 +264,7 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert "RUN --network=none /opt/venv/bin/python -I -B" in text
     assert "engineering_hub.current_executor_observation" in text
     assert "engineering_hub.current_executor_transport" in text
+    assert "engineering_hub.executor_launch_profile" in text
     assert "record['source_files']" in text and "is_relative_to(root)" in text
     assert "USER 10001:10001" in lines
     assert 'ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.installed_runner"]' in lines
