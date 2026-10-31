@@ -6,7 +6,7 @@ pytest.importorskip('fcntl')
 from hub_container_executor import trusted_local_session as local
 from hub_container_executor.installed_coordinator import parse_configuration
 from engineering_hub.trusted_queued_session import parse_enrollment, TrustedSessionError
-from tests.test_hub_container_executor_installed_coordinator import configuration, canonical
+from tests.test_hub_container_executor_installed_coordinator import configuration, github_configuration, canonical
 from tests.test_hub_trusted_queued_session import document, v2_document, encode
 from tests.test_hub_unified_pilot_startup import profile_document
 
@@ -37,9 +37,103 @@ def test_local_session_requires_disjoint_operator_enrollment_and_closes(monkeypa
     assert events == ['transport', 'observer', 'observer-close', 'transport-close']
 
 
+def test_github_local_session_binds_v3_actor_and_command_socket(monkeypatch):
+    data = github_configuration()
+    data['manifest'] = profile_document()['manifest']
+    data['secret_bindings']['executor']['digest'] = 'sha256:' + hashlib.sha256(b'synthetic-token').hexdigest()
+    config = parse_configuration(canonical(data))
+    evidence = v2_document()
+    evidence.update(schema=local.SCHEMA_V3, operator_actor='human:123')
+    calls = []
+    class Transport:
+        def __init__(self, path, *, credential): calls.append(('observe', path, credential))
+        def close(self): pass
+    class Observer:
+        def __init__(self, **kwargs): pass
+        def close(self): pass
+    monkeypatch.setattr(local, 'CurrentExecutorUnixTransport', Transport)
+    monkeypatch.setattr(local, 'CurrentExecutorObserver', Observer)
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    monkeypatch.setattr(ContainerPilotClient, 'for_private_unix',
+                        lambda path, token: calls.append(('command', path, token)))
+    session = local.TrustedLocalQueuedSession(config=config, enrollment=parse_enrollment(encode(evidence)),
+                                              credential=b'synthetic-token')
+    try:
+        session.executor_client_factory()
+        assert calls == [('observe', config.executor_socket, b'synthetic-token'),
+                         ('command', config.executor_socket, 'synthetic-token')]
+    finally:
+        session.close()
+    evidence['operator_actor'] = 'human:124'
+    with pytest.raises(TrustedSessionError):
+        local.TrustedLocalQueuedSession(config=config, enrollment=parse_enrollment(encode(evidence)),
+                                        credential=b'synthetic-token')
+
+
+@pytest.mark.asyncio
+async def test_github_split_service_rejects_other_executor_factory_before_owner(monkeypatch):
+    import asyncio
+    from dataclasses import replace
+    from agent_message_bus.auth import AuthSettings
+    from engineering_hub.app import Settings
+    from engineering_hub import queued_pilot_service as service
+    data = github_configuration()
+    data['manifest'] = profile_document()['manifest']
+    data['secret_bindings']['executor']['digest'] = 'sha256:' + hashlib.sha256(b'synthetic-token').hexdigest()
+    data['secret_bindings']['github']['digest'] = 'sha256:' + hashlib.sha256(b'fixture-secret').hexdigest()
+    config = parse_configuration(canonical(data))
+    evidence = v2_document()
+    evidence.update(schema=local.SCHEMA_V3, operator_actor='human:123')
+    class Transport:
+        def __init__(self, path, *, credential): pass
+        def close(self): pass
+    class Observer:
+        def __init__(self, **kwargs): pass
+        def close(self): pass
+    monkeypatch.setattr(local, 'CurrentExecutorUnixTransport', Transport)
+    monkeypatch.setattr(local, 'CurrentExecutorObserver', Observer)
+    session = local.TrustedLocalQueuedSession(config=config, enrollment=parse_enrollment(encode(evidence)),
+                                              credential=b'synthetic-token')
+    auth = replace(config.auth, github_client_secret='fixture-secret')
+    settings = Settings(config.database, AuthSettings('h', 'c', claude_token='cl'), auth,
+                        staging_machine_id='staging-pc')
+    stop = asyncio.Event(); stop.set()
+    options = dict(action_key='engineering-hub:container-pilot', machine_id='staging-pc',
+        target_verifier=lambda *_: True, reconciliation_factory=session.reconciliation_factory,
+        session_acceptance_factory=session.session_acceptance_factory, socket_path='/unused/browser.sock',
+        supervisor_stop_grace_seconds=1200, stop_event=stop, install_signals=False, allow_github=True)
+    try:
+        # A factory for another endpoint is rejected by identity before bind or owner creation.
+        with pytest.raises(ValueError, match='explicit owned queued pilot configuration required'):
+            await service.serve_owned_queued_pilot(settings, config.manifest, lambda: None, **options)
+        for altered in (replace(auth, cookie_name='other'),
+                        replace(auth, alternate_origins=('https://other.example',)),
+                        replace(auth, github_client_secret='wrong-secret')):
+            with pytest.raises(ValueError, match='explicit owned queued pilot configuration required'):
+                await service.serve_owned_queued_pilot(replace(settings, auth_config=altered), config.manifest,
+                                                       session.executor_client_factory, **options)
+        # The same session's fixed factory passes admission; a pre-set stop avoids side effects.
+        await service.serve_owned_queued_pilot(settings, config.manifest, session.executor_client_factory, **options)
+    finally:
+        session.close()
+
+
+@pytest.mark.asyncio
+async def test_wrong_github_enrollment_is_rejected_before_secret_access(monkeypatch):
+    data = github_configuration(); data['manifest'] = profile_document()['manifest']
+    config = parse_configuration(canonical(data))
+    evidence = v2_document(); evidence.update(schema=local.SCHEMA_V3, operator_actor='human:124')
+    calls = []
+    monkeypatch.setattr(local, 'ImmutableTestSecretResolver', lambda *a, **kw: calls.append('secret'))
+    with pytest.raises(TrustedSessionError):
+        await local.serve_trusted_local_coordinator(config, enrollment=parse_enrollment(encode(evidence)))
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_explicit_local_coordinator_composition_drains_before_session_close(monkeypatch):
-    config = parse_configuration(canonical(configuration()))
+    data = configuration(); data['manifest'] = profile_document()['manifest']
+    config = parse_configuration(canonical(data))
     enrollment = parse_enrollment(encode(v2_document()))
     events = []
     class Secrets:

@@ -9,6 +9,9 @@ recovered or replayed here. Existing listeners and default factories are intact.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import hashlib
+import hmac
 import inspect
 from pathlib import Path
 
@@ -53,7 +56,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
                                  session_acceptance_factory=None, access_verifier=None,
-                                 inherited_broker=False):
+                                 inherited_broker=False, allow_github=False):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -73,8 +76,13 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     try:
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
-                or settings.auth_config.cloudflare_config is None
+                or type(allow_github) is not bool
+                or (not allow_github and (settings.auth_config.human_auth_mode != 'cloudflare_access'
+                    or settings.auth_config.cloudflare_config is None))
+                or (allow_github and (settings.auth_config.human_auth_mode != 'github'
+                    or not settings.auth_config.secure or not settings.auth_config.github_client_id
+                    or not settings.auth_config.github_client_secret
+                    or settings.auth_config.beau_github_id is None or access_verifier is not None))
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
                 or not _synchronous(reconciliation_factory)
@@ -88,6 +96,32 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         target = ContainerPilotTarget.from_manifest(manifest)
         if target.target_id != 'engineering-hub:staging':
             raise ValueError()
+        if allow_github:
+            from hub_container_executor.trusted_local_session import TrustedLocalQueuedSession
+            from .trusted_queued_session import SCHEMA_V3
+            session = getattr(reconciliation_factory, '__self__', None)
+            if type(session) is TrustedLocalQueuedSession:
+                github_digests = [digest for slot, version, digest in session._config.bindings
+                                  if (slot, version) == session._config.roles.get('github')]
+            else:
+                github_digests = []
+            if (type(session) is not TrustedLocalQueuedSession
+                    or getattr(reconciliation_factory, '__func__', None) is not TrustedLocalQueuedSession.reconciliation_factory
+                    or getattr(session_acceptance_factory, '__self__', None) is not session
+                    or getattr(session_acceptance_factory, '__func__', None) is not TrustedLocalQueuedSession.session_acceptance_factory
+                    or getattr(client_factory, '__self__', None) is not session
+                    or getattr(client_factory, '__func__', None) is not TrustedLocalQueuedSession.executor_client_factory
+                    or Path(settings.database) != session._database
+                    or session._config.auth != replace(settings.auth_config, github_client_secret='')
+                    or len(github_digests) != 1
+                    or not hmac.compare_digest('sha256:' + hashlib.sha256(
+                        settings.auth_config.github_client_secret.encode('ascii')).hexdigest(), github_digests[0])
+                    or session._enrollment.schema != SCHEMA_V3
+                    or session._enrollment.machine_id != machine_id
+                    or session._enrollment.manifest_digest != manifest.digest()
+                    or session._enrollment.operator_actor != f'human:{settings.auth_config.beau_github_id}'):
+                raise ValueError()
+            session._fresh()
         action = WorkAction(machine_id, frozenset({'staging'}),
                             project='engineering-hub', requires_execution_proof=True)
     except Exception:
@@ -165,7 +199,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core, access_verifier=access_verifier)
+        return HubFrontends(core, access_verifier=access_verifier, allow_github=allow_github)
 
     async def cleanup():
         failed = False
@@ -216,7 +250,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             await serve_private_coordinator(pair_factory, socket_path=socket_path,
                 agent_host=agent_host, agent_port=agent_port, stop_event=stop,
                 on_ready=on_ready, install_signals=install_signals,
-                recover_socket=recover_socket)
+                recover_socket=recover_socket, allow_github=allow_github)
         finally:
             if owner is not None or client is not None:
                 await cleanup()

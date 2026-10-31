@@ -21,6 +21,12 @@ read-only mount and identity checks. The executor must already be independently
 enrolled and running. Human acceptance and current signed executor observations
 remain required by the existing reconciliation gate.
 
+Use manual-session schema v2 with the default Cloudflare coordinator config;
+the opt-in GitHub coordinator schema v2 requires manual-session schema v3 and
+the matching numeric GitHub operator. Both the signed observation and command
+factory use the same configured Unix socket and captured executor credential,
+subject to the no-replacement host prerequisite above.
+
 Run the following as the independently launched container's PID 1, using paths
 that already exist inside its approved mounts:
 

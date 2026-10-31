@@ -126,8 +126,10 @@ This path serves the existing agent and browser front doors from one owned Hub
 process; the GitHub browser path uses the existing OAuth state/PKCE, allowlisted
 session and CSRF checks. The caller must independently provide the reviewed HTTPS
 termination, exact public origin and route to the browser listener; this code does
-not install or configure them. The separate private-UDS browser gateway and installed
-local coordinator remain Cloudflare-only. Source tests use synthetic OAuth and
+not install or configure them. The separate private-UDS gateway and installed
+local coordinator also support explicitly opted-in GitHub as documented in
+[trusted local coordinator](trusted-local-coordinator.md), under its dedicated-host
+no-replacement prerequisite. Source tests use synthetic OAuth and
 executor evidence and do not establish a deployed route, host isolation,
 independent signer custody, reboot recovery or permission to use a held Engine.
 Changing an existing deployment's provider or entrypoint requires a separately

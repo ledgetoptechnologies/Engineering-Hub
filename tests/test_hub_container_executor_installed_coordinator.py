@@ -61,6 +61,31 @@ def parse(value=None):
     return module.parse_configuration(canonical(configuration() if value is None else value))
 
 
+def github_configuration():
+    data = configuration()
+    data['schema'] = module.SCHEMA_V2
+    data['public_auth'] = {'base_url': 'https://pilot.example.test',
+                           'github_client_id': 'fixture-client', 'beau_github_id': 123}
+    data['secret_bindings']['github'] = {'slot_id': 'test-github', 'version': 1,
+                                         'digest': 'sha256:' + '5' * 64}
+    return data
+
+
+def test_github_v2_is_explicit_and_has_distinct_protected_secret():
+    data = github_configuration()
+    config = parse(data)
+    assert config.auth.human_auth_mode == 'github' and config.auth.beau_github_id == 123
+    assert config.auth.github_client_secret == '' and config.roles['github'] == ('test-github', 1)
+    for mutate in ('missing-secret', 'inline-secret', 'duplicate', 'bad-id', 'http'):
+        bad = github_configuration()
+        if mutate == 'missing-secret': del bad['secret_bindings']['github']
+        if mutate == 'inline-secret': bad['public_auth']['github_client_secret'] = 'secret'
+        if mutate == 'duplicate': bad['secret_bindings']['github'] = bad['secret_bindings']['executor']
+        if mutate == 'bad-id': bad['public_auth']['beau_github_id'] = True
+        if mutate == 'http': bad['public_auth']['base_url'] = 'http://127.0.0.1'
+        with pytest.raises(module.InstalledCoordinatorError): parse(bad)
+
+
 def test_pure_parse_and_exact_additional_policy():
     config = parse()
     target = WorkTarget('1398cf6d-cebd-4f79-a913-be70321970c9',

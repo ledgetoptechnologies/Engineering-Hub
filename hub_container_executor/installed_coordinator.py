@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -33,6 +33,7 @@ from engineering_hub.work_queue import WorkTarget
 from .local_providers import ImmutableTestSecretResolver
 
 SCHEMA = 'engineering-hub.installed-coordinator.v1'
+SCHEMA_V2 = 'engineering-hub.installed-coordinator.v2'
 ACTION = 'engineering-hub:container-pilot'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed pilot coordinator unavailable'
@@ -118,7 +119,8 @@ def parse_configuration(raw):
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
         _object(value, _FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(value['schema'] in (SCHEMA, SCHEMA_V2) and _canonical(value) == raw)
+        github = value['schema'] == SCHEMA_V2
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         _require(manifest.target_id == 'engineering-hub:staging'
                  and value['machine_id'] == 'staging-pc' and value['action_key'] == ACTION)
@@ -137,18 +139,28 @@ def parse_configuration(raw):
         _require(type(actors) is list and 1 <= len(actors) <= 3
                  and all(type(actor) is str and actor in AGENTS for actor in actors)
                  and len(set(actors)) == len(actors))
-        public = dict(_object(value['public_auth'], _AUTH_FIELDS))
-        _require(all(type(public[name]) is str and 0 < len(public[name]) <= 512
-                     for name in _AUTH_FIELDS - {'cloudflare_allowed_emails'}))
-        emails = public['cloudflare_allowed_emails']
-        _require(type(emails) is list and 1 <= len(emails) <= 16
-                 and all(type(email) is str and email == email.lower() for email in emails))
-        public['cloudflare_allowed_emails'] = tuple(emails)
-        auth = AuthConfig(**public, human_auth_mode='cloudflare_access')
-        _require(auth.cloudflare_config is not None)
-        secrets = _object(value['secret_bindings'], {'codex', 'hermes', 'claude', 'executor'})
+        if github:
+            public = dict(_object(value['public_auth'], {'base_url', 'github_client_id', 'beau_github_id'}))
+            _require(type(public['base_url']) is str and 0 < len(public['base_url']) <= 512
+                     and type(public['github_client_id']) is str
+                     and 0 < len(public['github_client_id']) <= 512
+                     and all(33 <= ord(c) <= 126 for c in public['github_client_id']))
+            auth = AuthConfig(**public, human_auth_mode='github')
+            _require(auth.secure and type(auth.beau_github_id) is int)
+        else:
+            public = dict(_object(value['public_auth'], _AUTH_FIELDS))
+            _require(all(type(public[name]) is str and 0 < len(public[name]) <= 512
+                         for name in _AUTH_FIELDS - {'cloudflare_allowed_emails'}))
+            emails = public['cloudflare_allowed_emails']
+            _require(type(emails) is list and 1 <= len(emails) <= 16
+                     and all(type(email) is str and email == email.lower() for email in emails))
+            public['cloudflare_allowed_emails'] = tuple(emails)
+            auth = AuthConfig(**public, human_auth_mode='cloudflare_access')
+            _require(auth.cloudflare_config is not None)
+        names = ('codex', 'hermes', 'claude', 'executor', 'github') if github else ('codex', 'hermes', 'claude', 'executor')
+        secrets = _object(value['secret_bindings'], set(names))
         roles, bindings = {}, []
-        for name in ('codex', 'hermes', 'claude', 'executor'):
+        for name in names:
             item = _object(secrets[name], {'slot_id', 'version', 'digest'})
             slot = item['slot_id']
             _require(type(slot) is str and 6 <= len(slot) <= 96
@@ -158,7 +170,7 @@ def parse_configuration(raw):
             _require(type(digest) is str and re.fullmatch(r'sha256:[0-9a-f]{64}', digest))
             roles[name] = (slot, version)
             bindings.append((slot, version, digest))
-        _require(len(set(roles.values())) == 4 and len({item[2] for item in bindings}) == 4)
+        _require(len(set(roles.values())) == len(names) and len({item[2] for item in bindings}) == len(names))
         return CoordinatorConfiguration(manifest, *paths[:3], port, frozenset(actors), auth,
             paths[3], tuple(bindings), MappingProxyType(roles),
             _integer(value['supervisor_stop_grace_seconds'],
@@ -222,6 +234,23 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         # channel. An explicit Python composition must supply that dependency.
         _require(_synchronous(reconciliation_factory))
         _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        github = config.auth.human_auth_mode == 'github'
+        if github:
+            _require(config.auth.github_client_secret == '' and set(config.roles) ==
+                     {'codex', 'hermes', 'claude', 'executor', 'github'})
+            from .trusted_local_session import TrustedLocalQueuedSession
+            from engineering_hub.trusted_queued_session import SCHEMA_V3
+            session = getattr(reconciliation_factory, '__self__', None)
+            _require(type(session) is TrustedLocalQueuedSession
+                     and getattr(reconciliation_factory, '__func__', None) is TrustedLocalQueuedSession.reconciliation_factory
+                     and getattr(session_acceptance_factory, '__self__', None) is session
+                     and getattr(session_acceptance_factory, '__func__', None) is TrustedLocalQueuedSession.session_acceptance_factory
+                     and session._config is config
+                     and session._enrollment.schema == SCHEMA_V3
+                     and session._enrollment.operator_actor == f'human:{config.auth.beau_github_id}'
+                     and session._manifest == config.manifest.digest()
+                     and session._database == Path(config.database))
+            session._fresh()
         # The optional wheel can coexist with an older core having the same
         # distribution version. Deny that unsupported composition before even
         # reading TEST secrets. API presence is compatibility, not attestation
@@ -229,17 +258,21 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         _require(callable(getattr(ContainerPilotClient, 'for_private_unix', None)))
         with ImmutableTestSecretResolver(config.secret_root, bindings=config.bindings) as secrets:
             tokens = {name: secrets.resolve_test_secret(*slot) for name, slot in config.roles.items()}
-        _require(len(set(tokens.values())) == 4 and all(
+        _require(len(set(tokens.values())) == len(config.roles) and all(
             type(token) is str and token and all(33 <= ord(char) <= 126 for char in token)
             for token in tokens.values()))
+        auth = replace(config.auth, github_client_secret=tokens['github']) if github else config.auth
         settings = Settings(Path(config.database), AuthSettings(
             hermes_token=tokens['hermes'], codex_token=tokens['codex'], claude_token=tokens['claude'],
-            allowed_ips=frozenset({'127.0.0.1'})), config.auth, work_queue_enabled=True,
+            allowed_ips=frozenset({'127.0.0.1'})), auth, work_queue_enabled=True,
             staging_machine_id='staging-pc',
             agent_allowed_hosts=('127.0.0.1', f'127.0.0.1:{config.port}'))
 
-        def fresh_client():
-            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
+        if github:
+            fresh_client = session.executor_client_factory
+        else:
+            def fresh_client():
+                return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
 
         def policy(actor, action_key, environment, target):
             return target_allowed(config, actor, action_key, environment, target)
@@ -249,7 +282,7 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port)
+            agent_host='127.0.0.1', agent_port=config.port, **({'allow_github': True} if github else {}))
     except Exception:
         raise InstalledCoordinatorError() from None
 
