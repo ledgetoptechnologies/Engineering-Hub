@@ -110,4 +110,3 @@ async def test_protected_github_enrollment_owned_service_queue(rig, monkeypatch)
                     raise outcome[0]
         finally:
             composition.close()
-
