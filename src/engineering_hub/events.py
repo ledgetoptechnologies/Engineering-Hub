@@ -160,11 +160,16 @@ class NativeHubEventFeed:
         # the old epoch's streams may still be live, so nothing is available.
         self._transition_pending = False
         self._transition_seq = 0
+        # Each start() binds its source's callbacks to a new generation, so late
+        # callbacks from a stopped source can't move a restarted feed.
+        self._generation = 0
+        # Sticky until the next start(): a broker transition that raised.
+        self._apply_failed = False
         self.reason = "not_started"
 
     @property
     def available(self):
-        return (self.broker.available and not self._transition_pending
+        return (self.broker.available and not self._transition_pending and not self._apply_failed
                 and self._source is not None and self._source.healthy)
 
     @property
@@ -182,12 +187,12 @@ class NativeHubEventFeed:
         if state in {"suspended", "resumed"}:
             self._schedule(state=state)
 
-    def _schedule(self, *, cursor=None, error=False, state=None):
+    def _schedule(self, *, cursor=None, error=False, state=None, generation=None):
         # Native writes may burst while the ASGI loop is occupied: retain only
         # the latest head and at most one scheduled callback, not an unbounded
         # call_soon_threadsafe backlog. Errors always outrank invalidations.
         with self._lock:
-            if self._loop is None:
+            if self._loop is None or (generation is not None and generation != self._generation):
                 return
             if cursor is not None:
                 self._pending_cursor = max(cursor, self._pending_cursor or 0)
@@ -208,6 +213,15 @@ class NativeHubEventFeed:
             self._pending_error = self._scheduled = False
         try:
             self._apply(cursor, error, state)
+        except Exception:
+            # A transition that broke partway must never leave an old epoch live:
+            # fail the broker and stay unavailable until the next start().
+            self._apply_failed = True
+            self.reason = "native_source_failed"
+            try:
+                self.broker.fail()
+            except Exception:
+                pass
         finally:
             with self._lock:
                 # A transition reported after the snapshot keeps the gate shut
@@ -216,7 +230,9 @@ class NativeHubEventFeed:
                     self._transition_pending = False
 
     def _apply(self, cursor, error, state):
-        if error:
+        if self._apply_failed:
+            self.broker.fail()
+        elif error:
             self.reason = "native_source_failed"
             self.broker.fail()
         elif state == "suspended":
@@ -246,14 +262,29 @@ class NativeHubEventFeed:
             self.reason = "native_source_unsupported"
             self.broker.fail()
             return self.status
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self._apply_failed = False
         self._loop = asyncio.get_running_loop()
+
+        def notify(_channels, cursor):
+            self._schedule(cursor=cursor, generation=generation)
+
+        def error(_exc):
+            self._schedule(error=True, generation=generation)
+
+        def state(value):
+            if value in {"suspended", "resumed"}:
+                self._schedule(state=value, generation=generation)
+
         try:
             # The transient options are passed only when enabled, so existing
             # source factories keep their exact signature.
-            transient = ({"transient_busy_seconds": self._transient_busy_seconds, "on_state": self._state}
+            transient = ({"transient_busy_seconds": self._transient_busy_seconds, "on_state": state}
                          if self._transient_busy_seconds else {})
-            self._source = self._factory(self.path, HubOutboxCursorReader(), self._notify,
-                                         on_error=self._error, **transient)
+            self._source = self._factory(self.path, HubOutboxCursorReader(), notify,
+                                         on_error=error, **transient)
             stats = await asyncio.to_thread(self._source.start)
             self.broker.activate(int(stats["cursor"]))
             self.reason = "native_source_active"

@@ -547,6 +547,95 @@ async def test_stop_during_a_pending_transition_leaves_nothing_available(tmp_pat
     assert feed.status["reason"] == "stopped"
 
 
+async def test_a_failed_broker_transition_fails_closed_until_restart(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    stream = feed.broker.events()
+    await anext(stream)
+    original, calls = feed._apply, []
+
+    def broken(cursor, error, state):
+        calls.append(state)
+        if len(calls) == 1:
+            raise RuntimeError("transition broke partway")
+        original(cursor, error, state)
+
+    feed._apply = broken
+    fake.on_state("resumed")
+    await asyncio.sleep(0)
+    # The old epoch's stream is ended and nothing is available, with a stable reason.
+    assert (await anext(stream))["kind"] == "source_unavailable"
+    assert not feed.available and not feed.broker.available
+    assert feed.status["reason"] == "native_source_failed"
+    # A later resume can't reopen a feed whose transition failed.
+    fake.on_state("resumed")
+    await asyncio.sleep(0)
+    assert not feed.available and not feed.broker.available
+    await feed.stop()
+    feed._apply = original
+    await feed.start()
+    assert feed.available
+    await feed.stop()
+
+
+class StartupFake(StateFake):
+    script = ()
+
+    def start(self):
+        for state in self.script:
+            if state == "suspended":
+                self.healthy = False
+                self.stats["suspended"] = True
+            else:
+                self.healthy = True
+                self.stats["suspended"] = False
+            self.on_state(state)
+        return dict(self.stats)
+
+
+@pytest.mark.parametrize("script", [("suspended",), ("suspended", "resumed")])
+async def test_a_transition_during_startup_is_gated(tmp_path, script):
+    StartupFake.script = script
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StartupFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    status = await feed.start()
+    fake = StartupFake.instances[-1]
+    started_epoch = feed.broker.observer_epoch
+    # start() has returned but the reported transitions haven't been drained yet.
+    assert not status["available"] and not feed.available
+    await asyncio.sleep(0)
+    if script[-1] == "suspended":
+        assert not feed.available and feed.status["reason"] == "native_source_suspended"
+        fake.healthy = True
+        fake.stats["suspended"] = False
+        fake.on_state("resumed")
+        await asyncio.sleep(0)
+    assert feed.available and feed.broker.observer_epoch != started_epoch
+    await feed.stop()
+
+
+async def test_callbacks_from_a_stopped_source_cannot_move_a_restarted_feed(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    old = StateFake.instances[-1]
+    await feed.stop()
+    await feed.start()
+    current = StateFake.instances[-1]
+    assert current is not old and feed.available
+    epoch, cursor = feed.broker.observer_epoch, feed.broker.cursor
+    old.on_state("suspended")
+    old.on_error(RuntimeError("late failure from the old source"))
+    old.deliver(("hub",), cursor + 50)
+    assert feed.available
+    await asyncio.sleep(0)
+    assert feed.available and feed.broker.observer_epoch == epoch and feed.broker.cursor == cursor
+    assert feed.status["reason"] == "native_source_active"
+    await feed.stop()
+
+
 @pytest.mark.parametrize("value", [-1, 3601, True, math.nan, "5"])
 def test_feed_option_is_validated(tmp_path, value):
     with pytest.raises(ValueError):
