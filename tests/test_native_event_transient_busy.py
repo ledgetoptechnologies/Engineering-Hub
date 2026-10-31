@@ -1,0 +1,266 @@
+"""Opt-in transient write-lock recovery for the native SQLite event source.
+
+Real SQLite and Linux inotify where available: another connection holds the
+write lock while a native event arrives, then releases or keeps it.
+"""
+import asyncio
+from contextlib import closing
+from functools import partial
+import math
+import os
+import sqlite3
+import time
+
+import pytest
+
+from agent_message_bus.sqlite_events import SQLiteEventSource, WatcherFailed, native_event_support
+from engineering_hub.events import HubOutboxCursorReader, NativeHubEventFeed
+from engineering_hub.repository import HubRepository
+
+
+def ledger(tmp_path):
+    path = tmp_path / "hub.db"
+    HubRepository(path)
+    supported, reason = native_event_support(path)
+    if not supported:
+        pytest.skip(reason)
+    return path
+
+
+def wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def insert_outbox(db):
+    db.execute("INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES ('x','x',1,'now')")
+
+
+class Recorder:
+    def __init__(self):
+        self.deliveries, self.states, self.errors = [], [], []
+
+    def deliver(self, _recipients, cursor):
+        self.deliveries.append(cursor)
+
+
+def source(path, recorder, **options):
+    return SQLiteEventSource(path, HubOutboxCursorReader(), recorder.deliver, busy_timeout_ms=200,
+                             on_error=recorder.errors.append, on_state=recorder.states.append, **options)
+
+
+def hold_lock(path):
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+def poke(path):
+    # A metadata change is a relevant native event, so the source reconciles
+    # and meets the held lock without any data having been written.
+    os.utime(path)
+
+
+def test_runtime_lock_suspends_then_resumes_with_changes_committed_meanwhile(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        assert events.stats["cursor"] == 0
+        insert_outbox(holder)
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        assert not events.healthy and events.failure is None
+        assert recorder.states == ["suspended"] and recorder.errors == []
+        assert events.stats["sqlite_errorname"] == "SQLITE_BUSY"
+        assert events.stats["failure_stage"] == "acquire_write_barrier"
+        # Several retries fail while the lock is held; none of them is fatal.
+        time.sleep(0.8)
+        assert events.stats["suspended"] and events.failure is None
+        holder.commit()
+        # A second writer commits before the owed reconcile can run.
+        with closing(sqlite3.connect(path)) as other, other:
+            insert_outbox(other)
+        assert wait_until(lambda: events.healthy and events.stats["cursor"] == 2)
+        assert recorder.states == ["suspended", "resumed"] and recorder.errors == []
+        assert recorder.deliveries and recorder.deliveries[-1] == 2
+        stats = events.stats
+        assert stats["suspended"] is False and stats["suspensions"] == 1
+        assert stats["sqlite_errorname"] is None and stats["failure_stage"] is None
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_lock_held_past_the_bound_fails_closed(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=0.5)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        poke(path)
+        assert wait_until(lambda: events.failure is not None, timeout=5)
+        assert isinstance(events.failure, WatcherFailed)
+        assert not events.healthy and len(recorder.errors) == 1
+        assert recorder.states == ["suspended"]
+        assert events.stats["failure_stage"] == "acquire_write_barrier"
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_disabled_by_default_keeps_failing_closed(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        poke(path)
+        assert wait_until(lambda: events.failure is not None)
+        assert events.stats["sqlite_errorname"] == "SQLITE_BUSY"
+        assert recorder.states == [] and events.stats["suspensions"] == 0
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_startup_never_waits_out_a_held_lock(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=30)
+    holder = hold_lock(path)
+    try:
+        with pytest.raises(WatcherFailed):
+            events.start()
+        assert recorder.states == [] and not events.healthy
+    finally:
+        holder.close()
+        events.stop()
+
+
+def test_stop_is_prompt_while_suspended(tmp_path):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path)
+    try:
+        poke(path)
+        assert wait_until(lambda: events.stats["suspended"])
+        began = time.monotonic()
+        stats = events.stop(timeout=5)
+        assert time.monotonic() - began < 2
+        assert stats["watcher_stopped"] and events.failure is None
+    finally:
+        holder.close()
+        events.stop()
+
+
+@pytest.mark.parametrize("options", [
+    {"transient_busy_seconds": -1}, {"transient_busy_seconds": 3601}, {"transient_busy_seconds": True},
+    {"transient_busy_seconds": math.nan}, {"transient_busy_seconds": "1"},
+    {"retry_busy_timeout_ms": 0}, {"retry_busy_timeout_ms": 201}, {"retry_busy_timeout_ms": True},
+])
+def test_options_are_validated(tmp_path, options):
+    path = ledger(tmp_path)
+    with pytest.raises(ValueError):
+        source(path, Recorder(), **options)
+
+
+async def test_hub_feed_tells_viewers_and_reopens_under_a_new_epoch(tmp_path):
+    path = ledger(tmp_path)
+    feed = NativeHubEventFeed(path, transient_busy_seconds=30,
+                              source_factory=partial(SQLiteEventSource, busy_timeout_ms=200))
+    holder = None
+    try:
+        assert (await feed.start())["available"]
+        epoch = feed.broker.observer_epoch
+        stream = feed.broker.events()
+        assert (await anext(stream))["cursor"] == 0
+        holder = hold_lock(path)
+        insert_outbox(holder)
+        poke(path)
+        ended = await asyncio.wait_for(anext(stream), timeout=5)
+        assert ended["kind"] == "source_unavailable"
+        assert feed.status["reason"] == "native_source_suspended" and not feed.status["available"]
+        refused = feed.broker.events()
+        assert (await anext(refused))["kind"] == "source_unavailable"
+        await refused.aclose()
+        holder.commit()
+        deadline = time.monotonic() + 5
+        while not feed.available and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert feed.available and feed.status["reason"] == "native_source_active"
+        assert feed.broker.observer_epoch != epoch
+        reopened = feed.broker.events()
+        assert (await anext(reopened))["cursor"] == 1
+        await reopened.aclose()
+    finally:
+        if holder is not None:
+            holder.close()
+        await feed.stop()
+
+
+class StateFake:
+    instances = []
+
+    def __init__(self, path, reader, deliver, *, on_error, **options):
+        self.deliver, self.on_error, self.options = deliver, on_error, options
+        self.on_state = options.get("on_state")
+        self.healthy = True
+        self.stats = {"cursor": 4, "suspended": False}
+        self.instances.append(self)
+
+    def start(self):
+        return dict(self.stats)
+
+    def stop(self):
+        self.healthy = False
+
+
+async def test_feed_passes_transient_options_only_when_enabled(tmp_path):
+    off = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                             support_check=lambda _: (True, "fixture"))
+    await off.start()
+    assert StateFake.instances[-1].options == {}
+    await off.stop()
+    on = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                            support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await on.start()
+    assert StateFake.instances[-1].options["transient_busy_seconds"] == 5
+    assert callable(StateFake.instances[-1].options["on_state"])
+    await on.stop()
+
+
+async def test_suspend_then_resume_before_drain_still_forces_reconnect(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StateFake,
+                              support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
+    await feed.start()
+    fake = StateFake.instances[-1]
+    epoch = feed.broker.observer_epoch
+    stream = feed.broker.events()
+    await anext(stream)
+    # Both transitions land before the event loop drains them.
+    fake.on_state("suspended")
+    fake.stats["cursor"] = 9
+    fake.deliver(("hub",), 9)
+    fake.on_state("resumed")
+    await asyncio.sleep(0)
+    assert (await anext(stream))["kind"] == "source_unavailable"
+    assert feed.available and feed.broker.observer_epoch != epoch and feed.broker.cursor == 9
+    await stream.aclose()
+    await feed.stop()
+
+
+@pytest.mark.parametrize("value", [-1, 3601, True, math.nan, "5"])
+def test_feed_option_is_validated(tmp_path, value):
+    with pytest.raises(ValueError):
+        NativeHubEventFeed(tmp_path / "ignored", transient_busy_seconds=value)

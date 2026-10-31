@@ -137,17 +137,24 @@ class NativeHubEventFeed:
 
     def __init__(self, path: str | Path, *, queue_size=8,
                  source_factory: Callable = SQLiteEventSource,
-                 support_check: Callable = native_event_support):
+                 support_check: Callable = native_event_support,
+                 transient_busy_seconds=0):
+        # Zero keeps the original behavior: a held write lock fails the feed closed.
+        if (type(transient_busy_seconds) not in {int, float} or not 0 <= transient_busy_seconds <= 3600
+                or transient_busy_seconds != transient_busy_seconds):
+            raise ValueError("transient_busy_seconds must be between 0 and 3600")
         self.path = Path(path)
         self.broker = EventBroker(queue_size=queue_size)
         self._factory = source_factory
         self._support_check = support_check
+        self._transient_busy_seconds = transient_busy_seconds
         self._source = None
         self._loop = None
         self._lock = threading.Lock()
         self._scheduled = False
         self._pending_cursor = None
         self._pending_error = False
+        self._pending_state = None
         self.reason = "not_started"
 
     @property
@@ -165,7 +172,11 @@ class NativeHubEventFeed:
     def _error(self, _exc):
         self._schedule(error=True)
 
-    def _schedule(self, *, cursor=None, error=False):
+    def _state(self, state):
+        if state in {"suspended", "resumed"}:
+            self._schedule(state=state)
+
+    def _schedule(self, *, cursor=None, error=False, state=None):
         # Native writes may burst while the ASGI loop is occupied: retain only
         # the latest head and at most one scheduled callback, not an unbounded
         # call_soon_threadsafe backlog. Errors always outrank invalidations.
@@ -175,18 +186,33 @@ class NativeHubEventFeed:
             if cursor is not None:
                 self._pending_cursor = max(cursor, self._pending_cursor or 0)
             self._pending_error |= error
+            if state is not None:
+                self._pending_state = state
             if not self._scheduled:
                 self._scheduled = True
                 self._loop.call_soon_threadsafe(self._drain)
 
     def _drain(self):
         with self._lock:
-            cursor, error = self._pending_cursor, self._pending_error
-            self._pending_cursor = None
+            cursor, error, state = self._pending_cursor, self._pending_error, self._pending_state
+            self._pending_cursor = self._pending_state = None
             self._pending_error = self._scheduled = False
         if error:
             self.reason = "native_source_failed"
             self.broker.fail()
+        elif state == "suspended":
+            # Every viewer is told it's no longer current and must reconnect later.
+            self.reason = "native_source_suspended"
+            self.broker.fail()
+        elif state == "resumed":
+            # A suspension happened, so no viewer may keep its old stream: end any
+            # stragglers, then reopen under a new epoch at the caught-up head.
+            # The pending cursor is already included in that head.
+            source = self._source
+            self.broker.fail()
+            if source is not None and source.healthy:
+                self.broker.activate(int(source.stats["cursor"]))
+                self.reason = "native_source_active"
         elif cursor is not None:
             self.broker.publish(cursor)
 
@@ -200,15 +226,20 @@ class NativeHubEventFeed:
             return self.status
         self._loop = asyncio.get_running_loop()
         try:
+            # The transient options are passed only when enabled, so existing
+            # source factories keep their exact signature.
+            transient = ({"transient_busy_seconds": self._transient_busy_seconds, "on_state": self._state}
+                         if self._transient_busy_seconds else {})
             self._source = self._factory(self.path, HubOutboxCursorReader(), self._notify,
-                                         on_error=self._error)
+                                         on_error=self._error, **transient)
             stats = await asyncio.to_thread(self._source.start)
             self.broker.activate(int(stats["cursor"]))
             self.reason = "native_source_active"
             # Catch up changes delivered while start() was returning. The
             # source's stats is memory only, never another SQLite query.
             if not self._source.healthy:
-                self.reason = "native_source_failed"
+                suspended = bool(self._source.stats.get("suspended"))
+                self.reason = "native_source_suspended" if suspended else "native_source_failed"
                 self.broker.fail()
             else:
                 self.broker.publish(int(self._source.stats["cursor"]))
@@ -227,6 +258,6 @@ class NativeHubEventFeed:
             await asyncio.to_thread(source.stop)
         with self._lock:
             self._loop = None
-            self._pending_cursor = None
+            self._pending_cursor = self._pending_state = None
             self._pending_error = self._scheduled = False
         self.reason = "stopped"

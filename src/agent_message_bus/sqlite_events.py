@@ -4,6 +4,11 @@ Inotify readiness is only an invalidation hint. Each relevant filesystem batch
 is reconciled behind one ``BEGIN IMMEDIATE`` arbitration so uncommitted WAL
 frames cannot be mistaken for durable message commits. No timer or poll query is
 used; the worker blocks in epoll until an inotify or eventfd readiness event.
+
+One opt-in exception (``transient_busy_seconds``): if another writer holds the
+lock at runtime, the source reports itself unhealthy and suspended, keeps its
+cursor, and retries on a short timer until the lock clears or the bound passes.
+Startup and every other failure still fail closed.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import sqlite3
 import stat
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -194,6 +200,8 @@ _DIR_MASK = IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN
 _FILE_MASK = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF
 _REPLACEMENT_MASK = IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
 _EVENT_HEADER = struct.Struct("iIII")
+_RETRY_INTERVAL_SECONDS = 0.25
+_TRANSIENT_LOCK_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _FIONREAD = getattr(termios, "FIONREAD", None) if termios is not None else None
 
 
@@ -216,11 +224,20 @@ class SQLiteEventSource:
         read_buffer_bytes: int = 64 * 1024,
         max_flush_bytes: int = 8 * 1024 * 1024,
         on_error: Callable[[BaseException], None] | None = None,
+        transient_busy_seconds: float = 0,
+        retry_busy_timeout_ms: int = 100,
+        on_state: Callable[[str], None] | None = None,
     ) -> None:
         if not sys_platform_linux():
             raise OSError("SQLiteEventSource requires Linux inotify, epoll, and eventfd")
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
+        # Zero keeps the original behavior: any runtime barrier failure fails closed.
+        if (type(transient_busy_seconds) not in {int, float} or not 0 <= transient_busy_seconds <= 3600
+                or transient_busy_seconds != transient_busy_seconds):
+            raise ValueError("transient_busy_seconds must be between 0 and 3600")
+        if type(retry_busy_timeout_ms) is not int or not 1 <= retry_busy_timeout_ms <= busy_timeout_ms:
+            raise ValueError("retry_busy_timeout_ms must be positive and at most busy_timeout_ms")
         if read_buffer_bytes < _EVENT_HEADER.size:
             raise ValueError("read_buffer_bytes is too small for an inotify event")
         if max_flush_bytes < read_buffer_bytes:
@@ -239,6 +256,11 @@ class SQLiteEventSource:
         self.read_buffer_bytes = read_buffer_bytes
         self.max_flush_bytes = max_flush_bytes
         self.on_error = on_error
+        self.transient_busy_seconds = transient_busy_seconds
+        self.retry_busy_timeout_ms = retry_busy_timeout_ms
+        self.on_state = on_state
+        # Set while a runtime reconcile is owed because another writer held the lock.
+        self._suspended_since: float | None = None
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -260,6 +282,8 @@ class SQLiteEventSource:
             "failure_stage": None,
             "sqlite_errorcode": None,
             "sqlite_errorname": None,
+            "suspended": False,
+            "suspensions": 0,
         }
         self._stage = "created"
         self._failure: BaseException | None = None
@@ -439,8 +463,12 @@ class SQLiteEventSource:
             assert self._epoll is not None and self._inotify_fd is not None and self._event_fd is not None
             while True:
                 self._stage = "wait_native_event"
-                ready = self._epoll.poll(-1)
+                # Idle sources still block indefinitely. Only an owed reconcile
+                # after a transient lock wakes on a short timer to retry.
+                ready = self._epoll.poll(-1 if self._suspended_since is None else _RETRY_INTERVAL_SECONDS)
                 should_stop = False
+                if not ready and self._suspended_since is not None:
+                    self._reconcile(reason="retry")
                 for fd, _mask in ready:
                     if fd == self._inotify_fd:
                         self._stage = "read_native_event"
@@ -594,7 +622,14 @@ class SQLiteEventSource:
         began = False
         try:
             self._stage = "acquire_write_barrier"
-            self._barrier.execute("BEGIN IMMEDIATE")
+            try:
+                self._barrier.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                # Startup has no prior snapshot to fall back on, so it never waits this out.
+                if reason != "startup" and self._transient_lock(exc):
+                    self._suspend(exc)
+                    return
+                raise
             began = True
             self._stage = "read_committed_cursor"
             recipients, next_cursor = self.read_after(self._reader, self._cursor)
@@ -619,6 +654,9 @@ class SQLiteEventSource:
                 self._stage = "publish_invalidation"
                 self.deliver(selected, next_cursor)
                 self._add_stat("deliveries")
+            if self._suspended_since is not None:
+                # Healthy again only after the owed changes were read and delivered.
+                self._resume()
         except BaseException:
             if began:
                 try:
@@ -626,6 +664,55 @@ class SQLiteEventSource:
                 except sqlite3.Error:
                     pass
             raise
+
+    def _transient_lock(self, exc: sqlite3.OperationalError) -> bool:
+        code = getattr(exc, "sqlite_errorcode", None)
+        return (self.transient_busy_seconds > 0 and type(code) is int
+                and code & 0xFF in _TRANSIENT_LOCK_CODES)
+
+    def _suspend(self, exc: sqlite3.OperationalError) -> None:
+        """Report not-current and owe a reconcile; give up past the bound.
+
+        The cursor isn't advanced, so the next successful reconcile reads every
+        change committed meanwhile. Inotify keeps being read, so an overflow or
+        a replaced file still fails closed exactly as before.
+        """
+        assert self._barrier is not None
+        now = time.monotonic()
+        if self._suspended_since is None:
+            self._suspended_since = now
+            # Short waits from here on, so stop commands are served between retries.
+            self._barrier.execute(f"PRAGMA busy_timeout={self.retry_busy_timeout_ms}")
+            with self._condition:
+                self._stats["healthy"] = False
+                self._stats["suspended"] = True
+                self._stats["suspensions"] = int(self._stats["suspensions"] or 0) + 1
+                self._stats["failure_stage"] = self._stage
+                self._stats.update(_sqlite_error_details(exc))
+                self._condition.notify_all()
+            self._notify_state("suspended")
+        elif now - self._suspended_since > self.transient_busy_seconds:
+            raise WatcherFailed("SQLite write lock was held longer than the transient bound") from exc
+
+    def _resume(self) -> None:
+        assert self._barrier is not None
+        self._barrier.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        self._suspended_since = None
+        with self._condition:
+            self._stats["healthy"] = True
+            self._stats["suspended"] = False
+            self._stats["failure_stage"] = None
+            self._stats["sqlite_errorcode"] = None
+            self._stats["sqlite_errorname"] = None
+            self._condition.notify_all()
+        self._notify_state("resumed")
+
+    def _notify_state(self, state: str) -> None:
+        if self.on_state is not None:
+            try:
+                self.on_state(state)
+            except Exception:
+                pass
 
     def _fail(self, exc: BaseException) -> None:
         with self._condition:
