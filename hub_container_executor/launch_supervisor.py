@@ -985,7 +985,7 @@ class LaunchSupervisor:
         return result
 
     def _pin_sources(self):
-        if self.profile.role in {'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2'}:
+        if self.profile.role in {'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'}:
             self._pin_trusted_local_inputs()
         for role, mount in self._mounts.items():
             if role in {'local_config', 'local_enrollment', 'local_admission'}:
@@ -1178,7 +1178,7 @@ class LaunchSupervisor:
                     os.close(parent)
         config, config_pin = capture('local_config', MAX_CONFIG_BYTES)
         enrollment, enrollment_pin = capture('local_enrollment', MAX_ENROLLMENT_BYTES)
-        if self.profile.role == 'supervised-local-coordinator-v2':
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
             admission, admission_pin = capture('local_admission', MAX_ADMISSION_BYTES)
             admission_policy = parse_admission(admission)
             _require(self._ttl <= admission_policy.lifetime_seconds
@@ -1191,7 +1191,7 @@ class LaunchSupervisor:
         _require(capture('local_config', MAX_CONFIG_BYTES) == (config, config_pin)
                  and capture('local_enrollment', MAX_ENROLLMENT_BYTES) == (enrollment, enrollment_pin))
         pins = {'local_config': config_pin, 'local_enrollment': enrollment_pin}
-        if self.profile.role == 'supervised-local-coordinator-v2':
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
             _require(capture('local_admission', MAX_ADMISSION_BYTES) == (admission, admission_pin))
             pins['local_admission'] = admission_pin
         previous = getattr(self, '_trusted_local_input_pins', None)
@@ -1200,7 +1200,7 @@ class LaunchSupervisor:
                      for role, pin in pins.items()))
         self._trusted_local_input_pins = pins
         self._source_pins.update({role: pin[0] for role, pin in pins.items()})
-        if self.profile.role == 'supervised-local-coordinator-v2':
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
             previous = getattr(self, '_coordinator_admission', None)
             _require(previous is None or previous == admission_policy)
             self._coordinator_admission = admission_policy
@@ -1490,8 +1490,8 @@ class LaunchSupervisor:
             try:
                 self._guard()
                 role = getattr(getattr(self, 'profile', None), 'role', None)
-                _require(role is None or role == 'supervised-local-coordinator-v2')
-                coordinator = role == 'supervised-local-coordinator-v2'
+                _require(role is None or role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
+                coordinator = role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                 _require(type(self.release) is (CoordinatorReleaseEnrollment if coordinator else ExecutorReleaseEnrollment))
                 request_protocol = COORDINATOR_REQUEST_PROTOCOL if coordinator else REQUEST_PROTOCOL
                 protocol = COORDINATOR_PROTOCOL if coordinator else PROTOCOL
@@ -1564,7 +1564,7 @@ class LaunchSupervisor:
                     continue
                 try:
                     self._guard()
-                    _require(self.profile.role == 'supervised-local-coordinator-v2'
+                    _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                              and self._receipt_served and not self._issuance_open
                              and getattr(self, '_coordinator_stop_requested', False)
                              and getattr(self, '_coordinator_drain', None) is None)
@@ -1583,7 +1583,7 @@ class LaunchSupervisor:
             peer = None
             try:
                 self._guard()
-                _require(self.profile.role == 'supervised-local-coordinator-v2'
+                _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                          and self._receipt_served and not self._issuance_open
                          and getattr(self, '_coordinator_stop_requested', False)
                          and getattr(self, '_coordinator_drain', None) is None
@@ -2791,7 +2791,7 @@ class LaunchSupervisor:
         """Only identity/authority failures here hold; wire input is checked outside."""
         try:
             self._guard()
-            _require(getattr(getattr(self, 'profile', None), 'role', None) != 'supervised-local-coordinator-v2')
+            _require(getattr(getattr(self, 'profile', None), 'role', None) not in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
             _require(self._receipt_served and not self._issuance_open)
             deadline = min(deadline, self._expires)
             _remaining(deadline)
@@ -3130,7 +3130,7 @@ class LaunchSupervisor:
         not the container; only the caller's explicit stop signal requests stop.
         """
         _require(self._pid == os.getpid())
-        _require(getattr(getattr(self, 'profile', None), 'role', None) != 'supervised-local-coordinator-v2')
+        _require(getattr(getattr(self, 'profile', None), 'role', None) not in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
@@ -3175,7 +3175,7 @@ class LaunchSupervisor:
         external stop policy and paired lifecycle remain separate obligations.
         """
         _require(self._pid == os.getpid()
-                 and getattr(getattr(self, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2'
+                 and getattr(getattr(self, 'profile', None), 'role', None) in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                  and type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
@@ -3231,7 +3231,7 @@ class LaunchSupervisor:
         try:
             with self._mutex:
                 self._guard()
-                _require(self.profile.role == 'supervised-local-coordinator-v2'
+                _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                          and self._receipt_served and not self._issuance_open
                          and not getattr(self, '_coordinator_stop_requested', False)
                          and timeout_ms >= (self._coordinator_stop_grace * 1000

@@ -2,6 +2,7 @@
 import hashlib
 import os
 import socket
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -72,9 +73,10 @@ def test_pair_capture_pins_content_and_denies_replacement(tmp_path, monkeypatch)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason='Synthetic mapped-owner capture requires isolated root')
-def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path):
-    from hub_container_executor.coordinator_admission import admission_commitment, parse_admission
-    from tests.test_executor_launch_profile import supervised_local_profile
+@pytest.mark.parametrize('oauth', [False, True])
+def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path, oauth):
+    from hub_container_executor.coordinator_admission import admission_commitment, parse_admission, SCHEMA_V2, OAUTH_SOCKET
+    from tests.test_executor_launch_profile import supervised_local_profile, supervised_local_oauth_profile
     from tests.test_hub_coordinator_admission import document
     root = tmp_path / 'hub-pilot-local'; root.mkdir(mode=0o700)
     config = github_configuration(); config['manifest'] = profile_document()['manifest']
@@ -84,13 +86,17 @@ def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path):
                   secret_root='/var/lib/engineering-hub/local-secrets')
     evidence = v2_document(); evidence.update(schema=SCHEMA_V3, operator_actor='human:123')
     config_raw, evidence_raw = canonical(config), encode(evidence)
-    data = supervised_local_profile(); data['fixture_root'] = str(root)
+    data = (supervised_local_oauth_profile() if oauth else supervised_local_profile()); data['fixture_root'] = str(root)
     data['daemon_policy']['engine_id'] = evidence['launch']['engine_id']
     for item in data['mounts']: item['source'] = str(root / item['role'])
     for role, raw in [('local_config', config_raw), ('local_enrollment', evidence_raw)]:
         target = root / role; target.write_bytes(raw); os.chmod(target, 0o600); os.chown(target, 110001, 110001)
         _swap_mount(data, role, content_digest='sha256:' + hashlib.sha256(raw).hexdigest())
     admission = document(config_raw, evidence_raw)
+    if oauth:
+        admission['schema'] = SCHEMA_V2
+        admission['oauth_broker'] = {'socket_path': OAUTH_SOCKET, 'issuer_uid': 77, 'issuer_gid': 88,
+            'client_id': 'fixture-client', 'origin': 'https://pilot.example.test', 'secret_digest': 'sha256:'+'5'*64}
     normalized, _ = admission_commitment(canonical(admission))
     _swap_mount(data, 'local_admission', content_digest=normalized)
     profile = profiles.ExecutorLaunchProfile.model_validate(data)
@@ -99,16 +105,21 @@ def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path):
     target = root / 'local_admission'; target.write_bytes(raw); os.chmod(target, 0o600); os.chown(target, 110001, 110001)
     for role in ('local_state', 'local_secrets', 'local_executor_directory', 'local_browser_directory'):
         directory = root / role; directory.mkdir(mode=0o700); os.chown(directory, 110001, 110001)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    with ExitStack() as stack:
+        sock = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         sock.bind(str(root / 'local_issuer_socket'))
         os.chmod(root / 'local_issuer_socket', 0o660); os.chown(root / 'local_issuer_socket', 0, 110001)
+        if oauth:
+            broker = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+            broker.bind(str(root / 'local_oauth_socket'))
+            os.chmod(root / 'local_oauth_socket', 0o660); os.chown(root / 'local_oauth_socket', 120001, 110001)
         subject = SimpleNamespace(profile=profile, release=parse_admission(raw).release,
             _mounts={m.role:m for m in profile.mounts}, _source_pins={},
             _configuration_raw_digest='sha256:'+hashlib.sha256(config_raw).hexdigest(),
             _admission_raw_digest=raw_pin, _ttl=30, _request_ms=2000)
         subject._pin_trusted_local_inputs = lambda: launch.LaunchSupervisor._pin_trusted_local_inputs(subject)
         launch.LaunchSupervisor._pin_sources(subject)
-        assert set(subject._source_pins) == set(profiles.SUPERVISED_LOCAL_COORDINATOR_TARGETS)
+        assert set(subject._source_pins) == set(profiles.SUPERVISED_LOCAL_COORDINATOR_TARGETS) | ({'local_oauth_socket'} if oauth else set())
         subject._ttl = 31
         with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor._pin_sources(subject)
         subject._ttl = 30; subject._request_ms = 2001

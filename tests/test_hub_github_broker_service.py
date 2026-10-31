@@ -49,6 +49,19 @@ async def test_invalid_listener_is_closed_before_secret_resolver(tmp_path,monkey
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.getuid()!=0,reason='requires root-owned synthetic enrollment')
+async def test_wrong_expected_enrollment_denies_before_secret(tmp_path,monkeypatch):
+    fd=fd_for(tmp_path,enrollment(tmp_path));listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    monkeypatch.setattr(service,'ImmutableTestSecretResolver',lambda *a,**k: pytest.fail('secret read'))
+    try:
+        with pytest.raises(service.BrokerServiceError):
+            await service.serve_enrolled_broker(enrollment_fd=fd,listener=listener,stop_event=asyncio.Event(),
+                                                expected_enrollment_digest='sha256:'+'0'*64)
+        assert listener.fileno()==-1
+    finally: os.close(fd);listener.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.getuid()!=0,reason='requires root-owned synthetic enrollment')
 @pytest.mark.parametrize('replace_path',[False,True])
 async def test_enrolled_service_owns_listener_until_stop(tmp_path,monkeypatch,replace_path):
     import hashlib

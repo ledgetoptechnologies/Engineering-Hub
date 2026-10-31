@@ -291,7 +291,7 @@ def _execute(options):
                             custodian_thread.start()
                     elif not stop.requested:
                         raise RuntimeError('receipt readiness unavailable')
-                wait = (supervisor.wait_for_coordinator_stop if getattr(getattr(supervisor, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2'
+                wait = (supervisor.wait_for_coordinator_stop if getattr(getattr(supervisor, 'profile', None), 'role', None) in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
                         else supervisor.wait_for_stop_with_observations)
                 requested = stop.requested or wait(
                     timeout_ms=options.wait_seconds * 1000,
@@ -307,7 +307,7 @@ def _execute(options):
                     if gate_failed.is_set(): raise RuntimeError('gate unavailable')
                 if requested:
                     # Explicit signal only. Caller must already have drained.
-                    if getattr(getattr(supervisor, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2':
+                    if getattr(getattr(supervisor, 'profile', None), 'role', None) in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
                         supervisor.graceful_stop_coordinator(timeout_ms=(supervisor._coordinator_stop_grace * 1000
                             + supervisor._coordinator_admission.timeout_ms + 5000))
                     else:

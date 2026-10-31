@@ -6,6 +6,7 @@ The creator and root administrators remain trusted to preserve the enrolled
 descriptor and path throughout the service lifetime.
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -66,11 +67,15 @@ def read_enrollment(fd):
     except Exception: raise BrokerServiceError() from None
 
 
-async def serve_enrolled_broker(*, enrollment_fd, listener, stop_event, on_ready=None):
+async def serve_enrolled_broker(*, enrollment_fd, listener, stop_event, on_ready=None, expected_enrollment_digest=None):
     """Take ownership of a prebound listener until all admitted requests drain."""
     broker=None
     try:
         data=read_enrollment(enrollment_fd)
+        if expected_enrollment_digest is not None:
+            raw=json.dumps(data,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+            if (type(expected_enrollment_digest) is not str or
+                    'sha256:'+hashlib.sha256(raw).hexdigest()!=expected_enrollment_digest): raise ValueError()
         if (os.getuid()!=data['service_uid'] or os.geteuid()!=data['service_uid']
                 or os.getgid()!=data['service_gid'] or os.getegid()!=data['service_gid'] or os.getgroups()
                 or type(stop_event) is not asyncio.Event or type(listener) is not socket.socket

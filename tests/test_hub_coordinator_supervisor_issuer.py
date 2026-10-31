@@ -11,15 +11,16 @@ from hub_container_executor.launch_transport import CoordinatorUnixLaunchReceipt
 from tests.test_hub_container_executor_launch_supervisor import synthetic_issuer, short_root, root_journal, serve_fixture
 
 
-def coordinator(authority):
-    authority.profile = SimpleNamespace(role='supervised-local-coordinator-v2')
+def coordinator(authority, role='supervised-local-coordinator-v2'):
+    authority.profile = SimpleNamespace(role=role)
     authority.release = identity.CoordinatorReleaseEnrollment(**{
         name: getattr(authority.release, name) for name in identity.CoordinatorReleaseEnrollment.__dataclass_fields__})
 
 
-def test_coordinator_issuer_signs_role_specific_receipt_and_never_serves_executor_observations(synthetic_issuer):
+@pytest.mark.parametrize('role', ['supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'])
+def test_coordinator_issuer_signs_role_specific_receipt_and_never_serves_executor_observations(synthetic_issuer, role):
     authority, path, checks = synthetic_issuer
-    coordinator(authority)
+    coordinator(authority, role)
     thread, result = serve_fixture(authority)
     transport = CoordinatorUnixLaunchReceiptTransport(socket_path=str(path),
         expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())

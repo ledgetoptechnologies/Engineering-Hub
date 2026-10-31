@@ -12,9 +12,10 @@ from tests.test_hub_container_executor_launch_supervisor import synthetic_issuer
 
 
 @pytest.mark.parametrize('wrong_digest', [False, True])
-def test_local_drain_is_peer_bound_durable_and_one_shot(synthetic_issuer, wrong_digest):
+@pytest.mark.parametrize('role', ['supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'])
+def test_local_drain_is_peer_bound_durable_and_one_shot(synthetic_issuer, wrong_digest, role):
     authority, path, checks = synthetic_issuer
-    authority.profile = SimpleNamespace(role='supervised-local-coordinator-v2')
+    authority.profile = SimpleNamespace(role=role)
     authority.release = runtime_identity.CoordinatorReleaseEnrollment(**{
         name:getattr(authority.release,name) for name in runtime_identity.CoordinatorReleaseEnrollment.__dataclass_fields__})
     authority._coordinator_admission = SimpleNamespace(config_digest='sha256:'+'a'*64, session_digest='sha256:'+'b'*64, timeout_ms=2000)

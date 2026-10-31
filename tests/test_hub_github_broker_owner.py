@@ -44,6 +44,18 @@ def test_second_pipe_failure_closes_first_pair(monkeypatch):
         with pytest.raises(OSError): os.fstat(fd)
 
 
+def test_changed_enrollment_is_rejected_before_spawn(monkeypatch):
+    from hub_container_executor.github_broker_service import BrokerServiceError
+    monkeypatch.setattr(owner,'_runtime',lambda _: {'source_root':'/unused','python_path':'/unused'})
+    monkeypatch.setattr(owner,'read_enrollment',lambda _: {'peer_uid':2})
+    monkeypatch.setattr(owner.subprocess,'Popen',lambda *a,**k: pytest.fail('unexpected spawn'))
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    with pytest.raises(BrokerServiceError):
+        owner.OwnedBrokerProcess().start(runtime_policy='/unused',enrollment_fd=3,listener=listener,
+                                         _expected_enrollment={'peer_uid':1})
+    assert listener.fileno()==-1
+
+
 def test_pipe_cleanup_attempts_every_close_after_error(monkeypatch):
     from hub_container_executor.github_broker_service import BrokerServiceError
     original_pipe=os.pipe2;original_close=os.close;created=[];fail=[True]
@@ -79,6 +91,67 @@ def test_pinned_path_detects_replaced_ancestor():
     finally:
         if pin is not None: pin.close()
         shutil.rmtree(root)
+
+
+@pytest.mark.skipif(os.getuid()!=0,reason='requires root-owned synthetic enrollment')
+def test_coordinator_binding_precedes_broker_launch(tmp_path,monkeypatch):
+    from engineering_hub import executor_launch_profile as profiles
+    from engineering_hub.trusted_queued_session import SCHEMA_V3
+    from hub_container_executor.coordinator_admission import SCHEMA_V2,OAUTH_SOCKET,admission_commitment,parse_admission
+    from hub_container_executor.github_broker_service import BrokerServiceError
+    from tests.test_executor_launch_profile import supervised_local_profile,_swap_mount,digest_of
+    from tests.test_hub_coordinator_admission import document
+    from tests.test_hub_container_executor_installed_coordinator import github_configuration,canonical
+    from tests.test_hub_trusted_queued_session import v2_document,encode
+    from tests.test_hub_unified_pilot_startup import profile_document
+    config=github_configuration();config['manifest']=profile_document()['manifest']
+    config.update(database_path='/var/lib/engineering-hub/local-coordinator/hub.sqlite',
+        coordinator_socket_path='/run/hub-browser/hub.sock',executor_socket_path='/run/hub-executor/executor.sock',
+        secret_root='/var/lib/engineering-hub/local-secrets')
+    session=v2_document();session.update(schema=SCHEMA_V3,operator_actor='human:123')
+    cfg,sess=canonical(config),encode(session)
+    admission=document(cfg,sess);admission['schema']=SCHEMA_V2
+    admission['oauth_broker']={'socket_path':OAUTH_SOCKET,'issuer_uid':77,'issuer_gid':88,'client_id':'fixture-client',
+                               'origin':'https://pilot.example.test','secret_digest':'sha256:'+'5'*64}
+    normalized,_=admission_commitment(canonical(admission))
+    data=supervised_local_profile();data['role']='supervised-local-coordinator-v3'
+    data['daemon_policy']['engine_id']=session['launch']['engine_id']
+    _swap_mount(data,'local_config',content_digest=digest_of(cfg));_swap_mount(data,'local_enrollment',content_digest=digest_of(sess))
+    _swap_mount(data,'local_admission',content_digest=normalized)
+    path=str(tmp_path/'oauth.sock')
+    data['mounts'].append(dict(role='local_oauth_socket',source=path,target=OAUTH_SOCKET,kind='socket',
+                              read_only=True,uid=120001,gid=110001,mode=0o660,content_digest=None))
+    profile=profiles.ExecutorLaunchProfile.model_validate(data)
+    admission['release']['launch_profile_digest']=profile.digest();raw=canonical(admission)
+    release=parse_admission(raw).release;pin=admission_commitment(raw)[1]
+    values=enrollment(tmp_path);values.update(socket_path=path,service_uid=120001,service_gid=110001,
+        socket_uid=120001,socket_gid=110001,peer_uid=110001,peer_gid=110001,
+        client_id='fixture-client',origin='https://pilot.example.test',secret_digest='sha256:'+'5'*64)
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(path)
+    os.chown(path,120001,110001);os.chmod(path,0o660);listener.listen()
+    opened=os.fstat(listener.fileno());named=os.lstat(path)
+    values.update(listener_dev=opened.st_dev,listener_ino=opened.st_ino,path_dev=named.st_dev,path_ino=named.st_ino)
+    calls=[];monkeypatch.setattr(owner.OwnedBrokerProcess,'start',lambda self,**kw:calls.append(kw))
+    def attempt(fd,raw_pin=pin):
+        owner.OwnedBrokerProcess().start_for_coordinator(profile=profile,config_raw=cfg,session_raw=sess,
+            admission_raw=raw,admission_raw_digest=raw_pin,independent_release=release,
+            runtime_policy='/unused',enrollment_fd=fd,listener=listener)
+    try:
+        fd=fd_for(tmp_path,values)
+        try:
+            attempt(fd);assert len(calls)==1
+            with pytest.raises(BrokerServiceError): attempt(fd,'sha256:'+'0'*64)
+        finally: os.close(fd)
+        for key,wrong in [('peer_uid',110002),('peer_gid',110002),('socket_uid',120002),
+                          ('socket_path',str(tmp_path/'other.sock')),('client_id','other-client'),
+                          ('origin','https://other.example'),('secret_digest','sha256:'+'6'*64),
+                          ('listener_ino',values['listener_ino']+1),('path_ino',values['path_ino']+1)]:
+            altered=dict(values,**{key:wrong});fd=fd_for(tmp_path,altered)
+            try:
+                with pytest.raises(BrokerServiceError): attempt(fd)
+                assert len(calls)==1
+            finally: os.close(fd)
+    finally: listener.close()
 
 
 @pytest.mark.skipif(os.getuid()!=0,reason='requires root to create owned synthetic nonroot children')

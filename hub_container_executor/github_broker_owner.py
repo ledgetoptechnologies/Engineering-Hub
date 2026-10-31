@@ -5,11 +5,14 @@ kills an admitted exchange. Trusted root administrators preserve the enrolled
 read-only source/runtime and socket custody for the whole lifetime.
 """
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import select
+import socket
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -115,7 +118,51 @@ class OwnedBrokerProcess:
     @property
     def pid(self): return None if self._process is None else self._process.pid
 
-    def start(self, *, runtime_policy, enrollment_fd, listener, timeout_seconds=10):
+    def start_for_coordinator(self, *, profile, config_raw, session_raw, admission_raw,
+                              admission_raw_digest, independent_release, runtime_policy,
+                              enrollment_fd, listener, timeout_seconds=10):
+        """Bind the broker to a protected v3 coordinator before starting it.
+
+        The caller owns independent release/raw-admission authorization and
+        must retain the process through coordinator drain. The issuer IDs in the
+        coordinator admission are namespace observations and are not inferred
+        from the host socket owner here.
+        """
+        from .configuration_commitment import supervised_local_coordinator_commitment
+        from .coordinator_admission import parse_admission
+        try:
+            if profile.role!='supervised-local-coordinator-v3': raise ValueError()
+            supervised_local_coordinator_commitment(profile,config_raw,session_raw,admission_raw,
+                root_raw_digest=admission_raw_digest,independent_release=independent_release)
+            admission=parse_admission(admission_raw); broker=admission.oauth_broker
+            enrollment=read_enrollment(enrollment_fd)
+            mounts=[item for item in profile.mounts if item.role=='local_oauth_socket']
+            if len(mounts)!=1 or broker is None: raise ValueError()
+            mount=mounts[0]
+            def mapped(rows):
+                matches=[outside+10001-inside for inside,outside,count in rows if inside<=10001<inside+count]
+                if len(matches)!=1: raise ValueError()
+                return matches[0]
+            if (type(listener) is not socket.socket or enrollment['socket_path']!=mount.source or listener.getsockname()!=mount.source
+                    or (enrollment['socket_uid'],enrollment['socket_gid'],enrollment['socket_mode'])!=(mount.uid,mount.gid,mount.mode)
+                    or (enrollment['service_uid'],enrollment['service_gid'])!=(mount.uid,mount.gid)
+                    or (enrollment['peer_uid'],enrollment['peer_gid'])!=(mapped(profile.daemon_policy.uid_map),mapped(profile.daemon_policy.gid_map))
+                    or (enrollment['client_id'],enrollment['origin'],enrollment['secret_digest'])!=(broker.client_id,broker.origin,broker.secret_digest)):
+                raise ValueError()
+            if (type(listener) is not socket.socket or listener.family!=socket.AF_UNIX
+                    or listener.getsockopt(socket.SOL_SOCKET,socket.SO_TYPE)!=socket.SOCK_STREAM
+                    or listener.getsockopt(socket.SOL_SOCKET,socket.SO_ACCEPTCONN)!=1): raise ValueError()
+            opened=os.fstat(listener.fileno());named=os.lstat(mount.source)
+            _,creator_uid,creator_gid=struct.unpack('=iII',listener.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+            if (not stat.S_ISSOCK(named.st_mode) or (named.st_uid,named.st_gid,stat.S_IMODE(named.st_mode))!=(mount.uid,mount.gid,mount.mode)
+                    or (opened.st_dev,opened.st_ino)!=(enrollment['listener_dev'],enrollment['listener_ino'])
+                    or (named.st_dev,named.st_ino)!=(enrollment['path_dev'],enrollment['path_ino'])
+                    or (creator_uid,creator_gid)!=(enrollment['listener_uid'],enrollment['listener_gid'])): raise ValueError()
+        except Exception: raise BrokerServiceError() from None
+        self.start(runtime_policy=runtime_policy,enrollment_fd=enrollment_fd,listener=listener,
+                   timeout_seconds=timeout_seconds,_expected_enrollment=enrollment)
+
+    def start(self, *, runtime_policy, enrollment_fd, listener, timeout_seconds=10, _expected_enrollment=None):
         """Transfer the listener after runtime validation, retaining the child handle."""
         if (os.getpid()!=self._pid or threading.get_ident()!=self._thread or self._attempted or type(timeout_seconds) is not int
                 or not 1<=timeout_seconds<=30): raise BrokerServiceError()
@@ -124,11 +171,13 @@ class OwnedBrokerProcess:
         stop_read=stop_write=ready_read=ready_write=None
         try:
             enrollment=read_enrollment(enrollment_fd)
+            if _expected_enrollment is not None and enrollment!=_expected_enrollment: raise BrokerServiceError()
+            enrollment_digest='sha256:'+hashlib.sha256(json.dumps(enrollment,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest()
             stop_read,stop_write=os.pipe2(os.O_CLOEXEC)
             ready_read,ready_write=os.pipe2(os.O_CLOEXEC)
             for pin in runtime.get('_pins',()): pin.check()
             args=[runtime['python_path'],'-I','-B','-c',_BOOT,runtime['source_root'],
-                  str(enrollment_fd),str(listener.fileno()),str(stop_read),str(ready_write)]
+                  str(enrollment_fd),str(listener.fileno()),str(stop_read),str(ready_write),enrollment_digest]
             self._process=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,env={'LANG':'C.UTF-8'},close_fds=True,
                 pass_fds=(enrollment_fd,listener.fileno(),stop_read,ready_write),
