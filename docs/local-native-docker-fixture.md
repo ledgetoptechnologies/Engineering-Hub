@@ -22,8 +22,13 @@ identities from an already admitted native queue run. Its read-only snapshot is
 not a grant for host effects. The connected offline test prepares exact OCI
 fixture graphs with explicitly synthetic build assertions. A dedicated UID/GID
 10001 child holds its own PilotOwner while it creates and starts the baseline
-through the source broker, freezes its SQLite state and runs the actual
-BaselineObserver. The coordinator pins that observed draft, seals the source
+through the source broker. In the offline fixture the synthetic Engine creates
+the initial database in an empty generation. The child verifies fixed
+preflight probes, stops and checks the exited container has no PID, freezes its
+SQLite state, and restarts it once
+before running the actual BaselineObserver. The observer still requires the
+source inventory to remain unchanged; actual application restart behavior has
+not been validated. The coordinator pins that observed draft, seals the source
 broker and transfers the exact baseline ID to the successor broker. Native
 events, queue, workflow, HostAdapter, SQLite generation copying and the actual
 DockerEngineBackend then exercise candidate failure and healthy rollback over
@@ -31,11 +36,25 @@ broker Unix sockets against one **synthetic** Engine. This test uses legacy
 local reconciliation and does not execute an application container or prove
 daemon, image provenance, protected-owner recovery, or staging custody.
 
+`hub_local_baseline_child.py` is the fixed bounded IPC for that child; its
+listener is selected by a trusted parent and its path checks do not authenticate
+the listener. `hub_local_native_coordinator.py` and
+`hub_local_acceptance_components.py` own the connected offline queue and broker
+lifecycles. Their cleanup association is an in-process fixture boundary, not a
+portable certificate. The optional quiescent baseline path admits no startup
+grace retries: failed or uncertain operations remain held. The initializer and
+cached-image discovery have offline tests only; neither has been exercised
+against an actual daemon in this fixture.
+
 There is **no real-daemon opt-in runner yet**. Before one can be reviewed, it
 still needs verified real OCI archives and independently supplied exact manifest
 digests for both test images, an actual healthy task-owned application baseline
 and frozen backup, and an operator-owned lifecycle connecting those real
-resources to native admission. Aggregate budgets for the daemon, broker,
+resources to native admission. A fixed coordinator process entrypoint and
+launcher must carry the enrolled inputs without treating serialized cleanup
+claims as in-process ownership. Docker Desktop also needs an explicitly
+verified mapping of the daemon-reported volume path into the coordinator.
+Aggregate budgets for the daemon, broker,
 controller, application containers and storage also need verification.
 The existing archive helper requires an independently supplied exact manifest
 digest; a local Docker image ID is not that digest. A lost effect or any

@@ -451,6 +451,10 @@ class LocalTestBroker:
                     mounts[0].get('Destination') != want_mount['Target'] or mounts[0].get('RW') is not True or
                     mounts[0].get('Propagation') not in ('', 'rprivate') or mounts[0].get('Mode') not in ('', 'rw')):
                 raise Denied('owned container identity mismatch')
+            if state.get('Status') == 'exited' and (
+                    state.get('Running') is not False or type(state.get('Pid')) is not int or state['Pid'] != 0 or
+                    state.get('Paused') is not False or state.get('Restarting') is not False or state.get('Dead') is not False):
+                raise Denied('exited container process state unavailable')
             if (len(mounts) == 2 and (type(mounts[1]) is not dict or mounts[1].get('Type') != 'tmpfs' or
                     mounts[1].get('Destination') != '/tmp' or mounts[1].get('Source') not in (None, '') or
                     mounts[1].get('RW') is not True or mounts[1].get('Propagation') not in (None, ''))):
@@ -704,10 +708,36 @@ class LocalTestBroker:
                     raise Denied('probe denied')
             elif body is not None:
                 raise Denied('operation body denied')
-            self._inspect_owned(identity, name, 'created' if action == 'start' else 'running')
+            effect_kind = action
+            if action == 'start':
+                baseline = 'hub-pilot-' + uuid.UUID(self.owner).hex[:24] + '-00000000-000-rollback'
+                started = self.journal.db.execute("SELECT state FROM effects WHERE kind='start' AND effect_key=?", (identity,)).fetchone()
+                if name == baseline and started == ('complete',):
+                    created = self.journal.db.execute("SELECT state FROM effects WHERE kind='create' AND effect_key=?", (name,)).fetchone()
+                    stopped = self.journal.db.execute("SELECT state FROM effects WHERE kind='stop' AND effect_key=?", (identity,)).fetchone()
+                    if created != ('complete',) or stopped != ('complete',):
+                        raise Denied('baseline create or stop is not complete')
+                    unstarted = self.journal.db.execute(
+                        "SELECT 1 FROM owned o WHERE o.kind='exec' AND o.name=? AND NOT EXISTS "
+                        "(SELECT 1 FROM effects e WHERE e.kind='exec_start' AND e.effect_key=o.id AND e.state='complete') LIMIT 1",
+                        (identity,)).fetchone()
+                    if unstarted is not None:
+                        raise Denied('baseline probe execution is incomplete')
+                    self._inspect_owned(identity, name, 'exited')
+                    effect_kind = 'baseline_restart'
+                else:
+                    self._inspect_owned(identity, name, 'created')
+            else:
+                self._inspect_owned(identity, name, 'running')
             probe_key = (identity + ':' + hashlib.sha256(json.dumps(body, sort_keys=True,
                 separators=(',', ':'), allow_nan=False).encode()).hexdigest()) if action == 'exec' else identity
-            return self._effect(action, method, target, body, emit, name=identity if action == 'exec' else name,
+            if action == 'exec':
+                baseline = 'hub-pilot-' + uuid.UUID(self.owner).hex[:24] + '-00000000-000-rollback'
+                first = self.journal.db.execute("SELECT state FROM effects WHERE kind='exec' AND effect_key=?", (probe_key,)).fetchone()
+                restarted = self.journal.db.execute("SELECT state FROM effects WHERE kind='baseline_restart' AND effect_key=?", (identity,)).fetchone()
+                if name == baseline and first == ('complete',) and restarted == ('complete',):
+                    probe_key += ':post-restart'
+            return self._effect(effect_kind, method, target, body, emit, name=identity if action == 'exec' else name,
                                 effect_key=probe_key)
         match = re.fullmatch(re.escape(prefix) + r'/exec/([a-f0-9]{64})/(start|json)', target)
         if match:

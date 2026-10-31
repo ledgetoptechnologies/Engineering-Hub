@@ -91,3 +91,33 @@ def verify_fixture_image(manifest, role, fixture):
     if image.platform_manifest_digest != fixture.manifest_digest or image.image_config_id != fixture.config_digest:
         raise ValueError('Fixture identity mismatch')
     return image, record_store, metadata_store, synthetic_verifier
+
+
+def discover_cached_image(image, *, daemon_id, run=None):
+    """Read-only local daemon lookup of an exact verified fixture image.
+
+    This is a preflight, not source provenance or the backend's raw archive
+    verification. No image is pulled, imported, tagged, or removed. The caller
+    must trust and exclusively control the local daemon throughout the fixture.
+    """
+    import re
+    from hub_container_executor.build_record import VerifiedImage
+    from scripts.hub_local_test_volume import _call
+    if (type(image) is not VerifiedImage or type(daemon_id) is not str
+            or not re.fullmatch(r'[A-Za-z0-9:._-]{12,128}',daemon_id)):
+        raise ValueError('Explicit local image and daemon enrollment required')
+    call = _call if run is None else run
+    prefix=['/usr/bin/docker','--host','unix:///var/run/docker.sock']
+    try:
+        if call(prefix+['info','--format','{{.ID}}']).strip()!=daemon_id: raise ValueError
+        # Request immutable manifest digest, not a tag; emit no image environment.
+        value=call(prefix+['image','inspect','--format',
+            '{{.Id}}|{{.Os}}|{{.Architecture}}|{{.Variant}}', image.platform_manifest_digest]).strip()
+        fields=value.split('|')
+        variant=image.platform.variant or ''
+        if fields != [image.image_config_id,image.platform.os,image.platform.architecture,variant]:
+            raise ValueError
+        if call(prefix+['info','--format','{{.ID}}']).strip()!=daemon_id: raise ValueError
+    except Exception:
+        raise ValueError('Exact local image unavailable') from None
+    return image

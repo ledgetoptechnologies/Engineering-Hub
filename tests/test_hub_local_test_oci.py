@@ -45,3 +45,20 @@ def test_archive_digest_mismatch_denied(tmp_path):
         prepare_fixture_image(archive(rows),tmp_path/'layout','sha256:'+'0'*64,
             source_commit='a'*40,context_digest='sha256:'+'c'*64,recipe_digest='sha256:'+'d'*64,
             observations={},preparation_id=str(uuid.uuid4()))
+
+def test_cached_discovery_uses_exact_digest_and_no_mutation(tmp_path):
+    from scripts.hub_local_test_oci import discover_cached_image
+    obj=prepared(tmp_path); image,*_=verify_fixture_image(manifest_for(obj),'candidate',obj); calls=[]
+    def run(args):
+        calls.append(args)
+        if args[3]=='info': return 'daemon-1234567890'
+        return image.image_config_id+'|linux|amd64|'
+    assert discover_cached_image(image,daemon_id='daemon-1234567890',run=run) is image
+    assert calls[1][-1]==image.platform_manifest_digest
+    assert all(not any(x in a for x in ('pull','load','tag','rm')) for a in calls)
+
+def test_cached_discovery_rejects_wrong_config(tmp_path):
+    from scripts.hub_local_test_oci import discover_cached_image
+    obj=prepared(tmp_path); image,*_=verify_fixture_image(manifest_for(obj),'candidate',obj)
+    def run(args): return 'daemon-1234567890' if args[3]=='info' else 'sha256:'+'0'*64+'|linux|amd64|'
+    with pytest.raises(ValueError): discover_cached_image(image,daemon_id='daemon-1234567890',run=run)

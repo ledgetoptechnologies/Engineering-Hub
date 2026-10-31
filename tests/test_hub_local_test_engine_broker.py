@@ -71,6 +71,129 @@ def test_backend_generated_profile_is_enrolled_and_other_calls_never_forward(rig
             broker.dispatch(method, target, data, lambda *_: None)
 
 
+def test_only_baseline_can_restart_once_after_completed_stop(rig, monkeypatch):
+    broker, journal, _, _, _ = rig
+    baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'
+    identity = 'e' * 64
+    journal.db.execute('INSERT INTO owned(kind,id,name) VALUES(?,?,?)', ('container', identity, baseline))
+    created = journal.begin('create', baseline)
+    journal.complete(created)
+    state = {'status': 'created', 'calls': []}
+    def inspect(actual_id, name, expected):
+        assert (actual_id, name, expected) == (identity, baseline, state['status'])
+    class Connection:
+        def close(self): pass
+    class Response:
+        status = 204
+        def read(self, _limit): return b''
+        def getheader(self, _name, default=None): return default
+    def request(method, target, body):
+        state['calls'].append(target)
+        state['status'] = 'exited' if target.endswith('/stop?t=5') else 'running'
+        return Connection(), Response()
+    monkeypatch.setattr(broker, '_inspect_owned', inspect)
+    monkeypatch.setattr(broker, '_request', request)
+    emit = lambda *_: None
+    start = '/v1.41/containers/' + identity + '/start'
+    stop = '/v1.41/containers/' + identity + '/stop?t=5'
+    broker.dispatch('POST', start, b'', emit)
+    broker.dispatch('POST', stop, b'', emit)
+    broker.dispatch('POST', start, b'', emit)
+    state['status'] = 'exited'
+    with pytest.raises(Denied):
+        broker.dispatch('POST', start, b'', emit)
+    assert state['calls'] == [start, stop, start]
+
+
+def test_baseline_probe_has_only_one_attempt_per_restart_phase(rig, monkeypatch):
+    broker, journal, _, _, probe = rig
+    baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'
+    identity = 'e' * 64
+    journal.db.execute('INSERT INTO owned(kind,id,name) VALUES(?,?,?)', ('container', identity, baseline))
+    monkeypatch.setattr(broker, '_inspect_owned', lambda *_: None)
+    class Connection:
+        def close(self): pass
+    class Response:
+        status = 201
+        def __init__(self, value): self.value = value
+        def read(self, _limit): return json.dumps({'Id': self.value}).encode()
+        def getheader(self, _name, default=None): return default
+    calls = []
+    def request(*_args):
+        calls.append('probe')
+        return Connection(), Response(('a' if len(calls) == 1 else 'b') * 64)
+    monkeypatch.setattr(broker, '_request', request)
+    target = '/v1.41/containers/' + identity + '/exec'
+    raw = json.dumps(probe).encode()
+    broker.dispatch('POST', target, raw, lambda *_: None)
+    with pytest.raises(Denied): broker.dispatch('POST', target, raw, lambda *_: None)
+    restart = journal.begin('baseline_restart', identity); journal.complete(restart)
+    broker.dispatch('POST', target, raw, lambda *_: None)
+    with pytest.raises(Denied): broker.dispatch('POST', target, raw, lambda *_: None)
+    assert calls == ['probe', 'probe']
+
+
+def test_baseline_restart_rejects_unstarted_owned_probe(rig, monkeypatch):
+    broker, journal, _, _, _ = rig
+    baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'
+    identity, probe_id = 'e'*64, 'f'*64
+    journal.db.execute('INSERT INTO owned(kind,id,name) VALUES(?,?,?)', ('container', identity, baseline))
+    journal.db.execute('INSERT INTO owned(kind,id,name) VALUES(?,?,?)', ('exec', probe_id, identity))
+    for kind, key in (('create', baseline), ('start', identity), ('stop', identity)):
+        ticket = journal.begin(kind, key); journal.complete(ticket)
+    monkeypatch.setattr(broker, '_request', lambda *_a, **_k: pytest.fail('unstarted probe must deny before forwarding'))
+    with pytest.raises(Denied, match='probe execution is incomplete'):
+        broker.dispatch('POST', '/v1.41/containers/' + identity + '/start', b'', lambda *_: None)
+
+
+def test_lost_baseline_restart_is_held_and_never_replayed(rig, monkeypatch):
+    broker, journal, _, _, _ = rig
+    baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'
+    identity = 'e'*64
+    journal.db.execute('INSERT INTO owned(kind,id,name) VALUES(?,?,?)', ('container', identity, baseline))
+    for kind, key in (('create', baseline), ('start', identity), ('stop', identity)):
+        ticket = journal.begin(kind, key); journal.complete(ticket)
+    monkeypatch.setattr(broker, '_inspect_owned', lambda *_: None)
+    calls = []
+    def lost(*_args):
+        calls.append(1)
+        raise OSError('response lost')
+    monkeypatch.setattr(broker, '_request', lost)
+    target = '/v1.41/containers/' + identity + '/start'
+    with pytest.raises(OSError): broker.dispatch('POST', target, b'', lambda *_: None)
+    with pytest.raises(Denied): broker.dispatch('POST', target, b'', lambda *_: None)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize('field,value', [('Running', True), ('Pid', 7), ('Pid', False),
+                                         ('Paused', True), ('Restarting', True), ('Dead', True)])
+def test_baseline_exit_requires_no_live_process(rig, monkeypatch, field, value):
+    from dataclasses import replace
+    from tests.test_hub_container_executor_daemon_backend import container_inspect
+    broker, _, _, _, _ = rig
+    image = broker._fixture_rollback_image
+    baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'
+    profile = replace(make_profile(image, generation_id='baseline-g1', secrets={
+        'CODEX_TOKEN': 'synthetic-codex', 'HERMES_TOKEN': 'synthetic-hermes', 'CLAUDE_TOKEN': 'synthetic-claude'}),
+        cpu_millicores=300, pids_limit=80)
+    source = Path(broker.mount) / 'generations' / 'baseline-g1'
+    observed = container_inspect(image, profile, source, status='exited', container_id='e'*64)
+    observed['Config']['Labels'] = {'engineering-hub.local-test-owner': broker.owner}
+    observed['HostConfig']['PublishAllPorts'] = False
+    observed['HostConfig']['Mounts'][0].pop('ReadOnly')
+    observed['Mounts'] = observed['Mounts'][:1]; observed['Mounts'][0]['Mode'] = ''
+    observed['State'].update(Running=False, Pid=0, Paused=False, Restarting=False, Dead=False)
+    observed['State'][field] = value
+    class Connection:
+        def close(self): pass
+    class Response:
+        status = 200
+        def read(self, _limit): return json.dumps(observed).encode()
+    monkeypatch.setattr(broker, '_request', lambda *_a, **_k: (Connection(), Response()))
+    with pytest.raises(Denied, match='exited container process state unavailable'):
+        broker._inspect_owned('e'*64, baseline, 'exited')
+
+
 def test_uncertain_effect_is_durable_and_reopen_never_replays(rig, monkeypatch, tmp_path):
     broker, journal, name, body, _ = rig
     seen = []
