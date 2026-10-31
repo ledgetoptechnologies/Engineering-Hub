@@ -310,3 +310,289 @@ def test_client_does_not_connect_after_deadline_is_exhausted(rig, monkeypatch):
     with pytest.raises(BrokerTransportError):
         client.submit(request, .05)
     assert 'create' not in backend.events
+
+
+def test_exact_coordinator_client_uses_real_seqpacket_adapter(rig):
+    import asyncio
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    _, backend, manifest, path, broker, _ = rig
+    async def run():
+        client = ContainerPilotClient.for_broker_seqpacket(path, peer_pid=os.getpid(),
+            peer_uid=os.getuid(), peer_gid=os.getgid(), peer_start_ticks=_start(os.getpid()), timeout_seconds=5)
+        assert type(client) is ContainerPilotClient
+        request = command(manifest, 'deploy_container')
+        try:
+            thread, errors = start_once(broker)
+            assert (await client.submit_command(request)).state == 'succeeded'
+            thread.join(5)
+            assert not errors
+            thread, errors = start_once(broker)
+            assert (await client.submit_command(request)).replayed is True
+            thread.join(5)
+            assert not errors
+            thread, errors = start_once(broker)
+            assert (await client.get_command(request)).state == 'succeeded'
+            thread.join(5)
+            assert not errors
+        finally:
+            await client.aclose()
+        assert backend.events.count('create') == 1
+    asyncio.run(run())
+
+
+def test_cancelled_async_client_drains_active_call_before_close(rig):
+    import asyncio
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    adapter, _, manifest, path, broker, _ = rig
+    started, release = threading.Event(), threading.Event()
+    original_submit = adapter.submit
+    def delayed(request):
+        started.set()
+        assert release.wait(5)
+        return original_submit(request)
+    adapter.submit = delayed
+    async def run():
+        client = ContainerPilotClient.for_broker_seqpacket(path, peer_pid=os.getpid(),
+            peer_uid=os.getuid(), peer_gid=os.getgid(), peer_start_ticks=_start(os.getpid()), timeout_seconds=5)
+        thread, errors = start_once(broker)
+        task = asyncio.create_task(client.submit_command(command(manifest, 'deploy_container')))
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(.05)
+        close = asyncio.create_task(client.aclose())
+        await asyncio.sleep(.05)
+        assert not task.done() and not close.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await close
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+
+
+def test_owned_broker_service_drains_and_closes_real_adapter(tmp_path):
+    import asyncio
+    from contextlib import contextmanager
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from hub_container_executor.broker_service import serve_owned_broker
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    path = str(tmp_path / 'owned.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(2)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    entered = []
+    @contextmanager
+    def factory():
+        entered.append('enter')
+        try:
+            yield adapter
+        finally:
+            entered.append('exit')
+    async def run():
+        stop, ready = asyncio.Event(), asyncio.Event()
+        service = asyncio.create_task(serve_owned_broker(factory, listener=listener, peer=peer,
+            stop_event=stop, on_ready=ready.set, command_timeout_seconds=5))
+        await asyncio.wait_for(ready.wait(), 3)
+        client = ContainerPilotClient.for_broker_seqpacket(path, peer_pid=os.getpid(),
+            peer_uid=os.getuid(), peer_gid=os.getgid(), peer_start_ticks=_start(os.getpid()), timeout_seconds=5)
+        try:
+            request = command(manifest, 'deploy_container')
+            assert (await client.submit_command(request)).state == 'succeeded'
+            stop.set()
+            await asyncio.wait_for(service, 5)
+        finally:
+            await client.aclose()
+        assert adapter._closed and listener.fileno() == -1 and peer.fd is None
+        assert entered == ['enter', 'exit'] and backend.events.count('create') == 1
+    asyncio.run(run())
+
+
+def test_owned_broker_cancel_drains_accepted_adapter_work(tmp_path):
+    import asyncio
+    from contextlib import contextmanager
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from hub_container_executor.broker_service import serve_owned_broker
+    adapter, _, _, manifest = make_fixture(tmp_path)
+    path = str(tmp_path / 'drain.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(2)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    started, release = threading.Event(), threading.Event()
+    submit = adapter.submit
+    def delayed(request):
+        started.set()
+        assert release.wait(5)
+        return submit(request)
+    adapter.submit = delayed
+    @contextmanager
+    def factory():
+        yield adapter
+    async def run():
+        stop, ready = asyncio.Event(), asyncio.Event()
+        service = asyncio.create_task(serve_owned_broker(factory, listener=listener, peer=peer,
+            stop_event=stop, on_ready=ready.set, command_timeout_seconds=5))
+        await asyncio.wait_for(ready.wait(), 3)
+        client = ContainerPilotClient.for_broker_seqpacket(path, peer_pid=os.getpid(),
+            peer_uid=os.getuid(), peer_gid=os.getgid(), peer_start_ticks=_start(os.getpid()), timeout_seconds=5)
+        call = asyncio.create_task(client.submit_command(command(manifest, 'deploy_container')))
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            service.cancel()
+            await asyncio.sleep(.05)
+            assert not service.done() and not adapter._closed and listener.fileno() >= 0
+            release.set()
+            assert (await call).state == 'succeeded'
+            with pytest.raises(asyncio.CancelledError):
+                await service
+            assert adapter._closed and listener.fileno() == -1 and peer.fd is None
+        finally:
+            release.set()
+            await client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_stop_wins_admission_when_request_waits_before_dispatch(tmp_path, monkeypatch, cancel):
+    import asyncio
+    from contextlib import contextmanager
+    from hub_container_executor import broker_seqpacket as module
+    from hub_container_executor.broker_service import serve_owned_broker
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    path = str(tmp_path / 'stop-race.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(2)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    parsed, proceed = threading.Event(), threading.Event()
+    original = module._parse
+    def pause(raw):
+        value = original(raw)
+        parsed.set()
+        assert proceed.wait(5)
+        return value
+    monkeypatch.setattr(module, '_parse', pause)
+    @contextmanager
+    def factory():
+        yield adapter
+    async def run():
+        stop, ready = asyncio.Event(), asyncio.Event()
+        service = asyncio.create_task(serve_owned_broker(factory, listener=listener, peer=peer,
+            stop_event=stop, on_ready=ready.set, command_timeout_seconds=5))
+        await asyncio.wait_for(ready.wait(), 2)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            connection.connect(path)
+            request = command(manifest, 'deploy_container')
+            connection.send(_canonical({'protocol': _PROTOCOL, 'action': 'submit',
+                                        'payload': request.model_dump(mode='json')}))
+            assert await asyncio.to_thread(parsed.wait, 2)
+            if cancel:
+                service.cancel()
+                await asyncio.sleep(.05)
+            else:
+                stop.set()
+            proceed.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(service, 3)
+            else:
+                await asyncio.wait_for(service, 3)
+            assert 'create' not in backend.events and 'start' not in backend.events
+        finally:
+            proceed.set()
+            connection.close()
+    asyncio.run(run())
+
+
+def test_stale_readability_accept_timeout_is_short(tmp_path):
+    from hub_container_executor.broker_seqpacket import BrokerAcceptTimeout
+    import time
+    adapter, _, _, _ = make_fixture(tmp_path)
+    path = str(tmp_path / 'stale.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(1)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    broker = PilotCommandBroker(listener, adapter, peer)
+    try:
+        start = time.monotonic()
+        with pytest.raises(BrokerAcceptTimeout):
+            broker.serve_once(5, accept_timeout_seconds=.05, read_timeout_seconds=.1)
+        assert time.monotonic() - start < 1
+    finally:
+        broker.close()
+        peer.close()
+        listener.close()
+        adapter.close()
+
+
+def test_stop_during_incomplete_packet_is_bounded_and_no_effect(tmp_path):
+    import asyncio
+    import time
+    from contextlib import contextmanager
+    from hub_container_executor.broker_service import serve_owned_broker
+    adapter, backend, _, _ = make_fixture(tmp_path)
+    path = str(tmp_path / 'idle.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(1)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    @contextmanager
+    def factory():
+        yield adapter
+    async def run():
+        stop, ready = asyncio.Event(), asyncio.Event()
+        service = asyncio.create_task(serve_owned_broker(factory, listener=listener, peer=peer,
+            stop_event=stop, on_ready=ready.set, command_timeout_seconds=5))
+        await asyncio.wait_for(ready.wait(), 2)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+            connection.connect(path)
+            await asyncio.sleep(.1)
+            start = time.monotonic()
+            stop.set()
+            await asyncio.wait_for(service, 2)
+            assert time.monotonic() - start < 1.5
+        assert 'create' not in backend.events and adapter._closed
+    asyncio.run(run())
+
+
+def test_incomplete_packet_timeout_then_valid_command_no_retry(tmp_path):
+    import asyncio
+    from contextlib import contextmanager
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from hub_container_executor.broker_service import serve_owned_broker
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    path = str(tmp_path / 'timeout-then-valid.sock')
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(path)
+    listener.listen(2)
+    peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+    @contextmanager
+    def factory():
+        yield adapter
+    async def run():
+        stop, ready = asyncio.Event(), asyncio.Event()
+        service = asyncio.create_task(serve_owned_broker(factory, listener=listener, peer=peer,
+            stop_event=stop, on_ready=ready.set, command_timeout_seconds=3))
+        await asyncio.wait_for(ready.wait(), 2)
+        client = ContainerPilotClient.for_broker_seqpacket(path, peer_pid=os.getpid(),
+            peer_uid=os.getuid(), peer_gid=os.getgid(), peer_start_ticks=_start(os.getpid()), timeout_seconds=3)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as idle:
+                idle.connect(path)
+                await asyncio.sleep(1.2)
+                assert not service.done() and 'create' not in backend.events
+                result = await client.submit_command(command(manifest, 'deploy_container'))
+                assert result.state == 'succeeded'
+            stop.set()
+            await asyncio.wait_for(service, 3)
+            assert backend.events.count('create') == 1 and backend.events.count('start') == 1
+        finally:
+            await client.aclose()
+    asyncio.run(run())

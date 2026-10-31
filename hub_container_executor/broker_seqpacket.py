@@ -34,6 +34,18 @@ class BrokerTransportError(RuntimeError):
         super().__init__('pilot broker transport unavailable; inspect original command')
 
 
+class BrokerAcceptTimeout(BrokerTransportError):
+    """No connection was accepted; no operation could have been admitted."""
+
+
+class BrokerReadTimeout(BrokerTransportError):
+    """No complete request packet was admitted."""
+
+
+class BrokerAdmissionClosed(BrokerTransportError):
+    """A validated request was denied before adapter dispatch."""
+
+
 def _require(value):
     if not value:
         raise BrokerTransportError()
@@ -150,28 +162,38 @@ def _uuid(value):
 
 class PilotCommandBroker:
     """Single-threaded one-packet dispatch; adapter/listener owned by caller."""
-    def __init__(self, listener, adapter, peer):
+    def __init__(self, listener, adapter, peer, *, admission=None):
         self._pid, self._closed, self._busy = os.getpid(), False, threading.Lock()
         _require(type(listener) is socket.socket and listener.family == socket.AF_UNIX
                  and listener.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
                  and listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
-                 and type(adapter) is HostAdapter and type(peer) is PeerPin)
+                 and type(adapter) is HostAdapter and type(peer) is PeerPin
+                 and (admission is None or callable(admission)))
+        self._admission = admission
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         self.listener, self.adapter, self.peer = listener, adapter, peer
 
-    def serve_once(self, timeout_seconds):
+    def serve_once(self, timeout_seconds, *, accept_timeout_seconds=None, read_timeout_seconds=None):
         acquired = False
         try:
             _require(os.getpid() == self._pid and not self._closed
                      and type(timeout_seconds) in (int, float) and 0 < timeout_seconds <= 125)
             acquired = self._busy.acquire(blocking=False)
             _require(acquired and not self._closed)
+            for value in (accept_timeout_seconds, read_timeout_seconds):
+                _require(value is None or (type(value) in (int, float) and 0 < value <= timeout_seconds))
             deadline = time.monotonic() + timeout_seconds
-            _set_deadline(self.listener, deadline)
-            connection, _ = self.listener.accept()
+            _set_deadline(self.listener, min(deadline, time.monotonic() + (accept_timeout_seconds or timeout_seconds)))
+            try:
+                connection, _ = self.listener.accept()
+            except socket.timeout:
+                raise BrokerAcceptTimeout() from None
             with connection:
-                _set_deadline(connection, deadline)
-                request = _receive(connection, self.peer)
+                _set_deadline(connection, min(deadline, time.monotonic() + (read_timeout_seconds or timeout_seconds)))
+                try:
+                    request = _receive(connection, self.peer)
+                except socket.timeout:
+                    raise BrokerReadTimeout() from None
                 _require(set(request) == {'protocol', 'action', 'payload'} and request['protocol'] == _PROTOCOL)
                 action, payload = request['action'], request['payload']
                 if action == 'submit':
@@ -182,6 +204,9 @@ class PilotCommandBroker:
                     raise BrokerTransportError()
                 # Parsing, peer and scheduling checks consume the same deadline.
                 self.peer.check()
+                _require(time.monotonic() < deadline and not self._closed)
+                if self._admission is not None and self._admission(deadline) is not True:
+                    raise BrokerAdmissionClosed()
                 _require(time.monotonic() < deadline and not self._closed)
                 if action == 'submit':
                     result = self.adapter.submit(argument)
@@ -194,6 +219,8 @@ class PilotCommandBroker:
                 _require(time.monotonic() < deadline)
                 _set_deadline(connection, deadline)
                 _send(connection, {'protocol': _PROTOCOL, 'result': None if result is None else result.model_dump(mode='json')})
+        except (BrokerAcceptTimeout, BrokerReadTimeout, BrokerAdmissionClosed):
+            raise
         except Exception:
             raise BrokerTransportError() from None
         finally:

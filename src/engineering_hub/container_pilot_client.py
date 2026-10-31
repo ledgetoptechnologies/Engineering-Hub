@@ -132,6 +132,7 @@ class ContainerPilotClient:
         _validate_credential_and_timeout(service_token, timeout_seconds, self.MAX_TIMEOUT_SECONDS)
         self.__token = service_token
         self.__timeout_seconds = timeout_seconds
+        self.__broker = None
         self.__client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {service_token}", "Accept": "application/json"},
@@ -204,6 +205,57 @@ class ContainerPilotClient:
             if fd is not None:
                 os.close(fd)
 
+    @classmethod
+    def for_broker_seqpacket(cls, path, *, peer_pid, peer_uid, peer_gid, peer_start_ticks,
+                             timeout_seconds=125.0):
+        """Explicit uninstalled broker transport; independently enrolled pins required.
+
+        This is not broker activation, identity enrollment or state isolation.
+        The exact client retains ownership of its peer pidfd until aclose.
+        """
+        from hub_container_executor.broker_seqpacket import PeerPin, PilotCommandClient
+        if (type(timeout_seconds) not in (int, float) or isinstance(timeout_seconds, bool)
+                or not 0 < timeout_seconds <= cls.MAX_TIMEOUT_SECONDS):
+            raise ValueError("invalid broker timeout")
+        pin = None
+        try:
+            pin = PeerPin(pid=peer_pid, uid=peer_uid, gid=peer_gid, start_ticks=peer_start_ticks)
+            broker = PilotCommandClient(path, pin)
+            instance = cls.__new__(cls)
+            instance.__timeout_seconds = timeout_seconds
+            instance.__broker = broker
+            instance.__broker_pin = pin
+            instance.__broker_lock = asyncio.Lock()
+            instance.__broker_closed = False
+            instance.__broker_closing = False
+            instance.__client = None
+            instance.__token = None
+            return instance
+        except Exception:
+            if pin is not None:
+                pin.close()
+            raise ValueError("invalid broker transport") from None
+
+    async def _broker_command(self, action, command):
+        from .lifecycle import finish_owned
+        if type(command) is not ContainerPilotRequest:
+            raise TypeError("expected a container pilot request")
+        if self.__broker_closed or self.__broker_closing or self.__broker_lock.locked():
+            raise UnknownOutcome(command.command_id)
+        async with self.__broker_lock:
+            if self.__broker_closed or self.__broker_closing:
+                raise UnknownOutcome(command.command_id)
+            try:
+                result = await finish_owned(asyncio.to_thread(
+                    getattr(self.__broker, action), command, self.__timeout_seconds))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise UnknownOutcome(command.command_id) from None
+            if result is None:
+                raise UnknownOutcome(command.command_id)
+            return result
+
     def __repr__(self):
         return "ContainerPilotClient(credential=<redacted>)"
 
@@ -213,14 +265,31 @@ class ContainerPilotClient:
         return self.__timeout_seconds
 
     async def __aenter__(self):
-        await self.__client.__aenter__()
+        if self.__broker is None:
+            await self.__client.__aenter__()
         return self
 
     async def __aexit__(self, *args):
+        if self.__broker is not None:
+            await self.aclose()
+            return None
         return await self.__client.__aexit__(*args)
 
     async def aclose(self):
-        await self.__client.aclose()
+        if self.__broker is None:
+            await self.__client.aclose()
+            return
+        from .lifecycle import finish_owned
+        self.__broker_closing = True
+        async def close_broker():
+            async with self.__broker_lock:
+                if not self.__broker_closed:
+                    self.__broker_closed = True
+                    try:
+                        self.__broker.close()
+                    finally:
+                        self.__broker_pin.close()
+        await finish_owned(close_broker())
 
     async def _command(self, method: str, path: str, expected: ContainerPilotRequest,
                        *, submit: bool = False) -> ContainerPilotResponse:
@@ -263,6 +332,8 @@ class ContainerPilotClient:
         own cooperative <=min(1s, configured timeout) allowance per response.
         The caller must select a fresh canonical UUID. Never submit/reconcile.
         """
+        if self.__broker is not None:
+            raise ContainerPilotClientError("Executor connection check unavailable")
         try:
             if type(command_id) is not str or str(UUID(command_id)) != command_id:
                 raise ValueError()
@@ -317,11 +388,17 @@ class ContainerPilotClient:
                 "idle_verified": False, "workflow_verified": False}
 
     async def submit_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
+        if self.__broker is not None:
+            return await self._broker_command('submit', command)
         return await self._command("POST", "/v1/container-pilot/commands", command, submit=True)
 
     async def get_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
+        if self.__broker is not None:
+            return await self._broker_command('get', command)
         return await self._command("GET", f"/v1/container-pilot/commands/{command.command_id}", command)
 
     async def reconcile_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
         """Bodyless inspection only; never restart an exited workload or replay an effect."""
+        if self.__broker is not None:
+            return await self._broker_command('reconcile', command)
         return await self._command("POST", f"/v1/container-pilot/commands/{command.command_id}/reconcile", command)
