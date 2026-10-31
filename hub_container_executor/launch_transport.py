@@ -248,7 +248,7 @@ class UnixLaunchReceiptTransport:
     def issue_verified_pair_channel(self, *, role, pair_id, manifest_digest,
                                     executor_launch_id, coordinator_launch_id, executor_enrollment,
                                     coordinator_enrollment, pair_authority_public_key,
-                                    max_receipt_lifetime_seconds, timeout_ms):
+                                    max_receipt_lifetime_seconds, timeout_ms, _return_identity=False):
         """Quarantine the FD until both role receipts and the pair commit verify.
 
         Pins must be independently enrolled. This API does not establish actual
@@ -259,7 +259,8 @@ class UnixLaunchReceiptTransport:
                                        PAIR_COORDINATOR_REQUEST_PROTOCOL, verify_pair_channel_receipts)
         fds = []
         try:
-            _require(os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
+            _require(type(_return_identity) is bool and (not _return_identity or role == 'executor')
+                     and os.getpid() == self._pid and type(timeout_ms) is int and 100 <= timeout_ms <= 10000
                      and role in {'executor', 'coordinator'} and hasattr(socket, 'SCM_RIGHTS') and hasattr(socket, 'MSG_CMSG_CLOEXEC'))
             started = time.monotonic()
             wall_started = int(time.time() * 1000)
@@ -315,13 +316,16 @@ class UnixLaunchReceiptTransport:
                 commit = _receipt_frame(bytes(result[end + _LENGTH.size:]))
                 _require(os.getpid() == self._pid and _socket_leaf(self._path) == identity)
                 _remaining(deadline)
-                verify_pair_channel_receipts(raw, commit, fds[0], role=role, nonce=nonce, pair_id=pair_id,
+                verifier = verify_pair_channel_receipts(raw, commit, fds[0], role=role, nonce=nonce, pair_id=pair_id,
                     manifest_digest=manifest_digest, executor_launch_id=executor_launch_id,
                     coordinator_launch_id=coordinator_launch_id, executor_enrollment=executor_enrollment,
                     coordinator_enrollment=coordinator_enrollment, pair_authority_public_key=pair_authority_public_key,
                     start_monotonic=started, start_wall_ms=wall_started,
                     max_lifetime_seconds=max_receipt_lifetime_seconds)
                 _remaining(deadline)
+                if _return_identity:
+                    return fds.pop(), verifier
+                verifier.close()
                 return fds.pop()
         except Exception:
             raise RuntimeIdentityError(_ERROR) from None
@@ -331,6 +335,12 @@ class UnixLaunchReceiptTransport:
                     os.close(fd)
                 except OSError:
                     pass
+
+    def issue_verified_pair_channel_with_identity(self, **kwargs):
+        """Return a verified executor FD and its independently signed driver identity."""
+        if kwargs.get('role') != 'executor':
+            raise RuntimeIdentityError(_ERROR)
+        return self.issue_verified_pair_channel(_return_identity=True, **kwargs)
 
     def close(self):
         """Revoke future use promptly, without cancelling an admitted exchange.

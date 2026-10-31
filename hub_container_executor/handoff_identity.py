@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import os
 import re
 import socket
 import stat
 import time
+import threading
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -144,6 +146,69 @@ _PAIR_FIELDS = _FIELDS | {'pair_id', 'peer_launch_id'}
 _PAIR_COMMIT_FIELDS = frozenset({'protocol', 'pair_id', 'manifest_digest', 'executor_launch_id',
     'coordinator_launch_id', 'executor_receipt', 'coordinator_receipt',
     'executor_receipt_digest', 'coordinator_receipt_digest'})
+_PAIR_IDENTITY_KEY = object()
+
+
+class PairDriverIdentityVerifier:
+    """PID-fenced, bounded identity from a verified executor pair receipt.
+
+    This verifies signed launch claims, not continuing host isolation or peer
+    liveness. It is not an enrollment mechanism or a command capability.
+    """
+    def __init__(self, key, *, role, commit, started, deadline, observed_mono, wall_ms, wall_expiry, channel_identity):
+        _require(key is _PAIR_IDENTITY_KEY)
+        self._pid, self._role, self._commit = os.getpid(), role, commit
+        self._started, self._deadline = started, deadline
+        self._last_mono = observed_mono
+        self._last_wall, self._wall_expiry = wall_ms, wall_expiry
+        self._closed, self._lock = False, threading.Lock()
+        self._channel_identity, self._claimed, self._channel_fd = channel_identity, False, None
+
+    def _current(self):
+        try:
+            now, wall = time.monotonic(), int(time.time() * 1000)
+            _require(not self._closed and self._role == 'executor' and math.isfinite(now)
+                     and self._last_mono <= now < self._deadline
+                     and self._last_wall <= wall < self._wall_expiry)
+        except Exception:
+            self._closed = True
+            raise RuntimeIdentityError('Trusted pair channel handoff unavailable') from None
+        self._last_mono = now
+        self._last_wall = wall
+
+    def implementation_commit(self):
+        _require(os.getpid() == self._pid)
+        with self._lock:
+            self._current()
+            _require(self._claimed and self._channel_fd is not None)
+            try:
+                info = os.fstat(self._channel_fd)
+            except OSError:
+                self._closed = True
+                raise RuntimeIdentityError('Trusted pair channel handoff unavailable') from None
+            if not (stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._channel_identity):
+                self._closed = True
+                raise RuntimeIdentityError('Trusted pair channel handoff unavailable')
+            return self._commit
+
+    def claim_channel(self, fd):
+        """Bind this verifier once to the exact verified endpoint descriptor."""
+        _require(os.getpid() == self._pid and type(fd) is int and fd >= 0)
+        with self._lock:
+            self._current()
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                raise RuntimeIdentityError('Trusted pair channel handoff unavailable') from None
+            _require(not self._claimed and stat.S_ISSOCK(info.st_mode)
+                     and (info.st_dev, info.st_ino) == self._channel_identity)
+            self._claimed = True
+            self._channel_fd = fd
+
+    def close(self):
+        _require(os.getpid() == self._pid)
+        with self._lock:
+            self._closed = True
 
 
 def _signature(envelope, public_key, domain):
@@ -247,6 +312,15 @@ def verify_pair_channel_receipts(raw, commit_raw, fd, *, role, nonce, pair_id, m
         finally:
             borrowed.detach()
         os.set_inheritable(fd, False)
-        return pair_id
+        deadline = min(start_monotonic + (item['expires_at_ms'] - start_wall_ms) / 1000
+                       for item in (executor, coordinator))
+        deadline = min(deadline, start_monotonic +
+                       (own['expires_at_ms'] - own['issued_at_ms']) / 1000)
+        _require(math.isfinite(deadline) and now_mono < deadline)
+        return PairDriverIdentityVerifier(_PAIR_IDENTITY_KEY, role=role,
+            commit=executor['implementation_commit'], started=start_monotonic,
+            deadline=deadline, observed_mono=now_mono, wall_ms=now_wall,
+            wall_expiry=min(executor['expires_at_ms'], coordinator['expires_at_ms']),
+            channel_identity=(info.st_dev, info.st_ino))
     except Exception:
         raise RuntimeIdentityError('Trusted pair channel handoff unavailable') from None

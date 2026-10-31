@@ -1,6 +1,7 @@
 """Real Linux UDS/SCM_RIGHTS, synthetic independently signed pair authority."""
 import array
 import base64
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -34,7 +35,7 @@ def sign(key, domain, payload):
         key.sign(domain + _canonical(payload))).rstrip(b'=').decode()}
 
 
-def exercise(tmp_path, *, role='executor', failure=None, paused=None):
+def exercise(tmp_path, *, role='executor', failure=None, paused=None, with_identity=False, executor_commit=None):
     path = str(tmp_path / 'pair.sock')
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
@@ -42,6 +43,8 @@ def exercise(tmp_path, *, role='executor', failure=None, paused=None):
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     keys = {name: Ed25519PrivateKey.generate() for name in ('executor', 'coordinator', 'pair')}
     releases = {name: enrollment(keys[name]) for name in ('executor', 'coordinator')}
+    if executor_commit is not None:
+        releases['executor'] = replace(releases['executor'], implementation_commit=executor_commit)
     pair_id, executor_id, coordinator_id, boot_id = (str(uuid4()) for _ in range(4))
     manifest = 'sha256:' + 'f' * 64
     errors = []
@@ -138,7 +141,9 @@ def exercise(tmp_path, *, role='executor', failure=None, paused=None):
             with pytest.raises(RuntimeIdentityError):
                 transport.issue_verified_pair_channel(**kwargs)
             return None, left, right
-        return transport.issue_verified_pair_channel(**kwargs), left, right
+        result = (transport.issue_verified_pair_channel_with_identity(**kwargs) if with_identity
+                  else transport.issue_verified_pair_channel(**kwargs))
+        return result, left, right
     finally:
         transport.close()
         thread.join(4)
@@ -218,3 +223,81 @@ def test_peer_expiry_uses_exchange_monotonic_ceiling(tmp_path, monkeypatch):
     _, left, right = exercise(tmp_path, failure='peer_monotonic_expired')
     left.close()
     right.close()
+
+
+def test_verified_pair_driver_identity_is_fd_bound_and_one_shot(tmp_path):
+    (fd, identity), left, right = exercise(tmp_path, with_identity=True)
+    other, other_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with pytest.raises(RuntimeIdentityError): identity.implementation_commit()
+        with pytest.raises(RuntimeIdentityError): identity.claim_channel(other.fileno())
+        identity.claim_channel(fd)
+        assert identity.implementation_commit() == 'c' * 40
+        with pytest.raises(RuntimeIdentityError): identity.claim_channel(fd)
+        identity.close()
+        with pytest.raises(RuntimeIdentityError): identity.implementation_commit()
+    finally:
+        os.close(fd); left.close(); right.close(); other.close(); other_peer.close()
+
+
+def test_coordinator_role_cannot_request_executor_driver_identity(tmp_path):
+    transport = UnixLaunchReceiptTransport(socket_path=str(tmp_path / 'issuer.sock'),
+        expected_issuer_uid=os.getuid(), expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_pair_channel_with_identity(role='coordinator')
+    finally:
+        transport.close()
+
+
+def test_closed_verified_channel_revokes_driver_identity(tmp_path):
+    (fd, identity), left, right = exercise(tmp_path, with_identity=True)
+    try:
+        identity.claim_channel(fd)
+        os.close(fd)
+        with pytest.raises(RuntimeIdentityError): identity.implementation_commit()
+    finally:
+        identity.close(); left.close(); right.close()
+
+
+def test_verified_pair_identity_is_accepted_by_adapter_only_while_channel_open(tmp_path):
+    from hub_container_executor.adapter import _Held
+    from tests.test_hub_container_executor_adapter import make_fixture
+    adapter_root, socket_root = tmp_path / 'adapter', tmp_path / 'socket'
+    adapter_root.mkdir(); socket_root.mkdir()
+    adapter, _, _, manifest = make_fixture(adapter_root)
+    (fd, identity), left, right = exercise(socket_root, with_identity=True,
+                                           executor_commit=manifest.driver.implementation_commit)
+    try:
+        identity.claim_channel(fd)
+        adapter.driver_identity_verifier = identity
+        adapter._check_driver_identity()
+        os.close(fd)
+        fd = None
+        with pytest.raises(_Held): adapter._check_driver_identity()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        identity.close(); left.close(); right.close(); adapter.close()
+
+
+@pytest.mark.parametrize('failure', ['expiry', 'wall_regression', 'monotonic_regression', 'fork'])
+def test_pair_driver_identity_fails_closed_after_expiry_or_owner_change(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    from hub_container_executor import handoff_identity
+    (fd, identity), left, right = exercise(tmp_path, with_identity=True)
+    try:
+        identity.claim_channel(fd)
+        if failure == 'fork':
+            monkeypatch.setattr(handoff_identity, 'os', SimpleNamespace(getpid=lambda: identity._pid + 1))
+        else:
+            monkeypatch.setattr(handoff_identity, 'time', SimpleNamespace(
+                monotonic=(lambda: identity._deadline) if failure == 'expiry' else
+                    (lambda: identity._last_mono - .1) if failure == 'monotonic_regression' else time.monotonic,
+                time=(lambda: (identity._last_wall - 1) / 1000) if failure == 'wall_regression' else time.time))
+        with pytest.raises(RuntimeIdentityError): identity.implementation_commit()
+        if failure != 'fork':
+            monkeypatch.setattr(handoff_identity, 'time', time)
+            with pytest.raises(RuntimeIdentityError): identity.implementation_commit()
+    finally:
+        os.close(fd); left.close(); right.close()
