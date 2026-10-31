@@ -47,7 +47,7 @@ def test_gate_starts_actual_hub_or_denies(tmp_path, monkeypatch, allow):
             opener.open('http://127.0.0.1:8770/health', timeout=1)
         monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
         ledger = open_ledger(tmp_path); owned.callback(ledger.close)
-        _, _, pins = gate_fixture(ledger)
+        _, _, pins = gate_fixture(ledger, require_gate=True)
         target = '/var/lib/hub'; stat = os.stat(target); flags = os.statvfs(target).f_flag
         mount_flags = sorted(name for name, bit in [('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC),
                                                     ('nosuid', os.ST_NOSUID)] if flags & bit)

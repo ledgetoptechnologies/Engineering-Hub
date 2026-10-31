@@ -67,7 +67,7 @@ def _run_receiver_test(tmp_path, monkeypatch, hostile_config, owned):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     ledger = open_ledger(tmp_path)
     owned.callback(ledger.close)
-    _, _, pins = gate_fixture(ledger)
+    _, _, pins = gate_fixture(ledger, require_gate=True)
     stat = os.stat(target); vf = os.statvfs(target).f_flag
     flags = sorted(name for name, bit in [('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC),
                                            ('nosuid', os.ST_NOSUID)] if vf & bit)

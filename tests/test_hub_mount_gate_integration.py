@@ -31,7 +31,7 @@ def test_socket_controller_journal_ledger_reopen_is_fail_closed(journal, tmp_pat
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     monkeypatch.setattr(bootstrap, '_TARGET', str(tmp_path))
     ledger = open_ledger(tmp_path)
-    command, _, ledger_pins = gate_fixture(ledger)
+    command, _, ledger_pins = gate_fixture(ledger, require_gate=True)
     client, server, peer, process_pins = resources(tmp_path)
     pins = dict(ledger_pins)
     for key in ('host_pid', 'process_start_ticks', 'boot_id', 'expected_device', 'expected_inode', 'mount_flags'):
@@ -108,7 +108,7 @@ def test_sigkill_after_durable_boundary_remains_held(short_root, tmp_path, monke
         try:
             os.close(read_fd)
             ledger = open_ledger(tmp_path)
-            _, _, ledger_pins = gate_fixture(ledger)
+            _, _, ledger_pins = gate_fixture(ledger, require_gate=True)
             client, server, peer, process_pins = resources(tmp_path)
             pins = dict(ledger_pins)
             for field in ('host_pid', 'process_start_ticks', 'boot_id', 'expected_device', 'expected_inode', 'mount_flags'):

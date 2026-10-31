@@ -208,6 +208,33 @@ def test_fenced_acceptance_enables_finish_and_lost_reply_lookup(completed):
     assert ledger.lookup_gate_completion(pins) == accepted
 
 
+def test_committed_acceptance_remains_valid_after_health_window(completed, monkeypatch):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    from engineering_hub.container_pilot_client import ContainerPilotEvidence
+    ledger, command, pins, _, receipt = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    ledger.accept_gate_completion(pins, role='candidate', executable_digest='sha256:' + '3' * 64,
+        health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+        health_receipt_digest=snapshot['health_receipt_digest'], decision_payload_digest=snapshot['decision_payload_digest'])
+    monkeypatch.setattr(ledger_module.time, 'time', lambda: receipt['finished_at_ms'] / 1000 + 6)
+    ev = ContainerPilotEvidence(container_id=pins['container_id'], image_config_id=pins['image_config_id'],
+                                health='unknown', evidence_verified=True)
+    assert ledger.finish(command.command_id, state='succeeded', reason=None, evidence=ev,
+                         generation_id=pins['generation_id']).state == 'succeeded'
+
+
+def test_stale_health_cannot_create_acceptance(completed, monkeypatch):
+    from hub_container_executor.application_gate_enrollment import COMPLETION_HEALTH_CONTRACT
+    ledger, _, pins, _, receipt = completed
+    snapshot = ledger.gate_completion_snapshot(pins, PROBE)
+    monkeypatch.setattr(ledger_module.time, 'time', lambda: receipt['finished_at_ms'] / 1000 + 6)
+    with pytest.raises(PermissionError):
+        ledger.accept_gate_completion(pins, role='candidate', executable_digest='sha256:' + '3' * 64,
+            health_contract=COMPLETION_HEALTH_CONTRACT, probe_digest=PROBE,
+            health_receipt_digest=snapshot['health_receipt_digest'],
+            decision_payload_digest=snapshot['decision_payload_digest'])
+
+
 def test_wait_timeout_and_racing_held_are_conservative(completed):
     ledger, command, pins, _, _ = completed
     assert not ledger.wait_for_gate_acceptance(command.command_id, time.monotonic() + .05)

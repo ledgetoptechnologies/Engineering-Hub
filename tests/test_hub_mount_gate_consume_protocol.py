@@ -20,7 +20,7 @@ from tests.test_hub_container_executor_ledger import gate_fixture, open_ledger
 def setup(tmp_path, monkeypatch, *, hold=lambda _: None, live=lambda _: True):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     ledger = open_ledger(tmp_path)
-    _, decision, pins = gate_fixture(ledger)
+    _, decision, pins = gate_fixture(ledger, require_gate=True)
     peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
     pins.update(host_pid=peer.pid, process_start_ticks=peer.start)
     decision.update(host_pid=peer.pid, process_start_ticks=peer.start)

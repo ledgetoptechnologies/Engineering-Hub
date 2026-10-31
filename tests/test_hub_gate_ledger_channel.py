@@ -39,7 +39,7 @@ def verified_launch(key, public):
 def context(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     ledger = open_ledger(tmp_path)
-    _, decision, pins = gate_fixture(ledger)
+    _, decision, pins = gate_fixture(ledger, require_gate=True)
     now = int(time.time() * 1000)
     decision.update(issued_at_ms=now, expires_at_ms=now + 4000)
     key = Ed25519PrivateKey.generate()

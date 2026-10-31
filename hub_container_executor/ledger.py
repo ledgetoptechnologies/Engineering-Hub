@@ -722,7 +722,8 @@ class SQLiteLedger:
         with self._transaction() as db:
             return self._gate_completion_snapshot(db, pins, expected_probe_digest)
 
-    def _gate_completion_snapshot(self, db, pins, expected_probe_digest, *, allow_pending_health=False):
+    def _gate_completion_snapshot(self, db, pins, expected_probe_digest, *, allow_pending_health=False,
+                                  require_fresh_health=True):
         from .mount_gate_protocol import IDENTITY_FIELDS, _payload
         raw = _canonical(pins)
         operation = self._gate_binding(db, pins)
@@ -768,7 +769,8 @@ class SQLiteLedger:
                 or not 0 < receipt['started_at_ms'] <= receipt['finished_at_ms']
                 or not 0 <= receipt['elapsed_ms'] <= 120000
                 or abs((receipt['finished_at_ms'] - receipt['started_at_ms']) - receipt['elapsed_ms']) > 1000
-                or not receipt['finished_at_ms'] <= int(time.time() * 1000) < receipt['finished_at_ms'] + 5000):
+                or (require_fresh_health and not receipt['finished_at_ms'] <= int(time.time() * 1000)
+                    < receipt['finished_at_ms'] + 5000)):
             raise PermissionError('gate completion unavailable')
         return {'operation_id': operation_id, 'health_operation_id': verified['operation_id'],
                 'role': 'candidate' if operation['kind'] == 'create_candidate' else 'rollback',
@@ -887,7 +889,11 @@ class SQLiteLedger:
                 return False
             pins = record['identity']
             operation = self._gate_binding(db, pins)
-            snapshot = self._gate_completion_snapshot(db, pins, record['probe_digest'])
+            # Freshness was checked when the authenticated acceptance committed.
+            # Finish still rechecks the current fence, authenticated receipts and
+            # exact digests; elapsed wall time alone cannot revoke that commit.
+            snapshot = self._gate_completion_snapshot(db, pins, record['probe_digest'],
+                                                       require_fresh_health=False)
             return (operation['command_id'] == command_id and row['operation_id'] == pins['operation_id']
                     and snapshot['role'] == record['role']
                     and snapshot['health_receipt_digest'] == record['health_receipt_digest']
@@ -945,6 +951,14 @@ class SQLiteLedger:
         raw = _canonical(pins)
         with self._transaction() as db:
             operation = self._gate_binding(db, pins)
+            required = db.execute('SELECT * FROM gate_required WHERE command_id=? AND operation_id=?',
+                                  (operation['command_id'], pins['operation_id'])).fetchone()
+            required_mac = self._operation_mac(pins['operation_id'], operation['command_id'],
+                                               'gate_required', 'pending', '')
+            if (required is None or required['state'] != 'pending'
+                    or type(required['state_mac']) is not str
+                    or not hmac.compare_digest(required['state_mac'], required_mac)):
+                raise PermissionError('gate challenge unavailable')
             row = db.execute("SELECT * FROM mount_gate_challenges WHERE operation_id=?", (pins['operation_id'],)).fetchone()
             mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'], 'mount_gate_reserved', raw)
             if (row is None or row['state'] != 'reserved' or row['launch_id'] != pins['launch_id']
