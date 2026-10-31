@@ -41,6 +41,11 @@ class GateBuildTests(unittest.TestCase):
                                         capture_output=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(list(out.iterdir()), [])
+            result = subprocess.run([sys.executable, str(script), '--public-key-hex', 'a' * 64,
+                                     '--source-commit', 'b' * 40, '--output-dir', str(out),
+                                     '--channel-version', '4'], capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list(out.iterdir()), [])
 
 
 if __name__ == '__main__': unittest.main()

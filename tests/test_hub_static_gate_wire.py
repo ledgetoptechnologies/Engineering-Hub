@@ -34,6 +34,8 @@ class GateWireTests(unittest.TestCase):
         cls.lib.gate_wire_send.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(Timespec)]
         cls.lib.gate_wire_recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
                                            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(Timespec)]
+        cls.lib.gate_wire_connect.argtypes = [ctypes.c_char_p, ctypes.POINTER(Timespec)]
+        cls.lib.gate_wire_connect.restype = ctypes.c_int
         cls.lib.gate_wire_verify.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p,
                                              ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(Doc),
                                              ctypes.POINTER(ctypes.c_size_t)]
@@ -64,6 +66,28 @@ class GateWireTests(unittest.TestCase):
             self.assertEqual(self.receive(b, seconds=0.01)[0], 0)
             expired = self.deadline(-1)
             self.assertEqual(self.lib.gate_wire_send(a.fileno(), b'x', 1, ctypes.byref(expired)), 0)
+
+    def test_path_connect_requires_socket_and_cloexec(self):
+        path = self.dir / 'control.sock'
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            listener.bind(str(path)); listener.listen(1)
+            deadline = self.deadline()
+            fd = self.lib.gate_wire_connect(os.fsencode(path), ctypes.byref(deadline))
+            self.assertGreaterEqual(fd, 0)
+            with socket.socket(fileno=fd) as client:
+                server, _ = listener.accept()
+                with server:
+                    self.assertFalse(os.get_inheritable(client.fileno()))
+                    client.send(b'test'); self.assertEqual(server.recv(16), b'test')
+            alias = self.dir / 'alias.sock'; alias.symlink_to(path)
+            self.assertEqual(self.lib.gate_wire_connect(os.fsencode(alias), ctypes.byref(self.deadline())), -1)
+            self.assertEqual(self.lib.gate_wire_connect(b'relative', ctypes.byref(self.deadline())), -1)
+            self.assertEqual(self.lib.gate_wire_connect(os.fsencode(path), ctypes.byref(self.deadline(-1))), -1)
+        finally:
+            listener.close()
+            path.unlink(missing_ok=True)
+            (self.dir / 'alias.sock').unlink(missing_ok=True)
 
     def test_rights_are_closed_and_rejected(self):
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)

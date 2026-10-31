@@ -4,6 +4,8 @@ import io
 import struct
 import tarfile
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -54,12 +56,19 @@ def test_exact_archive_and_static_elf_reject_ambiguity(fault):
     with pytest.raises(DaemonBackendError): _static_gate_archive(payload, expected, 'amd64')
 
 
-@pytest.mark.parametrize('fault', ['none', 'wrong_binary', 'changed_container', 'missing_enrollment', 'old_schema', 'http_error'])
+@pytest.mark.parametrize('fault', ['none', 'v3', 'wrong_binary', 'changed_container', 'missing_enrollment', 'old_schema', 'http_error'])
 def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp_path, monkeypatch, fault):
     manifest, image, supervisor, policy = vector()
     binary = elf()
     image = replace(image, image_config={'config': {'Entrypoint': list(gate.STATIC_ENTRYPOINT), 'Cmd': [], 'Env': []}})
     policy.update(schema=gate.STATIC_SCHEMA, bootstrap_digest=digest(binary))
+    if fault == 'v3':
+        policy.update(schema=gate.SOCKET_SCHEMA, socket_source_directory='/operator/gate-channel',
+                      consumer_host_uid=110001, consumer_host_gid=110001)
+        supervisor._enrollment_path = Path('/operator/protected/enrollment')
+        supervisor._key_path = Path('/operator/protected/key')
+        supervisor._journal = SimpleNamespace(path=Path('/operator/protected/journal'))
+        supervisor._mounts = {}
     if fault == 'old_schema': policy['schema'] = 'engineering-hub.application-gate-enrollment.v1'
     def root_file(*_):
         if fault == 'missing_enrollment': raise FileNotFoundError()
@@ -95,7 +104,7 @@ def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp
     try:
         kwargs = dict(manifest=manifest, image=image, supervisor=supervisor,
                       enrollment_file='/root-owned/enrollment.json', timeout_ms=5000)
-        if fault == 'none':
+        if fault in ('none', 'v3'):
             assert backend.inspect_created_gate_bootstrap(container_id, **kwargs) is None
             assert sum(path.endswith('/json') for _, path in requests) == 2
         else:

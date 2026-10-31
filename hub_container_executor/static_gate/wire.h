@@ -10,6 +10,9 @@
 int gate_wire_send(int fd, const void *bytes, size_t length, const struct timespec *deadline);
 int gate_wire_recv(int fd, char *buffer, size_t capacity, size_t *length,
                    const struct timespec *deadline);
+/* Connect once to a pinned socket path. Signed messages authenticate issuer;
+ * pathname checks alone do not establish exclusive host custody. */
+int gate_wire_connect(const char *path, const struct timespec *deadline);
 /* doc references bytes; payload receives the index of the signed object.
  * The caller must validate the entire protocol-specific payload schema. */
 int gate_wire_verify(const char *bytes, size_t length, const unsigned char public_key[32],

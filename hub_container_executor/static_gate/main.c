@@ -20,6 +20,15 @@
 #ifndef GATE_PUBLIC_KEY_HEX
 #error GATE_PUBLIC_KEY_HEX must be an independently enrolled 64-character lowercase public key
 #endif
+#ifndef GATE_CHANNEL_VERSION
+#define GATE_CHANNEL_VERSION 2
+#endif
+#if GATE_CHANNEL_VERSION != 2 && GATE_CHANNEL_VERSION != 3
+#error Unsupported gate channel version
+#endif
+#if defined(GATE_TEST_CHANNEL_PATH) && !defined(GATE_TEST_BUILD)
+#error GATE_TEST_CHANNEL_PATH is restricted to test builds
+#endif
 #ifdef GATE_TEST_BUILD
 #ifndef GATE_TEST_TARGET
 #error GATE_TEST_TARGET is required for a test build
@@ -32,6 +41,9 @@
 #else
 #define TARGET "/var/lib/hub"
 #define EXECUTABLE "/opt/venv/bin/python"
+#endif
+#if !defined(GATE_TEST_BUILD) && GATE_CHANNEL_VERSION == 3
+#define GATE_CONTROL_SOCKET "/run/hub-gate/controller.sock"
 #endif
 
 extern char **environ;
@@ -128,14 +140,23 @@ int main(void)
 {
     unsigned char key[32], random[32]; char nonce[65], executable[72], request[8193], start[8193], decision_wire[8193], ack[8193];
     size_t start_len, decision_len, ack_len, identity; struct gate_json_doc doc; struct gate_decision decision;
-    uint64_t wall0, mono0, wall, mono, previous_wall; struct timespec deadline; struct stat st; int mount_fd = -1, result = 1;
+    uint64_t wall0, mono0, wall, mono, previous_wall; struct timespec deadline; struct stat st; int mount_fd = -1, channel = -1, result = 1;
     if (!tokens_snapshot() || clearenv() != 0 ||
         OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1 ||
         !key_decode(key) || !self_digest(executable) || !clocks(&wall0, &mono0) ||
         clock_gettime(CLOCK_MONOTONIC, &deadline) || deadline.tv_sec > (time_t)(INT64_MAX - 5) ||
-        fcntl(3, F_SETFD, FD_CLOEXEC) < 0 ||
         syscall(SYS_close_range, 4U, ~0U, CLOSE_RANGE_CLOEXEC) != 0) goto done;
     deadline.tv_sec += 5;
+#ifdef GATE_TEST_CHANNEL_PATH
+    (void)close(3);
+    channel = gate_wire_connect(GATE_TEST_CHANNEL_PATH, &deadline);
+#elif !defined(GATE_TEST_BUILD) && GATE_CHANNEL_VERSION == 3
+    (void)close(3); /* Never trust or inherit a runtime-provided descriptor. */
+    channel = gate_wire_connect(GATE_CONTROL_SOCKET, &deadline);
+#else
+    channel = 3; /* Legacy v2 contract; production activation remains disabled. */
+#endif
+    if (channel < 0 || fcntl(channel, F_SETFD, FD_CLOEXEC) < 0) goto done;
     ssize_t got = getrandom(random, sizeof(random), GRND_NONBLOCK);
     if (got != (ssize_t)sizeof(random)) goto done;
     for (size_t i = 0; i < 32; i++) { nonce[2*i] = hex[random[i] >> 4]; nonce[2*i+1] = hex[random[i] & 15]; }
@@ -144,8 +165,8 @@ int main(void)
     if (mount_fd < 0 || fstat(mount_fd, &st) || !S_ISDIR(st.st_mode) || !st.st_ino) goto done;
     uint64_t dev = (uint64_t)st.st_dev, ino = (uint64_t)st.st_ino;
     int n = snprintf(request, sizeof(request), "{\"nonce\":\"%s\",\"protocol\":\"engineering-hub.application-gate-start-request.v1\"}", nonce);
-    if (n <= 0 || (size_t)n >= sizeof(request) || !gate_wire_send(3, request, (size_t)n, &deadline) ||
-        !gate_wire_recv(3, start, 8192, &start_len, &deadline) || !clocks(&wall, &mono) || mono < mono0 ||
+    if (n <= 0 || (size_t)n >= sizeof(request) || !gate_wire_send(channel, request, (size_t)n, &deadline) ||
+        !gate_wire_recv(channel, start, 8192, &start_len, &deadline) || !clocks(&wall, &mono) || mono < mono0 ||
         mono - mono0 >= 5000 || !gate_start_verify(start, start_len, key, nonce, executable, dev, ino, wall0, mono - mono0, wall, &doc, &identity) ||
         !mount_current(mount_fd, dev, ino, &doc, identity)) goto done;
     previous_wall = wall;
@@ -153,8 +174,8 @@ int main(void)
     const char *identity_wire = start + id->start; size_t identity_len = id->end - id->start;
     n = snprintf(request, sizeof(request), "{\"identity\":%.*s,\"observed_device\":%llu,\"observed_inode\":%llu,\"protocol\":\"engineering-hub.application-mount-observation.v1\"}",
         (int)identity_len, identity_wire, (unsigned long long)dev, (unsigned long long)ino);
-    if (n <= 0 || (size_t)n >= sizeof(request) || !gate_wire_send(3, request, (size_t)n, &deadline) ||
-        !gate_wire_recv(3, decision_wire, 8192, &decision_len, &deadline) || !clocks(&wall, &mono) ||
+    if (n <= 0 || (size_t)n >= sizeof(request) || !gate_wire_send(channel, request, (size_t)n, &deadline) ||
+        !gate_wire_recv(channel, decision_wire, 8192, &decision_len, &deadline) || !clocks(&wall, &mono) ||
         wall < previous_wall || mono < mono0 || mono - mono0 >= 5000 ||
         !mount_current(mount_fd, dev, ino, &doc, identity) ||
         !gate_decision_verify(decision_wire, decision_len, key, identity_wire, identity_len, wall0, mono0, wall, mono, &decision)) goto done;
@@ -169,7 +190,7 @@ int main(void)
     n = snprintf(request, sizeof(request), "{\"decision_sha256\":\"%s\",\"fence\":%.*s,\"launch_id\":\"%.*s\",\"nonce\":\"%s\",\"operation_id\":\"%.*s\",\"protocol\":\"engineering-hub.application-gate-consume-request.v1\"}",
         digest_hex, fl, fence, ll, launch, nonce, ol, operation);
     if (n <= 0 || (size_t)n >= sizeof(request) || !mount_current(mount_fd, dev, ino, &doc, identity) ||
-        !gate_wire_send(3, request, (size_t)n, &deadline) || !gate_wire_recv(3, ack, 8192, &ack_len, &deadline) ||
+        !gate_wire_send(channel, request, (size_t)n, &deadline) || !gate_wire_recv(channel, ack, 8192, &ack_len, &deadline) ||
         !clocks(&wall, &mono) || wall < previous_wall || mono < mono0 || mono - mono0 >= 5000 ||
         !gate_ack_verify(ack, ack_len, key, identity_wire, identity_len,
             decision_wire, decision_len, wall0, mono0, wall, mono) || !mount_current(mount_fd, dev, ino, &doc, identity)) goto done;
@@ -189,6 +210,6 @@ int main(void)
     execve(EXECUTABLE, args, env);
 done:
     if (mount_fd >= 0) close(mount_fd);
-    close(3);
+    if (channel >= 0) close(channel);
     return result;
 }

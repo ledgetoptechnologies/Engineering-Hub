@@ -2,12 +2,15 @@
 #include "wire.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <openssl/evp.h>
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static int seqpacket(int fd)
@@ -50,6 +53,27 @@ static int wait_ready(int fd, short events, const struct timespec *deadline)
             (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) return 0;
         return 1;
     }
+}
+
+int gate_wire_connect(const char *path, const struct timespec *deadline)
+{
+    struct sockaddr_un address = {0}; struct stat before_stat, after_stat;
+    int fd = -1, error = 0; socklen_t error_len = sizeof(error);
+    if (!path || path[0] != '/' || strlen(path) >= sizeof(address.sun_path) ||
+        !before(deadline) || lstat(path, &before_stat) || !S_ISSOCK(before_stat.st_mode)) return -1;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        if (errno != EINPROGRESS || !wait_ready(fd, POLLOUT, deadline) ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) || error) goto fail;
+    }
+    if (!before(deadline) || lstat(path, &after_stat) || !S_ISSOCK(after_stat.st_mode) ||
+        before_stat.st_dev != after_stat.st_dev || before_stat.st_ino != after_stat.st_ino) goto fail;
+    return fd;
+fail:
+    close(fd); return -1;
 }
 
 int gate_wire_send(int fd, const void *bytes, size_t length, const struct timespec *deadline)

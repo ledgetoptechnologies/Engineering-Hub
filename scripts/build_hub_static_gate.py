@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--public-key-hex', required=True)
     parser.add_argument('--source-commit', required=True, help='declared revision; independently verify against source hashes')
     parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--channel-version', choices=('2', '3'), default='2',
+                        help='2 retains legacy inherited FD; 3 uses the enrolled fixed socket path')
     args = parser.parse_args()
     if not re.fullmatch(r'[0-9a-f]{64}', args.public_key_hex):
         parser.error('public key must be exactly 64 lowercase hexadecimal characters')
@@ -60,6 +62,7 @@ def main():
         binary = stage / 'gate'
         cmd = [gcc, '-static', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
                '-DGATE_PUBLIC_KEY_HEX="' + args.public_key_hex + '"',
+               '-DGATE_CHANNEL_VERSION=' + args.channel_version,
                *(str(stage / name) for name in SOURCES), '-lcrypto', '-ldl', '-pthread', '-o', str(binary)]
         subprocess.run(cmd, check=True, timeout=120)
         header = subprocess.run([readelf, '-h', str(binary)], check=True, capture_output=True, text=True, timeout=10).stdout
@@ -68,6 +71,7 @@ def main():
         validate_elf_reports(header, program, dynamic)
         data = binary.read_bytes()
         record = {'schema': 1, 'public_key_hex': args.public_key_hex, 'architecture': 'linux/amd64',
+                  'channel_version': int(args.channel_version),
                   'binary_sha256': hashlib.sha256(data).hexdigest(), 'compiler': compiler,
                   'compiler_sha256': hashlib.sha256(Path(gcc).resolve().read_bytes()).hexdigest(),
                   'linker': linker_version, 'linker_sha256': hashlib.sha256(Path(linker).resolve().read_bytes()).hexdigest(),

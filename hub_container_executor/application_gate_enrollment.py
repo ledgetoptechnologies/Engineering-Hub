@@ -9,6 +9,8 @@ parser does not compare it to a running controller or supervisor signing key.
 The bootstrap digest is enrolled metadata, not a measurement of image bytes.
 Any future runtime must independently verify the actual controller key and
 bootstrap bytes against those pins before authorization.
+The operator must independently bind the v2 or v3 channel build mode to the
+enrolled bootstrap digest; a reported build record alone is not provenance.
 """
 from __future__ import annotations
 
@@ -27,10 +29,12 @@ _ENTRYPOINT = ('/opt/venv/bin/python', '-I', '-B', '-m',
                'hub_container_executor.application_mount_gate')
 STATIC_ENTRYPOINT = ('/usr/local/libexec/hub-application-gate',)
 STATIC_SCHEMA = 'engineering-hub.application-gate-enrollment.v2'
+SOCKET_SCHEMA = 'engineering-hub.application-gate-enrollment.v3'
 _FIELDS = frozenset({'schema', 'manifest_digest', 'supervisor_profile_digest', 'role',
     'runnable_digest', 'platform_manifest_digest', 'image_config_id', 'source_commit',
     'build_record_digest', 'bootstrap_digest', 'controller_public_key',
     'socket_target', 'request_timeout_ms'})
+_SOCKET_FIELDS = _FIELDS | {'socket_source_directory', 'consumer_host_uid', 'consumer_host_gid'}
 
 
 class ApplicationGateEnrollmentError(ValueError):
@@ -61,6 +65,9 @@ class ApplicationGateEnrollment:
     socket_target: str
     request_timeout_ms: int
     schema: str = 'engineering-hub.application-gate-enrollment.v1'
+    socket_source_directory: str | None = None
+    consumer_host_uid: int | None = None
+    consumer_host_gid: int | None = None
 
     def check(self):
         try:
@@ -90,8 +97,9 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
             raise ValueError()
         raw, identity = _root_file(_path(path), 65536)
         data = _strict(raw, 65536)
-        if (type(data) is not dict or set(data) != _FIELDS
-                or data['schema'] not in ('engineering-hub.application-gate-enrollment.v1', STATIC_SCHEMA)
+        if (type(data) is not dict
+                or data.get('schema') not in ('engineering-hub.application-gate-enrollment.v1', STATIC_SCHEMA, SOCKET_SCHEMA)
+                or set(data) != (_SOCKET_FIELDS if data.get('schema') == SOCKET_SCHEMA else _FIELDS)
                 or data['role'] not in ('candidate', 'rollback')
                 or data['role'] != image.role
                 or data['manifest_digest'] != manifest.digest()
@@ -120,10 +128,24 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
         # An image-default gate is a distinct image contract; a command override
         # or a legacy Hub image cannot satisfy this versioned enrollment.
         config = image.image_config.get('config')
-        expected_entrypoint = STATIC_ENTRYPOINT if data['schema'] == STATIC_SCHEMA else _ENTRYPOINT
+        expected_entrypoint = STATIC_ENTRYPOINT if data['schema'] in (STATIC_SCHEMA, SOCKET_SCHEMA) else _ENTRYPOINT
         if (type(config) is not dict or config.get('Entrypoint') != list(expected_entrypoint)
                 or config.get('Cmd') not in ([], None)):
             raise ValueError()
+        source_directory = uid = gid = None
+        if data['schema'] == SOCKET_SCHEMA:
+            source_directory = data['socket_source_directory']
+            source = _path(source_directory)
+            uid, gid = data['consumer_host_uid'], data['consumer_host_gid']
+            if (source.name in ('.', '..') or any(type(value) is not int or not 0 < value < 2**32 - 1
+                                                    for value in (uid, gid))):
+                raise ValueError()
+            protected_paths = [supervisor._enrollment_path, supervisor._key_path,
+                               supervisor._journal.path]
+            protected_paths.extend(_path(mount.source) for mount in supervisor._mounts.values())
+            if any(source == other or source in other.parents or other in source.parents
+                   for other in protected_paths):
+                raise ValueError()
         supervisor._guard()
         if supervisor.profile.digest() != supervisor_profile_digest:
             raise ValueError()
@@ -131,6 +153,7 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
             data['supervisor_profile_digest'], data['role'], data['runnable_digest'],
             data['platform_manifest_digest'], data['image_config_id'], data['source_commit'],
             data['build_record_digest'], data['bootstrap_digest'],
-            bytes.fromhex(data['controller_public_key']), data['socket_target'], data['request_timeout_ms'], data['schema'])
+            bytes.fromhex(data['controller_public_key']), data['socket_target'], data['request_timeout_ms'],
+            data['schema'], source_directory, uid, gid)
     except Exception:
         raise ApplicationGateEnrollmentError() from None

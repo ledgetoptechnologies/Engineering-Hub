@@ -75,10 +75,21 @@ def _run_receiver_test(tmp_path, monkeypatch, hostile_config, owned):
     pins.update(expected_device=stat.st_dev, expected_inode=stat.st_ino, mount_flags=flags)
     key = Ed25519PrivateKey.from_private_bytes(b'\x01' * 32)
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    owned.callback(client.close)
-    owned.callback(server.close)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    path_mode = os.environ.get('HUB_STATIC_GATE_TEST_CHANNEL_MODE') == 'path'
+    if path_mode:
+        channel_dir = '/tmp/hub-static-gate-channel'
+        channel_path = channel_dir + '/controller.sock'
+        os.mkdir(channel_dir, 0o700); owned.callback(os.rmdir, channel_dir)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        owned.callback(listener.close)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        listener.bind(channel_path); owned.callback(_unlink_if_present, channel_path)
+        listener.listen(1); listener.settimeout(5)
+        client = server = None
+    else:
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        owned.callback(client.close); owned.callback(server.close)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     env = {'CODEX_TOKEN': 'test', 'HERMES_TOKEN': 'test', 'CLAUDE_TOKEN': 'test'}
     marker = '/tmp/hub-gate-hostile-provider-loaded'
     assert not os.path.lexists(marker)
@@ -94,11 +105,17 @@ def _run_receiver_test(tmp_path, monkeypatch, hostile_config, owned):
                        capture_output=True, timeout=5, check=False)
         assert os.path.exists(marker), 'hostile OpenSSL configuration did not load the test provider'
         os.unlink(marker)
-    pid = os.posix_spawn(binary, [binary], env, file_actions=[(os.POSIX_SPAWN_DUP2, client.fileno(), 3),
-                                                               (os.POSIX_SPAWN_CLOSE, server.fileno())])
+    actions = [] if path_mode else [(os.POSIX_SPAWN_DUP2, client.fileno(), 3),
+                                   (os.POSIX_SPAWN_CLOSE, server.fileno())]
+    pid = os.posix_spawn(binary, [binary], env, file_actions=actions)
     child = [pid]
     owned.callback(_reap_owned_child, child)
-    client.close(); peer = PeerPin(pid=pid, uid=os.getuid(), gid=os.getgid(), start_ticks=_start(pid))
+    if path_mode:
+        server, _ = listener.accept(); owned.callback(server.close)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    else:
+        client.close()
+    peer = PeerPin(pid=pid, uid=os.getuid(), gid=os.getgid(), start_ticks=_start(pid))
     owned.callback(peer.close)
     pins.update(host_pid=pid, process_start_ticks=peer.start)
     held = []; captured = []

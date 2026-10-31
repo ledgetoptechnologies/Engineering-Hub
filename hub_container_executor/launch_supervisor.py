@@ -677,6 +677,10 @@ class LaunchSupervisor:
         self._held_path = self._held_identity = None
         self._mutex = threading.Lock()
         self._gate_start_thread = None
+        self._gate_listener = self._gate_parent = None
+        self._gate_directory = self._gate_socket_identity = self._gate_enrollment = None
+        self._gate_accepted_channel = self._gate_accepted_peer = None
+        self._gate_accept_used = False
         self._journal = self._engine = self._consumer = self._listener = None
         self._socket_parent = None
         self._socket_identity = None
@@ -1235,6 +1239,149 @@ class LaunchSupervisor:
         """Issue one measured-executor endpoint receipt; pair launch remains disabled."""
         return self._serve_one_role_handoff(channel, 'executor')
 
+    def prepare_gate_socket(self, *, manifest, image, enrollment_file, timeout_seconds):
+        """Bind a single protected v3 gate endpoint before container creation.
+
+        This retains socket and parent descriptors until supervisor close; close
+        leaves the pathname as evidence. The caller must pass the enrolled source
+        directory through an independently authorized Docker profile. This
+        method does not authorize that mount or enable an application launch.
+        """
+        from .application_gate_enrollment import SOCKET_SCHEMA, load_application_gate_enrollment
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            _require(self._journal.start_mode and self._gate_listener is None and self._gate_parent is None)
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self)
+            _require(enrolled.schema == SOCKET_SCHEMA)
+            directory = _path(enrolled.socket_source_directory)
+            path = directory / 'controller.sock'
+            parent = _root_parent(path, private=False)
+            self._gate_parent, self._gate_directory = parent, directory
+            info = os.fstat(parent)
+            _require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o711
+                     and _identity(os.lstat(directory)) == _identity(info)
+                     # The daemon and namespaced app must be able to traverse
+                     # every ancestor without granting directory listing.
+                     and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001
+                             for ancestor in directory.parents))
+            try:
+                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            self._gate_listener = listener
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            endpoint = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(endpoint.encode()) <= 107)
+            listener.bind(endpoint)
+            first = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(first.st_mode))
+            self._gate_socket_identity = _identity(first)
+            os.chown(path.name, 0, enrolled.consumer_host_gid, dir_fd=parent, follow_symlinks=False)
+            os.chmod(path.name, 0o660, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(_identity(current) == self._gate_socket_identity and current.st_uid == 0
+                     and current.st_gid == enrolled.consumer_host_gid and stat.S_IMODE(current.st_mode) == 0o660)
+            listener.listen(1)
+            self._gate_enrollment = enrolled
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
+            _remaining(deadline)
+            return enrolled.socket_source_directory
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def _gate_socket_check(self, enrolled):
+        """Recheck the retained parent and socket; caller holds the lifecycle lock."""
+        _require(self._gate_enrollment == enrolled and self._gate_parent is not None
+                 and self._gate_listener is not None and self._gate_directory is not None)
+        directory = os.lstat(self._gate_directory)
+        endpoint = os.stat('controller.sock', dir_fd=self._gate_parent, follow_symlinks=False)
+        _require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == 0
+                 and stat.S_IMODE(directory.st_mode) == 0o711
+                 and _identity(directory) == _identity(os.fstat(self._gate_parent))
+                 and stat.S_ISSOCK(endpoint.st_mode) and _identity(endpoint) == self._gate_socket_identity
+                 and endpoint.st_uid == 0 and endpoint.st_gid == enrolled.consumer_host_gid
+                 and stat.S_IMODE(endpoint.st_mode) == 0o660
+                 and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001
+                         for ancestor in self._gate_directory.parents))
+
+    def accept_gate_channel(self, *, manifest, image, enrollment_file, host_pid,
+                            process_start_ticks, timeout_seconds):
+        """Accept once; authenticate the app in this supervisor's namespaces.
+
+        The independently measured host PID/start must refer to the enrolled
+        app container. SO_PEERCRED is interpreted here, not inside the app PID
+        namespace, where the outside supervisor may be represented as PID zero.
+        The supervisor retains both returned objects until close; no descriptor
+        custody or sole-writer property is established by this exchange.
+        """
+        from .application_gate_enrollment import SOCKET_SCHEMA, load_application_gate_enrollment
+        from .broker_seqpacket import PeerPin
+        _require(self._pid == os.getpid() and type(host_pid) is int and host_pid > 0
+                 and type(process_start_ticks) is int and process_start_ticks > 0
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        channel = peer = None
+        try:
+            _require(not self._gate_accept_used and self._gate_listener is not None and self._gate_parent is not None)
+            self._gate_accept_used = True
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self)
+            _require(enrolled.schema == SOCKET_SCHEMA)
+            self._gate_socket_check(enrolled)
+            self._gate_listener.settimeout(_remaining(deadline))
+            channel, _ = self._gate_listener.accept()
+            channel.set_inheritable(False)
+            channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            credentials = struct.unpack('=iII', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _require(credentials == (host_pid, enrolled.consumer_host_uid, enrolled.consumer_host_gid))
+            peer = PeerPin(pid=host_pid, uid=enrolled.consumer_host_uid,
+                           gid=enrolled.consumer_host_gid, start_ticks=process_start_ticks)
+            status = {}
+            for line in Path(f'/proc/{host_pid}/status').read_text().splitlines():
+                key, separator, value = line.partition(':')
+                if separator and key in {'Uid', 'Gid', 'NSpid'}:
+                    _require(key not in status)
+                    status[key] = value.split()
+            _require(status.get('Uid') == [str(enrolled.consumer_host_uid)] * 4
+                     and status.get('Gid') == [str(enrolled.consumer_host_gid)] * 4
+                     and status.get('NSpid') and status['NSpid'][-1] == '1'
+                     and _mapped_id(Path(f'/proc/{host_pid}/uid_map').read_text(), 10001) == enrolled.consumer_host_uid
+                     and _mapped_id(Path(f'/proc/{host_pid}/gid_map').read_text(), 10001) == enrolled.consumer_host_gid)
+            peer.check()
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
+            _remaining(deadline)
+            self._gate_accepted_channel, self._gate_accepted_peer = channel, peer
+            return channel, peer
+        except BaseException:
+            if channel is not None: channel.close()
+            if peer is not None: peer.close()
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
                                         verify_live, timeout_seconds):
@@ -1250,7 +1397,7 @@ class LaunchSupervisor:
         must be bounded and synchronous: a blocked callback cannot be canceled
         by this deadline, and the owner must hold the operation until it exits.
         """
-        from .application_gate_enrollment import STATIC_SCHEMA, load_application_gate_enrollment
+        from .application_gate_enrollment import STATIC_SCHEMA, SOCKET_SCHEMA, load_application_gate_enrollment
         from .mount_gate_start_enrollment import MountGateStartEnrollmentController
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
                  and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
@@ -1269,17 +1416,27 @@ class LaunchSupervisor:
             try:
                 _require(self._journal.start_mode)
                 _remaining(deadline)
+                base = json.loads(_canonical(expected_without_nonce))
                 self._validate_live(deadline)
                 enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                     image=image, supervisor=self)
-                _require(enrolled.schema == STATIC_SCHEMA)
+                _require(enrolled.schema in (STATIC_SCHEMA, SOCKET_SCHEMA))
+                if enrolled.schema == SOCKET_SCHEMA:
+                    _require(enrolled == self._gate_enrollment
+                             and channel is self._gate_accepted_channel and peer is self._gate_accepted_peer
+                             and type(base) is dict
+                             and base.get('manifest_digest') == enrolled.manifest_digest
+                             and base.get('image_config_id') == enrolled.image_config_id
+                             and base.get('runnable_digest') == enrolled.runnable_digest
+                             and base.get('platform_manifest_digest') == enrolled.platform_manifest_digest
+                             and base.get('implementation_commit') == enrolled.source_commit)
+                    self._gate_socket_check(enrolled)
                 key_path = _path(controller_key_file)
                 key, key_identity = _root_file(key_path, 32)
                 _require(len(key) == 32)
                 signer = Ed25519PrivateKey.from_private_bytes(key)
                 del key
                 record = json.loads(_canonical(self._record()))
-                base = json.loads(_canonical(expected_without_nonce))
                 supervisor_id = self._launch_id
                 _require(type(supervisor_id) is str)
 
@@ -1290,6 +1447,12 @@ class LaunchSupervisor:
                     _require(current_enrollment == enrolled and _root_file(key_path, 32)[1] == key_identity
                              and self._launch_id == supervisor_id and self._record() == record
                              and callable(verify_live) and verify_live(pins) is True)
+                    self._validate_live(deadline)
+                    _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                        image=image, supervisor=self) == enrolled and _root_file(key_path, 32)[1] == key_identity
+                        and self._launch_id == supervisor_id and self._record() == record)
+                    if enrolled.schema == SOCKET_SCHEMA:
+                        self._gate_socket_check(enrolled)
                     _remaining(deadline)
                     return True
 
@@ -1656,11 +1819,12 @@ class LaunchSupervisor:
         self._issuance_open = False
         self._closed = True
         failed = False
-        for name in ('_listener', '_socket_parent', '_consumer', '_engine', '_journal'):
+        for name in ('_listener', '_socket_parent', '_gate_listener', '_gate_parent', '_gate_accepted_channel',
+                     '_gate_accepted_peer', '_consumer', '_engine', '_journal'):
             value = getattr(self, name, None)
             if value is not None:
                 try:
-                    if name == '_socket_parent':
+                    if name in ('_socket_parent', '_gate_parent'):
                         os.close(value)
                     else:
                         value.close()

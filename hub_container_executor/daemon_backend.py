@@ -1387,13 +1387,13 @@ class DockerEngineBackend:
         existing operation on any error or uncertain outcome, without retry.
         """
         from .application_gate_enrollment import (
-            STATIC_ENTRYPOINT, STATIC_SCHEMA, load_application_gate_enrollment,
+            STATIC_ENTRYPOINT, STATIC_SCHEMA, SOCKET_SCHEMA, load_application_gate_enrollment,
         )
         try:
             deadline = self._deadline(timeout_ms)
             enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=supervisor)
-            if (enrolled.schema != STATIC_SCHEMA or type(container_id) is not str
+            if (enrolled.schema not in (STATIC_SCHEMA, SOCKET_SCHEMA) or type(container_id) is not str
                     or not CONTAINER_ID_RE.fullmatch(container_id)
                     or self._container_images.get(container_id) != image
                     or container_id not in self._container_profiles
