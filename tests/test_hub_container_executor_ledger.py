@@ -474,6 +474,46 @@ def test_pause_and_fence_are_rechecked_before_every_operation(tmp_path):
     ledger.close()
 
 
+@pytest.mark.parametrize('fault', ['pause', 'target_fence', 'target_run', 'run_state',
+                                   'phase_state', 'manifest', 'intent'])
+def test_state_copy_completion_rechecks_fence_and_preserves_intent(tmp_path, fault):
+    ledger = open_ledger(tmp_path)
+    try:
+        command = request()
+        assert ledger.admit(command).accepted
+        operation = ledger.begin_operation(command.command_id, 'state_copy')
+        if fault == 'pause':
+            ledger.set_paused(True)
+        else:
+            with ledger._transaction() as db:
+                if fault == 'target_fence': db.execute('UPDATE targets SET fence=fence+1')
+                elif fault == 'target_run': db.execute("UPDATE targets SET current_run_id='foreign'")
+                elif fault == 'run_state': db.execute("UPDATE runs SET state='held'")
+                elif fault == 'phase_state': db.execute("UPDATE phases SET state='held'")
+                elif fault == 'manifest': db.execute("UPDATE targets SET manifest_digest='foreign'")
+                else: db.execute("UPDATE operations SET intent='{}' WHERE operation_id=?", (operation,))
+        with pytest.raises(PermissionError):
+            ledger.complete_operation(operation, {'generation_id': 'synthetic'})
+        with ledger._connection() as db:
+            row = db.execute('SELECT status,receipt,receipt_mac FROM operations WHERE operation_id=?',
+                             (operation,)).fetchone()
+            assert tuple(row) == ('intent', None, None)
+    finally:
+        ledger.close()
+
+
+def test_state_copy_completion_accepts_unchanged_authority(tmp_path):
+    ledger = open_ledger(tmp_path)
+    try:
+        command = request()
+        assert ledger.admit(command).accepted
+        operation = ledger.begin_operation(command.command_id, 'state_copy')
+        ledger.complete_operation(operation, {'generation_id': 'synthetic'})
+        assert ledger.operation_rows(command.command_id)[0]['receipt_authentic'] is True
+    finally:
+        ledger.close()
+
+
 def test_reconcile_data_is_read_only_and_orphan_intents_stay_held(tmp_path):
     ledger = open_ledger(tmp_path)
     command = request()
@@ -506,7 +546,9 @@ def test_only_inspected_terminal_failure_can_unhold_phase_for_rollback(tmp_path)
     assert failed.state == "failed" and failed.reason == "effect_failed"
     rollback = request("rollback_container", run_id=run_id, fence=1)
     assert recovered.admit(rollback).accepted
-    assert recovered.begin_operation(rollback.command_id, "rollback_state")
+    rollback_operation = recovered.begin_operation(rollback.command_id, "rollback_state")
+    recovered.complete_operation(rollback_operation, {'generation_id': 'synthetic-rollback'})
+    assert recovered.operation_rows(rollback.command_id)[0]['receipt_authentic'] is True
     recovered.close()
 
 

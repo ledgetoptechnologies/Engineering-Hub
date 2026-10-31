@@ -239,6 +239,11 @@ class HostAdapter:
             self._verify_baseline_container(baseline, rollback_image, rollback_defaults, secrets, deadline)
             method = (self.state_provisioner.prepare_candidate if role == "candidate"
                       else self.state_provisioner.prepare_rollback)
+            def state_receipt(state):
+                # A rejected provider result must never become a completed,
+                # authenticated operation receipt before validation.
+                self._validate_generation(state, baseline)
+                return self._state_receipt(state)
             state = self._effect(
                 request, "state_copy" if role == "candidate" else "rollback_state",
                 lambda operation_id, timeout: method(
@@ -246,9 +251,8 @@ class HostAdapter:
                     deadline_monotonic=deadline,
                 ),
                 self.manifest.timeouts.total_command_ms, deadline,
-                self._state_receipt,
+                state_receipt,
             )
-            self._validate_generation(state, baseline)
             profile = self._profile(image, defaults, state.generation_id, secrets)
             container_id = self._start_new_container(request, role, image, profile, state,
                                                      deadline)

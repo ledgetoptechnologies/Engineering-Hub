@@ -980,10 +980,40 @@ class SQLiteLedger:
         if len(encoded.encode("utf-8")) > 16 * 1024:
             raise ValueError("private operation receipt exceeds limit")
         with self._transaction() as db:
-            row = db.execute("SELECT command_id,kind,status FROM operations WHERE operation_id=?",
+            row = db.execute("SELECT command_id,kind,status,intent FROM operations WHERE operation_id=?",
                              (operation_id,)).fetchone()
             if row is None or row["status"] != "intent":
                 raise RuntimeError("operation intent missing or already completed")
+            if row['kind'] in {'state_copy', 'rollback_state'}:
+                # A remote or slow provider may return after authority changed.
+                # Recheck in the same write transaction as receipt completion;
+                # refusal preserves the original intent for reconciliation.
+                command = db.execute('SELECT * FROM commands WHERE command_id=?',
+                                     (row['command_id'],)).fetchone()
+                if command is None or command['state'] != 'running':
+                    raise PermissionError('state operation authority unavailable')
+                request = ContainerPilotRequest.model_validate_json(command['payload'])
+                run = db.execute('SELECT * FROM runs WHERE run_id=?', (command['run_id'],)).fetchone()
+                target = db.execute('SELECT * FROM targets WHERE target_id=?', (command['target_id'],)).fetchone()
+                phase = db.execute('SELECT * FROM phases WHERE command_id=?', (row['command_id'],)).fetchone()
+                paused = db.execute("SELECT value FROM control WHERE key='paused'").fetchone()
+                expected_intent = _canonical({'operation_id': operation_id, 'kind': row['kind'],
+                    'command_id': request.command_id, 'run_id': request.run_id,
+                    'fencing_generation': request.fencing_generation})
+                if (paused is not None and paused['value'] != 'false'
+                        or request.command_id != row['command_id'] or request.run_id != command['run_id']
+                        or request.target_id != command['target_id'] or request.action != command['action']
+                        or request.action != ('deploy_container' if row['kind'] == 'state_copy' else 'rollback_container')
+                        or operation_id != str(uuid.uuid5(uuid.UUID(request.command_id), row['kind']))
+                        or row['intent'] != expected_intent
+                        or run is None or run['state'] != 'running' or run['target_id'] != request.target_id
+                        or run['fence'] != request.fencing_generation or run['manifest_digest'] != request.manifest_digest
+                        or run['candidate_commit'] != request.candidate_commit or run['policy_revision'] != request.policy_revision
+                        or target is None or target['state'] != 'running' or target['current_run_id'] != request.run_id
+                        or target['fence'] != request.fencing_generation or target['manifest_digest'] != request.manifest_digest
+                        or phase is None or phase['state'] != 'running' or phase['run_id'] != request.run_id
+                        or phase['action'] != request.action):
+                    raise PermissionError('state operation authority unavailable')
             mac = self._operation_mac(operation_id, row["command_id"], row["kind"],
                                       "completed", encoded)
             cursor = db.execute("UPDATE operations SET status='completed',receipt=?,receipt_mac=? "

@@ -438,6 +438,27 @@ def test_state_copy_receives_shared_monotonic_command_deadline(tmp_path):
     adapter.close()
 
 
+@pytest.mark.parametrize('fault', ['wrong_backup', 'same_generation', 'unverified'])
+def test_invalid_state_result_stays_intent_and_never_starts_container(tmp_path, fault):
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    original = state.prepare_candidate
+    def invalid(*args, **kwargs):
+        value = original(*args, **kwargs)
+        if fault == 'wrong_backup': return replace(value, source_backup_digest='sha256:' + '0' * 64)
+        if fault == 'same_generation': return replace(value, generation_id=value.previous_generation_id)
+        return replace(value, baseline_unchanged=False)
+    state.prepare_candidate = invalid
+    try:
+        request = command(manifest, 'deploy_container')
+        response = adapter.submit(request)
+        assert response.state == 'held' and response.reason == 'evidence_mismatch'
+        assert 'create' not in backend.events
+        row = next(row for row in adapter.ledger.operation_rows(request.command_id) if row['kind'] == 'state_copy')
+        assert row['status'] == 'intent' and row['receipt'] is None
+    finally:
+        adapter.close()
+
+
 def test_state_copy_overrun_stays_held_and_does_not_start_next_effect(tmp_path):
     adapter, backend, state, manifest = make_fixture(
         tmp_path, command_budget_ms=300, state_delay_seconds=0.4
