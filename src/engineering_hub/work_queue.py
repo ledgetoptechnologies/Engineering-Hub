@@ -697,6 +697,35 @@ class WorkQueue:
             or row['state'] == 'claimed' and row['lease_until'] <= self._now())
         return result
 
+    def machine_reservation(self, machine_id):
+        """Read this queue's reservation, not host-wide availability."""
+        _key(machine_id)
+        if machine_id not in {action.machine_id for action in self.actions.values()}:
+            raise HubError('work_machine_not_found', 404)
+        now = self._now()
+        with self.repo._connection() as db:
+            row = db.execute('SELECT m.machine_id AS registered_row,m.job_id,m.generation,j.machine_id AS job_machine,'
+                'j.state,j.fence,j.lease_until,EXISTS(SELECT 1 FROM hub_work_jobs x '
+                "WHERE x.machine_id=k.machine_id AND x.state IN ('claimed','held') "
+                'AND (m.job_id IS NULL OR x.id != m.job_id)) AS stray '
+                'FROM (SELECT ? AS machine_id) k LEFT JOIN hub_work_machines m '
+                'ON m.machine_id=k.machine_id LEFT JOIN hub_work_jobs j ON j.id=m.job_id',
+                (machine_id,)).fetchone()
+        state = 'not_reserved'
+        if (row['stray'] or row['registered_row'] is not None and
+                (type(row['generation']) is not int or row['generation'] < 0)):
+            state = 'unknown'
+        elif row['job_id'] is not None:
+            state = 'unknown'
+            if (row['job_machine'] == machine_id and type(row['fence']) is int
+                    and row['fence'] > 0 and row['fence'] == row['generation']):
+                if row['state'] == 'held':
+                    state = 'held'
+                elif row['state'] == 'claimed' and type(row['lease_until']) in (int, float) and math.isfinite(row['lease_until']):
+                    state = 'held' if row['lease_until'] <= now else 'active'
+        return {'machine_id': machine_id, 'queue_reservation': state,
+                'requires_reconciliation': state == 'held' if state != 'unknown' else None}
+
     def status(self, *, limit=50):
         self._limit(limit)
         # A status read never mutates expired jobs; expose ambiguity explicitly.

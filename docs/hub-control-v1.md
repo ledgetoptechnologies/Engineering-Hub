@@ -78,6 +78,14 @@ The REST contract is `contracts/hub-v1.openapi.json`; the running service expose
 `/openapi.json`. `/api/hub/v1/overview` supplies tasks, decisions, runs, configured
 projects and explicit capability flags. Unknown host/agent state is not online.
 
+Authenticated humans and agents can read machine-wide queue reservation state
+at `GET /api/hub/v1/work/machines/{machine_id}` for a registered machine. This
+shares the existing work-status read authority across projects and returns no
+job, owner, target or lease details. `not_reserved` describes only this queue's
+records; it does not prove the physical machine is idle or exclude other queues
+or writers. Expired claims are held for reconciliation; inconsistent records
+report `unknown`. An unconfigured queue returns 423.
+
 Humans assign tasks. A distinct existing agent identity claims each task, records
 an exact 40-character commit and obtains a different agent's review of that exact
 commit. All changes use expected revisions. Replacing a candidate invalidates

@@ -162,6 +162,11 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
         identity(request, actor)
         return {'items': configured().status(limit=limit)['jobs']}
 
+    @app.get('/api/hub/v1/work/machines/{machine_id}')
+    def machine_reservation(machine_id: Key, request: Request):
+        identity(request, actor)
+        return configured().machine_reservation(machine_id)
+
     @app.get('/api/hub/v1/work/jobs/{job_id}')
     def get_job(job_id: JobID, request: Request):
         identity(request, actor)

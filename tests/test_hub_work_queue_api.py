@@ -116,6 +116,31 @@ def test_reads_require_identity_and_all_agents_can_read(rig):
             assert client.get(BASE + path, headers=bearer(name)).status_code == 200
 
 
+def test_machine_reservation_requires_identity_and_exposes_no_job_details(rig):
+    client, _, _, build, _, submission, sessions, config = rig
+    path = BASE + '/machines/staging-pc'
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    session = sessions.create_session(42)
+    client.cookies.set(config.cookie_name, session['cookie_token'])
+    assert client.get(path).status_code == 200
+    assert client.get(path, headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert client.get(path, headers=[('Authorization', 'Bearer test-codex'),
+                                    ('Authorization', 'Bearer test-claude')]).status_code == 401
+    client.cookies.clear()
+    assert client.get(path, headers=bearer()).json() == {
+        'machine_id': 'staging-pc', 'queue_reservation': 'not_reserved',
+        'requires_reconciliation': False}
+    assert client.get(BASE + '/machines/unknown', headers=bearer()).status_code == 404
+    assert client.post(BASE + '/jobs', headers=bearer(), json=submission()).status_code == 201
+    assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).status_code == 200
+    assert client.get(path, headers=bearer()).json() == {
+        'machine_id': 'staging-pc', 'queue_reservation': 'active',
+        'requires_reconciliation': False}
+    with build(None) as unconfigured:
+        assert unconfigured.get(path, headers=bearer()).status_code == 423
+
+
 def test_unconfigured_returns423_after_auth_for_all_routes(rig):
     _, _, _, build, _, submission, *_ = rig
     with build(None) as client:
