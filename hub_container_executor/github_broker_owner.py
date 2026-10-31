@@ -146,7 +146,7 @@ def _cgroup_v2(fd):
 
 def _runtime(policy_file):
     """Validate independent root policy and immutable local source snapshot."""
-    from scripts.hub_local_test_launcher import source_tree_digest
+    from .source_tree import source_tree_digest
     raw,_=_root_file(_path(policy_file),16384)
     data=_strict(raw,16384)
     base={'schema','source_root','source_digest','python_path','python_digest'}

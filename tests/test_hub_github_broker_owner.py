@@ -15,6 +15,22 @@ from hub_container_executor import github_broker_owner as owner
 from tests.test_hub_github_broker_service import enrollment, fd_for
 
 
+def test_runtime_validation_does_not_import_local_fixture_launcher(monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name.startswith('scripts.hub_local_test_launcher'):
+            pytest.fail('broker runtime imported an unpackaged test launcher')
+        return original(name, *args, **kwargs)
+    class ReachedPolicyValidation(Exception): pass
+    def policy(*args, **kwargs): raise ReachedPolicyValidation()
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    monkeypatch.setattr(owner, '_root_file', policy)
+    with pytest.raises(ReachedPolicyValidation):
+        owner._runtime('/test-only/missing-policy')
+
+
 def test_stop_write_failure_still_waits_for_owned_child(monkeypatch):
     from hub_container_executor.github_broker_service import BrokerServiceError
     seen=[]
@@ -70,7 +86,7 @@ def test_supervised_broker_denies_missing_cgroup_before_spawn(monkeypatch):
 
 @pytest.mark.skipif(os.getuid()!=0,reason='requires root-owned protected policy fixture')
 def test_v2_runtime_policy_requires_and_pins_explicit_cgroup(monkeypatch):
-    import scripts.hub_local_test_launcher as launcher
+    from hub_container_executor import source_tree
     root=Path(tempfile.mkdtemp(prefix='eh-broker-runtime-',dir='/root'));source=root/'source';source.mkdir()
     python=Path(sys.executable).resolve();digest='sha256:'+hashlib.sha256(python.read_bytes()).hexdigest()
     source_digest='sha256:'+'a'*64;seen=[]
@@ -79,7 +95,7 @@ def test_v2_runtime_policy_requires_and_pins_explicit_cgroup(monkeypatch):
         def close(self):seen.append('closed')
     monkeypatch.setattr(owner,'_BrokerCgroup',SyntheticCgroup)
     monkeypatch.setattr(owner.os,'fstatvfs',lambda _:SimpleNamespace(f_flag=os.ST_RDONLY))
-    monkeypatch.setattr(launcher,'source_tree_digest',lambda path,**kw:source_digest)
+    monkeypatch.setattr(source_tree,'source_tree_digest',lambda path,**kw:source_digest)
     policy={'schema':'engineering-hub.github-broker-runtime.v2','source_root':str(source),
             'source_digest':source_digest,'python_path':str(python),'python_digest':digest,
             'cgroup_path':'/sys/fs/cgroup/hub-synthetic'}
