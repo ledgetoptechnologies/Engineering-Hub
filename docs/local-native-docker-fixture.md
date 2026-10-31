@@ -55,6 +55,12 @@ The explicit v2 launcher can pin an already-authorized socket supplementary
 group for its task containers; it does not change host socket permissions or
 account group membership. This grants those containers daemon capability and
 is suitable only under the stated trusted-local-operator assumption.
+The Windows parent request must also include the independently observed
+`operator_socket_source` for its Desktop socket proxy. The fixed operator
+requests private propagation and checks the created container's requested and
+effective bind metadata; a mismatch remains held. Before launching the inner
+fixture, its bootstrap checks the daemon ID through the mounted socket. This
+does not establish exclusive daemon access or host custody.
 The coordinator writes an authenticated post-exit cleanup handoff only after
 its native work and exact container cleanup have drained; the launcher must
 independently verify coordinator removal and exact container absence before it

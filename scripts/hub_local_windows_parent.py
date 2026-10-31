@@ -15,7 +15,7 @@ import stat
 
 from scripts.hub_local_windows_storage import WindowsTask, Held, provision_storage
 from scripts.hub_local_windows_initialization import initialize, SEED, CLI, _file, _stable_file_observation, validate_daemon_paths
-from scripts.hub_local_windows_operator import run_operator, OPERATOR_IMAGE
+from scripts.hub_local_windows_operator import run_operator, OPERATOR_IMAGE, SOCKET_PROXY
 from scripts.hub_local_windows_cleanup import cleanup
 
 
@@ -25,7 +25,7 @@ def _preflight(config):
     from scripts.hub_local_test_oci import verify_fixture_image
     from scripts.hub_local_test_launcher import _check_resource_envelope
     inner=config['inner']
-    if (config['helper_image_id']!=OPERATOR_IMAGE or config['operator_image_id']!=OPERATOR_IMAGE
+    if (config['helper_image_id']!=OPERATOR_IMAGE or config['operator_image_id']!=OPERATOR_IMAGE or config['operator_socket_source']!=SOCKET_PROXY
         or inner['helper_image_id']!=OPERATOR_IMAGE or inner['coordinator_image_id']!=OPERATOR_IMAGE
         or type(config['daemon_id']) is not str or not re.fullmatch(r'[A-Za-z0-9:._-]{12,128}',config['daemon_id'])
         or type(inner['source_digest']) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}',inner['source_digest'])
@@ -60,7 +60,7 @@ def _daemon_preflight(task,images,helper_image):
 
 def run(config):
     fields={'daemon_id','docker_root','base_dir','helper_image_id','operator_image_id',
-            'archive','archive_sha256','client','daemon_paths','inner','timeout_seconds'}
+            'archive','archive_sha256','client','daemon_paths','operator_socket_source','inner','timeout_seconds'}
     inner_fields={'helper_image_id','coordinator_image_id','initial_manifest','candidate','rollback',
                   'source_digest','startup_wait_ms','timeout_seconds'}
     if (type(config) is not dict or set(config)!=fields or type(config['inner']) is not dict
@@ -87,7 +87,7 @@ def run(config):
             'daemon_id':config['daemon_id'],'source_root':storage.source_mount+'/checkout',
             'private_dir':storage.scratch_mount,'journal_dir':storage.journal_mount,'socket_group':0}
         completion=run_operator(task,storage,image_id=config['operator_image_id'],request=request,
-                                timeout_seconds=config['timeout_seconds'])
+                                timeout_seconds=config['timeout_seconds'],socket_source=config['operator_socket_source'])
         result=cleanup(task,storage,completion)
         return {'status':result['status'],'task_id':task_id,'journal':str(task.journal_path),'journal_volume':result['journal_volume']}
     except Exception:

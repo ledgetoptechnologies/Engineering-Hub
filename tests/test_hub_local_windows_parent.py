@@ -8,6 +8,7 @@ def config(tmp_path):
         'helper_image_id':'sha256:'+'a'*64,'operator_image_id':'sha256:'+'b'*64,
         'archive':'archive','archive_sha256':'sha256:'+'c'*64,'client':'client',
         'daemon_paths':['C:\\p\\script','C:\\p\\archive','C:\\p\\client'],
+        'operator_socket_source':'/run/host-services/docker.proxy.sock',
         'timeout_seconds':60,'inner':{'helper_image_id':'sha256:'+'a'*64,'coordinator_image_id':'sha256:'+'d'*64,
         'initial_manifest':'manifest','candidate':{},'rollback':{},'source_digest':'sha256:'+'e'*64,
         'startup_wait_ms':0,'timeout_seconds':60}}
