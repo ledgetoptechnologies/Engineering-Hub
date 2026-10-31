@@ -43,7 +43,8 @@ from tests.test_hub_queued_pilot import DistinctContainerClient, ACTION, MACHINE
 
 
 @pytest.mark.asyncio
-async def test_local_signed_observation_requires_authenticated_operator(synthetic_issuer, monkeypatch):
+@pytest.mark.parametrize('rollback', [False, True])
+async def test_local_signed_observation_requires_authenticated_operator(synthetic_issuer, monkeypatch, rollback):
     import hub_container_executor.trusted_local_session as installed_local
     if os.environ.get('TEST_INSTALLED_EXECUTOR'):
         assert installed_local.__file__.startswith('/tmp/installed-executor/')
@@ -136,7 +137,7 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
                 target = ContainerPilotTarget.from_manifest(manifest)
                 gate = composition.reconciliation_factory(owner, target)
                 repo = HubRepository(database, execution_principal='executor:container-pilot', pilot_owner=owner)
-                client = DistinctContainerClient()
+                client = DistinctContainerClient({'smoke_container': 'failed'} if rollback else None)
                 workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
                 queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project='engineering-hub')})
                 bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE,
@@ -199,15 +200,27 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
                             if result['state'] in {'succeeded', 'failed', 'held'}: return result
                             await asyncio.sleep(.01)
                     result = await asyncio.wait_for(wait_done(), timeout=10)
-                    assert result['id'] == job['id'] and result['state'] == 'succeeded'
+                    assert result['id'] == job['id'] and result['state'] == ('failed' if rollback else 'succeeded')
                 finally:
                     try:
                         await runtime.stop()
                     finally:
                         await feed.stop()
-                assert [command.action for command in client.submissions] == ['deploy_container', 'smoke_container']
-                assert repo.list_runs()[0]['status'] == 'succeeded'
-                assert len(observations) >= 3 and checks and not failures and not adapter.touched
+                expected = ['deploy_container', 'smoke_container']
+                if rollback: expected += ['rollback_container', 'smoke_container_rollback']
+                assert [command.action for command in client.submissions] == expected
+                run = repo.list_runs()[0]
+                assert run['status'] == ('rolled_back' if rollback else 'succeeded')
+                if rollback:
+                    with repo._connection() as db:
+                        rows = db.execute('SELECT action,response_json FROM hub_container_pilot_commands WHERE run_id=?',
+                                          (run['id'],)).fetchall()
+                    receipts = {row['action']: json.loads(row['response_json']) for row in rows}
+                    assert receipts['deploy_container']['evidence']['container_id'] == 'e' * 64
+                    assert receipts['smoke_container']['evidence']['container_id'] == 'e' * 64
+                    assert receipts['rollback_container']['evidence']['container_id'] == 'f' * 64
+                    assert receipts['smoke_container_rollback']['evidence']['container_id'] == 'f' * 64
+                assert len(observations) >= (5 if rollback else 3) and checks and not failures and not adapter.touched
                 server_stop.set(); thread.join(3)
                 assert not thread.is_alive()
     finally:
