@@ -4,6 +4,8 @@ import hashlib
 import socket
 import sqlite3
 import struct
+import subprocess
+import sys
 import threading
 import time
 from uuid import uuid4
@@ -16,6 +18,7 @@ from hub_container_executor.state_custodian_admission import (
     CustodianAdmissionError, CustodianAdmissionJournal, DOMAIN, PROTOCOL, _canonical,
 )
 import hub_container_executor.state_custodian_admission as admission_module
+from hub_container_executor.launch_supervisor import _boot_id, _proc_start
 
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='requires synthetic root-owned enrollment')
 
@@ -151,7 +154,8 @@ def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
         journal.close()
 
 
-def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch):
+@pytest.mark.parametrize('uncertain_chown', [False, True, 'late'])
+def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch, uncertain_chown):
     source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
     stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
     source = source_dir / 'backup.sqlite'
@@ -212,6 +216,59 @@ def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch):
             journal.stage_quarantined_backup(operation_id=third['operation_id'], admission_digest=third_token,
                                              copy_policy_path=copy_policy, timeout_seconds=3)
         assert not (stage / (third['operation_id'] + '.quarantine')).exists()
+        owner_policy = tmp_path / 'owner.json'
+        owner_policy.write_bytes(_canonical({'schema': 1, 'boot_id': _boot_id(), 'daemon_pid': os.getpid(),
+            'daemon_start_ticks': _proc_start(os.getpid()), 'uid_map': open('/proc/self/uid_map').read(),
+            'gid_map': open('/proc/self/gid_map').read(), 'app_uid': 10002, 'app_gid': 10002}))
+        owner_policy.chmod(0o600)
+        with monkeypatch.context() as hooks:
+            if uncertain_chown == 'late':
+                root_file = admission_module._root_file
+                monotonic = time.monotonic
+                def delayed_policy(path, maximum):
+                    result = root_file(path, maximum)
+                    if (stage / (payload['operation_id'] + '.ownership-intent')).exists():
+                        hooks.setattr(admission_module.time, 'monotonic', lambda: monotonic() + 10)
+                    return result
+                hooks.setattr(admission_module, '_root_file', delayed_policy)
+                with pytest.raises(CustodianAdmissionError):
+                    journal.prepare_private_owner(operation_id=payload['operation_id'], admission_digest=token,
+                                                  owner_policy_path=owner_policy)
+            elif uncertain_chown:
+                real_fchown = os.fchown
+                def changed_then_failed(fd, uid, gid):
+                    real_fchown(fd, uid, gid)
+                    raise OSError('synthetic uncertain ownership')
+                hooks.setattr(admission_module.os, 'fchown', changed_then_failed)
+                with pytest.raises(CustodianAdmissionError):
+                    journal.prepare_private_owner(operation_id=payload['operation_id'], admission_digest=token,
+                                                  owner_policy_path=owner_policy)
+            else:
+                prepared = journal.prepare_private_owner(operation_id=payload['operation_id'], admission_digest=token,
+                                                          owner_policy_path=owner_policy)
+                assert prepared['state'] == 'private_owner_prepared'
+        assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
+        assert (stage / (payload['operation_id'] + '.ownership-intent')).exists()
+        denied = subprocess.run([sys.executable, '-c', 'import sys; open(sys.argv[1], "rb")', str(output)],
+            user=10002, group=10002, extra_groups=(), env={'LANG': 'C.UTF-8'}, cwd='/',
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        assert denied.returncode != 0
+        with pytest.raises(CustodianAdmissionError):
+            journal.prepare_private_owner(operation_id=payload['operation_id'], admission_digest=token,
+                                          owner_policy_path=owner_policy)
+        # Restore unrelated capacity and source conditions; the prior prepared
+        # file and its marker must be accounted without being adopted or reused.
+        filler.unlink()
+        source.write_bytes(output.read_bytes()); source.chmod(0o600)
+        policy['maximum_total_bytes'] = 4 * 1024 * 1024
+        copy_policy.write_bytes(_canonical(policy)); copy_policy.chmod(0o600)
+        fourth = dict(payload, operation_id=str(uuid4()), nonce='1' * 64)
+        fourth_token = journal.reserve(fourth, key.sign(DOMAIN + _canonical(fourth)))
+        fourth_result = journal.stage_quarantined_backup(operation_id=fourth['operation_id'], admission_digest=fourth_token,
+                                                         copy_policy_path=copy_policy, timeout_seconds=3)
+        assert fourth_result['digest'] == backup_digest
+        assert (stage / (fourth['operation_id'] + '.quarantine')).exists()
+        assert output.stat().st_uid == (0 if uncertain_chown == 'late' else 10002)
     finally:
         journal.close()
     reopened = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=False)

@@ -1,4 +1,4 @@
-"""Provider-side signed one-shot reservation; never performs a state effect.
+"""Provider-side signed one-shot reservation and private quarantine copy.
 
 Root-owned enrollment and journal are independent of the executor. A successful
 reservation is only a point-in-time admission record, not continuing custody or
@@ -23,7 +23,7 @@ import time
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from .launch_supervisor import _canonical, _root_file, _root_parent, _path
+from .launch_supervisor import _canonical, _root_file, _root_parent, _path, _Process, _boot_id, _mapped_id
 
 PROTOCOL = 'engineering-hub.state-custodian-admission.v1'
 DOMAIN = b'engineering-hub.state-custodian-admission.v1\x00'
@@ -66,13 +66,15 @@ class CustodianAdmissionJournal:
     manifest_digest, source_backup_digest, provider_key_digest, provider_uid and provider_gid. Its file
     and ancestors must satisfy the existing root-protected enrollment rules.
     Root and its administrators remain trusted; no anti-rollback storage is
-    claimed. No network listener, handoff, file copy or publication is provided.
+    claimed. This module can copy a backup into root-private quarantine; it
+    provides no network listener, ownership handoff or application publication.
     """
     def __init__(self, *, enrollment_path, journal_path, create):
         self._fd = None
         self._db = None
         self._pid = os.getpid()
         self._fresh = {}
+        self._staged = {}
         try:
             if os.geteuid() != 0 or type(create) is not bool:
                 raise ValueError()
@@ -196,6 +198,7 @@ class CustodianAdmissionJournal:
         The backup must be independently approved as a coherent, quiescent
         SQLite backup. Root administrators and filesystem/mount isolation remain
         trusted. Accounting excludes writes by other privileged principals.
+        Prepared or uncertain files remain held, and count against capacity.
         """
         source_fd = output_fd = source_parent = stage_fd = None
         try:
@@ -245,17 +248,46 @@ class CustodianAdmissionJournal:
             header = os.pread(source_fd, 20, 0)
             if header[:16] != b'SQLite format 3\x00' or header[18:20] != b'\x01\x01': raise ValueError()
             used = 0
+            inventory = {}
             with os.scandir(stage_fd) as entries:
                 for entry in entries:
                     current()
-                    if (not entry.name.endswith('.quarantine')
-                            or str(UUID(entry.name.removesuffix('.quarantine'))) != entry.name.removesuffix('.quarantine')):
-                        raise ValueError()
+                    suffix = next((s for s in ('.quarantine', '.ownership-intent') if entry.name.endswith(s)), None)
+                    if suffix is None: raise ValueError()
+                    operation = entry.name.removesuffix(suffix)
+                    if str(UUID(operation)) != operation: raise ValueError()
                     item = entry.stat(follow_symlinks=False)
-                    if (not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_nlink != 1
-                            or stat.S_IMODE(item.st_mode) != 0o600): raise ValueError()
+                    if not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 or stat.S_IMODE(item.st_mode) != 0o600: raise ValueError()
+                    inventory[entry.name] = item
                     used += item.st_size
                     if used + info.st_size > policy['maximum_total_bytes']: raise ValueError()
+            for name, item in inventory.items():
+                if name.endswith('.ownership-intent'):
+                    operation = name.removesuffix('.ownership-intent')
+                    counterpart = inventory.get(operation + '.quarantine')
+                    if item.st_uid != 0 or item.st_size > 4096 or counterpart is None: raise ValueError()
+                    marker = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
+                    try:
+                        marker_info = os.fstat(marker)
+                        if (marker_info.st_dev, marker_info.st_ino) != (item.st_dev, item.st_ino): raise ValueError()
+                        raw_marker = os.read(marker, 4097)
+                    finally:
+                        os.close(marker)
+                    evidence = json.loads(raw_marker)
+                    if (type(evidence) is not dict or set(evidence) != {'operation_id', 'admission_digest', 'device', 'inode', 'host_uid', 'host_gid', 'size', 'digest'}
+                            or _canonical(evidence) != raw_marker or evidence['operation_id'] != operation
+                            or type(evidence['admission_digest']) is not str or not _HEX.fullmatch(evidence['admission_digest'])
+                            or type(evidence['digest']) is not str or not _SHA.fullmatch(evidence['digest'])
+                            or any(type(evidence[k]) is not int or evidence[k] < 0 for k in ('device', 'inode', 'host_uid', 'host_gid', 'size'))
+                            or (counterpart.st_dev, counterpart.st_ino) != (evidence['device'], evidence['inode'])
+                            or counterpart.st_size != evidence['size']
+                            or (counterpart.st_uid, counterpart.st_gid) not in ((0, 0), (evidence['host_uid'], evidence['host_gid']))):
+                        raise ValueError()
+                    record = self._db.execute('SELECT payload,signature FROM admissions WHERE operation_id=?', (operation,)).fetchone()
+                    if (record is None or hashlib.sha256(record[0]).hexdigest() != evidence['admission_digest']): raise ValueError()
+                    self._key.verify(record[1], DOMAIN + record[0])
+                elif item.st_uid != 0 and name.removesuffix('.quarantine') + '.ownership-intent' not in inventory:
+                    raise ValueError()
             space = os.fstatvfs(stage_fd)
             if used + info.st_size > policy['maximum_total_bytes'] or space.f_bavail * space.f_frsize < info.st_size + policy['minimum_free_bytes']:
                 raise ValueError()
@@ -300,6 +332,8 @@ class CustodianAdmissionJournal:
                     or _root_file(policy_path, 4096)[1] != policy_pin):
                 raise ValueError()
             current()
+            self._staged[operation_id] = (admission_digest, stage, (out.st_dev, out.st_ino),
+                                           policy['source_digest'], total, deadline, last_wall, last_mono, fresh[1])
             return {'operation_id': operation_id, 'admission_digest': admission_digest,
                     'digest': 'sha256:' + digest.hexdigest(), 'size_bytes': total}
         except Exception:
@@ -310,7 +344,105 @@ class CustodianAdmissionJournal:
                 if fd is not None:
                     try: os.close(fd)
                     except OSError: close_failed = True
-            if close_failed: raise CustodianAdmissionError() from None
+            if close_failed:
+                self._staged.pop(operation_id, None)
+                raise CustodianAdmissionError() from None
+
+    def prepare_private_owner(self, *, operation_id, admission_digest, owner_policy_path):
+        """Change a fresh quarantine file's owner without making it accessible.
+
+        This is private preparation, not a handoff, publication, current-fence
+        grant or mount approval. The root-private parent stays inaccessible to
+        the app, and an intent marker and file remain on all failures. The root
+        enrollment must independently identify the actual daemon process; this
+        method checks its PID/start/maps but does not identify it as a daemon.
+        Trusted root/daemon administrators can override this boundary.
+        Preparation leaves the file and a root-owned intent marker held; later
+        copies may account for them but cannot adopt, retry or publish them.
+        """
+        stage_fd = file_fd = marker_fd = None
+        peer = None
+        try:
+            self._check()
+            if type(operation_id) is not str or type(admission_digest) is not str: raise ValueError()
+            saved = self._staged.pop(operation_id, None)
+            if saved is None or saved[0] != admission_digest: raise ValueError()
+            _, stage, inode, digest, size, deadline, last_wall, last_mono, expires = saved
+            policy_path = _path(str(owner_policy_path))
+            raw, pin = _root_file(policy_path, 16384)
+            policy = json.loads(raw)
+            if (type(policy) is not dict or set(policy) != {'schema', 'boot_id', 'daemon_pid', 'daemon_start_ticks',
+                    'uid_map', 'gid_map', 'app_uid', 'app_gid'} or _canonical(policy) != raw
+                    or type(policy['schema']) is not int or policy['schema'] != 1
+                    or type(policy['daemon_pid']) is not int or policy['daemon_pid'] <= 0
+                    or type(policy['daemon_start_ticks']) is not int or policy['daemon_start_ticks'] <= 0
+                    or any(type(policy[k]) is not str or len(policy[k]) > 65536 for k in ('boot_id', 'uid_map', 'gid_map'))
+                    or any(type(policy[k]) is not int or not 0 < policy[k] < 2**32 - 1 or policy[k] == 10001
+                           for k in ('app_uid', 'app_gid'))):
+                raise ValueError()
+            peer = _Process(policy['daemon_pid'], expected_start=policy['daemon_start_ticks'])
+            def current():
+                nonlocal last_wall, last_mono
+                self._check(); peer.check()
+                if _boot_id() != policy['boot_id'] or _root_file(policy_path, 16384)[1] != pin: raise ValueError()
+                uid_map = Path(f"/proc/{peer.pid}/uid_map").read_text()
+                gid_map = Path(f"/proc/{peer.pid}/gid_map").read_text()
+                if uid_map != policy['uid_map'] or gid_map != policy['gid_map']: raise ValueError()
+                peer.check()
+                mono, wall = time.monotonic(), time.time_ns() // 1_000_000
+                if not last_mono <= mono < deadline or not last_wall <= wall < expires: raise ValueError()
+                last_mono, last_wall = mono, wall
+                return _mapped_id(uid_map, policy['app_uid']), _mapped_id(gid_map, policy['app_gid'])
+            host_uid, host_gid = current()
+            if (not 0 < host_uid < 2**32 - 1 or not 0 < host_gid < 2**32 - 1
+                    or host_uid in (10001, self._policy['provider_uid'], _mapped_id(policy['uid_map'], 10001))
+                    or host_gid in (10001, self._policy['provider_gid'], _mapped_id(policy['gid_map'], 10001))):
+                raise ValueError()
+            stage_fd = _root_parent(stage / 'entry', private=True)
+            fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            name = operation_id + '.quarantine'
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=stage_fd)
+            before = os.fstat(file_fd)
+            named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size != size
+                    or (before.st_dev, before.st_ino) != inode or (named.st_dev, named.st_ino) != inode): raise ValueError()
+            hashed = hashlib.sha256()
+            while True:
+                current(); block = os.read(file_fd, 1024 * 1024)
+                if not block: break
+                hashed.update(block)
+            if 'sha256:' + hashed.hexdigest() != digest or current() != (host_uid, host_gid): raise ValueError()
+            marker_fd = os.open(operation_id + '.ownership-intent', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=stage_fd)
+            marker = _canonical({'operation_id': operation_id, 'admission_digest': admission_digest,
+                                 'device': inode[0], 'inode': inode[1], 'host_uid': host_uid, 'host_gid': host_gid,
+                                 'size': size, 'digest': digest})
+            if os.write(marker_fd, marker) != len(marker): raise ValueError()
+            os.fsync(marker_fd); os.fsync(stage_fd)
+            if current() != (host_uid, host_gid): raise ValueError()
+            os.fchown(file_fd, host_uid, host_gid)
+            os.fsync(file_fd); os.fsync(stage_fd)
+            after = os.fstat(file_fd)
+            named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+            if ((after.st_dev, after.st_ino) != inode or (named.st_dev, named.st_ino) != inode
+                    or after.st_uid != host_uid or after.st_gid != host_gid or after.st_nlink != 1
+                    or stat.S_IMODE(after.st_mode) != 0o600 or after.st_size != size
+                    or current() != (host_uid, host_gid)): raise ValueError()
+            return {'operation_id': operation_id, 'admission_digest': admission_digest,
+                    'state': 'private_owner_prepared', 'device': inode[0], 'inode': inode[1]}
+        except Exception:
+            raise CustodianAdmissionError() from None
+        finally:
+            failed = False
+            for fd in (marker_fd, file_fd, stage_fd):
+                if fd is not None:
+                    try: os.close(fd)
+                    except OSError: failed = True
+            if peer is not None:
+                try: peer.close()
+                except OSError: failed = True
+            if failed: raise CustodianAdmissionError() from None
 
     def exchange(self, channel, *, operation_id, timeout_seconds, provider_uid, provider_gid):
         """Request and reserve one observation on an owned connected seqpacket.
