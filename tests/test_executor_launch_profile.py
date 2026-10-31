@@ -300,6 +300,83 @@ def coordinator_profile(**changes):
     return value
 
 
+def trusted_local_profile():
+    root = '/operator/hub-pilot-local'
+    data = profile(root=root, daemon_policy=policy(), role='trusted-local-coordinator-v1')
+    data.update(entrypoint=['/opt/venv/bin/python', '-I', '-m', 'hub_container_executor.trusted_local_session'],
+        command=['--config', '/operator/coordinator.json', '--enrollment', '/operator-evidence/session.json'],
+        runner_file='/opt/venv/lib/python3.12/site-packages/hub_container_executor/trusted_local_session.py')
+    data['mounts'] = []
+    for role, target in core.TRUSTED_LOCAL_COORDINATOR_TARGETS.items():
+        kind = 'file' if role in {'local_config', 'local_enrollment'} else 'directory'
+        data['mounts'].append(dict(role=role, source=root+'/'+role, target=target, kind=kind,
+            read_only=role not in {'local_state', 'local_browser_directory'}, uid=110001, gid=110001,
+            mode=0o600 if kind in {'file', 'socket'} else 0o700,
+            content_digest='sha256:'+'a'*64 if kind=='file' else None))
+    return data
+
+
+def test_trusted_local_profile_is_distinct_closed_and_preserves_old_bytes():
+    previous = coordinator_profile()
+    assert core.ExecutorLaunchProfile.model_validate(previous).enrollment_value() == previous
+    data = trusted_local_profile()
+    raw = core.canonical(data)
+    assert core.verify_profile_bytes(raw, digest_of(raw)).enrollment_value() == data
+    for key, value in [('user', '10002:10002'), ('command', ['--config', '/operator/coordinator.json']),
+                       ('command_channel', 'inherited-seqpacket-v1'), ('supplementary_groups', [123])]:
+        with pytest.raises((ValueError, RuntimeError)):
+            core.ExecutorLaunchProfile.model_validate(dict(data, **{key: value}))
+    for role, changes in [('local_enrollment', {'read_only': False}),
+                          ('local_executor_directory', {'uid': 10001}),
+                          ('local_browser_directory', {'read_only': True})]:
+        altered = trusted_local_profile()
+        _swap_mount(altered, role, **changes)
+        with pytest.raises((ValueError, RuntimeError)):
+            core.ExecutorLaunchProfile.model_validate(altered)
+
+
+def test_trusted_local_commitment_binds_paths_and_v3_operator():
+    pytest.importorskip('fcntl')
+    from hub_container_executor.configuration_commitment import trusted_local_coordinator_commitment
+    from tests.test_hub_container_executor_installed_coordinator import github_configuration, canonical
+    from tests.test_hub_trusted_queued_session import v2_document, encode
+    from engineering_hub.trusted_queued_session import SCHEMA_V3
+    from tests.test_hub_unified_pilot_startup import profile_document
+    config = github_configuration()
+    config['manifest'] = profile_document()['manifest']
+    config.update(database_path='/var/lib/engineering-hub/local-coordinator/hub.sqlite',
+                  coordinator_socket_path='/run/hub-browser/hub.sock',
+                  executor_socket_path='/run/hub-executor/executor.sock',
+                  secret_root='/var/lib/engineering-hub/local-secrets')
+    enrollment = v2_document(); enrollment.update(schema=SCHEMA_V3, operator_actor='human:123')
+    config_raw, enrollment_raw = canonical(config), encode(enrollment)
+    data = trusted_local_profile()
+    data['daemon_policy']['engine_id'] = enrollment['launch']['engine_id']
+    _swap_mount(data, 'local_config', content_digest=digest_of(config_raw))
+    _swap_mount(data, 'local_enrollment', content_digest=digest_of(enrollment_raw))
+    signed = core.ExecutorLaunchProfile.model_validate(data)
+    assert trusted_local_coordinator_commitment(signed, config_raw, enrollment_raw).raw_digest == digest_of(config_raw)
+    for altered in (dict(config, executor_socket_path='/run/elsewhere/executor.sock'),
+                    dict(config, public_auth=dict(config['public_auth'], beau_github_id=124))):
+        raw = canonical(altered)
+        rebound = trusted_local_profile()
+        rebound['daemon_policy']['engine_id'] = enrollment['launch']['engine_id']
+        _swap_mount(rebound, 'local_config', content_digest=digest_of(raw))
+        _swap_mount(rebound, 'local_enrollment', content_digest=digest_of(enrollment_raw))
+        with pytest.raises(ValueError):
+            trusted_local_coordinator_commitment(core.ExecutorLaunchProfile.model_validate(rebound), raw, enrollment_raw)
+    with pytest.raises(ValueError):
+        trusted_local_coordinator_commitment(signed, config_raw + b' ', enrollment_raw)
+    remapped = trusted_local_profile()
+    remapped['daemon_policy']['engine_id'] = enrollment['launch']['engine_id']
+    remapped['daemon_policy']['uid_map'] = [[0, 10002, 1], [1, 200001, 65536]]
+    remapped['mounts'] = [dict(mount, uid=210001) for mount in remapped['mounts']]
+    _swap_mount(remapped, 'local_config', content_digest=digest_of(config_raw))
+    _swap_mount(remapped, 'local_enrollment', content_digest=digest_of(enrollment_raw))
+    with pytest.raises(ValueError):
+        trusted_local_coordinator_commitment(core.ExecutorLaunchProfile.model_validate(remapped), config_raw, enrollment_raw)
+
+
 def channel_profile():
     return profile(daemon_policy=policy(), command_channel='inherited-seqpacket-v1')
 

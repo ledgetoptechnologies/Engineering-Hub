@@ -27,6 +27,16 @@ the matching numeric GitHub operator. Both the signed observation and command
 factory use the same configured Unix socket and captured executor credential,
 subject to the no-replacement host prerequisite above.
 
+The signed profile parser recognizes the separate
+`trusted-local-coordinator-v1` role, with a fixed entrypoint, mapped UID/GID,
+and closed, separately mounted config, enrollment, database, secret and socket
+directories. The pure configuration commitment checks the v2 GitHub config,
+v3 enrollment, paths and file digests together. **The supervisor still rejects
+this role before creating its journal or contacting the Engine.** This profile
+is not an installed launch path: protected mount capture, commitment checks in
+the supervisor, coordinator/executor lifecycle binding and host custody still
+need to be implemented and verified before that guard can be reconsidered.
+
 Run the following as the independently launched container's PID 1, using paths
 that already exist inside its approved mounts:
 

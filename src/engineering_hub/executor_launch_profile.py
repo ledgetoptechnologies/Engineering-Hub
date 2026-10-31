@@ -43,6 +43,14 @@ COORDINATOR_TARGETS = MappingProxyType({
     'state': '/var/lib/engineering-hub/coordinator',
     'secrets': '/var/lib/engineering-hub/coordinator-secrets',
 })
+TRUSTED_LOCAL_COORDINATOR_TARGETS = MappingProxyType({
+    'local_config': '/operator/coordinator.json',
+    'local_enrollment': '/operator-evidence/session.json',
+    'local_state': '/var/lib/engineering-hub/local-coordinator',
+    'local_secrets': '/var/lib/engineering-hub/local-secrets',
+    'local_executor_directory': '/run/hub-executor',
+    'local_browser_directory': '/run/hub-browser',
+})
 _EXECUTOR_ID = 10001
 _COORDINATOR_ID = 10002
 
@@ -92,6 +100,16 @@ class ExecutorLaunchMount(_Closed):
 
     @model_validator(mode='after')
     def closed_role(self):
+        if self.role in TRUSTED_LOCAL_COORDINATOR_TARGETS:
+            _require(self.target == TRUSTED_LOCAL_COORDINATOR_TARGETS[self.role])
+            _path(self.source)
+            kind = 'file' if self.role in {'local_config', 'local_enrollment'} else 'directory'
+            _require(self.kind == kind and self.read_only is (self.role not in {'local_state', 'local_browser_directory'})
+                     and self.uid > 0 and self.gid > 0
+                     and self.mode == (0o600 if kind in {'file', 'socket'} else 0o700))
+            _require((type(self.content_digest) is str and _SHA.fullmatch(self.content_digest))
+                     if kind == 'file' else self.content_digest is None)
+            return self
         _require(self.role in _TARGETS or self.role in {'broker_socket', 'gate_channel_directory'})
         if self.role == 'broker_socket':
             _require(self.target == _BROKER_SOCKET_TARGET)
@@ -275,7 +293,7 @@ class ExecutorLaunchProfile(_Closed):
     broker_mode: Literal['broker-v1'] | None = None
     # Absent means the executor. A coordinator profile is a separate closed shape;
     # the supervisor refuses to launch it until pair launch is implemented.
-    role: Literal['coordinator'] | None = None
+    role: Literal['coordinator', 'trusted-local-coordinator-v1'] | None = None
     # Signed opt-in: commands arrive on a descriptor handed over at launch
     # instead of a path socket. The supervisor refuses it until implemented.
     command_channel: Literal['inherited-seqpacket-v1'] | None = None
@@ -306,20 +324,36 @@ class ExecutorLaunchProfile(_Closed):
     @model_validator(mode='after')
     def closed_profile(self):
         coordinator = self.role == 'coordinator'
+        local = self.role == 'trusted-local-coordinator-v1'
         identity = _COORDINATOR_ID if coordinator else _EXECUTOR_ID
-        module = 'installed_coordinator' if coordinator else 'installed_runner'
-        targets = COORDINATOR_TARGETS if coordinator else _TARGETS
+        module = 'installed_coordinator' if coordinator else 'trusted_local_session' if local else 'installed_runner'
+        targets = COORDINATOR_TARGETS if coordinator else TRUSTED_LOCAL_COORDINATOR_TARGETS if local else _TARGETS
         _require(self.user == f'{identity}:{identity}' and len(self.supplementary_groups) <= 2
                  and len(set(self.supplementary_groups)) == len(self.supplementary_groups)
                  and all(type(value) is int and 0 <= value < 2**32 - 1 for value in self.supplementary_groups))
         # The separately implemented, independently built runner must actually
         # exist in the pinned image; merely naming this module is not evidence.
         _require(self.entrypoint == ('/opt/venv/bin/python', '-I', '-m', f'hub_container_executor.{module}'))
-        _require(self.command == ((('serve',) if coordinator else ()) + ('--config', targets['config'])))
+        expected_command = (('--config', targets['local_config'], '--enrollment', targets['local_enrollment'])
+                            if local else ((('serve',) if coordinator else ()) + ('--config', targets['config'])))
+        _require(self.command == expected_command)
         _require(len(self.environment) <= 16 and len({item.split('=', 1)[0] for item in self.environment}) == len(self.environment)
                  and all(re.fullmatch(r'(PATH|LANG|LC_ALL|TZ|PYTHONDONTWRITEBYTECODE|PYTHONUNBUFFERED)=[^\x00\r\n]{1,512}', item)
                          for item in self.environment))
-        if coordinator:
+        if local:
+            _require(not self.supplementary_groups and self.daemon_policy is not None and self.broker_mode is None and self.command_channel is None
+                     and self.gate_channel is None and self.gate_completion is None
+                     and self.gate_ledger_channel is None and self.generation_isolation is None
+                     and self.custodian_control is None
+                     and _covers_inside(self.daemon_policy.uid_map, _EXECUTOR_ID)
+                     and _covers_inside(self.daemon_policy.gid_map, _EXECUTOR_ID))
+            host_uid = next(outside + _EXECUTOR_ID - inside for inside, outside, count in self.daemon_policy.uid_map
+                            if inside <= _EXECUTOR_ID < inside + count)
+            host_gid = next(outside + _EXECUTOR_ID - inside for inside, outside, count in self.daemon_policy.gid_map
+                            if inside <= _EXECUTOR_ID < inside + count)
+            _require(all(mount.uid == host_uid and mount.gid == host_gid for mount in self.mounts))
+            roles = set(TRUSTED_LOCAL_COORDINATOR_TARGETS)
+        elif coordinator:
             roles = set(COORDINATOR_TARGETS)
         elif self.broker_mode is None:
             roles = set(_TARGETS)
