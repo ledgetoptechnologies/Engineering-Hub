@@ -225,7 +225,7 @@ class SQLiteEventSource:
         max_flush_bytes: int = 8 * 1024 * 1024,
         on_error: Callable[[BaseException], None] | None = None,
         transient_busy_seconds: float = 0,
-        retry_busy_timeout_ms: int = 100,
+        retry_busy_timeout_ms: int | None = None,
         on_state: Callable[[str], None] | None = None,
     ) -> None:
         if not sys_platform_linux():
@@ -236,7 +236,11 @@ class SQLiteEventSource:
         if (type(transient_busy_seconds) not in {int, float} or not 0 <= transient_busy_seconds <= 3600
                 or transient_busy_seconds != transient_busy_seconds):
             raise ValueError("transient_busy_seconds must be between 0 and 3600")
-        if type(retry_busy_timeout_ms) is not int or not 1 <= retry_busy_timeout_ms <= busy_timeout_ms:
+        # Unset means 100 ms, never more than the normal wait, so existing short
+        # busy timeouts keep constructing exactly as before.
+        if retry_busy_timeout_ms is None:
+            retry_busy_timeout_ms = min(100, busy_timeout_ms)
+        elif type(retry_busy_timeout_ms) is not int or not 1 <= retry_busy_timeout_ms <= busy_timeout_ms:
             raise ValueError("retry_busy_timeout_ms must be positive and at most busy_timeout_ms")
         if read_buffer_bytes < _EVENT_HEADER.size:
             raise ValueError("read_buffer_bytes is too small for an inotify event")

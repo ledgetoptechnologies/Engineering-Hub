@@ -25,6 +25,9 @@ def ledger(tmp_path):
     supported, reason = native_event_support(path)
     if not supported:
         pytest.skip(reason)
+    # Scratch table for spilling uncommitted pages into the WAL (see poke).
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("CREATE TABLE spill(x BLOB)")
     return path
 
 
@@ -56,14 +59,18 @@ def source(path, recorder, **options):
 
 def hold_lock(path):
     holder = sqlite3.connect(path, isolation_level=None)
+    # A tiny page cache makes the holder's uncommitted writes spill into the WAL.
+    holder.execute("PRAGMA cache_size=2")
     holder.execute("BEGIN IMMEDIATE")
     return holder
 
 
-def poke(path):
-    # A metadata change is a relevant native event, so the source reconciles
-    # and meets the held lock without any data having been written.
-    os.utime(path)
+def poke(holder):
+    # Real uncommitted WAL writes by the lock holder: a relevant native event,
+    # so the source reconciles and meets the held lock. (Touching the database
+    # file instead would trip the separate replacement guard.)
+    for _ in range(32):
+        holder.execute("INSERT INTO spill VALUES (randomblob(65536))")
 
 
 def test_runtime_lock_suspends_then_resumes_with_changes_committed_meanwhile(tmp_path):
@@ -75,7 +82,7 @@ def test_runtime_lock_suspends_then_resumes_with_changes_committed_meanwhile(tmp
     try:
         assert events.stats["cursor"] == 0
         insert_outbox(holder)
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         assert not events.healthy and events.failure is None
         assert recorder.states == ["suspended"] and recorder.errors == []
@@ -106,7 +113,7 @@ def test_lock_held_past_the_bound_fails_closed(tmp_path):
     events.start()
     holder = hold_lock(path)
     try:
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.failure is not None, timeout=5)
         assert isinstance(events.failure, WatcherFailed)
         assert not events.healthy and len(recorder.errors) == 1
@@ -124,7 +131,7 @@ def test_disabled_by_default_keeps_failing_closed(tmp_path):
     events.start()
     holder = hold_lock(path)
     try:
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.failure is not None)
         assert events.stats["sqlite_errorname"] == "SQLITE_BUSY"
         assert recorder.states == [] and events.stats["suspensions"] == 0
@@ -147,6 +154,28 @@ def test_startup_never_waits_out_a_held_lock(tmp_path):
         events.stop()
 
 
+@pytest.mark.parametrize("locked", [False, True])
+def test_database_entry_change_still_fails_closed_when_enabled(tmp_path, locked):
+    path = ledger(tmp_path)
+    recorder = Recorder()
+    events = source(path, recorder, transient_busy_seconds=30)
+    events.start()
+    holder = hold_lock(path) if locked else None
+    try:
+        if locked:
+            poke(holder)
+            assert wait_until(lambda: events.stats["suspended"])
+        # A database directory entry change is never a transient lock, suspended or not.
+        os.utime(path)
+        assert wait_until(lambda: events.failure is not None)
+        assert isinstance(events.failure, WatcherFailed) and "directory entry" in str(events.failure)
+        assert not events.healthy
+    finally:
+        if holder is not None:
+            holder.close()
+        events.stop()
+
+
 def test_stop_is_prompt_while_suspended(tmp_path):
     path = ledger(tmp_path)
     recorder = Recorder()
@@ -154,7 +183,7 @@ def test_stop_is_prompt_while_suspended(tmp_path):
     events.start()
     holder = hold_lock(path)
     try:
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         began = time.monotonic()
         stats = events.stop(timeout=5)
@@ -176,7 +205,7 @@ def test_release_after_the_bound_never_resumes_or_delivers(tmp_path, monkeypatch
     holder = hold_lock(path)
     try:
         insert_outbox(holder)
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         time.sleep(0.8)
         holder.commit()
@@ -221,7 +250,7 @@ def test_readiness_flood_cannot_postpone_the_bound(tmp_path):
     events.start()
     holder = hold_lock(path)
     try:
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         with Flood(tmp_path):
             began = time.monotonic()
@@ -240,7 +269,7 @@ def test_readiness_flood_cannot_postpone_the_retry(tmp_path):
     holder = hold_lock(path)
     try:
         insert_outbox(holder)
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         with Flood(tmp_path):
             holder.commit()
@@ -260,7 +289,7 @@ def test_stop_is_prompt_while_suspended_under_a_flood(tmp_path):
     events.start()
     holder = hold_lock(path)
     try:
-        poke(path)
+        poke(holder)
         assert wait_until(lambda: events.stats["suspended"])
         with Flood(tmp_path):
             began = time.monotonic()
@@ -288,7 +317,7 @@ def test_a_failing_state_callback_fails_the_source_closed(tmp_path, failing):
     holder = hold_lock(path)
     try:
         insert_outbox(holder)
-        poke(path)
+        poke(holder)
         if failing == "resumed":
             assert wait_until(lambda: events.stats["suspended"])
             holder.commit()
@@ -323,7 +352,7 @@ async def test_hub_feed_tells_viewers_and_reopens_under_a_new_epoch(tmp_path):
         assert (await anext(stream))["cursor"] == 0
         holder = hold_lock(path)
         insert_outbox(holder)
-        poke(path)
+        poke(holder)
         ended = await asyncio.wait_for(anext(stream), timeout=5)
         assert ended["kind"] == "source_unavailable"
         assert feed.status["reason"] == "native_source_suspended" and not feed.status["available"]
