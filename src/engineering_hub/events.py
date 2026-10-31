@@ -163,13 +163,17 @@ class NativeHubEventFeed:
         # Each start() binds its source's callbacks to a new generation, so late
         # callbacks from a stopped source can't move a restarted feed.
         self._generation = 0
-        # Sticky until the next start(): a broker transition that raised.
-        self._apply_failed = False
+        # Sticky until the next start(): a source error, or a broker transition
+        # that raised. Nothing can reopen the feed while it is set.
+        self._failed = False
+        # True while start() awaits the source. Drains that run meanwhile never
+        # activate the broker; start() settles the final state once it returns.
+        self._starting = False
         self.reason = "not_started"
 
     @property
     def available(self):
-        return (self.broker.available and not self._transition_pending and not self._apply_failed
+        return (self.broker.available and not self._transition_pending and not self._failed
                 and self._source is not None and self._source.healthy)
 
     @property
@@ -216,7 +220,7 @@ class NativeHubEventFeed:
         except Exception:
             # A transition that broke partway must never leave an old epoch live:
             # fail the broker and stay unavailable until the next start().
-            self._apply_failed = True
+            self._failed = True
             self.reason = "native_source_failed"
             try:
                 self.broker.fail()
@@ -230,9 +234,10 @@ class NativeHubEventFeed:
                     self._transition_pending = False
 
     def _apply(self, cursor, error, state):
-        if self._apply_failed:
+        if self._failed:
             self.broker.fail()
         elif error:
+            self._failed = True
             self.reason = "native_source_failed"
             self.broker.fail()
         elif state == "suspended":
@@ -248,7 +253,7 @@ class NativeHubEventFeed:
             # until it is, because available also requires a healthy source.
             source = self._source
             self.broker.fail()
-            if source is not None:
+            if source is not None and not self._starting:
                 self.broker.activate(int(source.stats["cursor"]))
                 self.reason = "native_source_active"
         elif cursor is not None:
@@ -265,7 +270,7 @@ class NativeHubEventFeed:
         with self._lock:
             self._generation += 1
             generation = self._generation
-            self._apply_failed = False
+            self._failed = False
         self._loop = asyncio.get_running_loop()
 
         def notify(_channels, cursor):
@@ -285,7 +290,16 @@ class NativeHubEventFeed:
                          if self._transient_busy_seconds else {})
             self._source = self._factory(self.path, HubOutboxCursorReader(), notify,
                                          on_error=error, **transient)
-            stats = await asyncio.to_thread(self._source.start)
+            self._starting = True
+            try:
+                stats = await asyncio.to_thread(self._source.start)
+            finally:
+                self._starting = False
+            if self._failed:
+                # A drain during startup already failed the feed: keep it closed.
+                self.reason = "native_source_failed"
+                self.broker.fail()
+                return self.status
             self.broker.activate(int(stats["cursor"]))
             self.reason = "native_source_active"
             # Catch up changes delivered while start() was returning. The

@@ -582,37 +582,102 @@ async def test_a_failed_broker_transition_fails_closed_until_restart(tmp_path):
 
 class StartupFake(StateFake):
     script = ()
+    release = None   # a threading.Event when the test decides when start() returns
 
     def start(self):
-        for state in self.script:
-            if state == "suspended":
+        for step in self.script:
+            if step == "error":
                 self.healthy = False
-                self.stats["suspended"] = True
-            else:
-                self.healthy = True
-                self.stats["suspended"] = False
-            self.on_state(state)
+                self.on_error(RuntimeError("private detail"))
+                continue
+            self.healthy = step == "resumed"
+            self.stats["suspended"] = step == "suspended"
+            self.on_state(step)
+        self.reported = True
+        if self.release is not None:
+            assert self.release.wait(5)
         return dict(self.stats)
 
 
-@pytest.mark.parametrize("script", [("suspended",), ("suspended", "resumed")])
-async def test_a_transition_during_startup_is_gated(tmp_path, script):
+async def start_with_drain(feed, order):
+    """Start the feed with the startup transitions drained before or after start() returns."""
+    if order == "after":
+        held = []
+        feed._drain = lambda: held.append(True)
+        StartupFake.release = None
+        status = await feed.start()
+        del feed._drain
+        assert held and not status["available"] and not feed.available
+        feed._drain()
+        return status
+    StartupFake.release = threading.Event()
+    known = len(StartupFake.instances)
+    task = asyncio.create_task(feed.start())
+    try:
+        deadline = time.monotonic() + 5
+        while not (len(StartupFake.instances) > known and getattr(StartupFake.instances[-1], "reported", False)
+                   and not feed._scheduled and not feed._transition_pending):
+            assert time.monotonic() < deadline and not task.done()
+            await asyncio.sleep(0.01)
+    finally:
+        StartupFake.release.set()
+    return await task
+
+
+def startup_feed(tmp_path, script):
     StartupFake.script = script
-    feed = NativeHubEventFeed(tmp_path / "ignored", source_factory=StartupFake,
+    return NativeHubEventFeed(tmp_path / "ignored", source_factory=StartupFake,
                               support_check=lambda _: (True, "fixture"), transient_busy_seconds=5)
-    status = await feed.start()
-    fake = StartupFake.instances[-1]
-    started_epoch = feed.broker.observer_epoch
-    # start() has returned but the reported transitions haven't been drained yet.
-    assert not status["available"] and not feed.available
-    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("order", ["before", "after"])
+@pytest.mark.parametrize("script", [("suspended",), ("suspended", "resumed")])
+async def test_a_transition_during_startup_settles_either_way(tmp_path, script, order):
+    feed = startup_feed(tmp_path, script)
+    status = await start_with_drain(feed, order)
     if script[-1] == "suspended":
-        assert not feed.available and feed.status["reason"] == "native_source_suspended"
+        assert not status["available"] and not feed.available
+        assert feed.status["reason"] == "native_source_suspended"
+        fake = StartupFake.instances[-1]
         fake.healthy = True
         fake.stats["suspended"] = False
         fake.on_state("resumed")
         await asyncio.sleep(0)
-    assert feed.available and feed.broker.observer_epoch != started_epoch
+    elif order == "before":
+        # Drained before start() activated anything: one clean epoch.
+        assert status["available"] and status["observer_epoch"] == feed.broker.observer_epoch
+    else:
+        # start() activated an epoch while the resume was pending; it was replaced.
+        assert feed.broker.observer_epoch != status["observer_epoch"]
+    assert feed.available and feed.status["reason"] == "native_source_active"
+    await feed.stop()
+
+
+@pytest.mark.parametrize("order", ["before", "after"])
+@pytest.mark.parametrize("failure", ["apply", "error"])
+async def test_a_failure_during_startup_stays_failed_until_restart(tmp_path, failure, order):
+    feed = startup_feed(tmp_path, ("suspended", "resumed") + (("error",) if failure == "error" else ()))
+    if failure == "apply":
+        def broken(cursor, error, state):
+            raise RuntimeError("transition broke partway")
+        feed._apply = broken
+    status = await start_with_drain(feed, order)
+    if order == "before":
+        assert not status["available"] and status["reason"] == "native_source_failed"
+    assert not feed.available and not feed.broker.available
+    assert feed.status["reason"] == "native_source_failed"
+    # Nothing short of a restart reopens it, not even a later resume.
+    fake = StartupFake.instances[-1]
+    fake.healthy = True
+    fake.on_state("resumed")
+    await asyncio.sleep(0)
+    assert not feed.available and not feed.broker.available
+    await feed.stop()
+    if failure == "apply":
+        del feed._apply
+    StartupFake.script = ()
+    StartupFake.release = None
+    assert (await feed.start())["available"] and feed.available
     await feed.stop()
 
 
