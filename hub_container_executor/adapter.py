@@ -33,6 +33,7 @@ from .backend import (
     OperationObservation,
     PilotBackend,
     ProbeObservation,
+    GateHealthObservation,
     RunnerObservation,
     StateGeneration,
     TrustedDriverIdentityVerifier,
@@ -244,6 +245,21 @@ class HostAdapter:
             profile = self._profile(image, defaults, state.generation_id, secrets)
             container_id = self._start_new_container(request, role, image, profile, state,
                                                      deadline)
+            if self.gate_socket_directory is not None:
+                # Separate durable intent: this readiness observation does not
+                # replace the subsequent independently admitted smoke phase.
+                probes = self.manifest.probes.candidate if role == 'candidate' else self.manifest.probes.rollback
+                observed = self._effect(
+                    request, 'gate_health',
+                    lambda operation_id, timeout: self.backend.run_gate_health(
+                        container_id, probes, operation_id, self._probe_timeouts(probes, deadline), timeout),
+                    self.manifest.timeouts.total_command_ms, deadline, self._gate_health_receipt)
+                if (type(observed) is not GateHealthObservation or type(observed.probe) is not ProbeObservation
+                        or observed.probe.container_id != container_id
+                        or observed.probe.image_config_id != image.image_config_id
+                        or observed.probe.profile_digest != self._probe_digest(probes)
+                        or observed.probe.health != 'healthy' or observed.probe.evidence_verified is not True):
+                    raise _Held('inspect_required')
             evidence = self._evidence(container_id, image.image_config_id, "unknown", True)
             self._timeout(deadline, self.manifest.timeouts.total_command_ms)
             return self.ledger.finish(request.command_id, state="succeeded", reason=None,
@@ -469,6 +485,17 @@ class HostAdapter:
                 "profile_digest": outcome.profile_digest,
                 "health": outcome.health,
                 "evidence_verified": outcome.evidence_verified}
+
+    @staticmethod
+    def _gate_health_receipt(outcome):
+        if (type(outcome) is not GateHealthObservation or type(outcome.probe) is not ProbeObservation
+                or type(outcome.daemon_pid) is not int or outcome.daemon_pid <= 0
+                or any(type(value) is not int for value in (outcome.started_at_ms, outcome.finished_at_ms, outcome.elapsed_ms))
+                or not 0 < outcome.started_at_ms <= outcome.finished_at_ms or not 0 <= outcome.elapsed_ms <= 120000):
+            raise _Held('evidence_mismatch')
+        return {**HostAdapter._probe_receipt(outcome.probe), 'daemon_pid': outcome.daemon_pid,
+                'started_at_ms': outcome.started_at_ms, 'finished_at_ms': outcome.finished_at_ms,
+                'elapsed_ms': outcome.elapsed_ms}
 
     def _start_new_container(self, request: ContainerPilotRequest, role: str,
                              image: VerifiedImage, profile: EffectiveProfile,

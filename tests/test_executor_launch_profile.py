@@ -52,6 +52,19 @@ def test_gate_profile_is_explicit_and_preserves_legacy_digest():
     assert parsed.digest() != core.ExecutorLaunchProfile.model_validate(legacy).digest()
 
 
+def test_gate_completion_policy_is_explicit_and_bound_to_profile():
+    data = gate_profile()
+    before = core.ExecutorLaunchProfile.model_validate(data).digest()
+    data['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+    parsed = core.ExecutorLaunchProfile.model_validate(data)
+    assert parsed.digest() != before
+    assert parsed.gate_completion.candidate_executable_digest == 'sha256:' + 'a' * 64
+    data['gate_completion']['candidate_executable_digest'] = 'sha256:' + 'A' * 64
+    with pytest.raises(Exception): core.ExecutorLaunchProfile.model_validate(data)
+
+
 @pytest.mark.parametrize('change', ['missing_mode', 'writable', 'wrong_owner', 'alias', 'missing_policy', 'extra_mount'])
 def test_gate_profile_denies_unbound_mount(change):
     data = gate_profile(); mount = data['mounts'][-1]

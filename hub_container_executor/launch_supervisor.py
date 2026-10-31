@@ -99,6 +99,64 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
+def _measure_gate_process(peer, pins, executable_digest, deadline, *, proc_root=Path('/proc')):
+    """Measure a pinned process and mount now; this is not continuing custody."""
+    _require(type(pins) is dict and type(executable_digest) is str and _SHA.fullmatch(executable_digest)
+             and type(pins.get('expected_device')) is int and type(pins.get('expected_inode')) is int
+             and type(pins.get('mount_flags')) is list)
+    peer.check(); _remaining(deadline)
+    base = proc_root / str(peer.pid)
+    expected_argv = [b'/opt/venv/bin/python', b'-I', b'-B', b'-m', b'engineering_hub',
+                     b'--host', b'0.0.0.0', b'--port', b'8770']
+    with (base / 'cmdline').open('rb') as stream:
+        _require(stream.read(1025) == b'\x00'.join(expected_argv) + b'\x00')
+    fd = os.open(base / 'exe', os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        before = os.fstat(fd)
+        _require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 128 * 1024 * 1024)
+        digest = hashlib.sha256(); total = 0
+        while True:
+            _remaining(deadline)
+            block = os.read(fd, 1024 * 1024)
+            if not block: break
+            total += len(block)
+            _require(total <= before.st_size)
+            digest.update(block)
+        after = os.fstat(fd); named = os.stat(base / 'exe')
+        _require(total == before.st_size and _identity(before) == _identity(after) == _identity(named)
+                 and (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                 == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                 and 'sha256:' + digest.hexdigest() == executable_digest)
+    finally:
+        os.close(fd)
+    fds = []
+    try:
+        root = os.open(base / 'root', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC); fds.append(root)
+        parent = root
+        for part in ('var', 'lib', 'hub'):
+            parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            fds.append(parent)
+        for index, part in enumerate(('var', 'lib', 'hub')):
+            _require(_identity(os.stat(part, dir_fd=fds[index], follow_symlinks=False))
+                     == _identity(os.fstat(fds[index + 1])))
+        info = os.fstat(parent)
+        flags = os.fstatvfs(parent).f_flag
+        observed_flags = sorted(name for name, bit in (('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC),
+                                                        ('nosuid', os.ST_NOSUID)) if flags & bit)
+        if not flags & os.ST_RDONLY: observed_flags.append('rw')
+        _require(stat.S_ISDIR(info.st_mode) and _identity(info) == (pins['expected_device'], pins['expected_inode'])
+                 and observed_flags == pins['mount_flags'])
+        _require(_identity(os.stat(base / 'root')) == _identity(os.fstat(root)))
+        _require(_identity(os.stat(base / 'exe')) == _identity(after))
+        with (base / 'cmdline').open('rb') as stream:
+            _require(stream.read(1025) == b'\x00'.join(expected_argv) + b'\x00')
+        peer.check(); _remaining(deadline)
+        return {'executable_digest': executable_digest, 'device': info.st_dev, 'inode': info.st_ino,
+                'mount_flags': observed_flags}
+    finally:
+        for item in reversed(fds): os.close(item)
+
+
 def _root_parent(path, *, private):
     """No-follow root-owned ancestor walk; private leaves must be mode0700."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -1253,7 +1311,7 @@ class LaunchSupervisor:
         directory through an independently authorized Docker profile. This
         method does not authorize that mount or enable an application launch.
         """
-        from .application_gate_enrollment import SOCKET_SCHEMA, load_application_gate_enrollment
+        from .application_gate_enrollment import SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
                  and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
         deadline = time.monotonic() + timeout_seconds
@@ -1264,7 +1322,7 @@ class LaunchSupervisor:
             self._validate_live(deadline)
             enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=self)
-            _require(enrolled.schema == SOCKET_SCHEMA
+            _require(enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA)
                      and self._handoff_manifest_digest() == enrolled.manifest_digest)
             directory = _path(enrolled.socket_source_directory)
             path = directory / 'controller.sock'
@@ -1337,7 +1395,7 @@ class LaunchSupervisor:
         The supervisor retains both returned objects until close; no descriptor
         custody or sole-writer property is established by this exchange.
         """
-        from .application_gate_enrollment import SOCKET_SCHEMA, load_application_gate_enrollment
+        from .application_gate_enrollment import SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
         from .broker_seqpacket import PeerPin
         _require(self._pid == os.getpid() and type(host_pid) is int and host_pid > 0
                  and type(process_start_ticks) is int and process_start_ticks > 0
@@ -1353,7 +1411,7 @@ class LaunchSupervisor:
             self._validate_live(deadline)
             enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=self)
-            _require(enrolled.schema == SOCKET_SCHEMA)
+            _require(enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA))
             self._gate_socket_check(enrolled)
             self._gate_listener.settimeout(_remaining(deadline))
             channel, _ = self._gate_listener.accept()
@@ -1414,6 +1472,131 @@ class LaunchSupervisor:
         peer.check()
         _remaining(deadline)
 
+    def measure_gate_post_exec(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+        """Measure exact app executable, argv and mount now; never confirm a gate.
+
+        This is point-in-time evidence under independently established host,
+        daemon and exclusive-custody trust. It is not a health observation or
+        a claim that those facts remain unchanged after this method returns.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            from .mount_gate_protocol import IDENTITY_FIELDS, _payload
+            from .mount_gate_start_enrollment import PROTOCOL as START_PROTOCOL, AUDIENCE as START_AUDIENCE
+            _require(type(pins) is dict)
+            pins = json.loads(_canonical(pins))
+            _require(set(pins) == IDENTITY_FIELDS
+                     and self._journal.start_mode and self._journal._start_confirmed)
+            self._journal._check()  # PID fence precedes the journal lock.
+            with self._journal._gate_lock:
+                with self._journal.transaction() as db:
+                    owner = db.execute('SELECT state,data FROM launch WHERE id=?', (self._launch_id,)).fetchone()
+                    start = db.execute('SELECT operation_id,nonce,gate_launch_id,enrollment FROM gate_start '
+                                       'WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                    issue = db.execute('SELECT operation_id,nonce,gate_launch_id,decision FROM gate_issuance '
+                                       'WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                    _require(owner == ('running', _canonical(self._record()).decode()) and start is not None
+                             and issue is not None and start[:3] == issue[:3]
+                             and start[:3] == (pins['operation_id'], pins['nonce'], pins['launch_id']))
+                    start_value, decision = json.loads(start[3]), json.loads(issue[3])
+                    _require(_canonical(start_value).decode() == start[3]
+                             and _canonical(decision).decode() == issue[3])
+                    _payload(decision)
+                    original = start_value.get('identity') if type(start_value) is dict else None
+                    _require(type(original) is dict and set(original) == IDENTITY_FIELDS
+                             and all(type(pins[k]) is type(original[k]) is type(decision[k])
+                                     and pins[k] == original[k] == decision[k] for k in IDENTITY_FIELDS))
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                                                        image=image, supervisor=self)
+            _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment
+                     and peer is self._gate_accepted_peer and pins['manifest_digest'] == enrolled.manifest_digest
+                     and pins['image_config_id'] == enrolled.image_config_id
+                     and pins['runnable_digest'] == enrolled.runnable_digest
+                     and pins['platform_manifest_digest'] == enrolled.platform_manifest_digest
+                     and pins['implementation_commit'] == enrolled.source_commit)
+            _require(set(start_value) == {'protocol', 'audience', 'identity', 'bootstrap_digest',
+                                          'issued_at_ms', 'expires_at_ms'}
+                     and start_value['protocol'] == START_PROTOCOL and start_value['audience'] == START_AUDIENCE
+                     and start_value['bootstrap_digest'] == enrolled.bootstrap_digest
+                     and type(start_value['issued_at_ms']) is int and type(start_value['expires_at_ms']) is int
+                     and start_value['issued_at_ms'] > 0
+                     and 0 < start_value['expires_at_ms'] - start_value['issued_at_ms'] <= 5000)
+            self._gate_socket_check(enrolled)
+            self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+            first = _measure_gate_process(peer, pins, enrolled.application_executable_digest, deadline)
+            self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+            second = _measure_gate_process(peer, pins, enrolled.application_executable_digest, deadline)
+            self._validate_live(deadline)
+            _require(first == second and load_application_gate_enrollment(enrollment_file,
+                     manifest=manifest, image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled); _remaining(deadline)
+            return {**second, 'decision_payload_digest': 'sha256:' + hashlib.sha256(_canonical(decision)).hexdigest()}
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def observe_gate_completion_facts(self, *, peer, pins, manifest, image, enrollment_file,
+                                      ledger_client, timeout_seconds):
+        """Bind current process measurements to a signed read-only ledger snapshot.
+
+        This is point-in-time evidence, never a gate confirmation or permission
+        to finish. The caller must retain host/daemon/mount custody and hold on
+        an uncertain exchange; the client is borrowed and may be used only once.
+        """
+        from .gate_ledger_channel import SupervisorLedgerClient
+        from .runtime_profile import probe_set_digest
+        _require(self._pid == os.getpid() and type(ledger_client) is SupervisorLedgerClient
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5 and type(pins) is dict)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            pins = json.loads(_canonical(pins))
+            public = ledger_client._key.public_key().public_bytes(serialization.Encoding.Raw,
+                                                                   serialization.PublicFormat.Raw)
+            executor = self._consumer
+            _require(executor is not None and ledger_client._pid == self._pid
+                     and ledger_client._peer.pid == executor.pid
+                     and ledger_client._peer.uid == self._consumer_uid
+                     and ledger_client._peer.gid == self._consumer_gid
+                     and ledger_client._binding == (self._launch_id, executor.boot, executor.pid,
+                                                    executor.start, self._container_id)
+                     and ledger_client._manifest == manifest.digest()
+                     and public == self.release.public_key)
+            first = self.measure_gate_post_exec(peer=peer, pins=pins, manifest=manifest, image=image,
+                                                 enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            probes = manifest.probes.candidate if image.role == 'candidate' else manifest.probes.rollback
+            probe_digest = probe_set_digest(probes)
+            snapshot = ledger_client.invoke('inspect_completion_v4', {'identity': pins, 'probe_digest': probe_digest,
+                'role': image.role, 'executable_digest': first['executable_digest'],
+                'health_contract': 'engineering-hub.health-json-build-commit.v1'}, deadline_monotonic=deadline)
+            second = self.measure_gate_post_exec(peer=peer, pins=pins, manifest=manifest, image=image,
+                                                  enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(first == second and snapshot['operation_id'] == pins['operation_id']
+                     and snapshot['probe_digest'] == probe_digest
+                     and snapshot['health_daemon_pid'] == peer.pid
+                     and snapshot['health_finished_at_ms'] <= int(time.time() * 1000)
+                     < snapshot['health_finished_at_ms'] + 5000
+                     and snapshot['decision_payload_digest'] == first['decision_payload_digest'])
+            _remaining(deadline)
+            return {'identity': pins, 'measurement': second, 'ledger_snapshot': snapshot}
+        except BaseException:
+            # No result can authorize progress on a failed or uncertain read.
+            # Lifecycle ownership remains with the caller; durable gate intent
+            # continues to force a held finish even if this hold cannot persist.
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
     def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
                                         manifest, image, enrollment_file, controller_key_file,
                                         verify_live, timeout_seconds):
@@ -1429,7 +1612,7 @@ class LaunchSupervisor:
         must be bounded and synchronous: a blocked callback cannot be canceled
         by this deadline, and the owner must hold the operation until it exits.
         """
-        from .application_gate_enrollment import STATIC_SCHEMA, SOCKET_SCHEMA, load_application_gate_enrollment
+        from .application_gate_enrollment import STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
         from .mount_gate_start_enrollment import MountGateStartEnrollmentController
         _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
                  and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
@@ -1452,8 +1635,8 @@ class LaunchSupervisor:
                 self._validate_live(deadline)
                 enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                     image=image, supervisor=self)
-                _require(enrolled.schema in (STATIC_SCHEMA, SOCKET_SCHEMA))
-                if enrolled.schema == SOCKET_SCHEMA:
+                _require(enrolled.schema in (STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA))
+                if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
                     _require(enrolled == self._gate_enrollment
                              and channel is self._gate_accepted_channel and peer is self._gate_accepted_peer
                              and type(base) is dict
@@ -1474,7 +1657,7 @@ class LaunchSupervisor:
 
                 def current(pins):
                     self._validate_live(deadline)
-                    if enrolled.schema == SOCKET_SCHEMA:
+                    if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
                         self._gate_peer_engine_check(peer, pins, enrolled, deadline)
                     current_enrollment = load_application_gate_enrollment(enrollment_file,
                         manifest=manifest, image=image, supervisor=self)
@@ -1485,7 +1668,7 @@ class LaunchSupervisor:
                     _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
                         image=image, supervisor=self) == enrolled and _root_file(key_path, 32)[1] == key_identity
                         and self._launch_id == supervisor_id and self._record() == record)
-                    if enrolled.schema == SOCKET_SCHEMA:
+                    if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
                         self._gate_socket_check(enrolled)
                         self._gate_peer_engine_check(peer, pins, enrolled, deadline)
                     _remaining(deadline)

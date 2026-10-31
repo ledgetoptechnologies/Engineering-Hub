@@ -58,13 +58,13 @@ def test_exact_archive_and_static_elf_reject_ambiguity(fault):
     with pytest.raises(DaemonBackendError): _static_gate_archive(payload, expected, 'amd64')
 
 
-@pytest.mark.parametrize('fault', ['none', 'v3', 'wrong_binary', 'changed_container', 'missing_enrollment', 'old_schema', 'http_error'])
+@pytest.mark.parametrize('fault', ['none', 'v3', 'v4', 'wrong_binary', 'changed_container', 'missing_enrollment', 'old_schema', 'http_error'])
 def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp_path, monkeypatch, fault):
     manifest, image, supervisor, policy = vector()
     binary = elf()
     image = replace(image, image_config={'config': {'Entrypoint': list(gate.STATIC_ENTRYPOINT), 'Cmd': [], 'Env': []}})
     policy.update(schema=gate.STATIC_SCHEMA, bootstrap_digest=digest(binary))
-    if fault == 'v3':
+    if fault in ('v3', 'v4'):
         supervisor.profile = ExecutorLaunchProfile.model_validate(gate_profile())
         supervisor.release = replace(supervisor.release, launch_profile_digest=supervisor.profile.digest())
         policy.update(schema=gate.SOCKET_SCHEMA, socket_source_directory='/operator/hub-pilot-synthetic/gate-control',
@@ -74,6 +74,11 @@ def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp
         supervisor._key_path = Path('/operator/protected/key')
         supervisor._journal = SimpleNamespace(path=Path('/operator/protected/journal'))
         supervisor._mounts = {mount.role: mount for mount in supervisor.profile.mounts}
+        if fault == 'v4':
+            from tests.test_hub_gate_socket_supervisor import v4_policy
+            v4_policy(supervisor, policy)
+            policy.update(schema=gate.COMPLETION_SCHEMA, application_executable_digest='sha256:' + 'a' * 64,
+                          health_contract=gate.COMPLETION_HEALTH_CONTRACT)
     if fault == 'old_schema': policy['schema'] = 'engineering-hub.application-gate-enrollment.v1'
     def root_file(*_):
         if fault == 'missing_enrollment': raise FileNotFoundError()
@@ -109,7 +114,7 @@ def test_created_container_archive_uses_protected_v2_policy_and_never_starts(tmp
     try:
         kwargs = dict(manifest=manifest, image=image, supervisor=supervisor,
                       enrollment_file='/root-owned/enrollment.json', timeout_ms=5000)
-        if fault in ('none', 'v3'):
+        if fault in ('none', 'v3', 'v4'):
             assert backend.inspect_created_gate_bootstrap(container_id, **kwargs) is None
             assert sum(path.endswith('/json') for _, path in requests) == 2
         else:

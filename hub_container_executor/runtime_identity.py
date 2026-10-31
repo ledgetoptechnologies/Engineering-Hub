@@ -249,6 +249,18 @@ class LaunchReceiptIdentityVerifier:
         except Exception:
             raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
 
+    def launch_profile_digest(self):
+        """Return the enrolled profile digest while the signed receipt is live."""
+        try:
+            _require(os.getpid() == self._pid)
+            with self._lock:
+                now = time.monotonic()
+                _require(os.getpid() == self._pid and not self._closed and math.isfinite(now)
+                         and self._not_before <= now < self._deadline)
+                return self._receipt['launch_profile_digest']
+        except Exception:
+            raise RuntimeIdentityError("Trusted executor launch identity unavailable") from None
+
     def close(self):
         """Revoke this verifier only; never close or call the caller's transport."""
         _require(os.getpid() == self._pid)

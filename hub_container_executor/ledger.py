@@ -15,6 +15,7 @@ import secrets
 import sqlite3
 import stat
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -630,6 +631,73 @@ class SQLiteLedger:
             signature = self._operation_mac(pins['operation_id'], operation['command_id'], 'gate_required', 'held', '')
             db.execute("UPDATE gate_required SET state='held',state_mac=? WHERE command_id=? AND operation_id=?",
                        (signature, operation['command_id'], pins['operation_id']))
+
+    def gate_completion_snapshot(self, identity, expected_probe_digest):
+        """Read current authenticated gate/health facts; never authorize success.
+
+        Ledger MACs do not prevent whole-database rollback or establish host
+        identity or custody. Callers must freshly recheck those independently.
+        """
+        from .mount_gate_protocol import IDENTITY_FIELDS, PROTOCOL, AUDIENCE, _payload
+        if (type(identity) is not dict or set(identity) != IDENTITY_FIELDS
+                or type(expected_probe_digest) is not str
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', expected_probe_digest)):
+            raise ValueError('invalid gate completion request')
+        pins = json.loads(_canonical(identity))
+        _payload(dict(pins, protocol=PROTOCOL, audience=AUDIENCE, decision='allow',
+                      observed_device=pins['expected_device'], observed_inode=pins['expected_inode'],
+                      issued_at_ms=1, expires_at_ms=2))
+        raw = _canonical(pins)
+        with self._transaction() as db:
+            operation = self._gate_binding(db, pins)
+            command_id, operation_id = operation['command_id'], pins['operation_id']
+            required = db.execute('SELECT * FROM gate_required WHERE command_id=? AND operation_id=?',
+                                  (command_id, operation_id)).fetchone()
+            expected = self._operation_mac(operation_id, command_id, 'gate_required', 'pending', '')
+            if (required is None or required['state'] != 'pending' or type(required['state_mac']) is not str
+                    or not hmac.compare_digest(required['state_mac'], expected)):
+                raise PermissionError('gate completion unavailable')
+            challenge = db.execute('SELECT * FROM mount_gate_challenges WHERE operation_id=?', (operation_id,)).fetchone()
+            if (challenge is None or challenge['state'] != 'consumed' or challenge['identity'] != raw
+                    or challenge['launch_id'] != pins['launch_id'] or challenge['nonce'] != pins['nonce']
+                    or type(challenge['identity_mac']) is not str or type(challenge['decision']) is not str
+                    or type(challenge['decision_mac']) is not str):
+                raise PermissionError('gate completion unavailable')
+            identity_mac = self._operation_mac(operation_id, command_id, operation['kind'], 'mount_gate_consumed', raw)
+            decision_mac = self._operation_mac(operation_id, command_id, operation['kind'],
+                                               'mount_gate_decision', challenge['decision'])
+            if (not hmac.compare_digest(challenge['identity_mac'], identity_mac)
+                    or not hmac.compare_digest(challenge['decision_mac'], decision_mac)):
+                raise PermissionError('gate completion unavailable')
+            decision = json.loads(challenge['decision']); _payload(decision)
+            if (_canonical(decision) != challenge['decision']
+                    or any(type(decision[k]) is not type(pins[k]) or decision[k] != pins[k] for k in IDENTITY_FIELDS)):
+                raise PermissionError('gate completion unavailable')
+            health = db.execute('SELECT * FROM operations WHERE command_id=? AND kind=?',
+                                (command_id, 'gate_health')).fetchone()
+            if health is None: raise PermissionError('gate completion unavailable')
+            verified = self._format_operation(health); receipt = verified['receipt']
+            if (verified['status'] != 'completed' or verified['receipt_authentic'] is not True
+                    or type(receipt) is not dict
+                    or set(receipt) != {'container_id', 'image_config_id', 'profile_digest', 'health', 'evidence_verified',
+                                        'daemon_pid', 'started_at_ms', 'finished_at_ms', 'elapsed_ms'}
+                    or receipt['container_id'] != pins['container_id'] or receipt['image_config_id'] != pins['image_config_id']
+                    or receipt['profile_digest'] != expected_probe_digest or receipt['health'] != 'healthy'
+                    or receipt['evidence_verified'] is not True
+                    or type(receipt['daemon_pid']) is not int or receipt['daemon_pid'] != pins['host_pid']
+                    or any(type(receipt[k]) is not int for k in ('started_at_ms', 'finished_at_ms', 'elapsed_ms'))
+                    or not 0 < receipt['started_at_ms'] <= receipt['finished_at_ms']
+                    or not 0 <= receipt['elapsed_ms'] <= 120000
+                    or abs((receipt['finished_at_ms'] - receipt['started_at_ms']) - receipt['elapsed_ms']) > 1000
+                    or not receipt['finished_at_ms'] <= int(time.time() * 1000) < receipt['finished_at_ms'] + 5000):
+                raise PermissionError('gate completion unavailable')
+            return {'operation_id': operation_id, 'health_operation_id': verified['operation_id'],
+                    'role': 'candidate' if operation['kind'] == 'create_candidate' else 'rollback',
+                    'health_daemon_pid': receipt['daemon_pid'], 'health_started_at_ms': receipt['started_at_ms'],
+                    'health_finished_at_ms': receipt['finished_at_ms'], 'health_elapsed_ms': receipt['elapsed_ms'],
+                    'health_receipt_digest': 'sha256:' + hashlib.sha256(_canonical(receipt).encode()).hexdigest(),
+                    'decision_payload_digest': 'sha256:' + hashlib.sha256(challenge['decision'].encode()).hexdigest(),
+                    'probe_digest': expected_probe_digest}
 
     def reserve_mount_gate_challenge(self, identity):
         """Reserve one independently enrolled identity; this verifies no host claim.

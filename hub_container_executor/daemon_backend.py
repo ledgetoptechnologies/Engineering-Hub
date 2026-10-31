@@ -14,6 +14,7 @@ import stat
 import struct
 import tarfile
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -34,6 +35,7 @@ from .backend import (
     ImageDefaults,
     OperationObservation,
     ProbeObservation,
+    GateHealthObservation,
     RunnerObservation,
 )
 from .build_record import VerifiedImage
@@ -1470,13 +1472,13 @@ class DockerEngineBackend:
         existing operation on any error or uncertain outcome, without retry.
         """
         from .application_gate_enrollment import (
-            STATIC_ENTRYPOINT, STATIC_SCHEMA, SOCKET_SCHEMA, load_application_gate_enrollment,
+            STATIC_ENTRYPOINT, STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment,
         )
         try:
             deadline = self._deadline(timeout_ms)
             enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
                 image=image, supervisor=supervisor)
-            if (enrolled.schema not in (STATIC_SCHEMA, SOCKET_SCHEMA) or type(container_id) is not str
+            if (enrolled.schema not in (STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA) or type(container_id) is not str
                     or not CONTAINER_ID_RE.fullmatch(container_id)
                     or self._container_images.get(container_id) != image
                     or container_id not in self._container_profiles
@@ -1676,6 +1678,53 @@ class DockerEngineBackend:
                 return None
             return False
         raise DaemonBackendError("compiled probe process outcome is ambiguous")
+
+    def run_gate_health(self, container_id, probes, operation_id, probe_timeouts, total_timeout_ms):
+        """Bracket the real compiled probe with exact daemon process observations.
+
+        PID is expressed in the daemon's namespace; the supervisor must compare
+        it with its retained live peer in a verified common PID namespace.
+        """
+        deadline = self._deadline(total_timeout_ms)
+        wall_start, monotonic_start = time.time(), time.monotonic()
+        if not math.isfinite(wall_start) or wall_start <= 0: raise DaemonBackendError('gate health unavailable')
+        def process():
+            observation = self._known_container(container_id, 'running', deadline)
+            image = self._container_images.get(container_id)
+            if type(image) is not VerifiedImage or observation.selected_image.image_config_id != image.image_config_id:
+                raise DaemonBackendError('gate health unavailable')
+            self._assert_runner(deadline)
+            data = self._json('GET', self._route('/containers/' + container_id + '/json'),
+                              deadline, expected_status=200, limit=_MAX_JSON)
+            state = data.get('State') if type(data) is dict else None
+            if (type(data) is not dict or data.get('Id') != container_id or data.get('Image') != image.image_config_id
+                    or type(state) is not dict or state.get('Running') is not True or state.get('Status') != 'running'
+                    or state.get('Paused') is not False or state.get('Restarting') is not False
+                    or state.get('Dead') is not False or type(state.get('Pid')) is not int or state['Pid'] <= 0):
+                raise DaemonBackendError('gate health unavailable')
+            self._assert_runner(deadline)
+            return state['Pid']
+        before = process()
+        if (type(probe_timeouts) is not tuple or type(probes) is not tuple or len(probes) != len(probe_timeouts)
+                or any(type(x) is not int or x < 1 for x in probe_timeouts)):
+            raise DaemonBackendError('gate health unavailable')
+        remaining = self._remaining_ms(deadline) - sum(p.startup_grace_ms for p in probes)
+        budgets = []
+        for i, original in enumerate(probe_timeouts):
+            budget = min(original, remaining - (len(probe_timeouts) - i - 1))
+            if budget < 1 or (any(p.startup_grace_ms for p in probes) and budget != original):
+                raise DaemonBackendError('gate health budget unavailable')
+            budgets.append(budget); remaining -= budget
+        result = self.run_compiled_probes(container_id, probes, operation_id, tuple(budgets))
+        after = process()
+        wall_end, monotonic_end = time.time(), time.monotonic()
+        self._remaining(deadline)
+        if (before != after or not all(math.isfinite(x) for x in (wall_end, monotonic_end))
+                or wall_end < wall_start or monotonic_end < monotonic_start
+                or abs((wall_end - wall_start) - (monotonic_end - monotonic_start)) > 1):
+            raise DaemonBackendError('gate health unavailable')
+        return GateHealthObservation(result, before, int(wall_start * 1000), int(wall_end * 1000),
+                                     int((monotonic_end - monotonic_start) * 1000))
 
     def run_compiled_probes(self, container_id: str, probes: tuple[Probe, ...],
                             operation_id: str, timeout_ms: tuple[int, ...]) -> ProbeObservation:

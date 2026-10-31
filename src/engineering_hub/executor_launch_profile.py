@@ -197,6 +197,19 @@ class DisjointDaemonPolicy(_Closed):
         return self
 
 
+class GateCompletionPolicy(_Closed):
+    """Independent role pins; no claim of measurement or host custody."""
+    candidate_executable_digest: str
+    rollback_executable_digest: str
+    health_contract: Literal['engineering-hub.health-json-build-commit.v1']
+
+    @model_validator(mode='after')
+    def closed_digests(self):
+        _require(all(type(value) is str and _SHA.fullmatch(value)
+                     for value in (self.candidate_executable_digest, self.rollback_executable_digest)))
+        return self
+
+
 class ExecutorLaunchProfile(_Closed):
     """Exact independently enrolled executor or pilot-coordinator profile, NOT an app profile."""
     user: str
@@ -224,6 +237,7 @@ class ExecutorLaunchProfile(_Closed):
     command_channel: Literal['inherited-seqpacket-v1'] | None = None
     # Explicit new profile only; absent preserves every legacy profile digest.
     gate_channel: Literal['protected-socket-v1'] | None = None
+    gate_completion: GateCompletionPolicy | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -236,7 +250,7 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion'):
                 if name in value:
                     _require(value[name] is not None)
         return value
@@ -267,6 +281,8 @@ class ExecutorLaunchProfile(_Closed):
             _require(not coordinator and self.broker_mode is None and self.command_channel is None
                      and self.daemon_policy is not None)
             roles.add('gate_channel_directory')
+        if self.gate_completion is not None:
+            _require(self.gate_channel == 'protected-socket-v1' and self.daemon_policy is not None)
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
                  and {item.role for item in self.mounts} == roles
                  and all(item.target == targets[item.role] for item in self.mounts
@@ -298,7 +314,7 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel'):
+        for name in ('broker_mode', 'role', 'command_channel', 'gate_channel', 'gate_completion'):
             if value[name] is None:
                 del value[name]
         return value

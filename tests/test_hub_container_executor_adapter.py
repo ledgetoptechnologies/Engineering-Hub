@@ -19,6 +19,7 @@ from hub_container_executor.backend import (
     ImageDefaults,
     OperationObservation,
     ProbeObservation,
+    GateHealthObservation,
     RunnerObservation,
     StateGeneration,
 )
@@ -166,6 +167,11 @@ class FakeBackend:
         return ProbeObservation(container_id, container.selected_image.image_config_id,
                                 digest(raw), self.probe_health.pop(0), True)
 
+    def run_gate_health(self, container_id, probes, operation_id, timeout_ms, total_timeout_ms):
+        now = int(time.time() * 1000)
+        return GateHealthObservation(self.run_compiled_probes(container_id, probes, operation_id, timeout_ms),
+                                     42, now, now, 0)
+
     def inspect_operation(self, operation_id, timeout_ms):
         self.events.append("inspect_operation")
         return self.terminal_operations.get(
@@ -287,9 +293,11 @@ def test_gated_deploy_holds_before_effect_if_rollback_image_is_ungated(tmp_path,
         adapter.close()
 
 
-def test_gated_start_cannot_finish_success_without_confirmed_gate(tmp_path, monkeypatch):
+@pytest.mark.parametrize('health', ['healthy', 'unhealthy'])
+def test_gated_start_cannot_finish_success_without_confirmed_gate(tmp_path, monkeypatch, health):
     from hub_container_executor.application_gate_enrollment import STATIC_ENTRYPOINT
     adapter, backend, state, manifest = make_fixture(tmp_path)
+    backend.probe_health = [health]
     adapter.gate_socket_directory = '/synthetic/gate'
     inspect_defaults = adapter._image_defaults
     monkeypatch.setattr(adapter, '_image_defaults', lambda image, deadline:
@@ -300,9 +308,34 @@ def test_gated_start_cannot_finish_success_without_confirmed_gate(tmp_path, monk
         response = adapter.submit(request)
         assert response.state == 'held' and response.reason == 'inspect_required'
         assert state.calls and 'start' in backend.events
+        operations = adapter.ledger.operation_rows(request.command_id)
+        health_row = next(row for row in operations if row['kind'] == 'gate_health')
+        assert health_row['status'] == 'completed' and health_row['receipt_authentic'] is True
+        assert health_row['receipt']['health'] == health
         with adapter.ledger._connection() as db:
             row = db.execute('SELECT state FROM gate_required WHERE command_id=?', (request.command_id,)).fetchone()
             assert row is not None and row['state'] == 'pending'
+    finally:
+        adapter.close()
+
+
+def test_gated_health_timeout_keeps_original_intent_and_run_held(tmp_path, monkeypatch):
+    from hub_container_executor.application_gate_enrollment import STATIC_ENTRYPOINT
+    adapter, backend, _, manifest = make_fixture(tmp_path)
+    adapter.gate_socket_directory = '/synthetic/gate'
+    inspect_defaults = adapter._image_defaults
+    monkeypatch.setattr(adapter, '_image_defaults', lambda image, deadline:
+                        replace(inspect_defaults(image, deadline), entrypoint=STATIC_ENTRYPOINT, command=()))
+    monkeypatch.setattr(adapter, '_verify_baseline_container', lambda *_: None)
+    def timeout(*_): raise TimeoutError('synthetic uncertain probe')
+    monkeypatch.setattr(backend, 'run_compiled_probes', timeout)
+    try:
+        request = command(manifest, 'deploy_container')
+        result = adapter.submit(request)
+        assert result.state == 'held' and result.reason == 'inspect_required'
+        row = next(row for row in adapter.ledger.operation_rows(request.command_id) if row['kind'] == 'gate_health')
+        assert row['status'] == 'intent'
+        assert adapter.ledger.target_snapshot(request.target_id)['state'] == 'held'
     finally:
         adapter.close()
 

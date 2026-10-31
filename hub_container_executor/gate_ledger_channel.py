@@ -14,6 +14,7 @@ import secrets
 import socket
 import threading
 import time
+from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from .broker_seqpacket import PeerPin, _parse
@@ -21,6 +22,7 @@ from .ledger import SQLiteLedger
 from .mount_gate_controller import _read_observation
 from .mount_gate_protocol import IDENTITY_FIELDS, MAX_BYTES, _canonical, _payload
 from .runtime_identity import LaunchReceiptIdentityVerifier
+from engineering_hub.executor_launch_profile import GateCompletionPolicy, verify_profile_bytes
 
 REQUEST = 'engineering-hub.gate-ledger-request.v1'
 RESPONSE = 'engineering-hub.gate-ledger-response.v1'
@@ -49,7 +51,7 @@ class GateLedgerWorker:
     authenticates requests in the opposite direction only.
     """
     def __init__(self, *, channel, ledger, supervisor_public_key, launch_verifier,
-                 manifest_digest, hold_uncertain, timeout_seconds):
+                 manifest_digest, hold_uncertain, timeout_seconds, completion_policy=None):
         try:
             if (type(channel) is not socket.socket or channel.family != socket.AF_UNIX
                     or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -59,12 +61,14 @@ class GateLedgerWorker:
                     or not _sync(hold_uncertain) or type(manifest_digest) is not str
                     or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
                     or ledger._expected[0] != manifest_digest or type(timeout_seconds) not in (int, float)
+                    or (completion_policy is not None and type(completion_policy) is not GateCompletionPolicy)
                     or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
             channel.getpeername()
             self._channel, self._ledger = channel, ledger
             self._key = Ed25519PublicKey.from_public_bytes(supervisor_public_key)
             self._launch, self._manifest, self._hold = launch_verifier, manifest_digest, hold_uncertain
+            self._completion_policy = completion_policy
             self._timeout, self._pid, self._used, self._lock = timeout_seconds, os.getpid(), False, threading.Lock()
         except Exception:
             raise GateLedgerChannelError() from None
@@ -108,12 +112,15 @@ class GateLedgerWorker:
             if (payload['protocol'] != REQUEST or payload['challenge'] != challenge
                     or type(payload['launch_binding']) is not list or payload['launch_binding'] != list(binding)
                     or any(type(a) is not type(b) for a, b in zip(payload['launch_binding'], binding))
-                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume')
+                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4')
                     or type(issued) is not int or type(expires) is not int or not 0 < expires - issued <= 5000
                     or now < wall or issued < wall - 5000 or not issued <= now < expires
                     or expires <= wall or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
             value = payload['value']
-            if type(value) is not dict or value.get('manifest_digest') != self._manifest: raise ValueError()
+            if type(value) is not dict: raise ValueError()
+            is_snapshot = payload['action'] in ('inspect_completion', 'inspect_completion_v4')
+            identity = value.get('identity') if is_snapshot else value
+            if type(identity) is not dict or identity.get('manifest_digest') != self._manifest: raise ValueError()
             last_wall = [now]
             def fresh_decision():
                 current = int(time.time() * 1000)
@@ -123,7 +130,16 @@ class GateLedgerWorker:
                         or (time.monotonic() - started) * 1000 >= decision_expires - wall):
                     raise ValueError()
                 last_wall[0] = current
-            if payload['action'] == 'reserve':
+            if is_snapshot:
+                expected_fields = {'identity', 'probe_digest'}
+                if payload['action'] == 'inspect_completion_v4':
+                    expected_fields |= {'role', 'executable_digest', 'health_contract'}
+                    if (self._completion_policy is None or value.get('role') not in ('candidate', 'rollback')
+                            or value.get('health_contract') != self._completion_policy.health_contract
+                            or value.get('executable_digest') != getattr(self._completion_policy,
+                                value['role'] + '_executable_digest')): raise ValueError()
+                if set(value) != expected_fields or set(identity) != IDENTITY_FIELDS: raise ValueError()
+            elif payload['action'] == 'reserve':
                 if set(value) != IDENTITY_FIELDS: raise ValueError()
             else:
                 _payload(value)
@@ -135,11 +151,15 @@ class GateLedgerWorker:
                     or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
             last_wall[0] = current
             if payload['action'] == 'consume': fresh_decision()
-            scope(); attempted = True
+            scope(); attempted = not is_snapshot
             if payload['action'] == 'reserve':
                 self._ledger.reserve_mount_gate_challenge(value)
-            elif self._ledger.consume_mount_gate_challenge(value) is not True:
+            elif payload['action'] == 'consume' and self._ledger.consume_mount_gate_challenge(value) is not True:
                 raise ValueError()
+            elif is_snapshot:
+                snapshot = self._ledger.gate_completion_snapshot(identity, value['probe_digest'])
+                if payload['action'] == 'inspect_completion_v4' and snapshot['role'] != value['role']:
+                    raise ValueError()
             scope()
             if payload['action'] == 'consume': fresh_decision()
             current = int(time.time() * 1000)
@@ -147,7 +167,9 @@ class GateLedgerWorker:
                     or (time.monotonic() - started) * 1000 >= expires - wall):
                 raise ValueError()
             response = _canonical({'protocol': RESPONSE, 'challenge': challenge,
-                                   'action': payload['action'], 'outcome': 'committed'})
+                                   'action': payload['action'],
+                                   **({'outcome': 'observed', 'snapshot': snapshot}
+                                      if is_snapshot else {'outcome': 'committed'})})
             if len(response) > MAX_BYTES: raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if payload['action'] == 'consume': fresh_decision()
@@ -190,12 +212,16 @@ class SupervisorLedgerClient:
             raise GateLedgerChannelError() from None
 
 
-    def invoke(self, action, value):
+    def invoke(self, action, value, *, deadline_monotonic=None):
         if os.getpid() != self._pid: raise GateLedgerChannelError()
         with self._lock:
             if self._used: raise GateLedgerChannelError()
             self._used = True
         started = time.monotonic(); deadline = started + self._timeout
+        if deadline_monotonic is not None:
+            if (type(deadline_monotonic) not in (int, float) or not math.isfinite(deadline_monotonic)
+                    or deadline_monotonic <= started): raise GateLedgerChannelError()
+            deadline = min(deadline, deadline_monotonic)
         def scope():
             now = time.monotonic()
             if os.getpid() != self._pid or not started <= now < deadline: raise ValueError()
@@ -206,7 +232,7 @@ class SupervisorLedgerClient:
             if credentials != [(self._peer.pid, self._peer.uid, self._peer.gid)]: raise ValueError()
             scope(); return _parse(raw)
         try:
-            if action not in ('reserve', 'consume') or type(value) is not dict: raise ValueError()
+            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4') or type(value) is not dict: raise ValueError()
             snapshot = json.loads(_canonical(value))
             challenge = receive()
             if (type(challenge) is not dict or set(challenge) != {'protocol', 'challenge'}
@@ -223,11 +249,36 @@ class SupervisorLedgerClient:
             scope(); self._channel.settimeout(deadline - time.monotonic())
             if self._channel.send(raw) != len(raw): raise ValueError()
             response = receive()
-            if (response != {'protocol': RESPONSE, 'challenge': challenge['challenge'],
-                             'action': action, 'outcome': 'committed'}
-                    or not issued <= int(time.time() * 1000) < issued + ttl): raise ValueError()
+            is_snapshot = action in ('inspect_completion', 'inspect_completion_v4')
+            expected = {'protocol': RESPONSE, 'challenge': challenge['challenge'], 'action': action,
+                        'outcome': 'observed' if is_snapshot else 'committed'}
+            if is_snapshot:
+                if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
+                        or any(response[k] != v for k, v in expected.items())
+                        or type(response['snapshot']) is not dict
+                        or set(response['snapshot']) != {'operation_id', 'health_operation_id',
+                            'health_receipt_digest', 'decision_payload_digest', 'probe_digest', 'role',
+                            'health_daemon_pid', 'health_started_at_ms', 'health_finished_at_ms', 'health_elapsed_ms'}): raise ValueError()
+                observed = response['snapshot']
+                if (type(snapshot.get('identity')) is not dict
+                        or observed['operation_id'] != snapshot['identity'].get('operation_id')
+                        or observed['probe_digest'] != snapshot.get('probe_digest')
+                        or observed['role'] not in ('candidate', 'rollback')
+                        or (action == 'inspect_completion_v4' and observed['role'] != snapshot.get('role'))
+                        or any(type(observed[k]) is not int for k in ('health_daemon_pid', 'health_started_at_ms',
+                                                                      'health_finished_at_ms', 'health_elapsed_ms'))
+                        or observed['health_daemon_pid'] != snapshot['identity'].get('host_pid')
+                        or not 0 < observed['health_started_at_ms'] <= observed['health_finished_at_ms']
+                        or not 0 <= observed['health_elapsed_ms'] <= 120000
+                        or not observed['health_finished_at_ms'] <= int(time.time() * 1000) < observed['health_finished_at_ms'] + 5000
+                        or type(observed['health_operation_id']) is not str
+                        or str(UUID(observed['health_operation_id'])) != observed['health_operation_id']
+                        or any(type(observed[k]) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', observed[k])
+                               for k in ('health_receipt_digest', 'decision_payload_digest', 'probe_digest'))): raise ValueError()
+            elif response != expected: raise ValueError()
+            if not issued <= int(time.time() * 1000) < issued + ttl: raise ValueError()
             scope()
-            return True
+            return response['snapshot'] if is_snapshot else True
         except Exception:
             raise GateLedgerChannelError() from None
 
@@ -241,7 +292,7 @@ class OwnedGateLedgerService:
     commit: close waits for the worker thread, even after a deadline expires.
     """
     def __init__(self, *, listener, ledger, supervisor_public_key, launch_verifier,
-                 manifest_digest, hold_uncertain, timeout_seconds):
+                 manifest_digest, hold_uncertain, timeout_seconds, completion_profile_bytes=None):
         try:
             if (type(listener) is not socket.socket or listener.family != socket.AF_UNIX
                     or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET
@@ -255,8 +306,14 @@ class OwnedGateLedgerService:
             self.ledger = ledger
             if not hmac.compare_digest(launch_verifier.issuer_public_key(), supervisor_public_key):
                 raise ValueError()
+            completion_policy = None
+            if completion_profile_bytes is not None:
+                profile = verify_profile_bytes(completion_profile_bytes, launch_verifier.launch_profile_digest())
+                if profile.gate_completion is None: raise ValueError()
+                completion_policy = profile.gate_completion
             self._listener, self._key, self._launch = listener, supervisor_public_key, launch_verifier
             self._manifest, self._hold, self._timeout, self._on_failure = manifest_digest, hold_uncertain, timeout_seconds, None
+            self._completion_policy = completion_policy
             self._pid, self._lock, self._stopping, self._thread, self._failed = os.getpid(), threading.Lock(), False, None, False
             listener.settimeout(.1)
         except Exception:
@@ -289,7 +346,7 @@ class OwnedGateLedgerService:
                     channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
                     worker = GateLedgerWorker(channel=channel, ledger=self.ledger, supervisor_public_key=self._key,
                         launch_verifier=self._launch, manifest_digest=self._manifest, hold_uncertain=self._hold,
-                        timeout_seconds=self._timeout)
+                        timeout_seconds=self._timeout, completion_policy=self._completion_policy)
                     worker.serve_once()
         except BaseException:
             failed = True

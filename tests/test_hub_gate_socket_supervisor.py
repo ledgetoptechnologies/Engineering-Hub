@@ -26,6 +26,19 @@ from tests.test_executor_launch_profile import gate_profile
 from tests.test_hub_container_executor_launch_supervisor import short_root
 
 
+def v4_policy(supervisor, data):
+    profile = supervisor.profile.enrollment_value()
+    profile['gate_completion'] = {'candidate_executable_digest': 'sha256:' + 'a' * 64,
+        'rollback_executable_digest': 'sha256:' + 'b' * 64,
+        'health_contract': gate.COMPLETION_HEALTH_CONTRACT}
+    supervisor.profile = ExecutorLaunchProfile.model_validate(profile)
+    supervisor.release = replace(supervisor.release, launch_profile_digest=supervisor.profile.digest())
+    supervisor._mounts = {mount.role: mount for mount in supervisor.profile.mounts}
+    data['supervisor_profile_digest'] = supervisor.profile.digest()
+    data.update(schema=gate.COMPLETION_SCHEMA, application_executable_digest='sha256:' + 'a' * 64,
+                health_contract=gate.COMPLETION_HEALTH_CONTRACT)
+
+
 @pytest.fixture
 def socket_rig(short_root, monkeypatch):
     if os.geteuid() != 0: pytest.skip('requires disposable root-owned fixture')
@@ -84,6 +97,75 @@ def test_v3_socket_enrollment_is_closed_and_rejects_alias(socket_rig):
         gate.load_application_gate_enrollment(path, manifest=manifest, image=image, supervisor=supervisor)
 
 
+def test_v4_completion_pins_are_closed_and_socket_preparation_does_not_confirm(socket_rig):
+    supervisor, manifest, image, path, directory, _ = socket_rig
+    data = json.loads(Path(path).read_bytes())
+    v4_policy(supervisor, data)
+    Path(path).write_bytes(raw(data))
+    enrolled = gate.load_application_gate_enrollment(path, manifest=manifest, image=image, supervisor=supervisor)
+    assert enrolled.application_executable_digest == data['application_executable_digest']
+    assert enrolled.health_contract == gate.COMPLETION_HEALTH_CONTRACT
+    for change in ({'application_executable_digest': 'sha256:' + 'A' * 64},
+                   {'application_executable_digest': 'sha256:' + 'b' * 64},
+                   {'health_contract': 'http-200'}, {'unexpected': True}):
+        Path(path).write_bytes(raw(dict(data, **change)))
+        with pytest.raises(gate.ApplicationGateEnrollmentError):
+            gate.load_application_gate_enrollment(path, manifest=manifest, image=image, supervisor=supervisor)
+    Path(path).write_bytes(raw(data))
+    assert supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2) == str(directory)
+    assert supervisor._journal._start_confirmed is False
+
+
+@pytest.mark.parametrize('drift', ['none', 'measurement', 'nonce', 'fence', 'mount'])
+def test_post_exec_observation_rechecks_supervisor_measurements(socket_rig, monkeypatch, drift):
+    from hub_container_executor.mount_gate_protocol import PROTOCOL, AUDIENCE
+    supervisor, manifest, image, path, directory, held = socket_rig
+    data = json.loads(Path(path).read_bytes())
+    v4_policy(supervisor, data)
+    Path(path).write_bytes(raw(data))
+    supervisor._gate_enrollment = gate.load_application_gate_enrollment(path, manifest=manifest,
+                                                                         image=image, supervisor=supervisor)
+    identity = pins(directory)
+    identity.update(manifest_digest=manifest.digest(), image_config_id=image.image_config_id,
+                    runnable_digest=image.runnable_reference, platform_manifest_digest=image.platform_manifest_digest,
+                    implementation_commit=image.source_commit)
+    base = {k: v for k, v in identity.items() if k != 'nonce'}
+    start = {'protocol': 'engineering-hub.application-gate-start-enrollment.v1',
+             'audience': 'engineering-hub.static-application-bootstrap', 'identity': identity,
+             'bootstrap_digest': data['bootstrap_digest'], 'issued_at_ms': 100000, 'expires_at_ms': 104000}
+    supervisor._journal.reserve_gate_start(supervisor._launch_id, supervisor._record(), base,
+                                           data['bootstrap_digest'], start, 'd' * 64)
+    decision = dict(identity, protocol=PROTOCOL, audience=AUDIENCE, decision='allow',
+                    observed_device=identity['expected_device'], observed_inode=identity['expected_inode'],
+                    issued_at_ms=100000, expires_at_ms=104000)
+    supervisor._journal.reserve_gate_issuance(supervisor._launch_id, supervisor._record(), identity,
+                                              decision, 'e' * 64)
+    class Peer:
+        def close(self): pass
+    peer = Peer(); supervisor._gate_accepted_peer = peer
+    checks = []
+    monkeypatch.setattr(supervisor, '_gate_socket_check', lambda _: checks.append('socket'))
+    monkeypatch.setattr(supervisor, '_gate_peer_engine_check', lambda *_: checks.append('engine'))
+    def measure(*_):
+        checks.append('measure')
+        return {'value': checks.count('measure') if drift == 'measurement' else 1}
+    monkeypatch.setattr(launch, '_measure_gate_process', measure)
+    supplied = dict(identity)
+    if drift == 'nonce': supplied['nonce'] = 'f' * 64
+    if drift == 'fence': supplied['fence'] += 1
+    if drift == 'mount': supplied['expected_inode'] += 1
+    kwargs = dict(peer=peer, pins=supplied, manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2)
+    if drift != 'none':
+        with pytest.raises(launch.LaunchSupervisorError): supervisor.measure_gate_post_exec(**kwargs)
+        assert held
+    else:
+        result = supervisor.measure_gate_post_exec(**kwargs)
+        assert result['value'] == 1 and result['decision_payload_digest'].startswith('sha256:')
+        assert not held
+    expected_checks = 0 if drift in {'nonce', 'fence', 'mount'} else 2
+    assert checks.count('engine') == expected_checks and checks.count('measure') == expected_checks
+
+
 def test_listener_rejects_wrong_kernel_peer_and_never_reaccepts(socket_rig):
     supervisor, manifest, image, path, directory, held = socket_rig
     assert supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2) == str(directory)
@@ -120,10 +202,14 @@ def test_replaced_socket_is_rejected_without_removing_replacement(socket_rig):
     assert held and socket_path.read_text() == 'replacement'
 
 
-@pytest.mark.parametrize('fault', ['none', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation',
+@pytest.mark.parametrize('fault', ['none', 'v4', 'after_accept', 'during_callback', 'wrong_manifest', 'keyread_mutation',
                                    'daemon_pid', 'daemon_image', 'daemon_restart', 'daemon_changes_in_callback'])
 def test_real_peer_credentials_flow_to_start_controller(socket_rig, monkeypatch, tmp_path, fault):
     supervisor, manifest, image, path, directory, held = socket_rig
+    if fault == 'v4':
+        data = json.loads(Path(path).read_bytes())
+        v4_policy(supervisor, data)
+        Path(path).write_bytes(raw(data))
     supervisor.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=path, timeout_seconds=2)
     expected = pins(tmp_path)
     ready_read, ready_write = os.pipe(); release_read, release_write = os.pipe()

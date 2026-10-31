@@ -30,11 +30,14 @@ _ENTRYPOINT = ('/opt/venv/bin/python', '-I', '-B', '-m',
 STATIC_ENTRYPOINT = ('/usr/local/libexec/hub-application-gate',)
 STATIC_SCHEMA = 'engineering-hub.application-gate-enrollment.v2'
 SOCKET_SCHEMA = 'engineering-hub.application-gate-enrollment.v3'
+COMPLETION_SCHEMA = 'engineering-hub.application-gate-enrollment.v4'
+COMPLETION_HEALTH_CONTRACT = 'engineering-hub.health-json-build-commit.v1'
 _FIELDS = frozenset({'schema', 'manifest_digest', 'supervisor_profile_digest', 'role',
     'runnable_digest', 'platform_manifest_digest', 'image_config_id', 'source_commit',
     'build_record_digest', 'bootstrap_digest', 'controller_public_key',
     'socket_target', 'request_timeout_ms'})
 _SOCKET_FIELDS = _FIELDS | {'socket_source_directory', 'consumer_host_uid', 'consumer_host_gid'}
+_COMPLETION_FIELDS = _SOCKET_FIELDS | {'application_executable_digest', 'health_contract'}
 
 
 class ApplicationGateEnrollmentError(ValueError):
@@ -68,6 +71,8 @@ class ApplicationGateEnrollment:
     socket_source_directory: str | None = None
     consumer_host_uid: int | None = None
     consumer_host_gid: int | None = None
+    application_executable_digest: str | None = None
+    health_contract: str | None = None
 
     def check(self):
         try:
@@ -98,8 +103,10 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
         raw, identity = _root_file(_path(path), 65536)
         data = _strict(raw, 65536)
         if (type(data) is not dict
-                or data.get('schema') not in ('engineering-hub.application-gate-enrollment.v1', STATIC_SCHEMA, SOCKET_SCHEMA)
-                or set(data) != (_SOCKET_FIELDS if data.get('schema') == SOCKET_SCHEMA else _FIELDS)
+                or data.get('schema') not in ('engineering-hub.application-gate-enrollment.v1', STATIC_SCHEMA,
+                                               SOCKET_SCHEMA, COMPLETION_SCHEMA)
+                or set(data) != (_COMPLETION_FIELDS if data.get('schema') == COMPLETION_SCHEMA else
+                                 _SOCKET_FIELDS if data.get('schema') == SOCKET_SCHEMA else _FIELDS)
                 or data['role'] not in ('candidate', 'rollback')
                 or data['role'] != image.role
                 or data['manifest_digest'] != manifest.digest()
@@ -128,12 +135,22 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
         # An image-default gate is a distinct image contract; a command override
         # or a legacy Hub image cannot satisfy this versioned enrollment.
         config = image.image_config.get('config')
-        expected_entrypoint = STATIC_ENTRYPOINT if data['schema'] in (STATIC_SCHEMA, SOCKET_SCHEMA) else _ENTRYPOINT
+        expected_entrypoint = STATIC_ENTRYPOINT if data['schema'] in (STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA) else _ENTRYPOINT
         if (type(config) is not dict or config.get('Entrypoint') != list(expected_entrypoint)
                 or config.get('Cmd') not in ([], None)):
             raise ValueError()
         source_directory = uid = gid = None
-        if data['schema'] == SOCKET_SCHEMA:
+        executable_digest = health_contract = None
+        if data['schema'] == COMPLETION_SCHEMA:
+            executable_digest, health_contract = data['application_executable_digest'], data['health_contract']
+            if (type(executable_digest) is not str or not _SHA.fullmatch(executable_digest)
+                    or health_contract != COMPLETION_HEALTH_CONTRACT):
+                raise ValueError()
+            policy = supervisor.profile.gate_completion
+            if (policy is None or health_contract != policy.health_contract
+                    or executable_digest != getattr(policy, data['role'] + '_executable_digest')):
+                raise ValueError()
+        if data['schema'] in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
             source_directory = data['socket_source_directory']
             source = _path(source_directory)
             uid, gid = data['consumer_host_uid'], data['consumer_host_gid']
@@ -170,6 +187,6 @@ def load_application_gate_enrollment(path, *, manifest, image, supervisor):
             data['platform_manifest_digest'], data['image_config_id'], data['source_commit'],
             data['build_record_digest'], data['bootstrap_digest'],
             bytes.fromhex(data['controller_public_key']), data['socket_target'], data['request_timeout_ms'],
-            data['schema'], source_directory, uid, gid)
+            data['schema'], source_directory, uid, gid, executable_digest, health_contract)
     except Exception:
         raise ApplicationGateEnrollmentError() from None
