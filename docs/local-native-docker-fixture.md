@@ -80,6 +80,9 @@ uncompressed Git archive whose SHA-256 and commit association are independently
 established by the caller. It requires exclusive control of the archive and
 output parent, creates a new bounded tree with read-only modes, and returns the
 tree digest consumed by the launcher. Its focused tests use synthetic archives.
+On Windows, create the archive with `git -c core.autocrlf=false -c core.eol=lf archive` and
+verify that its fixed seed member matches the initializer's SHA-256 pin. The
+default `git archive` can otherwise apply the workstation's CRLF conversion.
 The Windows parent instead seeds task-owned named volumes from independently
 pinned archive and Docker CLI bytes. A fixed helper extracts the archive, then
 a separate read-only helper measures the tree before the operator can start.

@@ -21,7 +21,7 @@ from scripts.hub_local_windows_cleanup import cleanup
 
 def _preflight(config):
     from engineering_hub.container_pilot_manifest import PilotManifest
-    from scripts.hub_local_acceptance_runner import _fixture
+    from scripts.hub_local_fixture_metadata import decode_fixture as _fixture
     from scripts.hub_local_test_oci import verify_fixture_image
     from scripts.hub_local_test_launcher import _check_resource_envelope
     inner=config['inner']

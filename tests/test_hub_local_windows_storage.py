@@ -112,6 +112,20 @@ def test_seed_bootstrap_is_valid_python():
     compile(BOOT,'<fixed-bootstrap>','exec')
     assert 'sha256:'+hashlib.sha256((Path(__file__).resolve().parents[1]/'scripts/hub_local_operator_seed.py').read_bytes()).hexdigest()==SEED
 
+def test_seed_pin_is_exact_lf_archive_member():
+    import hashlib,io,tarfile
+    from pathlib import Path
+    from scripts.hub_local_windows_initialization import SEED
+    raw=(Path(__file__).resolve().parents[1]/'scripts/hub_local_operator_seed.py').read_bytes()
+    lf=raw.replace(b'\r\n',b'\n')
+    archive=io.BytesIO()
+    with tarfile.open(fileobj=archive,mode='w') as tar:
+        item=tarfile.TarInfo('scripts/hub_local_operator_seed.py'); item.size=len(lf); tar.addfile(item,io.BytesIO(lf))
+    archive.seek(0)
+    with tarfile.open(fileobj=archive,mode='r:') as tar: member=tar.extractfile('scripts/hub_local_operator_seed.py').read()
+    assert b'\r' not in member and 'sha256:'+hashlib.sha256(member).hexdigest()==SEED
+    assert 'sha256:'+hashlib.sha256(member.replace(b'\n',b'\r\n')).hexdigest()!=SEED
+
 def test_desktop_metadata_must_match_fixed_bind_and_inherited_labels():
     from scripts.hub_local_windows_initialization import _helper_labels
     image={'codex.owner':'root','desktop.docker.io/mounts/0/Source':'C:\\old','desktop.docker.io/mounts/0/SourceKind':'hostFile','desktop.docker.io/mounts/0/Target':'/old'}
