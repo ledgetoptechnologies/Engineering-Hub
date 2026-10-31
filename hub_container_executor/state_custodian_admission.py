@@ -23,7 +23,7 @@ import time
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from .launch_supervisor import _canonical, _root_file, _root_parent
+from .launch_supervisor import _canonical, _root_file, _root_parent, _path
 
 PROTOCOL = 'engineering-hub.state-custodian-admission.v1'
 DOMAIN = b'engineering-hub.state-custodian-admission.v1\x00'
@@ -72,6 +72,7 @@ class CustodianAdmissionJournal:
         self._fd = None
         self._db = None
         self._pid = os.getpid()
+        self._fresh = {}
         try:
             if os.geteuid() != 0 or type(create) is not bool:
                 raise ValueError()
@@ -166,6 +167,7 @@ class CustodianAdmissionJournal:
                 elapsed = time.monotonic() - started
                 if not last_wall <= now < payload['expires_at_ms'] or not 0 <= elapsed < budget: raise ValueError()
                 last_wall = now
+                if self._db.execute('SELECT COUNT(*) FROM admissions').fetchone()[0] >= 4096: raise ValueError()
                 self._db.execute('INSERT INTO admissions VALUES (?,?,?,?)',
                                  (payload['operation_id'], payload['nonce'], raw, signature))
                 self._db.execute('COMMIT')
@@ -179,9 +181,136 @@ class CustodianAdmissionJournal:
             elapsed = time.monotonic() - started
             if not last_wall <= now < payload['expires_at_ms'] or not 0 <= elapsed < budget:
                 raise ValueError()
-            return hashlib.sha256(raw).hexdigest()
+            digest = hashlib.sha256(raw).hexdigest()
+            self._fresh[payload['operation_id']] = (digest, payload['expires_at_ms'], started + budget, now, started + elapsed)
+            return digest
         except Exception:
             raise CustodianAdmissionError() from None
+
+    def stage_quarantined_backup(self, *, operation_id, admission_digest, copy_policy_path, timeout_seconds):
+        """Copy one enrolled frozen backup to private quarantine; never publish.
+
+        Only an admission freshly committed by this process may start a copy.
+        A durable exclusive destination is created before bytes are copied; any
+        failure keeps it in quarantine and permanently prevents automatic retry.
+        The backup must be independently approved as a coherent, quiescent
+        SQLite backup. Root administrators and filesystem/mount isolation remain
+        trusted. Accounting excludes writes by other privileged principals.
+        """
+        source_fd = output_fd = source_parent = stage_fd = None
+        try:
+            self._check()
+            if (type(operation_id) is not str or str(UUID(operation_id)) != operation_id
+                    or type(admission_digest) is not str or not _HEX.fullmatch(admission_digest)
+                    or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 120):
+                raise ValueError()
+            fresh = self._fresh.pop(operation_id, None)
+            if fresh is None or fresh[0] != admission_digest:
+                raise ValueError()
+            last_mono = time.monotonic()
+            last_wall = time.time_ns() // 1_000_000
+            if last_wall < fresh[3] or last_mono < fresh[4]: raise ValueError()
+            deadline = min(last_mono + timeout_seconds, fresh[2])
+            def current():
+                nonlocal last_mono, last_wall
+                self._check()
+                mono, wall = time.monotonic(), time.time_ns() // 1_000_000
+                if not last_mono <= mono < deadline or not last_wall <= wall < fresh[1]: raise ValueError()
+                last_mono, last_wall = mono, wall
+            policy_path = _path(str(copy_policy_path))
+            raw, policy_pin = _root_file(policy_path, 4096)
+            policy = json.loads(raw)
+            if (type(policy) is not dict or set(policy) != {'schema', 'source', 'source_digest', 'staging_directory', 'maximum_bytes', 'maximum_total_bytes', 'minimum_free_bytes'}
+                    or _canonical(policy) != raw or type(policy['schema']) is not int or policy['schema'] != 1
+                    or policy['source_digest'] != self._policy['source_backup_digest']
+                    or type(policy['maximum_bytes']) is not int or not 0 < policy['maximum_bytes'] <= 512 * 1024 * 1024
+                    or type(policy['maximum_total_bytes']) is not int or not policy['maximum_bytes'] <= policy['maximum_total_bytes'] <= 16 * 1024**3
+                    or type(policy['minimum_free_bytes']) is not int or not 0 < policy['minimum_free_bytes'] <= 16 * 1024**3):
+                raise ValueError()
+            source, stage = _path(policy['source']), _path(policy['staging_directory'])
+            if source.parent == stage or source == stage or stage in source.parents or source.parent in stage.parents:
+                raise ValueError()
+            source_parent = _root_parent(source, private=True)
+            stage_fd = _root_parent(stage / 'entry', private=True)
+            fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current()
+            source_fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=source_parent)
+            info = os.fstat(source_fd)
+            identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= policy['maximum_bytes']
+                    or identity(info) != identity(os.stat(source.name, dir_fd=source_parent, follow_symlinks=False))
+                    or any(os.path.lexists(str(source) + suffix) for suffix in ('-wal', '-shm', '-journal'))):
+                raise ValueError()
+            header = os.pread(source_fd, 20, 0)
+            if header[:16] != b'SQLite format 3\x00' or header[18:20] != b'\x01\x01': raise ValueError()
+            used = 0
+            with os.scandir(stage_fd) as entries:
+                for entry in entries:
+                    current()
+                    if (not entry.name.endswith('.quarantine')
+                            or str(UUID(entry.name.removesuffix('.quarantine'))) != entry.name.removesuffix('.quarantine')):
+                        raise ValueError()
+                    item = entry.stat(follow_symlinks=False)
+                    if (not stat.S_ISREG(item.st_mode) or item.st_uid != 0 or item.st_nlink != 1
+                            or stat.S_IMODE(item.st_mode) != 0o600): raise ValueError()
+                    used += item.st_size
+                    if used + info.st_size > policy['maximum_total_bytes']: raise ValueError()
+            space = os.fstatvfs(stage_fd)
+            if used + info.st_size > policy['maximum_total_bytes'] or space.f_bavail * space.f_frsize < info.st_size + policy['minimum_free_bytes']:
+                raise ValueError()
+            name = operation_id + '.quarantine'
+            output_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                0o600, dir_fd=stage_fd)
+            os.fsync(output_fd); os.fsync(stage_fd)
+            digest = hashlib.sha256(); total = 0
+            while True:
+                current()
+                block = os.read(source_fd, 1024 * 1024)
+                if not block: break
+                total += len(block)
+                if total > info.st_size: raise ValueError()
+                digest.update(block)
+                view = memoryview(block)
+                while view:
+                    current()
+                    written = os.write(output_fd, view)
+                    if written <= 0: raise ValueError()
+                    view = view[written:]
+            os.fsync(output_fd); os.fsync(stage_fd)
+            out = os.fstat(output_fd)
+            named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+            os.lseek(output_fd, 0, os.SEEK_SET)
+            output_digest = hashlib.sha256(); output_size = 0
+            while True:
+                current()
+                block = os.read(output_fd, 1024 * 1024)
+                if not block: break
+                output_size += len(block)
+                if output_size > total: raise ValueError()
+                output_digest.update(block)
+            if (total != info.st_size or 'sha256:' + digest.hexdigest() != policy['source_digest']
+                    or output_size != total or output_digest.digest() != digest.digest()
+                    or identity(info) != identity(os.fstat(source_fd))
+                    or identity(info) != identity(os.stat(source.name, dir_fd=source_parent, follow_symlinks=False))
+                    or not stat.S_ISREG(out.st_mode) or out.st_uid != 0 or out.st_nlink != 1
+                    or stat.S_IMODE(out.st_mode) != 0o600 or identity(out) != identity(os.fstat(output_fd))
+                    or identity(out) != identity(named) or out.st_size != total
+                    or any(os.path.lexists(str(source) + suffix) for suffix in ('-wal', '-shm', '-journal'))
+                    or _root_file(policy_path, 4096)[1] != policy_pin):
+                raise ValueError()
+            current()
+            return {'operation_id': operation_id, 'admission_digest': admission_digest,
+                    'digest': 'sha256:' + digest.hexdigest(), 'size_bytes': total}
+        except Exception:
+            raise CustodianAdmissionError() from None
+        finally:
+            close_failed = False
+            for fd in (output_fd, source_fd, source_parent, stage_fd):
+                if fd is not None:
+                    try: os.close(fd)
+                    except OSError: close_failed = True
+            if close_failed: raise CustodianAdmissionError() from None
 
     def exchange(self, channel, *, operation_id, timeout_seconds, provider_uid, provider_gid):
         """Request and reserve one observation on an owned connected seqpacket.
@@ -233,16 +362,25 @@ class CustodianAdmissionJournal:
             if time.monotonic() >= deadline: raise ValueError()
             result = self.reserve(response['payload'], bytes.fromhex(response['signature']))
             if time.monotonic() >= deadline: raise ValueError()
-            return result
-        except Exception:
+        except BaseException as error:
+            self._fresh.pop(operation_id, None)
+            if not isinstance(error, Exception): raise
             raise CustodianAdmissionError() from None
         finally:
-            if child is not None:
-                if child.stdin is not None: child.stdin.close()
-                try: child.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    child.kill(); child.wait(timeout=1)
-                if child.stdout is not None: child.stdout.close()
+            try:
+                if child is not None:
+                    if child.stdin is not None: child.stdin.close()
+                    try: child.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        child.kill(); child.wait(timeout=1)
+                    if child.stdout is not None: child.stdout.close()
+            except BaseException:
+                self._fresh.pop(operation_id, None)
+                raise
+        if time.monotonic() >= deadline:
+            self._fresh.pop(operation_id, None)
+            raise CustodianAdmissionError()
+        return result
 
     def close(self):
         if self._db is not None:

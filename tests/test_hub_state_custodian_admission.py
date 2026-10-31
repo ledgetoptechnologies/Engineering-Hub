@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import socket
 import sqlite3
 import struct
@@ -52,7 +53,8 @@ def test_signed_admission_is_durable_and_one_shot(tmp_path):
         journal.close()
 
 
-def test_exchange_uses_fresh_nonce_and_reserves(tmp_path, monkeypatch):
+@pytest.mark.parametrize('late', [False, True])
+def test_exchange_uses_fresh_nonce_and_reserves(tmp_path, monkeypatch, late):
     monkeypatch.setenv('CUSTODIAN_TEST_SECRET', 'must-not-reach-child')
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
@@ -62,6 +64,13 @@ def test_exchange_uses_fresh_nonce_and_reserves(tmp_path, monkeypatch):
     enrollment = tmp_path / 'enrollment.json'
     enrollment.write_bytes(_canonical(policy)); enrollment.chmod(0o600)
     journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=True)
+    if late:
+        real_reserve = journal.reserve
+        def slow_reserve(*args):
+            result = real_reserve(*args)
+            time.sleep(1.1)
+            return result
+        monkeypatch.setattr(journal, 'reserve', slow_reserve)
     client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     operation = str(uuid4())
@@ -87,7 +96,16 @@ def test_exchange_uses_fresh_nonce_and_reserves(tmp_path, monkeypatch):
     worker = threading.Thread(target=issuer)
     worker.start()
     try:
-        assert len(journal.exchange(client, operation_id=operation, timeout_seconds=3, provider_uid=10001, provider_gid=10001)) == 64
+        if late:
+            with pytest.raises(CustodianAdmissionError):
+                journal.exchange(client, operation_id=operation, timeout_seconds=1, provider_uid=10001, provider_gid=10001)
+            assert journal._db.execute('SELECT COUNT(*) FROM admissions').fetchone()[0] == 1
+            assert operation not in journal._fresh
+            with pytest.raises(CustodianAdmissionError):
+                journal.stage_quarantined_backup(operation_id=operation, admission_digest='a' * 64,
+                    copy_policy_path=tmp_path / 'unused', timeout_seconds=1)
+        else:
+            assert len(journal.exchange(client, operation_id=operation, timeout_seconds=3, provider_uid=10001, provider_gid=10001)) == 64
     finally:
         client.close(); server.close(); worker.join(timeout=3); journal.close()
     assert not worker.is_alive()
@@ -131,3 +149,75 @@ def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
         assert journal._db.execute('SELECT COUNT(*) FROM admissions').fetchone()[0] == 1
     finally:
         journal.close()
+
+
+def test_quarantined_copy_is_bound_and_never_replayed(tmp_path, monkeypatch):
+    source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
+    stage = tmp_path / 'stage'; stage.mkdir(mode=0o700)
+    source = source_dir / 'backup.sqlite'
+    db = sqlite3.connect(source); db.execute('CREATE TABLE item (value TEXT)'); db.commit(); db.close()
+    source.chmod(0o600)
+    backup_digest = 'sha256:' + hashlib.sha256(source.read_bytes()).hexdigest()
+    digest = 'sha256:' + 'a' * 64
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    enrollment = tmp_path / 'enrollment.json'
+    enrollment.write_bytes(_canonical({'schema': 1, 'supervisor_public_key': public, 'manifest_digest': digest,
+        'source_backup_digest': backup_digest, 'provider_key_digest': digest, 'provider_uid': 10001, 'provider_gid': 10001}))
+    enrollment.chmod(0o600)
+    copy_policy = tmp_path / 'copy.json'
+    copy_policy.write_bytes(_canonical({'schema': 1, 'source': str(source), 'source_digest': backup_digest,
+        'staging_directory': str(stage), 'maximum_bytes': 1024 * 1024,
+        'maximum_total_bytes': 4 * 1024 * 1024, 'minimum_free_bytes': 1024})); copy_policy.chmod(0o600)
+    now = time.time_ns() // 1_000_000
+    payload = {'protocol': PROTOCOL, 'operation_id': str(uuid4()), 'command_id': str(uuid4()),
+        'run_id': str(uuid4()), 'target_id': 'engineering-hub:staging', 'fencing_generation': 1,
+        'manifest_digest': digest, 'role': 'candidate', 'source_backup_digest': backup_digest,
+        'provider_key_digest': digest, 'nonce': 'c' * 64, 'issued_at_ms': now, 'expires_at_ms': now + 5000}
+    journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=True)
+    try:
+        token = journal.reserve(payload, key.sign(DOMAIN + _canonical(payload)))
+        receipt = journal.stage_quarantined_backup(operation_id=payload['operation_id'], admission_digest=token,
+                                                   copy_policy_path=copy_policy, timeout_seconds=3)
+        output = stage / (payload['operation_id'] + '.quarantine')
+        assert output.read_bytes() == source.read_bytes() and receipt['digest'] == backup_digest
+        assert output.stat().st_mode & 0o777 == 0o600
+        with pytest.raises(CustodianAdmissionError):
+            journal.stage_quarantined_backup(operation_id=payload['operation_id'], admission_digest=token,
+                                             copy_policy_path=copy_policy, timeout_seconds=3)
+        clock_op = dict(payload, operation_id=str(uuid4()), nonce='f' * 64)
+        clock_token = journal.reserve(clock_op, key.sign(DOMAIN + _canonical(clock_op)))
+        with monkeypatch.context() as clock:
+            clock.setattr(admission_module.time, 'time_ns', lambda: (now - 1) * 1_000_000)
+            with pytest.raises(CustodianAdmissionError):
+                journal.stage_quarantined_backup(operation_id=clock_op['operation_id'], admission_digest=clock_token,
+                                                 copy_policy_path=copy_policy, timeout_seconds=3)
+        assert not (stage / (clock_op['operation_id'] + '.quarantine')).exists()
+        assert journal._db.execute('SELECT COUNT(*) FROM admissions WHERE operation_id=?', (clock_op['operation_id'],)).fetchone()[0] == 1
+        second = dict(payload, operation_id=str(uuid4()), nonce='d' * 64)
+        second_token = journal.reserve(second, key.sign(DOMAIN + _canonical(second)))
+        with source.open('ab') as file: file.write(b'changed')
+        with pytest.raises(CustodianAdmissionError):
+            journal.stage_quarantined_backup(operation_id=second['operation_id'], admission_digest=second_token,
+                                             copy_policy_path=copy_policy, timeout_seconds=3)
+        assert (stage / (second['operation_id'] + '.quarantine')).exists()
+        third = dict(payload, operation_id=str(uuid4()), nonce='e' * 64)
+        third_token = journal.reserve(third, key.sign(DOMAIN + _canonical(third)))
+        policy = json.loads(copy_policy.read_bytes()); policy['maximum_total_bytes'] = policy['maximum_bytes']
+        copy_policy.write_bytes(_canonical(policy)); copy_policy.chmod(0o600)
+        filler = stage / (str(uuid4()) + '.quarantine')
+        with filler.open('wb') as file: file.truncate(1024 * 1024)
+        filler.chmod(0o600)
+        with pytest.raises(CustodianAdmissionError):
+            journal.stage_quarantined_backup(operation_id=third['operation_id'], admission_digest=third_token,
+                                             copy_policy_path=copy_policy, timeout_seconds=3)
+        assert not (stage / (third['operation_id'] + '.quarantine')).exists()
+    finally:
+        journal.close()
+    reopened = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=tmp_path / 'journal.sqlite', create=False)
+    try:
+        with pytest.raises(CustodianAdmissionError):
+            reopened.stage_quarantined_backup(operation_id=second['operation_id'], admission_digest=second_token,
+                                              copy_policy_path=copy_policy, timeout_seconds=3)
+    finally:
+        reopened.close()
