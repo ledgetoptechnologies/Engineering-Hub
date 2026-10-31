@@ -25,7 +25,7 @@ import hub_container_executor.ledger as ledger_module
 
 @pytest.mark.skipif(os.name != 'posix' or os.geteuid() != 0,
                     reason='requires synthetic root and distinct provider UID')
-@pytest.mark.parametrize('mode', ['exchange', 'prepare', 'deadline'])
+@pytest.mark.parametrize('mode', ['exchange', 'prepare', 'deadline', 'context_mismatch'])
 def test_supervisor_through_nonroot_transport_to_root_journal(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
     source_dir = tmp_path / 'source'; source_dir.mkdir(mode=0o700)
@@ -92,7 +92,17 @@ def test_supervisor_through_nonroot_transport_to_root_journal(tmp_path, monkeypa
                 assert len(journal.exchange(client, operation_id=operation, timeout_seconds=4,
                                             provider_uid=200000, provider_gid=200000)) == 64
             else:
-                if mode == 'deadline':
+                if mode == 'context_mismatch':
+                    expected = {'command_id': command.command_id, 'run_id': command.run_id,
+                        'target_id': command.target_id, 'fencing_generation': command.fencing_generation + 1,
+                        'manifest_digest': manifest.digest(), 'source_backup_digest': backup, 'role': 'candidate'}
+                    with pytest.raises(CustodianAdmissionError):
+                        journal.execute_private_preparation(client, operation_id=operation, timeout_seconds=4,
+                            provider_uid=200000, provider_gid=200000, copy_policy_path=copy_policy,
+                            owner_policy_path=owner_policy, expected_context=expected)
+                    assert not (stage / (operation + '.quarantine')).exists()
+                    assert journal._db.execute('SELECT COUNT(*) FROM admissions').fetchone()[0] == 0
+                elif mode == 'deadline':
                     original_stage, original_check = journal.stage_quarantined_backup, journal._check
                     delayed = [False]
                     def mark_stage(*args, **kwargs):
@@ -127,8 +137,11 @@ def test_supervisor_through_nonroot_transport_to_root_journal(tmp_path, monkeypa
         # its final peer-liveness check. That is a legitimate unconfirmed send.
         assert results == ['sent_unconfirmed'] or (len(results) == 1 and type(results[0]) is LaunchSupervisorError)
         row = journal._db.execute('SELECT operation_id,payload,signature FROM admissions').fetchone()
-        assert row is not None and row[0] == operation
-        key.public_key().verify(row[2], DOMAIN + row[1])
-        recorded = json.loads(row[1])
-        assert recorded['operation_id'] == operation and recorded['command_id'] == command.command_id
-        assert recorded['manifest_digest'] == manifest.digest() and recorded['role'] == 'candidate'
+        if mode == 'context_mismatch':
+            assert row is None
+        else:
+            assert row is not None and row[0] == operation
+            key.public_key().verify(row[2], DOMAIN + row[1])
+            recorded = json.loads(row[1])
+            assert recorded['operation_id'] == operation and recorded['command_id'] == command.command_id
+            assert recorded['manifest_digest'] == manifest.digest() and recorded['role'] == 'candidate'

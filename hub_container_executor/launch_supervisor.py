@@ -1843,7 +1843,7 @@ class LaunchSupervisor:
             if peer is not None:
                 peer.close()
 
-    def serve_protected_state_custodian(self, *, manifest, timeout_seconds):
+    def serve_protected_state_custodian(self, *, manifest, timeout_seconds, on_ready=None):
         """Serve one observation on an enrolled root-owned socket; no state effect.
 
         The socket name remains as evidence after closure. This does not start
@@ -1855,7 +1855,8 @@ class LaunchSupervisor:
         try:
             _require(self._pid == os.getpid() and type(manifest) is PilotManifest
                      and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
-                     and 0 < timeout_seconds <= 5)
+                     and 0 < timeout_seconds <= 5
+                     and (on_ready is None or callable(on_ready) and not inspect.iscoroutinefunction(on_ready)))
             deadline = time.monotonic() + timeout_seconds
             profile, release = self.profile, self.release
             control, isolation, daemon = profile.custodian_control, profile.generation_isolation, profile.daemon_policy
@@ -1939,6 +1940,9 @@ class LaunchSupervisor:
                 policies()
             custody()
             listener.listen(1); listener.settimeout(_remaining(deadline))
+            if on_ready is not None:
+                _require(on_ready() is None)
+                listener.settimeout(_remaining(deadline))
             channel, _ = listener.accept()
             channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
             custody()

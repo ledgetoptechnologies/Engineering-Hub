@@ -8,6 +8,7 @@ permission to retry. Host isolation and effect integration remain disabled.
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -44,6 +45,10 @@ _HOLD_SCHEMA = 'CREATE TABLE custody_holds (target_id TEXT PRIMARY KEY, operatio
 _TRANSPORT = r'''
 import array, os, socket, struct, sys
 s = socket.socket(fileno=int(sys.argv[1]))
+# A timeout-configured parent socket carries O_NONBLOCK across exec even
+# though this reconstructed socket starts with Python's default timeout.
+# Parent owns the bounded child lifetime and will terminate it on timeout.
+s.setblocking(True)
 request = sys.stdin.buffer.readline(4097)
 if not request.endswith(b'\n') or len(request) > 4096: sys.exit(2)
 if s.send(request[:-1]) != len(request)-1: sys.exit(2)
@@ -269,7 +274,8 @@ class CustodianAdmissionJournal:
         except Exception:
             raise CustodianAdmissionError() from None
 
-    def stage_quarantined_backup(self, *, operation_id, admission_digest, copy_policy_path, timeout_seconds):
+    def stage_quarantined_backup(self, *, operation_id, admission_digest, copy_policy_path, timeout_seconds,
+                                 expected_policy_digest=None, authority_anchor=None):
         """Copy one enrolled frozen backup to private quarantine; never publish.
 
         Only an admission freshly committed by this process may start a copy.
@@ -298,11 +304,13 @@ class CustodianAdmissionJournal:
             def current():
                 nonlocal last_mono, last_wall
                 self._check()
+                if authority_anchor is not None and _root_file(authority_anchor[0], 65536)[1] != authority_anchor[1]: raise ValueError()
                 mono, wall = time.monotonic(), time.time_ns() // 1_000_000
                 if not last_mono <= mono < deadline or not last_wall <= wall < fresh[1]: raise ValueError()
                 last_mono, last_wall = mono, wall
             policy_path = _path(str(copy_policy_path))
             raw, policy_pin = _root_file(policy_path, 4096)
+            if expected_policy_digest is not None and 'sha256:' + hashlib.sha256(raw).hexdigest() != expected_policy_digest: raise ValueError()
             policy = json.loads(raw)
             if (type(policy) is not dict or set(policy) != {'schema', 'source', 'source_digest', 'staging_directory', 'maximum_bytes', 'maximum_total_bytes', 'minimum_free_bytes'}
                     or _canonical(policy) != raw or type(policy['schema']) is not int or policy['schema'] != 1
@@ -439,7 +447,8 @@ class CustodianAdmissionJournal:
                 self._staged.pop(operation_id, None)
                 raise CustodianAdmissionError() from None
 
-    def prepare_private_owner(self, *, operation_id, admission_digest, owner_policy_path):
+    def prepare_private_owner(self, *, operation_id, admission_digest, owner_policy_path,
+                              expected_policy_digest=None, authority_anchor=None):
         """Change a fresh quarantine file's owner without making it accessible.
 
         This is private preparation, not a handoff, publication, current-fence
@@ -466,6 +475,7 @@ class CustodianAdmissionJournal:
             _, stage, inode, digest, size, deadline, last_wall, last_mono, expires = saved
             policy_path = _path(str(owner_policy_path))
             raw, pin = _root_file(policy_path, 16384)
+            if expected_policy_digest is not None and 'sha256:' + hashlib.sha256(raw).hexdigest() != expected_policy_digest: raise ValueError()
             policy = json.loads(raw)
             if (type(policy) is not dict or set(policy) != {'schema', 'boot_id', 'daemon_pid', 'daemon_start_ticks',
                     'uid_map', 'gid_map', 'app_uid', 'app_gid'} or _canonical(policy) != raw
@@ -480,6 +490,7 @@ class CustodianAdmissionJournal:
             def current():
                 nonlocal last_wall, last_mono
                 self._check(); peer.check()
+                if authority_anchor is not None and _root_file(authority_anchor[0], 65536)[1] != authority_anchor[1]: raise ValueError()
                 if _boot_id() != policy['boot_id'] or _root_file(policy_path, 16384)[1] != pin: raise ValueError()
                 uid_map = Path(f"/proc/{peer.pid}/uid_map").read_text()
                 gid_map = Path(f"/proc/{peer.pid}/gid_map").read_text()
@@ -712,7 +723,8 @@ class CustodianAdmissionJournal:
                     except OSError: failed = True
             if failed: raise CustodianAdmissionError() from None
 
-    def exchange(self, channel, *, operation_id, timeout_seconds, provider_uid, provider_gid):
+    def exchange(self, channel, *, operation_id, timeout_seconds, provider_uid, provider_gid, expected_context=None,
+                 authority_anchor=None):
         """Request and reserve one observation on an owned connected seqpacket.
 
         The caller owns the connected channel and its host custody. The signed
@@ -759,8 +771,15 @@ class CustodianAdmissionJournal:
                     or response['payload'].get('nonce') != nonce or type(response['signature']) is not str
                     or not re.fullmatch(r'[0-9a-f]{128}', response['signature'])):
                 raise ValueError()
+            if expected_context is not None:
+                if (type(expected_context) is not dict or set(expected_context) != {'command_id', 'run_id', 'target_id',
+                        'fencing_generation', 'manifest_digest', 'source_backup_digest', 'role'}
+                        or any(type(response['payload'].get(k)) is not type(v) or response['payload'].get(k) != v
+                               for k, v in expected_context.items())): raise ValueError()
             if time.monotonic() >= deadline: raise ValueError()
+            if authority_anchor is not None and _root_file(authority_anchor[0], 65536)[1] != authority_anchor[1]: raise ValueError()
             result = self.reserve(response['payload'], bytes.fromhex(response['signature']))
+            if authority_anchor is not None and _root_file(authority_anchor[0], 65536)[1] != authority_anchor[1]: raise ValueError()
             if time.monotonic() >= deadline: raise ValueError()
         except BaseException as error:
             self._fresh.pop(operation_id, None)
@@ -783,7 +802,9 @@ class CustodianAdmissionJournal:
         return result
 
     def execute_private_preparation(self, channel, *, operation_id, provider_uid, provider_gid,
-                                    copy_policy_path, owner_policy_path, timeout_seconds):
+                                    copy_policy_path, owner_policy_path, timeout_seconds, expected_context=None,
+                                    expected_copy_policy_digest=None, expected_owner_policy_digest=None,
+                                    authority_anchor=None, absolute_deadline=None):
         """Own one signed exchange and private state effect, never publication.
 
         The journal owner performs all three stages without accepting an
@@ -796,26 +817,33 @@ class CustodianAdmissionJournal:
         Cooperative deadlines cannot cancel an in-progress filesystem syscall.
         """
         try:
+            started = time.monotonic()
+            if (absolute_deadline is not None and (type(absolute_deadline) not in (int, float)
+                    or not math.isfinite(absolute_deadline) or absolute_deadline <= started)):
+                raise ValueError()
             self._check()
             if (self._read_only or type(operation_id) is not str or str(UUID(operation_id)) != operation_id
                     or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 5):
                 raise ValueError()
-            started = time.monotonic(); deadline = started + timeout_seconds
+            deadline = min(started + timeout_seconds, absolute_deadline) if absolute_deadline is not None else started + timeout_seconds
             def remaining():
                 now = time.monotonic()
                 if not started <= now < deadline: raise ValueError()
                 return deadline - now
             admission = self.exchange(channel, operation_id=operation_id, provider_uid=provider_uid,
-                                      provider_gid=provider_gid, timeout_seconds=remaining())
+                                      provider_gid=provider_gid, timeout_seconds=remaining(), expected_context=expected_context,
+                                      authority_anchor=authority_anchor)
             fresh = self._fresh.get(operation_id)
             if fresh is None or fresh[0] != admission: raise ValueError()
             # Preserve the single outer deadline even if a later precheck blocks
             # before the copy helper constructs its own cooperative budget.
             self._fresh[operation_id] = (fresh[0], fresh[1], min(fresh[2], deadline), fresh[3], fresh[4])
             self.stage_quarantined_backup(operation_id=operation_id, admission_digest=admission,
-                                          copy_policy_path=copy_policy_path, timeout_seconds=remaining())
+                copy_policy_path=copy_policy_path, timeout_seconds=remaining(),
+                expected_policy_digest=expected_copy_policy_digest, authority_anchor=authority_anchor)
             result = self.prepare_private_owner(operation_id=operation_id, admission_digest=admission,
-                                                owner_policy_path=owner_policy_path)
+                owner_policy_path=owner_policy_path, expected_policy_digest=expected_owner_policy_digest,
+                authority_anchor=authority_anchor)
             remaining()
             return result
         except BaseException as error:

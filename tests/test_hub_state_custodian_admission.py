@@ -182,6 +182,34 @@ def test_read_only_reopen_rejects_wal_and_sidecars_without_mutation(tmp_path, co
     assert hashlib.sha256(path.read_bytes()).digest() == before and set(os.listdir(tmp_path)) == names
 
 
+def test_composed_worker_precheck_cannot_extend_caller_deadline(tmp_path, monkeypatch):
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    digest = 'sha256:' + 'a' * 64
+    path = tmp_path / 'journal.sqlite'; enrollment = tmp_path / 'enrollment.json'
+    enrollment.write_bytes(_canonical({'schema': 2, 'journal_path': str(path), 'supervisor_public_key': public,
+        'manifest_digest': digest, 'source_backup_digest': digest, 'provider_key_digest': digest,
+        'provider_uid': 10001, 'provider_gid': 10001})); enrollment.chmod(0o600)
+    journal = CustodianAdmissionJournal(enrollment_path=enrollment, journal_path=path, create=True)
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    original = journal._check
+    def delayed_check():
+        time.sleep(.15)
+        original()
+    monkeypatch.setattr(journal, '_check', delayed_check)
+    try:
+        with pytest.raises(CustodianAdmissionError):
+            journal.execute_private_preparation(client, operation_id=str(uuid4()), provider_uid=10001, provider_gid=10001,
+                copy_policy_path=tmp_path / 'unused-copy', owner_policy_path=tmp_path / 'unused-owner',
+                timeout_seconds=1, absolute_deadline=time.monotonic() + .05)
+        assert journal._db.execute('SELECT COUNT(*) FROM admissions').fetchone()[0] == 0
+        assert journal._db.execute('SELECT COUNT(*) FROM custody_holds').fetchone()[0] == 0
+        server.setblocking(False)
+        with pytest.raises(BlockingIOError): server.recv(1)
+    finally:
+        client.close(); server.close(); journal.close()
+
+
 def test_post_commit_clock_regression_keeps_reservation(tmp_path, monkeypatch):
     key = Ed25519PrivateKey.generate()
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
