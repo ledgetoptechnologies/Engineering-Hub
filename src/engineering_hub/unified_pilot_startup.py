@@ -29,6 +29,7 @@ from .repository import AGENTS
 
 
 SCHEMA = 'engineering-hub.unified-pilot.v1'
+SCHEMA_V2 = 'engineering-hub.unified-pilot.v2'
 ACTION = 'engineering-hub:container-pilot'
 ERROR = 'Unified pilot configuration or startup unavailable'
 
@@ -73,6 +74,7 @@ class PilotProfile:
     credential_file: Path = field(repr=False)
     credential_sha256: str = field(repr=False)
     grace_seconds: int
+    profile_mode: str = 'legacy'
 
 
 def parse_profile(raw):
@@ -88,9 +90,12 @@ def parse_profile(raw):
         def reject(_):
             raise UnifiedPilotStartupError()
         value = json.loads(raw, object_pairs_hook=unique, parse_constant=reject, parse_float=reject)
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, SCHEMA_V2))
+        schema = value['schema']
         _object(value, {'schema', 'manifest', 'machine_id', 'action_key', 'allowed_actors',
-                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'})
-        _require(value['schema'] == SCHEMA and value['action_key'] == ACTION
+                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'} |
+                ({'profile_mode'} if schema == SCHEMA_V2 else set()))
+        _require((schema == SCHEMA or value['profile_mode'] == 'disjoint-v3') and value['action_key'] == ACTION
                  and value['machine_id'] == 'staging-pc')
         manifest = PilotManifest.from_bytes(json.dumps(value['manifest'], separators=(',', ':')).encode())
         _require(manifest.target_id == 'engineering-hub:staging')
@@ -115,7 +120,8 @@ def parse_profile(raw):
         _require(type(grace) is int and REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS <= grace <= 86400)
         return PilotProfile(manifest, frozenset(actors), frozenset(tasks), value['machine_id'],
             origin, _path(executor['ca_file']), _digest(executor['ca_sha256']),
-            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace)
+            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace,
+            'legacy' if schema == SCHEMA else value['profile_mode'])
     except Exception:
         raise UnifiedPilotStartupError() from None
 

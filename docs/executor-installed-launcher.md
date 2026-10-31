@@ -67,7 +67,11 @@ The explicitly selected manual-session enrollment supports a closed v2 form:
 `profile_mode` must be `disjoint-v3`, and `profile_json` contains the exact
 canonical profile as a UTF-8 JSON string. It must match the independently
 enrolled release digest and the launch and manifest Engine identities before
-transport construction. Legacy v1 enrollment retains its original behavior.
+transport construction. An independently protected unified-pilot v2 profile
+must explicitly select `profile_mode: disjoint-v3`; it requires manual-session
+v2. Legacy unified-pilot v1 requires manual-session v1, retaining its original
+behavior. The Hub verifies the pinned profile digest and Engine identities;
+the supervisor separately checks live daemon maps.
 This recognition is not proof of the held attestation or live isolation. The
 existing model trusts the protected file's owner; that owner can replace v2
 with v1, so this is not anti-rollback or an independent version authority.

@@ -13,6 +13,7 @@ import re
 import time
 
 from .container_pilot_manifest import Platform
+from .executor_launch_profile import verify_profile_bytes
 from .container_pilot import ContainerPilotTarget
 from .pilot_ownership import PilotOwner
 from .current_executor_observation import (CurrentExecutorObserver,
@@ -104,7 +105,6 @@ def parse_enrollment(raw):
         if schema == SCHEMA_V2:
             _require(data['profile_mode'] == 'disjoint-v3' and type(data['profile_json']) is str)
             profile_bytes = data['profile_json'].encode('utf-8')
-            from .executor_launch_profile import verify_profile_bytes
             recognized = verify_profile_bytes(profile_bytes, release.launch_profile_digest)
             _require(recognized.daemon_policy is not None and recognized.daemon_policy.engine_id == launch.engine_id)
         actor = data['operator_actor']
@@ -153,13 +153,14 @@ class TrustedQueuedSessionComposition:
             # dataclass construction with malformed/false attestation fields.
             self._enrollment = parse_enrollment(enrollment_bytes(enrollment))
             e = self._enrollment
+            _require((profile.profile_mode == 'legacy' and e.schema == SCHEMA)
+                     or (profile.profile_mode == 'disjoint-v3' and e.schema == SCHEMA_V2))
             _require(profile.manifest.digest() == e.manifest_digest
                      and profile.manifest.target_id == e.target_id and profile.machine_id == e.machine_id
                      and profile.manifest.driver.implementation_commit == e.release.implementation_commit
                      and profile.manifest.runner_binding.platform == e.release.platform
                      and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id)
             if e.schema == SCHEMA_V2:
-                from .executor_launch_profile import verify_profile_bytes
                 recognized = verify_profile_bytes(e.profile_bytes, e.release.launch_profile_digest)
                 _require(recognized.daemon_policy is not None
                          and recognized.daemon_policy.engine_id == e.launch.engine_id

@@ -135,9 +135,13 @@ def dependencies(monkeypatch):
 
 
 def construct(tmp_path, data=None):
-    profile = parse_profile(encode(profile_document()))
+    selected = document() if data is None else data
+    profile_data = profile_document()
+    if selected.get('schema') == module.SCHEMA_V2:
+        profile_data.update(schema='engineering-hub.unified-pilot.v2', profile_mode='disjoint-v3')
+    profile = parse_profile(encode(profile_data))
     return module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
-        enrollment=module.parse_enrollment(encode(document() if data is None else data)),
+        enrollment=module.parse_enrollment(encode(selected)),
         ca_pem=b'captured-ca', credential=b'captured-executor-credential')
 
 
@@ -190,6 +194,30 @@ def test_v1_remains_legacy_and_rejects_v2_fields():
     data['profile_mode'] = 'disjoint-v3'
     with pytest.raises(module.TrustedSessionError):
         module.parse_enrollment(encode(data))
+
+
+@pytest.mark.parametrize('enrollment_version', ['v1', 'v2'])
+def test_independent_pilot_mode_mismatch_denied_before_transport(tmp_path, dependencies, enrollment_version):
+    data = v2_document()
+    pilot = profile_document()
+    if enrollment_version == 'v1':
+        # The opaque digest is still the valid v3 digest; omission is denied.
+        data['schema'] = module.SCHEMA
+        del data['profile_mode'], data['profile_json']
+        pilot.update(schema='engineering-hub.unified-pilot.v2', profile_mode='disjoint-v3')
+    profile = parse_profile(encode(pilot))
+    with pytest.raises(module.TrustedSessionError):
+        module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
+            enrollment=module.parse_enrollment(encode(data)), ca_pem=b'ca', credential=b'credential')
+    assert dependencies.events == []
+
+
+@pytest.mark.parametrize('mode', [None, 'legacy', 'other'])
+def test_v2_pilot_profile_requires_disjoint_mode(mode):
+    data = profile_document()
+    data.update(schema='engineering-hub.unified-pilot.v2', profile_mode=mode)
+    with pytest.raises(Exception):
+        parse_profile(encode(data))
 
 
 @pytest.mark.parametrize('change', ['stale', 'future', 'expired', 'manifest', 'driver', 'engine'])
