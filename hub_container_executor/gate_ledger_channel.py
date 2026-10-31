@@ -172,7 +172,7 @@ class GateLedgerWorker:
             if (payload['protocol'] != REQUEST or payload['challenge'] != challenge
                     or type(payload['launch_binding']) is not list or payload['launch_binding'] != list(binding)
                     or any(type(a) is not type(b) for a, b in zip(payload['launch_binding'], binding))
-                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5')
+                    or payload['manifest_digest'] != self._manifest or payload['action'] not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1')
                     or type(issued) is not int or type(expires) is not int or not 0 < expires - issued <= 5000
                     or now < wall or issued < wall - 5000 or not issued <= now < expires
                     or expires <= wall or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
@@ -182,12 +182,13 @@ class GateLedgerWorker:
             is_lookup = payload['action'] == 'lookup_completion_v5'
             is_pending = payload['action'] == 'pending_gate_v5'
             is_ready = payload['action'] == 'health_ready_v5'
+            is_state = payload['action'] == 'pending_state_v1'
             if self._lookup_only and not is_lookup: raise ValueError()
-            if (is_accept or is_lookup or is_pending or is_ready) and (not self._require_sender_liveness or self._completion_policy is None):
+            if (is_accept or is_lookup or is_pending or is_ready or is_state) and (not self._require_sender_liveness or self._completion_policy is None):
                 raise ValueError()
             is_snapshot = payload['action'] in ('inspect_completion', 'inspect_completion_v4')
             identity = value.get('identity') if (is_snapshot or is_accept or is_lookup or is_ready) else value
-            if not is_pending and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
+            if not (is_pending or is_state) and (type(identity) is not dict or identity.get('manifest_digest') != self._manifest): raise ValueError()
             last_wall = [now]
             def fresh_decision():
                 current = int(time.time() * 1000)
@@ -197,7 +198,10 @@ class GateLedgerWorker:
                         or (time.monotonic() - started) * 1000 >= decision_expires - wall):
                     raise ValueError()
                 last_wall[0] = current
-            if is_ready:
+            if is_state:
+                if (set(value) != {'operation_id'} or type(value['operation_id']) is not str
+                        or str(UUID(value['operation_id'])) != value['operation_id']): raise ValueError()
+            elif is_ready:
                 if (set(value) != {'identity', 'probe_digest'} or set(identity) != IDENTITY_FIELDS
                         or type(value['probe_digest']) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', value['probe_digest'])): raise ValueError()
             elif is_pending:
@@ -234,7 +238,7 @@ class GateLedgerWorker:
                     or (time.monotonic() - started) * 1000 >= expires - wall): raise ValueError()
             last_wall[0] = current
             if payload['action'] == 'consume': fresh_decision()
-            scope(); attempted = not (is_snapshot or is_lookup or is_pending or is_ready)
+            scope(); attempted = not (is_snapshot or is_lookup or is_pending or is_ready or is_state)
             if payload['action'] == 'reserve':
                 self._ledger.reserve_mount_gate_challenge(value)
             elif payload['action'] == 'consume' and self._ledger.consume_mount_gate_challenge(value) is not True:
@@ -247,6 +251,8 @@ class GateLedgerWorker:
                 snapshot = self._ledger.pending_gate_context(role=value['role'])
             elif is_ready:
                 snapshot = self._ledger.gate_health_ready(identity, value['probe_digest'])
+            elif is_state:
+                snapshot = self._ledger.pending_state_context(value['operation_id'])
             elif is_snapshot:
                 snapshot = self._ledger.gate_completion_snapshot(identity, value['probe_digest'])
                 if payload['action'] == 'inspect_completion_v4' and snapshot['role'] != value['role']:
@@ -260,7 +266,7 @@ class GateLedgerWorker:
             response = _canonical({'protocol': RESPONSE, 'challenge': challenge,
                                    'action': payload['action'],
                                    **({'outcome': 'observed', 'snapshot': snapshot}
-                                      if (is_snapshot or is_lookup or is_pending or is_ready) else
+                                      if (is_snapshot or is_lookup or is_pending or is_ready or is_state) else
                                       {'outcome': 'committed', 'snapshot': snapshot} if is_accept else {'outcome': 'committed'})})
             if len(response) > MAX_BYTES: raise ValueError()
             scope(); self._channel.settimeout(deadline - time.monotonic())
@@ -334,7 +340,7 @@ class SupervisorLedgerClient:
             if credentials != [(self._peer.pid, self._peer.uid, self._peer.gid)]: raise ValueError()
             scope(); return _parse(raw)
         try:
-            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5') or type(value) is not dict: raise ValueError()
+            if action not in ('reserve', 'consume', 'inspect_completion', 'inspect_completion_v4', 'accept_completion_v5', 'lookup_completion_v5', 'pending_gate_v5', 'health_ready_v5', 'pending_state_v1') or type(value) is not dict: raise ValueError()
             if self._lookup_only and action != 'lookup_completion_v5': raise ValueError()
             snapshot = json.loads(_canonical(value))
             challenge = receive()
@@ -357,9 +363,25 @@ class SupervisorLedgerClient:
             is_lookup = action == 'lookup_completion_v5'
             is_pending = action == 'pending_gate_v5'
             is_ready = action == 'health_ready_v5'
+            is_state = action == 'pending_state_v1'
             expected = {'protocol': RESPONSE, 'challenge': challenge['challenge'], 'action': action,
-                        'outcome': 'observed' if (is_snapshot or is_lookup or is_pending or is_ready) else 'committed'}
-            if is_ready:
+                        'outcome': 'observed' if (is_snapshot or is_lookup or is_pending or is_ready or is_state) else 'committed'}
+            if is_state:
+                if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
+                        or any(response[k] != v for k, v in expected.items())
+                        or set(snapshot) != {'operation_id'}): raise ValueError()
+                record = response['snapshot']
+                fields = {'operation_id', 'command_id', 'run_id', 'target_id', 'fencing_generation', 'manifest_digest', 'role'}
+                if (type(record) is not dict or set(record) != fields
+                        or record['operation_id'] != snapshot['operation_id']
+                        or record['manifest_digest'] != self._manifest
+                        or record['target_id'] != 'engineering-hub:staging'
+                        or record['role'] not in ('candidate', 'rollback')
+                        or type(record['fencing_generation']) is not int
+                        or not 0 < record['fencing_generation'] < 2**63
+                        or any(type(record[k]) is not str or str(UUID(record[k])) != record[k]
+                               for k in ('operation_id', 'command_id', 'run_id'))): raise ValueError()
+            elif is_ready:
                 if (type(response) is not dict or set(response) != set(expected) | {'snapshot'}
                         or any(response[k] != v for k, v in expected.items())
                         or type(response['snapshot']) is not dict or set(response['snapshot']) != {'ready'}
@@ -422,7 +444,7 @@ class SupervisorLedgerClient:
             elif response != expected: raise ValueError()
             if not issued <= int(time.time() * 1000) < issued + ttl: raise ValueError()
             scope()
-            return response['snapshot'] if (is_snapshot or is_accept or is_lookup or is_pending or is_ready) else True
+            return response['snapshot'] if (is_snapshot or is_accept or is_lookup or is_pending or is_ready or is_state) else True
         except Exception:
             raise GateLedgerChannelError() from None
 

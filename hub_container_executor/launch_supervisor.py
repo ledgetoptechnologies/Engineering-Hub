@@ -1761,6 +1761,11 @@ class LaunchSupervisor:
         with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
             return client.invoke('pending_gate_v5', {'role': role})
 
+    def pending_state_context(self, *, operation_id, manifest_digest, timeout_seconds):
+        """Read one current fenced state intent; this observation grants no custody."""
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('pending_state_v1', {'operation_id': operation_id})
+
     def observe_pending_gate_runtime(self, *, manifest, image, enrollment_file, timeout_seconds):
         """Bind the current fenced create to the live bootstrap and host source.
 

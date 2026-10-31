@@ -288,6 +288,7 @@ class SQLiteLedger:
                     "CREATE TABLE IF NOT EXISTS operations (operation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, intent TEXT NOT NULL, receipt TEXT, receipt_mac TEXT, UNIQUE (command_id, kind))",
                     "CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS create_contexts (operation_id TEXT PRIMARY KEY, context TEXT NOT NULL, context_mac TEXT NOT NULL)",
+                    "CREATE TABLE IF NOT EXISTS state_intent_macs (operation_id TEXT PRIMARY KEY, intent_mac TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS mount_gate_challenges (operation_id TEXT PRIMARY KEY, launch_id TEXT NOT NULL UNIQUE, nonce TEXT NOT NULL UNIQUE, identity TEXT NOT NULL, identity_mac TEXT NOT NULL, state TEXT NOT NULL, decision TEXT, decision_mac TEXT)",
                     "CREATE TABLE IF NOT EXISTS gate_required (command_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, state_mac TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS gate_acceptances (operation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, record TEXT NOT NULL, record_mac TEXT NOT NULL)",
@@ -452,6 +453,10 @@ class SQLiteLedger:
             try:
                 db.execute("INSERT INTO operations VALUES (?,?,?,'intent',?,NULL,NULL)",
                            (operation_id, command_id, kind, intent))
+                if kind in {"state_copy", "rollback_state"}:
+                    mac = self._operation_mac(operation_id, command_id, kind, "state_intent",
+                                              _canonical({'intent': intent, 'request': row['payload']}))
+                    db.execute("INSERT INTO state_intent_macs VALUES (?,?)", (operation_id, mac))
                 if encoded_context is not None:
                     mac = self._operation_mac(operation_id, command_id, kind,
                                               "create_context", encoded_context)
@@ -460,6 +465,58 @@ class SQLiteLedger:
             except sqlite3.IntegrityError:
                 raise RuntimeError("operation already reserved; never repeat") from None
             return operation_id
+
+    def pending_state_context(self, operation_id: str) -> dict:
+        """Read a MACed, currently fenced intent; this is not an effect grant.
+
+        The snapshot can become stale immediately. A supervisor must bind it to
+        independently enrolled manifest/provider authority and recheck before
+        admitting an effect. Legacy unauthenticated intents fail closed.
+        """
+        self._check_open()
+        with self._transaction() as db:
+            row = db.execute('SELECT * FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+            auth = db.execute('SELECT intent_mac FROM state_intent_macs WHERE operation_id=?', (operation_id,)).fetchone()
+            command = (db.execute('SELECT * FROM commands WHERE command_id=?', (row['command_id'],)).fetchone()
+                       if row is not None else None)
+            if (row is None or row['kind'] not in {'state_copy', 'rollback_state'}
+                    or row['status'] != 'intent' or row['receipt'] is not None or row['receipt_mac'] is not None
+                    or command is None or command['state'] != 'running'
+                    or auth is None or type(auth['intent_mac']) is not str
+                    or not re.fullmatch(r'[0-9a-f]{64}', auth['intent_mac'])
+                    or not hmac.compare_digest(auth['intent_mac'], self._operation_mac(
+                        operation_id, row['command_id'], row['kind'], 'state_intent',
+                        _canonical({'intent': row['intent'], 'request': command['payload']})))):
+                raise PermissionError('state operation authority unavailable')
+            try:
+                request = ContainerPilotRequest.model_validate_json(command['payload'])
+                expected = _canonical({'operation_id': operation_id, 'kind': row['kind'],
+                    'command_id': request.command_id, 'run_id': request.run_id,
+                    'fencing_generation': request.fencing_generation})
+                run = db.execute('SELECT * FROM runs WHERE run_id=?', (request.run_id,)).fetchone()
+                target = db.execute('SELECT * FROM targets WHERE target_id=?', (request.target_id,)).fetchone()
+                phase = db.execute('SELECT * FROM phases WHERE command_id=?', (request.command_id,)).fetchone()
+                paused = db.execute("SELECT value FROM control WHERE key='paused'").fetchone()
+                if (paused is not None and paused['value'] != 'false'
+                        or request.command_id != row['command_id'] or request.run_id != command['run_id']
+                        or request.target_id != command['target_id'] or request.action != command['action']
+                        or request.action != ('deploy_container' if row['kind'] == 'state_copy' else 'rollback_container')
+                        or operation_id != str(uuid.uuid5(uuid.UUID(request.command_id), row['kind']))
+                        or row['intent'] != expected or run is None or run['state'] != 'running'
+                        or run['target_id'] != request.target_id or run['fence'] != request.fencing_generation
+                        or run['manifest_digest'] != request.manifest_digest or run['candidate_commit'] != request.candidate_commit
+                        or run['policy_revision'] != request.policy_revision or target is None
+                        or target['state'] != 'running' or target['current_run_id'] != request.run_id
+                        or target['fence'] != request.fencing_generation or target['manifest_digest'] != request.manifest_digest
+                        or phase is None or phase['state'] != 'running' or phase['run_id'] != request.run_id
+                        or phase['action'] != request.action):
+                    raise ValueError
+                return {'operation_id': operation_id, 'command_id': request.command_id,
+                        'run_id': request.run_id, 'target_id': request.target_id,
+                        'fencing_generation': request.fencing_generation, 'manifest_digest': request.manifest_digest,
+                        'role': 'candidate' if row['kind'] == 'state_copy' else 'rollback'}
+            except (ValueError, TypeError, KeyError):
+                raise PermissionError('state operation authority unavailable') from None
 
     def _operation_mac(self, operation_id: str, command_id: str, kind: str,
                        status: str, receipt: str) -> str:

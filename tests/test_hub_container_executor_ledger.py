@@ -1,5 +1,6 @@
 """Real private SQLite and kernel-owner tests; no Docker or listener."""
 import multiprocessing
+import json
 import os
 import sqlite3
 import stat
@@ -510,6 +511,40 @@ def test_state_copy_completion_accepts_unchanged_authority(tmp_path):
         operation = ledger.begin_operation(command.command_id, 'state_copy')
         ledger.complete_operation(operation, {'generation_id': 'synthetic'})
         assert ledger.operation_rows(command.command_id)[0]['receipt_authentic'] is True
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize('fault', ['mac', 'missing_mac', 'intent', 'fence', 'paused', 'completed', 'retarget_manifest'])
+def test_pending_state_context_rejects_changed_authority(tmp_path, fault):
+    ledger = open_ledger(tmp_path)
+    try:
+        command = request()
+        assert ledger.admit(command).accepted
+        operation = ledger.begin_operation(command.command_id, 'state_copy')
+        context = ledger.pending_state_context(operation)
+        assert context == {'operation_id': operation, 'command_id': command.command_id,
+                           'run_id': command.run_id, 'target_id': command.target_id,
+                           'fencing_generation': command.fencing_generation,
+                           'manifest_digest': command.manifest_digest, 'role': 'candidate'}
+        if fault == 'paused':
+            ledger.set_paused(True)
+        elif fault == 'completed':
+            ledger.complete_operation(operation, {'generation_id': 'synthetic'})
+        else:
+            with ledger._transaction() as db:
+                if fault == 'mac': db.execute("UPDATE state_intent_macs SET intent_mac='bad'")
+                if fault == 'missing_mac': db.execute('DELETE FROM state_intent_macs')
+                if fault == 'intent': db.execute("UPDATE operations SET intent='{}'")
+                if fault == 'fence': db.execute('UPDATE targets SET fence=fence+1')
+                if fault == 'retarget_manifest':
+                    payload = json.loads(db.execute('SELECT payload FROM commands').fetchone()['payload'])
+                    payload['manifest_digest'] = 'sha256:' + 'c' * 64
+                    db.execute('UPDATE commands SET payload=?', (json.dumps(payload, sort_keys=True, separators=(',', ':')),))
+                    db.execute('UPDATE runs SET manifest_digest=?', (payload['manifest_digest'],))
+                    db.execute('UPDATE targets SET manifest_digest=?', (payload['manifest_digest'],))
+        with pytest.raises(PermissionError):
+            ledger.pending_state_context(operation)
     finally:
         ledger.close()
 
