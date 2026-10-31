@@ -61,6 +61,130 @@ def configuration():
         bearer_test_binding=dict(slot_id='test-executor-service', version=1))
 
 
+def pair_configuration():
+    data = configuration()
+    data['schema'] = module.PAIR_SCHEMA
+    data['pair'] = {'authority_public_key_hex': 'b' * 64, 'peer_uid': 10002, 'peer_gid': 10002}
+    return data
+
+
+def test_pair_configuration_has_only_independent_authority_and_peer_pins():
+    data = pair_configuration()
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.pair['authority_public_key'] == bytes.fromhex('b' * 64)
+    assert parsed.pair['peer_uid'] == 10002
+    data['pair']['pair_id'] = str(uuid4())
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+
+
+@pytest.mark.asyncio
+async def test_pair_runner_wires_two_one_shot_exchanges_then_owned_broker(monkeypatch):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    events, pipes = [], []
+    monkeypatch.setattr(module, '_process', lambda: None)
+    class Verifier:
+        def claim_channel(self, fd): events.append(('claim', fd))
+        def implementation_commit(self): return config.release.implementation_commit
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs):
+            self.index = len([item for item in events if item == 'transport'])
+            events.append('transport')
+        def issue_pair_enrollment(self, **kwargs):
+            assert self.index == 0 and kwargs['own_enrollment'] is config.release
+            events.append('enrollment')
+            return object()
+        def issue_enrolled_pair_channel(self, **kwargs):
+            assert self.index == 1 and kwargs['authority_public_key'] == bytes.fromhex('b' * 64)
+            events.append('channel')
+            fd, writer = os.pipe(); pipes.append(writer)
+            return fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop): yield
+    async def serve(factory, *, fd, peer, stop_event, cleanup_report):
+        assert (peer.uid, peer.gid) == (10002, 10002)
+        assert factory.keywords['driver_identity_verifier'].__class__ is Verifier
+        events.append('broker-drain')
+        os.close(fd)
+        cleanup_report.state = 'clean'
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    monkeypatch.setattr(module, 'serve_owned_inherited_broker', serve)
+    try:
+        await module.run_installed_executor(config)
+        assert [entry for entry in events if isinstance(entry, str)] == ['transport', 'enrollment',
+            'transport', 'channel', 'broker-drain', 'identity-close', 'transport-close', 'transport-close']
+    finally:
+        for fd in pipes: os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_pair_runner_closes_received_fd_if_identity_claim_fails(monkeypatch):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    read_fd, write_fd = os.pipe()
+    events = []
+    class Verifier:
+        def claim_channel(self, fd): raise RuntimeError('synthetic refusal')
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs): pass
+        def issue_pair_enrollment(self, **kwargs): return object()
+        def issue_enrolled_pair_channel(self, **kwargs): return read_fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop): yield
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    try:
+        with pytest.raises(module.InstalledRunnerError): await module.run_installed_executor(config)
+        with pytest.raises(OSError): os.fstat(read_fd)
+        assert events == ['identity-close', 'transport-close', 'transport-close']
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('interruption', ['stop_after_enrollment', 'cancel_after_channel'])
+async def test_pair_runner_interruptions_close_pre_adoption_resources(monkeypatch, interruption):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    read_fd, write_fd = os.pipe()
+    events, state = [], {}
+    class Verifier:
+        def claim_channel(self, fd):
+            if interruption == 'cancel_after_channel': asyncio.current_task().cancel()
+        def implementation_commit(self): return config.release.implementation_commit
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs): events.append('transport')
+        def issue_pair_enrollment(self, **kwargs):
+            if interruption == 'stop_after_enrollment': state['stop'].set()
+            return object()
+        def issue_enrolled_pair_channel(self, **kwargs): return read_fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop):
+        state['stop'] = stop
+        yield
+    async def unexpected_broker(*args, **kwargs): pytest.fail('broker must not be entered')
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    monkeypatch.setattr(module, 'serve_owned_inherited_broker', unexpected_broker)
+    try:
+        expected = module.InstalledRunnerError if interruption == 'stop_after_enrollment' else asyncio.CancelledError
+        with pytest.raises(expected): await module.run_installed_executor(config)
+        if interruption == 'cancel_after_channel':
+            with pytest.raises(OSError): os.fstat(read_fd)
+            assert events == ['transport', 'transport', 'identity-close', 'transport-close', 'transport-close']
+        else:
+            os.close(read_fd)
+            assert events == ['transport', 'transport-close']
+    finally:
+        os.close(write_fd)
+
+
 def changed(value, path, replacement):
     keys = path.split('.')
     target = value

@@ -30,9 +30,13 @@ from .local_providers import ImmutableTestSecretResolver
 from .local_resources import local_host_adapter_resources
 from .runtime_identity import ExecutorReleaseEnrollment, LaunchReceiptIdentityVerifier
 from .service import serve_owned_host_executor_unix
+from .broker_seqpacket import PeerAccount
+from .broker_service import BrokerCleanupReport, serve_owned_inherited_broker
+from engineering_hub.server import _signal_stop
 
 
 SCHEMA = 'engineering-hub.installed-executor.v1'
+PAIR_SCHEMA = 'engineering-hub.installed-executor.v2'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -109,6 +113,7 @@ class RunnerConfiguration:
     socket_path: str
     bearer_slot: tuple
     process_id: int
+    pair: object = None
 
 
 def parse_configuration(raw):
@@ -128,8 +133,9 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _object(value, _ROOT_FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, PAIR_SCHEMA))
+        _object(value, _ROOT_FIELDS | ({'pair'} if value['schema'] == PAIR_SCHEMA else set()))
+        _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         binding_data = dict(_object(value['docker_binding'], DockerEngineBinding.__dataclass_fields__))
         binding_data['platform'] = Platform.model_validate(binding_data['platform'])
@@ -196,13 +202,22 @@ def parse_configuration(raw):
         _require(len(os.fsencode(socket_path)) < 108
                  and socket_path != transport['socket_path']
                  and socket_path != binding.unix_socket_path)
+        pair = None
+        if value['schema'] == PAIR_SCHEMA:
+            pair = dict(_object(value['pair'], {'authority_public_key_hex', 'peer_uid', 'peer_gid'}))
+            key = pair.pop('authority_public_key_hex')
+            _require(type(key) is str and _HEX_KEY.fullmatch(key))
+            pair['authority_public_key'] = bytes.fromhex(key)
+            for name in ('peer_uid', 'peer_gid'):
+                _integer(pair[name], 0, 2**32 - 2)
+            pair = MappingProxyType(pair)
         return RunnerConfiguration(manifest, binding, MappingProxyType(resources), release,
             MappingProxyType(transport),
             _integer(value['max_receipt_lifetime_seconds'], 1, 3600),
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid())
+            socket_path, bearer_slot, os.getpid(), pair)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -256,6 +271,42 @@ async def run_installed_executor(config):
         _process()
         _require(type(config) is RunnerConfiguration and config.process_id == os.getpid())
         with ExitStack() as owned:
+            if config.pair is not None:
+                stop, report = asyncio.Event(), BrokerCleanupReport()
+                owned.enter_context(_signal_stop(stop))
+                enrollment_transport = UnixLaunchReceiptTransport(**config.transport)
+                owned.callback(enrollment_transport.close)
+                enrollment = enrollment_transport.issue_pair_enrollment(role='executor',
+                    authority_public_key=config.pair['authority_public_key'], own_enrollment=config.release,
+                    manifest_digest=config.manifest.digest(), timeout_ms=config.timeout_ms)
+                await asyncio.sleep(0)
+                _require(not stop.is_set())
+                channel_transport = UnixLaunchReceiptTransport(**config.transport)
+                owned.callback(channel_transport.close)
+                fd, verifier = channel_transport.issue_enrolled_pair_channel(enrollment=enrollment, role='executor',
+                    authority_public_key=config.pair['authority_public_key'], own_enrollment=config.release,
+                    manifest_digest=config.manifest.digest(), max_receipt_lifetime_seconds=config.lifetime_seconds,
+                    timeout_ms=config.timeout_ms)
+                descriptor = [fd]
+                def close_untransferred():
+                    if descriptor[0] is not None:
+                        os.close(descriptor[0])
+                        descriptor[0] = None
+                owned.callback(close_untransferred)
+                owned.callback(verifier.close)
+                verifier.claim_channel(fd)
+                _require(verifier.implementation_commit() == config.release.implementation_commit
+                         == config.manifest.driver.implementation_commit)
+                await asyncio.sleep(0)
+                _require(not stop.is_set())
+                factory = partial(local_host_adapter_resources, manifest=config.manifest,
+                    binding=config.binding, **config.resources, driver_identity_verifier=verifier)
+                peer = PeerAccount(uid=config.pair['peer_uid'], gid=config.pair['peer_gid'])
+                descriptor[0] = None  # The owned service takes custody at invocation.
+                await serve_owned_inherited_broker(factory, fd=fd, peer=peer, stop_event=stop,
+                                                   cleanup_report=report)
+                _require(report.state == 'clean')
+                return
             transport = UnixLaunchReceiptTransport(**config.transport)
             owned.callback(transport.close)
             verifier = LaunchReceiptIdentityVerifier(enrollment=config.release,
