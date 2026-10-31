@@ -118,7 +118,7 @@ def test_lock_held_past_the_bound_fails_closed(tmp_path):
         assert isinstance(events.failure, WatcherFailed)
         assert not events.healthy and len(recorder.errors) == 1
         assert recorder.states == ["suspended"]
-        assert events.stats["failure_stage"] == "acquire_write_barrier"
+        assert events.stats["failure_stage"] == "transient_lock_bound"
     finally:
         holder.close()
         events.stop()
@@ -213,6 +213,7 @@ def test_release_after_the_bound_never_resumes_or_delivers(tmp_path, monkeypatch
         time.sleep(0.5)
         assert recorder.deliveries == [] and recorder.states == ["suspended"]
         assert events.stats["cursor"] == 0 and not events.healthy
+        assert events.stats["failure_stage"] == "transient_lock_bound"
     finally:
         holder.close()
         events.stop()
@@ -256,6 +257,7 @@ def test_readiness_flood_cannot_postpone_the_bound(tmp_path):
             began = time.monotonic()
             assert wait_until(lambda: events.failure is not None, timeout=4)
             assert time.monotonic() - began < 2
+            assert events.stats["failure_stage"] == "transient_lock_bound"
     finally:
         holder.close()
         events.stop()

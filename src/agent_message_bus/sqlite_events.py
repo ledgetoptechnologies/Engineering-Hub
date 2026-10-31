@@ -716,6 +716,8 @@ class SQLiteEventSource:
         if self._suspended_since is None:
             return
         if (time.monotonic() if now is None else now) - self._suspended_since > self.transient_busy_seconds:
+            # One fixed stage, wherever the expiry is noticed (wait loop, retry or barrier).
+            self._stage = "transient_lock_bound"
             raise WatcherFailed("SQLite write lock was held longer than the transient bound")
 
     def _wait_seconds(self) -> float:
