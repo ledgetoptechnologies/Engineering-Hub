@@ -458,15 +458,23 @@ def _unique(pairs):
     return result
 
 
+_GATE_ISSUANCE_SCHEMA = ('CREATE TABLE gate_issuance (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                         'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
+                         'decision TEXT NOT NULL, digest TEXT NOT NULL)')
+
+
 class _Journal:
     """Root-private local durable single-launch/one-issuance reservation.
 
     Restart can inspect retained rows but never adopts an earlier launch. The
     lock is held until close; no row or lock file is deleted on uncertainty.
     """
-    def __init__(self, path, *, create):
+    def __init__(self, path, *, create, gate_mode=False):
         from engineering_hub.pilot_ownership import _local_filesystem
-        _require(type(create) is bool)
+        _require(type(create) is bool and type(gate_mode) is bool)
+        self.gate_mode = gate_mode
+        self._gate_fresh = gate_mode and create
+        self._gate_lock = threading.Lock()
         self.path, self.pid = _path(path), os.getpid()
         self.parent = self.lock = None
         try:
@@ -495,9 +503,15 @@ class _Journal:
                     db.execute('CREATE TABLE launch (id TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL)')
                     db.execute('CREATE TABLE issuance (launch_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                                'state TEXT NOT NULL, receipt_digest TEXT)')
-                    db.execute('PRAGMA user_version=1')
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == 1)
-                _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'launch', 'issuance'})
+                    if gate_mode:
+                        db.execute(_GATE_ISSUANCE_SCHEMA)
+                    db.execute('PRAGMA user_version=' + ('2' if gate_mode else '1'))
+                _require(db.execute('PRAGMA user_version').fetchone()[0] == (2 if gate_mode else 1))
+                tables = {'launch', 'issuance'} | ({'gate_issuance'} if gate_mode else set())
+                _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == tables)
+                if gate_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_issuance'").fetchone()
+                             == (_GATE_ISSUANCE_SCHEMA,))
         except BaseException:
             self.close()
             raise
@@ -546,6 +560,41 @@ class _Journal:
         with self.transaction() as db:
             _require(db.execute('UPDATE issuance SET state=?,receipt_digest=? WHERE launch_id=?',
                                 (state, digest, identity)).rowcount == 1)
+
+    def reserve_gate_issuance(self, supervisor_id, supervisor_record, expected, decision, digest):
+        """One durable reservation in this journal; external authorities stay external.
+
+        Trusted composition must hold the supervisor lifecycle lock and validate
+        live application process, fence, custodian and independent enrollment.
+        This transaction cannot atomically inspect the separate adapter ledger.
+        A raised error, including after commit, is uncertain and never retryable.
+        """
+        self._check()  # PID fence precedes a possibly inherited lock.
+        with self._gate_lock:
+            return self._reserve_gate_issuance(supervisor_id, supervisor_record, expected, decision, digest)
+
+    def _reserve_gate_issuance(self, supervisor_id, supervisor_record, expected, decision, digest):
+        from .mount_gate_protocol import IDENTITY_FIELDS, _payload
+        _require(self.gate_mode and self._gate_fresh and type(supervisor_id) is str
+                 and type(supervisor_record) is dict and type(expected) is dict
+                 and set(expected) == IDENTITY_FIELDS and type(digest) is str
+                 and re.fullmatch(r'[0-9a-f]{64}', digest) is not None)
+        _payload(decision)
+        _require(all(type(expected[k]) is type(decision[k]) and expected[k] == decision[k]
+                     for k in IDENTITY_FIELDS))
+        encoded = _canonical(decision).decode()
+        try:
+            with self.transaction() as db:
+                row = db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                _require(row == ('running', _canonical(supervisor_record).decode()))
+                db.execute('INSERT INTO gate_issuance VALUES (?,?,?,?,?,?)',
+                           (decision['operation_id'], decision['nonce'], decision['launch_id'], supervisor_id, encoded, digest))
+        except BaseException:
+            # Even an exception after SQLite commit is ambiguous. Permanently
+            # close this in-process issuance path until manual reconciliation.
+            self._gate_fresh = False
+            raise
+        return True
 
     def close(self):
         if self.lock is not None:
