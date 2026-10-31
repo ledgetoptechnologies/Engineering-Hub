@@ -22,7 +22,7 @@ from hub_container_executor.asgi import create_app as executor_app
 from hub_container_executor.launch_transport import UnixCurrentObservationTransport
 from tests.test_hub_container_executor_installed_coordinator import github_configuration, canonical
 from tests.test_hub_container_executor_launch_supervisor import synthetic_issuer, short_root, root_journal, current_pins, current_ready
-from tests.test_hub_current_observation_end_to_end import owned_supervisor_wait, request, NoCommands
+from tests.test_hub_current_observation_end_to_end import owned_supervisor_wait, request
 from tests.test_hub_trusted_queued_session import v2_document, encode
 from tests.test_hub_unified_pilot_startup import profile_document
 
@@ -34,7 +34,8 @@ def owned_resources():
 
 
 @pytest.mark.asyncio
-async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources):
+@pytest.mark.parametrize('tamper_observation', [False, True])
+async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(synthetic_issuer, monkeypatch, owned_resources, tamper_observation):
     import engineering_hub.pilot_ownership as ownership
     synthetic_filesystem=ownership._local_filesystem
     monkeypatch.setattr(ownership,'_local_filesystem',lambda fd, **_:synthetic_filesystem(fd))
@@ -87,7 +88,27 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
     owned_resources.callback(listener.close)
     listener.bind(str(executor_path));os.chmod(executor_path,0o600);listener.listen(4);listener.settimeout(.2)
     relay=UnixCurrentObservationTransport(socket_path=str(issuer_path),expected_issuer_uid=os.geteuid(),expected_issuer_gid=os.getegid())
-    adapter=NoCommands(); executor=executor_app(adapter,bearer_token=token,current_observation_transport=relay)
+    from engineering_hub.container_pilot_client import ContainerPilotResponse, ContainerPilotEvidence
+    class SyntheticAdapter:
+        def __init__(self): self.commands = []; self.fence = None
+        def submit(self, command):
+            if command.manifest_digest != manifest.digest() or (self.fence is not None and command.fencing_generation != self.fence):
+                return ContainerPilotResponse(**command.model_dump(), state='held', reason='identity_conflict', replayed=False,
+                    evidence=ContainerPilotEvidence(container_id=None, image_config_id=None, health='unknown', evidence_verified=False))
+            self.fence = command.fencing_generation
+            self.commands.append(command)
+            return ContainerPilotResponse(**command.model_dump(), state='succeeded', reason=None, replayed=False,
+                evidence=ContainerPilotEvidence(container_id='e'*64, image_config_id=manifest.candidate.image_config_id,
+                                                health='healthy', evidence_verified=True))
+    class Observation:
+        def observe_current_launch(self, **kwargs):
+            raw = relay.observe_current_launch(**kwargs)
+            if not tamper_observation: return raw
+            import json
+            envelope = json.loads(raw)
+            envelope['payload']['nonce'] = '0' * 64
+            return json.dumps(envelope, sort_keys=True, separators=(',', ':')).encode()
+    adapter=SyntheticAdapter(); executor=executor_app(adapter,bearer_token=token,current_observation_transport=Observation())
     stop_thread=threading.Event(); errors=[]; observations=[]
     def worker():
         try:
@@ -143,8 +164,59 @@ async def test_github_owned_split_coordinator_accepts_signed_session_over_uds(sy
             decision={'request_id':snapshot.json()['request_id'],'expected_revision':snapshot.json()['revision'],'action':'accept'}
             assert (await browser.post(route,json=decision)).status_code==403
             accepted=await browser.post(route,json=decision,headers={'Origin':'https://pilot.example.test','X-Hub-CSRF':me['csrf_token']})
+            if tamper_observation:
+                assert accepted.status_code == 503
+                assert accepted.json()['detail']['code'] == 'session_acceptance_unavailable'
+                assert not adapter.commands and observations and all(s == 200 for s in observations) and checks and not errors
+                return
             assert accepted.status_code==200
-        assert observations and all(status==200 for status in observations) and checks and not errors and not adapter.touched
+            headers={'Origin':'https://pilot.example.test','X-Hub-CSRF':me['csrf_token']}
+            task_response=await browser.post('/api/hub/v1/tasks',headers=headers,json={'project':'engineering-hub',
+                'title':'Signed local UDS pilot','client_request_id':'signed-local-uds'})
+            assert task_response.status_code==201
+            task=task_response.json(); task_path='/api/hub/v1/tasks/'+task['id']
+            agent_address=ready.result()[0]
+            async with httpx.AsyncClient(base_url=f'http://127.0.0.1:{agent_address[1]}',trust_env=False,
+                    headers={'Host':f'127.0.0.1:{config.port}','Authorization':'Bearer '+tokens['codex']}) as agent:
+                claim=await agent.post(task_path+'/claim',json={'expected_revision':task['revision']}); assert claim.status_code==200
+                candidate=await agent.post(task_path+'/candidate',json={'expected_revision':claim.json()['revision'],
+                    'commit':manifest.candidate.source_commit}); assert candidate.status_code==200
+                reviewed=await agent.post(task_path+'/review',headers={'Authorization':'Bearer '+tokens['claude']},
+                    json={'expected_revision':candidate.json()['revision'],'commit':manifest.candidate.source_commit,'verdict':'approve'})
+                assert reviewed.status_code==200
+                job=await agent.post('/api/hub/v1/work/jobs',json={'request_id':'signed-local-uds',
+                    'action_key':installed.ACTION,'environment':'staging','target':{'task_id':task['id'],
+                    'source_commit':manifest.candidate.source_commit,'artifact_digest':manifest.candidate.image_config_id}})
+                assert job.status_code==201
+                async with asyncio.timeout(10):
+                    while True:
+                        state=(await browser.get('/api/hub/v1/work/jobs/'+job.json()['id'])).json()['state']
+                        if state in {'succeeded','failed','held'}: break
+                        await asyncio.sleep(.05)
+                assert state=='succeeded'
+        assert [command.action for command in adapter.commands]==['deploy_container','smoke_container']
+        assert all(command.manifest_digest==manifest.digest() and command.fencing_generation>0 for command in adapter.commands)
+        deploy, smoke = adapter.commands
+        for field in ('run_id', 'target_id', 'policy_revision', 'candidate_commit', 'fencing_generation'):
+            assert getattr(deploy, field) == getattr(smoke, field)
+        from uuid import UUID
+        assert deploy.command_id != smoke.command_id
+        assert all(str(UUID(value)) == value for value in (deploy.run_id, deploy.command_id, smoke.command_id))
+        assert deploy.target_id == 'engineering-hub:staging'
+        assert deploy.candidate_commit == manifest.candidate.source_commit
+        # Exercise the same private HTTP endpoint with altered authority; the
+        # synthetic adapter models denial and must record no extra effect.
+        from engineering_hub.container_pilot_client import ContainerPilotClient
+        direct=ContainerPilotClient.for_private_unix(config.executor_socket,token)
+        try:
+            stale=adapter.commands[0].model_copy(update={'fencing_generation':adapter.commands[0].fencing_generation+1})
+            assert (await direct.submit_command(stale)).state=='held'
+            tampered=adapter.commands[0].model_copy(update={'manifest_digest':'sha256:'+'0'*64})
+            assert (await direct.submit_command(tampered)).state=='held'
+        finally:
+            await direct.aclose()
+        assert len(adapter.commands)==2
+        assert observations and all(status==200 for status in observations) and checks and not errors
     finally:
         stop.set()
         try:
