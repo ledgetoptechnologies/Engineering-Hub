@@ -24,8 +24,10 @@ mounts storage, installs services, changes Cloudflare policy or starts an execut
 
 The ordinary protected pilot profile retains its existing manifest, exact allowed
 tasks/agents, machine, literal-IP HTTPS executor origin, CA and dedicated executor
-credential paths/hashes. The selector first obtains the existing `PilotOwner`,
-then captures CA/credential bytes once. Both the command client and synchronous
+credential paths/hashes. In GitHub mode, the selector first reads and validates
+the protected v3 session enrollment and actor against the deployment settings.
+It then obtains the existing `PilotOwner` and captures CA/credential bytes once.
+Both the command client and synchronous
 current-identity transport use that same captured profile/material. Neither
 reopens those paths for network requests. The credential must not match any agent
 token. TLS trust and the executor signing authority are distinct checks.
@@ -33,15 +35,23 @@ token. TLS trust and the executor signing authority are distinct checks.
 The additional manual-session file is protected data: current-UID mode0600,
 private mode0700 parent and trusted ancestors, read through the existing stable
 no-follow reader. It is never a public Hub note, code/module name, arbitrary
-factory, executable file or an executor-supplied enrollment response. Its closed
-schema is `engineering-hub.manual-staging-session.v1`:
+factory, executable file or an executor-supplied enrollment response. The legacy
+Cloudflare form uses `engineering-hub.manual-staging-session.v1`; the disjoint
+Cloudflare form uses v2. The explicit GitHub form described below uses v3. Their
+common retained fields are:
 
 | Field | Independently retained content |
 |---|---|
 | `release` | Exact `CurrentExecutorReleasePins` fields; `public_key_hex` replaces `public_key`, platform is its closed platform object |
 | `launch` | Exact `CurrentLaunchPins` fields, including original approval expiry, boot/process/Engine identities and launch/container IDs |
-| `operator_actor` | Exact independently enrolled `human:cf:<64 lowercase hex>` actor; not the first visitor or the global allowlist |
+| `operator_actor` | Exact independently enrolled `human:cf:<64 lowercase hex>` actor for v1/v2, or `human:<numeric GitHub ID>` for v3; never the first visitor |
 | `report` | Exact fields below; original observations, not newly generated facts |
+
+For session v2 and v3, the top-level object additionally requires
+`profile_mode: "disjoint-v3"` and `profile_json`, a string containing the exact
+canonical JSON bytes of the independently enrolled executor launch profile. Its
+digest must match the separately retained release pin; the embedded profile is
+not itself proof of host isolation.
 
 The report has `target_id`, `manifest_digest`, `machine_id`, `source` (bounded
 source identifier), `observed_at_ms`, `expires_at_ms`, `executor`, `evidence` (1–6000 UTF-8
@@ -65,6 +75,63 @@ The original source observation time and expiry are displayed in the operator
 evidence; binding a new process challenge does not relabel those facts as fresh.
 Expiry and backwards wall/monotonic movement veto admission, including acceptance
 after an operator leaves a review page open. No automatic report renewal exists.
+
+## Explicit GitHub mode for a separate staging deployment
+
+The default deployment configuration remains Cloudflare Access. A GitHub pilot
+requires an independently approved deployment settings file with the exact
+`schema_version` integer `3`, `base_url`, `github`, `agent_allowed_hosts`,
+`agent_allowed_ips`, and `storage` keys. `base_url` must be the exact HTTPS
+origin. `github` contains only `client_id` and `allowed_user_id`: the latter is
+the owner's positive numeric GitHub ID below 2^63, not a login name. `storage`
+must be `{"layout":"protected-ledger-v1"}`. The host and IP lists retain their
+existing exact allowlist semantics. Do not include a Cloudflare block, OAuth
+secret, tokens, or any other key in this v3 file.
+
+The approved launcher supplies the existing `HUB_GITHUB_CLIENT_SECRET`
+environment secret to the Hub process through its protected deployment mechanism;
+it is not stored in the settings file, command line, logs, or evidence. The
+OAuth application must already be independently configured for the deployment's
+exact HTTPS origin and `/api/hub/v1/auth/callback`. Separate agent tokens, the
+executor credential and pinned CA remain required. This selector does not create
+or authorize those credentials or change an identity-provider policy.
+
+The pilot profile must use `engineering-hub.unified-pilot.v2` with
+`profile_mode` set to `disjoint-v3`. Its protected file, executor credential and
+CA use the existing protected-ledger paths: `/var/lib/hub-private/pilot.json`,
+`/var/lib/hub-private/executor.token` and `/var/lib/hub-private/staging-ca.pem`.
+Provision a separately captured `engineering-hub.manual-staging-session.v3`
+file with the signed disjoint executor profile and exact retained release,
+launch and report evidence. Its `operator_actor` must be `human:` followed by
+the same numeric `allowed_user_id`; use neither a Cloudflare actor nor a made-up
+attestation. The report's currentness, source and writer-exclusion prerequisites
+above still apply.
+
+Use the existing validation entrypoint to check configuration shape and
+protected-boundary metadata:
+
+```text
+python -I -B -m engineering_hub.unified_pilot_startup validate --config <settings> --pilot-config /var/lib/hub-private/pilot.json
+```
+
+This does not read the session enrollment or OAuth
+secret, authenticate an operator, contact the executor, or prove readiness. The
+activation entrypoint is the fixed `engineering_hub.trusted_session_startup`
+command shown above, with `--session-config` naming the protected v3 file. The
+plain `unified_pilot_startup serve` CLI cannot supply that file and is not the
+v3 activation path. `serve` acquires the existing owner and can perform effects;
+it is not a read-only validation command.
+
+This path serves the existing agent and browser front doors from one owned Hub
+process; the GitHub browser path uses the existing OAuth state/PKCE, allowlisted
+session and CSRF checks. The caller must independently provide the reviewed HTTPS
+termination, exact public origin and route to the browser listener; this code does
+not install or configure them. The separate private-UDS browser gateway and installed
+local coordinator remain Cloudflare-only. Source tests use synthetic OAuth and
+executor evidence and do not establish a deployed route, host isolation,
+independent signer custody, reboot recovery or permission to use a held Engine.
+Changing an existing deployment's provider or entrypoint requires a separately
+reviewed operator rollout; preserve the existing production access path.
 
 ## What still requires real evidence
 

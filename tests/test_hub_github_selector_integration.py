@@ -4,6 +4,7 @@ import hashlib
 import json
 import queue
 import sys
+import multiprocessing
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -21,6 +22,21 @@ from tests.test_hub_queued_pilot import DistinctContainerClient, COMMIT, IMAGE
 from tests.test_hub_trusted_queued_session import v2_document, encode, synthetic_dependencies
 from tests.test_hub_unified_pilot_startup import profile_document, certificate
 from tests.test_hub_unified_queued_pilot_service import url
+
+
+async def stop_owned_process(process, stop_requested, *, grace=12, forced=3):
+    """Stop only this test's child; bounded termination covers pre-service hangs."""
+    stop_requested.set()
+    await asyncio.to_thread(process.join, grace)
+    forced_stop = process.is_alive()
+    if forced_stop:
+        process.terminate()
+        await asyncio.to_thread(process.join, forced)
+    if process.is_alive():
+        process.kill()
+        await asyncio.to_thread(process.join, forced)
+    assert not process.is_alive(), 'task-owned selector process did not exit'
+    return forced_stop
 
 
 @pytest.mark.asyncio
@@ -79,35 +95,43 @@ async def test_actual_selector_v3_to_github_owned_queue(tmp_path, monkeypatch):
         return ContainerPilotClient('http://127.0.0.1', credential, transport=httpx.MockTransport(executor))
     monkeypatch.setattr(ContainerPilotClient, 'for_verified_https', classmethod(make_client))
     original_service = owned_service.serve_owned_unified_queued_pilot
-    original_owned = owned_service._owned_service
-    failures = []
-    async def capture_owned(operation, stop):
-        try: return await original_owned(operation, stop)
-        except Exception as error:
-            import traceback
-            failures.append(''.join(traceback.format_exception(error)))
-            raise
-    monkeypatch.setattr(owned_service, '_owned_service', capture_owned)
-    ready = queue.Queue(maxsize=1); control = {}
+    context = multiprocessing.get_context('fork')
+    ready = context.Queue(maxsize=1)
+    finished = context.Queue(maxsize=1)
+    stop_requested = context.Event()
     async def bounded_service(*args, **kwargs):
-        control['loop'] = asyncio.get_running_loop(); control['stop'] = asyncio.Event()
+        stop = asyncio.Event()
+        async def watch_stop():
+            await asyncio.to_thread(stop_requested.wait)
+            stop.set()
+        watcher = asyncio.create_task(watch_stop())
         kwargs.update(agent_host='127.0.0.1', agent_port=0, browser_host='127.0.0.1', browser_port=0,
-                      install_signals=False, stop_event=control['stop'], on_ready=lambda *a: ready.put_nowait(a))
-        return await original_service(*args, **kwargs)
+                      install_signals=False, stop_event=stop, on_ready=lambda *a: ready.put_nowait(a))
+        try:
+            return await original_service(*args, **kwargs)
+        finally:
+            stop_requested.set()
+            await watcher
     monkeypatch.setattr(owned_service, 'serve_owned_unified_queued_pilot', bounded_service)
     startup.validate_configuration(config, profile)
     def run_selector():
         try:
-            return selector.main(['--config', str(config), '--pilot-config', str(profile), '--session-config', str(enrollment)])
+            code = selector.main(['--config', str(config), '--pilot-config', str(profile), '--session-config', str(enrollment)])
         except SystemExit as error:
-            return error.code
-    selector_task = asyncio.create_task(asyncio.to_thread(run_selector))
+            code = error.code
+        except BaseException:
+            code = -1
+        finished.put({'code': code, 'actions': [item.action for item in requests],
+                      'observations': dependencies.events.count('observe')})
+    process = context.Process(target=run_selector, name='synthetic-github-selector')
+    process.start()
     try:
         async def await_ready():
-            while ready.empty():
-                if selector_task.done(): pytest.fail('selector exited early: ' + str(selector_task.result()) + ' '.join(failures))
-                await asyncio.sleep(.02)
-            return ready.get_nowait()
+            while True:
+                try: return ready.get_nowait()
+                except queue.Empty:
+                    if not process.is_alive(): pytest.fail('selector exited before readiness')
+                    await asyncio.sleep(.02)
         addresses = await asyncio.wait_for(await_ready(), 8)
         async with (httpx.AsyncClient(base_url=url(addresses[0]), trust_env=False,
                     headers={'Authorization': 'Bearer synthetic-codex', 'Host': 'hub.example'}, timeout=8) as agent,
@@ -138,9 +162,32 @@ async def test_actual_selector_v3_to_github_owned_queue(tmp_path, monkeypatch):
                     if result.json()['state'] in {'succeeded', 'failed', 'held'}: return result.json()['state']
                     await asyncio.sleep(.01)
             assert await asyncio.wait_for(completed(), 8) == 'succeeded'
-            assert [item.action for item in requests] == ['deploy_container', 'smoke_container']
-            assert dependencies.events.count('observe') >= 3
     finally:
-        if 'loop' in control and not control['loop'].is_closed(): control['loop'].call_soon_threadsafe(control['stop'].set)
-        result = await asyncio.wait_for(asyncio.shield(selector_task), 12)
-        if sys.exc_info()[1] is None: assert result == 0
+        active_error = sys.exc_info()[1]
+        try:
+            forced_stop = await stop_owned_process(process, stop_requested)
+            if active_error is None:
+                assert not forced_stop and process.exitcode == 0
+                report = finished.get(timeout=1)
+                assert report['code'] == 0
+                assert report['actions'] == ['deploy_container', 'smoke_container']
+                assert report['observations'] >= 3
+        finally:
+            ready.close(); finished.close()
+            ready.join_thread(); finished.join_thread()
+
+
+@pytest.mark.asyncio
+async def test_pre_service_hang_terminates_only_task_owned_child():
+    import time
+    context = multiprocessing.get_context('fork')
+    stop_requested = context.Event()
+    process = context.Process(target=time.sleep, args=(60,), name='synthetic-selector-stall')
+    process.start()
+    try:
+        assert await stop_owned_process(process, stop_requested, grace=.1, forced=2)
+        assert process.exitcode is not None
+    finally:
+        if process.is_alive():
+            process.kill()
+            await asyncio.to_thread(process.join, 2)
