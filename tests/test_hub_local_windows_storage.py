@@ -13,7 +13,7 @@ def fixture_task(fail=None,wrong_label=False):
     def call(*args):
         calls.append(args)
         if fail and args[:len(fail)]==fail: raise RuntimeError('unknown')
-        if args[:2]==('image','inspect'): return json.dumps([{'Id':image,'Config':{'Volumes':None,'Labels':{'codex.owner':'inherited-image-label'}}}])
+        if args[:2]==('image','inspect'): return json.dumps([{'Id':image,'Config':{'Volumes':None,'Labels':{'codex.owner':'inherited-image-label','desktop.docker.io/mounts/0/Source':'C:\\old','desktop.docker.io/mounts/0/SourceKind':'hostFile','desktop.docker.io/mounts/0/Target':'/old','desktop.docker.io/mounts/1/Source':'C:\\old-input','desktop.docker.io/mounts/1/SourceKind':'hostFile','desktop.docker.io/mounts/1/Target':'/old-input','desktop.docker.io/ports.scheme':'v2'}}}])
         if args[:2]==('volume','ls'): return ''
         if args[:2]==('volume','create'):
             name=args[-1]; options=OPTIONS if len(volumes)==1 else {}
@@ -134,6 +134,18 @@ def test_desktop_metadata_must_match_fixed_bind_and_inherited_labels():
     assert not _helper_labels({**current,'codex.owner':'wrong'},image,'task',{('C:\\new','/seed/program')})
     assert not _helper_labels(current,image,'task',{('C:\\other','/seed/program')})
     assert not _helper_labels({**current,'desktop.docker.io/arbitrary':'x'},image,'task',{('C:\\new','/seed/program')})
+
+def test_desktop_strips_only_known_inherited_metadata():
+    from scripts.hub_local_windows_storage import image_labels_match
+    image={'codex.owner':'root','desktop.docker.io/mounts/0/Source':'C:\\old',
+        'desktop.docker.io/mounts/0/SourceKind':'hostFile','desktop.docker.io/mounts/0/Target':'/old',
+        'desktop.docker.io/ports.scheme':'v2'}
+    actual={'codex.owner':'root',LABEL:'task'}
+    assert image_labels_match(actual,image,'task',set())
+    assert not image_labels_match({LABEL:'task'},image,'task',set())
+    assert not image_labels_match({**actual,LABEL:'other'},image,'task',set())
+    assert not image_labels_match({**actual,'desktop.docker.io/ports.scheme':'v3'},image,'task',set())
+    assert not image_labels_match({**actual,'desktop.docker.io/mounts/0/Source':'C:\\new'},image,'task',set())
 
 def test_input_file_size_limit(tmp_path):
     import hashlib

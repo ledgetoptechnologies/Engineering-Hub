@@ -10,7 +10,7 @@ import re
 import stat
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from scripts.hub_local_windows_storage import WindowsTask,OperatorStorage,Held,LABEL,OPTIONS,KEEPER
+from scripts.hub_local_windows_storage import WindowsTask,OperatorStorage,Held,LABEL,OPTIONS,KEEPER,image_labels_match
 
 CLI='sha256:6f7a95d27f98fc8c5f6b220898988bf8f61dd9b040936797917cbdc72c6cabe6'
 SEED='sha256:e6ea621f0c175f9678509272e266f055d22b457ba81f75c2d935fc56931bd7a7'
@@ -24,18 +24,7 @@ BOOT=("import os,sys,stat,hashlib;f=os.open('/seed/program',os.O_RDONLY|os.O_NOF
 
 def _helper_labels(actual,image_labels,task_id,binds):
     """Allow only Desktop mount metadata tied to an inspected fixed bind."""
-    if type(actual) is not dict or type(image_labels) is not dict or LABEL in image_labels: return False
-    expected={**image_labels,LABEL:task_id}; prefix='desktop.docker.io/mounts/'
-    keys=set(actual)|set(expected); dynamic={}
-    for key in keys:
-        if actual.get(key)==expected.get(key): continue
-        match=re.fullmatch(r'desktop\.docker\.io/mounts/([0-9]{1,2})/(Source|SourceKind|Target)',key)
-        if not match or key not in actual: return False
-        dynamic.setdefault(match.group(1),{})[match.group(2)]=actual[key]
-    for index in dynamic:
-        values={field:actual.get(prefix+index+'/'+field) for field in ('Source','SourceKind','Target')}
-        if values['SourceKind']!='hostFile' or (values['Source'],values['Target']) not in binds: return False
-    return True
+    return image_labels_match(actual,image_labels,task_id,binds)
 
 
 def _stable_file_observation(named,before,after,final):
@@ -82,7 +71,7 @@ def _storage(task,storage):
     labels=image[0].get('Config',{}).get('Labels') or {}
     if type(labels) is not dict or LABEL in labels: raise ValueError('Keeper image labels invalid')
     if (c.get('Id')!=storage.scratch_keeper_id or c.get('Name')!='/hub-operator-scratch-keeper-'+task.task_id
-        or cfg.get('Image')!=storage.scratch_keeper_image or cfg.get('Labels')!={**labels,LABEL:task.task_id}
+        or cfg.get('Image')!=storage.scratch_keeper_image or not image_labels_match(cfg.get('Labels'),labels,task.task_id,set())
         or cfg.get('User')!='10001:10001' or cfg.get('Entrypoint')!=['/usr/local/bin/python'] or cfg.get('Cmd')!=['-I','-S','-B','-c',KEEPER]
         or s.get('Status')!='running' or s.get('Running') is not True or type(s.get('Pid')) is not int or s['Pid']<=0
         or any(s.get(k) is not False for k in ('Paused','Restarting','Dead'))

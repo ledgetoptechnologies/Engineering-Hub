@@ -24,6 +24,22 @@ KEEPER='import time;time.sleep(1000000000)'
 class Held(RuntimeError): pass
 
 
+def image_labels_match(actual,image_labels,task_id,binds):
+    """Check pinned image labels while allowing observed Desktop metadata stripping."""
+    if type(actual) is not dict or type(image_labels) is not dict or LABEL in image_labels: return False
+    expected={**image_labels,LABEL:task_id}; prefix='desktop.docker.io/mounts/'; dynamic=set()
+    for key in set(actual)|set(expected):
+        if key in actual and key in expected and actual[key]==expected[key]: continue
+        match=re.fullmatch(r'desktop\.docker\.io/mounts/([0-9]{1,2})/(Source|SourceKind|Target)',key)
+        if key not in actual and key in expected and (match or key=='desktop.docker.io/ports.scheme'): continue
+        if not match or key not in actual: return False
+        dynamic.add(match.group(1))
+    for index in dynamic:
+        values={field:actual.get(prefix+index+'/'+field) for field in ('Source','SourceKind','Target')}
+        if values['SourceKind']!='hostFile' or (values['Source'],values['Target']) not in binds: return False
+    return True
+
+
 class WindowsTask:
     """One task, one exclusively created fsynced journal and fixed transport."""
     def __init__(self, *, task_id, daemon_id, docker_root, directory):
@@ -184,7 +200,6 @@ def provision_storage(task, *, helper_image_id, source_task_id, scratch_task_id,
         if len(image)!=1 or image[0]['Id']!=helper_image_id or image[0]['Config'].get('Volumes') not in (None,{}): raise ValueError
         image_labels=image[0]['Config'].get('Labels') or {}
         if type(image_labels) is not dict or LABEL in image_labels: raise ValueError
-        expected_labels={**image_labels,LABEL:task.task_id}
         existing=task.call('volume','ls','--format','{{.Name}}').splitlines()
         if any(name in existing for name in names): raise ValueError
         for i,name in enumerate(names):
@@ -208,7 +223,7 @@ def provision_storage(task, *, helper_image_id, source_task_id, scratch_task_id,
         if not re.fullmatch(r'[a-f0-9]{64}',cid): raise ValueError
         ids.append(cid); task.record('keeper-created',id=cid)
         c=json.loads(task.call('container','inspect',cid))[0]; h=c['HostConfig']; cfg=c['Config']; mounts=c['Mounts']
-        if (c['Id']!=cid or c['Name']!='/'+name or cfg['Image']!=helper_image_id or cfg['Labels']!=expected_labels
+        if (c['Id']!=cid or c['Name']!='/'+name or cfg['Image']!=helper_image_id or not image_labels_match(cfg.get('Labels'),image_labels,task.task_id,set())
             or cfg['User']!='10001:10001' or cfg['Entrypoint']!=['/usr/local/bin/python'] or cfg['Cmd']!=['-I','-S','-B','-c',KEEPER]
             or h['NetworkMode']!='none' or h['ReadonlyRootfs'] is not True or h['CapDrop']!=['ALL']
             or h.get('CapAdd') not in (None,[]) or h['Privileged'] is not False or h['SecurityOpt']!=['no-new-privileges']
