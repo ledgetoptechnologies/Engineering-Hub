@@ -112,8 +112,12 @@ class PilotRecovery:
                 return 'held'
             failed = True
         else:
-            if smoke and smoke['state'] == 'succeeded' and smoke['container_id'] != deploy['container_id']:
-                return 'held'
+            if smoke and (smoke['state'] == 'succeeded' or smoke['container_id'] is not None):
+                # A failed effect may have no container evidence, but if it
+                # identifies one it must be the deployed candidate. A failure
+                # observed on another container cannot authorize rollback.
+                if smoke['container_id'] != deploy['container_id']:
+                    return 'held'
             failed = bool(smoke and smoke['state'] == 'failed')
             if not failed:
                 if rollback or rollback_smoke:

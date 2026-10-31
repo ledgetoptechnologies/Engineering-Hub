@@ -337,3 +337,44 @@ def test_synchronous_observer_negative_control_rejects_latency_only():
     assert report['inline_observation_overlaps_request'] is True
     assert report['max_seconds'] >= .3
     assert report['rejection'] == 'latency_limit_exceeded'
+
+
+@pytest.mark.parametrize('phase,state', [
+    ('smoke_container', 'succeeded'), ('smoke_container', 'failed'),
+    ('smoke_container_rollback', 'succeeded'), ('smoke_container_rollback', 'failed'),
+])
+async def test_async_queue_holds_foreign_smoke_container(case, phase, state):
+    if phase == 'smoke_container_rollback':
+        case.client.outcomes['smoke_container'] = 'failed'
+    original = case.client.response
+    def altered(command):
+        response = original(command)
+        if command.action == phase:
+            return response.model_copy(update={'state': state, 'evidence':
+                response.evidence.model_copy(update={'container_id': '1' * 64})})
+        return response
+    case.client.response = altered
+    await accept(case)
+    _, job = submit(case)
+    result = await case.bridge.run_once()
+    assert result['state'] == 'held'
+    assert machine_job(case) == job['id']
+    expected = 2 if phase == 'smoke_container' else 4
+    assert len(case.client.submissions) == expected
+
+
+async def test_async_failed_smoke_without_id_keeps_rollback_path(case):
+    original = case.client.response
+    def altered(command):
+        response = original(command)
+        if command.action == 'smoke_container':
+            return response.model_copy(update={'state': 'failed', 'evidence':
+                response.evidence.model_copy(update={'container_id': None})})
+        return response
+    case.client.response = altered
+    await accept(case)
+    _, job = submit(case)
+    result = await case.bridge.run_once()
+    assert result['state'] == 'failed' and machine_job(case) is None
+    assert [item.action for item in case.client.submissions] == [
+        'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback']
