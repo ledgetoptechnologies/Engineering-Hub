@@ -1728,3 +1728,169 @@ def test_coordinator_and_inherited_channel_profiles_refused_before_journal_or_en
             launch.LaunchSupervisor(**kwargs)
         assert requests == []
         assert not Path(kwargs['journal_file']).exists()
+
+
+def test_executor_channel_issuance_real_rights_and_durable_once(synthetic_issuer):
+    """Synthetic launch authority; real kernel stream, signature, pidfd and FD."""
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            results.append(authority.serve_one_executor_handoff(issued))
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    fd = None
+    try:
+        fd = transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and results == [authority._launch_id]
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        received = socket.socket(fileno=fd)
+        fd = None
+        try:
+            received.send(b'fixture')
+            assert other.recv(16) == b'fixture'
+        finally:
+            received.close()
+        with pytest.raises(RuntimeError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_executor_handoff_denies_legacy_profile_and_closes_fd(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel=None)
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.serve_one_executor_handoff(issued)
+        assert issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone()[0] == 0
+    finally:
+        other.close()
+
+
+def test_handoff_journal_failure_after_fd_send_quarantines_receiver(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    original = authority._journal.issuance_state
+    def fail_commit(identity, state, digest):
+        if state == 'sent':
+            raise OSError('injected commit failure')
+        return original(identity, state, digest)
+    authority._journal.issuance_state = fail_commit
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            authority.serve_one_executor_handoff(issued)
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and len(results) == 1 and authority._held
+        assert issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('held',)
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_handoff_lost_final_confirmation_never_returns_fd_or_retries(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    signer = authority._signer
+    class LoseConfirmation:
+        def sign(self, value):
+            if value.startswith(b'engineering-hub-launch-channel-commit-v1\x00'):
+                raise OSError('synthetic lost confirmation')
+            return signer.sign(value)
+    authority._signer = LoseConfirmation()
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            authority.serve_one_executor_handoff(issued)
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and len(results) == 1 and authority._held
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        second, second_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.serve_one_executor_handoff(second)
+            assert second.fileno() == -1
+            with authority._journal.transaction() as db:
+                assert db.execute('SELECT count(*),min(state) FROM issuance').fetchone() == (1, 'sent')
+        finally:
+            second_peer.close()
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_handoff_manifest_is_derived_from_pinned_runner_config(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            authority._pin_sources()
+            from hub_container_executor.installed_runner import parse_configuration
+            path = Path(next(m['source'] for m in data['profile']['mounts'] if m['role'] == 'config'))
+            assert authority._handoff_manifest_digest() == parse_configuration(path.read_bytes()).manifest.digest()
+            path.write_bytes(path.read_bytes() + b' ')
+            with pytest.raises(Exception):
+                authority._handoff_manifest_digest()
+            assert requests == []
+        finally:
+            authority.close()

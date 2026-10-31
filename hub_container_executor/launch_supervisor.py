@@ -10,6 +10,7 @@ because its health endpoint works. Same-UID/root administrators remain trusted.
 from __future__ import annotations
 
 import base64
+import array
 from contextlib import contextmanager
 from dataclasses import dataclass, InitVar
 import fcntl
@@ -1065,6 +1066,144 @@ class LaunchSupervisor:
             finally:
                 if peer is not None:
                     peer.close()
+
+    def _handoff_manifest_digest(self):
+        """Derive only from the already pinned canonical runner configuration."""
+        from .installed_runner import parse_configuration
+        mount = self._mounts['config']
+        path = _path(mount.source)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            named = os.lstat(path)
+            _require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                     and _identity(info) == _identity(named)
+                     and _identity(info) == self._source_pins['config']
+                     and 0 < info.st_size <= 65536)
+            raw = bytearray()
+            while len(raw) <= 65536:
+                chunk = os.read(fd, min(65537 - len(raw), 65536))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info)
+                     and _identity(os.lstat(path)) == _identity(info))
+            raw = bytes(raw)
+            commitment = configuration_commitment(raw)
+            _require(commitment.raw_digest == self._configuration_raw_digest
+                     and commitment.content_digest == mount.content_digest
+                     and commitment.release == self.release)
+            return parse_configuration(raw).manifest.digest()
+        finally:
+            os.close(fd)
+
+    def serve_one_executor_handoff(self, channel):
+        """One measured-executor FD receipt; pair launch remains hard-disabled.
+
+        Transfers ownership of an already connected channel to this method. The
+        trusted pair supervisor must have created and retained both ends; this
+        executor-only step does not attest the other end, its owner, exclusive
+        custody, or pair identity and must never be treated as pair authentication
+        or launch approval. Constructor launch gates remain unchanged.
+        Its journal reservation is the same one-shot issuance as the ordinary
+        receipt, so neither version can be issued after the other. A lost/partial
+        send is held, never retried; this method always closes its channel copy.
+        """
+        _require(self._pid == os.getpid())
+        with self._mutex:
+            peer = None
+            reserved = False
+            try:
+                self._guard()
+                _require(type(channel) is socket.socket and channel.family == socket.AF_UNIX
+                         and channel.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
+                         and channel.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 0
+                         and getattr(self.profile, 'role', None) is None
+                         and getattr(self.profile, 'command_channel', None) == 'inherited-seqpacket-v1'
+                         and self._issuance_open and time.monotonic() < self._expires)
+                channel.getpeername()
+                info = os.fstat(channel.fileno())
+                _require(stat.S_ISSOCK(info.st_mode))
+                deadline = min(self._expires, time.monotonic() + self._request_ms / 1000)
+                self._listener.settimeout(_remaining(deadline))
+                peer, _ = self._listener.accept()
+                credentials = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._validate_live(deadline)
+                size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+                _require(0 < size <= MAX_REQUEST_BYTES)
+                request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+                _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
+                         and request['protocol'] == 'engineering-hub.launch-channel-request.v1'
+                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+                peer.settimeout(_remaining(deadline))
+                _require(peer.recv(1) == b'')
+                self._validate_live(deadline)
+                manifest = self._handoff_manifest_digest()
+                self._journal.reserve_issuance(self._launch_id, request['nonce'])
+                reserved = True
+                self._issuance_open = False
+                self._validate_live(deadline)
+                now = int(time.time() * 1000)
+                remaining = int((self._expires - time.monotonic()) * 1000)
+                _require(remaining > 0)
+                payload = {'protocol': 'engineering-hub.launch-channel.v1',
+                    'audience': 'engineering-hub.container-executor', 'nonce': request['nonce'],
+                    'role': 'executor', 'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
+                    'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
+                    'container_id': self._container_id, 'issuer_id': self.release.issuer_id,
+                    'implementation_commit': self.release.implementation_commit,
+                    'runnable_digest': self.release.runnable_digest,
+                    'platform_manifest_digest': self.release.platform_manifest_digest,
+                    'image_config_id': self.release.image_config_id,
+                    'platform': self.release.platform.model_dump(mode='json'),
+                    'launch_profile_digest': self.release.launch_profile_digest,
+                    'manifest_digest': manifest, 'channel_device': info.st_dev, 'channel_inode': info.st_ino,
+                    'issued_at_ms': now, 'expires_at_ms': min(now + remaining, self._approval_expires_at_ms)}
+                _require(payload['expires_at_ms'] > now)
+                sig = self._signer.sign(b'engineering-hub-launch-channel-v1\x00' + _canonical(payload))
+                signature = base64.urlsafe_b64encode(sig).rstrip(b'=').decode('ascii')
+                raw = _canonical({'payload': payload, 'signature': signature})
+                _require(len(raw) <= MAX_RECEIPT_BYTES)
+                self._validate_live(deadline)
+                peer.settimeout(_remaining(deadline))
+                packet = struct.pack('!I', len(raw)) + raw
+                sent = peer.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                               array.array('i', [channel.fileno()]))])
+                _require(sent == len(packet))
+                _remaining(deadline)
+                receipt_hash = hashlib.sha256(raw).hexdigest()
+                self._journal.issuance_state(self._launch_id, 'sent', receipt_hash)
+                # This durable one-shot state is never reverted after the first
+                # descriptor send: final confirmation delivery can be unknown.
+                reserved = False
+                self._validate_live(deadline)
+                commit = {'protocol': 'engineering-hub.launch-channel-commit.v1',
+                          'nonce': request['nonce'], 'launch_id': self._launch_id,
+                          'receipt_digest': 'sha256:' + receipt_hash}
+                commit_sig = self._signer.sign(b'engineering-hub-launch-channel-commit-v1\x00'
+                                               + _canonical(commit))
+                commit_raw = _canonical({'payload': commit, 'signature':
+                    base64.urlsafe_b64encode(commit_sig).rstrip(b'=').decode('ascii')})
+                _require(len(commit_raw) <= MAX_RECEIPT_BYTES)
+                peer.settimeout(_remaining(deadline))
+                peer.sendall(struct.pack('!I', len(commit_raw)) + commit_raw)
+                peer.shutdown(socket.SHUT_WR)
+                self._receipt_served = True
+                return payload['launch_id']
+            except BaseException:
+                if reserved:
+                    try:
+                        self._journal.issuance_state(self._launch_id, 'held', None)
+                    except BaseException:
+                        pass
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                if peer is not None:
+                    peer.close()
+                if type(channel) is socket.socket:
+                    channel.close()
 
     @contextmanager
     def _observation_mutex(self, deadline, *, wait_window=False):
