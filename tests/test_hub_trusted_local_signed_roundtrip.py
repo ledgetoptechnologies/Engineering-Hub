@@ -91,27 +91,38 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
     data['secret_root'] = str(issuer_path.parent / 'secrets')
     config = parse_configuration(canonical(data))
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path)); os.chmod(socket_path, 0o600); listener.listen(1); listener.settimeout(3)
+    listener.bind(str(socket_path)); os.chmod(socket_path, 0o600); listener.listen(4); listener.settimeout(.2)
+    server_stop = threading.Event()
     relay = UnixCurrentObservationTransport(socket_path=str(issuer_path),
         expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())
     adapter = NoCommands()
     executor = executor_app(adapter, bearer_token=token, current_observation_transport=relay)
-    failures = []
+    failures, observations = [], []
     def serve_once():
         try:
-            peer, _ = listener.accept()
-            with peer:
-                data = b''
-                while b'\r\n\r\n' not in data: data += peer.recv(4096)
-                header, body = data.split(b'\r\n\r\n', 1)
-                length = int(next(line.split(b':', 1)[1] for line in header.split(b'\r\n')
-                                  if line.lower().startswith(b'content-length:')))
-                while len(body) < length: body += peer.recv(length - len(body))
-                with asyncio.Runner() as runner: events = runner.run(request(executor, header, body))
-                start, end = events
-                assert start['status'] == 200
-                peer.sendall(b'HTTP/1.1 200 OK\r\n' + b'\r\n'.join(k + b': ' + v for k, v in start['headers'])
-                             + b'\r\n\r\n' + end['body'])
+            while not server_stop.is_set():
+                try: peer, _ = listener.accept()
+                except socket.timeout: continue
+                with peer:
+                    peer.settimeout(3)
+                    data = b''
+                    while b'\r\n\r\n' not in data:
+                        chunk = peer.recv(4096)
+                        if not chunk: raise ValueError('short request')
+                        data += chunk
+                    header, body = data.split(b'\r\n\r\n', 1)
+                    length = int(next(line.split(b':', 1)[1] for line in header.split(b'\r\n')
+                                      if line.lower().startswith(b'content-length:')))
+                    while len(body) < length:
+                        chunk = peer.recv(length - len(body))
+                        if not chunk: raise ValueError('short body')
+                        body += chunk
+                    with asyncio.Runner() as runner: events = runner.run(request(executor, header, body))
+                    start, end = events
+                    assert start['status'] == 200
+                    observations.append(True)
+                    peer.sendall(b'HTTP/1.1 200 OK\r\n' + b'\r\n'.join(k + b': ' + v for k, v in start['headers'])
+                                 + b'\r\n\r\n' + end['body'])
         except BaseException as error: failures.append(error)
     thread = threading.Thread(target=serve_once)
     composition = None
@@ -170,9 +181,35 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
                     assert gate.admission_state == 'pending'
                     thread.start()
                     response = await browser.post(route, headers=headers, json=decision)
-                    assert response.status_code == 200 and gate.admission_state == 'accepted'
-                thread.join(3)
-                assert not thread.is_alive() and not failures and checks and not adapter.touched and not client.submissions
+                    assert response.status_code == 200 and gate.admission_state == 'accepted', failures
+                try:
+                    await feed.start()
+                    assert feed.available
+                    await runtime.start()
+                    from engineering_hub.work_queue import WorkTarget
+                    task = repo.create_task('human:1234', 'engineering-hub', 'Synthetic pilot', 'signed-dispatch')
+                    task = repo.claim_task('codex', task['id'], task['revision'])
+                    task = repo.set_candidate('codex', task['id'], task['revision'], target.candidate_commit)
+                    task = repo.review_task('claude', task['id'], task['revision'], target.candidate_commit, 'approve')
+                    job = queue.submit(actor='codex', request_id='signed-dispatch', action_key=ACTION,
+                        environment='staging', target=WorkTarget(task['id'], target.candidate_commit, target.artifact_digest))
+                    async def wait_done():
+                        while True:
+                            result = queue.get_job(job['id'])
+                            if result['state'] in {'succeeded', 'failed', 'held'}: return result
+                            await asyncio.sleep(.01)
+                    result = await asyncio.wait_for(wait_done(), timeout=10)
+                    assert result['id'] == job['id'] and result['state'] == 'succeeded'
+                finally:
+                    try:
+                        await runtime.stop()
+                    finally:
+                        await feed.stop()
+                assert [command.action for command in client.submissions] == ['deploy_container', 'smoke_container']
+                assert repo.list_runs()[0]['status'] == 'succeeded'
+                assert len(observations) >= 3 and checks and not failures and not adapter.touched
+                server_stop.set(); thread.join(3)
+                assert not thread.is_alive()
     finally:
         try:
             if composition is not None: composition.close()
@@ -180,7 +217,12 @@ async def test_local_signed_observation_requires_authenticated_operator(syntheti
             try:
                 relay.close()
             finally:
-                listener.close()
-                if thread.ident is not None:
-                    thread.join(4)
-                    assert not thread.is_alive()
+                server_stop.set()
+                try:
+                    if thread.ident is not None:
+                        thread.join(4)
+                        assert not thread.is_alive()
+                finally:
+                    listener.close()
+
+
