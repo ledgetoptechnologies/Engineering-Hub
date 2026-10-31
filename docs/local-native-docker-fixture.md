@@ -25,8 +25,8 @@ fixture graphs with explicitly synthetic build assertions. A dedicated UID/GID
 through the source broker. In the offline fixture the synthetic Engine creates
 the initial database in an empty generation. The child verifies fixed
 preflight probes, stops and checks the exited container has no PID, freezes its
-SQLite state, and restarts it once
-before running the actual BaselineObserver. The observer still requires the
+SQLite state, and restarts it once before running the actual BaselineObserver.
+The observer still requires the
 source inventory to remain unchanged; actual application restart behavior has
 not been validated. The coordinator pins that observed draft, seals the source
 broker and transfers the exact baseline ID to the successor broker. Native
@@ -46,16 +46,29 @@ grace retries: failed or uncertain operations remain held. The initializer and
 cached-image discovery have offline tests only; neither has been exercised
 against an actual daemon in this fixture.
 
-There is **no real-daemon opt-in runner yet**. Before one can be reviewed, it
-still needs verified real OCI archives and independently supplied exact manifest
-digests for both test images, an actual healthy task-owned application baseline
-and frozen backup, and an operator-owned lifecycle connecting those real
-resources to native admission. A fixed coordinator process entrypoint and
-launcher must carry the enrolled inputs without treating serialized cleanup
-claims as in-process ownership. Docker Desktop also needs an explicitly
-verified mapping of the daemon-reported volume path into the coordinator.
-Aggregate budgets for the daemon, broker,
-controller, application containers and storage also need verification.
+The fixed-FD coordinator and launcher are **test-only candidates**, not yet
+accepted for real-daemon use. They require independently supplied exact OCI
+manifest digests already resolvable on the pinned local daemon, a bounded
+512MiB/4096-inode tmpfs task volume, a separately bounded private scratch mount,
+and a task-owned keeper that remains mounted until receipt authentication.
+The explicit v2 launcher can pin an already-authorized socket supplementary
+group for its task containers; it does not change host socket permissions or
+account group membership. This grants those containers daemon capability and
+is suitable only under the stated trusted-local-operator assumption.
+The coordinator writes an authenticated post-exit cleanup handoff only after
+its native work and exact container cleanup have drained; the launcher must
+independently verify coordinator removal and exact container absence before it
+removes the volume. A held or ambiguous operation retains the keeper and
+resources for inspection. Docker Desktop path mapping, socket access, actual
+Engine formatting and the application's post-restart source inventory remain
+unverified for the full workflow. The shared daemon and image store are not
+subject to the task volume cap, so their aggregate resource headroom must be independently
+established before any real run.
+The coordinator shares a 4GiB archive-response budget between its serial source
+and successor brokers; this does not bound daemon read-ahead or CPU. The broker
+requires a local log driver capped at two 1MiB files per application container.
+The holder has bounded resources but deliberately remains alive on an uncertain
+outcome until an operator inspects the original task and resolves cleanup.
 The existing archive helper requires an independently supplied exact manifest
 digest; a local Docker image ID is not that digest. A lost effect or any
 unverified cleanup retains the task resources for explicit inspection. Do not

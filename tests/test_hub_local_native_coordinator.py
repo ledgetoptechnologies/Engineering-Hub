@@ -1,6 +1,9 @@
 import asyncio
 import types
+import sys
 import pytest
+if sys.platform != 'linux':
+    pytest.skip('local native coordinator requires Linux', allow_module_level=True)
 from scripts import hub_local_native_coordinator as m
 
 @pytest.mark.asyncio

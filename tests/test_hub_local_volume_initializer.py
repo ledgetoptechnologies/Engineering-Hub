@@ -25,7 +25,7 @@ class Docker:
    if '.Config.Entrypoint' in op[2]: return json.dumps(['/usr/local/bin/python'])
    if '.Config.Cmd' in op[2]: return json.dumps(['-I','-B','-c',INIT_SCRIPT])
    if '.Config.Volumes' in op[2]: return 'null'
-   if 'HostConfig' in op[2]: return json.dumps({'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':['CHOWN'],'Memory':134217728,'MemorySwap':134217728,'NanoCpus':250000000,'PidsLimit':32,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'IpcMode':'private','PidMode':'','AutoRemove':False,'PublishAllPorts':False,'PortBindings':None,'RestartPolicy':{'Name':'no'},'SecurityOpt':['no-new-privileges'],'Mounts':[{'Type':'volume','Source':NAME,'Target':'/fixture','VolumeOptions':{'NoCopy':True}}]})
+   if 'HostConfig' in op[2]: return json.dumps({'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':['CHOWN'],'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'Memory':134217728,'MemorySwap':134217728,'NanoCpus':250000000,'PidsLimit':32,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'IpcMode':'private','PidMode':'','AutoRemove':False,'PublishAllPorts':False,'PortBindings':None,'RestartPolicy':{'Name':'no'},'SecurityOpt':['no-new-privileges'],'Mounts':[{'Type':'volume','Source':NAME,'Target':'/fixture','VolumeOptions':{'NoCopy':True}}]})
    if 'Mounts' in op[2]: return json.dumps([{'Type':'volume','Name':NAME,'Source':V.mountpoint,'Driver':'local','Destination':'/fixture','RW':True}])
    return '|'.join([ID,'/hub-local-init-'+OWNER,IMAGE,OWNER,self.state,'0'])
   if op[0]=='start':

@@ -28,14 +28,36 @@ _ID = re.compile(r'[0-9a-f]{64}\Z')
 _DIGEST = re.compile(r'sha256:[0-9a-f]{64}\Z')
 _NAME = re.compile(r'hub-pilot-[a-f0-9]{24}-[a-f0-9]{8}-[a-f0-9]{3}-(?:candidate|rollback)\Z')
 _LABEL = 'engineering-hub.local-test-owner'
+_LOG_CONFIG = {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
 _MAX_BODY = 256 * 1024
 _MAX_ARCHIVE = 2 * 1024**3
+_MAX_RUN_ARCHIVES = 4 * 1024**3
 _MAX_STREAM_SECONDS = 120
 _REQUEST_TIMEOUT_SECONDS = 10
 
 
 class Denied(RuntimeError):
     pass
+
+
+class ArchiveBudget:
+    """One process-owned aggregate archive budget shared by both brokers."""
+    def __init__(self):
+        self._pid=os.getpid(); self._lock=threading.Lock(); self._remaining=_MAX_RUN_ARCHIVES; self._exhausted=False
+
+    def remaining(self):
+        if os.getpid()!=self._pid: raise Denied('archive budget process changed')
+        with self._lock:
+            if self._exhausted or self._remaining<=0: raise Denied('aggregate archive budget exhausted')
+            return self._remaining
+
+    def consume(self, amount):
+        if os.getpid()!=self._pid or type(amount) is not int or amount<=0: raise Denied('invalid archive accounting')
+        with self._lock:
+            if self._exhausted or amount>self._remaining:
+                self._exhausted=True
+                raise Denied('aggregate archive budget exhausted')
+            self._remaining-=amount
 
 
 @dataclass(frozen=True)
@@ -252,19 +274,19 @@ class LocalTestBroker:
     """
 
     def __init__(self, *, socket_path, socket_identity, version, owner,
-                 volume, images, creates, exec_bodies, journal):
-        from scripts.hub_local_test_volume import OwnedVolume
+                 volume, images, creates, exec_bodies, journal, archive_budget=None):
+        from scripts.hub_local_test_volume import OwnedVolume, TMPFS_OPTIONS
         if (socket_path != '/var/run/docker.sock' or
                 not re.fullmatch(r'1\.[0-9]{2,3}', version) or
                 type(owner) is not str or str(uuid.UUID(owner)) != owner or
                 type(socket_identity) is not tuple or len(socket_identity) != 2 or
-                type(volume) is not OwnedVolume or volume.owner != owner or
+                type(volume) is not OwnedVolume or volume.owner != owner or volume.options not in ((), TMPFS_OPTIONS) or
                 volume.name != 'hub-local-test-' + owner or
                 type(volume.mountpoint) is not str or not volume.mountpoint.startswith('/') or
                 str(Path(volume.mountpoint)) != volume.mountpoint or '..' in Path(volume.mountpoint).parts or
                 not volume.mountpoint.endswith('/volumes/' + volume.name + '/_data') or
                 type(images) is not dict or type(creates) is not dict or type(exec_bodies) is not list or
-                type(journal) is not EffectJournal):
+                type(journal) is not EffectJournal or archive_budget is not None and type(archive_budget) is not ArchiveBudget):
             raise Denied('invalid test enrollment')
         if len(images) != 2 or len(creates) != 3 or not 1 <= len(exec_bodies) <= 32:
             raise Denied('invalid test enrollment')
@@ -277,6 +299,7 @@ class LocalTestBroker:
         volume_mount = volume.mountpoint
         self.version, self.owner, self.mount, self.images = version, owner, volume_mount, dict(images)
         self.volume = volume
+        self.archive_budget = self._archive_budget_pin = archive_budget
         self.journal = journal
         self._lock = threading.RLock()
         self._listener = None
@@ -369,10 +392,16 @@ class LocalTestBroker:
         journal.bind(self._binding)
 
     def _current_binding(self):
+        if self.archive_budget is not self._archive_budget_pin:
+            raise Denied('archive budget changed')
         enrollment = {'owner': self.owner, 'daemon_id': self.volume.daemon_id, 'volume': self.volume.name,
                       'mountpoint': self.volume.mountpoint, 'version': self.version,
                       'socket_path': self.socket_path, 'socket_identity': self.socket_identity, 'images': self.images,
-                      'creates': self.creates, 'exec_bodies': self.exec_bodies}
+                      'creates': self.creates, 'exec_bodies': self.exec_bodies, 'log_config':_LOG_CONFIG}
+        if self.volume.options:
+            enrollment['volume_options'] = self.volume.options
+        if self.archive_budget is not None:
+            enrollment['archive_budget_bytes'] = _MAX_RUN_ARCHIVES
         return hashlib.sha256(json.dumps(enrollment, sort_keys=True, separators=(',', ':'),
                                           ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 
@@ -470,6 +499,7 @@ class LocalTestBroker:
             if host.get('PidMode') not in (None, '', 'private') or host.get('IpcMode') not in (None, '', 'private'):
                 raise Denied('owned container profile mismatch')
             if (host.get('Tmpfs') != expected['HostConfig']['Tmpfs'] or
+                    host.get('LogConfig') != _LOG_CONFIG or
                     type(host.get('RestartPolicy')) is not dict or host['RestartPolicy'].get('Name') != 'no' or
                     host.get('PortBindings') not in (None, {}) or host.get('PublishAllPorts') is not False):
                 raise Denied('owned container profile mismatch')
@@ -485,6 +515,7 @@ class LocalTestBroker:
 
     def _attest_volume(self):
         """Recheck exact daemon and task volume; no host-custody claim."""
+        from scripts.hub_local_test_volume import _options_match
         for target, kind in ((f'/v{self.version}/info', 'info'),
                              (f'/v{self.version}/volumes/{self.volume.name}', 'volume')):
             connection, response = self._request('GET', target)
@@ -501,7 +532,8 @@ class LocalTestBroker:
                         raise Denied('daemon changed')
                 elif (value.get('Name') != self.volume.name or value.get('Driver') != 'local' or
                       value.get('Scope') != 'local' or value.get('Mountpoint') != self.volume.mountpoint or
-                      value.get('Labels') != {_LABEL: self.owner} or value.get('Options') not in (None, {})):
+                      value.get('Labels') != {_LABEL: self.owner} or
+                      not _options_match(self.volume,value.get('Options'))):
                     raise Denied('test volume changed')
             finally:
                 connection.close()
@@ -591,6 +623,7 @@ class LocalTestBroker:
         with source._lock, self._lock:
             if (not source._listener_closed or source._listener is None or source.journal.transfer_started() or
                     source.owner != self.owner or source.volume != self.volume or source.version != self.version or
+                    source.archive_budget is not self.archive_budget or
                     source.socket_path != self.socket_path or source.socket_identity != self.socket_identity or
                     source.images != self.images or source.exec_bodies != self.exec_bodies or
                     not hmac.compare_digest(source._binding, source._current_binding()) or
@@ -761,6 +794,7 @@ class LocalTestBroker:
             if name not in self.creates or _object(raw) != self.creates[name]:
                 raise Denied('create denied')
             body = dict(self.creates[name]); body['Labels'] = {_LABEL: self.owner}
+            body['HostConfig'] = dict(body['HostConfig']); body['HostConfig']['LogConfig'] = _LOG_CONFIG
             return self._effect('create', method, target, body, emit, name=name, effect_key=name)
         raise Denied('route denied')
 
@@ -798,6 +832,8 @@ class LocalTestBroker:
                 connection.close()
 
     def _stream(self, method, target, emit, maximum):
+        archive = target.endswith('/get') and self.archive_budget is not None
+        if archive: self.archive_budget.remaining()
         connection, response = self._request(method, target, timeout=10, total_timeout=_MAX_STREAM_SECONDS)
         started = time.monotonic()
         length = response.getheader('Content-Length')
@@ -823,11 +859,18 @@ class LocalTestBroker:
                     if remaining <= 0:
                         raise Denied('response deadline')
                     stream_socket.settimeout(min(10, remaining))
-                    chunk = response.read1(min(65536, maximum - total + 1))
+                    amount = min(65536, maximum - total + 1)
+                    if archive:
+                        try: amount = min(amount,self.archive_budget.remaining()+1)
+                        except Denied:
+                            # One byte distinguishes exact EOF from an over-budget body.
+                            amount = 1
+                    chunk = response.read1(amount)
                     if time.monotonic() - started >= _MAX_STREAM_SECONDS:
                         raise Denied('response deadline')
                     if not chunk:
                         break
+                    if archive: self.archive_budget.consume(len(chunk))
                     total += len(chunk)
                     if total > maximum:
                         raise Denied('response too large')

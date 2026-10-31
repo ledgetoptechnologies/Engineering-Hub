@@ -37,14 +37,14 @@ class _SyntheticDriver:
 class LocalSource:
     """One initial broker; a sealed exact baseline may transfer to a successor."""
     def __init__(self, *, manifest, candidate, rollback, volume, private_dir,
-                 daemon_socket_identity, api_version='1.41'):
+                 daemon_socket_identity, api_version='1.41', archive_budget=None):
         if (type(manifest) is not PilotManifest or type(candidate) is not VerifiedImage or candidate.role != 'candidate'
                 or type(rollback) is not VerifiedImage or rollback.role != 'rollback' or type(volume) is not OwnedVolume):
             raise ValueError('Exact local source enrollment required')
         prefix = 'hub-pilot-' + uuid.UUID(volume.owner).hex[:24]
         if manifest.runtime.resource_name_prefix != prefix:
             raise ValueError('Local source owner mismatch')
-        self.private, self.volume = Path(private_dir), volume
+        self.private, self.volume, self.manifest = Path(private_dir), volume, manifest
         root = Path(volume.mountpoint) / 'generations'
         images = {'candidate':candidate,'rollback':rollback}
         secrets = {'CODEX_TOKEN':'synthetic-codex','HERMES_TOKEN':'synthetic-hermes','CLAUDE_TOKEN':'synthetic-claude'}
@@ -66,12 +66,13 @@ class LocalSource:
                     probe.kind,probe.path,str(probe.expected_status),probe.expectation_id,
                     str(probe.max_response_bytes),str(probe.timeout_ms),images[role].source_commit]})
         self._stack, self.server, self.thread, self.broker, self._closed = ExitStack(), None, None, None, False
+        self._dispose_attempted, self._disposed, self._pid = False, False, os.getpid()
         try:
             journal = EffectJournal(self.private/'bootstrap-broker.sqlite'); self._stack.callback(journal.close)
             self.broker = LocalTestBroker(socket_path='/var/run/docker.sock',socket_identity=daemon_socket_identity,
                 version=api_version,owner=volume.owner,volume=volume,images={image.runnable_reference:
                     (image.image_config_id,image.platform_manifest_digest) for image in images.values()},
-                creates=bodies,exec_bodies=probes,journal=journal)
+                creates=bodies,exec_bodies=probes,journal=journal,archive_budget=archive_budget)
             self.server = LocalTestSocketServer(str(self.private/'bootstrap.sock'),self.broker)
             self.thread = threading.Thread(target=self.server.serve_forever)
             self._stack.callback(self._close_server)
@@ -93,11 +94,18 @@ class LocalSource:
             if self.thread.is_alive(): raise RuntimeError('Local source broker did not drain')
 
     def seal(self):
+        if os.getpid() != self._pid: raise RuntimeError('Local source process changed')
         snapshot = self.broker.seal()
         self._close_server()
         return snapshot
 
-    def close(self): self._stack.close()
+    def close(self):
+        if os.getpid() != self._pid: raise RuntimeError('Local source process changed')
+        if self._disposed: return
+        if self._dispose_attempted: raise RuntimeError('Local source cleanup is uncertain')
+        self._dispose_attempted = True
+        self._stack.close()
+        self._disposed = True
 
 
 class LocalSuccessor:
@@ -121,6 +129,7 @@ class LocalSuccessor:
         self._lock, self._closed = threading.RLock(), False
         self._pid = os.getpid()
         self._server_closed, self._adapter = False, None
+        self._close_attempted, self._cleaned_snapshot = False, None
 
     def prepare(self, bound):
         if os.getpid() != self._pid:
@@ -160,7 +169,7 @@ class LocalSuccessor:
         broker = LocalTestBroker(socket_path='/var/run/docker.sock',socket_identity=self.identity,version=self.version,
             owner=self.volume.owner,volume=self.volume,images={image.runnable_reference:
                 (image.image_config_id,image.platform_manifest_digest) for image in images.values()},
-            creates=bodies,exec_bodies=probes,journal=journal)
+            creates=bodies,exec_bodies=probes,journal=journal,archive_budget=self.source_broker.archive_budget)
         self.broker = broker
         baseline = broker.transfer_baseline_from(source=self.source_broker,snapshot=self.source_snapshot,
             manifest=manifest,rollback_image=self.rollback,provider=self.baseline_provider)
@@ -209,13 +218,17 @@ class LocalSuccessor:
                 raise RuntimeError('Local coordinator is not drained')
             snapshot = self.broker.seal()
             self._close_server()
-            return self.broker.cleanup_owned(snapshot)
+            cleaned = self.broker.cleanup_owned(snapshot)
+            self._cleaned_snapshot = cleaned
+            return cleaned
 
     def close(self):
         """Drain preparation; caller must first drain and close the adapter."""
         if os.getpid() != self._pid:
             raise RuntimeError('Local successor process changed')
         with self._lock:
-            if not self._closed:
-                self._closed = True
-                self._stack.close()
+            if self._closed: return
+            if self._close_attempted: raise RuntimeError('Local successor cleanup is uncertain')
+            self._close_attempted = True
+            self._stack.close()
+            self._closed = True

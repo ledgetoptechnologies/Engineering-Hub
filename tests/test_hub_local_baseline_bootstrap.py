@@ -5,6 +5,8 @@ import types
 import os
 import sys
 import pytest
+if sys.platform != 'linux':
+    pytest.skip('local baseline bootstrap requires Linux', allow_module_level=True)
 from scripts import hub_local_baseline_bootstrap as b
 from tests.test_hub_container_pilot_manifest import make_manifest_data
 from engineering_hub.container_pilot_manifest import PilotManifest

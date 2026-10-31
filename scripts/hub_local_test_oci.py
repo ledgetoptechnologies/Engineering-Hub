@@ -112,10 +112,11 @@ def discover_cached_image(image, *, daemon_id, run=None):
         if call(prefix+['info','--format','{{.ID}}']).strip()!=daemon_id: raise ValueError
         # Request immutable manifest digest, not a tag; emit no image environment.
         value=call(prefix+['image','inspect','--format',
-            '{{.Id}}|{{.Os}}|{{.Architecture}}|{{.Variant}}', image.platform_manifest_digest]).strip()
+            '{{.Id}}|{{.Os}}|{{.Architecture}}|{{with index . "Variant"}}{{.}}{{end}}', image.platform_manifest_digest]).strip()
         fields=value.split('|')
         variant=image.platform.variant or ''
-        if fields != [image.image_config_id,image.platform.os,image.platform.architecture,variant]:
+        if (len(fields)!=4 or fields[0] not in (image.image_config_id,image.platform_manifest_digest)
+                or fields[1:] != [image.platform.os,image.platform.architecture,variant]):
             raise ValueError
         if call(prefix+['info','--format','{{.ID}}']).strip()!=daemon_id: raise ValueError
     except Exception:

@@ -55,7 +55,15 @@ def test_cached_discovery_uses_exact_digest_and_no_mutation(tmp_path):
         return image.image_config_id+'|linux|amd64|'
     assert discover_cached_image(image,daemon_id='daemon-1234567890',run=run) is image
     assert calls[1][-1]==image.platform_manifest_digest
+    assert 'with index . "Variant"' in calls[1][-2]
     assert all(not any(x in a for x in ('pull','load','tag','rm')) for a in calls)
+
+
+def test_cached_discovery_accepts_verified_manifest_id(tmp_path):
+    from scripts.hub_local_test_oci import discover_cached_image
+    obj=prepared(tmp_path); image,*_=verify_fixture_image(manifest_for(obj),'candidate',obj)
+    def run(args): return 'daemon-1234567890' if args[3]=='info' else image.platform_manifest_digest+'|linux|amd64|'
+    assert discover_cached_image(image,daemon_id='daemon-1234567890',run=run) is image
 
 def test_cached_discovery_rejects_wrong_config(tmp_path):
     from scripts.hub_local_test_oci import discover_cached_image

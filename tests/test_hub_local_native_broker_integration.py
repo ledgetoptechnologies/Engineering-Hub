@@ -5,7 +5,9 @@ No Docker socket, real image, host authority or staging resources are used.
 import asyncio
 import base64
 from contextlib import ExitStack
+from dataclasses import replace
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler
 import io
 import json
@@ -21,6 +23,9 @@ import uuid
 
 import pytest
 
+if sys.platform != 'linux':
+    pytest.skip('local native broker integration requires Linux', allow_module_level=True)
+
 from engineering_hub.container_pilot_manifest import PilotManifest
 from engineering_hub.pilot_ownership import PilotOwner
 from hub_container_executor.adapter import HostAdapter
@@ -33,11 +38,13 @@ from hub_container_executor.runtime_profile import derive_runtime_profile
 from hub_container_executor.state_provider import FrozenSQLiteStateProvisioner
 from scripts.hub_local_native_coordinator import LocalNativeCoordinator, MACHINE
 from scripts.hub_local_acceptance_components import LocalSource, LocalSuccessor
+from scripts.hub_local_cleanup_receipt import DOMAIN, write_cleanup_receipt
 from scripts.hub_local_test_engine_broker import EffectJournal, LocalTestBroker, LocalTestSocketServer, UnixHTTPConnection
-from scripts.hub_local_test_volume import OwnedVolume
+from scripts.hub_local_test_volume import OwnedVolume, TMPFS_OPTIONS
 from scripts.hub_local_test_oci import prepare_fixture_image, verify_fixture_image
 from tests.test_hub_container_executor_adapter import FakeDriverIdentityVerifier
 from tests.test_hub_container_executor_build_record import FakeStore, FakeTrust, make_record
+from tests.local_synthetic_engine import SyntheticEngine
 from tests.test_hub_container_executor_daemon_backend import binding, container_inspect, docker_config, oci_archive
 from tests.test_hub_container_pilot_manifest import make_manifest_data
 
@@ -55,13 +62,18 @@ def owned_resources():
 @pytest.mark.skipif(sys.platform != 'linux' or os.getuid() != 10001 or os.getgid() != 10001,
                     reason='isolated Linux app UID/GID 10001 required')
 @pytest.mark.asyncio
-async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failure_rollback(tmp_path, monkeypatch, owned_resources):
+@pytest.mark.parametrize('via_runner',[
+    'components','fixed-runner',
+    pytest.param('fixed-fd',marks=pytest.mark.skipif(os.environ.get('HUB_LOCAL_FD_SYNTHETIC')!='1',
+                                                    reason='requires disposable synthetic-FD QA container'))])
+async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failure_rollback(tmp_path, monkeypatch, owned_resources, via_runner):
     """Synthetic Engine responses prove wiring, not actual Engine acceptance."""
     task_owner = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
     volume_name = 'hub-local-test-' + task_owner
     fake_root = tmp_path / 'fake-engine-root'
     volume_root = fake_root / 'volumes' / volume_name / '_data'
     generations = volume_root / 'generations'; generations.mkdir(parents=True, mode=0o700)
+    volume_root.chmod(0o700)
     reservations = volume_root / 'reservations'; reservations.mkdir(mode=0o700)
     baseline_dir = generations / 'baseline-g1'; baseline_dir.mkdir(mode=0o700)
     baseline_db = baseline_dir / 'hub.sqlite3'
@@ -90,6 +102,7 @@ async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failur
         data[role]['provenance']['build_inputs_digest'] = fixture.inputs_digest
         data[role]['provenance']['attestation_digest'] = fixture.record_digest
     manifest = PilotManifest.from_bytes(json.dumps(data).encode())
+    initial_manifest = manifest
     candidate, _, _, candidate_trust = verify_fixture_image(manifest, 'candidate', fixtures['candidate'])
     rollback, _, _, rollback_trust = verify_fixture_image(manifest, 'rollback', fixtures['rollback'])
     records = FakeStore({item.record_digest: item.record for item in fixtures.values()})
@@ -110,100 +123,19 @@ async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failur
     owner_path = private / 'hub.sqlite3'
     resources = owned_resources
     state = {'calls': [], 'errors': [], 'responses': [], 'adapter': None, 'server': None, 'server_thread': None, 'broker': None}
-    # One Engine inventory spans bootstrap and the native broker. Both brokers
-    # address this same task-owned synthetic socket, never the Docker daemon.
-    profiles, names, by_name, containers, execs = {}, {}, {}, {}, {}
-    by_ref = {candidate.runnable_reference: 'candidate', rollback.runnable_reference: 'rollback'}
+    # One task-owned Engine inventory spans source and successor brokers.
     volume = OwnedVolume(volume_name, task_owner, 'fixture-daemon', str(volume_root))
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_): pass
-        def reply(self, status, value, binary=False):
-            raw = value if binary else json.dumps(value).encode()
-            self.send_response(status); self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
-        def do_GET(self):
-            path = self.path
-            if path.endswith('/info'):
-                return self.reply(200, {'ID': 'fixture-daemon', 'OSType': 'linux', 'Architecture': 'amd64',
-                                        'DockerRootDir': str(fake_root)})
-            if '/volumes/' in path:
-                return self.reply(200, {'Name': volume.name, 'Driver': 'local', 'Scope': 'local',
-                    'Mountpoint': volume.mountpoint, 'Labels': {'engineering-hub.local-test-owner': task_owner}, 'Options': {}})
-            for ref, role in by_ref.items():
-                base = '/v1.41/images/' + quote(ref, safe='')
-                if path == base + '/json': return self.reply(200, docker_config(images[role]))
-                if path == base + '/get': return self.reply(200, archives[role], True)
-            for name in names.values():
-                if path == '/v1.41/containers/' + name + '/json': return self.reply(404, {})
-            for ident, item in containers.items():
-                if path == '/v1.41/containers/' + ident + '/json':
-                    role = item['role']; profile = profiles[role]; image = candidate if role == 'candidate' else rollback
-                    value = container_inspect(image, profile, generations / profile.state_generation_id,
-                                              status=item['status'], container_id=ident)
-                    value['Config']['Labels'] = {'engineering-hub.local-test-owner': task_owner}
-                    value['HostConfig']['PublishAllPorts'] = False
-                    value['HostConfig']['Mounts'][0].pop('ReadOnly')
-                    value['Mounts'] = value['Mounts'][:1]; value['Mounts'][0]['Mode'] = ''
-                    value['State'].update(Running=item['status'] == 'running', Pid=123 if item['status'] == 'running' else 0,
-                        Paused=False, Restarting=False, Dead=False,
-                        StartedAt='2026-10-21T00:00:00Z' if item['status'] == 'running' else '0001-01-01T00:00:00Z')
-                    return self.reply(200, value)
-            for ident, item in execs.items():
-                if path == '/v1.41/exec/' + ident + '/json':
-                    return self.reply(200, {'ID': ident, 'Running': False, 'ExitCode': 1 if item['failed'] else 0})
-            self.reply(404, {})
-        def do_POST(self):
-            path = self.path
-            length = int(self.headers.get('Content-Length', '0'))
-            body = json.loads(self.rfile.read(length)) if length else None
-            if path.startswith('/v1.41/containers/create?name='):
-                name = path.split('=', 1)[1]; role = by_name[name]
-                assert body['Labels'] == {'engineering-hub.local-test-owner': task_owner}
-                ident = {'baseline': 'e', 'candidate': 'c', 'rollback': 'd'}[role] * 64
-                containers[ident] = {'role': role, 'status': 'created'}
-                return self.reply(201, {'Id': ident, 'Warnings': []})
-            for ident, item in list(containers.items()):
-                if path == '/v1.41/containers/' + ident + '/start':
-                    if item['role'] == 'baseline' and not baseline_db.exists():
-                        db = sqlite3.connect(baseline_db)
-                        try:
-                            db.execute('CREATE TABLE synthetic_fixture(v TEXT)')
-                            db.execute("INSERT INTO synthetic_fixture VALUES('baseline')")
-                            db.commit()
-                        finally:
-                            db.close()
-                        baseline_db.chmod(0o600)
-                    item['status'] = 'running'; self.send_response(204); self.end_headers(); return
-                if path == '/v1.41/containers/' + ident + '/stop?t=5':
-                    item['status'] = 'exited'; self.send_response(204); self.end_headers(); return
-                if path == '/v1.41/containers/' + ident + '/exec':
-                    cmd = body['Cmd']; ident_exec = uuid.uuid4().hex + uuid.uuid4().hex
-                    failed = item['role'] == 'candidate' and cmd[4] == 'health_json'
-                    execs[ident_exec] = {'failed': failed, 'expectation': cmd[7],
-                                         'status': 503 if failed else int(cmd[6])}
-                    return self.reply(201, {'Id': ident_exec})
-            for ident, item in execs.items():
-                if path == '/v1.41/exec/' + ident + '/start':
-                    raw = json.dumps({'expectation_id': item['expectation'], 'ok': not item['failed'],
-                                      'status': item['status']}).encode()
-                    return self.reply(200, b'\x01\x00\x00\x00' + len(raw).to_bytes(4, 'big') + raw, True)
-            self.reply(404, {})
-        def do_DELETE(self):
-            ident = self.path.split('/containers/', 1)[1].split('?', 1)[0]
-            if ident not in containers or containers[ident]['status'] != 'exited': return self.reply(409, {})
-            del containers[ident]; self.send_response(204); self.end_headers()
-    upstream_path = str(private / 'synthetic-engine.sock')
-    upstream = socketserver.UnixStreamServer(upstream_path, Handler)
-    upstream_thread = threading.Thread(target=upstream.serve_forever); upstream_thread.start()
-    def close_upstream():
-        upstream.shutdown(); upstream_thread.join(timeout=5); upstream.server_close()
-        assert not upstream_thread.is_alive()
-    resources.callback(close_upstream)
+    engine_volume = replace(volume, options=TMPFS_OPTIONS) if via_runner != 'components' else volume
+    upstream_path = '/var/run/docker.sock' if via_runner == 'fixed-fd' else str(tmp_path/'synthetic-engine.sock')
+    engine = SyntheticEngine(socket_path=upstream_path, fake_root=fake_root, volume=engine_volume,
+        owner=task_owner, images=images, archives=archives, manifest=manifest, secrets=secrets,
+        baseline_db=baseline_db, dynamic_names=via_runner == 'fixed-fd')
+    resources.callback(engine.close)
+    engine.start()
+    profiles,names,by_name,containers = engine.profiles,engine.names,engine.by_name,engine.containers
 
     # Bootstrap has its own broker journal and a child-owned PilotOwner. The
     # owner is enrolled before the child and reopened only after it exits.
-    initial_owner = PilotOwner(owner_path, allow_ephemeral_test_storage=True)
-    initial_owner.close()
     prefix = manifest.runtime.resource_name_prefix
     names.update({'baseline': prefix + '-00000000-000-rollback',
                   'candidate': prefix + '-11111111-111-candidate',
@@ -214,8 +146,91 @@ async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failur
         'rollback': derive_runtime_profile(manifest, HostAdapter._defaults_from_record(rollback), 'rollback-placeholder', secrets),
     })
     by_name.update({names[role]: role for role in names})
-    monkeypatch.setattr(LocalTestBroker, '_connection',
-        lambda self, timeout, total: UnixHTTPConnection(upstream_path, timeout, total))
+    if via_runner != 'fixed-fd':
+        monkeypatch.setattr(LocalTestBroker, '_connection',
+            lambda self, timeout, total: UnixHTTPConnection(upstream_path, timeout, total))
+    if via_runner != 'components':
+        from scripts import hub_local_acceptance_runner as runner
+        if via_runner == 'fixed-runner':
+            monkeypatch.setattr(runner,'_socket_identity',lambda:(1,2))
+            monkeypatch.setattr(runner,'discover_cached_image',lambda image,**_kwargs:image)
+            monkeypatch.setattr(runner,'_bounded_volume',lambda _path:None)  # Synthetic Engine, no actual named tmpfs mount.
+        actual_prepare=LocalSuccessor.prepare
+        def prepare_runner(self,bound):
+            profiles.update({
+                'baseline':derive_runtime_profile(manifest,HostAdapter._defaults_from_record(rollback),'baseline-g1',secrets),
+                'candidate':derive_runtime_profile(manifest,HostAdapter._defaults_from_record(candidate),bound.candidate_generation,secrets),
+                'rollback':derive_runtime_profile(manifest,HostAdapter._defaults_from_record(rollback),bound.rollback_generation,secrets)})
+            names.update({'baseline':bound.baseline_name,'candidate':bound.candidate_name,'rollback':bound.rollback_name})
+            by_name.update({names[role]:role for role in names})
+            return actual_prepare(self,bound)
+        if via_runner == 'fixed-runner': monkeypatch.setattr(LocalSuccessor,'prepare',prepare_runner)
+        def fixture_request(fixture):
+            return {'record':base64.b64encode(fixture.record).decode(),
+                'inputs':base64.b64encode(fixture.inputs).decode(),
+                'manifest_digest':fixture.manifest_digest,'config_digest':fixture.config_digest,
+                'blobs':{key:base64.b64encode(value).decode() for key,value in fixture.blobs.items()}}
+        request={'schema':runner.SCHEMA,'task_id':task_owner,'daemon_id':'fixture-daemon',
+            'volume_mount':str(volume_root),'private_dir':str(private),
+            'manifest':manifest.canonical_bytes().decode(),'candidate':fixture_request(fixtures['candidate']),
+            'rollback':fixture_request(fixtures['rollback']),'coordinator_id':'f'*64,
+            'coordinator_image_id':'sha256:'+'b'*64,'cleanup_nonce':'a'*64,'cleanup_key':(b'k'*32).hex(),
+            'startup_wait_ms':0,'volume_storage':'tmpfs-512m-v1'}
+        try:
+            if via_runner == 'fixed-fd':
+                import signal
+                map_path=Path('/tmp/hub-local-fake-docker-map.json')
+                script_path=Path('/tmp/hub-local-fake-docker.py')
+                for path in (map_path,script_path): assert not os.path.lexists(path)
+                image_map={image.platform_manifest_digest:[image.image_config_id,image.platform.os,
+                           image.platform.architecture,image.platform.variant or ''] for image in (candidate,rollback)}
+                fd=os.open(map_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                resources.callback(lambda: map_path.unlink(missing_ok=True))
+                with os.fdopen(fd,'w',encoding='utf8') as out: out.write(json.dumps(image_map))
+                fd=os.open(script_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                resources.callback(lambda: script_path.unlink(missing_ok=True))
+                with os.fdopen(fd,'w',encoding='utf8') as out:
+                    out.write('''import json,sys\na=sys.argv[1:]\nif a[2:3]==["info"]: print("fixture-daemon")\nelif a[2:4]==["image","inspect"]: print("|".join(json.load(open("/tmp/hub-local-fake-docker-map.json"))[a[-1]]))\nelse: raise SystemExit(2)\n''')
+                read_fd,write_fd=os.pipe(); process=None; writer=None
+                encoded=json.dumps(request,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
+                try:
+                    entry=Path(__file__).resolve().parents[1]/'scripts/hub_local_acceptance_runner.py'
+                    boot='import os,sys; fd=int(sys.argv[1]); os.dup2(fd,3); os.close(fd) if fd!=3 else None; os.set_inheritable(3,True); os.execv(sys.executable,[sys.executable,"-I","-B",sys.argv[2],"--request-fd","3"])'
+                    argv=[sys.executable,'-I','-B','-c',boot,str(read_fd),str(entry)]
+                    process=subprocess.Popen(argv,
+                        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                        env={'LANG':'C.UTF-8','PATH':'/usr/bin:/bin'},pass_fds=(read_fd,),
+                        start_new_session=True)
+                    os.close(read_fd); read_fd=None
+                    def send():
+                        try:
+                            offset=0
+                            while offset<len(encoded): offset+=os.write(write_fd,encoded[offset:offset+65536])
+                        finally: os.close(write_fd)
+                    writer=threading.Thread(target=send); writer.start()
+                    output,error=await asyncio.to_thread(process.communicate,timeout=145)
+                    assert process.returncode==0 and error==b'', (output,error)
+                    outcome=json.loads(output)
+                finally:
+                    if process is not None and process.poll() is None:
+                        os.killpg(process.pid,signal.SIGKILL); process.wait(timeout=5)
+                    if read_fd is not None: os.close(read_fd)
+                    if writer is None: os.close(write_fd)
+                    else:
+                        writer.join(timeout=5); assert not writer.is_alive()
+            else:
+                outcome=await runner.run(request)
+            assert outcome['state']=='rolled_back' and outcome['cleanup']=='receipt_written'
+            assert containers=={}
+            envelope=json.loads((private/'cleanup-receipt.json').read_bytes())
+            body=json.dumps(envelope['payload'],sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
+            assert envelope['signature']==hmac.new(b'k'*32,DOMAIN+body,hashlib.sha256).hexdigest()
+            assert envelope['payload']['initial_manifest_digest']==manifest.digest()
+        finally:
+            resources.close()
+        return
+    initial_owner = PilotOwner(owner_path, allow_ephemeral_test_storage=True)
+    initial_owner.close()
     source = LocalSource(manifest=manifest, candidate=candidate, rollback=rollback,
         volume=volume, private_dir=private, daemon_socket_identity=(1, 2))
     resources.callback(source.close)
@@ -225,7 +240,7 @@ async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failur
         'socket': source_path, 'generation_root': str(generations), 'journal': str(private / 'bootstrap-operations.sqlite'),
         'owner': task_owner, 'record': base64.b64encode(fixtures['rollback'].record).decode(),
         'blobs': {key: base64.b64encode(value).decode() for key, value in fixtures['rollback'].blobs.items()},
-        'ids': [str(uuid.uuid4()) for _ in range(6)]}
+        'ids': [str(uuid.uuid4()) for _ in range(6)], 'startup_wait_ms':0}
     child_entry = Path(__file__).resolve().parents[1] / 'scripts/hub_local_baseline_child.py'
     child = subprocess.run([sys.executable, '-I', '-B', str(child_entry)], input=json.dumps(payload),
                            capture_output=True, text=True, timeout=45, check=True,
@@ -281,6 +296,28 @@ async def test_native_queue_real_adapter_and_broker_with_synthetic_engine_failur
         await coordinator.close()
         cleaned = successor.seal_and_cleanup(coordinator)
         assert {identity for identity, _name in cleaned.containers} == {'c'*64, 'd'*64, 'e'*64}
+        receipt_dir = private/'cleanup'; receipt_dir.mkdir(mode=0o700)
+        key = b'k'*32; nonce = 'a'*64
+        with pytest.raises(ValueError,match='handoff unavailable'):
+            write_cleanup_receipt(directory=receipt_dir,key=key,nonce=nonce,
+                coordinator_id='f'*64,coordinator_image_id='sha256:'+'b'*64,initial_manifest_digest=initial_manifest.digest(),
+                baseline_backup_digest=snapshot.sha256,manifest_digest=manifest.digest(),
+                coordinator=coordinator,source=source,successor=successor,cleaned=cleaned)
+        assert list(receipt_dir.iterdir()) == []
+        successor.close(); source.close()
+        written = write_cleanup_receipt(directory=receipt_dir,key=key,nonce=nonce,
+            coordinator_id='f'*64,coordinator_image_id='sha256:'+'b'*64,initial_manifest_digest=initial_manifest.digest(),
+            baseline_backup_digest=snapshot.sha256,manifest_digest=manifest.digest(),
+            coordinator=coordinator,source=source,successor=successor,cleaned=cleaned)
+        envelope = json.loads((receipt_dir/'cleanup-receipt.json').read_bytes())
+        raw = json.dumps(written,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False).encode('ascii')
+        assert envelope == {'payload':written,'signature':hmac.new(key,DOMAIN+raw,hashlib.sha256).hexdigest()}
+        assert written['nonce'] == nonce and written['manifest_digest'] == manifest.digest()
+        with pytest.raises(FileExistsError):
+            write_cleanup_receipt(directory=receipt_dir,key=key,nonce=nonce,
+                coordinator_id='f'*64,coordinator_image_id='sha256:'+'b'*64,initial_manifest_digest=initial_manifest.digest(),
+                baseline_backup_digest=snapshot.sha256,manifest_digest=manifest.digest(),
+                coordinator=coordinator,source=source,successor=successor,cleaned=cleaned)
     finally:
         try: await coordinator.close()
         finally: resources.close()

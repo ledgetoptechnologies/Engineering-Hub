@@ -6,6 +6,9 @@ import sys
 
 import pytest
 
+if sys.platform != 'linux':
+    pytest.skip('local baseline child requires Linux', allow_module_level=True)
+
 
 @pytest.mark.parametrize('body', [b'{}', b'{"owner":"one","owner":"two"}', b'x' * (4*1024*1024+1)],
                          ids=['empty-object', 'duplicate-field', 'oversized'])

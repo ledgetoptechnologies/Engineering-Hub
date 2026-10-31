@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 LABEL = 'engineering-hub.local-test-owner'
+TMPFS_OPTIONS = (('device','tmpfs'),('o','size=536870912,mode=0700,nr_inodes=4096'),('type','tmpfs'))
 
 class VolumeError(RuntimeError):
     pass
@@ -32,6 +33,12 @@ class OwnedVolume:
     owner: str
     daemon_id: str
     mountpoint: str
+    options: tuple = ()
+
+
+def _options_match(volume, actual):
+    if type(volume) is not OwnedVolume or volume.options not in ((), TMPFS_OPTIONS): return False
+    return actual in (None,{}) if not volume.options else actual == dict(volume.options)
 
 
 def _call(args):
@@ -103,7 +110,7 @@ def _close_handles(handles):
         raise OSError('Journal descriptor cleanup failed')
 
 
-def _reserve_intent(journal_dir, task_id, daemon_id, name, suffix, operation):
+def _reserve_intent(journal_dir, task_id, daemon_id, name, suffix, operation, *, storage=None):
     # Hold a no-follow descriptor for each ancestor through create.
     handles = []
     try:
@@ -128,7 +135,9 @@ def _reserve_intent(journal_dir, task_id, daemon_id, name, suffix, operation):
                 raise ValueError
         _check_path(handles)
         dfd = handles[-1][0]
-        record = json.dumps({'daemon_id':daemon_id,'name':name,'task_id':task_id,'operation':operation},
+        value = {'daemon_id':daemon_id,'name':name,'task_id':task_id,'operation':operation}
+        if storage is not None: value['storage'] = storage
+        record = json.dumps(value,
             sort_keys=True,separators=(',',':')).encode('ascii') + b'\n'
         fd = os.open(task_id + suffix, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=dfd)
@@ -149,7 +158,8 @@ def _reserve_intent(journal_dir, task_id, daemon_id, name, suffix, operation):
     return handles
 
 
-def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', endpoint='unix:///var/run/docker.sock', run=_call):
+def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', endpoint='unix:///var/run/docker.sock',
+                  storage='local-v1', run=_call):
     """Create one fresh task-named volume after checking the independently pinned daemon.
 
     On any create failure or malformed/ambiguous post-create inspection, ownership
@@ -158,7 +168,7 @@ def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', 
     try:
         if str(uuid.UUID(task_id)) != task_id or not re.fullmatch(r'[A-Za-z0-9:._-]{12,128}', daemon_id):
             raise ValueError
-        if docker != '/usr/bin/docker' or endpoint != 'unix:///var/run/docker.sock':
+        if docker != '/usr/bin/docker' or endpoint != 'unix:///var/run/docker.sock' or storage not in ('local-v1','tmpfs-512m-v1'):
             raise ValueError
     except (ValueError, TypeError, AttributeError):
         raise VolumeError('Invalid local test enrollment') from None
@@ -185,10 +195,14 @@ def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', 
         raise VolumeError('Invalid volume inventory')
     if name in listed:
         raise VolumeError('Volume name already exists')
-    handles = _reserve_intent(journal_dir, task_id, daemon_id, name, '.intent', 'create')
+    options = TMPFS_OPTIONS if storage == 'tmpfs-512m-v1' else ()
+    handles = _reserve_intent(journal_dir, task_id, daemon_id, name, '.intent', 'create',
+                              storage=storage if options else None)
     try:
         _check_path(handles)
-        result = run(prefix + ['volume', 'create', '--driver', 'local', '--label', LABEL + '=' + task_id, name]).strip()
+        command = prefix + ['volume', 'create', '--driver', 'local', '--label', LABEL + '=' + task_id]
+        for key,value in options: command += ['--opt',key+'='+value]
+        result = run(command + [name]).strip()
         if result != name:
             raise ValueError
         data = json.loads(run(prefix + ['volume', 'inspect', name]))
@@ -196,7 +210,7 @@ def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', 
             raise ValueError
         item = data[0]; point = item.get('Mountpoint'); path = PurePosixPath(point)
         if (item.get('Name') != name or item.get('Driver') != 'local'
-                or item.get('Labels') != {LABEL: task_id} or item.get('Options') not in (None, {})
+                or item.get('Labels') != {LABEL: task_id} or not _options_match(OwnedVolume(name,task_id,daemon_id,str(point),options),item.get('Options'))
                 or item.get('Scope') != 'local'
                 or type(point) is not str or not path.is_absolute()
                 or str(path) != point or '..' in path.parts or point.startswith('//')
@@ -212,7 +226,7 @@ def create_volume(*, task_id, daemon_id, journal_dir, docker='/usr/bin/docker', 
             _close_handles(handles)
         except OSError:
             raise VolumeOutcomeUnknown('Volume outcome unknown; journal cleanup failed') from None
-    return OwnedVolume(name, task_id, daemon_id, point)
+    return OwnedVolume(name, task_id, daemon_id, point, options)
 
 
 def remove_sealed_volume(*, volume, snapshot, server_thread, journal_dir, run=_call):
@@ -257,7 +271,7 @@ def remove_sealed_volume(*, volume, snapshot, server_thread, journal_dir, run=_c
         item=obj[0]
         if (item.get('Name')!=volume.name or item.get('Mountpoint')!=volume.mountpoint
                 or item.get('Driver')!='local' or item.get('Scope')!='local'
-                or item.get('Options') not in (None,{}) or item.get('Labels')!={LABEL:volume.owner}):
+                or not _options_match(volume,item.get('Options')) or item.get('Labels')!={LABEL:volume.owner}):
             raise ValueError
         all_ids=run(prefix+['ps','--all','--quiet','--no-trunc']).splitlines()
         if any(not re.fullmatch(r'[a-f0-9]{64}', i) for i in all_ids) or any(i in all_ids for i in ids):

@@ -2,8 +2,12 @@
 from contextlib import ExitStack
 import threading
 import os
+import sys
 
 import pytest
+
+if sys.platform != 'linux':
+    pytest.skip('local acceptance components require Linux', allow_module_level=True)
 
 from scripts.hub_local_acceptance_components import LocalSuccessor
 from scripts.hub_local_native_coordinator import LocalNativeCoordinator
@@ -12,6 +16,7 @@ from scripts.hub_local_native_coordinator import LocalNativeCoordinator
 def test_close_waits_for_preparation_and_prevents_reuse(monkeypatch):
     successor = object.__new__(LocalSuccessor)
     successor._lock, successor._closed, successor._stack = threading.RLock(), False, ExitStack()
+    successor._close_attempted = False
     successor._pid = os.getpid()
     entered, release, closed = threading.Event(), threading.Event(), threading.Event()
     successor._stack.callback(closed.set)

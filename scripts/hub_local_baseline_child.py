@@ -37,12 +37,13 @@ def _strict_pairs(pairs):
 
 def run(request):
     if (type(request) is not dict or set(request) != {'manifest', 'owner_db', 'socket', 'generation_root',
-            'journal', 'owner', 'record', 'blobs', 'ids'} or
+            'journal', 'owner', 'record', 'blobs', 'ids', 'startup_wait_ms'} or
             any(type(request[k]) is not str for k in ('manifest','owner_db','socket','generation_root','journal','owner','record')) or
             type(request['blobs']) is not dict or len(request['blobs']) != 2 or
             any(type(k) is not str or type(v) is not str for k,v in request['blobs'].items()) or
             type(request['ids']) is not list or len(request['ids']) != 6 or
-            any(type(value) is not str for value in request['ids'])):
+            any(type(value) is not str for value in request['ids']) or
+            type(request['startup_wait_ms']) is not int or not 0 <= request['startup_wait_ms'] <= 30000):
         raise ValueError('invalid bootstrap request')
     owner_db, sock, journal, generation = (Path(request[k]) for k in ('owner_db','socket','journal','generation_root'))
     if (any(not path.is_absolute() or '..' in path.parts or str(path) != str(path.resolve())
@@ -77,8 +78,9 @@ def run(request):
             verifier=_SyntheticTrust(raw),secret_resolver=Secrets(),owner_id=request['owner'],generation_root=str(generation),
             source_generation_id='baseline-g1',frozen_leaf='frozen.sqlite3',create_id=request['ids'][0],
             start_id=request['ids'][1],observe_id=request['ids'][2],maximum_bytes=2*1024*1024,
-            deadline_monotonic=time.monotonic()+30,quiescent=True,preflight_probe_id=request['ids'][3],
-            stop_id=request['ids'][4],restart_id=request['ids'][5],initialize_empty=True)
+            deadline_monotonic=time.monotonic()+120,quiescent=True,preflight_probe_id=request['ids'][3],
+            stop_id=request['ids'][4],restart_id=request['ids'][5],initialize_empty=True,
+            startup_wait_ms=request['startup_wait_ms'])
         return {'manifest':result.manifest.canonical_bytes().decode(),'snapshot':asdict(result.snapshot),
             'receipt':base64.b64encode(result.draft.receipt_bytes).decode(),
             'receipt_digest':result.draft.receipt_digest,'profile_digest':result.draft.runtime_profile_digest,

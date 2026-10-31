@@ -34,6 +34,29 @@ def test_create_exact_owned_volume(tmp_path):
     assert v.name == NAME and v.mountpoint.endswith(NAME+'/_data')
     assert all(c[:3]==['/usr/bin/docker','--host','unix:///var/run/docker.sock'] for c in d.calls)
 
+
+def test_tmpfs_volume_pins_options_and_precreate_intent(tmp_path):
+    d=Docker()
+    def run(argv):
+        result=d(argv)
+        if argv[3:5]==['volume','inspect']:
+            value=json.loads(result); value[0]['Options']=dict(m.TMPFS_OPTIONS); return json.dumps(value)
+        return result
+    volume=m.create_volume(journal_dir=str(tmp_path),task_id=TASK,daemon_id=DAEMON,storage='tmpfs-512m-v1',run=run)
+    create=next(call for call in d.calls if call[3:5]==['volume','create'])
+    assert volume.options==m.TMPFS_OPTIONS and create[-1]==NAME
+    assert [create[i+1] for i,value in enumerate(create) if value=='--opt']==[k+'='+v for k,v in m.TMPFS_OPTIONS]
+    intent=json.loads((tmp_path/(TASK+'.intent')).read_text())
+    assert intent['storage']=='tmpfs-512m-v1'
+
+
+def test_tmpfs_wrong_daemon_options_are_held_not_removed(tmp_path):
+    d=Docker()
+    with pytest.raises(m.VolumeOutcomeUnknown):
+        m.create_volume(journal_dir=str(tmp_path),task_id=TASK,daemon_id=DAEMON,storage='tmpfs-512m-v1',run=d)
+    assert not any('rm' in call for call in d.calls)
+    assert (tmp_path/(TASK+'.intent')).is_file()
+
 def test_existing_never_adopted(tmp_path):
     d=Docker(); d.existing=True
     with pytest.raises(m.VolumeError): m.create_volume(journal_dir=str(tmp_path),task_id=TASK,daemon_id=DAEMON,run=d)

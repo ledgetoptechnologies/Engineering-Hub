@@ -5,6 +5,7 @@ is never staging enrollment, host-custody evidence or production authority.
 The caller owns and drains the separately constructed broker/Engine resources.
 """
 import asyncio
+import math
 import os
 from uuid import uuid4
 
@@ -66,8 +67,11 @@ class _LocalClient:
 
 class LocalNativeCoordinator:
     """Own one synthetic-attestation queue lifecycle and one admitted run."""
-    def __init__(self, *, database, manifest, task_owner, prepare_bound):
-        if not callable(prepare_bound): raise ValueError('Local fixture preparer required')
+    def __init__(self, *, database, manifest, task_owner, prepare_bound, timeout_seconds=30):
+        if (not callable(prepare_bound) or type(timeout_seconds) not in (int,float)
+                or not math.isfinite(timeout_seconds) or not 1 <= timeout_seconds <= 600):
+            raise ValueError('Local fixture preparer required')
+        self.timeout_seconds=float(timeout_seconds)
         self._pid=os.getpid(); self._used=False; self._started=False; self._feed_started=False; self._closed=False
         self._close_task=None; self._feed_start_task=None; self._runtime_start_task=None
         self.reconciliation=None
@@ -106,7 +110,7 @@ class LocalNativeCoordinator:
         job=self.queue.submit(actor='codex',request_id='native-broker',action_key=ACTION,environment='staging',
             target=WorkTarget(task['id'],self.manifest.candidate.source_commit,self.manifest.candidate.image_config_id))
         await self._start_feed_and_runtime()
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(self.timeout_seconds):
             while self.runtime.status['last_job'] is None: await asyncio.sleep(.01)
         return job,self.runtime.status['last_job']
 

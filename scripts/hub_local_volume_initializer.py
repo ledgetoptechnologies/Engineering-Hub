@@ -6,7 +6,7 @@ Uncertain effects are permanently held for inspection; this module never retries
 import json
 import re
 import uuid
-from scripts.hub_local_test_volume import OwnedVolume, VolumeError, VolumeOutcomeUnknown, _call, _reserve_intent, _check_path, _close_handles
+from scripts.hub_local_test_volume import OwnedVolume, VolumeError, VolumeOutcomeUnknown, _call, _reserve_intent, _check_path, _close_handles, _options_match, TMPFS_OPTIONS
 
 LABEL='engineering-hub.local-test-owner'
 PREFIX=['/usr/bin/docker','--host','unix:///var/run/docker.sock']
@@ -30,12 +30,18 @@ finally: os.close(root)
 '''
 
 
-def initialize_owned_volume(*, volume, helper_image_id, journal_dir, run=_call):
+def initialize_owned_volume(*, volume, helper_image_id, journal_dir, keeper=None, run=_call):
     """Create/start/remove exactly one labeled initializer; uncertain means held."""
     if (type(volume) is not OwnedVolume or not re.fullmatch(r'sha256:[0-9a-f]{64}',helper_image_id)
             or volume.name != 'hub-local-test-' + volume.owner
             or type(volume.owner) is not str or str(uuid.UUID(volume.owner)) != volume.owner):
         raise VolumeError('Explicit test volume and immutable helper image required')
+    def check_keeper():
+        if volume.options == TMPFS_OPTIONS:
+            from scripts.hub_local_test_launcher import check_tmpfs_keeper
+            check_tmpfs_keeper(keeper,volume=volume,run=run)
+        elif keeper is not None:
+            raise ValueError('Unexpected keeper')
     name='hub-local-init-'+volume.owner
     def verify_daemon_volume():
         if run(PREFIX+['info','--format','{{.ID}}']).strip()!=volume.daemon_id: raise ValueError
@@ -45,10 +51,10 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, run=_call):
         if type(rows) is not list or len(rows)!=1: raise ValueError
         v=rows[0]
         if (v.get('Name')!=volume.name or v.get('Driver')!='local' or v.get('Scope')!='local'
-            or v.get('Mountpoint')!=volume.mountpoint or v.get('Options') not in (None,{})
+            or v.get('Mountpoint')!=volume.mountpoint or not _options_match(volume,v.get('Options'))
             or v.get('Labels')!={LABEL:volume.owner}): raise ValueError
     try:
-        verify_daemon_volume()
+        verify_daemon_volume(); check_keeper()
         if run(PREFIX+['image','inspect','--format','{{.Id}}',helper_image_id]).strip()!=helper_image_id:
             raise ValueError
         image_volumes=json.loads(run(PREFIX+['image','inspect','--format','{{json .Config.Volumes}}',helper_image_id]))
@@ -58,10 +64,10 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, run=_call):
     except Exception: raise VolumeError('Owned test volume or helper unavailable') from None
     handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.init-create','init-create')
     try:
-        _check_path(handles); verify_daemon_volume(); _check_path(handles)
+        _check_path(handles); verify_daemon_volume(); check_keeper(); _check_path(handles)
         ident=run(PREFIX+['create','--pull=never','--name',name,'--label',LABEL+'='+volume.owner,
             '--network','none','--read-only','--cpus','0.25','--memory','128m','--memory-swap','128m',
-            '--pids-limit','32','--user','0:0','--cap-drop','ALL','--cap-add','CHOWN',
+            '--pids-limit','32','--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=2','--user','0:0','--cap-drop','ALL','--cap-add','CHOWN',
             '--security-opt','no-new-privileges','--mount','type=volume,src='+volume.name+',dst=/fixture,volume-nocopy',
             '--entrypoint','/usr/local/bin/python',helper_image_id,'-I','-B','-c',INIT_SCRIPT]).strip()
         if not re.fullmatch('[0-9a-f]{64}',ident): raise ValueError
@@ -80,6 +86,7 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, run=_call):
         if (type(profile) is not dict or profile.get('NetworkMode')!='none'
             or profile.get('ReadonlyRootfs') is not True or profile.get('Privileged') is not False
             or profile.get('CapDrop') != ['ALL'] or profile.get('CapAdd') != ['CHOWN']
+            or profile.get('LogConfig') != {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
             or profile.get('Memory') != 134217728 or profile.get('MemorySwap') != 134217728
             or profile.get('NanoCpus') != 250000000 or profile.get('PidsLimit') != 32
             or profile.get('Binds') not in (None,[]) or profile.get('Devices') not in (None,[])
@@ -103,16 +110,16 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, run=_call):
     except Exception: raise VolumeOutcomeUnknown('Initializer identity unverified; preserve') from None
     handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.init-start','init-start')
     try:
-        _check_path(handles); verify_daemon_volume(); inspect(['created','0']); _check_path(handles)
+        _check_path(handles); verify_daemon_volume(); check_keeper(); inspect(['created','0']); _check_path(handles)
         run(PREFIX+['start','--attach',ident])
-        verify_daemon_volume(); inspect(['exited','0'])
+        verify_daemon_volume(); check_keeper(); inspect(['exited','0'])
     except Exception: raise VolumeOutcomeUnknown('Initializer start outcome unknown; preserve') from None
     finally:
         try: _close_handles(handles)
         except OSError: raise VolumeOutcomeUnknown('Initializer start cleanup unknown; preserve') from None
     handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.init-remove','init-remove')
     try:
-        _check_path(handles); verify_daemon_volume(); inspect(['exited','0']); _check_path(handles)
+        _check_path(handles); verify_daemon_volume(); check_keeper(); inspect(['exited','0']); _check_path(handles)
         if run(PREFIX+['rm',ident]).strip()!=ident: raise ValueError
         verify_daemon_volume()
         remaining=run(PREFIX+['ps','--all','--quiet','--no-trunc']).splitlines()

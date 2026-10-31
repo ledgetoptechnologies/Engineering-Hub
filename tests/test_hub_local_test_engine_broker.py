@@ -180,6 +180,7 @@ def test_baseline_exit_requires_no_live_process(rig, monkeypatch, field, value):
     observed = container_inspect(image, profile, source, status='exited', container_id='e'*64)
     observed['Config']['Labels'] = {'engineering-hub.local-test-owner': broker.owner}
     observed['HostConfig']['PublishAllPorts'] = False
+    observed['HostConfig']['LogConfig'] = {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
     observed['HostConfig']['Mounts'][0].pop('ReadOnly')
     observed['Mounts'] = observed['Mounts'][:1]; observed['Mounts'][0]['Mode'] = ''
     observed['State'].update(Running=False, Pid=0, Paused=False, Restarting=False, Dead=False)
@@ -240,6 +241,27 @@ def test_aggregate_concurrent_application_budget_is_enforced(rig):
                         creates=bad, exec_bodies=broker.exec_bodies, journal=journal)
 
 
+def test_tmpfs_volume_options_are_rechecked_against_daemon(rig, monkeypatch):
+    from dataclasses import replace
+    from scripts.hub_local_test_volume import TMPFS_OPTIONS
+    broker, _, _, _, _ = rig
+    broker.volume=replace(broker.volume,options=TMPFS_OPTIONS)
+    del broker._attest_volume
+    class Connection:
+        def close(self): pass
+    class Response:
+        status=200
+        def __init__(self,value): self.value=value
+        def read(self,_limit): return json.dumps(self.value).encode()
+    info={'ID':broker.volume.daemon_id,'DockerRootDir':str(Path(broker.mount).parents[2])}
+    volume={'Name':broker.volume.name,'Driver':'local','Scope':'local','Mountpoint':broker.mount,
+            'Labels':{'engineering-hub.local-test-owner':broker.owner},'Options':dict(TMPFS_OPTIONS)}
+    monkeypatch.setattr(broker,'_request',lambda _method,path:(Connection(),Response(info if path.endswith('/info') else volume)))
+    broker._attest_volume()
+    volume['Options']['o']='size=1073741824,mode=0700'
+    with pytest.raises(Denied,match='volume changed'): broker._attest_volume()
+
+
 @pytest.mark.parametrize('change', ['daemon', 'root', 'name', 'label', 'mountpoint', 'driver'])
 def test_live_volume_and_daemon_are_rechecked_before_effect(rig, monkeypatch, change):
     broker, _, _, _, _ = rig
@@ -280,13 +302,15 @@ def test_successful_create_injects_label_checks_returned_container_and_is_one_sh
         calls.append((method, target, sent))
         if method == 'POST':
             assert sent['Labels'] == {'engineering-hub.local-test-owner': broker.owner}
-            assert {key: value for key, value in sent.items() if key != 'Labels'} == body
+            expected_body = dict(body); expected_body['HostConfig'] = dict(body['HostConfig'])
+            expected_body['HostConfig']['LogConfig'] = {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
+            assert {key: value for key, value in sent.items() if key != 'Labels'} == expected_body
             return Connection(), Response({'Id': identity}, 201)
         expected = body['HostConfig']['Mounts'][0]
         actual = {'Id': identity, 'Image': broker.images[body['Image']][0],
                   'Config': {'Image': body['Image'], 'User': body['User'], 'Env': body['Env'],
                              'Labels': {'engineering-hub.local-test-owner': broker.owner}},
-                  'HostConfig': body['HostConfig'], 'State': {'Status': 'created'},
+                  'HostConfig': dict(body['HostConfig'],LogConfig={'Type':'local','Config':{'max-size':'1m','max-file':'2'}}), 'State': {'Status': 'created'},
                   'Mounts': [{'Type': 'bind', 'Source': expected['Source'], 'Destination': expected['Target'],
                               'RW': True, 'Mode': '', 'Propagation': 'rprivate'}]}
         return Connection(), Response(actual, 200)
@@ -607,7 +631,7 @@ def test_baseline_transfer_rechecks_both_brokers_through_synthetic_engine_uds(ri
                 value = {'Id': identity, 'Image': image.image_config_id, 'State': {'Status': 'running'},
                          'Config': {'Image': expected['Image'], 'User': expected['User'], 'Env': expected['Env'],
                                     'Labels': {'engineering-hub.local-test-owner': source.owner}},
-                         'HostConfig': expected['HostConfig'],
+                         'HostConfig': dict(expected['HostConfig'],LogConfig={'Type':'local','Config':{'max-size':'1m','max-file':'2'}}),
                          'Mounts': [{'Type': 'bind', 'Source': mount['Source'], 'Destination': mount['Target'],
                                      'RW': True, 'Mode': '', 'Propagation': 'rprivate'}]}
             raw = json.dumps(value).encode(); self.send_response(200)
@@ -719,6 +743,47 @@ def test_stream_closes_upstream_if_downstream_header_write_fails(rig, monkeypatc
         pair[0].close(); pair[1].close()
 
 
+def test_archive_bytes_are_shared_between_source_and_successor(rig,monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    from scripts import hub_local_test_engine_broker as module
+    broker,_,_,_,_=rig
+    monkeypatch.setattr(module,'_MAX_RUN_ARCHIVES',6)
+    budget=module.ArchiveBudget(); journals=[EffectJournal(tmp_path/'source-io.sqlite'),EffectJournal(tmp_path/'target-io.sqlite')]
+    pair=__import__('socket').socketpair(); calls=[]
+    class Connection:
+        def close(self): pass
+    class Response:
+        status=200
+        fp=SimpleNamespace(raw=SimpleNamespace(_sock=pair[0]))
+        def __init__(self,body): self.body=body
+        def getheader(self,_,default=None): return default
+        def read1(self,n):
+            result=self.body[:n]; self.body=self.body[n:]; return result
+        def isclosed(self): return not self.body
+    try:
+        both=[]
+        for journal in journals:
+            value=LocalTestBroker(socket_path=broker.socket_path,socket_identity=broker.socket_identity,version=broker.version,
+                owner=broker.owner,volume=broker.volume,images=broker.images,creates=broker.creates,
+                exec_bodies=broker.exec_bodies,journal=journal,archive_budget=budget)
+            both.append(value)
+        def response(body):
+            def request(*_a,**_k): calls.append(1); return Connection(),Response(body)
+            return request
+        monkeypatch.setattr(both[0],'_request',response(b'abc'))
+        monkeypatch.setattr(both[1],'_request',response(b'defg'))
+        emit=lambda _s,_h,chunks:b''.join(chunks)
+        both[0]._stream('GET','/v1.41/images/x/get',emit,1000)
+        with pytest.raises(Denied,match='aggregate archive budget'):
+            both[1]._stream('GET','/v1.41/images/x/get',emit,1000)
+        with pytest.raises(Denied,match='aggregate archive budget'):
+            both[0]._stream('GET','/v1.41/images/x/get',emit,1000)
+        assert calls==[1,1]
+    finally:
+        pair[0].close(); pair[1].close()
+        for journal in journals: journal.close()
+
+
 def test_stream_watchdog_interrupts_slow_drip_before_absolute_deadline_is_lost(rig, monkeypatch):
     from types import SimpleNamespace
     import socket
@@ -776,6 +841,7 @@ def test_owned_inspection_accepts_engine_private_modes_but_rejects_host_modes(ri
         observed['Mounts'][0]['Source'] = source
         observed['HostConfig']['Mounts'][0]['Source'] = source
         observed['HostConfig']['PublishAllPorts'] = False
+        observed['HostConfig']['LogConfig'] = {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
         observed['HostConfig']['NanoCpus'] = body['HostConfig']['NanoCpus']
         observed['HostConfig']['PidsLimit'] = body['HostConfig']['PidsLimit']
         observed['HostConfig']['PidMode'] = observed['HostConfig']['IpcMode'] = 'private'
@@ -787,6 +853,10 @@ def test_owned_inspection_accepts_engine_private_modes_but_rejects_host_modes(ri
         monkeypatch.setattr(broker, '_request', lambda *_a, **_k: (Connection(), Response()))
         broker._inspect_owned('e' * 64, name, 'created')
         observed['HostConfig']['IpcMode'] = 'host'
+        with pytest.raises(Denied):
+            broker._inspect_owned('e' * 64, name, 'created')
+        observed['HostConfig']['IpcMode'] = 'private'
+        observed['HostConfig']['LogConfig']['Config']['max-size'] = '10m'
         with pytest.raises(Denied):
             broker._inspect_owned('e' * 64, name, 'created')
     finally:
@@ -850,6 +920,7 @@ def test_real_backend_create_through_broker_to_synthetic_unix_engine(rig, tmp_pa
     observed = container_inspect(image, profile, generation)
     observed['Config']['Labels'] = {'engineering-hub.local-test-owner': broker.owner}
     observed['HostConfig']['PublishAllPorts'] = False
+    observed['HostConfig']['LogConfig'] = {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
     observed['HostConfig']['Mounts'][0].pop('ReadOnly')
     observed['Mounts'] = observed['Mounts'][:1]; observed['Mounts'][0]['Mode'] = ''
     observed['State'].update(Running=False, Pid=0, StartedAt='0001-01-01T00:00:00Z')
