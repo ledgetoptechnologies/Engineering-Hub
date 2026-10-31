@@ -39,6 +39,138 @@ def evidence():
                                   health="unknown", evidence_verified=False)
 
 
+def gate_fixture(ledger):
+    from tests.test_hub_mount_gate_protocol import fixture
+    from hub_container_executor.mount_gate_protocol import IDENTITY_FIELDS
+    command = request()
+    assert ledger.admit(command).accepted
+    decision = fixture()
+    decision.update(run_id=command.run_id, fence=command.fencing_generation,
+                    manifest_digest=command.manifest_digest)
+    context = {'schema': 2, 'role': 'candidate', 'run_id': command.run_id, 'fencing_generation': command.fencing_generation,
+        'manifest_digest': command.manifest_digest, 'image_config_id': decision['image_config_id'],
+        'generation_id': decision['generation_id'], 'runnable_reference': decision['runnable_digest'],
+        'platform_manifest_digest': decision['platform_manifest_digest']}
+    operation = ledger.begin_operation(command.command_id, 'create_candidate', create_context=context)
+    decision['operation_id'] = operation
+    ledger.complete_operation(operation, {'container_id': decision['container_id']})
+    ledger.record_target_instance(command.command_id, decision['container_id'],
+                                  decision['image_config_id'], decision['generation_id'])
+    return command, decision, {k: decision[k] for k in IDENTITY_FIELDS}
+
+
+def test_gate_challenge_is_consumed_once_under_concurrent_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    barrier, results = threading.Barrier(3), []
+    def consume():
+        barrier.wait()
+        try: results.append(ledger.consume_mount_gate_challenge(decision))
+        except PermissionError: results.append(False)
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads: thread.start()
+    barrier.wait()
+    for thread in threads: thread.join(10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == [False, True]
+    with pytest.raises(PermissionError): ledger.reserve_mount_gate_challenge(pins)
+    ledger.close()
+
+
+@pytest.mark.parametrize('change', ['paused', 'target_fence', 'run_held', 'context_mac', 'wrong_identity'])
+def test_gate_challenge_rechecks_ledger_before_consumption(tmp_path, monkeypatch, change):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    if change == 'paused': ledger.set_paused(True)
+    elif change == 'wrong_identity': decision['host_pid'] += 1
+    else:
+        with ledger._transaction() as db:
+            if change == 'target_fence': db.execute('UPDATE targets SET fence=fence+1')
+            elif change == 'run_held': db.execute("UPDATE runs SET state='held'")
+            else: db.execute("UPDATE create_contexts SET context_mac='bad'")
+    with pytest.raises(PermissionError): ledger.consume_mount_gate_challenge(decision)
+    with ledger._connection() as db:
+        assert db.execute('SELECT state FROM mount_gate_challenges').fetchone()[0] == 'reserved'
+    ledger.close()
+
+
+@pytest.mark.parametrize('consume_first', [False, True])
+def test_gate_challenge_never_replays_after_owner_restart(tmp_path, monkeypatch, consume_first):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    command, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    if consume_first: assert ledger.consume_mount_gate_challenge(decision) is True
+    ledger.close()
+    with pytest.raises(ledger_module.LedgerClosed): ledger.consume_mount_gate_challenge(decision)
+    reopened = open_ledger(tmp_path)
+    assert reopened.get(command.command_id).state == 'held'
+    with pytest.raises(PermissionError): reopened.consume_mount_gate_challenge(decision)
+    reopened.close()
+
+
+def test_gate_consumed_state_cannot_be_reset_by_database_tampering(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    assert ledger.consume_mount_gate_challenge(decision) is True
+    with ledger._transaction() as db:
+        db.execute("UPDATE mount_gate_challenges SET state='reserved',decision=NULL,decision_mac=NULL")
+    with pytest.raises(PermissionError): ledger.consume_mount_gate_challenge(decision)
+    ledger.close()
+
+
+def test_gate_legacy_create_without_authenticated_context_cannot_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, _, pins = gate_fixture(ledger)
+    with ledger._transaction() as db: db.execute('DELETE FROM create_contexts')
+    with pytest.raises(PermissionError): ledger.reserve_mount_gate_challenge(pins)
+    ledger.close()
+
+
+def test_gate_failure_after_commit_remains_consumed(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from hub_container_executor import mount_gate_protocol as protocol
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    key = Ed25519PrivateKey.generate()
+    ticks = iter((11.0, 14.0))
+    with pytest.raises(protocol.MountGateProtocolError):
+        protocol.verify_decision(protocol.issue_decision(decision, key), public_key=key.public_key(),
+            expected=pins, exchange_wall_ms=100000, exchange_monotonic=10.0,
+            consume_challenge=ledger.consume_mount_gate_challenge,
+            wall_clock=lambda: 101.0, monotonic=lambda: next(ticks))
+    with ledger._connection() as db:
+        row = db.execute('SELECT state,decision,decision_mac FROM mount_gate_challenges').fetchone()
+        assert row['state'] == 'consumed' and row['decision'] and row['decision_mac']
+    with pytest.raises(PermissionError): ledger.consume_mount_gate_challenge(decision)
+    ledger.close()
+
+
+def test_gate_transaction_failure_does_not_partially_consume(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = open_ledger(tmp_path)
+    _, decision, pins = gate_fixture(ledger)
+    ledger.reserve_mount_gate_challenge(pins)
+    with ledger._transaction() as db:
+        db.execute("CREATE TRIGGER fail_gate BEFORE UPDATE ON mount_gate_challenges BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    with pytest.raises(sqlite3.IntegrityError): ledger.consume_mount_gate_challenge(decision)
+    with ledger._transaction() as db:
+        row = db.execute('SELECT state,decision,decision_mac FROM mount_gate_challenges').fetchone()
+        assert tuple(row) == ('reserved', None, None)
+        db.execute('DROP TRIGGER fail_gate')
+    assert ledger.consume_mount_gate_challenge(decision) is True
+    ledger.close()
+
+
 def open_ledger(tmp_path):
     root = tmp_path / "private"
     root.mkdir(mode=0o700, exist_ok=True)

@@ -286,6 +286,7 @@ class SQLiteLedger:
                     "CREATE TABLE IF NOT EXISTS operations (operation_id TEXT PRIMARY KEY, command_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, intent TEXT NOT NULL, receipt TEXT, receipt_mac TEXT, UNIQUE (command_id, kind))",
                     "CREATE TABLE IF NOT EXISTS control (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                     "CREATE TABLE IF NOT EXISTS create_contexts (operation_id TEXT PRIMARY KEY, context TEXT NOT NULL, context_mac TEXT NOT NULL)",
+                    "CREATE TABLE IF NOT EXISTS mount_gate_challenges (operation_id TEXT PRIMARY KEY, launch_id TEXT NOT NULL UNIQUE, nonce TEXT NOT NULL UNIQUE, identity TEXT NOT NULL, identity_mac TEXT NOT NULL, state TEXT NOT NULL, decision TEXT, decision_mac TEXT)",
                 )
                 for statement in statements:
                     db.execute(statement)
@@ -508,6 +509,126 @@ class SQLiteLedger:
             return parsed
         except (ValueError, TypeError, UnicodeError, RecursionError):
             return None
+
+    def _gate_binding(self, db, pins):
+        """Recheck ledger facts; other pins remain independently enrolled inputs."""
+        operation = db.execute("SELECT * FROM operations WHERE operation_id=?", (pins['operation_id'],)).fetchone()
+        if operation is None or operation['kind'] not in {'create_candidate', 'create_rollback'}:
+            raise PermissionError('gate binding unavailable')
+        verified = self._format_operation(operation)
+        if (verified['status'] != 'completed' or verified['receipt_authentic'] is not True
+                or verified['receipt'] != {'container_id': pins['container_id']}):
+            raise PermissionError('gate binding unavailable')
+        row = db.execute("SELECT context,context_mac FROM create_contexts WHERE operation_id=?", (pins['operation_id'],)).fetchone()
+        if row is None or type(row['context']) is not str or len(row['context'].encode('utf-8')) > 16384:
+            raise PermissionError('gate binding unavailable')
+        mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'],
+                                  'create_context', row['context'])
+        if type(row['context_mac']) is not str or not hmac.compare_digest(mac, row['context_mac']):
+            raise PermissionError('gate binding unavailable')
+        context = json.loads(row['context'])
+        if type(context) is not dict or _canonical(context) != row['context']:
+            raise PermissionError('gate binding unavailable')
+        command = db.execute("SELECT * FROM commands WHERE command_id=?", (operation['command_id'],)).fetchone()
+        if command is None or command['state'] != 'running':
+            raise PermissionError('gate binding unavailable')
+        request = ContainerPilotRequest.model_validate_json(command['payload'])
+        run = db.execute("SELECT * FROM runs WHERE run_id=?", (command['run_id'],)).fetchone()
+        target = db.execute("SELECT * FROM targets WHERE target_id=?", (command['target_id'],)).fetchone()
+        phase = db.execute("SELECT * FROM phases WHERE command_id=?", (operation['command_id'],)).fetchone()
+        paused = db.execute("SELECT value FROM control WHERE key='paused'").fetchone()
+        if (paused is not None and paused['value'] != 'false'
+                or run is None or run['state'] != 'running'
+                or target is None or target['state'] != 'running'
+                or phase is None or phase['state'] != 'running'
+                or request.command_id != command['command_id'] or request.run_id != command['run_id']
+                or request.target_id != command['target_id'] or request.action != command['action']
+                or phase['run_id'] != request.run_id or phase['action'] != request.action
+                or request.run_id != pins['run_id'] or request.fencing_generation != pins['fence']
+                or request.manifest_digest != pins['manifest_digest']
+                or request.candidate_commit != run['candidate_commit'] or request.policy_revision != run['policy_revision']
+                or run['fence'] != pins['fence'] or run['target_id'] != request.target_id
+                or run['manifest_digest'] != pins['manifest_digest']
+                or (run['manifest_digest'], run['candidate_commit'], run['policy_revision']) != self._expected
+                or target['fence'] != pins['fence'] or target['current_run_id'] != pins['run_id']
+                or target['manifest_digest'] != pins['manifest_digest']
+                or target['container_id'] != pins['container_id']
+                or target['image_config_id'] != pins['image_config_id']
+                or target['generation_id'] != pins['generation_id']
+                or context.get('schema') != 2 or context.get('run_id') != pins['run_id']
+                or (operation['kind'], request.action, context.get('role')) not in {
+                    ('create_candidate', 'deploy_container', 'candidate'),
+                    ('create_rollback', 'rollback_container', 'rollback')}
+                or context.get('fencing_generation') != pins['fence']
+                or context.get('manifest_digest') != pins['manifest_digest']
+                or context.get('image_config_id') != pins['image_config_id']
+                or context.get('generation_id') != pins['generation_id']
+                or context.get('runnable_reference') != pins['runnable_digest']
+                or context.get('platform_manifest_digest') != pins['platform_manifest_digest']):
+            raise PermissionError('gate binding unavailable')
+        return operation
+
+    def reserve_mount_gate_challenge(self, identity):
+        """Reserve one independently enrolled identity; this verifies no host claim.
+
+        MACs detect changed rows, not restoration of a complete earlier valid row
+        or database. An independently enforced owner/storage anti-rollback
+        boundary is required; this reservation is not a machine-wide fence.
+        """
+        from .mount_gate_protocol import IDENTITY_FIELDS, MAX_BYTES, PROTOCOL, AUDIENCE, _payload
+        if type(identity) is not dict or set(identity) != IDENTITY_FIELDS:
+            raise ValueError('invalid gate identity')
+        encoded = _canonical(identity)
+        if len(encoded.encode('utf-8')) > MAX_BYTES:
+            raise ValueError('invalid gate identity')
+        pins = json.loads(encoded)
+        _payload(dict(pins, protocol=PROTOCOL, audience=AUDIENCE, decision='allow',
+            observed_device=pins['expected_device'], observed_inode=pins['expected_inode'],
+            issued_at_ms=1, expires_at_ms=2))
+        raw = _canonical(pins)
+        with self._transaction() as db:
+            operation = self._gate_binding(db, pins)
+            mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'], 'mount_gate_reserved', raw)
+            try:
+                db.execute("INSERT INTO mount_gate_challenges VALUES(?,?,?,?,?,'reserved',NULL,NULL)",
+                           (pins['operation_id'], pins['launch_id'], pins['nonce'], raw, mac))
+            except sqlite3.IntegrityError:
+                raise PermissionError('gate challenge already reserved') from None
+
+    def consume_mount_gate_challenge(self, decision):
+        """Consume once within this ledger history; caller verifies signature/freshness.
+
+        Authenticated old rows or a restored old database can be replayed unless
+        independently protected storage and owner authority prevent rollback.
+        This method neither establishes that boundary nor proves host custody.
+        """
+        from .mount_gate_protocol import IDENTITY_FIELDS, MAX_BYTES, _payload
+        if type(decision) is not dict:
+            raise ValueError('invalid gate decision')
+        encoded = _canonical(decision)
+        if len(encoded.encode('utf-8')) > MAX_BYTES:
+            raise ValueError('invalid gate decision')
+        payload = json.loads(encoded)
+        _payload(payload)
+        pins = {name: payload[name] for name in IDENTITY_FIELDS}
+        raw = _canonical(pins)
+        with self._transaction() as db:
+            operation = self._gate_binding(db, pins)
+            row = db.execute("SELECT * FROM mount_gate_challenges WHERE operation_id=?", (pins['operation_id'],)).fetchone()
+            mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'], 'mount_gate_reserved', raw)
+            if (row is None or row['state'] != 'reserved' or row['launch_id'] != pins['launch_id']
+                    or row['nonce'] != pins['nonce'] or row['identity'] != raw
+                    or row['decision'] is not None or row['decision_mac'] is not None
+                    or type(row['identity_mac']) is not str or not hmac.compare_digest(row['identity_mac'], mac)):
+                raise PermissionError('gate challenge unavailable')
+            consumed_mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'], 'mount_gate_consumed', raw)
+            decision_raw = _canonical(payload)
+            decision_mac = self._operation_mac(pins['operation_id'], operation['command_id'], operation['kind'], 'mount_gate_decision', decision_raw)
+            changed = db.execute("UPDATE mount_gate_challenges SET state='consumed',identity_mac=?,decision=?,decision_mac=? WHERE operation_id=? AND state='reserved'",
+                                 (consumed_mac, decision_raw, decision_mac, pins['operation_id'])).rowcount
+            if changed != 1:
+                raise PermissionError('gate challenge unavailable')
+        return True
 
     def complete_operation(self, operation_id: str, receipt) -> None:
         encoded = _canonical(receipt)

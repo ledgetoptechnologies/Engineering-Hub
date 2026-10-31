@@ -82,6 +82,13 @@ effect until independently authorized reconciliation establishes the outcome.
 An acknowledgement does not by itself prove later process liveness or continued
 exclusive state custody.
 
+The ledger's authenticated reservation and decision rows can detect modified
+contents, but their MACs cannot detect restoration of an older, fully valid row
+or an earlier complete database. A separate enforced owner and storage boundary
+must prevent alternate writers, downgrade and rollback of the ledger and its
+evidence key. A local transaction or MAC is not that boundary, and the source
+does not enable the application gate or establish machine-wide exclusivity.
+
 ## Acceptance required before enabling
 
 - Review the exact image, manifest/profile versions, key enrollment, command,
