@@ -782,6 +782,49 @@ class CustodianAdmissionJournal:
             raise CustodianAdmissionError()
         return result
 
+    def execute_private_preparation(self, channel, *, operation_id, provider_uid, provider_gid,
+                                    copy_policy_path, owner_policy_path, timeout_seconds):
+        """Own one signed exchange and private state effect, never publication.
+
+        The journal owner performs all three stages without accepting an
+        intermediate caller-supplied admission or inode. A timeout or exception
+        revokes process-local capabilities but retains any durable admission,
+        quarantine, target hold and records for explicit inspection. The signed
+        observation is point-in-time: this is not a live fence, app handoff,
+        quiescence proof or permission to start a container. Root, the enrolled
+        daemon identity and exclusive host custody remain external prerequisites.
+        Cooperative deadlines cannot cancel an in-progress filesystem syscall.
+        """
+        try:
+            self._check()
+            if (self._read_only or type(operation_id) is not str or str(UUID(operation_id)) != operation_id
+                    or type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 5):
+                raise ValueError()
+            started = time.monotonic(); deadline = started + timeout_seconds
+            def remaining():
+                now = time.monotonic()
+                if not started <= now < deadline: raise ValueError()
+                return deadline - now
+            admission = self.exchange(channel, operation_id=operation_id, provider_uid=provider_uid,
+                                      provider_gid=provider_gid, timeout_seconds=remaining())
+            fresh = self._fresh.get(operation_id)
+            if fresh is None or fresh[0] != admission: raise ValueError()
+            # Preserve the single outer deadline even if a later precheck blocks
+            # before the copy helper constructs its own cooperative budget.
+            self._fresh[operation_id] = (fresh[0], fresh[1], min(fresh[2], deadline), fresh[3], fresh[4])
+            self.stage_quarantined_backup(operation_id=operation_id, admission_digest=admission,
+                                          copy_policy_path=copy_policy_path, timeout_seconds=remaining())
+            result = self.prepare_private_owner(operation_id=operation_id, admission_digest=admission,
+                                                owner_policy_path=owner_policy_path)
+            remaining()
+            return result
+        except BaseException as error:
+            if type(operation_id) is str:
+                self._fresh.pop(operation_id, None)
+                self._staged.pop(operation_id, None)
+            if not isinstance(error, Exception): raise
+            raise CustodianAdmissionError() from None
+
     def close(self):
         if self._db is not None:
             self._db.close(); self._db = None

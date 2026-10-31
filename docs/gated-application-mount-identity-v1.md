@@ -34,6 +34,14 @@ owner is active and is not a concurrent health check. Root, the host and the
 protected enrollment remain trusted. This source command has not been deployed
 or accepted on the staging host.
 
+The source-only custodian can compose the signed supervisor exchange, private
+quarantine copy and durable-hold-before-owner-preparation in one bounded call.
+The call retains uncertain admissions, files and holds rather than retrying.
+It does not publish a generation or start an application; an installed service,
+independent host custody and a live fence still need to be established. A
+filesystem syscall already in progress cannot be forcibly cancelled by its
+cooperative deadline.
+
 The current pilot requires the verified image's default entrypoint and command
 (`container_pilot_manifest.py`, `daemon_backend.py`). Docker's create/inspect
 response describes configured mount paths and flags; it does not prove the inode
