@@ -236,6 +236,42 @@ class ContainerPilotClient:
                 pin.close()
             raise ValueError("invalid broker transport") from None
 
+    @classmethod
+    def for_inherited_seqpacket(cls, fd, *, peer_uid, peer_gid, timeout_seconds=125.0):
+        """Explicit uninstalled inherited-descriptor transport; disabled until pair launch exists.
+
+        Takes ownership of ``fd``, closing it on refusal too. The descriptor can
+        be delegated, so this authenticates only the expected sender account,
+        not a process. Any failure closes the channel and is an unknown outcome.
+        """
+        from hub_container_executor.broker_seqpacket import InheritedCommandClient, PeerAccount
+        if (type(timeout_seconds) not in (int, float) or isinstance(timeout_seconds, bool)
+                or not 0 < timeout_seconds <= cls.MAX_TIMEOUT_SECONDS):
+            try:
+                if type(fd) is int and fd >= 0:
+                    os.close(fd)
+            except OSError:
+                pass
+            raise ValueError("invalid broker timeout")
+        try:
+            try:
+                account = PeerAccount(uid=peer_uid, gid=peer_gid)
+            except Exception:
+                account = None
+            broker = InheritedCommandClient(fd, account)
+        except Exception:
+            raise ValueError("invalid broker transport") from None
+        instance = cls.__new__(cls)
+        instance.__timeout_seconds = timeout_seconds
+        instance.__broker = broker
+        instance.__broker_pin = None
+        instance.__broker_lock = asyncio.Lock()
+        instance.__broker_closed = False
+        instance.__broker_closing = False
+        instance.__client = None
+        instance.__token = None
+        return instance
+
     async def _broker_command(self, action, command):
         from .lifecycle import finish_owned
         if type(command) is not ContainerPilotRequest:
@@ -288,7 +324,8 @@ class ContainerPilotClient:
                     try:
                         self.__broker.close()
                     finally:
-                        self.__broker_pin.close()
+                        if self.__broker_pin is not None:
+                            self.__broker_pin.close()
         await finish_owned(close_broker())
 
     async def _command(self, method: str, path: str, expected: ContainerPilotRequest,

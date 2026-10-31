@@ -106,7 +106,8 @@ def parse_enrollment(raw):
             _require(data['profile_mode'] == 'disjoint-v3' and type(data['profile_json']) is str)
             profile_bytes = data['profile_json'].encode('utf-8')
             recognized = verify_profile_bytes(profile_bytes, release.launch_profile_digest)
-            _require(recognized.broker_mode is None and recognized.daemon_policy is not None
+            _require(recognized.broker_mode is None and recognized.role is None
+                     and recognized.command_channel is None and recognized.daemon_policy is not None
                      and recognized.daemon_policy.engine_id == launch.engine_id)
         actor = data['operator_actor']
         _require(type(actor) is str and re.fullmatch(r'human:cf:[0-9a-f]{64}', actor))
@@ -163,7 +164,8 @@ class TrustedQueuedSessionComposition:
                      and profile.manifest.runner_binding.daemon_identity == e.launch.engine_id)
             if e.schema == SCHEMA_V2:
                 recognized = verify_profile_bytes(e.profile_bytes, e.release.launch_profile_digest)
-                _require(recognized.broker_mode is None and recognized.daemon_policy is not None
+                _require(recognized.broker_mode is None and recognized.role is None
+                         and recognized.command_channel is None and recognized.daemon_policy is not None
                          and recognized.daemon_policy.engine_id == e.launch.engine_id
                          and recognized.daemon_policy.engine_id == profile.manifest.runner_binding.daemon_identity)
             self._database = Path(database)

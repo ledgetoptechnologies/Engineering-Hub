@@ -34,6 +34,17 @@ LAUNCH_TARGETS = MappingProxyType({
 })
 _TARGETS = LAUNCH_TARGETS
 _BROKER_SOCKET_TARGET = "/run/engineering-hub/broker.sock"
+# A coordinator-role profile's closed mounts. It never gets the Engine socket,
+# generations, records, metadata or baseline; the issuer socket only carries
+# its receipt and inherited command channel.
+COORDINATOR_TARGETS = MappingProxyType({
+    'issuer_socket': '/run/engineering-hub/issuer.sock',
+    'config': '/operator/coordinator.json',
+    'state': '/var/lib/engineering-hub/coordinator',
+    'secrets': '/var/lib/engineering-hub/coordinator-secrets',
+})
+_EXECUTOR_ID = 10001
+_COORDINATOR_ID = 10002
 
 
 class LaunchProfileError(RuntimeError):
@@ -89,7 +100,8 @@ class ExecutorLaunchMount(_Closed):
             # the executor must see this exact absolute path, not an alias.
             _require(self.target == self.source)
         else:
-            _require(self.target == _TARGETS[self.role])
+            # The profile requires the exact target for its own role.
+            _require(self.target in {_TARGETS[self.role], COORDINATOR_TARGETS.get(self.role)})
         _path(self.source)
         kind = ('socket' if self.role.endswith('_socket') else 'file' if self.role == 'config' else 'directory')
         _require(self.kind == kind and self.read_only is (self.role not in {'state', 'generations'}))
@@ -184,7 +196,7 @@ class DisjointDaemonPolicy(_Closed):
 
 
 class ExecutorLaunchProfile(_Closed):
-    """Exact independently enrolled executor-only profile, NOT an app profile."""
+    """Exact independently enrolled executor or pilot-coordinator profile, NOT an app profile."""
     user: str
     supplementary_groups: tuple[int, ...]
     entrypoint: tuple[str, ...]
@@ -202,6 +214,12 @@ class ExecutorLaunchProfile(_Closed):
     daemon_policy: DisjointDaemonPolicy | None = None
     # Signed opt-in boundary only; the supervisor refuses it until implemented.
     broker_mode: Literal['broker-v1'] | None = None
+    # Absent means the executor. A coordinator profile is a separate closed shape;
+    # the supervisor refuses to launch it until pair launch is implemented.
+    role: Literal['coordinator'] | None = None
+    # Signed opt-in: commands arrive on a descriptor handed over at launch
+    # instead of a path socket. The supervisor refuses it until implemented.
+    command_channel: Literal['inherited-seqpacket-v1'] | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -214,30 +232,45 @@ class ExecutorLaunchProfile(_Closed):
     def no_explicit_null_policy(cls, value):
         # Legacy input never had this key; an explicit null was refused then and still is.
         if isinstance(value, dict):
-            for name in ('daemon_policy', 'broker_mode'):
+            for name in ('daemon_policy', 'broker_mode', 'role', 'command_channel'):
                 if name in value:
                     _require(value[name] is not None)
         return value
 
     @model_validator(mode='after')
     def closed_profile(self):
-        _require(self.user == '10001:10001' and len(self.supplementary_groups) <= 2
+        coordinator = self.role == 'coordinator'
+        identity = _COORDINATOR_ID if coordinator else _EXECUTOR_ID
+        module = 'installed_coordinator' if coordinator else 'installed_runner'
+        targets = COORDINATOR_TARGETS if coordinator else _TARGETS
+        _require(self.user == f'{identity}:{identity}' and len(self.supplementary_groups) <= 2
                  and len(set(self.supplementary_groups)) == len(self.supplementary_groups)
                  and all(type(value) is int and 0 <= value < 2**32 - 1 for value in self.supplementary_groups))
         # The separately implemented, independently built runner must actually
         # exist in the pinned image; merely naming this module is not evidence.
-        _require(self.entrypoint == ('/opt/venv/bin/python', '-I', '-m',
-                                     'hub_container_executor.installed_runner'))
-        _require(self.command == ('--config', _TARGETS['config']))
+        _require(self.entrypoint == ('/opt/venv/bin/python', '-I', '-m', f'hub_container_executor.{module}'))
+        _require(self.command == ((('serve',) if coordinator else ()) + ('--config', targets['config'])))
         _require(len(self.environment) <= 16 and len({item.split('=', 1)[0] for item in self.environment}) == len(self.environment)
                  and all(re.fullmatch(r'(PATH|LANG|LC_ALL|TZ|PYTHONDONTWRITEBYTECODE|PYTHONUNBUFFERED)=[^\x00\r\n]{1,512}', item)
                          for item in self.environment))
-        roles = (set(_TARGETS) if self.broker_mode is None else
-                 (set(_TARGETS) - {'engine_socket', 'generations'}) | {'broker_socket'})
+        if coordinator:
+            roles = set(COORDINATOR_TARGETS)
+        elif self.broker_mode is None:
+            roles = set(_TARGETS)
+        else:
+            roles = (set(_TARGETS) - {'engine_socket', 'generations'}) | {'broker_socket'}
         _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(roles)
-                 and {item.role for item in self.mounts} == roles)
-        if self.broker_mode is not None:
+                 and {item.role for item in self.mounts} == roles
+                 and all(item.target == targets[item.role] for item in self.mounts
+                         if item.role not in {'generations', 'broker_socket'}))
+        if self.broker_mode is not None or self.command_channel is not None or coordinator:
             _require(self.daemon_policy is not None)
+        if coordinator:
+            # A coordinator only ever talks to its executor over the inherited
+            # channel, and its own account must map inside the pinned daemon.
+            _require(self.broker_mode is None and self.command_channel is not None
+                     and _covers_inside(self.daemon_policy.uid_map, _COORDINATOR_ID)
+                     and _covers_inside(self.daemon_policy.gid_map, _COORDINATOR_ID))
         fixture = _path(self.fixture_root)
         _require(re.fullmatch(r'hub-pilot-[a-z0-9][a-z0-9-]{0,63}', fixture.name))
         sources = [PurePosixPath(item.source) for item in self.mounts]
@@ -246,7 +279,7 @@ class ExecutorLaunchProfile(_Closed):
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
         _path(self.runner_file)
-        _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
+        _require(self.runner_file.endswith(f'/hub_container_executor/{module}.py')
                  and not any(self.runner_file == item.target or PurePosixPath(item.target) in PurePosixPath(self.runner_file).parents
                          for item in self.mounts) and type(self.runner_digest) is str and _SHA.fullmatch(self.runner_digest))
         return self
@@ -257,8 +290,9 @@ class ExecutorLaunchProfile(_Closed):
         if value['daemon_policy'] is None:
             # Legacy profiles never carried this key; their bytes must not change.
             del value['daemon_policy']
-        if value['broker_mode'] is None:
-            del value['broker_mode']
+        for name in ('broker_mode', 'role', 'command_channel'):
+            if value[name] is None:
+                del value[name]
         return value
 
     def digest(self):
