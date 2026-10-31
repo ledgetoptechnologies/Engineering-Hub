@@ -38,6 +38,13 @@ def _helper_labels(actual,image_labels,task_id,binds):
     return True
 
 
+def _stable_file_observation(named,before,after,final):
+    # Windows named stat and fstat can report different ctime semantics.
+    cross=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,getattr(s,'st_file_attributes',0))
+    stable=lambda s:(cross(s),s.st_ctime_ns)
+    return stable(before)==stable(after) and stable(named)==stable(final) and cross(named)==cross(before) and cross(final)==cross(after)
+
+
 def _file(path,expected,maximum):
     if (type(path) is not str or not os.path.isabs(path) or ',' in path
         or any(ord(c)<32 or ord(c)==127 for c in path) or not SHA.fullmatch(expected)):
@@ -55,9 +62,8 @@ def _file(path,expected,maximum):
             h.update(b)
         after=os.fstat(f.fileno())
     final=os.stat(path,follow_symlinks=False)
-    key=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns,getattr(s,'st_file_attributes',0))
-    if size!=before.st_size or key(before)!=key(after) or key(named)!=key(after) or key(final)!=key(after) or 'sha256:'+h.hexdigest()!=expected: raise ValueError('Input changed')
-    return key(after)
+    if size!=before.st_size or not _stable_file_observation(named,before,after,final) or 'sha256:'+h.hexdigest()!=expected: raise ValueError('Input changed')
+    return (after.st_dev,after.st_ino,after.st_mode,after.st_nlink,after.st_size,after.st_mtime_ns,after.st_ctime_ns,getattr(after,'st_file_attributes',0))
 
 
 def _storage(task,storage):

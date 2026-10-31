@@ -142,6 +142,16 @@ def test_input_file_size_limit(tmp_path):
     assert _file(str(path),digest,5)
     with pytest.raises(ValueError): _file(str(path),digest,4)
 
+def test_windows_named_and_handle_ctime_domains_remain_individually_stable():
+    from types import SimpleNamespace
+    from scripts.hub_local_windows_initialization import _stable_file_observation
+    common=dict(st_dev=1,st_ino=2,st_mode=0o100644,st_nlink=1,st_size=5,st_mtime_ns=10,st_file_attributes=32)
+    named=SimpleNamespace(**common,st_ctime_ns=11); handle=SimpleNamespace(**common,st_ctime_ns=12)
+    assert _stable_file_observation(named,handle,handle,named)
+    assert not _stable_file_observation(named,handle,SimpleNamespace(**common,st_ctime_ns=13),named)
+    assert not _stable_file_observation(named,handle,handle,SimpleNamespace(**common,st_ctime_ns=13))
+    assert not _stable_file_observation(named,handle,SimpleNamespace(**{**common,'st_ino':3},st_ctime_ns=12),named)
+
 def test_unknown_verification_never_retries(monkeypatch):
     import scripts.hub_local_windows_initialization as init
     task,image,events,calls=fixture_task(); a,b,c=[str(uuid.uuid4()) for _ in range(3)]

@@ -14,7 +14,7 @@ import re
 import stat
 
 from scripts.hub_local_windows_storage import WindowsTask, Held, provision_storage
-from scripts.hub_local_windows_initialization import initialize, SEED, CLI, _file, validate_daemon_paths
+from scripts.hub_local_windows_initialization import initialize, SEED, CLI, _file, _stable_file_observation, validate_daemon_paths
 from scripts.hub_local_windows_operator import run_operator, OPERATOR_IMAGE
 from scripts.hub_local_windows_cleanup import cleanup
 
@@ -109,9 +109,9 @@ def main(argv=None):
             before=os.fstat(f.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or getattr(before,'st_file_attributes',0)&0x400: raise ValueError
             raw=f.read(8*1024*1024+1); after=os.fstat(f.fileno())
-        identity=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns,getattr(s,'st_file_attributes',0))
         final=os.stat(args.request_file,follow_symlinks=False)
-        if len(raw)>8*1024*1024 or len(raw)!=before.st_size or identity(named)!=identity(before) or identity(before)!=identity(after) or identity(after)!=identity(final) or getattr(final,'st_file_attributes',0)&0x400: raise ValueError
+        if (len(raw)>8*1024*1024 or len(raw)!=before.st_size or not _stable_file_observation(named,before,after,final)
+            or getattr(final,'st_file_attributes',0)&0x400): raise ValueError
         def pairs(values):
             result={}
             for key,value in values:
