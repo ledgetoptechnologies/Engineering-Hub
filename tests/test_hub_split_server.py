@@ -30,6 +30,62 @@ async def close_runner(task, stop):
 
 
 @pytest.mark.asyncio
+async def test_github_oauth_through_real_private_socket(config, endpoint):
+    from dataclasses import replace
+    from urllib.parse import parse_qs, urlsplit
+    from engineering_hub.auth import AuthConfig
+    from tests.test_hub_auth import FakeGitHub
+
+    auth = AuthConfig(ORIGIN, human_auth_mode='github', github_client_id='fixture-id',
+                      github_client_secret='fixture-secret', beau_github_id=123)
+    core = create_app(replace(config, auth_config=auth), github_client=FakeGitHub())
+    pair = HubFrontends(core, allow_github=True)
+    loop = asyncio.get_running_loop()
+    ready, public_ready = loop.create_future(), loop.create_future()
+    stop, public_stop = asyncio.Event(), asyncio.Event()
+    private = asyncio.create_task(runner.serve_private_coordinator(
+        lambda: pair, socket_path=endpoint, agent_host='127.0.0.1', agent_port=0,
+        stop_event=stop, install_signals=False, allow_github=True,
+        on_ready=lambda address, path: ready.set_result(address)))
+    public = None
+    try:
+        agent_address = await asyncio.wait_for(ready, 5)
+        public = asyncio.create_task(runner.serve_public_browser(
+            lambda: create_private_browser_client(endpoint), browser_port=0,
+            stop_event=public_stop, install_signals=False, allow_github=True,
+            on_ready=lambda address: public_ready.set_result(address)))
+        address = await asyncio.wait_for(public_ready, 5)
+        url = f'http://127.0.0.1:{address[1]}'
+        async with httpx.AsyncClient(trust_env=False, headers={'Host': 'hub.test'}) as client:
+            assert (await client.get(url + BASE + '/overview')).status_code == 401
+            login = await client.get(url + BASE + '/auth/login')
+            state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            callback = await client.get(url + BASE + '/auth/callback', params={'state': state, 'code': 'fixture'},
+                                        headers={'Cookie': auth.cookie_name + '_oauth=' + state})
+            assert callback.status_code == 303
+            cookie = client.cookies.get(auth.cookie_name)
+            human = {'Cookie': auth.cookie_name + '=' + cookie}
+            me = (await client.get(url + BASE + '/auth/me', headers=human)).json()
+            assert me['actor'] == 'human:123'
+            assert (await client.get(url + BASE + '/overview', headers=human)).status_code == 200
+            assert (await client.post(url + BASE + '/tasks', headers=human, json={})).status_code in (401, 403)
+            assert (await client.get(url + '/mcp', headers=CODEX)).status_code == 403
+            agent_url = f'http://127.0.0.1:{agent_address[1]}'
+            assert (await client.get(agent_url + BASE + '/auth/login', headers=CODEX)).status_code == 403
+            assert (await client.get(agent_url + BASE + '/overview', headers=human)).status_code == 401
+            csrf = {**human, 'Origin': ORIGIN, 'X-Hub-CSRF': me['csrf_token']}
+            made = await client.post(url + BASE + '/tasks', headers=csrf, json={
+                'project': 'treedar', 'title': 'GitHub split task', 'client_request_id': 'github-split-1'})
+            assert made.status_code == 201
+            assert (await client.post(url + BASE + '/auth/logout', headers=csrf)).status_code == 200
+            assert (await client.get(url + BASE + '/overview', headers=human)).status_code == 401
+    finally:
+        if public is not None:
+            await close_runner(public, public_stop)
+        await close_runner(private, stop)
+
+
+@pytest.mark.asyncio
 async def test_real_split_listeners_share_human_sessions_and_original_agent_identity(config, endpoint):
     feed = Feed()
     core = create_app(config, event_feed=feed)
