@@ -291,7 +291,9 @@ def _execute(options):
                             custodian_thread.start()
                     elif not stop.requested:
                         raise RuntimeError('receipt readiness unavailable')
-                requested = stop.requested or supervisor.wait_for_stop_with_observations(
+                wait = (supervisor.wait_for_coordinator_stop if getattr(getattr(supervisor, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2'
+                        else supervisor.wait_for_stop_with_observations)
+                requested = stop.requested or wait(
                     timeout_ms=options.wait_seconds * 1000,
                     stop_requested=lambda: stop.requested or gate_failed.is_set() or custodian_failed.is_set())
                 if custodian_thread is not None:

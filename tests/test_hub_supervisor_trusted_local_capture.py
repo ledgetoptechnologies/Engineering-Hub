@@ -1,6 +1,7 @@
 """Protected input capture only; the supervisor launch guard stays closed."""
 import hashlib
 import os
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -68,3 +69,50 @@ def test_pair_capture_pins_content_and_denies_replacement(tmp_path, monkeypatch)
     target = root / 'local_enrollment'
     moved = root / 'old-enrollment'; target.rename(moved); target.symlink_to(moved)
     with pytest.raises((launch.LaunchSupervisorError, OSError)): launch.LaunchSupervisor._pin_sources(subject)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason='Synthetic mapped-owner capture requires isolated root')
+def test_supervised_capture_binds_root_raw_pin_and_release(tmp_path):
+    from hub_container_executor.coordinator_admission import admission_commitment, parse_admission
+    from tests.test_executor_launch_profile import supervised_local_profile
+    from tests.test_hub_coordinator_admission import document
+    root = tmp_path / 'hub-pilot-local'; root.mkdir(mode=0o700)
+    config = github_configuration(); config['manifest'] = profile_document()['manifest']
+    config.update(database_path='/var/lib/engineering-hub/local-coordinator/hub.sqlite',
+                  coordinator_socket_path='/run/hub-browser/hub.sock',
+                  executor_socket_path='/run/hub-executor/executor.sock',
+                  secret_root='/var/lib/engineering-hub/local-secrets')
+    evidence = v2_document(); evidence.update(schema=SCHEMA_V3, operator_actor='human:123')
+    config_raw, evidence_raw = canonical(config), encode(evidence)
+    data = supervised_local_profile(); data['fixture_root'] = str(root)
+    data['daemon_policy']['engine_id'] = evidence['launch']['engine_id']
+    for item in data['mounts']: item['source'] = str(root / item['role'])
+    for role, raw in [('local_config', config_raw), ('local_enrollment', evidence_raw)]:
+        target = root / role; target.write_bytes(raw); os.chmod(target, 0o600); os.chown(target, 110001, 110001)
+        _swap_mount(data, role, content_digest='sha256:' + hashlib.sha256(raw).hexdigest())
+    admission = document(config_raw, evidence_raw)
+    normalized, _ = admission_commitment(canonical(admission))
+    _swap_mount(data, 'local_admission', content_digest=normalized)
+    profile = profiles.ExecutorLaunchProfile.model_validate(data)
+    admission['release']['launch_profile_digest'] = profile.digest()
+    raw = canonical(admission); _, raw_pin = admission_commitment(raw)
+    target = root / 'local_admission'; target.write_bytes(raw); os.chmod(target, 0o600); os.chown(target, 110001, 110001)
+    for role in ('local_state', 'local_secrets', 'local_executor_directory', 'local_browser_directory'):
+        directory = root / role; directory.mkdir(mode=0o700); os.chown(directory, 110001, 110001)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.bind(str(root / 'local_issuer_socket'))
+        os.chmod(root / 'local_issuer_socket', 0o660); os.chown(root / 'local_issuer_socket', 0, 110001)
+        subject = SimpleNamespace(profile=profile, release=parse_admission(raw).release,
+            _mounts={m.role:m for m in profile.mounts}, _source_pins={},
+            _configuration_raw_digest='sha256:'+hashlib.sha256(config_raw).hexdigest(),
+            _admission_raw_digest=raw_pin, _ttl=30, _request_ms=2000)
+        subject._pin_trusted_local_inputs = lambda: launch.LaunchSupervisor._pin_trusted_local_inputs(subject)
+        launch.LaunchSupervisor._pin_sources(subject)
+        assert set(subject._source_pins) == set(profiles.SUPERVISED_LOCAL_COORDINATOR_TARGETS)
+        subject._ttl = 31
+        with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor._pin_sources(subject)
+        subject._ttl = 30; subject._request_ms = 2001
+        with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor._pin_sources(subject)
+        subject._request_ms = 2000
+        subject._admission_raw_digest = 'sha256:'+'0'*64
+        with pytest.raises(ValueError): launch.LaunchSupervisor._pin_sources(subject)

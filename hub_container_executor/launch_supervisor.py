@@ -41,10 +41,12 @@ from engineering_hub import current_executor_observation as current_observation
 from .build_record import VerifiedImage
 from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
-                               SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES)
-from .launch_transport import REQUEST_PROTOCOL, MAX_REQUEST_BYTES
+                               SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES,
+                               CoordinatorReleaseEnrollment, COORDINATOR_PROTOCOL,
+                               COORDINATOR_AUDIENCE, COORDINATOR_SIGNATURE_DOMAIN)
+from .launch_transport import REQUEST_PROTOCOL, COORDINATOR_REQUEST_PROTOCOL, MAX_REQUEST_BYTES
 from .configuration_commitment import (configuration_commitment, coordinator_configuration_commitment,
-                                       trusted_local_coordinator_commitment)
+                                       trusted_local_coordinator_commitment, supervised_local_coordinator_commitment)
 
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -973,10 +975,10 @@ class LaunchSupervisor:
                 'start_ticks': None if self._consumer is None else self._consumer.start}
 
     def _pin_sources(self):
-        if self.profile.role == 'trusted-local-coordinator-v1':
+        if self.profile.role in {'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2'}:
             self._pin_trusted_local_inputs()
         for role, mount in self._mounts.items():
-            if role in {'local_config', 'local_enrollment'}:
+            if role in {'local_config', 'local_enrollment', 'local_admission'}:
                 continue
             path = _path(mount.source)
             _require(path.resolve(strict=True) == path)
@@ -1014,6 +1016,7 @@ class LaunchSupervisor:
     def _pin_trusted_local_inputs(self):
         """Capture and bind both exact protected inputs; no launch authority is inferred."""
         from .installed_coordinator import MAX_CONFIG_BYTES
+        from .coordinator_admission import MAX_BYTES as MAX_ADMISSION_BYTES, parse_admission
         from engineering_hub.trusted_queued_session import MAX_ENROLLMENT_BYTES
         def capture(role, maximum):
             mount = self._mounts[role]
@@ -1039,7 +1042,8 @@ class LaunchSupervisor:
                 _require(len(raw) == before.st_size and stable(before) == stable(os.fstat(fd)) == stable(named)
                          and _identity(os.fstat(parent)) == _identity(os.lstat(path.parent))
                          and path.resolve(strict=True) == path
-                         and 'sha256:' + hashlib.sha256(raw).hexdigest() == mount.content_digest)
+                         and (role == 'local_admission' or
+                              'sha256:' + hashlib.sha256(raw).hexdigest() == mount.content_digest))
                 return bytes(raw), stable(before)
             finally:
                 try:
@@ -1048,11 +1052,22 @@ class LaunchSupervisor:
                     os.close(parent)
         config, config_pin = capture('local_config', MAX_CONFIG_BYTES)
         enrollment, enrollment_pin = capture('local_enrollment', MAX_ENROLLMENT_BYTES)
-        commitment = trusted_local_coordinator_commitment(self.profile, config, enrollment)
+        if self.profile.role == 'supervised-local-coordinator-v2':
+            admission, admission_pin = capture('local_admission', MAX_ADMISSION_BYTES)
+            admission_policy = parse_admission(admission)
+            _require(self._ttl <= admission_policy.lifetime_seconds
+                     and self._request_ms <= admission_policy.timeout_ms)
+            commitment = supervised_local_coordinator_commitment(self.profile, config, enrollment, admission,
+                root_raw_digest=self._admission_raw_digest, independent_release=self.release)
+        else:
+            commitment = trusted_local_coordinator_commitment(self.profile, config, enrollment)
         _require(commitment.raw_digest == self._configuration_raw_digest)
         _require(capture('local_config', MAX_CONFIG_BYTES) == (config, config_pin)
                  and capture('local_enrollment', MAX_ENROLLMENT_BYTES) == (enrollment, enrollment_pin))
         pins = {'local_config': config_pin, 'local_enrollment': enrollment_pin}
+        if self.profile.role == 'supervised-local-coordinator-v2':
+            _require(capture('local_admission', MAX_ADMISSION_BYTES) == (admission, admission_pin))
+            pins['local_admission'] = admission_pin
         previous = getattr(self, '_trusted_local_input_pins', None)
         _require(previous is None or previous == pins)
         _require(all(role not in self._source_pins or self._source_pins[role] == pin[0]
@@ -1335,6 +1350,14 @@ class LaunchSupervisor:
             reserved = False
             try:
                 self._guard()
+                role = getattr(getattr(self, 'profile', None), 'role', None)
+                _require(role is None or role == 'supervised-local-coordinator-v2')
+                coordinator = role == 'supervised-local-coordinator-v2'
+                _require(type(self.release) is (CoordinatorReleaseEnrollment if coordinator else ExecutorReleaseEnrollment))
+                request_protocol = COORDINATOR_REQUEST_PROTOCOL if coordinator else REQUEST_PROTOCOL
+                protocol = COORDINATOR_PROTOCOL if coordinator else PROTOCOL
+                audience = COORDINATOR_AUDIENCE if coordinator else AUDIENCE
+                domain = COORDINATOR_SIGNATURE_DOMAIN if coordinator else SIGNATURE_DOMAIN
                 _require(self._issuance_open and time.monotonic() < self._expires)
                 deadline = min(self._expires, time.monotonic() + self._request_ms / 1000)
                 self._listener.settimeout(_remaining(deadline))
@@ -1346,7 +1369,7 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == REQUEST_PROTOCOL and type(request['nonce']) is str
+                         and request['protocol'] == request_protocol and type(request['nonce']) is str
                          and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')  # One frame plus explicit SHUT_WR, no trailing data.
@@ -1358,7 +1381,7 @@ class LaunchSupervisor:
                 now = int(time.time() * 1000)
                 remaining = int((self._expires - time.monotonic()) * 1000)
                 _require(remaining > 0)
-                payload = {'protocol': PROTOCOL, 'audience': AUDIENCE, 'nonce': request['nonce'],
+                payload = {'protocol': protocol, 'audience': audience, 'nonce': request['nonce'],
                     'receipt_id': str(uuid4()), 'launch_id': self._launch_id, 'issuer_id': self.release.issuer_id,
                     'boot_id': self._consumer.boot, 'authenticated_host_pid': self._consumer.pid,
                     'process_start_ticks': self._consumer.start, 'container_id': self._container_id,
@@ -1369,7 +1392,7 @@ class LaunchSupervisor:
                     'implementation_commit': self.release.implementation_commit,
                     'launch_profile_digest': self.release.launch_profile_digest,
                     'issued_at_ms': now, 'expires_at_ms': now + remaining}
-                signature = base64.urlsafe_b64encode(self._signer.sign(SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                signature = base64.urlsafe_b64encode(self._signer.sign(domain + _canonical(payload))).rstrip(b'=').decode()
                 raw = _canonical({'payload': payload, 'signature': signature})
                 _require(len(raw) <= MAX_RECEIPT_BYTES)
                 self._validate_live(deadline)
@@ -2527,6 +2550,7 @@ class LaunchSupervisor:
         """Only identity/authority failures here hold; wire input is checked outside."""
         try:
             self._guard()
+            _require(getattr(getattr(self, 'profile', None), 'role', None) != 'supervised-local-coordinator-v2')
             _require(self._receipt_served and not self._issuance_open)
             deadline = min(deadline, self._expires)
             _remaining(deadline)
@@ -2864,6 +2888,7 @@ class LaunchSupervisor:
         not the container; only the caller's explicit stop signal requests stop.
         """
         _require(self._pid == os.getpid())
+        _require(getattr(getattr(self, 'profile', None), 'role', None) != 'supervised-local-coordinator-v2')
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
@@ -2900,6 +2925,37 @@ class LaunchSupervisor:
             if pending:
                 self._serve_current_until(min(
                     deadline, time.monotonic() + self._request_ms / 1000))
+
+    def wait_for_coordinator_stop(self, *, timeout_ms, stop_requested):
+        """Retain the measured coordinator without issuing executor observations.
+
+        This wait is not proof of queue drain or executor custody. The explicit
+        external stop policy and paired lifecycle remain separate obligations.
+        """
+        _require(self._pid == os.getpid()
+                 and getattr(getattr(self, 'profile', None), 'role', None) == 'supervised-local-coordinator-v2'
+                 and type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
+                 and callable(stop_requested))
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            requested = stop_requested()
+            _require(type(requested) is bool)
+            if requested: return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: return False
+            try:
+                with self._observation_mutex(deadline, wait_window=True):
+                    _require(not self._closed and not self._held and self._receipt_served
+                             and not self._issuance_open and self._consumer is not None)
+                    self._consumer.check()
+                    ready, _, _ = select.select([self._consumer.fd], [], [], min(.1, remaining))
+                    _require(self._consumer.fd not in ready)
+            except _ObservationWaitExpired:
+                return False
+            except BaseException:
+                with self._mutex:
+                    self._hold()
+                raise LaunchSupervisorError() from None
 
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""
