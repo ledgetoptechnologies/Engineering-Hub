@@ -140,7 +140,10 @@ class KeeperDocker(Docker):
   self.calls.append(a); op=a[3:]
   if op[0]=='info': return ROOT if 'DockerRootDir' in op[-1] else DAEMON
   if op[:2]==['volume','inspect']: return json.dumps([{'Name':NAME,'Driver':'local','Scope':'local','Mountpoint':MOUNT,'Options':dict(TMPFS_OPTIONS),'Labels':{'engineering-hub.local-test-owner':TASK}}])
-  if op[:2]==['image','inspect']: return 'null' if 'Volumes' in op[-2] else IMG
+  if op[:2]==['image','inspect']:
+   if 'Volumes' in op[-2]:
+    assert op[-2]=='{{json (index .Config "Volumes")}}'; return 'null'
+   return IMG
   if op[0]=='ps': return ''
   if op[0]=='create': return 'a'*64
   if op[0]=='inspect':
@@ -254,7 +257,10 @@ def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,mon
  monkeypatch.setattr(l.os.path,'realpath',lambda p,*a,**k:'/run/docker.sock' if str(p)=='/var/run/docker.sock' else original_realpath(p,*a,**k))
  def run(a):
   op=a[3:]; calls.append(op[0]);
-  if op[:2]==['image','inspect']: return 'null' if 'Volumes' in op[-2] else IMG
+  if op[:2]==['image','inspect']:
+   if 'Volumes' in op[-2]:
+    assert op[-2]=='{{json (index .Config "Volumes")}}'; return 'null'
+   return IMG
   if op[0]=='ps': return ''
   if op[0]=='create':
    assert '--pull=never' in a and all('cleanup_key' not in x for x in a)

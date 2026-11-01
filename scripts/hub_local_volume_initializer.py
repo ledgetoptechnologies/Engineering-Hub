@@ -57,7 +57,7 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, keeper=None
         verify_daemon_volume(); check_keeper()
         if run(PREFIX+['image','inspect','--format','{{.Id}}',helper_image_id]).strip()!=helper_image_id:
             raise ValueError
-        image_volumes=json.loads(run(PREFIX+['image','inspect','--format','{{json .Config.Volumes}}',helper_image_id]))
+        image_volumes=json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',helper_image_id]))
         if image_volumes not in (None,{}): raise ValueError
         existing=run(PREFIX+['ps','--all','--format','{{.Names}}']).splitlines()
         if name in existing: raise ValueError

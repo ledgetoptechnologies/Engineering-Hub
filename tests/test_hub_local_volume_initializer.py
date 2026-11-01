@@ -1,6 +1,6 @@
 import json
 import pytest
-from scripts.hub_local_test_volume import OwnedVolume, VolumeOutcomeUnknown
+from scripts.hub_local_test_volume import OwnedVolume, VolumeError, VolumeOutcomeUnknown
 from scripts.hub_local_volume_initializer import initialize_owned_volume, LABEL, INIT_SCRIPT
 OWNER='db04aa59-54f0-4269-bcba-539c0151e13e'
 NAME='hub-local-test-'+OWNER
@@ -15,7 +15,10 @@ class Docker:
   self.calls.append(a); op=a[3:]
   if op[0]=='info': return ROOT if 'DockerRootDir' in op[-1] else V.daemon_id
   if op[:2]==['volume','inspect']: return json.dumps([{'Name':NAME,'Driver':'local','Scope':'local','Mountpoint':V.mountpoint,'Options':{},'Labels':{LABEL:OWNER}}])
-  if op[:2]==['image','inspect']: return 'null' if 'Volumes' in op[-2] else IMAGE
+  if op[:2]==['image','inspect']:
+   if 'Volumes' in op[-2]:
+    assert op[-2]=='{{json (index .Config "Volumes")}}'; return 'null'
+   return IMAGE
   if op[0]=='ps': return ''
   if op[0]=='create':
    if self.fail=='create': raise TimeoutError
@@ -39,6 +42,16 @@ def test_exact_one_shot_profile_and_intents(tmp_path):
  create=next(a for a in d.calls if 'create' in a)
  assert 'none' in create and '--read-only' in create and 'type=volume,src='+NAME+',dst=/fixture,volume-nocopy' in create
  assert all((tmp_path/(OWNER+s)).exists() for s in ('.init-create','.init-start','.init-remove'))
+
+def test_image_declared_volumes_denied_before_create(tmp_path):
+ d=Docker()
+ def declared(a):
+  if a[3:5]==['image','inspect'] and 'Volumes' in a[-2]:
+   assert a[-2]=='{{json (index .Config "Volumes")}}'
+   return json.dumps({'/unexpected':{}})
+  return d(a)
+ with pytest.raises(VolumeError): initialize_owned_volume(volume=V,helper_image_id=IMAGE,journal_dir=str(tmp_path),run=declared)
+ assert not any('create' in a for a in d.calls)
 
 def test_lost_create_retains_intent_and_never_starts(tmp_path):
  d=Docker(); d.fail='create'

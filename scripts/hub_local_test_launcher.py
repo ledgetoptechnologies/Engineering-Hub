@@ -206,7 +206,7 @@ def start_tmpfs_keeper(*, volume, helper_image_id, journal_dir, run=_call):
         _keeper_volume(volume,run)
         if (not re.fullmatch('sha256:[0-9a-f]{64}',helper_image_id)
             or run(PREFIX+['image','inspect','--format','{{.Id}}',helper_image_id]).strip()!=helper_image_id
-            or json.loads(run(PREFIX+['image','inspect','--format','{{json .Config.Volumes}}',helper_image_id])) not in (None,{})
+            or json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',helper_image_id])) not in (None,{})
             or 'hub-local-keeper-'+volume.owner in run(PREFIX+['ps','--all','--format','{{.Names}}']).splitlines()): raise ValueError
     except Exception: raise VolumeError('Keeper enrollment unavailable') from None
     handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.keeper-create','keeper-create')
@@ -441,7 +441,7 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
         initialize_owned_volume(volume=volume,helper_image_id=helper_image_id,journal_dir=journal_dir,keeper=keeper,run=run)
         check_tmpfs_keeper(keeper,volume=volume,run=run)
         if (run(PREFIX+['image','inspect','--format','{{.Id}}',coordinator_image_id]).strip()!=coordinator_image_id
-            or json.loads(run(PREFIX+['image','inspect','--format','{{json .Config.Volumes}}',coordinator_image_id])) not in (None,{})
+            or json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',coordinator_image_id])) not in (None,{})
             or name in run(PREFIX+['ps','--all','--format','{{.Names}}']).splitlines()):
             raise VolumeError('Coordinator image unavailable')
         if time.monotonic()>=deadline_monotonic or source_tree_digest(source_root,deadline_monotonic=deadline_monotonic)!=source_digest: raise VolumeError('Local admission unavailable; keeper retained')
@@ -590,7 +590,7 @@ def run_local_acceptance(*, task_id, daemon_id, helper_image_id, coordinator_ima
                               docker_root+'/volumes/hub-local-test-'+task_id+'/_data')
         for image_id in (helper_image_id,coordinator_image_id):
             if (run(PREFIX+['image','inspect','--format','{{.Id}}',image_id]).strip()!=image_id
-                or json.loads(run(PREFIX+['image','inspect','--format','{{json .Config.Volumes}}',image_id])) not in (None,{})):
+                or json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',image_id])) not in (None,{})):
                 raise ValueError
         for image in images: discover_cached_image(image,daemon_id=daemon_id,run=run)
         if time.monotonic()>=deadline_monotonic: raise ValueError
