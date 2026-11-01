@@ -6,6 +6,7 @@ retry, cleanup or publication occurs after any uncertain Docker effect.
 """
 from dataclasses import dataclass
 import os
+import stat
 import math
 import sys
 import json
@@ -47,6 +48,26 @@ def _preflight_snapshot(root, generation, frozen, maximum, deadline, *, initiali
             with os.scandir(gen_fd) as entries:
                 if next(entries, None) is not None:
                     raise ValueError('Initial generation must be empty')
+            # The synthetic fixture starts with a private empty database;
+            # SQLite otherwise creates it under the application's umask.
+            _guard(Path(root), root_fd, root_identity)
+            _guard(Path(root) / generation, gen_fd, gen_identity)
+            if time.monotonic() >= deadline:
+                raise ValueError('Initial generation deadline exceeded')
+            db_fd = os.open('hub.sqlite3', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                            os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=gen_fd)
+            try:
+                opened = os.fstat(db_fd)
+                named = os.stat('hub.sqlite3', dir_fd=gen_fd, follow_symlinks=False)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 10001 or
+                        opened.st_gid != 10001 or stat.S_IMODE(opened.st_mode) != 0o600 or
+                        opened.st_nlink != 1 or opened.st_size != 0 or
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    raise ValueError('Initial database identity unavailable')
+                os.fsync(db_fd)
+                os.fsync(gen_fd)
+            finally:
+                os.close(db_fd)
         else:
             _operator_process_gate(gen_fd, deadline)
             _inventory(gen_fd, maximum=maximum, deadline=deadline)

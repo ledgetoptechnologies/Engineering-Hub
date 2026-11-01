@@ -95,7 +95,62 @@ def test_empty_generation_preflight_denies_existing_entries(tmp_path):
     source=root/'baseline-one'; source.mkdir(mode=0o700)
     b._preflight_snapshot(str(root),'baseline-one','frozen.sqlite3',1048576,time.monotonic()+10,
                           initialize_empty=True)
+    database=source/'hub.sqlite3'
+    assert database.read_bytes()==b''
+    assert database.stat().st_mode & 0o777 == 0o600
+    assert database.stat().st_nlink==1
     (source/'unexpected').write_text('preserve')
+    with pytest.raises(ValueError,match='must be empty'):
+        b._preflight_snapshot(str(root),'baseline-one','frozen.sqlite3',1048576,time.monotonic()+10,
+                              initialize_empty=True)
+
+
+@pytest.mark.parametrize('link', [False, True])
+def test_empty_preflight_preserves_existing_database_or_symlink(tmp_path, monkeypatch, link):
+    root=tmp_path/'generations'; root.mkdir()
+    source=root/'baseline-one'; source.mkdir()
+    target=tmp_path/'original'; target.write_bytes(b'preserve')
+    database=source/'hub.sqlite3'
+    if link:
+        database.symlink_to(target)
+    else:
+        database.write_bytes(b'preserve')
+    def directory(path, **_):
+        fd=os.open(path,os.O_RDONLY | os.O_DIRECTORY)
+        info=os.fstat(fd)
+        return fd,(info.st_dev,info.st_ino)
+    monkeypatch.setattr(b,'_directory',directory)
+    monkeypatch.setattr(b,'_guard',lambda *args:None)
+    with pytest.raises(ValueError,match='must be empty'):
+        b._preflight_snapshot(str(root),'baseline-one','frozen.sqlite3',1048576,time.monotonic()+10,
+                              initialize_empty=True)
+    assert target.read_bytes()==b'preserve'
+    assert database.is_symlink() if link else database.read_bytes()==b'preserve'
+
+
+def test_empty_preflight_creates_exclusive_private_database(tmp_path, monkeypatch):
+    root=tmp_path/'generations'; root.mkdir()
+    source=root/'baseline-one'; source.mkdir()
+    real_fstat=os.fstat
+    def directory(path, **_):
+        fd=os.open(path,os.O_RDONLY | os.O_DIRECTORY)
+        info=real_fstat(fd)
+        return fd,(info.st_dev,info.st_ino)
+    def enrolled_owner(fd):
+        info=real_fstat(fd)
+        if not __import__('stat').S_ISREG(info.st_mode):
+            return info
+        fields=list(info); fields[4]=fields[5]=10001
+        return os.stat_result(fields)
+    monkeypatch.setattr(b,'_directory',directory)
+    monkeypatch.setattr(b,'_guard',lambda *args:None)
+    monkeypatch.setattr(b.os,'fstat',enrolled_owner)
+    b._preflight_snapshot(str(root),'baseline-one','frozen.sqlite3',1048576,time.monotonic()+10,
+                          initialize_empty=True)
+    database=source/'hub.sqlite3'
+    assert database.read_bytes()==b''
+    assert database.stat().st_mode & 0o777 == 0o600
+    assert database.stat().st_nlink==1
     with pytest.raises(ValueError,match='must be empty'):
         b._preflight_snapshot(str(root),'baseline-one','frozen.sqlite3',1048576,time.monotonic()+10,
                               initialize_empty=True)
