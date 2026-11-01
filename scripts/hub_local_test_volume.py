@@ -84,12 +84,65 @@ def _call(args):
                 process.stderr.close()
 
 
+# Local test only: an initial-namespace root parent may attest root-owned
+# ancestors by passing retained directory FDs. The parent, not these FDs alone,
+# is responsible for checking host ownership before entering the user namespace.
+_ANCESTOR_PINS = None
+
+
+def _install_attested_ancestor_fds(fds):
+    import fcntl
+    global _ANCESTOR_PINS
+    if (_ANCESTOR_PINS is not None or os.geteuid() != 0 or type(fds) is not tuple
+            or not 0 < len(fds) <= 32 or any(type(fd) is not int or fd < 4 for fd in fds)
+            or len(set(fds)) != len(fds)):
+        raise ValueError('Invalid local ancestor attestation')
+    pins = {}
+    for fd in fds:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        key = (info.st_dev, info.st_ino)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if (flags & os.O_ACCMODE != os.O_RDONLY or flags & getattr(os, 'O_PATH', 0)
+                or not stat.S_ISDIR(info.st_mode) or info.st_uid != 65534 or key in pins
+                or (mode & 0o022 and not mode & stat.S_ISVTX)):
+            raise ValueError('Invalid local ancestor attestation')
+        pins[key] = (fd, mode)
+    _ANCESTOR_PINS = pins
+
+
+def _attested_ancestor(info):
+    if info.st_uid != 65534 or _ANCESTOR_PINS is None:
+        return False
+    pin = _ANCESTOR_PINS.get((info.st_dev, info.st_ino))
+    if pin is None:
+        return False
+    try:
+        held = os.fstat(pin[0])
+    except OSError:
+        return False
+    return (stat.S_ISDIR(held.st_mode) and held.st_uid == 65534
+            and (held.st_dev, held.st_ino, stat.S_IMODE(held.st_mode))
+            == (info.st_dev, info.st_ino, pin[1])
+            and stat.S_IMODE(info.st_mode) == pin[1])
+
+
+def _ancestor_owner_ok(info):
+    return info.st_uid in (0, os.geteuid()) or _attested_ancestor(info)
+
+
+def _ancestor_mode_ok(info):
+    mode = stat.S_IMODE(info.st_mode)
+    return not (mode & 0o022) or bool(mode & stat.S_ISVTX and
+                                         (info.st_uid == 0 or _attested_ancestor(info)))
+
+
 def _check_path(handles):
     for index, (fd, parent, name) in enumerate(handles):
         held = os.fstat(fd)
         mode = stat.S_IMODE(held.st_mode)
-        if (held.st_uid not in (0, os.geteuid())
-                or (mode & 0o022 and not (held.st_uid == 0 and mode & stat.S_ISVTX))
+        if (not _ancestor_owner_ok(held)
+                or not _ancestor_mode_ok(held)
                 or (index == len(handles)-1 and (held.st_uid != os.geteuid() or mode != 0o700))):
             raise ValueError('Journal directory permissions changed')
         if parent is not None:
@@ -127,9 +180,9 @@ def _reserve_intent(journal_dir, task_id, daemon_id, name, suffix, operation, *,
         for index, (fd, _, _) in enumerate(handles):
             st = os.fstat(fd)
             mode = stat.S_IMODE(st.st_mode)
-            if st.st_uid not in (0, os.geteuid()):
+            if not _ancestor_owner_ok(st):
                 raise ValueError
-            if mode & 0o022 and not (st.st_uid == 0 and mode & stat.S_ISVTX):
+            if not _ancestor_mode_ok(st):
                 raise ValueError
             if index == len(handles)-1 and (st.st_uid != os.geteuid() or mode != 0o700):
                 raise ValueError

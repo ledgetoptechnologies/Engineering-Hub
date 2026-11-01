@@ -61,6 +61,16 @@ requests private propagation and checks the created container's requested and
 effective bind metadata; a mismatch remains held. Before launching the inner
 fixture, its bootstrap checks the daemon ID through the mounted socket. This
 does not establish exclusive daemon access or host custody.
+For a launcher entered into a shifted user namespace, the optional
+`--attested-journal-ancestor-fds` argument is a local test-only handoff from
+its trusted initial-namespace root parent. The parent must retain and pass each
+journal ancestor directory FD after verifying its real host ownership and mode.
+The launcher matches overflow-owned ancestors to those exact retained inodes
+and modes throughout each journal operation; the final journal directory must
+still be owned by the launcher and mode 0700. The FDs alone do not establish
+host ownership to an arbitrary caller. Without this opt-in the original strict
+ownership check remains in force. This is not installed supervisor admission or
+host custody evidence.
 The coordinator writes an authenticated post-exit cleanup handoff only after
 its native work and exact container cleanup have drained; the launcher must
 independently verify coordinator removal and exact container absence before it

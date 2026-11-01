@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 _ROOT=Path(__file__).resolve().parent.parent
 sys.path[:0]=[str(_ROOT/'src'),str(_ROOT)]
 from hub_container_executor.source_tree import source_tree_digest
-from scripts.hub_local_test_volume import OwnedVolume, VolumeError, VolumeOutcomeUnknown, _call, _reserve_intent, _check_path, _close_handles, _options_match, TMPFS_OPTIONS, LABEL
+from scripts.hub_local_test_volume import OwnedVolume, VolumeError, VolumeOutcomeUnknown, _call, _reserve_intent, _check_path, _close_handles, _options_match, _install_attested_ancestor_fds, TMPFS_OPTIONS, LABEL
 
 DOMAIN=b'engineering-hub.local-cleanup-receipt.v1\0'
 SCHEMA='engineering-hub.local-cleanup-receipt.v1'
@@ -625,7 +625,10 @@ def main(argv=None):
     from scripts.hub_local_acceptance_runner import _read_request
     parser=argparse.ArgumentParser(description='Disposable local fixture only; unknown effects are held')
     parser.add_argument('--request-fd',type=int,required=True,choices=[3])
+    parser.add_argument('--attested-journal-ancestor-fds',default=None,
+                        help='Local test only: FDs attested by the trusted initial-namespace root parent')
     args=parser.parse_args(argv)
+    pin_fds=()
     try:
         try:
             request=_read_request(args.request_fd)
@@ -640,6 +643,12 @@ def main(argv=None):
             or type(request['initial_manifest']) is not str
             or type(request['timeout_seconds']) is not int or not 1<=request['timeout_seconds']<=600):
             raise ValueError
+        if args.attested_journal_ancestor_fds is not None:
+            values=args.attested_journal_ancestor_fds.split(',')
+            if not values or any(not value.isdecimal() for value in values): raise ValueError
+            pin_fds=tuple(int(value) for value in values)
+            if ','.join(str(value) for value in pin_fds)!=args.attested_journal_ancestor_fds: raise ValueError
+            _install_attested_ancestor_fds(pin_fds)
         manifest=PilotManifest.from_bytes(request['initial_manifest'].encode('ascii'))
         if manifest.canonical_bytes()!=request['initial_manifest'].encode('ascii'): raise ValueError
         result=run_local_acceptance(task_id=request['task_id'],daemon_id=request['daemon_id'],
@@ -661,6 +670,10 @@ def main(argv=None):
     except Exception:
         print('Local fixture preflight unavailable',file=sys.stderr)
         return 1
+    finally:
+        for fd in pin_fds:
+            try: os.close(fd)
+            except OSError: pass
 
 
 if __name__=='__main__':

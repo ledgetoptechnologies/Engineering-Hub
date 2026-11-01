@@ -209,3 +209,27 @@ def test_sealed_but_not_cleaned_snapshot_denied(tmp_path):
     t=threading.Thread(target=lambda:None); t.start(); t.join(); d=Docker()
     with pytest.raises(m.VolumeError): m.remove_sealed_volume(volume=m.OwnedVolume(NAME,TASK,DAEMON,snap.volume_mount),snapshot=snap,server_thread=t,journal_dir=str(tmp_path),run=d)
     assert not d.calls
+
+
+def test_attested_overflow_ancestor_requires_retained_exact_directory(monkeypatch):
+    import fcntl, os, stat, types
+    monkeypatch.setattr(m, '_ANCESTOR_PINS', None)
+    monkeypatch.setattr(m.os, 'geteuid', lambda: 0)
+    original = os.fstat
+    original_fcntl = fcntl.fcntl
+    monkeypatch.setattr(fcntl, 'fcntl', lambda fd, *a: 0 if fd == 9001 else original_fcntl(fd, *a))
+    held = {'info': types.SimpleNamespace(st_dev=11, st_ino=22, st_uid=65534,
+                                          st_mode=stat.S_IFDIR | 0o1777)}
+    monkeypatch.setattr(m.os, 'fstat', lambda fd: held['info'] if fd == 9001 else original(fd))
+    info = held['info']
+    assert not m._ancestor_owner_ok(info)
+    m._install_attested_ancestor_fds((9001,))
+    assert m._ancestor_owner_ok(info) and m._ancestor_mode_ok(info)
+    unpinned = types.SimpleNamespace(st_dev=11, st_ino=23, st_uid=65534,
+                                     st_mode=stat.S_IFDIR | 0o1777)
+    assert not m._ancestor_owner_ok(unpinned)
+    with pytest.raises(ValueError): m._check_path([(9001, None, None)])
+    held['info'] = types.SimpleNamespace(st_dev=11, st_ino=22, st_uid=65534,
+                                         st_mode=stat.S_IFDIR | 0o755)
+    assert not m._ancestor_owner_ok(info)
+    with pytest.raises(ValueError): m._install_attested_ancestor_fds((9001,))
