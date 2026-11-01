@@ -87,6 +87,20 @@ def _read_request(fd):
     return request
 
 
+def _snapshot_diagnostic(output):
+    try:
+        diagnostic=json.loads(output,object_pairs_hook=_pairs)
+        allowed={'baseline_inventory_changed','private_snapshot_file_required',
+                 'foreign_baseline_entry','baseline_snapshot_failed','unavailable'}
+        if (type(diagnostic) is dict and set(diagnostic)=={'error','phase','code'} and
+                diagnostic['error']=='local_baseline_unavailable' and diagnostic['phase']=='snapshot' and
+                type(diagnostic['code']) is str and diagnostic['code'] in allowed):
+            return diagnostic['code']
+    except (ValueError,TypeError,UnicodeError):
+        pass
+    return None
+
+
 def _child(payload):
     """Owned child, bounded input/output and deadline; uncertainty is held."""
     raw=json.dumps(payload,separators=(',',':'),allow_nan=False).encode()
@@ -116,6 +130,11 @@ def _child(payload):
                     target.extend(block)
                     if len(target)>256*1024: raise ValueError('child output exceeds bound')
         if process.wait(timeout=max(.001,deadline-time.monotonic()))!=0 or errors:
+            # Only a closed set of synthetic fixture codes can cross this
+            # boundary; child output may otherwise contain private data.
+            code=_snapshot_diagnostic(output)
+            if code is not None:
+                print('local baseline snapshot: '+code,file=sys.stderr)
             raise ValueError('child outcome unavailable')
         return json.loads(output,object_pairs_hook=_pairs)
     finally:

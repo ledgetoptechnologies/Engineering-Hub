@@ -10,6 +10,15 @@ import time
 
 import pytest
 
+
+def test_snapshot_diagnostic_accepts_only_closed_sanitized_schema():
+    from scripts.hub_local_acceptance_runner import _snapshot_diagnostic
+    assert _snapshot_diagnostic(b'{"error":"local_baseline_unavailable","phase":"snapshot","code":"baseline_inventory_changed"}')=='baseline_inventory_changed'
+    for raw in (b'{"error":"local_baseline_unavailable","phase":"snapshot","code":"secret"}',
+                b'{"error":"local_baseline_unavailable","phase":"snapshot","code":"unavailable","extra":"secret"}',
+                b'{"error":"local_baseline_unavailable","phase":"snapshot","code":"unavailable","code":"secret"}', b'\xff'):
+        assert _snapshot_diagnostic(raw) is None
+
 if sys.platform != 'linux':
     pytest.skip('local acceptance runner requires Linux', allow_module_level=True)
 

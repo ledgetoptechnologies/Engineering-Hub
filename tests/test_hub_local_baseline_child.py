@@ -1,5 +1,7 @@
 """Fixed bootstrap IPC rejects malformed requests without opening resources."""
 import json
+import io
+import types
 from pathlib import Path
 import subprocess
 import sys
@@ -20,3 +22,20 @@ def test_invalid_child_request_is_sanitized_and_creates_nothing(tmp_path, body):
     assert child.returncode == 2 and child.stderr == b''
     assert json.loads(child.stdout) == {'error': 'local_baseline_unavailable'}
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(('message','expected'), [
+    ('baseline_inventory_changed','baseline_inventory_changed'),
+    ('private client material','unavailable'),
+])
+def test_child_reports_only_allowlisted_snapshot_codes(monkeypatch, capsys, message, expected):
+    from scripts import hub_local_baseline_child as child
+    from hub_container_executor.baseline_snapshot import BaselineSnapshotError
+    monkeypatch.setattr(child.sys,'stdin',types.SimpleNamespace(buffer=io.BytesIO(b'{}')))
+    def fail(_):
+        raise BaselineSnapshotError(message)
+    monkeypatch.setattr(child,'run',fail)
+    assert child.main()==2
+    out=capsys.readouterr()
+    assert json.loads(out.out)=={'error':'local_baseline_unavailable','phase':'snapshot','code':expected}
+    assert out.err==''

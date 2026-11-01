@@ -21,6 +21,7 @@ import engineering_hub.pilot_ownership as _owner_module
 import hub_container_executor.baseline_observer as _observer_module
 from hub_container_executor.daemon_backend import DockerEngineBackend, DockerEngineBinding
 from hub_container_executor.operation_journal import SQLiteOperationJournal
+from hub_container_executor.baseline_snapshot import BaselineSnapshotError
 from scripts.hub_local_baseline_bootstrap import bootstrap_baseline
 import scripts.hub_local_baseline_bootstrap as _bootstrap_module
 from scripts.hub_local_test_oci import _Store, _SyntheticTrust
@@ -99,6 +100,12 @@ def main():
         result = run(json.loads(raw, object_pairs_hook=_strict_pairs))
         print(json.dumps(result,separators=(',',':')))
         return 0
+    except BaselineSnapshotError as exc:
+        allowed={'baseline_inventory_changed','private_snapshot_file_required',
+                 'foreign_baseline_entry','baseline_snapshot_failed'}
+        code=exc.args[0] if len(exc.args)==1 and type(exc.args[0]) is str and exc.args[0] in allowed else 'unavailable'
+        print(json.dumps({'error':'local_baseline_unavailable','phase':'snapshot','code':code},separators=(',',':')))
+        return 2
     except Exception:
         print('{"error":"local_baseline_unavailable"}')
         return 2
