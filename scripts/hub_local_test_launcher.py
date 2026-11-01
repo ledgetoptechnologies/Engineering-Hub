@@ -677,4 +677,10 @@ def main(argv=None):
 
 
 if __name__=='__main__':
+    # Initializer code imports this module by its package name.  Keep the
+    # direct entry point and that import bound to the same exact keeper type.
+    existing=sys.modules.get('scripts.hub_local_test_launcher')
+    if existing is not None and existing is not sys.modules[__name__]:
+        raise RuntimeError('Conflicting local launcher module')
+    sys.modules['scripts.hub_local_test_launcher']=sys.modules[__name__]
     raise SystemExit(main())

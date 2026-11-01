@@ -9,6 +9,42 @@ DAEMON='daemon-1234567890'; ROOT='/var/lib/docker'; MOUNT=ROOT+'/volumes/'+NAME+
 CID='c'*64; IMG='sha256:'+'a'*64; INITIAL=PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode()); BACKUP='sha256:'+'f'*64; MAN=_final_manifest(INITIAL,BACKUP).digest(); NONCE='d'*64; KEY=b'k'*32
 V=OwnedVolume(NAME,TASK,DAEMON,MOUNT)
 
+def test_direct_launcher_uses_canonical_keeper_type():
+ import pathlib,subprocess,sys
+ launcher=pathlib.Path(__file__).resolve().parents[1]/'scripts'/'hub_local_test_launcher.py'
+ code='''import argparse,importlib,json,runpy,sys
+def inspect(self, args=None, namespace=None):
+    current=sys.modules['__main__']
+    imported=importlib.import_module('scripts.hub_local_test_launcher')
+    assert current is imported
+    assert current.TmpfsKeeper is imported.TmpfsKeeper
+    initializer=importlib.import_module('scripts.hub_local_volume_initializer')
+    task='db04aa59-54f0-4269-bcba-539c0151e13e'; name='hub-local-test-'+task
+    volume=current.OwnedVolume(name,task,'daemon-1234567890','/var/lib/docker/volumes/'+name+'/_data',current.TMPFS_OPTIONS)
+    keeper=current.TmpfsKeeper('c'*64,'sha256:'+'a'*64,volume); observed=[]
+    def check(value, *, volume, run):
+        assert type(value) is current.TmpfsKeeper and value.volume is volume
+        observed.append(True)
+    current.check_tmpfs_keeper=check
+    class Stop(Exception): pass
+    def stop(*args, **kwargs): raise Stop()
+    initializer._reserve_intent=stop
+    def run(args):
+        if args[3]=='info': return volume.daemon_id if args[-1]=='{{.ID}}' else '/var/lib/docker'
+        if args[3:5]==['volume','inspect']:
+            return json.dumps([{'Name':name,'Driver':'local','Scope':'local','Mountpoint':volume.mountpoint,'Options':dict(current.TMPFS_OPTIONS),'Labels':{current.LABEL:task}}])
+        if args[3:5]==['image','inspect']: return keeper.image_id if '{{.Id}}' in args else 'null'
+        if args[3]=='ps': return ''
+        raise AssertionError(args)
+    try: initializer.initialize_owned_volume(volume=volume,helper_image_id=keeper.image_id,journal_dir='/unused',keeper=keeper,run=run)
+    except Stop: pass
+    assert observed==[True]
+    raise SystemExit(0)
+argparse.ArgumentParser.parse_args=inspect
+runpy.run_path(sys.argv[1],run_name='__main__')
+'''
+ subprocess.run([sys.executable,'-I','-B','-c',code,str(launcher)],check=True,timeout=15)
+
 class Docker:
  def __init__(self): self.calls=[]; self.present=False; self.lost=False
  def __call__(self,a):
