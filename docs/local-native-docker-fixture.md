@@ -51,6 +51,13 @@ accepted for real-daemon use. They require independently supplied exact OCI
 manifest digests already resolvable on the pinned local daemon, a bounded
 512MiB/4096-inode tmpfs task volume, a separately bounded private scratch mount,
 and a task-owned keeper that remains mounted until receipt authentication.
+For a newly initialized disposable baseline, the local fixture makes its
+snapshot from an exclusive, inode-pinned workspace inside that same bounded
+tmpfs. SQLite accesses only the copy; the original DB and sidecars are
+rechecked before publication. The tmpfs ceiling bounds combined use but does
+not reserve free space: exhaustion or uncertain cleanup leaves the workspace
+held and prevents reuse. This local fixture path does not change the installed
+snapshot contract or establish staging storage custody.
 The explicit v2 launcher can pin an already-authorized socket supplementary
 group for its task containers; it does not change host socket permissions or
 account group membership. This grants those containers daemon capability and

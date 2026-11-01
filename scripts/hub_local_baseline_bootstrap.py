@@ -218,9 +218,16 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
                 raise RuntimeError('Baseline health is unverified')
             check(); backend.stop_container(container_id,stop_id,timeout()); check()
             _exited_baseline(backend, container_id, deadline_monotonic); check()
-        snapshot=freeze_baseline_snapshot(generation_root=generation_root,source_generation_id=source_generation_id,
-            frozen_leaf=frozen_leaf,maximum_bytes=maximum_bytes,deadline_monotonic=deadline_monotonic,
-            allow_ephemeral_test_storage=True)
+        if initialize_empty:
+            # Only this explicitly disposable fixture has an independently
+            # bounded tmpfs that can hold the private sidecar copy.
+            from scripts.hub_local_scratch_snapshot import freeze_copy
+            snapshot=freeze_copy(generation_root,source_generation_id,frozen_leaf,
+                                 maximum=maximum_bytes,deadline=deadline_monotonic)
+        else:
+            snapshot=freeze_baseline_snapshot(generation_root=generation_root,source_generation_id=source_generation_id,
+                frozen_leaf=frozen_leaf,maximum_bytes=maximum_bytes,deadline_monotonic=deadline_monotonic,
+                allow_ephemeral_test_storage=True)
         check()
         if quiescent:
             _exited_baseline(backend, container_id, deadline_monotonic); check()
