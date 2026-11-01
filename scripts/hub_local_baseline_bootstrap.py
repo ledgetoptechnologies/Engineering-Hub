@@ -139,12 +139,44 @@ def _wait_after_restart(check, deadline, startup_wait_ms, probes):
         raise RuntimeError('Restarted baseline probe budget unavailable')
 
 
+def _inventory_category(observed, snapshot):
+    """Return a fixed diagnostic category without exposing inventory values."""
+    before=snapshot.source_inventory
+    if {row[0] for row in observed[0]}!={row[0] for row in before}:
+        return 'names_changed'
+    if observed[0]!=before:
+        return 'content_changed'
+    if observed[1]!=snapshot.source_identities:
+        return 'identity_changed'
+    return 'match'
+
+
+def _record_inventory_diagnostic(diagnostic, generation_fd, deadline, maximum, snapshot):
+    try:
+        # Never open and close a raw DB descriptor while this process has a
+        # SQLite handle: doing so could release its process-scoped locks.
+        _operator_process_gate(generation_fd,deadline)
+        observed=_inventory(generation_fd,maximum=maximum,deadline=deadline)
+        diagnostic['inventory']=_inventory_category(observed,snapshot)
+    except Exception:
+        diagnostic['inventory']='unavailable'
+
+
+def _diagnostic_storage(original, diagnostic, snapshot, maximum,
+                        root_fd, root_identity, generation_fd, generation_identity, deadline):
+    try:
+        return original(root_fd,root_identity,generation_fd,generation_identity,deadline)
+    except Exception:
+        _record_inventory_diagnostic(diagnostic,generation_fd,deadline,maximum,snapshot)
+        raise
+
+
 def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metadata_store,
                        verifier, secret_resolver, owner_id, generation_root,
                        source_generation_id, frozen_leaf, create_id, start_id, observe_id,
                        maximum_bytes, deadline_monotonic, quiescent=False,
                        preflight_probe_id=None, stop_id=None, restart_id=None, startup_wait_ms=0,
-                       initialize_empty=False):
+                       initialize_empty=False, diagnostic=None):
     """Run once in the actual child while holding its real PilotOwner.
 
     Inputs are synthetic local fixture facts. Explicit empty initialization
@@ -152,6 +184,11 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
     a valid database and passes the later checks. A returned draft is not an
     independently accepted baseline receipt.
     """
+    if (diagnostic is not None and type(diagnostic) is not dict):
+        raise ValueError('Invalid local diagnostic sink')
+    def phase(name):
+        if diagnostic is not None:diagnostic['phase']=name
+    phase('admission')
     if (os.getuid() != 10001 or os.getgid() != 10001 or type(backend) is not DockerEngineBackend
             or type(backend.operation_journal) is not SQLiteOperationJournal
             or type(manifest) is not PilotManifest or type(deadline_monotonic) not in (int,float)
@@ -212,9 +249,11 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
         profile=derive_runtime_profile(manifest,defaults,source_generation_id,secrets)
         resource='hub-pilot-'+UUID(owner_id).hex[:24]+'-00000000-000-rollback'
         plan=ContainerPlan(resource_name=resource,image=image,immutable_reference=image.runnable_reference,pull=False,profile=profile)
+        phase('initial_start')
         container_id=backend.create_container(plan,create_id,timeout())
         check(); backend.start_container(container_id,start_id,timeout()); check()
         if quiescent:
+            phase('initial_probe')
             if time.monotonic() + startup_wait_ms / 1000 >= deadline_monotonic:
                 raise RuntimeError('Baseline startup budget unavailable')
             if startup_wait_ms:
@@ -231,6 +270,7 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
                 raise RuntimeError('Baseline health is unverified')
             check(); backend.stop_container(container_id,stop_id,timeout()); check()
             _exited_baseline(backend, container_id, deadline_monotonic); check()
+        phase('freeze')
         if initialize_empty:
             # Only this explicitly disposable fixture has an independently
             # bounded tmpfs that can hold the private sidecar copy.
@@ -243,14 +283,25 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
                 allow_ephemeral_test_storage=True)
         check()
         if quiescent:
+            phase('restart')
             _exited_baseline(backend, container_id, deadline_monotonic); check()
             _restart_baseline(backend, container_id, restart_id, timeout()); check()
+            phase('restart_wait')
             _wait_after_restart(check, deadline_monotonic, startup_wait_ms, manifest.probes.rollback)
+        phase('observer_setup')
         final=_final_manifest(manifest, snapshot.sha256)
         observer=BaselineObserver(final,backend=backend,record_store=record_store,metadata_store=metadata_store,
             provenance_verifier=verifier,secret_resolver=secret_resolver,snapshot=snapshot,
             generation_root=generation_root,source_generation_id=source_generation_id,frozen_leaf=frozen_leaf,
             container_id=container_id,owner_guard=check,allow_ephemeral_test_storage=True)
+        if diagnostic is not None:
+            original_storage=observer._storage
+            def checked_storage(root_fd,root_identity,generation_fd,generation_identity,deadline):
+                return _diagnostic_storage(original_storage,diagnostic,snapshot,
+                                           manifest.retention.max_storage_bytes,root_fd,root_identity,
+                                           generation_fd,generation_identity,deadline)
+            observer._storage=checked_storage
+        phase('observe')
         draft=observer.observe(observe_id); check()
         return BootstrapResult(final,snapshot,draft,container_id)
     finally:

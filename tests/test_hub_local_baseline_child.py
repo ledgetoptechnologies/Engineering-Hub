@@ -39,3 +39,16 @@ def test_child_reports_only_allowlisted_snapshot_codes(monkeypatch, capsys, mess
     out=capsys.readouterr()
     assert json.loads(out.out)=={'error':'local_baseline_unavailable','phase':'snapshot','code':expected}
     assert out.err==''
+
+
+def test_child_phase_diagnostic_redacts_unknown_values(monkeypatch,capsys):
+    from scripts import hub_local_baseline_child as child
+    monkeypatch.setattr(child.sys,'stdin',types.SimpleNamespace(buffer=io.BytesIO(b'{}')))
+    def fail(_):
+        child._DIAGNOSTIC.update(phase='observe',inventory='private value')
+        raise ValueError('private exception')
+    monkeypatch.setattr(child,'run',fail)
+    assert child.main()==2
+    out=capsys.readouterr()
+    assert json.loads(out.out)=={'error':'local_baseline_unavailable','phase':'observe','inventory':'unavailable'}
+    assert out.err==''

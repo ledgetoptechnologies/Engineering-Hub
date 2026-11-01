@@ -228,6 +228,33 @@ def test_restart_wait_checks_owner_and_fixed_budget(monkeypatch,wait_ms):
     assert events==(['check',('sleep',1.0),'check'] if wait_ms else ['check','check'])
 
 
+def test_inventory_diagnostic_uses_only_fixed_categories(monkeypatch):
+    snapshot=types.SimpleNamespace(source_inventory=(('db',1,'digest'),),
+                                   source_identities=(('db',1,2,3,4),))
+    assert b._inventory_category(((('other',1,'digest'),),()),snapshot)=='names_changed'
+    assert b._inventory_category(((('db',2,'digest'),),()),snapshot)=='content_changed'
+    assert b._inventory_category((snapshot.source_inventory,(('db',1,2,3,5),)),snapshot)=='identity_changed'
+    assert b._inventory_category((snapshot.source_inventory,snapshot.source_identities),snapshot)=='match'
+    def fail(*a,**k):raise RuntimeError('private value')
+    monkeypatch.setattr(b,'_operator_process_gate',lambda *a,**k:None)
+    monkeypatch.setattr(b,'_inventory',fail)
+    out={};b._record_inventory_diagnostic(out,1,10,1024,snapshot)
+    assert out=={'inventory':'unavailable'}
+
+
+def test_inventory_diagnostic_preserves_original_observer_failure(monkeypatch):
+    original=RuntimeError('original')
+    def storage(*args):raise original
+    def unsafe(*args,**kwargs):raise RuntimeError('operator gate denied')
+    monkeypatch.setattr(b,'_operator_process_gate',unsafe)
+    monkeypatch.setattr(b,'_inventory',lambda *a,**k:pytest.fail('must not open source files'))
+    result={}
+    with pytest.raises(RuntimeError) as error:
+        b._diagnostic_storage(storage,result,None,1024,1,(1,1),2,(1,2),10)
+    assert error.value is original
+    assert result=={'inventory':'unavailable'}
+
+
 @pytest.mark.parametrize('case',['insufficient','oversleep','interrupt'])
 def test_restart_wait_fails_closed_on_budget_or_interrupt(monkeypatch,case):
     now=[10.0];events=[]

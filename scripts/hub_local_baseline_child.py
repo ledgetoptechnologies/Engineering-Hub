@@ -15,6 +15,7 @@ import sys
 import time
 
 _ROOT = Path(__file__).resolve().parent.parent
+_DIAGNOSTIC = {}
 sys.path[:0] = [str(_ROOT / 'src'), str(_ROOT)]
 from engineering_hub.container_pilot_manifest import PilotManifest
 import engineering_hub.pilot_ownership as _owner_module
@@ -81,7 +82,7 @@ def run(request):
             start_id=request['ids'][1],observe_id=request['ids'][2],maximum_bytes=2*1024*1024,
             deadline_monotonic=time.monotonic()+120,quiescent=True,preflight_probe_id=request['ids'][3],
             stop_id=request['ids'][4],restart_id=request['ids'][5],initialize_empty=True,
-            startup_wait_ms=request['startup_wait_ms'])
+            startup_wait_ms=request['startup_wait_ms'],diagnostic=_DIAGNOSTIC)
         return {'manifest':result.manifest.canonical_bytes().decode(),'snapshot':asdict(result.snapshot),
             'receipt':base64.b64encode(result.draft.receipt_bytes).decode(),
             'receipt_digest':result.draft.receipt_digest,'profile_digest':result.draft.runtime_profile_digest,
@@ -94,6 +95,7 @@ def run(request):
 
 
 def main():
+    _DIAGNOSTIC.clear()
     try:
         raw = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
         if not 0 < len(raw) <= 4 * 1024 * 1024: raise ValueError('invalid request size')
@@ -107,7 +109,15 @@ def main():
         print(json.dumps({'error':'local_baseline_unavailable','phase':'snapshot','code':code},separators=(',',':')))
         return 2
     except Exception:
-        print('{"error":"local_baseline_unavailable"}')
+        phases={'initial_start','initial_probe','freeze','restart','restart_wait','observer_setup','observe'}
+        categories={'names_changed','content_changed','identity_changed','match','unavailable'}
+        phase=_DIAGNOSTIC.get('phase')
+        if type(phase) is str and phase in phases:
+            category=_DIAGNOSTIC.get('inventory','unavailable')
+            if type(category) is not str or category not in categories:category='unavailable'
+            print(json.dumps({'error':'local_baseline_unavailable','phase':phase,'inventory':category},separators=(',',':')))
+        else:
+            print('{"error":"local_baseline_unavailable"}')
         return 2
 
 

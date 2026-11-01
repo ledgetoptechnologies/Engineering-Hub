@@ -19,6 +19,16 @@ def test_snapshot_diagnostic_accepts_only_closed_sanitized_schema():
                 b'{"error":"local_baseline_unavailable","phase":"snapshot","code":"unavailable","code":"secret"}', b'\xff'):
         assert _snapshot_diagnostic(raw) is None
 
+
+def test_phase_diagnostic_accepts_only_closed_sanitized_schema():
+    from scripts.hub_local_acceptance_runner import _phase_diagnostic
+    assert _phase_diagnostic(b'{"error":"local_baseline_unavailable","phase":"observe","inventory":"identity_changed"}')==('observe','identity_changed')
+    for raw in (b'{"error":"local_baseline_unavailable","phase":"secret","inventory":"match"}',
+                b'{"error":"local_baseline_unavailable","phase":"observe","inventory":"secret"}',
+                b'{"error":"local_baseline_unavailable","phase":"observe","inventory":"match","extra":"secret"}',
+                b'{"error":"local_baseline_unavailable","phase":"observe","inventory":"match","inventory":"secret"}',b'\xff'):
+        assert _phase_diagnostic(raw) is None
+
 if sys.platform != 'linux':
     pytest.skip('local acceptance runner requires Linux', allow_module_level=True)
 

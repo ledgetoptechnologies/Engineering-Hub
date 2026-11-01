@@ -101,6 +101,20 @@ def _snapshot_diagnostic(output):
     return None
 
 
+def _phase_diagnostic(output):
+    try:
+        value=json.loads(output,object_pairs_hook=_pairs)
+        phases={'initial_start','initial_probe','freeze','restart','restart_wait','observer_setup','observe'}
+        categories={'names_changed','content_changed','identity_changed','match','unavailable'}
+        if (type(value) is dict and set(value)=={'error','phase','inventory'} and
+                value['error']=='local_baseline_unavailable' and type(value['phase']) is str and
+                value['phase'] in phases and type(value['inventory']) is str and value['inventory'] in categories):
+            return value['phase'],value['inventory']
+    except (ValueError,TypeError,UnicodeError):
+        pass
+    return None
+
+
 def _child(payload):
     """Owned child, bounded input/output and deadline; uncertainty is held."""
     raw=json.dumps(payload,separators=(',',':'),allow_nan=False).encode()
@@ -135,6 +149,9 @@ def _child(payload):
             code=_snapshot_diagnostic(output)
             if code is not None:
                 print('local baseline snapshot: '+code,file=sys.stderr)
+            phase=_phase_diagnostic(output)
+            if phase is not None:
+                print('local baseline phase: '+phase[0]+' inventory: '+phase[1],file=sys.stderr)
             raise ValueError('child outcome unavailable')
         return json.loads(output,object_pairs_hook=_pairs)
     finally:
