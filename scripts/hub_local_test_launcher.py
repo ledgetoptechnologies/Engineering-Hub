@@ -555,7 +555,7 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
                 '--memory-swap','1g','--pids-limit','256','--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=2','--cap-drop','ALL','--security-opt','no-new-privileges',
                 '--tmpfs','/tmp:rw,noexec,nosuid,nodev,size=64m',
                 '--mount','type=volume,src='+volume.name+',dst='+volume.mountpoint+',volume-nocopy',
-                *([] if alias is None else ['--mount','type=volume,src='+volume.name+',dst='+alias.path+',volume-nocopy']),
+                *([] if alias is None else ['--mount','type=bind,src='+alias.path+',dst='+alias.path+',bind-propagation=rprivate']),
                 '--mount','type=bind,src='+source_root+',dst=/opt/hub,readonly',
                 '--mount','type=bind,src='+private_dir+',dst='+private_dir,
                 '--mount','type=bind,src='+socket_source+',dst=/var/run/docker.sock',
@@ -589,24 +589,27 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
             mounts=json.loads(run(PREFIX+['inspect','--format','{{json .Mounts}}',coord_id]))
             expected={(volume.name,volume.mountpoint,volume.mountpoint,True),('',source_root,'/opt/hub',False),
                       ('',private_dir,private_dir,True),('',socket_source,'/var/run/docker.sock',True)}
-            if alias is not None: expected.add((volume.name,volume.mountpoint,alias.path,True))
+            if alias is not None: expected.add(('',alias.path,alias.path,True))
             if type(mounts) is not list: raise ValueError
             tmp=[m for m in mounts if m.get('Destination')=='/tmp']
             if len(tmp)>1 or any(m.get('Type')!='tmpfs' or m.get('RW') is not True for m in tmp): raise ValueError
             mounts=[m for m in mounts if m.get('Destination')!='/tmp']
             if len(mounts)!=len(expected): raise ValueError
             for mount in mounts:
-                if mount.get('Destination') in ({volume.mountpoint} if alias is None else {volume.mountpoint,alias.path}):
+                if mount.get('Destination')==volume.mountpoint:
                     if mount.get('Type')!='volume' or mount.get('Driver')!='local': raise ValueError
                 elif mount.get('Type')!='bind' or mount.get('Propagation') not in ('rprivate','private'):
                     raise ValueError
             observed={(m.get('Name',''),m.get('Source'),m.get('Destination'),m.get('RW')) for m in mounts}
             if observed!=expected: raise ValueError
             requested=host.get('Mounts')
-            targets={volume.mountpoint} if alias is None else {volume.mountpoint,alias.path}
+            targets={volume.mountpoint}
             if (type(requested) is not list or
                 {x.get('Target') for x in requested if x.get('Type')=='volume' and x.get('Source')==volume.name and x.get('VolumeOptions',{}).get('NoCopy') is True}!=targets or
                 sum(x.get('Type')=='volume' for x in requested)!=len(targets)): raise ValueError
+            if alias is not None and sum(x.get('Type')=='bind' and x.get('Source')==alias.path and
+                x.get('Target')==alias.path and x.get('BindOptions',{}).get('Propagation')=='rprivate' and
+                ('ReadOnly' not in x or x['ReadOnly'] is False) for x in requested)!=1: raise ValueError
         inspect('created')
         request={'schema':'engineering-hub.local-acceptance-request.v1','task_id':volume.owner,'daemon_id':volume.daemon_id,
             'volume_mount':volume.mountpoint,'private_dir':private_dir,

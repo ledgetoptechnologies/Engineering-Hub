@@ -89,8 +89,8 @@ The Linux launcher also has an explicit local-only v3 `state_alias` option for
 engines that report a non-private propagation mode for binds beneath Docker's
 data root. It binds the already initialized, keeper-held tmpfs at a private
 task path outside that root, while retaining the original named-volume identity.
-The coordinator receives the same volume at both paths and verifies their
-directory and mount identities; application generation binds use the alias
+The coordinator receives the named volume and a private bind of the alias and
+verifies their directory and mount identities; application generation binds use the alias
 and must still be reported as `rprivate`. The trusted exclusive local operator
 must provide the empty, root-owned `/run/eh/state-aliases` parent and mount
 authority in the daemon's mount namespace. After authenticated coordinator

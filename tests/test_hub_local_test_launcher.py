@@ -265,8 +265,10 @@ def test_private_input_transport_bounds_and_timeout():
 @pytest.mark.parametrize('socket_group',[None,0])
 @pytest.mark.parametrize('state_alias',[False,True])
 @pytest.mark.parametrize('detach_failure',[False,True])
-def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,monkeypatch,socket_group,state_alias,detach_failure):
+@pytest.mark.parametrize('alias_mode',['valid','requested-rslave','effective-rslave'])
+def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,monkeypatch,socket_group,state_alias,detach_failure,alias_mode):
  if detach_failure and not state_alias: pytest.skip('detach applies only to alias mode')
+ if alias_mode!='valid' and (not state_alias or detach_failure): pytest.skip('propagation denial applies to alias create')
  import time,types,stat as stmod
  import scripts.hub_local_test_launcher as l
  import scripts.hub_local_volume_initializer as init
@@ -322,8 +324,8 @@ def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,mon
    if '.Config.Entrypoint' in op[2]: return json.dumps(['/opt/validation-venv/bin/python'])
    if '.Config.Cmd' in op[2]: return json.dumps(command)
    if '.Config.Volumes' in op[2]: return 'null'
-   if 'HostConfig' in op[2]: return json.dumps({'GroupAdd':None if socket_group is None else ['0'],'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':None,'SecurityOpt':['no-new-privileges'],'Memory':1073741824,'MemorySwap':1073741824,'NanoCpus':1000000000,'PidsLimit':256,'Tmpfs':{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'AutoRemove':False,'PublishAllPorts':False,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'PidMode':'','IpcMode':'private','RestartPolicy':{'Name':'no'},'Mounts':[{'Type':'volume','Source':NAME,'Target':target,'VolumeOptions':{'NoCopy':True}} for target in ([MOUNT,alias_path] if state_alias else [MOUNT])]})
-   if 'Mounts' in op[2]: return json.dumps([{'Type':'volume','Driver':'local','Name':NAME,'Source':MOUNT,'Destination':target,'RW':True} for target in ([MOUNT,alias_path] if state_alias else [MOUNT])]+[{'Type':'bind','Propagation':'rprivate','Source':'/src','Destination':'/opt/hub','RW':False},{'Type':'bind','Propagation':'rprivate','Source':str(private),'Destination':str(private),'RW':True},{'Type':'bind','Propagation':'rprivate','Source':'/run/docker.sock','Destination':'/var/run/docker.sock','RW':True}])
+   if 'HostConfig' in op[2]: return json.dumps({'GroupAdd':None if socket_group is None else ['0'],'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':None,'SecurityOpt':['no-new-privileges'],'Memory':1073741824,'MemorySwap':1073741824,'NanoCpus':1000000000,'PidsLimit':256,'Tmpfs':{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'AutoRemove':False,'PublishAllPorts':False,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'PidMode':'','IpcMode':'private','RestartPolicy':{'Name':'no'},'Mounts':[{'Type':'volume','Source':NAME,'Target':MOUNT,'VolumeOptions':{'NoCopy':True}}]+([{'Type':'bind','Source':alias_path,'Target':alias_path,'BindOptions':{'Propagation':'rslave' if alias_mode=='requested-rslave' else 'rprivate'}}] if state_alias else [])})
+   if 'Mounts' in op[2]: return json.dumps([{'Type':'volume','Driver':'local','Name':NAME,'Source':MOUNT,'Destination':MOUNT,'RW':True}]+([{'Type':'bind','Propagation':'rslave' if alias_mode=='effective-rslave' else 'rprivate','Source':alias_path,'Destination':alias_path,'RW':True}] if state_alias else [])+[{'Type':'bind','Propagation':'rprivate','Source':'/src','Destination':'/opt/hub','RW':False},{'Type':'bind','Propagation':'rprivate','Source':str(private),'Destination':str(private),'RW':True},{'Type':'bind','Propagation':'rprivate','Source':'/run/docker.sock','Destination':'/var/run/docker.sock','RW':True}])
    return '|'.join([cid,'/hub-local-coordinator-'+TASK,IMG,TASK,state[0],'0'])
   if op[0]=='rm': return cid
   raise AssertionError(op)
@@ -333,6 +335,10 @@ def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,mon
   assert request['cleanup_key'] not in ' '.join(args)
   calls.append('start'); state[0]='exited'
  args=dict(volume=v,keeper=keeper,helper_image_id=IMG,coordinator_image_id=IMG,initial_manifest=INITIAL,candidate={},rollback={},source_root='/src',source_digest='sha256:'+'a'*64,private_dir=str(private),journal_dir=str(journal),startup_wait_ms=0,socket_group=socket_group,state_alias=state_alias,deadline_monotonic=time.monotonic()+30,run=run,run_input=start)
+ if alias_mode!='valid':
+  with pytest.raises(VolumeOutcomeUnknown): l.launch_initialized_fixture(**args)
+  assert 'start' not in calls and 'stop-keeper' not in calls and 'remove-volume' not in calls
+  return
  if detach_failure:
   with pytest.raises(VolumeOutcomeUnknown): l.launch_initialized_fixture(**args)
   assert 'alias-detach' in calls and 'stop-keeper' not in calls and 'remove-volume' not in calls
