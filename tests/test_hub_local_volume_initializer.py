@@ -43,6 +43,20 @@ def test_exact_one_shot_profile_and_intents(tmp_path):
  assert 'none' in create and '--read-only' in create and 'type=volume,src='+NAME+',dst=/fixture,volume-nocopy' in create
  assert all((tmp_path/(OWNER+s)).exists() for s in ('.init-create','.init-start','.init-remove'))
 
+@pytest.mark.parametrize('caps,accepted', [(['CHOWN'],True),(['CAP_CHOWN'],True),(['CAP_CHOWN','CAP_SYS_ADMIN'],False),([],False)])
+def test_initializer_accepts_only_one_chown_capability(tmp_path,caps,accepted):
+ d=Docker()
+ def observed(a):
+  result=d(a)
+  if a[3]=='inspect' and 'HostConfig' in a[5]:
+   value=json.loads(result);value['CapAdd']=caps;return json.dumps(value)
+  return result
+ if accepted:
+  assert initialize_owned_volume(volume=V,helper_image_id=IMAGE,journal_dir=str(tmp_path),run=observed)==ID
+ else:
+  with pytest.raises(VolumeOutcomeUnknown): initialize_owned_volume(volume=V,helper_image_id=IMAGE,journal_dir=str(tmp_path),run=observed)
+  assert not any(a[3]=='start' for a in d.calls)
+
 def test_image_declared_volumes_denied_before_create(tmp_path):
  d=Docker()
  def declared(a):

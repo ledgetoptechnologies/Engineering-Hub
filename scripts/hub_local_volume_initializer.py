@@ -85,7 +85,7 @@ def initialize_owned_volume(*, volume, helper_image_id, journal_dir, keeper=None
         profile=json.loads(run(PREFIX+['inspect','--format','{{json .HostConfig}}',ident]))
         if (type(profile) is not dict or profile.get('NetworkMode')!='none'
             or profile.get('ReadonlyRootfs') is not True or profile.get('Privileged') is not False
-            or profile.get('CapDrop') != ['ALL'] or profile.get('CapAdd') != ['CHOWN']
+            or profile.get('CapDrop') != ['ALL'] or profile.get('CapAdd') not in (['CHOWN'], ['CAP_CHOWN'])
             or profile.get('LogConfig') != {'Type':'local','Config':{'max-size':'1m','max-file':'2'}}
             or profile.get('Memory') != 134217728 or profile.get('MemorySwap') != 134217728
             or profile.get('NanoCpus') != 250000000 or profile.get('PidsLimit') != 32
