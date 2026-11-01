@@ -85,6 +85,19 @@ and successor brokers; this does not bound daemon read-ahead or CPU. The broker
 requires a local log driver capped at two 1MiB files per application container.
 The holder has bounded resources but deliberately remains alive on an uncertain
 outcome until an operator inspects the original task and resolves cleanup.
+The Linux launcher also has an explicit local-only v3 `state_alias` option for
+engines that report a non-private propagation mode for binds beneath Docker's
+data root. It binds the already initialized, keeper-held tmpfs at a private
+task path outside that root, while retaining the original named-volume identity.
+The coordinator receives the same volume at both paths and verifies their
+directory and mount identities; application generation binds use the alias
+and must still be reported as `rprivate`. The trusted exclusive local operator
+must provide the empty, root-owned `/run/eh/state-aliases` parent and mount
+authority in the daemon's mount namespace. After authenticated coordinator
+cleanup, the launcher detaches the alias while the keeper is still live; any
+uncertain bind or detach holds the keeper and volume. This is local fixture
+custody, not proof against a privileged host writer, and the alias route has
+not yet established a successful native rollback.
 The existing archive helper requires an independently supplied exact manifest
 digest; a local Docker image ID is not that digest. A lost effect or any
 unverified cleanup retains the task resources for explicit inspection. Do not

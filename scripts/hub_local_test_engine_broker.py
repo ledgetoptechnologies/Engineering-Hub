@@ -274,8 +274,9 @@ class LocalTestBroker:
     """
 
     def __init__(self, *, socket_path, socket_identity, version, owner,
-                 volume, images, creates, exec_bodies, journal, archive_budget=None):
+                 volume, images, creates, exec_bodies, journal, archive_budget=None, state_alias=None):
         from scripts.hub_local_test_volume import OwnedVolume, TMPFS_OPTIONS
+        from scripts.hub_local_state_alias import StateAlias
         if (socket_path != '/var/run/docker.sock' or
                 not re.fullmatch(r'1\.[0-9]{2,3}', version) or
                 type(owner) is not str or str(uuid.UUID(owner)) != owner or
@@ -286,7 +287,8 @@ class LocalTestBroker:
                 str(Path(volume.mountpoint)) != volume.mountpoint or '..' in Path(volume.mountpoint).parts or
                 not volume.mountpoint.endswith('/volumes/' + volume.name + '/_data') or
                 type(images) is not dict or type(creates) is not dict or type(exec_bodies) is not list or
-                type(journal) is not EffectJournal or archive_budget is not None and type(archive_budget) is not ArchiveBudget):
+                type(journal) is not EffectJournal or archive_budget is not None and type(archive_budget) is not ArchiveBudget or
+                state_alias is not None and (type(state_alias) is not StateAlias or state_alias.volume != volume)):
             raise Denied('invalid test enrollment')
         if len(images) != 2 or len(creates) != 3 or not 1 <= len(exec_bodies) <= 32:
             raise Denied('invalid test enrollment')
@@ -296,7 +298,9 @@ class LocalTestBroker:
                for k, v in images.items()):
             raise Denied('invalid test images')
         self.socket_path, self.socket_identity = socket_path, socket_identity
-        volume_mount = volume.mountpoint
+        self.state_alias = state_alias
+        self._state_alias_pin = state_alias.check() if state_alias is not None else None
+        volume_mount = volume.mountpoint if state_alias is None else state_alias.alias
         self.version, self.owner, self.mount, self.images = version, owner, volume_mount, dict(images)
         self.volume = volume
         self.archive_budget = self._archive_budget_pin = archive_budget
@@ -391,15 +395,25 @@ class LocalTestBroker:
         self._binding = self._current_binding()
         journal.bind(self._binding)
 
+    def _recheck_alias(self):
+        try:
+            if self.state_alias is not None and self.state_alias.check()!=self._state_alias_pin:
+                raise ValueError
+        except Exception:
+            raise Denied('state alias changed') from None
+
     def _current_binding(self):
         if self.archive_budget is not self._archive_budget_pin:
             raise Denied('archive budget changed')
+        self._recheck_alias()
         enrollment = {'owner': self.owner, 'daemon_id': self.volume.daemon_id, 'volume': self.volume.name,
                       'mountpoint': self.volume.mountpoint, 'version': self.version,
                       'socket_path': self.socket_path, 'socket_identity': self.socket_identity, 'images': self.images,
                       'creates': self.creates, 'exec_bodies': self.exec_bodies, 'log_config':_LOG_CONFIG}
         if self.volume.options:
             enrollment['volume_options'] = self.volume.options
+        if self.state_alias is not None:
+            enrollment['state_alias'] = (self.state_alias.alias,self._state_alias_pin)
         if self.archive_budget is not None:
             enrollment['archive_budget_bytes'] = _MAX_RUN_ARCHIVES
         return hashlib.sha256(json.dumps(enrollment, sort_keys=True, separators=(',', ':'),
@@ -678,6 +692,7 @@ class LocalTestBroker:
 
     def _cleanup_effect(self, kind, identity, name):
         self._attest_volume()
+        self._recheck_alias()
         ticket = self.journal.begin_cleanup(kind, identity)
         connection = None
         try:
@@ -696,7 +711,7 @@ class LocalTestBroker:
                 self._read_bounded(response, _MAX_BODY)
                 if response.status != 404:
                     raise Denied('container removal unverified')
-            self.journal.complete(ticket)
+            self._recheck_alias();self.journal.complete(ticket)
         finally:
             if connection is not None:
                 connection.close()
@@ -804,6 +819,7 @@ class LocalTestBroker:
         if effect_key is None:
             effect_key = os.urandom(16).hex()
         self._attest_volume()
+        self._recheck_alias()
         ticket = self.journal.begin(kind, effect_key)
         connection = None
         try:
@@ -821,7 +837,7 @@ class LocalTestBroker:
                 record_kind = 'container' if kind == 'create' else 'exec'
                 if kind == 'create':
                     self._inspect_owned(identity, name, 'created')
-            self.journal.complete(ticket, kind=record_kind, identity=identity, name=name)
+            self._recheck_alias();self.journal.complete(ticket, kind=record_kind, identity=identity, name=name)
             try:
                 emit(response.status, {'Content-Type': response.getheader('Content-Type', 'application/json')}, iter((raw,)))
             except BaseException:

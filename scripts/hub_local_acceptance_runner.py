@@ -177,8 +177,10 @@ async def run(request):
     fields={'schema','task_id','daemon_id','volume_mount','private_dir','manifest',
             'candidate','rollback','coordinator_id','coordinator_image_id','cleanup_nonce','cleanup_key','startup_wait_ms',
             'volume_storage'}
-    if (os.getuid()!=10001 or os.getgid()!=10001 or type(request) is not dict or set(request)!=fields
-            or request['schema']!=SCHEMA or type(request['task_id']) is not str
+    if (os.getuid()!=10001 or os.getgid()!=10001 or type(request) is not dict
+            or not (set(request)==fields and request.get('schema')==SCHEMA
+                    or set(request)==fields|{'state_alias'} and request.get('schema')=='engineering-hub.local-acceptance-request.v2')
+            or type(request['task_id']) is not str
             or str(uuid.UUID(request['task_id']))!=request['task_id']
             or type(request['daemon_id']) is not str or not re.fullmatch('[A-Za-z0-9:._-]{12,128}',request['daemon_id'])
             or type(request['coordinator_id']) is not str or not re.fullmatch('[a-f0-9]{64}',request['coordinator_id'])
@@ -195,8 +197,12 @@ async def run(request):
     _bounded_volume(mount)
     if private==mount or private.is_relative_to(mount) or mount.is_relative_to(private):
         raise ValueError('local acceptance paths overlap')
-    root=_directory(str(mount/'generations')); _directory(str(root/'baseline-g1'),empty=True)
-    _directory(str(mount/'reservations'),empty=True)
+    alias=request.get('state_alias')
+    if 'state_alias' in request and alias!='/run/eh/state-aliases/'+request['task_id']:
+        raise ValueError('local state alias unavailable')
+    state_root=mount if alias is None else _directory(alias)
+    root=_directory(str(state_root/'generations')); _directory(str(root/'baseline-g1'),empty=True)
+    _directory(str(state_root/'reservations'),empty=True)
     with os.scandir(root) as entries:
         if {entry.name for entry in entries}!={'baseline-g1'}: raise ValueError('generation root unavailable')
     manifest=PilotManifest.from_bytes(request['manifest'].encode())
@@ -208,9 +214,17 @@ async def run(request):
     for image in (candidate,rollback): discover_cached_image(image,daemon_id=request['daemon_id'])
     socket_identity=_socket_identity()
     volume=OwnedVolume('hub-local-test-'+request['task_id'],request['task_id'],request['daemon_id'],str(mount),TMPFS_OPTIONS)
-    owner_path=private/'hub.sqlite3'; owner=PilotOwner(owner_path,allow_ephemeral_test_storage=True); owner.close()
-    source=LocalSource(manifest=manifest,candidate=candidate,rollback=rollback,volume=volume,private_dir=private,
-                       daemon_socket_identity=socket_identity,archive_budget=ArchiveBudget())
+    alias_guard=None
+    if alias is not None:
+        from scripts.hub_local_state_alias import StateAlias
+        alias_guard=StateAlias(alias,volume,uid=10001,gid=10001)
+    try:
+        owner_path=private/'hub.sqlite3'; owner=PilotOwner(owner_path,allow_ephemeral_test_storage=True); owner.close()
+        source=LocalSource(manifest=manifest,candidate=candidate,rollback=rollback,volume=volume,private_dir=private,
+                           daemon_socket_identity=socket_identity,archive_budget=ArchiveBudget(),state_alias=alias_guard)
+    except BaseException:
+        if alias_guard is not None: alias_guard.close()
+        raise
     coordinator=successor=provider=None
     try:
         payload={'manifest':manifest.canonical_bytes().decode(),'owner_db':str(owner_path),
@@ -238,7 +252,7 @@ async def run(request):
         source_snapshot=source.seal()
         successor=LocalSuccessor(manifest=final,candidate=candidate,rollback=rollback,records=records,metadata=metadata,
             verifier=verifier,baseline_provider=provider,snapshot=snapshot,source_broker=source.broker,
-            source_snapshot=source_snapshot,volume=volume,private_dir=private,daemon_socket_identity=socket_identity)
+            source_snapshot=source_snapshot,volume=volume,private_dir=private,daemon_socket_identity=socket_identity,state_alias=alias_guard)
         coordinator=LocalNativeCoordinator(database=owner_path,manifest=final,task_owner=request['task_id'],
                                            prepare_bound=successor.prepare,timeout_seconds=300)
         job,result=await coordinator.run_once()
@@ -264,7 +278,9 @@ async def run(request):
                 try:
                     if provider is not None: provider.close()
                 finally:
-                    source.close()
+                    try: source.close()
+                    finally:
+                        if alias_guard is not None: alias_guard.close()
 
 
 def main():

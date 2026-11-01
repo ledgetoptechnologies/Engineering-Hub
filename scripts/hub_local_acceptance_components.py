@@ -37,15 +37,19 @@ class _SyntheticDriver:
 class LocalSource:
     """One initial broker; a sealed exact baseline may transfer to a successor."""
     def __init__(self, *, manifest, candidate, rollback, volume, private_dir,
-                 daemon_socket_identity, api_version='1.41', archive_budget=None):
+                 daemon_socket_identity, api_version='1.41', archive_budget=None, state_alias=None):
+        from scripts.hub_local_state_alias import StateAlias
         if (type(manifest) is not PilotManifest or type(candidate) is not VerifiedImage or candidate.role != 'candidate'
-                or type(rollback) is not VerifiedImage or rollback.role != 'rollback' or type(volume) is not OwnedVolume):
+                or type(rollback) is not VerifiedImage or rollback.role != 'rollback' or type(volume) is not OwnedVolume
+                or state_alias is not None and (type(state_alias) is not StateAlias or state_alias.volume != volume)):
             raise ValueError('Exact local source enrollment required')
         prefix = 'hub-pilot-' + uuid.UUID(volume.owner).hex[:24]
         if manifest.runtime.resource_name_prefix != prefix:
             raise ValueError('Local source owner mismatch')
         self.private, self.volume, self.manifest = Path(private_dir), volume, manifest
-        root = Path(volume.mountpoint) / 'generations'
+        self.state_alias=state_alias
+        if state_alias is not None: state_alias.check()
+        root = Path(volume.mountpoint if state_alias is None else state_alias.alias) / 'generations'
         images = {'candidate':candidate,'rollback':rollback}
         secrets = {'CODEX_TOKEN':'synthetic-codex','HERMES_TOKEN':'synthetic-hermes','CLAUDE_TOKEN':'synthetic-claude'}
         names = {'baseline':prefix+'-00000000-000-rollback','candidate':prefix+'-11111111-111-candidate',
@@ -72,7 +76,7 @@ class LocalSource:
             self.broker = LocalTestBroker(socket_path='/var/run/docker.sock',socket_identity=daemon_socket_identity,
                 version=api_version,owner=volume.owner,volume=volume,images={image.runnable_reference:
                     (image.image_config_id,image.platform_manifest_digest) for image in images.values()},
-                creates=bodies,exec_bodies=probes,journal=journal,archive_budget=archive_budget)
+                creates=bodies,exec_bodies=probes,journal=journal,archive_budget=archive_budget,state_alias=state_alias)
             self.server = LocalTestSocketServer(str(self.private/'bootstrap.sock'),self.broker)
             self.thread = threading.Thread(target=self.server.serve_forever)
             self._stack.callback(self._close_server)
@@ -112,18 +116,20 @@ class LocalSuccessor:
     """One admitted bound run, with a serial owned broker and adapter."""
     def __init__(self, *, manifest, candidate, rollback, records, metadata, verifier,
                  baseline_provider, snapshot, source_broker, source_snapshot, volume,
-                 private_dir, daemon_socket_identity, api_version='1.41'):
+                 private_dir, daemon_socket_identity, api_version='1.41', state_alias=None):
         if (type(manifest) is not PilotManifest or type(candidate) is not VerifiedImage or candidate.role != 'candidate'
                 or type(rollback) is not VerifiedImage or rollback.role != 'rollback'
                 or type(baseline_provider) is not ProtectedBaselineProvider or type(snapshot) is not FrozenBaselineSnapshot
                 or type(source_broker) is not LocalTestBroker or type(source_snapshot) is not ClosedBrokerSnapshot
-                or type(volume) is not OwnedVolume or source_broker.volume != volume):
+                or type(volume) is not OwnedVolume or source_broker.volume != volume or source_broker.state_alias is not state_alias):
             raise ValueError('Exact local successor enrollment required')
         self.manifest, self.candidate, self.rollback = manifest, candidate, rollback
         self.records, self.metadata, self.verifier = records, metadata, verifier
         self.baseline_provider, self.snapshot = baseline_provider, snapshot
         self.source_broker, self.source_snapshot, self.volume = source_broker, source_snapshot, volume
-        self.private = Path(private_dir); self.generation_root = Path(volume.mountpoint) / 'generations'
+        self.private = Path(private_dir); self.state_alias=state_alias
+        self.state_root=Path(volume.mountpoint if state_alias is None else state_alias.alias)
+        self.generation_root = self.state_root / 'generations'
         self.identity, self.version = daemon_socket_identity, api_version
         self._stack, self._attempted, self.server, self.thread, self.broker = ExitStack(), False, None, None, None
         self._lock, self._closed = threading.RLock(), False
@@ -169,7 +175,7 @@ class LocalSuccessor:
         broker = LocalTestBroker(socket_path='/var/run/docker.sock',socket_identity=self.identity,version=self.version,
             owner=self.volume.owner,volume=self.volume,images={image.runnable_reference:
                 (image.image_config_id,image.platform_manifest_digest) for image in images.values()},
-            creates=bodies,exec_bodies=probes,journal=journal,archive_budget=self.source_broker.archive_budget)
+            creates=bodies,exec_bodies=probes,journal=journal,archive_budget=self.source_broker.archive_budget,state_alias=self.state_alias)
         self.broker = broker
         baseline = broker.transfer_baseline_from(source=self.source_broker,snapshot=self.source_snapshot,
             manifest=manifest,rollback_image=self.rollback,provider=self.baseline_provider)
@@ -183,7 +189,7 @@ class LocalSuccessor:
         backend = DockerEngineBackend(binding); self._stack.callback(backend.close)
         provider = FrozenSQLiteStateProvisioner(manifest,baseline,baseline_provider=self.baseline_provider,
             frozen_backup=self.generation_root/'frozen.sqlite3',generation_root=self.generation_root,
-            reservation_root=Path(self.volume.mountpoint)/'reservations',
+            reservation_root=self.state_root/'reservations',
             baseline_generation_inventory=self.snapshot.source_inventory,create=True,allow_ephemeral_test_storage=True)
         self._stack.callback(provider.close)
         self._adapter = HostAdapter(self.private/'adapter.sqlite3',manifest,record_store=self.records,metadata_store=self.metadata,

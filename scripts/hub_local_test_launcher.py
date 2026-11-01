@@ -238,6 +238,26 @@ def start_tmpfs_keeper(*, volume, helper_image_id, journal_dir, run=_call):
     return keeper
 
 
+def _authorize_keeper_stop(*, keeper, initial_manifest, coordinator_id, coordinator_image_id,
+                           nonce, key, receipt_directory_fd, receipt_directory_identity, run):
+    """Recheck the receipt and absence of every recorded app."""
+    try:
+        if type(keeper) is not TmpfsKeeper: raise ValueError
+        volume=keeper.volume
+        root=run(PREFIX+['info','--format','{{.DockerRootDir}}']).strip()
+        expected={'task_id':volume.owner,'daemon_id':volume.daemon_id,'docker_root':root,
+            'volume_name':volume.name,'volume_mount':volume.mountpoint,'coordinator_id':coordinator_id,
+            'coordinator_image_id':coordinator_image_id,'volume_storage':'tmpfs-512m-v1',
+            'volume_options':dict(volume.options),'initial_manifest_digest':initial_manifest.digest(),'nonce':nonce}
+        rows=read_cleanup_receipt(directory_fd=receipt_directory_fd,directory_identity=receipt_directory_identity,
+                                  key=key,expected=expected,initial_manifest=initial_manifest)
+        ids=run(PREFIX+['ps','--all','--quiet','--no-trunc']).splitlines()
+        if (any(not re.fullmatch('[a-f0-9]{64}',x) for x in ids)
+            or coordinator_id in ids or any(ident in ids for ident,_ in rows)): raise ValueError
+        return rows
+    except Exception: raise VolumeError('Keeper stop authorization unavailable') from None
+
+
 def stop_tmpfs_keeper(*, keeper, initial_manifest, coordinator_id, coordinator_image_id,
                       nonce, key, receipt_directory_fd, receipt_directory_identity, journal_dir, run=_call):
     """Stop/remove the keeper only after authenticated coordinator exit evidence.
@@ -245,22 +265,13 @@ def stop_tmpfs_keeper(*, keeper, initial_manifest, coordinator_id, coordinator_i
     The trusted launcher must independently verify exit-zero and remove the
     exact coordinator first. Every uncertainty retains all remaining resources.
     """
+    def authorize():
+        return _authorize_keeper_stop(keeper=keeper,initial_manifest=initial_manifest,coordinator_id=coordinator_id,
+            coordinator_image_id=coordinator_image_id,nonce=nonce,key=key,receipt_directory_fd=receipt_directory_fd,
+            receipt_directory_identity=receipt_directory_identity,run=run)
     try:
         if type(keeper) is not TmpfsKeeper: raise ValueError
-        volume=keeper.volume
-        check_tmpfs_keeper(keeper,volume=volume,run=run)
-        root=run(PREFIX+['info','--format','{{.DockerRootDir}}']).strip()
-        expected={'task_id':volume.owner,'daemon_id':volume.daemon_id,'docker_root':root,
-            'volume_name':volume.name,'volume_mount':volume.mountpoint,'coordinator_id':coordinator_id,
-            'coordinator_image_id':coordinator_image_id,'volume_storage':'tmpfs-512m-v1',
-            'volume_options':dict(volume.options),'initial_manifest_digest':initial_manifest.digest(),'nonce':nonce}
-        def authorize():
-            rows=read_cleanup_receipt(directory_fd=receipt_directory_fd,directory_identity=receipt_directory_identity,
-                                      key=key,expected=expected,initial_manifest=initial_manifest)
-            ids=run(PREFIX+['ps','--all','--quiet','--no-trunc']).splitlines()
-            if (any(not re.fullmatch('[a-f0-9]{64}',x) for x in ids)
-                or coordinator_id in ids or any(ident in ids for ident,_ in rows)): raise ValueError
-            return rows
+        volume=keeper.volume;check_tmpfs_keeper(keeper,volume=volume,run=run)
         original=authorize()
     except Exception: raise VolumeError('Keeper stop authorization unavailable') from None
     handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.keeper-stop','keeper-stop')
@@ -353,8 +364,8 @@ def _check_resource_envelope(manifest):
         raise VolumeError('Local fixture aggregate resource envelope exceeded')
 
 
-def _validate_local_paths(source_root, private_dir, journal_dir, volume_mount):
-    paths=(source_root,private_dir,journal_dir,volume_mount)
+def _validate_local_paths(source_root, private_dir, journal_dir, volume_mount, state_alias_path=None):
+    paths=(source_root,private_dir,journal_dir,volume_mount)+(() if state_alias_path is None else (state_alias_path,))
     if any(type(p) is not str or not p.startswith('/') or p.startswith('//') or ',' in p
            or str(PurePosixPath(p))!=p or '..' in PurePosixPath(p).parts for p in paths):
         raise VolumeError('Invalid local fixture paths')
@@ -381,10 +392,95 @@ def _socket_pin(group):
     return (source,sock.st_dev,sock.st_ino,sock.st_uid,sock.st_gid,stat.S_IMODE(sock.st_mode))
 
 
+_STATE_ALIAS_PARENT='/run/eh/state-aliases'
+
+
+class _OwnedStateAlias:
+    """One private, task-local bind of the already initialized named volume."""
+    def __init__(self, volume, journal_dir):
+        import ctypes
+        from scripts.hub_local_state_alias import StateAlias
+        if os.geteuid()!=0 or type(volume) is not OwnedVolume:
+            raise VolumeError('Local alias authority unavailable')
+        parent=_STATE_ALIAS_PARENT
+        if os.path.realpath(parent)!=parent: raise VolumeError('Local alias parent unavailable')
+        self.path=parent+'/'+volume.owner
+        self.volume=volume; self.journal_dir=journal_dir; self.guard=None; self.parent=None
+        handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.alias-bind','alias-bind')
+        source=target=None
+        try:
+            _check_path(handles)
+            self.parent=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+            p=os.fstat(self.parent)
+            if (p.st_uid,p.st_gid,stat.S_IMODE(p.st_mode))!=(0,0,0o700) or os.listdir(self.parent): raise ValueError
+            os.mkdir(volume.owner,0o700,dir_fd=self.parent)
+            target=os.open(volume.owner,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=self.parent)
+            before=os.fstat(target); self.placeholder=(before.st_dev,before.st_ino)
+            source=os.open(volume.mountpoint,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+            libc=ctypes.CDLL(None,use_errno=True)
+            libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_char_p]
+            src=os.fsencode('/proc/self/fd/'+str(source)); dst=os.fsencode('/proc/self/fd/'+str(target))
+            if libc.mount(src,dst,None,4096,None): raise OSError(ctypes.get_errno(),'alias bind failed')
+            os.close(target); target=None
+            if libc.mount(None,os.fsencode(self.path),None,16384|262144,None): raise OSError(ctypes.get_errno(),'alias privacy failed')
+            self.guard=StateAlias(self.path,volume,uid=10001,gid=10001)
+            self.guard.check(); _check_path(handles)
+        except Exception:
+            if self.guard is not None:
+                try: self.guard.close()
+                except Exception: pass
+                self.guard=None
+            if self.parent is not None:
+                try: os.close(self.parent)
+                except OSError: pass
+                self.parent=None
+            raise VolumeOutcomeUnknown('State alias creation unknown; preserve') from None
+        finally:
+            failed=False
+            for fd in (target,source):
+                if fd is not None:
+                    try: os.close(fd)
+                    except OSError: failed=True
+            try: _close_handles(handles)
+            except OSError: failed=True
+            if failed:
+                if self.guard is not None:
+                    try: self.guard.close()
+                    except Exception: pass
+                    self.guard=None
+                if self.parent is not None:
+                    try: os.close(self.parent)
+                    except OSError: pass
+                    self.parent=None
+                raise VolumeOutcomeUnknown('State alias descriptor cleanup unknown; preserve') from None
+
+    def detach(self):
+        import ctypes
+        if self.guard is None or self.parent is None: raise VolumeError('State alias unavailable')
+        volume=self.volume
+        handles=_reserve_intent(self.journal_dir,volume.owner,volume.daemon_id,volume.name,'.alias-detach','alias-detach')
+        try:
+            _check_path(handles); self.guard.check()
+            p=os.fstat(self.parent); named=os.stat(_STATE_ALIAS_PARENT,follow_symlinks=False)
+            if (p.st_dev,p.st_ino)!=(named.st_dev,named.st_ino): raise ValueError
+            self.guard.close(); self.guard=None
+            libc=ctypes.CDLL(None,use_errno=True);libc.umount2.argtypes=[ctypes.c_char_p,ctypes.c_int]
+            if libc.umount2(os.fsencode(self.path),0): raise OSError(ctypes.get_errno(),'alias detach failed')
+            leaf=os.stat(volume.owner,dir_fd=self.parent,follow_symlinks=False)
+            if not stat.S_ISDIR(leaf.st_mode) or (leaf.st_dev,leaf.st_ino)!=self.placeholder: raise ValueError
+            os.rmdir(volume.owner,dir_fd=self.parent);os.fsync(self.parent)
+            _check_path(handles)
+        except Exception:
+            raise VolumeOutcomeUnknown('State alias detach unknown; preserve') from None
+        finally:
+            _close_handles(handles)
+        os.close(self.parent);self.parent=None
+
+
 def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_image_id,
                                initial_manifest, candidate, rollback, source_root, source_digest,
                                private_dir, journal_dir,
-                               startup_wait_ms, deadline_monotonic, socket_group=None, socket_pin=None, run=_call,
+                               startup_wait_ms, deadline_monotonic, socket_group=None, socket_pin=None, state_alias=False, run=_call,
                                run_input=_call_with_input):
     """Run fixed local fixture through post-exit cleanup; failure retains resources.
 
@@ -405,7 +501,7 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
         or not re.fullmatch('sha256:[a-f0-9]{64}',coordinator_image_id)
         or type(source_digest) is not str or not re.fullmatch('sha256:[a-f0-9]{64}',source_digest)
         or type(startup_wait_ms) is not int or not 0<=startup_wait_ms<=30000
-        or type(deadline_monotonic) not in (int,float) or not math.isfinite(deadline_monotonic)
+        or type(deadline_monotonic) not in (int,float) or not math.isfinite(deadline_monotonic) or type(state_alias) is not bool
         or time.monotonic()>=deadline_monotonic or type(candidate) is not dict or type(rollback) is not dict):
         raise VolumeError('Invalid local acceptance enrollment')
     _check_resource_envelope(initial_manifest)
@@ -415,7 +511,8 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
             verify_fixture_image(initial_manifest,role,_fixture(raw))
     except Exception:
         raise VolumeError('Synthetic image enrollment invalid') from None
-    _validate_local_paths(source_root,private_dir,journal_dir,volume.mountpoint)
+    _validate_local_paths(source_root,private_dir,journal_dir,volume.mountpoint,
+                          _STATE_ALIAS_PARENT+'/'+volume.owner if state_alias else None)
     if source_tree_digest(source_root,deadline_monotonic=deadline_monotonic)!=source_digest: raise VolumeError('Local source identity changed')
     for p in (private_dir,):
         st=os.stat(p,follow_symlinks=False)
@@ -433,13 +530,16 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
     bootstrap=_coordinator_bootstrap(socket_group)
     receipt_fd=os.open(private_dir,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     receipt_stat=os.fstat(receipt_fd); receipt_identity=(receipt_stat.st_dev,receipt_stat.st_ino)
-    name='hub-local-coordinator-'+volume.owner; coord_id=None
+    name='hub-local-coordinator-'+volume.owner; coord_id=None; alias=None
     key=secrets.token_bytes(32); nonce=secrets.token_hex(32)
     try:
         if time.monotonic()>=deadline_monotonic: raise VolumeError('Local deadline expired; keeper retained')
         check_tmpfs_keeper(keeper,volume=volume,run=run)
         initialize_owned_volume(volume=volume,helper_image_id=helper_image_id,journal_dir=journal_dir,keeper=keeper,run=run)
         check_tmpfs_keeper(keeper,volume=volume,run=run)
+        if state_alias:
+            alias=_OwnedStateAlias(volume,journal_dir)
+            alias.guard.check();check_tmpfs_keeper(keeper,volume=volume,run=run)
         if (run(PREFIX+['image','inspect','--format','{{.Id}}',coordinator_image_id]).strip()!=coordinator_image_id
             or json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',coordinator_image_id])) not in (None,{})
             or name in run(PREFIX+['ps','--all','--format','{{.Names}}']).splitlines()):
@@ -448,12 +548,14 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
         handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.coordinator-create','coordinator-create')
         try:
             _check_path(handles); check_tmpfs_keeper(keeper,volume=volume,run=run); _check_path(handles)
+            if alias is not None: alias.guard.check()
             if _socket_pin(socket_group)!=socket_pin: raise ValueError
             coord_id=run(PREFIX+['create','--pull=never','--interactive','--name',name,'--label',LABEL+'='+volume.owner,
                 '--user','10001:10001','--network','none','--read-only','--cpus','1','--memory','1g',
                 '--memory-swap','1g','--pids-limit','256','--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=2','--cap-drop','ALL','--security-opt','no-new-privileges',
                 '--tmpfs','/tmp:rw,noexec,nosuid,nodev,size=64m',
                 '--mount','type=volume,src='+volume.name+',dst='+volume.mountpoint+',volume-nocopy',
+                *([] if alias is None else ['--mount','type=volume,src='+volume.name+',dst='+alias.path+',volume-nocopy']),
                 '--mount','type=bind,src='+source_root+',dst=/opt/hub,readonly',
                 '--mount','type=bind,src='+private_dir+',dst='+private_dir,
                 '--mount','type=bind,src='+socket_source+',dst=/var/run/docker.sock',
@@ -487,36 +589,44 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
             mounts=json.loads(run(PREFIX+['inspect','--format','{{json .Mounts}}',coord_id]))
             expected={(volume.name,volume.mountpoint,volume.mountpoint,True),('',source_root,'/opt/hub',False),
                       ('',private_dir,private_dir,True),('',socket_source,'/var/run/docker.sock',True)}
+            if alias is not None: expected.add((volume.name,volume.mountpoint,alias.path,True))
             if type(mounts) is not list: raise ValueError
             tmp=[m for m in mounts if m.get('Destination')=='/tmp']
             if len(tmp)>1 or any(m.get('Type')!='tmpfs' or m.get('RW') is not True for m in tmp): raise ValueError
             mounts=[m for m in mounts if m.get('Destination')!='/tmp']
             if len(mounts)!=len(expected): raise ValueError
             for mount in mounts:
-                if mount.get('Destination')==volume.mountpoint:
+                if mount.get('Destination') in ({volume.mountpoint} if alias is None else {volume.mountpoint,alias.path}):
                     if mount.get('Type')!='volume' or mount.get('Driver')!='local': raise ValueError
                 elif mount.get('Type')!='bind' or mount.get('Propagation') not in ('rprivate','private'):
                     raise ValueError
             observed={(m.get('Name',''),m.get('Source'),m.get('Destination'),m.get('RW')) for m in mounts}
             if observed!=expected: raise ValueError
             requested=host.get('Mounts')
-            if type(requested) is not list or not any(x.get('Type')=='volume' and x.get('Source')==volume.name and x.get('Target')==volume.mountpoint and x.get('VolumeOptions',{}).get('NoCopy') is True for x in requested): raise ValueError
+            targets={volume.mountpoint} if alias is None else {volume.mountpoint,alias.path}
+            if (type(requested) is not list or
+                {x.get('Target') for x in requested if x.get('Type')=='volume' and x.get('Source')==volume.name and x.get('VolumeOptions',{}).get('NoCopy') is True}!=targets or
+                sum(x.get('Type')=='volume' for x in requested)!=len(targets)): raise ValueError
         inspect('created')
         request={'schema':'engineering-hub.local-acceptance-request.v1','task_id':volume.owner,'daemon_id':volume.daemon_id,
             'volume_mount':volume.mountpoint,'private_dir':private_dir,
             'manifest':initial_manifest.canonical_bytes().decode('utf8'),'candidate':candidate,'rollback':rollback,
             'coordinator_id':coord_id,'coordinator_image_id':coordinator_image_id,'cleanup_nonce':nonce,
             'cleanup_key':key.hex(),'startup_wait_ms':startup_wait_ms,'volume_storage':'tmpfs-512m-v1'}
+        if alias is not None:
+            alias.guard.check();request['schema']='engineering-hub.local-acceptance-request.v2';request['state_alias']=alias.path
         raw=_canonical(request)
         if len(raw)>8*1024*1024: raise VolumeError('Local acceptance request exceeds limit')
         if time.monotonic()>=deadline_monotonic or source_tree_digest(source_root,deadline_monotonic=deadline_monotonic)!=source_digest: raise VolumeOutcomeUnknown('Local admission unavailable; coordinator and keeper retained')
         handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.coordinator-start','coordinator-start')
         try:
             _check_path(handles); check_tmpfs_keeper(keeper,volume=volume,run=run); inspect('created'); _check_path(handles)
+            if alias is not None: alias.guard.check()
             if _socket_pin(socket_group)!=socket_pin: raise ValueError
             run_input(PREFIX+['start','--attach','--interactive',coord_id],raw,deadline_monotonic)
             check_tmpfs_keeper(keeper,volume=volume,run=run); inspect('exited')
             if source_tree_digest(source_root,deadline_monotonic=deadline_monotonic)!=source_digest: raise ValueError('Local source identity changed')
+            if alias is not None: alias.guard.check()
         except Exception: raise VolumeOutcomeUnknown('Coordinator result unknown; keeper retained') from None
         finally: _close_handles(handles)
         handles=_reserve_intent(journal_dir,volume.owner,volume.daemon_id,volume.name,'.coordinator-remove','coordinator-remove')
@@ -527,6 +637,11 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
             if any(not re.fullmatch('[a-f0-9]{64}',x) for x in ids) or coord_id in ids: raise ValueError
         except Exception: raise VolumeOutcomeUnknown('Coordinator removal unknown; keeper retained') from None
         finally: _close_handles(handles)
+        if alias is not None:
+            _authorize_keeper_stop(keeper=keeper,initial_manifest=initial_manifest,coordinator_id=coord_id,
+                coordinator_image_id=coordinator_image_id,nonce=nonce,key=key,receipt_directory_fd=receipt_fd,
+                receipt_directory_identity=receipt_identity,run=run)
+            check_tmpfs_keeper(keeper,volume=volume,run=run);alias.guard.check();alias.detach()
         stop_tmpfs_keeper(keeper=keeper,initial_manifest=initial_manifest,coordinator_id=coord_id,
             coordinator_image_id=coordinator_image_id,nonce=nonce,key=key,receipt_directory_fd=receipt_fd,
             receipt_directory_identity=receipt_identity,journal_dir=journal_dir,run=run)
@@ -545,7 +660,7 @@ def launch_initialized_fixture(*, volume, keeper, helper_image_id, coordinator_i
 def run_local_acceptance(*, task_id, daemon_id, helper_image_id, coordinator_image_id,
                          initial_manifest, candidate, rollback, source_root, source_digest,
                          private_dir, journal_dir, startup_wait_ms,
-                         deadline_monotonic, socket_group=None, run=_call, run_input=_call_with_input):
+                         deadline_monotonic, socket_group=None, state_alias=False, run=_call, run_input=_call_with_input):
     """Own a new local tmpfs volume, keeper and fixed coordinator; no retries.
 
     Source must be an independently checked exact tracked-source snapshot, with
@@ -562,7 +677,7 @@ def run_local_acceptance(*, task_id, daemon_id, helper_image_id, coordinator_ima
         if (type(task_id) is not str or str(uuid.UUID(task_id))!=task_id
             or type(initial_manifest) is not PilotManifest or type(startup_wait_ms) is not int
             or not 0<=startup_wait_ms<=30000 or type(deadline_monotonic) not in (int,float)
-            or not math.isfinite(deadline_monotonic) or time.monotonic()>=deadline_monotonic
+            or not math.isfinite(deadline_monotonic) or time.monotonic()>=deadline_monotonic or type(state_alias) is not bool
             or type(source_digest) is not str or not re.fullmatch('sha256:[a-f0-9]{64}',source_digest)
             or not re.fullmatch('sha256:[a-f0-9]{64}',helper_image_id)
             or not re.fullmatch('sha256:[a-f0-9]{64}',coordinator_image_id)):
@@ -587,7 +702,20 @@ def run_local_acceptance(*, task_id, daemon_id, helper_image_id, coordinator_ima
             or '..' in PurePosixPath(docker_root).parts or any(ord(c)<32 or ord(c)==127 for c in docker_root)):
             raise ValueError
         _validate_local_paths(source_root,private_dir,journal_dir,
-                              docker_root+'/volumes/hub-local-test-'+task_id+'/_data')
+                              docker_root+'/volumes/hub-local-test-'+task_id+'/_data',
+                              _STATE_ALIAS_PARENT+'/'+task_id if state_alias else None)
+        if state_alias:
+            p=os.stat(_STATE_ALIAS_PARENT,follow_symlinks=False)
+            with open('/proc/self/status','r',encoding='ascii') as status_file: status=status_file.read(65537)
+            caps=[line.split(':',1)[1].strip() for line in status.splitlines() if line.startswith('CapEff:')]
+            alias_parent=PurePosixPath(_STATE_ALIAS_PARENT);daemon_root=PurePosixPath(docker_root)
+            if (os.geteuid()!=0 or os.path.realpath(_STATE_ALIAS_PARENT)!=_STATE_ALIAS_PARENT
+                or not stat.S_ISDIR(p.st_mode) or (p.st_uid,p.st_gid,stat.S_IMODE(p.st_mode))!=(0,0,0o700)
+                or alias_parent==daemon_root or daemon_root in alias_parent.parents or alias_parent in daemon_root.parents
+                or os.listdir(_STATE_ALIAS_PARENT) or os.statvfs(_STATE_ALIAS_PARENT).f_flag & os.ST_RDONLY
+                or len(status)>65536 or len(caps)!=1 or not re.fullmatch('[0-9a-fA-F]+',caps[0])
+                or not int(caps[0],16) & (1<<21)):
+                raise ValueError
         for image_id in (helper_image_id,coordinator_image_id):
             if (run(PREFIX+['image','inspect','--format','{{.Id}}',image_id]).strip()!=image_id
                 or json.loads(run(PREFIX+['image','inspect','--format','{{json (index .Config "Volumes")}}',image_id])) not in (None,{})):
@@ -605,7 +733,7 @@ def run_local_acceptance(*, task_id, daemon_id, helper_image_id, coordinator_ima
         return launch_initialized_fixture(volume=volume,keeper=keeper,helper_image_id=helper_image_id,
             coordinator_image_id=coordinator_image_id,initial_manifest=initial_manifest,candidate=candidate,
             rollback=rollback,source_root=source_root,source_digest=source_digest,private_dir=private_dir,
-            journal_dir=journal_dir,startup_wait_ms=startup_wait_ms,socket_group=socket_group,socket_pin=socket_pin,
+            journal_dir=journal_dir,startup_wait_ms=startup_wait_ms,socket_group=socket_group,socket_pin=socket_pin,state_alias=state_alias,
             deadline_monotonic=deadline_monotonic,run=run,run_input=run_input)
     except VolumeOutcomeUnknown as error:
         if str(error).startswith('Local fixture held; volume '): raise
@@ -638,7 +766,8 @@ def main(argv=None):
               'candidate','rollback','source_root','source_digest','private_dir','journal_dir',
               'startup_wait_ms','timeout_seconds'}
         if (type(request) is not dict or not (set(request)==keys and request.get('schema')=='engineering-hub.local-launch-request.v1'
-                or set(request)==keys|{'socket_group'} and request.get('schema')=='engineering-hub.local-launch-request.v2')
+                or set(request)==keys|{'socket_group'} and request.get('schema')=='engineering-hub.local-launch-request.v2'
+                or set(request) in (keys|{'state_alias'},keys|{'state_alias','socket_group'}) and request.get('schema')=='engineering-hub.local-launch-request.v3' and request.get('state_alias') is True)
             or ('socket_group' in request and (type(request['socket_group']) is not int or not 0<=request['socket_group']<2**31))
             or type(request['initial_manifest']) is not str
             or type(request['timeout_seconds']) is not int or not 1<=request['timeout_seconds']<=600):
@@ -656,7 +785,7 @@ def main(argv=None):
             initial_manifest=manifest,candidate=request['candidate'],rollback=request['rollback'],
             source_root=request['source_root'],source_digest=request['source_digest'],
             private_dir=request['private_dir'],journal_dir=request['journal_dir'],
-            startup_wait_ms=request['startup_wait_ms'],socket_group=request.get('socket_group'),deadline_monotonic=time.monotonic()+request['timeout_seconds'])
+            startup_wait_ms=request['startup_wait_ms'],socket_group=request.get('socket_group'),state_alias=request.get('state_alias',False),deadline_monotonic=time.monotonic()+request['timeout_seconds'])
         print(_canonical(result).decode('ascii'))
         return 0
     except VolumeOutcomeUnknown as error:

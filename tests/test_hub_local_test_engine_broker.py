@@ -71,6 +71,60 @@ def test_backend_generated_profile_is_enrolled_and_other_calls_never_forward(rig
             broker.dispatch(method, target, data, lambda *_: None)
 
 
+def test_state_alias_is_bound_and_rechecked_before_daemon_effect(rig, tmp_path, monkeypatch):
+    from scripts.hub_local_state_alias import StateAlias
+    source, _, _, _, _ = rig
+    alias=object.__new__(StateAlias)
+    alias._paths=('/run/eh/state-aliases/'+source.owner,source.volume.mountpoint)
+    alias._volume=source.volume
+    stable=[True]
+    def check(_):
+        if not stable[0]: raise ValueError('changed')
+        return (11,22)
+    monkeypatch.setattr(StateAlias,'check',check)
+    bodies=json.loads(json.dumps(source.creates))
+    for body in bodies.values():
+        mount=body['HostConfig']['Mounts'][0]
+        mount['Source']=alias.alias+'/generations/'+Path(mount['Source']).name
+    journal=EffectJournal(tmp_path/'alias-broker.sqlite')
+    try:
+        broker=LocalTestBroker(socket_path=source.socket_path,socket_identity=(1,2),version=source.version,
+            owner=source.owner,volume=source.volume,images=source.images,creates=bodies,
+            exec_bodies=source.exec_bodies,journal=journal,state_alias=alias)
+        assert all(x['HostConfig']['Mounts'][0]['Source'].startswith(alias.alias+'/generations/') for x in broker.creates.values())
+        monkeypatch.setattr(broker,'_request',lambda *args,**kwargs:pytest.fail('daemon must not be contacted'))
+        name=next(iter(broker.creates));body=broker.creates[name]
+        stable[0]=False
+        with pytest.raises(Denied):
+            broker.dispatch('POST','/v1.41/containers/create?name='+name,json.dumps(body).encode(),lambda *_:None)
+        assert journal.db.execute('SELECT * FROM effects').fetchall()==[]
+        assert journal.db.execute('SELECT * FROM owned').fetchall()==[]
+        stable[0]=True
+        monkeypatch.setattr(broker,'_attest_volume',lambda:stable.__setitem__(0,False))
+        with pytest.raises(Denied):
+            broker.dispatch('POST','/v1.41/containers/create?name='+name,json.dumps(body).encode(),lambda *_:None)
+        assert journal.db.execute('SELECT * FROM effects').fetchall()==[]
+        stable[0]=True
+        monkeypatch.setattr(broker,'_attest_volume',lambda:None)
+        class Connection:
+            def close(self): pass
+        class Response:
+            status=201
+            def read(self): return json.dumps({'Id':'d'*64}).encode()
+        def accepted(*args,**kwargs):
+            stable[0]=False
+            return Connection(),Response()
+        monkeypatch.setattr(broker,'_request',accepted)
+        monkeypatch.setattr(broker,'_read_bounded',lambda response,maximum:response.read())
+        monkeypatch.setattr(broker,'_inspect_owned',lambda *args:None)
+        with pytest.raises(Denied):
+            broker.dispatch('POST','/v1.41/containers/create?name='+name,json.dumps(body).encode(),lambda *_:None)
+        assert journal.db.execute('SELECT state FROM effects').fetchall()==[('pending',)]
+        assert journal.db.execute('SELECT * FROM owned').fetchall()==[]
+    finally:
+        journal.close()
+
+
 def test_only_baseline_can_restart_once_after_completed_stop(rig, monkeypatch):
     broker, journal, _, _, _ = rig
     baseline = 'hub-pilot-' + uuid.UUID(broker.owner).hex[:24] + '-00000000-000-rollback'

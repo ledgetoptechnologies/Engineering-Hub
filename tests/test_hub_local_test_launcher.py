@@ -263,7 +263,10 @@ def test_private_input_transport_bounds_and_timeout():
   _call_with_input([sys.executable,'-c','import time; time.sleep(5)'],b'',time.monotonic()+0.1)
 
 @pytest.mark.parametrize('socket_group',[None,0])
-def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,monkeypatch,socket_group):
+@pytest.mark.parametrize('state_alias',[False,True])
+@pytest.mark.parametrize('detach_failure',[False,True])
+def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,monkeypatch,socket_group,state_alias,detach_failure):
+ if detach_failure and not state_alias: pytest.skip('detach applies only to alias mode')
  import time,types,stat as stmod
  import scripts.hub_local_test_launcher as l
  import scripts.hub_local_volume_initializer as init
@@ -280,6 +283,15 @@ def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,mon
  journal=tmp_path/'journal'; journal.mkdir(mode=0o700)
  v=OwnedVolume(NAME,TASK,DAEMON,MOUNT,TMPFS_OPTIONS); keeper=l.TmpfsKeeper('a'*64,IMG,v)
  calls=[]; state=['created']; cid='f'*64; command=[]
+ alias_path='/run/eh/state-aliases/'+TASK
+ class Alias:
+  def __init__(self,volume,journal_dir): self.path=alias_path;self.guard=self;calls.append('alias-bind')
+  def check(self): calls.append('alias-check')
+  def detach(self):
+   calls.append('alias-detach')
+   if detach_failure: raise OSError('uncertain detach')
+ monkeypatch.setattr(l,'_OwnedStateAlias',Alias)
+ monkeypatch.setattr(l,'_authorize_keeper_stop',lambda **kw:calls.append('authorize-detach'))
  monkeypatch.setattr(l,'source_tree_digest',lambda root,**kwargs:'sha256:'+'a'*64)
  monkeypatch.setattr(l,'check_tmpfs_keeper',lambda *a,**k:calls.append('keeper'))
  monkeypatch.setattr(init,'initialize_owned_volume',lambda **kw:calls.append('initialize'))
@@ -310,18 +322,25 @@ def test_coordinator_launcher_orders_effects_and_keeps_key_off_argv(tmp_path,mon
    if '.Config.Entrypoint' in op[2]: return json.dumps(['/opt/validation-venv/bin/python'])
    if '.Config.Cmd' in op[2]: return json.dumps(command)
    if '.Config.Volumes' in op[2]: return 'null'
-   if 'HostConfig' in op[2]: return json.dumps({'GroupAdd':None if socket_group is None else ['0'],'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':None,'SecurityOpt':['no-new-privileges'],'Memory':1073741824,'MemorySwap':1073741824,'NanoCpus':1000000000,'PidsLimit':256,'Tmpfs':{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'AutoRemove':False,'PublishAllPorts':False,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'PidMode':'','IpcMode':'private','RestartPolicy':{'Name':'no'},'Mounts':[{'Type':'volume','Source':NAME,'Target':MOUNT,'VolumeOptions':{'NoCopy':True}}]})
-   if 'Mounts' in op[2]: return json.dumps([{'Type':'volume','Driver':'local','Name':NAME,'Source':MOUNT,'Destination':MOUNT,'RW':True},{'Type':'bind','Propagation':'rprivate','Source':'/src','Destination':'/opt/hub','RW':False},{'Type':'bind','Propagation':'rprivate','Source':str(private),'Destination':str(private),'RW':True},{'Type':'bind','Propagation':'rprivate','Source':'/run/docker.sock','Destination':'/var/run/docker.sock','RW':True}])
+   if 'HostConfig' in op[2]: return json.dumps({'GroupAdd':None if socket_group is None else ['0'],'NetworkMode':'none','ReadonlyRootfs':True,'Privileged':False,'CapDrop':['ALL'],'CapAdd':None,'SecurityOpt':['no-new-privileges'],'Memory':1073741824,'MemorySwap':1073741824,'NanoCpus':1000000000,'PidsLimit':256,'Tmpfs':{'/tmp':'rw,noexec,nosuid,nodev,size=64m'},'LogConfig':{'Type':'local','Config':{'max-size':'1m','max-file':'2'}},'AutoRemove':False,'PublishAllPorts':False,'Binds':None,'Devices':None,'DeviceRequests':None,'VolumesFrom':None,'PortBindings':None,'PidMode':'','IpcMode':'private','RestartPolicy':{'Name':'no'},'Mounts':[{'Type':'volume','Source':NAME,'Target':target,'VolumeOptions':{'NoCopy':True}} for target in ([MOUNT,alias_path] if state_alias else [MOUNT])]})
+   if 'Mounts' in op[2]: return json.dumps([{'Type':'volume','Driver':'local','Name':NAME,'Source':MOUNT,'Destination':target,'RW':True} for target in ([MOUNT,alias_path] if state_alias else [MOUNT])]+[{'Type':'bind','Propagation':'rprivate','Source':'/src','Destination':'/opt/hub','RW':False},{'Type':'bind','Propagation':'rprivate','Source':str(private),'Destination':str(private),'RW':True},{'Type':'bind','Propagation':'rprivate','Source':'/run/docker.sock','Destination':'/var/run/docker.sock','RW':True}])
    return '|'.join([cid,'/hub-local-coordinator-'+TASK,IMG,TASK,state[0],'0'])
   if op[0]=='rm': return cid
   raise AssertionError(op)
  def start(args,data,deadline):
   request=json.loads(data); assert request['coordinator_id']==cid and len(request['cleanup_key'])==64
+  assert (request.get('state_alias')==alias_path) is state_alias
   assert request['cleanup_key'] not in ' '.join(args)
   calls.append('start'); state[0]='exited'
- result=l.launch_initialized_fixture(volume=v,keeper=keeper,helper_image_id=IMG,coordinator_image_id=IMG,initial_manifest=INITIAL,candidate={},rollback={},source_root='/src',source_digest='sha256:'+'a'*64,private_dir=str(private),journal_dir=str(journal),startup_wait_ms=0,socket_group=socket_group,deadline_monotonic=time.monotonic()+30,run=run,run_input=start)
+ args=dict(volume=v,keeper=keeper,helper_image_id=IMG,coordinator_image_id=IMG,initial_manifest=INITIAL,candidate={},rollback={},source_root='/src',source_digest='sha256:'+'a'*64,private_dir=str(private),journal_dir=str(journal),startup_wait_ms=0,socket_group=socket_group,state_alias=state_alias,deadline_monotonic=time.monotonic()+30,run=run,run_input=start)
+ if detach_failure:
+  with pytest.raises(VolumeOutcomeUnknown): l.launch_initialized_fixture(**args)
+  assert 'alias-detach' in calls and 'stop-keeper' not in calls and 'remove-volume' not in calls
+  return
+ result=l.launch_initialized_fixture(**args)
  assert result=={'status':'completed','coordinator_id':cid}
  assert calls.index('initialize') < calls.index('create') < calls.index('start') < calls.index('rm') < calls.index('stop-keeper') < calls.index('remove-volume')
+ if state_alias: assert calls.index('rm') < calls.index('authorize-detach') < calls.index('alias-detach') < calls.index('stop-keeper')
 
 def test_coordinator_socket_permission_denied_before_effect(tmp_path,monkeypatch):
  import time,types,stat as stmod
@@ -432,6 +451,30 @@ def test_path_overlap_denied_before_effect(tmp_path):
  for p in (source,private,journal): p.mkdir()
  with pytest.raises(VolumeError): _validate_local_paths(str(source),str(source),str(journal),'/some/volume')
 
+def test_missing_alias_parent_denied_before_volume_create(tmp_path,monkeypatch):
+ import time
+ import scripts.hub_local_test_launcher as launcher
+ import scripts.hub_local_acceptance_runner as runner
+ import scripts.hub_local_test_oci as oci
+ import scripts.hub_local_test_volume as volumes
+ if os.geteuid()!=0: pytest.skip('synthetic UID ownership requires root')
+ private=tmp_path/'private';private.mkdir(mode=0o700);os.chown(private,10001,10001)
+ journal=tmp_path/'journal';journal.mkdir(mode=0o700)
+ monkeypatch.setattr(launcher,'_check_resource_envelope',lambda manifest:None)
+ monkeypatch.setattr(launcher,'source_tree_digest',lambda *a,**k:'sha256:'+'a'*64)
+ monkeypatch.setattr(launcher,'_socket_pin',lambda group:(None,1,2,0,0,0o660))
+ monkeypatch.setattr(launcher,'_STATE_ALIAS_PARENT',str(tmp_path/'missing-alias-parent'))
+ monkeypatch.setattr(runner,'_fixture',lambda value:value);monkeypatch.setattr(runner,'_bounded_volume',lambda path:None)
+ monkeypatch.setattr(oci,'verify_fixture_image',lambda *args:(object(),))
+ calls=[];monkeypatch.setattr(volumes,'create_volume',lambda **kwargs:calls.append(kwargs))
+ def run(args): return ROOT if 'DockerRootDir' in args[-1] else DAEMON
+ with pytest.raises(VolumeError):
+  launcher.run_local_acceptance(task_id=TASK,daemon_id=DAEMON,helper_image_id=IMG,coordinator_image_id=IMG,
+   initial_manifest=INITIAL,candidate={},rollback={},source_root='/src',source_digest='sha256:'+'a'*64,
+   private_dir=str(private),journal_dir=str(journal),startup_wait_ms=0,state_alias=True,
+   deadline_monotonic=time.monotonic()+30,run=run)
+ assert calls==[]
+
 def test_outer_missing_helper_image_denies_before_volume_create(tmp_path,monkeypatch):
  import time,types,stat as stmod
  import scripts.hub_local_test_launcher as l
@@ -509,6 +552,19 @@ def test_fixed_fd3_entry_rejects_extra_field_before_effect(monkeypatch,capsys):
  monkeypatch.setattr(launcher,'run_local_acceptance',lambda **kwargs:pytest.fail('unexpected effect'))
  assert launcher.main(['--request-fd','3'])==1
  assert 'preflight' in capsys.readouterr().err and closed==[3]
+
+@pytest.mark.parametrize('flag,accepted',[(True,True),(False,False),(1,False)])
+def test_fixed_fd3_alias_requires_explicit_boolean_opt_in(monkeypatch,capsys,flag,accepted):
+ import scripts.hub_local_test_launcher as launcher
+ import scripts.hub_local_acceptance_runner as runner
+ req=_launch_request();req['schema']='engineering-hub.local-launch-request.v3';req['state_alias']=flag
+ monkeypatch.setattr(runner,'_read_request',lambda fd:req)
+ monkeypatch.setattr(launcher.os,'close',lambda fd:None)
+ seen=[]
+ monkeypatch.setattr(launcher,'run_local_acceptance',lambda **kwargs:seen.append(kwargs) or {'status':'completed','coordinator_id':CID})
+ assert launcher.main(['--request-fd','3'])==(0 if accepted else 1)
+ assert bool(seen) is accepted
+ if accepted: assert seen[0]['state_alias'] is True
 
 def test_actual_isolated_fd3_entry_rejects_invalid_request_without_daemon():
  import subprocess,sys

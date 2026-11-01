@@ -18,6 +18,21 @@ from scripts import hub_local_acceptance_runner as runner
 _BOOT='import os,sys; fd=int(sys.argv[1]); os.dup2(fd,3); os.close(fd) if fd!=3 else None; os.set_inheritable(3,True); os.execv(sys.executable,[sys.executable,"-I","-B",sys.argv[2],"--request-fd","3"])'
 
 
+@pytest.mark.parametrize('alias',[None,'/run/eh/state-aliases/wrong'])
+def test_alias_request_rejects_missing_or_wrong_path_before_effect(monkeypatch,alias):
+    import asyncio
+    task='db04aa59-54f0-4269-bcba-539c0151e13e'
+    request={'schema':'engineering-hub.local-acceptance-request.v2','task_id':task,'daemon_id':'daemon-1234567890',
+        'volume_mount':'/volume','private_dir':'/private','manifest':'{}','candidate':{},'rollback':{},
+        'coordinator_id':'a'*64,'coordinator_image_id':'sha256:'+'b'*64,'cleanup_nonce':'c'*64,
+        'cleanup_key':'d'*64,'startup_wait_ms':0,'volume_storage':'tmpfs-512m-v1','state_alias':alias}
+    monkeypatch.setattr(runner.os,'getuid',lambda:10001);monkeypatch.setattr(runner.os,'getgid',lambda:10001)
+    monkeypatch.setattr(runner,'_directory',lambda path,**kwargs:Path(path))
+    monkeypatch.setattr(runner,'_bounded_volume',lambda path:None)
+    monkeypatch.setattr(runner,'PilotOwner',lambda *a,**k:pytest.fail('must not create owner'))
+    with pytest.raises(ValueError,match='state alias'): asyncio.run(runner.run(request))
+
+
 @pytest.mark.skipif(sys.platform != 'linux',reason='fixed Linux FD entrypoint')
 @pytest.mark.parametrize('payload',[b'{}',b'{"z":1, "a":2}',b'{"x":1,"x":2}'],
                          ids=['wrong-schema','noncanonical','duplicate'])
