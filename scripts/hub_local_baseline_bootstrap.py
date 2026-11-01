@@ -126,6 +126,19 @@ def _restart_baseline(backend, container_id, operation_id, timeout_ms):
         raise RuntimeError('Baseline restart is unverified')
 
 
+def _wait_after_restart(check, deadline, startup_wait_ms, probes):
+    """Reserve the fixed probe budget before observing the restarted fixture."""
+    budget=sum(probe.timeout_ms for probe in probes)/1000
+    check()
+    if time.monotonic()+startup_wait_ms/1000+budget >= deadline:
+        raise RuntimeError('Restarted baseline probe budget unavailable')
+    if startup_wait_ms:
+        time.sleep(startup_wait_ms/1000)
+    check()
+    if time.monotonic()+budget >= deadline:
+        raise RuntimeError('Restarted baseline probe budget unavailable')
+
+
 def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metadata_store,
                        verifier, secret_resolver, owner_id, generation_root,
                        source_generation_id, frozen_leaf, create_id, start_id, observe_id,
@@ -232,6 +245,7 @@ def bootstrap_baseline(*, owner_database, backend, manifest, record_store, metad
         if quiescent:
             _exited_baseline(backend, container_id, deadline_monotonic); check()
             _restart_baseline(backend, container_id, restart_id, timeout()); check()
+            _wait_after_restart(check, deadline_monotonic, startup_wait_ms, manifest.probes.rollback)
         final=_final_manifest(manifest, snapshot.sha256)
         observer=BaselineObserver(final,backend=backend,record_store=record_store,metadata_store=metadata_store,
             provenance_verifier=verifier,secret_resolver=secret_resolver,snapshot=snapshot,

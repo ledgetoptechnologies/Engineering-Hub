@@ -217,6 +217,68 @@ def test_unhealthy_preflight_never_stops_or_freezes(monkeypatch):
     with pytest.raises(RuntimeError,match='health is unverified'): b.bootstrap_baseline(**a)
     assert events == ['closed']
 
+
+@pytest.mark.parametrize('wait_ms',[0,1000])
+def test_restart_wait_checks_owner_and_fixed_budget(monkeypatch,wait_ms):
+    now=[10.0];events=[]
+    monkeypatch.setattr(b.time,'monotonic',lambda:now[0])
+    def sleep(seconds):events.append(('sleep',seconds));now[0]+=seconds
+    monkeypatch.setattr(b.time,'sleep',sleep)
+    b._wait_after_restart(lambda:events.append('check'),20.0,wait_ms,[types.SimpleNamespace(timeout_ms=1000)])
+    assert events==(['check',('sleep',1.0),'check'] if wait_ms else ['check','check'])
+
+
+@pytest.mark.parametrize('case',['insufficient','oversleep','interrupt'])
+def test_restart_wait_fails_closed_on_budget_or_interrupt(monkeypatch,case):
+    now=[10.0];events=[]
+    monkeypatch.setattr(b.time,'monotonic',lambda:now[0])
+    def sleep(_):
+        events.append('sleep')
+        if case=='interrupt':raise InterruptedError('interrupted')
+        now[0]=19.5
+    monkeypatch.setattr(b.time,'sleep',sleep)
+    with pytest.raises((RuntimeError,InterruptedError)):
+        b._wait_after_restart(lambda:events.append('check'),11.5 if case=='insufficient' else 20.0,
+                              1000,[types.SimpleNamespace(timeout_ms=1000)])
+    assert events==(['check'] if case=='insufficient' else ['check','sleep'] if case=='interrupt' else ['check','sleep','check'])
+
+
+def test_exhausted_budget_after_restart_never_constructs_observer(monkeypatch):
+    from hub_container_executor.backend import ProbeObservation
+    from hub_container_executor.runtime_profile import probe_set_digest
+    a=args(monkeypatch);manifest=a['manifest'];events=[];now=[100.0]
+    monkeypatch.setattr(b.time,'monotonic',lambda:now[0])
+    class Backend:
+        def __init__(self):
+            self.operation_journal=object.__new__(SQLiteOperationJournal)
+            self.binding=types.SimpleNamespace(generation_root='/owned/generations')
+        def inspect_image(self,*x):return 'defaults'
+        def create_container(self,*x):return 'c'*64
+        def start_container(self,*x):pass
+        def run_compiled_probes(self,*x):
+            return ProbeObservation('c'*64,'sha256:'+'d'*64,probe_set_digest(manifest.probes.rollback),'healthy',True)
+        def stop_container(self,*x):pass
+    class Owner:
+        def __init__(self,*x,**y):pass
+        def assert_active(self,*x):pass
+        def close(self):events.append('closed')
+    class Resolver:
+        def resolve_test_secret(self,*x):return 'synthetic'
+    monkeypatch.setattr(b,'DockerEngineBackend',Backend);a['backend']=Backend();a['secret_resolver']=Resolver()
+    monkeypatch.setattr(b,'PilotOwner',Owner);monkeypatch.setattr(b,'_preflight_snapshot',lambda *x,**k:None)
+    monkeypatch.setattr(b,'verify_image_record',lambda *x:types.SimpleNamespace(runnable_reference='sha256:'+'e'*64,image_config_id='sha256:'+'d'*64))
+    monkeypatch.setattr(b.HostAdapter,'_defaults_from_record',lambda x:'defaults')
+    monkeypatch.setattr(b,'derive_runtime_profile',lambda *x:'profile')
+    monkeypatch.setattr(b,'freeze_baseline_snapshot',lambda **x:types.SimpleNamespace(sha256='sha256:'+'f'*64))
+    monkeypatch.setattr(b,'_exited_baseline',lambda *x:None)
+    def restart(*_):events.append('restart');now[0]=129.9
+    monkeypatch.setattr(b,'_restart_baseline',restart)
+    monkeypatch.setattr(b,'BaselineObserver',lambda *x,**y:pytest.fail('observer must not be constructed'))
+    a.update(deadline_monotonic=130.0,quiescent=True,preflight_probe_id='6f665c4c-98d7-4715-b909-645411bc30f7',
+             stop_id='d80c95ff-ec54-4bf9-85bf-69e15f589010',restart_id='24a60394-13b0-4d4c-a61f-152629e7c1a5')
+    with pytest.raises(RuntimeError,match='probe budget unavailable'):b.bootstrap_baseline(**a)
+    assert events==['restart','closed']
+
 def test_snapshot_preflight_close_attempts_both_descriptors(monkeypatch):
     seen=[]
     def directory(path,**kwargs):
