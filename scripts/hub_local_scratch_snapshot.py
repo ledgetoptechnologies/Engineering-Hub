@@ -104,13 +104,32 @@ def freeze_copy(root, generation, frozen, *, maximum, deadline):
         if _inventory(srcfd,maximum=maximum,deadline=deadline)!=before: raise ValueError('source inventory changed')
         _guard(root,rootfd,rootid);_guard(source,srcfd,srcid);_work_entries(rootfd,generation,leaf,workid);_scratch_quota(rootfd)
         _guard(root/leaf,workfd,workid); _guard(root/leaf/generation,copyfd,(copyinfo.st_dev,copyinfo.st_ino))
-        # Delete only previously pinned scratch inputs. SQLite may have removed them.
-        for name in os.listdir(copyfd):
-            if name==outname: continue
-            st=os.stat(name,dir_fd=copyfd,follow_symlinks=False)
-            if name not in identities or _file(st)[:2]!=identities[name]: raise ValueError('scratch changed')
+        # SQLite can create or replace sidecars on the exclusive scratch copy.
+        # Only after every SQLite connection has closed successfully, pin every
+        # exact allowed leaf; unfamiliar entries and uncertain cleanup are held.
+        allowed={'hub.sqlite3','hub.sqlite3-wal','hub.sqlite3-shm','hub.sqlite3-journal',
+                 'snapshot.sqlite3-wal','snapshot.sqlite3-shm','snapshot.sqlite3-journal'}
+        current=set(os.listdir(copyfd))
+        if outname not in current or 'hub.sqlite3' not in current or current-allowed-{outname}:
+            raise ValueError('scratch changed')
+        pins=[]; sidecar_bytes=0
+        for name in sorted(current-{outname}):
+            _deadline(deadline)
+            fd=own(os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,dir_fd=copyfd))
+            opened=_file(os.fstat(fd)); named=_file(os.stat(name,dir_fd=copyfd,follow_symlinks=False))
+            if opened!=named or opened[0]!=rootid[0]: raise ValueError('scratch changed')
+            if name=='hub.sqlite3' and opened[:2]!=identities.get(name): raise ValueError('scratch main changed')
+            sidecar_bytes+=opened[2]
+            if sidecar_bytes>maximum*2: raise ValueError('scratch byte limit')
+            pins.append((name,fd,opened))
+        _guard(root/leaf,workfd,workid); _guard(root/leaf/generation,copyfd,(copyinfo.st_dev,copyinfo.st_ino))
+        for name,fd,identity in pins:
+            _deadline(deadline)
+            if _file(os.fstat(fd))!=identity or _file(os.stat(name,dir_fd=copyfd,follow_symlinks=False))!=identity:
+                raise ValueError('scratch changed')
             os.unlink(name,dir_fd=copyfd)
         os.fsync(copyfd)
+        if set(os.listdir(copyfd))!={outname}: raise ValueError('scratch changed')
         if _inventory(srcfd,maximum=maximum,deadline=deadline)!=before: raise ValueError('source inventory changed')
         _deadline(deadline)
         os.link(outname,frozen,src_dir_fd=copyfd,dst_dir_fd=rootfd,follow_symlinks=False)

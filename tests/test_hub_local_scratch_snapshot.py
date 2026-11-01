@@ -169,3 +169,77 @@ def test_actual_task_tmpfs_quota_when_provided():
     fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:scratch._scratch_quota(fd)
     finally:os.close(fd)
+def _baseline_without_sidecars(root, gen):
+    for item in gen.iterdir(): item.unlink()
+    dbpath=gen/'hub.sqlite3'
+    fd=os.open(dbpath,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(fd)
+    db=sqlite3.connect(dbpath); db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE t(value INTEGER)');db.execute('INSERT INTO t VALUES(42)');db.commit();db.close()
+    assert set(p.name for p in gen.iterdir())=={'hub.sqlite3'}
+    assert (dbpath.stat().st_mode & 0o777)==0o600
+    return dbpath.read_bytes()
+
+
+def test_sqlite_generated_sidecars_are_pinned_and_cleaned(seeded):
+    root,gen,_=seeded;before=_baseline_without_sidecars(root,gen)
+    call(root)
+    assert {p.name for p in gen.iterdir()}=={'hub.sqlite3'}
+    assert (gen/'hub.sqlite3').read_bytes()==before
+    assert {p.name for p in root.iterdir()}=={'baseline-one','frozen.sqlite3'}
+    with sqlite3.connect((root/'frozen.sqlite3').as_uri()+'?mode=ro',uri=True) as db:
+        assert db.execute('SELECT value FROM t').fetchone()==(42,)
+
+
+def test_new_sidecar_replaced_during_pin_is_held(seeded,monkeypatch):
+    root,gen,_=seeded;before=_baseline_without_sidecars(root,gen)
+    original=scratch.os.stat; replaced=[]
+    def swap(path,*args,**kwargs):
+        if path=='hub.sqlite3-shm' and kwargs.get('dir_fd') is not None and not replaced:
+            fd=kwargs['dir_fd'];os.rename(path,'sidecar-held',src_dir_fd=fd,dst_dir_fd=fd)
+            newfd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd);os.close(newfd);replaced.append(True)
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(scratch.os,'stat',swap)
+    with pytest.raises(ValueError,match='scratch changed'):call(root)
+    assert replaced and not (root/'frozen.sqlite3').exists()
+    assert (gen/'hub.sqlite3').read_bytes()==before
+    assert len([p for p in root.iterdir() if p.name.startswith('snapshot-work-')])==1
+
+
+
+def test_sidecar_replaced_after_pin_is_held(seeded,monkeypatch):
+    root,gen,_=seeded;before=_baseline_without_sidecars(root,gen)
+    original=scratch.os.fstat; seen=[]; replaced=[]
+    def swap(fd):
+        try: path=os.readlink('/proc/self/fd/'+str(fd))
+        except OSError: path=''
+        if 'snapshot-work-' in path and path.endswith('/hub.sqlite3-shm'):
+            seen.append(True)
+            if len(seen)==2:
+                os.rename(path,path+'.held')
+                newfd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.close(newfd)
+                replaced.append(True)
+        return original(fd)
+    monkeypatch.setattr(scratch.os,'fstat',swap)
+    with pytest.raises(ValueError,match='scratch changed'):call(root)
+    assert replaced and not (root/'frozen.sqlite3').exists()
+    assert (gen/'hub.sqlite3').read_bytes()==before
+    assert len([p for p in root.iterdir() if p.name.startswith('snapshot-work-')])==1
+
+
+@pytest.mark.parametrize('kind',['unknown','symlink','hardlink'])
+def test_foreign_scratch_entries_are_held(seeded,monkeypatch,kind):
+    root,gen,_=seeded;before=_baseline_without_sidecars(root,gen)
+    original=scratch.copy_sqlite_generation
+    def inject(*args,**kwargs):
+        result=original(*args,**kwargs); work=Path(args[0]).parent
+        if kind=='unknown': (work/'foreign').write_bytes(b'x')
+        else:
+            target=work/'hub.sqlite3-shm'
+            if target.exists(): target.unlink()
+            if kind=='symlink': target.symlink_to('hub.sqlite3')
+            else: os.link(work/'hub.sqlite3',target)
+        return result
+    monkeypatch.setattr(scratch,'copy_sqlite_generation',inject)
+    with pytest.raises(Exception):call(root)
+    assert not (root/'frozen.sqlite3').exists()
+    assert (gen/'hub.sqlite3').read_bytes()==before
+    assert len([p for p in root.iterdir() if p.name.startswith('snapshot-work-')])==1
