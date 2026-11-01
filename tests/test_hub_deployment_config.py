@@ -142,3 +142,40 @@ def test_exact_size_limit_accepts_valid_document_but_one_extra_byte_is_rejected(
     path.write_bytes(path.read_bytes() + b" ")
     with pytest.raises(ValueError, match="^Invalid Hub deployment configuration$"):
         load_deployment_config(path)
+
+
+def github_document():
+    document = valid()
+    document.pop('cloudflare_access')
+    return dict(document, schema_version=3,
+                github={'client_id': 'Iv1_public-synthetic', 'allowed_user_id': 42},
+                storage={'layout': 'protected-ledger-v1'})
+
+
+def test_github_requires_versioned_public_config_and_keeps_secret_external(tmp_path, monkeypatch):
+    monkeypatch.setenv('HUB_GITHUB_CLIENT_SECRET', 'synthetic-private-secret')
+    result = load_deployment_config(write(tmp_path, github_document()))
+    assert result.protected_ledger is True
+    assert result.auth_config.human_auth_mode == 'github'
+    assert result.auth_config.github_client_id == 'Iv1_public-synthetic'
+    assert result.auth_config.beau_github_id == 42
+    assert result.auth_config.github_client_secret == ''
+    assert result.auth_config.cloudflare_config is None
+    assert 'synthetic-private-secret' not in repr(result)
+
+
+@pytest.mark.parametrize('change', ['old-version', 'both-providers', 'secret', 'missing-storage',
+                                    'http', 'bool-owner', 'no-owner', 'overflow-owner', 'bad-client'])
+def test_github_deployment_rejects_ambiguous_incomplete_or_secret_input(tmp_path, change):
+    data = github_document()
+    if change == 'old-version': data['schema_version'] = 2
+    elif change == 'both-providers': data['cloudflare_access'] = valid()['cloudflare_access']
+    elif change == 'secret': data['github']['client_secret'] = 'private-sentinel'
+    elif change == 'missing-storage': data.pop('storage')
+    elif change == 'http': data['base_url'] = 'http://localhost'
+    elif change == 'bool-owner': data['github']['allowed_user_id'] = True
+    elif change == 'no-owner': data['github']['allowed_user_id'] = 0
+    elif change == 'overflow-owner': data['github']['allowed_user_id'] = 2**63
+    elif change == 'bad-client': data['github']['client_id'] = 'client\nsecret'
+    with pytest.raises(ValueError, match='^Invalid Hub deployment configuration$'):
+        load_deployment_config(write(tmp_path, data))

@@ -1,0 +1,10 @@
+# The caller must independently approve an immutable executor image digest and
+# verify its source commit and closed runtime configuration before this build.
+# This recipe does not establish provenance or authorize a coordinator launch.
+ARG EXECUTOR_IMAGE
+FROM ${EXECUTOR_IMAGE}
+
+# Preserve the executor filesystem and image defaults, changing only the
+# supervised coordinator's fixed command.
+ENTRYPOINT ["/opt/venv/bin/python", "-I", "-m", "hub_container_executor.trusted_local_session"]
+CMD ["--supervised"]

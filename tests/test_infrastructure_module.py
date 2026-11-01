@@ -306,3 +306,106 @@ def test_trusted_guard_write_postcheck_rolls_back_before_commit():
         assert registry.db.execute('SELECT count(*) FROM infra_devices').fetchone()[0]==0
         assert registry.db.execute('SELECT count(*) FROM infra_events').fetchone()[0]==0
     finally:registry.close()
+
+
+def test_startup_diagnostics_are_bounded_and_do_not_expose_configuration(tmp_path, caplog):
+    secret = 'private-token-in-path-and-content'
+    path = tmp_path / secret
+    path.write_text(secret)
+    module = compose_infrastructure(path, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'config_unreadable_or_invalid' in caplog.text
+    assert secret not in caplog.text and str(tmp_path) not in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(tmp_path / 'absent', state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'config_missing_no_default_owner' in caplog.text
+    caplog.clear()
+    module = compose_infrastructure(write(tmp_path / 'disabled', config(False)), state_root=tmp_path)
+    assert module.state == 'disabled'
+    assert 'explicitly_disabled' in caplog.text
+
+
+@POSIX
+def test_startup_diagnostics_identify_private_directory_failure(tmp_path, caplog):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_mode_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_chmod_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    def fail(*args, **kwargs):
+        raise OSError('private failure detail')
+    monkeypatch.setattr(os, 'chmod', fail)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_chmod_failed' in caplog.text
+    assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_owner_failure_is_safe(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = os.fstat
+    def altered(fd):
+        info = original(fd)
+        if info.st_ino == root.stat().st_ino:
+            values = list(info)
+            values[4] = info.st_uid + 1
+            return os.stat_result(values)
+        return info
+    monkeypatch.setattr(os, 'fstat', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_owner_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_directory_identity_failure_is_safe(tmp_path, caplog, monkeypatch):
+    import engineering_hub.infrastructure_module as module_impl
+    settings = write(tmp_path / 'settings.json', config())
+    root = tmp_path / 'infrastructure'
+    root.mkdir(mode=0o700)
+    original = module_impl._identity
+    calls = 0
+    def altered(info):
+        nonlocal calls
+        calls += 1
+        identity = original(info)
+        return (identity[0], identity[1] + 1) if calls == 3 else identity
+    monkeypatch.setattr(module_impl, '_identity', altered)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'state_directory_identity_failed' in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_existing_directory_is_allowed_but_chmod_file_exists_fails_closed(tmp_path, caplog, monkeypatch):
+    settings = write(tmp_path / 'settings.json', config())
+    existing_state = tmp_path / 'existing'
+    existing_state.mkdir()
+    (existing_state / 'infrastructure').mkdir(mode=0o700)
+    existing = compose_infrastructure(settings, state_root=existing_state)
+    assert existing.state == 'ready'
+    existing.close()
+
+    new_state = tmp_path / 'new'
+    new_state.mkdir()
+    def fail_chmod(*args, **kwargs):
+        raise FileExistsError('private failure detail')
+    monkeypatch.setattr(os, 'chmod', fail_chmod)
+    failed = compose_infrastructure(settings, state_root=new_state)
+    assert failed.state == 'invalid' and failed.service is None
+    assert 'state_directory_chmod_failed' in caplog.text
+    assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text

@@ -61,6 +61,254 @@ def configuration():
         bearer_test_binding=dict(slot_id='test-executor-service', version=1))
 
 
+def pair_configuration():
+    data = configuration()
+    data['schema'] = module.PAIR_SCHEMA
+    data['pair'] = {'authority_public_key_hex': 'b' * 64, 'peer_uid': 10002, 'peer_gid': 10002}
+    return data
+
+
+def test_gate_v3_config_is_closed_and_source_changes_commitment():
+    from hub_container_executor.configuration_commitment import configuration_commitment
+    data = configuration(); data['schema'] = module.GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.gate_socket_directory == '/fixture/gate-control' and parsed.pair is None
+    first = configuration_commitment(canonical(data)).content_digest
+    data['gate_socket_directory'] = '/fixture/other-gate'
+    assert configuration_commitment(canonical(data)).content_digest != first
+    data['gate_socket_directory'] = '/fixture/secrets/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+
+
+def test_pair_ledger_v7_is_explicit_disjoint_and_preserves_gate_guard():
+    data = configuration(); data['schema'] = module.PAIR_LEDGER_SCHEMA
+    data['pair_ledger_directory'] = '/fixture/pair-ledger'
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.pair_ledger_directory == '/fixture/pair-ledger'
+    assert parsed.gate_socket_directory is None and not parsed.gate_ledger_channel
+    module._require_supported_gate_runtime(parsed)
+    data['pair_ledger_directory'] = '/fixture/secrets/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+    gate = configuration(); gate['schema'] = module.GATE_LEDGER_SCHEMA
+    gate['gate_socket_directory'] = '/fixture/gate-control'
+    with pytest.raises(module.InstalledRunnerError): module._require_supported_gate_runtime(module.parse_configuration(canonical(gate)))
+
+
+@pytest.mark.asyncio
+async def test_installed_pair_ledger_constructs_real_owned_worker(tmp_path, monkeypatch):
+    """Actual runner and signed FD verification; synthetic issuer and service owner."""
+    import base64, socket, threading, time
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
+    from hub_container_executor import gate_ledger_handoff as handoff, ledger as ledger_module
+    from hub_container_executor.broker_seqpacket import PeerPin, _start
+    from hub_container_executor.gate_ledger_channel import SupervisorLedgerClient
+    from tests.test_executor_launch_profile import gate_profile
+    from tests.test_hub_container_executor_runtime_identity import Issuer
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    fixture_root = tmp_path / 'hub-pilot-fixture'; fixture_root.mkdir(mode=0o700)
+    directory = fixture_root / 'ledger-channel'; directory.mkdir(mode=0o700)
+    data = configuration(); data['schema'] = module.PAIR_LEDGER_SCHEMA; data['pair_ledger_directory'] = str(directory)
+    profile_data = gate_profile(str(fixture_root)); del profile_data['gate_channel']
+    profile_data['gate_ledger_channel'] = 'pair-outcome-listener-v1'
+    mount = next(m for m in profile_data['mounts'] if m['role'] == 'gate_channel_directory')
+    mount['source'] = mount['target'] = str(directory)
+    profile = ExecutorLaunchProfile.model_validate(profile_data)
+    data['release_enrollment']['public_key_hex'] = public.hex()
+    data['release_enrollment']['launch_profile_digest'] = profile.digest()
+    config = module.parse_configuration(canonical(data))
+    profile_raw = canonical(profile.enrollment_value())
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(directory / 'ledger.sock')); listener.listen(1)
+    info, leaf = os.fstat(listener.fileno()), os.lstat(directory / 'ledger.sock')
+    ledger_root = tmp_path / 'db'; ledger_root.mkdir(mode=0o700)
+    monkeypatch.setattr(ledger_module, '_mount_type_for', lambda *_: 'ext4')
+    ledger = ledger_module.SQLiteLedger(str(ledger_root / 'ledger.sqlite'), manifest_digest=config.manifest.digest(),
+        candidate_commit=config.manifest.candidate.source_commit, policy_revision=config.manifest.policy_revision)
+    clock = SimpleNamespace(wall=time.time(), mono=time.monotonic())
+    monkeypatch.setattr(module, '_process', lambda: None)
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', lambda **_: Issuer(config.release, key, clock))
+    class Observations:
+        def __init__(self, **_): pass
+        def close(self): pass
+        def issue_ledger_listener(self, *, verifier, manifest_digest, source_directory, timeout_ms, pair_only):
+            assert pair_only and source_directory == str(directory)
+            wall, tick, nonce = int(time.time()*1000), time.monotonic(), 'a'*64
+            binding = verifier.launch_binding()
+            payload = dict(zip(('launch_id','boot_id','authenticated_host_pid','process_start_ticks','container_id'), binding))
+            payload.update(protocol=handoff.PAIR_PROTOCOL, audience=handoff.PAIR_AUDIENCE, nonce=nonce,
+                manifest_digest=manifest_digest, launch_profile_digest=profile.digest(), listener_device=info.st_dev,
+                listener_inode=info.st_ino, path_device=leaf.st_dev, path_inode=leaf.st_ino,
+                issued_at_ms=wall, expires_at_ms=wall+4000)
+            signature = base64.urlsafe_b64encode(key.sign(handoff.PAIR_DOMAIN+canonical(payload))).rstrip(b'=').decode()
+            return os.dup(listener.fileno()), canonical({'payload':payload,'signature':signature}), nonce, wall, tick, profile_raw
+    class Secrets:
+        def __init__(self, *_, **__): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def resolve_test_secret(self, *_): return 'synthetic-bearer'
+    monkeypatch.setattr(module, 'UnixCurrentObservationTransport', Observations)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', Secrets)
+    seen = []
+    async def service(_factory, **kwargs):
+        worker = kwargs['gate_worker_factory'](SimpleNamespace(ledger=ledger))
+        worker.start(on_failure=lambda: seen.append('failed'))
+        def exchange():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+                channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1); channel.connect(str(directory / 'ledger.sock'))
+                peer = PeerPin(pid=os.getpid(), uid=os.getuid(), gid=os.getgid(), start_ticks=_start(os.getpid()))
+                try:
+                    client = SupervisorLedgerClient(channel=channel, peer=peer, signing_key=key,
+                        launch_binding=worker._launch.launch_binding(), manifest_digest=config.manifest.digest(),
+                        timeout_seconds=2, pair_only=True)
+                    assert client.invoke('seal_pair_drain_v1', {'pair_id':str(uuid4())}) is True
+                finally: peer.close()
+        try:
+            await asyncio.to_thread(exchange)
+            seen.append('sealed')
+        finally:
+            await asyncio.to_thread(worker.close)
+    monkeypatch.setattr(module, 'serve_owned_host_executor_unix', service)
+    try:
+        await module.run_installed_executor(config)
+        assert seen == ['sealed'] and ledger.has_pair_drain_seal()
+    finally:
+        listener.close(); ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_gate_v3_dispatch_denied_before_identity_or_provider_effects(monkeypatch):
+    data = configuration(); data['schema'] = module.GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    config = module.parse_configuration(canonical(data))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    def forbidden(*_args, **_kwargs): pytest.fail('v3 entered provider or issuer')
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', forbidden)
+    monkeypatch.setattr(module, 'local_host_adapter_resources', forbidden)
+    with pytest.raises(module.InstalledRunnerError): await module.run_installed_executor(config)
+
+
+def test_pair_configuration_has_only_independent_authority_and_peer_pins():
+    data = pair_configuration()
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.pair['authority_public_key'] == bytes.fromhex('b' * 64)
+    assert parsed.pair['peer_uid'] == 10002
+    data['pair']['pair_id'] = str(uuid4())
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))
+
+
+@pytest.mark.asyncio
+async def test_pair_runner_wires_two_one_shot_exchanges_then_owned_broker(monkeypatch):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    events, pipes = [], []
+    monkeypatch.setattr(module, '_process', lambda: None)
+    class Verifier:
+        def claim_channel(self, fd): events.append(('claim', fd))
+        def implementation_commit(self): return config.release.implementation_commit
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs):
+            self.index = len([item for item in events if item == 'transport'])
+            events.append('transport')
+        def issue_pair_enrollment(self, **kwargs):
+            assert self.index == 0 and kwargs['own_enrollment'] is config.release
+            events.append('enrollment')
+            return object()
+        def issue_enrolled_pair_channel(self, **kwargs):
+            assert self.index == 1 and kwargs['authority_public_key'] == bytes.fromhex('b' * 64)
+            events.append('channel')
+            fd, writer = os.pipe(); pipes.append(writer)
+            return fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop): yield
+    async def serve(factory, *, fd, peer, stop_event, cleanup_report):
+        assert (peer.uid, peer.gid) == (10002, 10002)
+        assert factory.keywords['driver_identity_verifier'].__class__ is Verifier
+        events.append('broker-drain')
+        os.close(fd)
+        cleanup_report.state = 'clean'
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    monkeypatch.setattr(module, 'serve_owned_inherited_broker', serve)
+    try:
+        await module.run_installed_executor(config)
+        assert [entry for entry in events if isinstance(entry, str)] == ['transport', 'enrollment',
+            'transport', 'channel', 'broker-drain', 'identity-close', 'transport-close', 'transport-close']
+    finally:
+        for fd in pipes: os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_pair_runner_closes_received_fd_if_identity_claim_fails(monkeypatch):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    read_fd, write_fd = os.pipe()
+    events = []
+    class Verifier:
+        def claim_channel(self, fd): raise RuntimeError('synthetic refusal')
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs): pass
+        def issue_pair_enrollment(self, **kwargs): return object()
+        def issue_enrolled_pair_channel(self, **kwargs): return read_fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop): yield
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    try:
+        with pytest.raises(module.InstalledRunnerError): await module.run_installed_executor(config)
+        with pytest.raises(OSError): os.fstat(read_fd)
+        assert events == ['identity-close', 'transport-close', 'transport-close']
+    finally:
+        os.close(write_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('interruption', ['stop_after_enrollment', 'cancel_after_channel'])
+async def test_pair_runner_interruptions_close_pre_adoption_resources(monkeypatch, interruption):
+    config = module.parse_configuration(canonical(pair_configuration()))
+    monkeypatch.setattr(module, '_process', lambda: None)
+    read_fd, write_fd = os.pipe()
+    events, state = [], {}
+    class Verifier:
+        def claim_channel(self, fd):
+            if interruption == 'cancel_after_channel': asyncio.current_task().cancel()
+        def implementation_commit(self): return config.release.implementation_commit
+        def close(self): events.append('identity-close')
+    class Transport:
+        def __init__(self, **kwargs): events.append('transport')
+        def issue_pair_enrollment(self, **kwargs):
+            if interruption == 'stop_after_enrollment': state['stop'].set()
+            return object()
+        def issue_enrolled_pair_channel(self, **kwargs): return read_fd, Verifier()
+        def close(self): events.append('transport-close')
+    @contextmanager
+    def signals(stop):
+        state['stop'] = stop
+        yield
+    async def unexpected_broker(*args, **kwargs): pytest.fail('broker must not be entered')
+    monkeypatch.setattr(module, 'UnixLaunchReceiptTransport', Transport)
+    monkeypatch.setattr(module, '_signal_stop', signals)
+    monkeypatch.setattr(module, 'serve_owned_inherited_broker', unexpected_broker)
+    try:
+        expected = module.InstalledRunnerError if interruption == 'stop_after_enrollment' else asyncio.CancelledError
+        with pytest.raises(expected): await module.run_installed_executor(config)
+        if interruption == 'cancel_after_channel':
+            with pytest.raises(OSError): os.fstat(read_fd)
+            assert events == ['transport', 'transport', 'identity-close', 'transport-close', 'transport-close']
+        else:
+            os.close(read_fd)
+            assert events == ['transport', 'transport-close']
+    finally:
+        os.close(write_fd)
+
+
 def changed(value, path, replacement):
     keys = path.split('.')
     target = value
@@ -334,3 +582,23 @@ def test_cli_invalid_arguments_sanitized_before_io(monkeypatch, capsys, argument
     assert module.main(arguments) == 2
     output = capsys.readouterr()
     assert output.out == '' and output.err == 'Installed executor unavailable\n'
+
+
+def test_v6_baseline_authority_is_signed_config_bound_and_gate_remains_disabled():
+    from hub_container_executor.configuration_commitment import configuration_commitment
+    data = configuration(); data['schema'] = module.BASELINE_GATE_SCHEMA
+    data['gate_socket_directory'] = '/fixture/gate-control'
+    data['baseline_gate'] = dict(issuer_id='baseline-issuer', issuer_public_key_hex='b' * 64,
+        receipt_public_key_hex='c' * 64, socket_source_directory='/fixture/baseline-gate',
+        launch_transport=dict(socket_path='/run/fixture/baseline-issuer.sock', expected_issuer_uid=65533,
+                              expected_issuer_gid=65533))
+    parsed = module.parse_configuration(canonical(data))
+    assert parsed.baseline_gate['source_directory'] == '/fixture/baseline-gate'
+    assert parsed.baseline_gate['public_key'] == bytes.fromhex('c' * 64)
+    assert parsed.gate_ledger_channel is True
+    with pytest.raises(module.InstalledRunnerError): module._require_supported_gate_runtime(parsed)
+    old = configuration_commitment(canonical(data)).content_digest
+    data['baseline_gate']['receipt_public_key_hex'] = 'd' * 64
+    assert configuration_commitment(canonical(data)).content_digest != old
+    data['baseline_gate']['socket_source_directory'] = '/fixture/gate-control/nested'
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(data))

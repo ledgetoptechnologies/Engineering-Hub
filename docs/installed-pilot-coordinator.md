@@ -17,10 +17,26 @@ or repaired. A valid file or canonical JSON is not approval of its contents.
 `validate` reads only the configuration and validates its data/model shape.
 It does not open secrets, sockets, providers or the database, contact an
 identity provider, or establish host readiness. It does not validate an actual
-supervisor's drain behavior. `serve` separately resolves four distinct TEST
-credentials and calls the owned queue service. A missing required core Unix
-client API is rejected before secrets or owner state are touched. That check
-is compatibility evidence, not authentication of the core artifact.
+supervisor's drain behavior. The standalone `serve` CLI currently fails closed
+before reading secrets: it does not supply the required reconciliation factory.
+An explicit Python composition must provide that factory; the separately
+documented [trusted local coordinator](trusted-local-coordinator.md) is one
+such composition for an explicitly approved disposable TEST VM. Once supplied,
+the runner resolves the distinct TEST credentials and calls the owned queue
+service. A missing required core Unix client API is rejected before secrets or
+owner state are touched. That check is compatibility evidence, not
+authentication of the core artifact.
+
+The opt-in `engineering-hub.installed-coordinator.v2` schema replaces the v1
+`public_auth` object with exactly `base_url` (HTTPS), `github_client_id`, and
+the positive numeric `beau_github_id`. It adds a fifth distinct TEST binding,
+`github`, with the same `slot_id`, `version`, and `digest` fields; the client
+secret is resolved from that protected slot and is never placed in the JSON.
+All other v1 fields and restrictions remain. The trusted local entrypoint also
+requires a fresh `engineering-hub.manual-staging-session.v3` enrollment for
+that exact numeric human, machine and manifest. The separate public browser
+gateway needs `--allow-github` to expose the exact GET OAuth callback. This
+configures no GitHub application or credentials and does not grant approval.
 
 The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 

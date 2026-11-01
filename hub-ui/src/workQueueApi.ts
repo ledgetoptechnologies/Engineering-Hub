@@ -12,8 +12,9 @@ export interface QueueJob {
 export interface QueueSnapshot {
   paused: boolean; queue_paused: boolean; master_paused: boolean;
   claim_admission_state: "unconfigured" | "trusted_composition" | "worker_policy";
-  counts: Partial<Record<WorkState, number>>; jobs: QueueJob[];
+  counts: Partial<Record<WorkState, number>>; jobs: QueueJob[]; stagingMachines: string[];
 }
+export type Reservation = "not_reserved" | "active" | "held" | "unknown";
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const key = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
 const reasons = new Set(["requires_reconciliation", "paused", "registry_changed", "production_approval_required",
@@ -38,6 +39,16 @@ export function parseQueueSnapshot(value: unknown): QueueSnapshot {
     counts[state as WorkState] = count as number;
   }
   if (!Array.isArray(row.jobs) || row.jobs.length > 50) return invalid();
+  const actions = Object.entries(object(row.actions));
+  if (actions.length > 256) return invalid();
+  const stagingMachines = [...new Set(actions.flatMap(([name, value]) => {
+    text(name, key);
+    const action = object(value);
+    const machine = text(action.machine_id, key);
+    if (!Array.isArray(action.environments) || action.environments.length > 2
+        || action.environments.some(item => item !== "staging" && item !== "production")) return invalid();
+    return action.environments.includes("staging") ? [machine] : [];
+  }))].sort();
   const jobs = row.jobs.map((value): QueueJob => {
     const job = object(value), target = object(job.target);
     if (!states.includes(job.state as WorkState) || !["production", "staging"].includes(job.environment as string)
@@ -51,9 +62,24 @@ export function parseQueueSnapshot(value: unknown): QueueSnapshot {
   });
   if (new Set(jobs.map(job => job.id)).size !== jobs.length) return invalid();
   const result: QueueSnapshot = { paused: bool(row.paused), queue_paused: bool(row.queue_paused), master_paused: bool(row.master_paused),
-    claim_admission_state: admission, counts, jobs };
+    claim_admission_state: admission, counts, jobs, stagingMachines };
   if (result.paused !== (result.queue_paused || result.master_paused)) return invalid();
   return result;
+}
+export async function readMachineReservation(machine: string, signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<Reservation> {
+  text(machine, key);
+  // The closed key grammar excludes path separators and escapes; preserve ':'
+  // because the split gateway rejects percent-encoded path spellings.
+  const response = await fetchImpl.call(globalThis, `/api/hub/v1/work/machines/${machine}`, {
+    method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal,
+  });
+  if (!response.ok) throw new HubApiError(response.status, "machine_reservation_unavailable");
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
+  const value = object(await response.json());
+  const state = value.queue_reservation;
+  if (value.machine_id !== machine || !["not_reserved", "active", "held", "unknown"].includes(state as string)
+      || value.requires_reconciliation !== (state === "unknown" ? null : state === "held")) return invalid();
+  return state as Reservation;
 }
 export async function readQueueSnapshot(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<QueueSnapshot> {
   const response = await fetchImpl.call(globalThis, "/api/hub/v1/work/status?limit=50", {

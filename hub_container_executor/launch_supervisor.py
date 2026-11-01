@@ -10,11 +10,13 @@ because its health endpoint works. Same-UID/root administrators remain trusted.
 from __future__ import annotations
 
 import base64
+import array
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, InitVar
 import fcntl
 import hashlib
 import http.client
+import inspect
 import json
 import math
 import os
@@ -32,32 +34,28 @@ from uuid import UUID, uuid4
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engineering_hub.container_pilot_manifest import Platform
+from engineering_hub.executor_launch_profile import LAUNCH_TARGETS, MAX_PROFILE_BYTES
 from engineering_hub import current_executor_observation as current_observation
 from .build_record import VerifiedImage
 from .daemon_backend import _archive_metadata, _archive_image
 from .runtime_identity import (ExecutorReleaseEnrollment, PROTOCOL, AUDIENCE,
-                               SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES)
-from .launch_transport import REQUEST_PROTOCOL, MAX_REQUEST_BYTES
-from .configuration_commitment import configuration_commitment
+                               SIGNATURE_DOMAIN, MAX_RECEIPT_BYTES,
+                               CoordinatorReleaseEnrollment, COORDINATOR_PROTOCOL,
+                               COORDINATOR_AUDIENCE, COORDINATOR_SIGNATURE_DOMAIN)
+from .launch_transport import REQUEST_PROTOCOL, COORDINATOR_REQUEST_PROTOCOL, MAX_REQUEST_BYTES
+from .configuration_commitment import (configuration_commitment, coordinator_configuration_commitment,
+                                       trusted_local_coordinator_commitment, supervised_local_coordinator_commitment)
 
 
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
-_TARGETS = {
-    'engine_socket': '/run/engineering-hub/docker.sock',
-    'issuer_socket': '/run/engineering-hub/issuer.sock',
-    'config': '/operator/runner.json',
-    'state': '/var/lib/engineering-hub/executor',
-    'generations': '/var/lib/engineering-hub/generations',
-    'records': '/var/lib/engineering-hub/records',
-    'metadata': '/var/lib/engineering-hub/metadata',
-    'baseline': '/var/lib/engineering-hub/baseline',
-    'secrets': '/var/lib/engineering-hub/secrets',
-}
+GATE_MOUNT_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-mount-observation-request.v1'
+GATE_LEDGER_REQUEST_PROTOCOL = 'engineering-hub.executor-gate-ledger-handoff-request.v1'
+PAIR_LEDGER_REQUEST_PROTOCOL = 'engineering-hub.executor-pair-outcome-handoff-request.v1'
+_TARGETS = LAUNCH_TARGETS
 
 
 class _ObservationWaitExpired(Exception):
@@ -74,6 +72,20 @@ class LaunchSupervisorError(RuntimeError):
 def _require(value):
     if not value:
         raise LaunchSupervisorError()
+
+
+def _check_gate_authority(callback):
+    """Require a synchronous completed check; never schedule caller-owned work."""
+    _require(callable(callback) and not inspect.iscoroutinefunction(callback)
+             and not inspect.isasyncgenfunction(callback)
+             and not inspect.iscoroutinefunction(getattr(callback, '__call__', None))
+             and not inspect.isasyncgenfunction(getattr(callback, '__call__', None)))
+    result = callback()
+    if inspect.isawaitable(result) or inspect.isasyncgen(result):
+        if inspect.iscoroutine(result) and inspect.getcoroutinestate(result) == inspect.CORO_CREATED:
+            result.close()
+        raise LaunchSupervisorError()
+    _require(result is None)
 
 
 def _canonical(value):
@@ -105,6 +117,65 @@ def _path(value):
 
 def _identity(info):
     return info.st_dev, info.st_ino
+
+
+def _measure_gate_process(peer, pins, executable_digest, deadline, *, proc_root=Path('/proc'), bootstrap=False):
+    """Measure a pinned process and mount now; this is not continuing custody."""
+    _require(type(bootstrap) is bool and type(pins) is dict and type(executable_digest) is str and _SHA.fullmatch(executable_digest)
+             and type(pins.get('expected_device')) is int and type(pins.get('expected_inode')) is int
+             and type(pins.get('mount_flags')) is list)
+    peer.check(); _remaining(deadline)
+    base = proc_root / str(peer.pid)
+    expected_argv = ([b'/usr/local/libexec/hub-application-gate'] if bootstrap else
+                     [b'/opt/venv/bin/python', b'-I', b'-B', b'-m', b'engineering_hub',
+                      b'--host', b'0.0.0.0', b'--port', b'8770'])
+    with (base / 'cmdline').open('rb') as stream:
+        _require(stream.read(1025) == b'\x00'.join(expected_argv) + b'\x00')
+    fd = os.open(base / 'exe', os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        before = os.fstat(fd)
+        _require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 128 * 1024 * 1024)
+        digest = hashlib.sha256(); total = 0
+        while True:
+            _remaining(deadline)
+            block = os.read(fd, 1024 * 1024)
+            if not block: break
+            total += len(block)
+            _require(total <= before.st_size)
+            digest.update(block)
+        after = os.fstat(fd); named = os.stat(base / 'exe')
+        _require(total == before.st_size and _identity(before) == _identity(after) == _identity(named)
+                 and (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                 == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                 and 'sha256:' + digest.hexdigest() == executable_digest)
+    finally:
+        os.close(fd)
+    fds = []
+    try:
+        root = os.open(base / 'root', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC); fds.append(root)
+        parent = root
+        for part in ('var', 'lib', 'hub'):
+            parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            fds.append(parent)
+        for index, part in enumerate(('var', 'lib', 'hub')):
+            _require(_identity(os.stat(part, dir_fd=fds[index], follow_symlinks=False))
+                     == _identity(os.fstat(fds[index + 1])))
+        info = os.fstat(parent)
+        flags = os.fstatvfs(parent).f_flag
+        observed_flags = sorted(name for name, bit in (('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC),
+                                                        ('nosuid', os.ST_NOSUID)) if flags & bit)
+        if not flags & os.ST_RDONLY: observed_flags.append('rw')
+        _require(stat.S_ISDIR(info.st_mode) and _identity(info) == (pins['expected_device'], pins['expected_inode'])
+                 and observed_flags == pins['mount_flags'])
+        _require(_identity(os.stat(base / 'root')) == _identity(os.fstat(root)))
+        _require(_identity(os.stat(base / 'exe')) == _identity(after))
+        with (base / 'cmdline').open('rb') as stream:
+            _require(stream.read(1025) == b'\x00'.join(expected_argv) + b'\x00')
+        peer.check(); _remaining(deadline)
+        return {'executable_digest': executable_digest, 'device': info.st_dev, 'inode': info.st_ino,
+                'mount_flags': observed_flags}
+    finally:
+        for item in reversed(fds): os.close(item)
 
 
 def _root_parent(path, *, private):
@@ -204,95 +275,9 @@ class _Process:
             self.fd = None
 
 
-class _Closed(BaseModel):
-    model_config = ConfigDict(strict=True, frozen=True, extra='forbid')
-
-
-class ExecutorLaunchMount(_Closed):
-    role: str
-    source: str
-    target: str
-    kind: str
-    read_only: bool
-    uid: int = Field(ge=0, le=2**32 - 2)
-    gid: int = Field(ge=0, le=2**32 - 2)
-    mode: int = Field(ge=0, le=0o777)
-    content_digest: str | None
-
-    @model_validator(mode='after')
-    def closed_role(self):
-        _require(self.role in _TARGETS)
-        if self.role == 'generations':
-            # Engine bind sources are resolved in the daemon's host namespace;
-            # the executor must see this exact absolute path, not an alias.
-            _require(self.target == self.source)
-        else:
-            _require(self.target == _TARGETS[self.role])
-        _path(self.source)
-        kind = ('socket' if self.role.endswith('_socket') else 'file' if self.role == 'config' else 'directory')
-        _require(self.kind == kind and self.read_only is (self.role not in {'state', 'generations'}))
-        if self.kind == 'file':
-            _require(self.uid > 0 and self.gid > 0 and self.mode == 0o600 and type(self.content_digest) is str
-                     and _SHA.fullmatch(self.content_digest))
-        else:
-            _require(self.content_digest is None)
-        if self.role == 'issuer_socket':
-            _require(self.uid == 0 and self.mode == 0o660)
-        return self
-
-
-class ExecutorLaunchProfile(_Closed):
-    """Exact independently enrolled executor-only profile, NOT an app profile."""
-    user: str
-    supplementary_groups: tuple[int, ...]
-    entrypoint: tuple[str, ...]
-    command: tuple[str, ...]
-    environment: tuple[str, ...]
-    fixture_root: str
-    memory_bytes: int = Field(ge=64 * 1024**2, le=512 * 1024**2)
-    cpu_millicores: int = Field(ge=100, le=1000)
-    pids_limit: int = Field(ge=16, le=128)
-    tmpfs_bytes: int = Field(ge=1024**2, le=64 * 1024**2)
-    mounts: tuple[ExecutorLaunchMount, ...]
-    runner_file: str
-    runner_digest: str
-
-    @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
-    @classmethod
-    def arrays(cls, value):
-        _require(type(value) in {list, tuple})
-        return tuple(value)
-
-    @model_validator(mode='after')
-    def closed_profile(self):
-        _require(self.user == '10001:10001' and len(self.supplementary_groups) <= 2
-                 and len(set(self.supplementary_groups)) == len(self.supplementary_groups)
-                 and all(type(value) is int and 0 <= value < 2**32 - 1 for value in self.supplementary_groups))
-        # The separately implemented, independently built runner must actually
-        # exist in the pinned image; merely naming this module is not evidence.
-        _require(self.entrypoint == ('/opt/venv/bin/python', '-I', '-m',
-                                     'hub_container_executor.installed_runner'))
-        _require(self.command == ('--config', _TARGETS['config']))
-        _require(len(self.environment) <= 16 and len({item.split('=', 1)[0] for item in self.environment}) == len(self.environment)
-                 and all(re.fullmatch(r'(PATH|LANG|LC_ALL|TZ|PYTHONDONTWRITEBYTECODE|PYTHONUNBUFFERED)=[^\x00\r\n]{1,512}', item)
-                         for item in self.environment))
-        _require(self.tmpfs_bytes <= self.memory_bytes and len(self.mounts) == len(_TARGETS)
-                 and {item.role for item in self.mounts} == set(_TARGETS))
-        fixture = _path(self.fixture_root)
-        _require(re.fullmatch(r'hub-pilot-[a-z0-9][a-z0-9-]{0,63}', fixture.name))
-        sources = [Path(item.source) for item in self.mounts]
-        _require(all(fixture in Path(item.source).parents for item in self.mounts
-                     if item.role not in {'engine_socket', 'issuer_socket'}))
-        _require(all(not (left == right or left in right.parents or right in left.parents)
-                     for index, left in enumerate(sources) for right in sources[index + 1:]))
-        _path(self.runner_file)
-        _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
-                 and not any(self.runner_file == item.target or Path(item.target) in Path(self.runner_file).parents
-                         for item in self.mounts) and type(self.runner_digest) is str and _SHA.fullmatch(self.runner_digest))
-        return self
-
-    def digest(self):
-        return 'sha256:' + hashlib.sha256(_canonical(self.model_dump(mode='json'))).hexdigest()
+from engineering_hub.executor_launch_profile import (  # re-exported; one parser for supervisor and verifiers
+    DisjointDaemonPolicy, ExecutorLaunchMount, ExecutorLaunchProfile, LaunchProfileError, _HELD_HOST_IDS,
+    _UNUSABLE_DAEMON_IDS, _covers, _covers_inside, _map_rows, _proc_map_rows)
 
 
 @dataclass(frozen=True)
@@ -304,15 +289,21 @@ class _DaemonPin:
     gid: int
     daemon_id: str
     api_version: str
+    disjoint: InitVar[bool] = False
 
-    def __post_init__(self):
+    def __post_init__(self, disjoint):
         _path(self.socket_path)
         _require(all(type(value) is int and value > 0 for value in (self.pid, self.start_ticks))
                  and all(type(value) is int and 0 <= value < 2**32 - 1 for value in (self.uid, self.gid))
                  and type(self.daemon_id) is str and re.fullmatch(r'[A-Za-z0-9:_.-]{1,128}', self.daemon_id)
                  and type(self.api_version) is str and re.fullmatch(r'1\.[0-9]{2,3}', self.api_version)
                  and int(self.api_version.split('.')[1]) >= 41)
-        _rootless_daemon_uid(self.uid)
+        _require(type(disjoint) is bool)
+        if disjoint:
+            # A separate root-protected v3 enrollment pins this exact UID and GID.
+            _require(self.uid not in _UNUSABLE_DAEMON_IDS and self.gid not in _UNUSABLE_DAEMON_IDS)
+        else:
+            _rootless_daemon_uid(self.uid)
 
 
 def _rootless_daemon_uid(uid):
@@ -320,12 +311,59 @@ def _rootless_daemon_uid(uid):
     _require(uid == 10001)
 
 
+HELD_RANGES_SCHEMA = 'engineering-hub.held-id-ranges.v1'
+
+
+def _host_ranges(value):
+    _require(type(value) is list and 1 <= len(value) <= 16)
+    ranges = []
+    for item in value:
+        _require(type(item) is list and len(item) == 2 and all(type(part) is int for part in item))
+        start, length = item
+        _require(start >= 0 and length > 0 and start + length <= 2**32)
+        ranges.append((start, length))
+    return tuple(ranges)
+
+
+def _held_ranges(raw):
+    """Operator-attested host ID ranges for the held TEST account.
+
+    Root ownership protects the file's integrity after it is placed. It does not
+    prove the ranges are complete or where they came from; the evidence digest is
+    only checked for form. Overlap checks against it are only as good as that attestation.
+    """
+    data = _strict(raw, 65536)
+    _require(type(data) is dict and set(data) == {'schema', 'uid_ranges', 'gid_ranges', 'evidence_sha256'}
+             and data['schema'] == HELD_RANGES_SCHEMA
+             and type(data['evidence_sha256']) is str and _HEX.fullmatch(data['evidence_sha256']))
+    uids, gids = _host_ranges(data['uid_ranges']), _host_ranges(data['gid_ranges'])
+    # A record that doesn't even cover the held account itself is not about it.
+    _require(any(start <= 10001 < start + length for start, length in uids)
+             and any(start <= 10001 < start + length for start, length in gids))
+    return uids, gids
+
+
+def _disjoint_from(rows, ranges):
+    return not any(outside < start + length and start < outside + size
+                   for _, outside, size in rows for start, length in ranges)
+
+
+def _live_maps(policy, uid_map, gid_map):
+    """Exact equality between kernel-reported maps and the profile-pinned policy."""
+    try:
+        rows = _proc_map_rows(uid_map), _proc_map_rows(gid_map)
+    except LaunchProfileError:
+        # Callers of the supervisor see only its own sanitized error type.
+        raise LaunchSupervisorError() from None
+    _require(rows == (policy.uid_map, policy.gid_map))
+
+
 def _mapped_id(raw, identifier):
     _require(type(raw) is str and len(raw) <= 65536)
     rows = []
     for line in raw.splitlines():
         fields = line.split()
-        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]+', value) for value in fields))
+        _require(len(fields) == 3 and all(re.fullmatch(r'[0-9]{1,10}', value) for value in fields))
         inside, outside, length = map(int, fields)
         _require(length > 0 and inside + length <= 2**32 and outside + length <= 2**32)
         _require(all(inside + length <= old[0] or old[0] + old[2] <= inside for old in rows))
@@ -338,7 +376,8 @@ def _mapped_id(raw, identifier):
 
 def _kernel_profile(profile, status, uid_map, gid_map, mountinfo, consumer_uid, consumer_gid):
     """Validate caller-observed /proc data, not Engine's desired configuration."""
-    _require(_mapped_id(uid_map, 10001) == consumer_uid and _mapped_id(gid_map, 10001) == consumer_gid)
+    identity = 10002 if profile.role == 'coordinator' else 10001
+    _require(_mapped_id(uid_map, identity) == consumer_uid and _mapped_id(gid_map, identity) == consumer_gid)
     _require([int(value) for value in status['Uid'].split()] == [consumer_uid] * 4
              and [int(value) for value in status['Gid'].split()] == [consumer_gid] * 4
              and status.get('NoNewPrivs') == '1'
@@ -499,15 +538,39 @@ def _unique(pairs):
     return result
 
 
+_GATE_ISSUANCE_SCHEMA = ('CREATE TABLE gate_issuance (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                         'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
+                         'decision TEXT NOT NULL, digest TEXT NOT NULL)')
+_GATE_START_SCHEMA = ('CREATE TABLE gate_start (operation_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                      'gate_launch_id TEXT UNIQUE NOT NULL, supervisor_id TEXT UNIQUE NOT NULL, '
+                      'enrollment TEXT NOT NULL, digest TEXT NOT NULL)')
+_LEDGER_HANDOFF_SCHEMA = ('CREATE TABLE ledger_handoff (supervisor_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
+                          'binding TEXT NOT NULL, digest TEXT NOT NULL)')
+_LEDGER_HANDOFF_FIELDS = frozenset({'protocol', 'audience', 'nonce', 'launch_id', 'boot_id',
+    'authenticated_host_pid', 'process_start_ticks', 'container_id', 'manifest_digest',
+    'launch_profile_digest', 'listener_device', 'listener_inode', 'path_device', 'path_inode',
+    'issued_at_ms', 'expires_at_ms'})
+
+
 class _Journal:
     """Root-private local durable single-launch/one-issuance reservation.
 
     Restart can inspect retained rows but never adopts an earlier launch. The
     lock is held until close; no row or lock file is deleted on uncertainty.
     """
-    def __init__(self, path, *, create):
+    def __init__(self, path, *, create, gate_mode=False, start_mode=False, ledger_mode=False):
         from engineering_hub.pilot_ownership import _local_filesystem
-        _require(type(create) is bool)
+        _require(type(create) is bool and type(gate_mode) is bool and type(start_mode) is bool
+                 and type(ledger_mode) is bool and (gate_mode or not start_mode)
+                 and (start_mode or not ledger_mode))
+        self.gate_mode = gate_mode
+        self.start_mode = start_mode
+        self.ledger_mode = ledger_mode
+        self._gate_fresh = gate_mode and create
+        self._start_fresh = start_mode and create
+        self._start_confirmed = False
+        self._ledger_fresh = ledger_mode and create
+        self._gate_lock = threading.Lock()
         self.path, self.pid = _path(path), os.getpid()
         self.parent = self.lock = None
         try:
@@ -536,9 +599,29 @@ class _Journal:
                     db.execute('CREATE TABLE launch (id TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL)')
                     db.execute('CREATE TABLE issuance (launch_id TEXT PRIMARY KEY, nonce TEXT UNIQUE NOT NULL, '
                                'state TEXT NOT NULL, receipt_digest TEXT)')
-                    db.execute('PRAGMA user_version=1')
-                _require(db.execute('PRAGMA user_version').fetchone()[0] == 1)
-                _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'launch', 'issuance'})
+                    if gate_mode:
+                        db.execute(_GATE_ISSUANCE_SCHEMA)
+                    if start_mode:
+                        db.execute(_GATE_START_SCHEMA)
+                    if ledger_mode:
+                        db.execute(_LEDGER_HANDOFF_SCHEMA)
+                    db.execute('PRAGMA user_version=' + ('4' if ledger_mode else '3' if start_mode else '2' if gate_mode else '1'))
+                _require(db.execute('PRAGMA user_version').fetchone()[0] == (4 if ledger_mode else 3 if start_mode else 2 if gate_mode else 1))
+                tables = {'launch', 'issuance'} | ({'gate_issuance'} if gate_mode else set())
+                if start_mode:
+                    tables.add('gate_start')
+                if ledger_mode:
+                    tables.add('ledger_handoff')
+                _require({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == tables)
+                if gate_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_issuance'").fetchone()
+                             == (_GATE_ISSUANCE_SCHEMA,))
+                if start_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='gate_start'").fetchone()
+                             == (_GATE_START_SCHEMA,))
+                if ledger_mode:
+                    _require(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='ledger_handoff'").fetchone()
+                             == (_LEDGER_HANDOFF_SCHEMA,))
         except BaseException:
             self.close()
             raise
@@ -578,15 +661,147 @@ class _Journal:
             _require(db.execute('UPDATE launch SET state=?,data=? WHERE id=?',
                 (state, _canonical(data).decode(), identity)).rowcount == 1)
 
+    def record_coordinator_drain(self, identity, record):
+        """One local-drain report after the original stop intent; never replay."""
+        with self.transaction() as db:
+            _require(db.execute('SELECT state FROM issuance WHERE launch_id=?', (identity,)).fetchone() == ('sent',))
+            _require(db.execute("UPDATE launch SET state='drain_recorded',data=? WHERE id=? AND state='term_reserved'",
+                (_canonical(record).decode(), identity)).rowcount == 1)
+
     def reserve_issuance(self, identity, nonce):
         with self.transaction() as db:
             _require(db.execute('SELECT state FROM launch WHERE id=?', (identity,)).fetchone() == ('running',))
             db.execute('INSERT INTO issuance VALUES (?,?,?,NULL)', (identity, nonce, 'reserved'))
 
+    def reserve_ledger_handoff(self, supervisor_id, supervisor_record, binding, digest):
+        """Reserve one handoff before descriptor send; ambiguity never permits retry.
+
+        Caller must validate live peer, signed envelope and protected listener;
+        this journal records those claims but does not establish their truth.
+        """
+        self._check()
+        with self._gate_lock:
+            try:
+                _require(self.ledger_mode and self._ledger_fresh and type(supervisor_id) is str
+                         and type(supervisor_record) is dict and type(binding) is dict
+                         and set(binding) == _LEDGER_HANDOFF_FIELDS and type(digest) is str
+                         and _HEX.fullmatch(digest))
+                snapshot = json.loads(_canonical(binding))
+                _require(snapshot['protocol'] == 'engineering-hub.gate-ledger-handoff.v1'
+                         and snapshot['audience'] == 'engineering-hub.container-executor-ledger'
+                         and snapshot['launch_id'] == supervisor_id
+                         and type(snapshot['boot_id']) is str and str(UUID(snapshot['boot_id'])) == snapshot['boot_id']
+                         and type(snapshot['container_id']) is str and _HEX.fullmatch(snapshot['container_id'])
+                         and all(type(snapshot[k]) is int and 0 < snapshot[k] < 2**63
+                                 for k in ('authenticated_host_pid', 'process_start_ticks', 'issued_at_ms', 'expires_at_ms'))
+                         and 0 < snapshot['expires_at_ms'] - snapshot['issued_at_ms'] <= 5000
+                         and type(supervisor_record.get('approval_expires_at_ms')) is int
+                         and snapshot['expires_at_ms'] <= supervisor_record['approval_expires_at_ms']
+                         and snapshot['boot_id'] == supervisor_record.get('boot_id')
+                         and snapshot['container_id'] == supervisor_record.get('container_id')
+                         and snapshot['authenticated_host_pid'] == supervisor_record.get('pid')
+                         and snapshot['process_start_ticks'] == supervisor_record.get('start_ticks')
+                         and snapshot['launch_profile_digest'] == supervisor_record.get('manifest')
+                         and type(snapshot['nonce']) is str and _HEX.fullmatch(snapshot['nonce'])
+                         and all(type(snapshot[k]) is str and _SHA.fullmatch(snapshot[k])
+                                 for k in ('manifest_digest', 'launch_profile_digest'))
+                         and all(type(snapshot[k]) is int and 0 <= snapshot[k] < 2**63
+                                 for k in ('listener_device', 'path_device'))
+                         and all(type(snapshot[k]) is int and 0 < snapshot[k] < 2**63
+                                 for k in ('listener_inode', 'path_inode')))
+                encoded = _canonical(snapshot).decode()
+                with self.transaction() as db:
+                    _require(db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                             == ('running', _canonical(supervisor_record).decode()))
+                    _require(db.execute('SELECT state FROM issuance WHERE launch_id=?', (supervisor_id,)).fetchone()
+                             == ('sent',))
+                    db.execute('INSERT INTO ledger_handoff VALUES (?,?,?,?)',
+                               (supervisor_id, snapshot['nonce'], encoded, digest))
+            finally:
+                # Even a raised commit/fsync can have committed. Never retry.
+                self._ledger_fresh = False
+            return True
+
     def issuance_state(self, identity, state, digest):
         with self.transaction() as db:
             _require(db.execute('UPDATE issuance SET state=?,receipt_digest=? WHERE launch_id=?',
                                 (state, digest, identity)).rowcount == 1)
+
+    def reserve_gate_start(self, supervisor_id, supervisor_record, expected_without_nonce,
+                           bootstrap_digest, payload, digest):
+        """Durably reserve one start before sending; no cross-ledger atomicity."""
+        from .mount_gate_start_enrollment import PROTOCOL, AUDIENCE, _identity
+        from .mount_gate_protocol import IDENTITY_FIELDS
+        self._check()
+        with self._gate_lock:
+            try:
+                _require(self.start_mode and self._start_fresh and type(supervisor_id) is str
+                         and type(supervisor_record) is dict and type(expected_without_nonce) is dict
+                         and set(expected_without_nonce) == IDENTITY_FIELDS - {'nonce'}
+                         and type(payload) is dict and set(payload) == {'protocol', 'audience', 'identity',
+                             'bootstrap_digest', 'issued_at_ms', 'expires_at_ms'}
+                         and payload['protocol'] == PROTOCOL and payload['audience'] == AUDIENCE
+                         and type(bootstrap_digest) is str and _SHA.fullmatch(bootstrap_digest)
+                         and payload['bootstrap_digest'] == bootstrap_digest
+                         and type(digest) is str and _HEX.fullmatch(digest))
+                pins = payload['identity']; _identity(pins)
+                _require(all(type(pins[k]) is type(expected_without_nonce[k]) and pins[k] == expected_without_nonce[k]
+                             for k in expected_without_nonce))
+                issued, expires = payload['issued_at_ms'], payload['expires_at_ms']
+                _require(type(issued) is int and type(expires) is int and issued > 0
+                         and 0 < expires - issued <= 5000)
+                with self.transaction() as db:
+                    row = db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                    _require(row == ('running', _canonical(supervisor_record).decode()))
+                    db.execute('INSERT INTO gate_start VALUES (?,?,?,?,?,?)',
+                        (pins['operation_id'], pins['nonce'], pins['launch_id'], supervisor_id,
+                         _canonical(payload).decode(), digest))
+            except BaseException:
+                self._start_fresh = False
+                self._gate_fresh = False
+                raise
+            self._start_fresh = False
+            self._start_confirmed = True
+            return True
+
+    def reserve_gate_issuance(self, supervisor_id, supervisor_record, expected, decision, digest):
+        """One durable reservation in this journal; external authorities stay external.
+
+        Trusted composition must hold the supervisor lifecycle lock and validate
+        live application process, fence, custodian and independent enrollment.
+        This transaction cannot atomically inspect the separate adapter ledger.
+        A raised error, including after commit, is uncertain and never retryable.
+        """
+        self._check()  # PID fence precedes a possibly inherited lock.
+        with self._gate_lock:
+            return self._reserve_gate_issuance(supervisor_id, supervisor_record, expected, decision, digest)
+
+    def _reserve_gate_issuance(self, supervisor_id, supervisor_record, expected, decision, digest):
+        from .mount_gate_protocol import IDENTITY_FIELDS, _payload
+        _require(self.gate_mode and self._gate_fresh and type(supervisor_id) is str
+                 and type(supervisor_record) is dict and type(expected) is dict
+                 and set(expected) == IDENTITY_FIELDS and type(digest) is str
+                 and re.fullmatch(r'[0-9a-f]{64}', digest) is not None)
+        _payload(decision)
+        _require(all(type(expected[k]) is type(decision[k]) and expected[k] == decision[k]
+                     for k in IDENTITY_FIELDS))
+        encoded = _canonical(decision).decode()
+        try:
+            with self.transaction() as db:
+                row = db.execute('SELECT state,data FROM launch WHERE id=?', (supervisor_id,)).fetchone()
+                _require(row == ('running', _canonical(supervisor_record).decode()))
+                if self.start_mode:
+                    _require(self._start_confirmed)
+                    started = db.execute('SELECT enrollment FROM gate_start WHERE supervisor_id=?', (supervisor_id,)).fetchone()
+                    _require(started is not None and json.loads(started[0])['identity'] == expected)
+                db.execute('INSERT INTO gate_issuance VALUES (?,?,?,?,?,?)',
+                           (decision['operation_id'], decision['nonce'], decision['launch_id'], supervisor_id, encoded, digest))
+        except BaseException:
+            # Even an exception after SQLite commit is ambiguous. Permanently
+            # close this in-process issuance path until manual reconciliation.
+            self._gate_fresh = False
+            raise
+        return True
 
     def close(self):
         if self.lock is not None:
@@ -608,13 +823,24 @@ class LaunchSupervisor:
     No automatic name adoption, POST retry, Docker stop/kill timeout, remove,
     cleanup of generations, key creation or restart recovery is implemented.
     """
-    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal):
+    def __init__(self, *, enrollment_file, signing_key_file, journal_file, create_journal,
+                 held_ranges_file=None, gate_start_mode=False, retained_pair=None):
         self._pid = os.getpid()
+        self._held_path = self._held_identity = None
         self._mutex = threading.Lock()
+        self._gate_start_thread = None
+        self._gate_listener = self._gate_parent = None
+        self._gate_directory = self._gate_socket_identity = self._gate_enrollment = None
+        self._gate_manifest = self._gate_image = self._gate_policy_path = None
+        self._gate_accepted_channel = self._gate_accepted_peer = None
+        self._gate_accept_used = False
+        self._ledger_handoff_parent = self._ledger_handoff_listener = None
+        self._ledger_handoff_directory = self._ledger_handoff_path_identity = None
         self._journal = self._engine = self._consumer = self._listener = None
         self._socket_parent = None
         self._socket_identity = None
         self._launch_id = self._container_id = None
+        self._pair_reservation = None
         self._closed = False
         self._issuance_open = False
         self._receipt_served = False
@@ -622,7 +848,7 @@ class LaunchSupervisor:
         self._held = False
         self._source_pins = {}
         try:
-            _require(sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
+            _require(type(gate_start_mode) is bool and sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
                      and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'))
             self._enrollment_path, self._key_path = _path(enrollment_file), _path(signing_key_file)
             raw, self._enrollment_identity = _root_file(self._enrollment_path, 1024**2)
@@ -630,10 +856,13 @@ class LaunchSupervisor:
             _require(len(key) == 32)
             self._signer = Ed25519PrivateKey.from_private_bytes(key)
             data = _strict(raw, 1024**2)
-            _require(type(data) is dict and set(data) == {'schema', 'release', 'image', 'profile', 'daemon',
+            _require(type(data) is dict)
+            coordinator_enrollment = data.get('schema') == 'coordinator_launch_supervisor_v4'
+            _require(set(data) == ({'schema', 'release', 'image', 'profile', 'daemon',
                 'socket_path', 'consumer_host_uid', 'consumer_host_gid', 'receipt_lifetime_seconds',
-                'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'})
-            _require(data['schema'] == 'executor_launch_supervisor_v2')
+                'request_timeout_ms', 'launch_timeout_ms', 'configuration_raw_digest'} |
+                ({'admission_raw_digest'} if coordinator_enrollment else set())))
+            _require(data['schema'] in ('executor_launch_supervisor_v2', 'executor_launch_supervisor_v3', 'coordinator_launch_supervisor_v4'))
             self._configuration_raw_digest = data['configuration_raw_digest']
             _require(type(self._configuration_raw_digest) is str
                      and _SHA.fullmatch(self._configuration_raw_digest))
@@ -641,11 +870,25 @@ class LaunchSupervisor:
             _require(type(release.get('public_key')) is str and _HEX.fullmatch(release['public_key']))
             release['public_key'] = bytes.fromhex(release['public_key'])
             release['platform'] = Platform.model_validate(release['platform'])
-            self.release = ExecutorReleaseEnrollment(**release)
+            self.release = (CoordinatorReleaseEnrollment if coordinator_enrollment else ExecutorReleaseEnrollment)(**release)
             _require(self.release.public_key == self._signer.public_key().public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw))
             self.profile = ExecutorLaunchProfile.model_validate(data['profile'])
             _require(self.profile.digest() == self.release.launch_profile_digest)
+            if coordinator_enrollment:
+                from .retained_oauth_pair import RetainedOAuthPair
+                _require(type(retained_pair) is RetainedOAuthPair
+                         and self.profile.role == 'supervised-local-coordinator-v3'
+                         and self.profile.broker_mode is None and self.profile.command_channel is None
+                         and self.profile.generation_isolation is None and not gate_start_mode
+                         and create_journal is True)
+                self._admission_raw_digest = data['admission_raw_digest']
+                _require(type(self._admission_raw_digest) is str and _SHA.fullmatch(self._admission_raw_digest))
+            else:
+                # Legacy and inherited-channel roles retain their prior refusal.
+                _require(retained_pair is None and self.profile.broker_mode is None and self.profile.role is None
+                         and self.profile.command_channel is None and self.profile.generation_isolation is None)
+            _require(self.profile.gate_channel is None or gate_start_mode)
             image = dict(data['image'])
             _require(set(image) == set(VerifiedImage.__dataclass_fields__))
             image['platform'] = Platform.model_validate(image['platform'])
@@ -655,29 +898,66 @@ class LaunchSupervisor:
                      and self.image.image_config_id == self.release.image_config_id
                      and self.image.platform == self.release.platform
                      and self.image.source_commit == self.release.implementation_commit)
-            self._daemon_pin = _DaemonPin(**data['daemon'])
+            _require(type(data['daemon']) is dict and 'disjoint' not in data['daemon'])
+            disjoint = data['schema'] in ('executor_launch_supervisor_v3', 'coordinator_launch_supervisor_v4')
+            self._daemon_pin = _DaemonPin(**data['daemon'], disjoint=disjoint)
             self._socket_path = _path(data['socket_path'])
             self._consumer_uid, self._consumer_gid = data['consumer_host_uid'], data['consumer_host_gid']
             _require(all(type(value) is int and 0 < value < 2**32 - 1
                          for value in (self._consumer_uid, self._consumer_gid)))
+            policy = self.profile.daemon_policy
+            # The version and the signed profile must agree: legacy never carries a
+            # policy or held evidence; v3 needs both and can't run without them.
+            _require((policy is not None) is disjoint and (held_ranges_file is not None) is disjoint)
+            if disjoint:
+                self._held_path = _path(held_ranges_file)
+                held_raw, self._held_identity = _root_file(self._held_path, 65536)
+                # Only the exact attestation the signed profile names may be compared against.
+                _require('sha256:' + hashlib.sha256(held_raw).hexdigest() == policy.held_ranges_digest)
+                held_uids, held_gids = _held_ranges(held_raw)
+                _require(self._daemon_pin.uid == policy.daemon_uid and self._daemon_pin.gid == policy.daemon_gid
+                         and self._daemon_pin.daemon_id == policy.engine_id
+                         and _disjoint_from(policy.uid_map, held_uids) and _disjoint_from(policy.gid_map, held_gids))
+                # Signed role selects the namespace account whose host identity is pinned.
+                identity = 10002 if self.profile.role == 'coordinator' else 10001
+                uid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.uid_map)
+                gid_text = ''.join(f'{a} {b} {c}\n' for a, b, c in policy.gid_map)
+                _require(_mapped_id(uid_text, identity) == self._consumer_uid
+                         and _mapped_id(gid_text, identity) == self._consumer_gid)
+                _require(len({self._held_path, self._enrollment_path, self._key_path, _path(journal_file)}) == 4)
+            else:
+                self._held_path = self._held_identity = None
             self._ttl, self._request_ms, self._launch_ms = (data['receipt_lifetime_seconds'],
                 data['request_timeout_ms'], data['launch_timeout_ms'])
             _require(type(self._ttl) is int and 1 <= self._ttl <= 3600
                      and type(self._request_ms) is int and 100 <= self._request_ms <= 10000
                      and type(self._launch_ms) is int and 100 <= self._launch_ms <= 120000)
             self._mounts = {item.role: item for item in self.profile.mounts}
-            _require(self._mounts['issuer_socket'].source == str(self._socket_path)
-                     and self._mounts['issuer_socket'].gid == self._consumer_gid
-                     and self._mounts['config'].uid == self._consumer_uid
-                     and self._mounts['config'].gid == self._consumer_gid
-                     and self._mounts['engine_socket'].source == self._daemon_pin.socket_path)
+            if coordinator_enrollment:
+                _require(self._mounts['local_issuer_socket'].source == str(self._socket_path)
+                         and self._mounts['local_issuer_socket'].gid == self._consumer_gid
+                         and self._mounts['local_config'].uid == self._consumer_uid
+                         and self._mounts['local_config'].gid == self._consumer_gid)
+            else:
+                _require(self._mounts['issuer_socket'].source == str(self._socket_path)
+                         and self._mounts['issuer_socket'].gid == self._consumer_gid
+                         and self._mounts['config'].uid == self._consumer_uid
+                         and self._mounts['config'].gid == self._consumer_gid
+                         and self._mounts['engine_socket'].source == self._daemon_pin.socket_path)
             protected = (self._key_path.parent, self._enrollment_path.parent, _path(journal_file).parent)
             for mount in self.profile.mounts:
                 source = Path(mount.source)
                 _require(not any(source == item or source in item.parents or item in source.parents for item in protected))
             _require(self._key_path != self._enrollment_path and self._key_path != _path(journal_file)
                      and self._enrollment_path != _path(journal_file))
-            self._journal = _Journal(journal_file, create=create_journal)
+            if coordinator_enrollment:
+                self._pin_trusted_local_inputs()
+                retained_pair._authorize_coordinator_construction(self, enrollment_raw=raw,
+                    enrollment_digest='sha256:' + hashlib.sha256(raw).hexdigest())
+                self._retained_pair = retained_pair
+            self._journal = _Journal(journal_file, create=create_journal,
+                                     gate_mode=gate_start_mode, start_mode=gate_start_mode,
+                                     ledger_mode=self.profile.gate_ledger_channel is not None)
             self._engine = _UnixEngine(self._daemon_pin)
         except BaseException:
             self.close()
@@ -687,6 +967,18 @@ class LaunchSupervisor:
         _require(self._pid == os.getpid() and not self._closed and (allow_held or not self._held))
         _require(_root_file(self._enrollment_path, 1024**2)[1] == self._enrollment_identity
                  and _root_file(self._key_path, 32)[1] == self._key_identity)
+        if self._held_path is not None:
+            _require(_root_file(self._held_path, 65536)[1] == self._held_identity)
+
+    def _check_daemon_maps(self):
+        """v3 only: the pinned daemon's live kernel maps equal the signed policy."""
+        policy = self.profile.daemon_policy
+        if policy is None:
+            return
+        self._engine.process.check()
+        _live_maps(policy, Path(f'/proc/{self._daemon_pin.pid}/uid_map').read_text(),
+                   Path(f'/proc/{self._daemon_pin.pid}/gid_map').read_text())
+        self._engine.process.check()
 
     def _hold(self):
         self._held = True
@@ -703,7 +995,7 @@ class LaunchSupervisor:
                 pass
 
     def _record(self):
-        return {'container_id': self._container_id, 'manifest': self.release.launch_profile_digest,
+        result = {'container_id': self._container_id, 'manifest': self.release.launch_profile_digest,
                 'approval_expires_at_ms': getattr(self, '_approval_expires_at_ms', None),
                 'engine_id': getattr(getattr(self, '_daemon_pin', None), 'daemon_id', None),
                 'engine_pid': getattr(getattr(self, '_daemon_pin', None), 'pid', None),
@@ -711,9 +1003,16 @@ class LaunchSupervisor:
                 'boot_id': None if self._consumer is None else self._consumer.boot,
                 'pid': None if self._consumer is None else self._consumer.pid,
                 'start_ticks': None if self._consumer is None else self._consumer.start}
+        if getattr(self, '_coordinator_drain', None) is not None:
+            result['local_drain'] = self._coordinator_drain
+        return result
 
     def _pin_sources(self):
+        if self.profile.role in {'trusted-local-coordinator-v1', 'supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'}:
+            self._pin_trusted_local_inputs()
         for role, mount in self._mounts.items():
+            if role in {'local_config', 'local_enrollment', 'local_admission'}:
+                continue
             path = _path(mount.source)
             _require(path.resolve(strict=True) == path)
             info = path.lstat()
@@ -729,17 +1028,210 @@ class LaunchSupervisor:
                 try:
                     raw = os.read(fd, 65537)
                     _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info))
-                    commitment = configuration_commitment(raw)
-                    _require(commitment.raw_digest == self._configuration_raw_digest
-                             and commitment.content_digest == mount.content_digest
-                             and commitment.release == self.release
-                             and commitment.release.launch_profile_digest == self.profile.digest())
+                    if self.profile.role == 'coordinator':
+                        commitment = coordinator_configuration_commitment(raw)
+                        _require(commitment.raw_digest == self._configuration_raw_digest
+                                 and commitment.content_digest == mount.content_digest)
+                    else:
+                        commitment = configuration_commitment(raw)
+                        self._runner_configuration(raw)
+                        _require(commitment.raw_digest == self._configuration_raw_digest
+                                 and commitment.content_digest == mount.content_digest
+                                 and commitment.release == self.release
+                                 and commitment.release.launch_profile_digest == self.profile.digest())
                 finally:
                     os.close(fd)
             if role in self._source_pins:
                 _require(self._source_pins[role] == _identity(info))
             else:
                 self._source_pins[role] = _identity(info)
+        if getattr(self.profile, 'executor_endpoint', None) is not None:
+            self._check_executor_endpoint_directory()
+
+    def _check_executor_endpoint_directory(self):
+        """Pin a dedicated endpoint without adopting preexisting entries."""
+        mount = self._mounts['executor_endpoint_directory']
+        name = self._executor_endpoint_name
+        path = _path(mount.source)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            def check_directory():
+                info, named = os.fstat(fd), os.lstat(path)
+                _require(stat.S_ISDIR(info.st_mode) and stat.S_ISDIR(named.st_mode)
+                         and _identity(info) == self._source_pins['executor_endpoint_directory'] == _identity(named)
+                         and info.st_uid == named.st_uid == mount.uid and info.st_gid == named.st_gid == mount.gid
+                         and stat.S_IMODE(info.st_mode) == stat.S_IMODE(named.st_mode) == 0o700)
+            def bounded_names():
+                with os.scandir(fd) as entries:
+                    first = next(entries, None)
+                    _require(next(entries, None) is None)
+                    return [] if first is None else [first.name]
+            check_directory()
+            names = bounded_names()
+            _require(bounded_names() == names)
+            check_directory()
+            previous = getattr(self, '_executor_endpoint_identity', None)
+            if self._launch_id is None:
+                _require(not names and previous is None)
+                return
+            _require(not names or names == [name])
+            if not names:
+                _require(previous is None)
+                return
+            socket_info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            _require(stat.S_ISSOCK(socket_info.st_mode) and socket_info.st_uid == mount.uid
+                     and socket_info.st_gid == mount.gid and stat.S_IMODE(socket_info.st_mode) == 0o600
+                     and socket_info.st_nlink == 1)
+            identity = _identity(socket_info)
+            _require(previous is None or previous == identity)
+            after = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            _require(_identity(after) == identity and stat.S_ISSOCK(after.st_mode)
+                     and after.st_uid == mount.uid and after.st_gid == mount.gid
+                     and stat.S_IMODE(after.st_mode) == 0o600 and after.st_nlink == 1
+                     and bounded_names() == names)
+            check_directory()
+            self._executor_endpoint_identity = identity
+        finally:
+            os.close(fd)
+
+    def attest_executor_endpoint(self, *, timeout_ms):
+        """Observe the configured UDS peer against this retained executor.
+
+        This sends no HTTP data and grants no pair authority. Same-UID/root
+        mutation remains inside the separately approved dedicated-host trust.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 100 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        if not self._mutex.acquire(timeout=_remaining(deadline)):
+            raise LaunchSupervisorError()
+        try:
+            directory = connection = None
+            try:
+                _remaining(deadline)
+                self._guard()
+                _require(self.profile.role is None and self.profile.executor_endpoint == 'protected-uds-v1'
+                         and self._receipt_served and not self._issuance_open and self._consumer is not None)
+                expected = getattr(self, '_executor_endpoint_identity', None)
+                _require(expected is not None)
+                self._validate_live(deadline)
+                self._check_executor_endpoint_directory()
+                _require(self._executor_endpoint_identity == expected)
+                mount = self._mounts['executor_endpoint_directory']
+                directory = os.open(mount.source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                _require(_identity(os.fstat(directory)) == self._source_pins['executor_endpoint_directory'])
+                before = os.stat(self._executor_endpoint_name, dir_fd=directory, follow_symlinks=False)
+                _require(stat.S_ISSOCK(before.st_mode) and _identity(before) == expected)
+                address = f'/proc/self/fd/{directory}/{self._executor_endpoint_name}'
+                _require(len(os.fsencode(address)) < 108)
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(_remaining(deadline))
+                connection.connect(address)
+                credentials = struct.unpack('=iII', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._consumer.check()
+                self._validate_live(deadline)
+                after = os.stat(self._executor_endpoint_name, dir_fd=directory, follow_symlinks=False)
+                _require(stat.S_ISSOCK(after.st_mode) and _identity(after) == expected
+                         and after.st_uid == mount.uid and after.st_gid == mount.gid
+                         and stat.S_IMODE(after.st_mode) == 0o600 and after.st_nlink == 1
+                         and _identity(os.fstat(directory)) == self._source_pins['executor_endpoint_directory'])
+                self._check_executor_endpoint_directory()
+                _remaining(deadline)
+                return (self._launch_id, self._container_id, self._consumer.boot, self._consumer.pid,
+                        self._consumer.start, self._source_pins['executor_endpoint_directory'], expected)
+            except BaseException:
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                failed = False
+                for resource in (connection, directory):
+                    if resource is not None:
+                        try:
+                            if type(resource) is int: os.close(resource)
+                            else: resource.close()
+                        except BaseException:
+                            failed = True
+                if failed:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+                try:
+                    _remaining(deadline)
+                except BaseException:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def _pin_trusted_local_inputs(self):
+        """Capture and bind both exact protected inputs; no launch authority is inferred."""
+        from .installed_coordinator import MAX_CONFIG_BYTES, parse_configuration
+        from .coordinator_admission import MAX_BYTES as MAX_ADMISSION_BYTES, parse_admission
+        from engineering_hub.trusted_queued_session import MAX_ENROLLMENT_BYTES
+        def capture(role, maximum):
+            mount = self._mounts[role]
+            path = _path(mount.source)
+            parent = _root_parent(path, private=False)
+            fd = None
+            try:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                             dir_fd=parent)
+                before = os.fstat(fd)
+                def stable(info):
+                    return (_identity(info), info.st_mode, info.st_uid, info.st_gid, info.st_nlink,
+                            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                _require(stat.S_ISREG(before.st_mode) and before.st_uid == mount.uid
+                         and before.st_gid == mount.gid and stat.S_IMODE(before.st_mode) == 0o600
+                         and before.st_nlink == 1 and 0 < before.st_size <= maximum)
+                raw = bytearray()
+                while len(raw) <= maximum:
+                    block = os.read(fd, min(65536, maximum + 1 - len(raw)))
+                    if not block: break
+                    raw.extend(block)
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                _require(len(raw) == before.st_size and stable(before) == stable(os.fstat(fd)) == stable(named)
+                         and _identity(os.fstat(parent)) == _identity(os.lstat(path.parent))
+                         and path.resolve(strict=True) == path
+                         and (role == 'local_admission' or
+                              'sha256:' + hashlib.sha256(raw).hexdigest() == mount.content_digest))
+                return bytes(raw), stable(before)
+            finally:
+                try:
+                    if fd is not None: os.close(fd)
+                finally:
+                    os.close(parent)
+        config, config_pin = capture('local_config', MAX_CONFIG_BYTES)
+        enrollment, enrollment_pin = capture('local_enrollment', MAX_ENROLLMENT_BYTES)
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
+            admission, admission_pin = capture('local_admission', MAX_ADMISSION_BYTES)
+            admission_policy = parse_admission(admission)
+            _require(self._ttl <= admission_policy.lifetime_seconds
+                     and self._request_ms <= admission_policy.timeout_ms)
+            commitment = supervised_local_coordinator_commitment(self.profile, config, enrollment, admission,
+                root_raw_digest=self._admission_raw_digest, independent_release=self.release)
+        else:
+            commitment = trusted_local_coordinator_commitment(self.profile, config, enrollment)
+        _require(commitment.raw_digest == self._configuration_raw_digest)
+        _require(capture('local_config', MAX_CONFIG_BYTES) == (config, config_pin)
+                 and capture('local_enrollment', MAX_ENROLLMENT_BYTES) == (enrollment, enrollment_pin))
+        pins = {'local_config': config_pin, 'local_enrollment': enrollment_pin}
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
+            _require(capture('local_admission', MAX_ADMISSION_BYTES) == (admission, admission_pin))
+            pins['local_admission'] = admission_pin
+        previous = getattr(self, '_trusted_local_input_pins', None)
+        _require(previous is None or previous == pins)
+        _require(all(role not in self._source_pins or self._source_pins[role] == pin[0]
+                     for role, pin in pins.items()))
+        self._trusted_local_input_pins = pins
+        self._source_pins.update({role: pin[0] for role, pin in pins.items()})
+        if self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'):
+            previous = getattr(self, '_coordinator_admission', None)
+            _require(previous is None or previous == admission_policy)
+            self._coordinator_admission = admission_policy
+            grace = parse_configuration(config).stop_grace
+            _require(1120 <= grace <= 86400)
+            previous_grace = getattr(self, '_coordinator_stop_grace', None)
+            _require(previous_grace is None or previous_grace == grace)
+            self._coordinator_stop_grace = grace
 
     def _bind_issuer(self):
         self._socket_parent = _root_parent(self._socket_path, private=False)
@@ -822,13 +1314,14 @@ class LaunchSupervisor:
                      and info.get('Args') == list((*self.profile.entrypoint[1:], *self.profile.command)))
         return state
 
-    def _wait_stopped(self, deadline):
+    def _wait_stopped(self, deadline, *, require_exit_zero=False):
         """Reconcile Engine accounting after kernel exit, without another effect.
 
         A readable pidfd can precede Docker's terminal state. Only the exact
         validated profile still reporting our original PID is worth waiting
         for. Changed profiles, malformed states and GET failures fail closed.
         """
+        _require(type(require_exit_zero) is bool)
         while True:
             _remaining(deadline)
             self._guard(allow_held=True)
@@ -837,26 +1330,46 @@ class LaunchSupervisor:
             if not state['Running']:
                 _require(state.get('Status') == 'exited'
                          and type(state.get('Pid')) is int and state['Pid'] == 0)
+                if require_exit_zero:
+                    _require(type(state.get('ExitCode')) is int and state['ExitCode'] == 0
+                             and state.get('OOMKilled') is False and state.get('Error') in ('', None))
                 return
             _require(state['Pid'] == self._consumer.pid)
             time.sleep(min(0.05, _remaining(deadline)))
 
-    def launch(self):
+    def _check_retained_pair(self, retained_pair):
+        """Require the exact retained owner at each supervised v3 effect."""
+        if getattr(getattr(self, 'profile', None), 'role', None) == 'supervised-local-coordinator-v3':
+            from .retained_oauth_pair import RetainedOAuthPair
+            _require(type(retained_pair) is RetainedOAuthPair and getattr(self, '_retained_pair', None) is retained_pair
+                     and retained_pair._coordinator is self)
+            retained_pair._check_authority()
+        else:
+            _require(retained_pair is None)
+
+    def launch(self, *, pair_reservation=None, retained_pair=None):
         """One bounded real create/start. Any uncertain effect stays held forever."""
         _require(self._pid == os.getpid())
         with self._mutex:
             try:
                 self._guard()
                 _require(self._launch_id is None)
+                _require(pair_reservation is getattr(self, '_pair_reservation', None))
                 deadline = time.monotonic() + self._launch_ms / 1000
-                self._bind_issuer()
+                # Before any socket bind or Engine request: wrong live maps mean no effect at all.
+                self._check_daemon_maps()
+                if pair_reservation is None:
+                    self._check_retained_pair(retained_pair)
+                    _remaining(deadline)
+                    self._bind_issuer()
                 self._pin_sources()
                 defaults = self._engine.image(self.image, deadline)
                 _require(not defaults.get('Volumes') and not defaults.get('Healthcheck') and not defaults.get('OnBuild')
                          and tuple(defaults.get('Entrypoint') or ()) == self.profile.entrypoint
                          and tuple(defaults.get('Cmd') or ()) == self.profile.command
                          and tuple(defaults.get('Env') or ()) == self.profile.environment)
-                launch_id = str(uuid4())
+                launch_id = (str(uuid4()) if pair_reservation is None else
+                             pair_reservation._claim(self))
                 self._origin = time.monotonic()
                 wall = time.time()
                 _require(type(self._origin) in (int, float) and math.isfinite(self._origin)
@@ -868,6 +1381,10 @@ class LaunchSupervisor:
                     'image': self.image.runnable_reference,
                     'request_digest': 'sha256:' + hashlib.sha256(_canonical(self._create_body())).hexdigest()})
                 self._launch_id = launch_id
+                if pair_reservation is not None:
+                    pair_reservation._check_launch(self)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 _, created = self._engine.json('POST', '/containers/create?name=eh-executor-' + launch_id,
                     deadline, body=self._create_body(), statuses=(201,))
                 _require(type(created) is dict and set(created) <= {'Id', 'Warnings'}
@@ -877,6 +1394,8 @@ class LaunchSupervisor:
                 self._journal.state(launch_id, 'created', self._record())
                 self._inspect(deadline, running=False)
                 self._journal.state(launch_id, 'start_reserved', self._record())
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 self._engine.json('POST', '/containers/' + self._container_id + '/start', deadline, statuses=(204,))
                 state = self._inspect(deadline, running=True)
                 self._consumer = _Process(state['Pid'])
@@ -901,11 +1420,15 @@ class LaunchSupervisor:
             if ':' in line:
                 key, value = line.split(':', 1)
                 status[key] = value.strip()
-        _kernel_profile(self.profile, status,
-                        Path(f'/proc/{self._consumer.pid}/uid_map').read_text(),
-                        Path(f'/proc/{self._consumer.pid}/gid_map').read_text(),
+        consumer_uid_map = Path(f'/proc/{self._consumer.pid}/uid_map').read_text()
+        consumer_gid_map = Path(f'/proc/{self._consumer.pid}/gid_map').read_text()
+        _kernel_profile(self.profile, status, consumer_uid_map, consumer_gid_map,
                         Path(f'/proc/{self._consumer.pid}/mountinfo').read_bytes(),
                         self._consumer_uid, self._consumer_gid)
+        if self.profile.daemon_policy is not None:
+            # Rootless containers share the daemon's user namespace: both must match the policy.
+            _live_maps(self.profile.daemon_policy, consumer_uid_map, consumer_gid_map)
+            self._check_daemon_maps()
         for namespace in ('ipc', 'cgroup', 'net'):
             _require(_identity(os.stat(f'/proc/{self._consumer.pid}/ns/{namespace}'))
                      != _identity(os.stat('/proc/self/ns/' + namespace)))
@@ -997,7 +1520,7 @@ class LaunchSupervisor:
                 self._hold()
             raise LaunchSupervisorError() from None
 
-    def serve_one_receipt(self):
+    def serve_one_receipt(self, *, retained_pair=None):
         """One direct init-peer exchange; caller explicitly chooses to serve it."""
         _require(self._pid == os.getpid())
         with self._mutex:
@@ -1005,6 +1528,14 @@ class LaunchSupervisor:
             reserved = False
             try:
                 self._guard()
+                role = getattr(getattr(self, 'profile', None), 'role', None)
+                _require(role is None or role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
+                coordinator = role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
+                _require(type(self.release) is (CoordinatorReleaseEnrollment if coordinator else ExecutorReleaseEnrollment))
+                request_protocol = COORDINATOR_REQUEST_PROTOCOL if coordinator else REQUEST_PROTOCOL
+                protocol = COORDINATOR_PROTOCOL if coordinator else PROTOCOL
+                audience = COORDINATOR_AUDIENCE if coordinator else AUDIENCE
+                domain = COORDINATOR_SIGNATURE_DOMAIN if coordinator else SIGNATURE_DOMAIN
                 _require(self._issuance_open and time.monotonic() < self._expires)
                 deadline = min(self._expires, time.monotonic() + self._request_ms / 1000)
                 self._listener.settimeout(_remaining(deadline))
@@ -1016,11 +1547,13 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == REQUEST_PROTOCOL and type(request['nonce']) is str
+                         and request['protocol'] == request_protocol and type(request['nonce']) is str
                          and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')  # One frame plus explicit SHUT_WR, no trailing data.
                 self._validate_live(deadline)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 self._journal.reserve_issuance(self._launch_id, request['nonce'])
                 reserved = True
                 self._issuance_open = False
@@ -1028,7 +1561,7 @@ class LaunchSupervisor:
                 now = int(time.time() * 1000)
                 remaining = int((self._expires - time.monotonic()) * 1000)
                 _require(remaining > 0)
-                payload = {'protocol': PROTOCOL, 'audience': AUDIENCE, 'nonce': request['nonce'],
+                payload = {'protocol': protocol, 'audience': audience, 'nonce': request['nonce'],
                     'receipt_id': str(uuid4()), 'launch_id': self._launch_id, 'issuer_id': self.release.issuer_id,
                     'boot_id': self._consumer.boot, 'authenticated_host_pid': self._consumer.pid,
                     'process_start_ticks': self._consumer.start, 'container_id': self._container_id,
@@ -1039,10 +1572,12 @@ class LaunchSupervisor:
                     'implementation_commit': self.release.implementation_commit,
                     'launch_profile_digest': self.release.launch_profile_digest,
                     'issued_at_ms': now, 'expires_at_ms': now + remaining}
-                signature = base64.urlsafe_b64encode(self._signer.sign(SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                signature = base64.urlsafe_b64encode(self._signer.sign(domain + _canonical(payload))).rstrip(b'=').decode()
                 raw = _canonical({'payload': payload, 'signature': signature})
                 _require(len(raw) <= MAX_RECEIPT_BYTES)
                 self._validate_live(deadline)
+                self._check_retained_pair(retained_pair)
+                _remaining(deadline)
                 peer.settimeout(_remaining(deadline))
                 peer.sendall(struct.pack('!I', len(raw)) + raw)
                 peer.shutdown(socket.SHUT_WR)
@@ -1061,6 +1596,1216 @@ class LaunchSupervisor:
             finally:
                 if peer is not None:
                     peer.close()
+
+    def _serve_one_coordinator_drain(self, deadline):
+        """Record an exact live coordinator's local drain before acknowledging it."""
+        from .coordinator_drain import REQUEST, RESPONSE, AUDIENCE as DRAIN_AUDIENCE, DOMAIN, MAX_BYTES
+        try:
+            while True:
+                remaining = _remaining(deadline)
+                if not self._mutex.acquire(timeout=min(.1, remaining)):
+                    continue
+                try:
+                    self._guard()
+                    _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
+                             and self._receipt_served and not self._issuance_open
+                             and getattr(self, '_coordinator_stop_requested', False)
+                             and getattr(self, '_coordinator_drain', None) is None)
+                    listener, consumer = self._listener, self._consumer
+                    _require(type(listener) is socket.socket and consumer is not None)
+                    consumer.check()
+                finally:
+                    self._mutex.release()
+                ready, _, _ = select.select([listener, consumer.fd], [], [], min(.1, _remaining(deadline)))
+                _require(consumer.fd not in ready)
+                if listener in ready: break
+        except BaseException:
+            with self._mutex: self._hold()
+            raise LaunchSupervisorError() from None
+        with self._observation_mutex(deadline):
+            peer = None
+            try:
+                self._guard()
+                _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
+                         and self._receipt_served and not self._issuance_open
+                         and getattr(self, '_coordinator_stop_requested', False)
+                         and getattr(self, '_coordinator_drain', None) is None
+                         and self._listener is listener and self._consumer is consumer)
+                self._consumer.check()
+                deadline = min(deadline, time.monotonic() + self._coordinator_admission.timeout_ms / 1000)
+                self._listener.settimeout(_remaining(deadline))
+                peer, _ = self._listener.accept()
+                credentials = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._validate_live(deadline)
+                size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+                _require(0 < size <= MAX_BYTES)
+                raw_request = self._receive(peer, size, deadline)
+                request = _strict(raw_request, MAX_BYTES)
+                fields = {'protocol', 'nonce', 'launch_id', 'boot_id', 'authenticated_host_pid',
+                    'process_start_ticks', 'container_id', 'owner_epoch', 'launch_profile_digest',
+                    'config_digest', 'session_digest'}
+                _require(type(request) is dict and set(request) == fields and request['protocol'] == REQUEST
+                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce'])
+                         and type(request['owner_epoch']) is str
+                         and str(UUID(request['owner_epoch'])) == request['owner_epoch']
+                         and request['launch_id'] == self._launch_id and request['boot_id'] == self._consumer.boot
+                         and type(request['authenticated_host_pid']) is int and request['authenticated_host_pid'] == self._consumer.pid
+                         and type(request['process_start_ticks']) is int and request['process_start_ticks'] == self._consumer.start
+                         and request['container_id'] == self._container_id
+                         and request['launch_profile_digest'] == self.release.launch_profile_digest
+                         and request['config_digest'] == self._coordinator_admission.config_digest
+                         and request['session_digest'] == self._coordinator_admission.session_digest)
+                peer.settimeout(_remaining(deadline)); _require(peer.recv(1) == b'')
+                self._validate_live(deadline)
+                payload = dict(request, protocol=RESPONSE, audience=DRAIN_AUDIENCE)
+                signature = base64.urlsafe_b64encode(self._signer.sign(DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+                response = _canonical({'payload': payload, 'signature': signature})
+                _require(len(response) <= MAX_BYTES)
+                evidence = {'request_sha256': hashlib.sha256(raw_request).hexdigest(),
+                            'owner_epoch': request['owner_epoch']}
+                record = dict(self._record(), local_drain=evidence)
+                self._journal.record_coordinator_drain(self._launch_id, record)
+                self._coordinator_drain = evidence
+                self._validate_live(deadline)
+                peer.settimeout(_remaining(deadline))
+                peer.sendall(struct.pack('!I', len(response)) + response)
+                peer.shutdown(socket.SHUT_WR)
+                _remaining(deadline)
+            except BaseException:
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                if peer is not None:
+                    try: peer.close()
+                    except BaseException:
+                        self._hold()
+                        raise LaunchSupervisorError() from None
+
+    def _runner_configuration(self, raw):
+        from .installed_runner import parse_configuration
+        from engineering_hub.executor_launch_profile import EXECUTOR_ENDPOINT_TARGET
+        parsed = parse_configuration(raw)
+        # Paired runners consume an inherited channel. A legacy signed launch
+        # profile cannot authorize that different entrypoint behavior.
+        _require((parsed.pair is not None) ==
+                 (self.profile.command_channel == 'inherited-seqpacket-v1'))
+        _require((parsed.gate_socket_directory is not None) == (self.profile.gate_channel is not None))
+        _require(parsed.gate_ledger_channel == (self.profile.gate_ledger_channel == 'supervisor-listener-v1'))
+        _require((parsed.pair_ledger_directory is not None) == (self.profile.gate_ledger_channel == 'pair-outcome-listener-v1'))
+        if self.profile.executor_endpoint is not None:
+            _require(Path(parsed.socket_path).parent == Path(EXECUTOR_ENDPOINT_TARGET))
+            name = Path(parsed.socket_path).name
+            prior = getattr(self, '_executor_endpoint_name', None)
+            _require(prior is None or prior == name)
+            self._executor_endpoint_name = name
+        if parsed.gate_socket_directory is not None:
+            _require(self._mounts['gate_channel_directory'].source == parsed.gate_socket_directory)
+        if parsed.pair_ledger_directory is not None:
+            _require(self._mounts['gate_channel_directory'].source == parsed.pair_ledger_directory)
+        return parsed
+
+    def _handoff_manifest_digest(self):
+        """Derive only from the already pinned canonical runner configuration."""
+        mount = self._mounts['config']
+        path = _path(mount.source)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            named = os.lstat(path)
+            _require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                     and _identity(info) == _identity(named)
+                     and _identity(info) == self._source_pins['config']
+                     and 0 < info.st_size <= 65536)
+            raw = bytearray()
+            while len(raw) <= 65536:
+                chunk = os.read(fd, min(65537 - len(raw), 65536))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            _require(len(raw) == info.st_size and _identity(os.fstat(fd)) == _identity(info)
+                     and _identity(os.lstat(path)) == _identity(info))
+            raw = bytes(raw)
+            if self.profile.role == 'coordinator':
+                commitment = coordinator_configuration_commitment(raw)
+                _require(commitment.raw_digest == self._configuration_raw_digest
+                         and commitment.content_digest == mount.content_digest)
+                return commitment.manifest_digest
+            commitment = configuration_commitment(raw)
+            _require(commitment.raw_digest == self._configuration_raw_digest
+                     and commitment.content_digest == mount.content_digest
+                     and commitment.release == self.release)
+            return self._runner_configuration(raw).manifest.digest()
+        finally:
+            os.close(fd)
+
+    def serve_one_executor_handoff(self, channel):
+        """Issue one measured-executor endpoint receipt; pair launch remains disabled."""
+        return self._serve_one_role_handoff(channel, 'executor')
+
+    def prepare_gate_socket(self, *, manifest, image, enrollment_file, timeout_seconds):
+        """Bind a single protected v3 gate endpoint before container creation.
+
+        This retains socket and parent descriptors until supervisor close; close
+        leaves the pathname as evidence. The caller must pass the enrolled source
+        directory through an independently authorized Docker profile. This
+        method does not authorize that mount or enable an application launch.
+        """
+        from .application_gate_enrollment import SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            _require(self._journal.start_mode and self._gate_listener is None and self._gate_parent is None)
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self)
+            _require(enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA)
+                     and self._handoff_manifest_digest() == enrolled.manifest_digest)
+            directory = _path(enrolled.socket_source_directory)
+            path = directory / 'controller.sock'
+            parent = _root_parent(path, private=False)
+            self._gate_parent, self._gate_directory = parent, directory
+            info = os.fstat(parent)
+            _require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o711
+                     and _identity(os.lstat(directory)) == _identity(info)
+                     # The daemon and namespaced app must be able to traverse
+                     # every ancestor without granting directory listing.
+                     and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001
+                             for ancestor in directory.parents))
+            try:
+                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            self._gate_listener = listener
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            endpoint = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(endpoint.encode()) <= 107)
+            listener.bind(endpoint)
+            first = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(first.st_mode))
+            self._gate_socket_identity = _identity(first)
+            os.chown(path.name, 0, enrolled.consumer_host_gid, dir_fd=parent, follow_symlinks=False)
+            os.chmod(path.name, 0o660, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(_identity(current) == self._gate_socket_identity and current.st_uid == 0
+                     and current.st_gid == enrolled.consumer_host_gid and stat.S_IMODE(current.st_mode) == 0o660)
+            listener.listen(1)
+            self._gate_enrollment = enrolled
+            self._gate_manifest, self._gate_image, self._gate_policy_path = manifest, image, enrollment_file
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
+            _remaining(deadline)
+            return enrolled.socket_source_directory
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def _gate_socket_check(self, enrolled):
+        """Recheck the retained parent and socket; caller holds the lifecycle lock."""
+        _require(self._gate_enrollment == enrolled and self._gate_parent is not None
+                 and self._gate_listener is not None and self._gate_directory is not None)
+        directory = os.lstat(self._gate_directory)
+        endpoint = os.stat('controller.sock', dir_fd=self._gate_parent, follow_symlinks=False)
+        _require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == 0
+                 and stat.S_IMODE(directory.st_mode) == 0o711
+                 and _identity(directory) == _identity(os.fstat(self._gate_parent))
+                 and stat.S_ISSOCK(endpoint.st_mode) and _identity(endpoint) == self._gate_socket_identity
+                 and endpoint.st_uid == 0 and endpoint.st_gid == enrolled.consumer_host_gid
+                 and stat.S_IMODE(endpoint.st_mode) == 0o660
+                 and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001
+                         for ancestor in self._gate_directory.parents))
+
+    def accept_gate_channel(self, *, manifest, image, enrollment_file, host_pid,
+                            process_start_ticks, timeout_seconds):
+        """Accept once; authenticate the app in this supervisor's namespaces.
+
+        The independently measured host PID/start must refer to the enrolled
+        app container. SO_PEERCRED is interpreted here, not inside the app PID
+        namespace, where the outside supervisor may be represented as PID zero.
+        The supervisor retains both returned objects until close; no descriptor
+        custody or sole-writer property is established by this exchange.
+        """
+        from .application_gate_enrollment import SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .broker_seqpacket import PeerPin
+        _require(self._pid == os.getpid() and type(host_pid) is int and host_pid > 0
+                 and type(process_start_ticks) is int and process_start_ticks > 0
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        channel = peer = None
+        try:
+            _require(not self._gate_accept_used and self._gate_listener is not None and self._gate_parent is not None)
+            self._gate_accept_used = True
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self)
+            _require(enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA))
+            self._gate_socket_check(enrolled)
+            self._gate_listener.settimeout(_remaining(deadline))
+            channel, _ = self._gate_listener.accept()
+            channel.set_inheritable(False)
+            channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            credentials = struct.unpack('=iII', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _require(credentials == (host_pid, enrolled.consumer_host_uid, enrolled.consumer_host_gid))
+            peer = PeerPin(pid=host_pid, uid=enrolled.consumer_host_uid,
+                           gid=enrolled.consumer_host_gid, start_ticks=process_start_ticks)
+            status = {}
+            for line in Path(f'/proc/{host_pid}/status').read_text().splitlines():
+                key, separator, value = line.partition(':')
+                if separator and key in {'Uid', 'Gid', 'NSpid'}:
+                    _require(key not in status)
+                    status[key] = value.split()
+            _require(status.get('Uid') == [str(enrolled.consumer_host_uid)] * 4
+                     and status.get('Gid') == [str(enrolled.consumer_host_gid)] * 4
+                     and status.get('NSpid') and status['NSpid'][-1] == '1'
+                     and _mapped_id(Path(f'/proc/{host_pid}/uid_map').read_text(), 10001) == enrolled.consumer_host_uid
+                     and _mapped_id(Path(f'/proc/{host_pid}/gid_map').read_text(), 10001) == enrolled.consumer_host_gid)
+            peer.check()
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
+            _remaining(deadline)
+            self._gate_accepted_channel, self._gate_accepted_peer = channel, peer
+            return channel, peer
+        except BaseException:
+            if channel is not None: channel.close()
+            if peer is not None: peer.close()
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def _gate_peer_engine_check(self, peer, pins, enrolled, deadline):
+        """Bind the accepted live peer to the pinned daemon's running container.
+
+        This establishes daemon accounting only; independent mount custody,
+        ledger fencing and the daemon's own integrity remain prerequisites.
+        """
+        container_id = pins.get('container_id') if type(pins) is dict else None
+        _require(type(container_id) is str and re.fullmatch(r'[0-9a-f]{64}', container_id)
+                 and type(pins.get('host_pid')) is int and pins['host_pid'] == peer.pid
+                 and type(pins.get('process_start_ticks')) is int
+                 and pins['process_start_ticks'] == peer.start
+                 and pins.get('image_config_id') == enrolled.image_config_id)
+        peer.check()
+        _, inspected = self._engine.json('GET', '/containers/' + container_id + '/json', deadline)
+        _require(type(inspected) is dict and inspected.get('Id') == container_id
+                 and inspected.get('Image') == enrolled.image_config_id)
+        state = inspected.get('State')
+        _require(type(state) is dict and state.get('Running') is True
+                 and state.get('Status') == 'running' and state.get('Paused') is False
+                 and state.get('Restarting') is False and state.get('Dead') is False
+                 and type(state.get('Pid')) is int and state['Pid'] == peer.pid)
+        peer.check()
+        _remaining(deadline)
+
+    def measure_gate_post_exec(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds):
+        """Measure exact app executable, argv and mount now; never confirm a gate.
+
+        This is point-in-time evidence under independently established host,
+        daemon and exclusive-custody trust. It is not a health observation or
+        a claim that those facts remain unchanged after this method returns.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            from .mount_gate_protocol import IDENTITY_FIELDS, _payload
+            from .mount_gate_start_enrollment import PROTOCOL as START_PROTOCOL, AUDIENCE as START_AUDIENCE
+            _require(type(pins) is dict)
+            pins = json.loads(_canonical(pins))
+            _require(set(pins) == IDENTITY_FIELDS
+                     and self._journal.start_mode and self._journal._start_confirmed)
+            self._journal._check()  # PID fence precedes the journal lock.
+            with self._journal._gate_lock:
+                with self._journal.transaction() as db:
+                    owner = db.execute('SELECT state,data FROM launch WHERE id=?', (self._launch_id,)).fetchone()
+                    start = db.execute('SELECT operation_id,nonce,gate_launch_id,enrollment FROM gate_start '
+                                       'WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                    issue = db.execute('SELECT operation_id,nonce,gate_launch_id,decision FROM gate_issuance '
+                                       'WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                    _require(owner == ('running', _canonical(self._record()).decode()) and start is not None
+                             and issue is not None and start[:3] == issue[:3]
+                             and start[:3] == (pins['operation_id'], pins['nonce'], pins['launch_id']))
+                    start_value, decision = json.loads(start[3]), json.loads(issue[3])
+                    _require(_canonical(start_value).decode() == start[3]
+                             and _canonical(decision).decode() == issue[3])
+                    _payload(decision)
+                    original = start_value.get('identity') if type(start_value) is dict else None
+                    _require(type(original) is dict and set(original) == IDENTITY_FIELDS
+                             and all(type(pins[k]) is type(original[k]) is type(decision[k])
+                                     and pins[k] == original[k] == decision[k] for k in IDENTITY_FIELDS))
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                                                        image=image, supervisor=self)
+            _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment
+                     and peer is self._gate_accepted_peer and pins['manifest_digest'] == enrolled.manifest_digest
+                     and pins['image_config_id'] == enrolled.image_config_id
+                     and pins['runnable_digest'] == enrolled.runnable_digest
+                     and pins['platform_manifest_digest'] == enrolled.platform_manifest_digest
+                     and pins['implementation_commit'] == enrolled.source_commit)
+            _require(set(start_value) == {'protocol', 'audience', 'identity', 'bootstrap_digest',
+                                          'issued_at_ms', 'expires_at_ms'}
+                     and start_value['protocol'] == START_PROTOCOL and start_value['audience'] == START_AUDIENCE
+                     and start_value['bootstrap_digest'] == enrolled.bootstrap_digest
+                     and type(start_value['issued_at_ms']) is int and type(start_value['expires_at_ms']) is int
+                     and start_value['issued_at_ms'] > 0
+                     and 0 < start_value['expires_at_ms'] - start_value['issued_at_ms'] <= 5000)
+            self._gate_socket_check(enrolled)
+            self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+            first = _measure_gate_process(peer, pins, enrolled.application_executable_digest, deadline)
+            self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+            second = _measure_gate_process(peer, pins, enrolled.application_executable_digest, deadline)
+            self._validate_live(deadline)
+            _require(first == second and load_application_gate_enrollment(enrollment_file,
+                     manifest=manifest, image=image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled); _remaining(deadline)
+            return {**second, 'decision_payload_digest': 'sha256:' + hashlib.sha256(_canonical(decision)).hexdigest()}
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            self._mutex.release()
+
+    def observe_gate_completion_facts(self, *, peer, pins, manifest, image, enrollment_file,
+                                      ledger_client, timeout_seconds):
+        """Bind current process measurements to a signed read-only ledger snapshot.
+
+        This is point-in-time evidence, never a gate confirmation or permission
+        to finish. The caller must retain host/daemon/mount custody and hold on
+        an uncertain exchange; the client is borrowed and may be used only once.
+        """
+        from .gate_ledger_channel import SupervisorLedgerClient
+        from .runtime_profile import probe_set_digest
+        _require(self._pid == os.getpid() and type(ledger_client) is SupervisorLedgerClient
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5 and type(pins) is dict)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            pins = json.loads(_canonical(pins))
+            public = ledger_client._key.public_key().public_bytes(serialization.Encoding.Raw,
+                                                                   serialization.PublicFormat.Raw)
+            executor = self._consumer
+            _require(executor is not None and ledger_client._pid == self._pid
+                     and ledger_client._peer.pid == executor.pid
+                     and ledger_client._peer.uid == self._consumer_uid
+                     and ledger_client._peer.gid == self._consumer_gid
+                     and ledger_client._binding == (self._launch_id, executor.boot, executor.pid,
+                                                    executor.start, self._container_id)
+                     and ledger_client._manifest == manifest.digest()
+                     and public == self.release.public_key)
+            first = self.measure_gate_post_exec(peer=peer, pins=pins, manifest=manifest, image=image,
+                                                 enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            probes = manifest.probes.candidate if image.role == 'candidate' else manifest.probes.rollback
+            probe_digest = probe_set_digest(probes)
+            snapshot = ledger_client.invoke('inspect_completion_v4', {'identity': pins, 'probe_digest': probe_digest,
+                'role': image.role, 'executable_digest': first['executable_digest'],
+                'health_contract': 'engineering-hub.health-json-build-commit.v1'}, deadline_monotonic=deadline)
+            second = self.measure_gate_post_exec(peer=peer, pins=pins, manifest=manifest, image=image,
+                                                  enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(first == second and snapshot['operation_id'] == pins['operation_id']
+                     and snapshot['probe_digest'] == probe_digest
+                     and snapshot['health_daemon_pid'] == peer.pid
+                     and snapshot['health_finished_at_ms'] <= int(time.time() * 1000)
+                     < snapshot['health_finished_at_ms'] + 5000
+                     and snapshot['decision_payload_digest'] == first['decision_payload_digest'])
+            _remaining(deadline)
+            return {'identity': pins, 'measurement': second, 'ledger_snapshot': snapshot}
+        except BaseException:
+            # No result can authorize progress on a failed or uncertain read.
+            # Lifecycle ownership remains with the caller; durable gate intent
+            # continues to force a held finish even if this hold cannot persist.
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def accept_gate_completion(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds, authority_check):
+        """Commit exact freshly observed gate evidence through the owned v5 channel.
+
+        The fenced ledger commit is authoritative. A lost reply or failed later
+        recheck is unknown: preserve the original operation and reconcile by a
+        separate authenticated lookup, never by repeating this acceptance.
+        Direct non-relayed custody and host writer exclusion remain prerequisites.
+        """
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5 and callable(authority_check))
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            _check_gate_authority(authority_check); _remaining(deadline)
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                facts = self.observe_gate_completion_facts(peer=peer, pins=pins, manifest=manifest, image=image,
+                    enrollment_file=enrollment_file, ledger_client=client, timeout_seconds=_remaining(deadline))
+            before = self.measure_gate_post_exec(peer=peer, pins=facts['identity'], manifest=manifest, image=image,
+                enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(before == facts['measurement'])
+            snapshot = facts['ledger_snapshot']
+            value = {'identity': facts['identity'], 'role': image.role,
+                     'executable_digest': before['executable_digest'],
+                     'health_contract': 'engineering-hub.health-json-build-commit.v1',
+                     'probe_digest': snapshot['probe_digest'],
+                     'health_receipt_digest': snapshot['health_receipt_digest'],
+                     'decision_payload_digest': snapshot['decision_payload_digest']}
+            _check_gate_authority(authority_check); _remaining(deadline)
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                _check_gate_authority(authority_check); _remaining(deadline)
+                accepted = client.invoke('accept_completion_v5', value, deadline_monotonic=deadline)
+            _check_gate_authority(authority_check); _remaining(deadline)
+            after = self.measure_gate_post_exec(peer=peer, pins=facts['identity'], manifest=manifest, image=image,
+                enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline))
+            _require(after == before and accepted == value)
+            _remaining(deadline)
+            return accepted
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def lookup_gate_completion(self, *, identity, manifest_digest, timeout_seconds):
+        """Authenticated read of authoritative acceptance; never replay effects."""
+        with self._open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds,
+                                           lookup_only=True) as client:
+            return client.invoke('lookup_completion_v5', {'identity': identity})
+
+    def finish_pending_gate(self, *, peer, pins, manifest, image, enrollment_file, timeout_seconds, authority_check):
+        """Observe health readiness, then attempt one fully rechecked acceptance.
+
+        None means no authenticated health receipt yet, not healthy or accepted.
+        An uncertain acceptance must be reconciled with lookup, never repeated.
+        """
+        from .runtime_profile import probe_set_digest
+        _require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5 and callable(authority_check))
+        deadline = time.monotonic() + timeout_seconds
+        pins = json.loads(_canonical(pins))
+        _check_gate_authority(authority_check); _remaining(deadline)
+        probes = manifest.probes.candidate if image.role == 'candidate' else manifest.probes.rollback
+        with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+            readiness = client.invoke('health_ready_v5', {'identity': pins, 'probe_digest': probe_set_digest(probes)},
+                                      deadline_monotonic=deadline)
+        _require(type(readiness) is dict and set(readiness) == {'ready'} and type(readiness['ready']) is bool)
+        if not readiness['ready']: return None
+        _check_gate_authority(authority_check); _remaining(deadline)
+        return self.accept_gate_completion(peer=peer, pins=pins, manifest=manifest, image=image,
+                                           enrollment_file=enrollment_file, timeout_seconds=_remaining(deadline),
+                                           authority_check=authority_check)
+
+    def pending_gate_context(self, *, role, manifest_digest, timeout_seconds):
+        """Read one fenced pending create from the enrolled ledger owner."""
+        _require(role in ('candidate', 'rollback'))
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('pending_gate_v5', {'role': role})
+
+    def pending_state_context(self, *, operation_id, manifest_digest, timeout_seconds):
+        """Read one current fenced state intent; this observation grants no custody."""
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('pending_state_v1', {'operation_id': operation_id})
+
+    def seal_pair_drain(self, *, pair_id, manifest_digest, timeout_seconds):
+        """Seal this live executor's future command admission once.
+
+        The caller independently enrolls the pair and must preserve unknown
+        outcomes. This does not assert quiescence or release a held effect.
+        """
+        _require(type(pair_id) is str and str(UUID(pair_id)) == pair_id)
+        with self.open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds) as client:
+            return client.invoke('seal_pair_drain_v1', {'pair_id': pair_id})
+
+    def serve_state_custodian_admission(self, *, channel, manifest, timeout_seconds, _custody_check=None):
+        """Serve one peer-challenged intent observation, not a live effect lease.
+
+        The accepted socket and its listener are owned by the caller. The
+        custodian must independently pin this issuer, reserve the signed nonce
+        and operation durably, and establish live custody before any effect.
+        Direct channel custody and the host's trusted root are prerequisites.
+        """
+        from engineering_hub.container_pilot_manifest import PilotManifest
+        from .broker_seqpacket import PeerPin, _start
+        from .mount_gate_controller import _read_observation
+        from .state_custodian_admission import DOMAIN, PROTOCOL
+        peer = None
+        try:
+            _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                     and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
+                     and type(channel) is socket.socket and channel.family == socket.AF_UNIX
+                     and channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_SEQPACKET
+                     and channel.getsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED) == 1
+                     and type(manifest) is PilotManifest)
+            deadline = time.monotonic() + timeout_seconds
+            start_wall = int(time.time() * 1000)
+            profile = self.profile
+            policy = profile.generation_isolation
+            _require(policy is not None and profile.digest() == self.release.launch_profile_digest)
+            # Revalidate the supplied model, then bind its digest to the exact
+            # independently enrolled read-only runner configuration.
+            manifest = PilotManifest.model_validate_json(manifest.canonical_bytes())
+            digest = manifest.digest()
+            _require(digest == self._handoff_manifest_digest())
+            channel.settimeout(_remaining(deadline))
+            raw, credentials = _read_observation(channel)
+            request = _strict(raw, MAX_RECEIPT_BYTES)
+            _require(type(request) is dict and set(request) == {'protocol', 'operation_id', 'nonce'}
+                     and _canonical(request) == raw
+                     and request['protocol'] == 'engineering-hub.state-custodian-request.v1'
+                     and type(request['operation_id']) is str
+                     and str(UUID(request['operation_id'])) == request['operation_id']
+                     and type(request['nonce']) is str and _HEX.fullmatch(request['nonce'])
+                     and len(credentials) == 1)
+            pid, uid, gid = credentials[0]
+            _require(uid == policy.provider_host_uid and gid == policy.provider_host_gid)
+            peer = PeerPin(pid=pid, uid=uid, gid=gid, start_ticks=_start(pid))
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                peer.check()
+            context = self.pending_state_context(operation_id=request['operation_id'],
+                manifest_digest=digest, timeout_seconds=_remaining(deadline))
+            # A second independent read narrows, but cannot eliminate, the
+            # interval in which a fence can change after this observation.
+            _require(context == self.pending_state_context(operation_id=request['operation_id'],
+                manifest_digest=digest, timeout_seconds=_remaining(deadline)))
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                peer.check()
+                _require(digest == self._handoff_manifest_digest()
+                         and profile.digest() == self.release.launch_profile_digest)
+                if _custody_check is not None:
+                    _custody_check()
+                now = int(time.time() * 1000)
+                _require(now >= start_wall and _remaining(deadline) > 0)
+                payload = dict(context, protocol=PROTOCOL,
+                    source_backup_digest=manifest.state_policy.baseline_backup_digest,
+                    provider_key_digest='sha256:' + hashlib.sha256(bytes.fromhex(policy.provider_public_key)).hexdigest(),
+                    nonce=request['nonce'], issued_at_ms=now,
+                    expires_at_ms=now + min(5000, max(1, int(_remaining(deadline) * 1000))))
+                response = _canonical({'payload': payload, 'signature': self._signer.sign(DOMAIN + _canonical(payload)).hex()})
+                peer.check(); channel.settimeout(_remaining(deadline))
+                _require(channel.send(response) == len(response))
+                peer.check(); _remaining(deadline)
+            return 'sent_unconfirmed'
+        except Exception:
+            raise LaunchSupervisorError() from None
+        finally:
+            if peer is not None:
+                peer.close()
+
+    def serve_protected_state_custodian(self, *, manifest, timeout_seconds, on_ready=None):
+        """Serve one observation on an enrolled root-owned socket; no state effect.
+
+        The socket name remains as evidence after closure. This does not start
+        a custodian, establish writer exclusion, or authorize publication.
+        """
+        from engineering_hub.container_pilot_manifest import PilotManifest
+        from engineering_hub.executor_launch_profile import _proc_map_rows
+        listener = channel = parent = None
+        try:
+            _require(self._pid == os.getpid() and type(manifest) is PilotManifest
+                     and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                     and 0 < timeout_seconds <= 5
+                     and (on_ready is None or callable(on_ready) and not inspect.iscoroutinefunction(on_ready)))
+            deadline = time.monotonic() + timeout_seconds
+            profile, release = self.profile, self.release
+            control, isolation, daemon = profile.custodian_control, profile.generation_isolation, profile.daemon_policy
+            _require(control is not None and isolation is not None and daemon is not None
+                     and profile.digest() == release.launch_profile_digest)
+            manifest = PilotManifest.model_validate_json(manifest.canonical_bytes())
+            digest = manifest.digest()
+            _require(digest == self._handoff_manifest_digest())
+            paths = {name: _path(getattr(control, name + '_path'))
+                     for name in ('journal_enrollment', 'copy_policy', 'owner_policy')}
+            pins = {}
+            def policies():
+                records = {}
+                for name, path in paths.items():
+                    raw, pin = _root_file(path, 16384 if name == 'owner_policy' else 4096)
+                    _require('sha256:' + hashlib.sha256(raw).hexdigest() == getattr(control, name + '_digest'))
+                    if name in pins:
+                        _require(pins[name] == pin)
+                    else:
+                        pins[name] = pin
+                    records[name] = _strict(raw, 16384 if name == 'owner_policy' else 4096)
+                enrollment, copy, owner = records['journal_enrollment'], records['copy_policy'], records['owner_policy']
+                public = self._signer.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+                _require(type(enrollment) is dict and set(enrollment) == {'schema', 'supervisor_public_key',
+                    'manifest_digest', 'source_backup_digest', 'provider_key_digest', 'provider_uid', 'provider_gid', 'journal_path'}
+                    and type(enrollment['schema']) is int and enrollment['schema'] == 2
+                    and enrollment['supervisor_public_key'] == public and enrollment['manifest_digest'] == digest
+                    and enrollment['source_backup_digest'] == manifest.state_policy.baseline_backup_digest
+                    and enrollment['provider_key_digest'] == 'sha256:' + hashlib.sha256(bytes.fromhex(isolation.provider_public_key)).hexdigest()
+                    and type(enrollment['provider_uid']) is int and enrollment['provider_uid'] == isolation.provider_host_uid
+                    and type(enrollment['provider_gid']) is int and enrollment['provider_gid'] == isolation.provider_host_gid
+                    and enrollment['journal_path'] == control.journal_path)
+                _require(type(copy) is dict and copy.get('source_digest') == manifest.state_policy.baseline_backup_digest)
+                _require(type(owner) is dict and set(owner) == {'schema', 'boot_id', 'daemon_pid', 'daemon_start_ticks',
+                    'uid_map', 'gid_map', 'app_uid', 'app_gid'} and type(owner['schema']) is int and owner['schema'] == 1
+                    and type(owner['daemon_pid']) is int and owner['daemon_pid'] == self._daemon_pin.pid
+                    and type(owner['daemon_start_ticks']) is int and owner['daemon_start_ticks'] == self._daemon_pin.start_ticks
+                    and type(owner['app_uid']) is int and owner['app_uid'] == isolation.app_uid
+                    and type(owner['app_gid']) is int and owner['app_gid'] == isolation.app_gid
+                    and owner['boot_id'] == _boot_id()
+                    and _proc_map_rows(owner['uid_map']) == daemon.uid_map
+                    and _proc_map_rows(owner['gid_map']) == daemon.gid_map)
+                self._check_daemon_maps()
+                _require(profile.digest() == release.launch_profile_digest and digest == self._handoff_manifest_digest())
+                _remaining(deadline)
+            policies()
+            path = _path(control.listener_path)
+            parent = _root_parent(path, private=False)
+            parent_info = os.fstat(parent)
+            _require(parent_info.st_uid == 0 and parent_info.st_gid == isolation.provider_host_gid
+                     and stat.S_IMODE(parent_info.st_mode) == 0o710
+                     and _identity(os.lstat(path.parent)) == _identity(parent_info)
+                     and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001 for ancestor in path.parent.parents))
+            try:
+                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            endpoint = f'/proc/self/fd/{parent}/{path.name}'
+            _require(len(os.fsencode(endpoint)) <= 107)
+            listener.bind(endpoint)
+            first = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(first.st_mode))
+            os.chown(path.name, 0, isolation.provider_host_gid, dir_fd=parent, follow_symlinks=False)
+            os.chmod(path.name, 0o660, dir_fd=parent, follow_symlinks=False)
+            identity = _identity(first)
+            def custody():
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                current_parent = os.fstat(parent)
+                _require(_identity(named) == identity and stat.S_ISSOCK(named.st_mode)
+                         and named.st_uid == 0 and named.st_gid == isolation.provider_host_gid
+                         and stat.S_IMODE(named.st_mode) == 0o660
+                         and _identity(os.lstat(path.parent)) == _identity(parent_info)
+                         and _identity(current_parent) == _identity(parent_info)
+                         and current_parent.st_uid == 0 and current_parent.st_gid == isolation.provider_host_gid
+                         and stat.S_IMODE(current_parent.st_mode) == 0o710
+                         and all(os.stat(ancestor, follow_symlinks=False).st_mode & 0o001 for ancestor in path.parent.parents))
+                policies()
+            custody()
+            listener.listen(1); listener.settimeout(_remaining(deadline))
+            if on_ready is not None:
+                _require(on_ready() is None)
+                listener.settimeout(_remaining(deadline))
+            channel, _ = listener.accept()
+            channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+            custody()
+            return self.serve_state_custodian_admission(channel=channel, manifest=manifest,
+                timeout_seconds=_remaining(deadline), _custody_check=custody)
+        except Exception:
+            raise LaunchSupervisorError() from None
+        finally:
+            failed = False
+            for resource in (channel, listener):
+                if resource is not None:
+                    try: resource.close()
+                    except OSError: failed = True
+            if parent is not None:
+                try: os.close(parent)
+                except OSError: failed = True
+            if failed:
+                raise LaunchSupervisorError() from None
+
+    def observe_pending_gate_runtime(self, *, manifest, image, enrollment_file, timeout_seconds):
+        """Bind the current fenced create to the live bootstrap and host source.
+
+        A missing create or a not-yet-started container returns None. This is
+        point-in-time evidence: independent exclusive writer custody is still a
+        host prerequisite. A subsequent admission must recheck all bindings.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .broker_seqpacket import PeerPin, _start
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        peer = None
+        fds = []
+        try:
+            context = self.pending_gate_context(role=image.role, manifest_digest=manifest.digest(),
+                                                timeout_seconds=_remaining(deadline))
+            if context is None: return None
+            with self._observation_mutex(deadline):
+                self._validate_live(deadline)
+                enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                                                            image=image, supervisor=self)
+                _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment
+                         and context['role'] == image.role
+                         and context['image_config_id'] == enrolled.image_config_id
+                         and context['runnable_digest'] == enrolled.runnable_digest
+                         and context['platform_manifest_digest'] == enrolled.platform_manifest_digest)
+                _, info = self._engine.json('GET', '/containers/' + context['container_id'] + '/json', deadline)
+                _require(type(info) is dict and info.get('Id') == context['container_id']
+                         and info.get('Image') == enrolled.image_config_id and type(info.get('State')) is dict)
+                state = info['State']
+                if state.get('Running') is False and state.get('Status') == 'created':
+                    _remaining(deadline)
+                    return None
+                _require(state.get('Running') is True and state.get('Status') == 'running'
+                         and state.get('Paused') is False and state.get('Restarting') is False
+                         and state.get('Dead') is False and type(state.get('Pid')) is int and state['Pid'] > 0)
+                pid = state['Pid']
+                peer = PeerPin(pid=pid, uid=enrolled.consumer_host_uid, gid=enrolled.consumer_host_gid,
+                               start_ticks=_start(pid))
+                root = _path(self._mounts['generations'].source)
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC); fds.append(root_fd)
+                _require(_identity(os.fstat(root_fd)) == self._source_pins['generations']
+                         and _identity(os.lstat(root)) == self._source_pins['generations'])
+                generation = context['generation_id']
+                _require(type(generation) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', generation))
+                source = os.open(generation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd); fds.append(source)
+                source_info = os.fstat(source)
+                _require(_identity(source_info) == _identity(os.stat(generation, dir_fd=root_fd, follow_symlinks=False)))
+                root_app = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC); fds.append(root_app)
+                parent = root_app
+                for part in ('var', 'lib', 'hub'):
+                    parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                    fds.append(parent)
+                _require(_identity(os.fstat(parent)) == _identity(source_info))
+                bits = os.fstatvfs(parent).f_flag
+                flags = sorted(name for name, bit in (('nodev', os.ST_NODEV), ('noexec', os.ST_NOEXEC), ('nosuid', os.ST_NOSUID)) if bits & bit)
+                if not bits & os.ST_RDONLY: flags.append('rw')
+                _require('rw' in flags)
+                pins = {'launch_id': str(uuid4()), 'operation_id': context['operation_id'], 'run_id': context['run_id'],
+                        'fence': context['fence'], 'manifest_digest': manifest.digest(), 'image_config_id': enrolled.image_config_id,
+                        'generation_id': generation, 'expected_device': source_info.st_dev, 'expected_inode': source_info.st_ino,
+                        'boot_id': self._consumer.boot, 'container_id': context['container_id'], 'host_pid': pid,
+                        'process_start_ticks': peer.start, 'mount_target': '/var/lib/hub', 'mount_flags': flags,
+                        'runnable_digest': enrolled.runnable_digest, 'platform_manifest_digest': enrolled.platform_manifest_digest,
+                        'implementation_commit': enrolled.source_commit}
+                self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                _require(_identity(os.fstat(source)) == _identity(os.stat(generation, dir_fd=root_fd, follow_symlinks=False))
+                         and _identity(os.fstat(root_fd)) == self._source_pins['generations'])
+                self._validate_live(deadline); self._gate_socket_check(enrolled); _remaining(deadline)
+                return pins
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+        finally:
+            for fd in reversed(fds): os.close(fd)
+            if peer is not None: peer.close()
+
+    def serve_pending_gate_bootstrap(self, *, manifest, image, enrollment_file, controller_key_file, timeout_seconds,
+                                     authority_check):
+        """One fenced bootstrap exchange, or None while the create is pending.
+
+        A caller owns repeated readiness waits and later health acceptance.
+        Every effect after accepting an app peer is one-shot and any uncertain
+        phase holds. Host-exclusive writer and nondelegated descriptor custody
+        are independently enforced prerequisites, not established here.
+        """
+        from .application_gate_enrollment import COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .mount_gate_controller import MountGateController
+        from .mount_gate_consume_protocol import MountGateConsumeController
+        from .mount_gate_protocol import issue_decision
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5 and callable(authority_check))
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            _check_gate_authority(authority_check); _remaining(deadline)
+            if self._gate_listener is None:
+                self.prepare_gate_socket(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                                         timeout_seconds=_remaining(deadline))
+            base = self.observe_pending_gate_runtime(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                                                     timeout_seconds=_remaining(deadline))
+            if base is None: return None
+            _check_gate_authority(authority_check); _remaining(deadline)
+            channel, peer = self.accept_gate_channel(manifest=manifest, image=image, enrollment_file=enrollment_file,
+                host_pid=base['host_pid'], process_start_ticks=base['process_start_ticks'],
+                timeout_seconds=_remaining(deadline))
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest, image=image, supervisor=self)
+            _require(enrolled.schema == COMPLETION_SCHEMA and enrolled == self._gate_enrollment)
+            key_path = _path(controller_key_file)
+            key, key_identity = _root_file(key_path, 32)
+            _require(len(key) == 32)
+            signer = Ed25519PrivateKey.from_private_bytes(key); del key
+            _require(signer.public_key().public_bytes(serialization.Encoding.Raw,
+                     serialization.PublicFormat.Raw) == enrolled.controller_public_key)
+
+            def source_current(pins):
+                _check_gate_authority(authority_check); _remaining(deadline)
+                root = _path(self._mounts['generations'].source)
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                source = None
+                try:
+                    _require(_identity(os.fstat(root_fd)) == self._source_pins['generations']
+                             and _identity(os.lstat(root)) == self._source_pins['generations'])
+                    name = pins['generation_id']
+                    _require(type(name) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', name))
+                    source = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+                    _require(_identity(os.fstat(source)) == _identity(os.stat(name, dir_fd=root_fd, follow_symlinks=False))
+                             == (pins['expected_device'], pins['expected_inode']))
+                    peer.check(); _remaining(deadline)
+                finally:
+                    if source is not None: os.close(source)
+                    os.close(root_fd)
+                return True
+
+            started = self.serve_one_gate_start_enrollment(channel=channel, peer=peer,
+                expected_without_nonce=base, manifest=manifest, image=image, enrollment_file=enrollment_file,
+                controller_key_file=controller_key_file, verify_live=source_current,
+                timeout_seconds=_remaining(deadline))
+            pins = started['identity']
+            _check_gate_authority(authority_check); _remaining(deadline)
+            with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                _check_gate_authority(authority_check); _remaining(deadline)
+                _require(client.invoke('reserve', pins, deadline_monotonic=deadline) is True)
+
+            def current_locked(candidate):
+                _check_gate_authority(authority_check); _remaining(deadline)
+                self._validate_live(deadline)
+                _require(load_application_gate_enrollment(enrollment_file, manifest=manifest, image=image, supervisor=self) == enrolled
+                         and _root_file(key_path, 32)[1] == key_identity and candidate == pins)
+                self._gate_socket_check(enrolled); self._gate_peer_engine_check(peer, candidate, enrolled, deadline)
+                source_current(candidate)
+                _measure_gate_process(peer, candidate, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                self._validate_live(deadline); _remaining(deadline)
+                return True
+            def current(candidate):
+                with self._observation_mutex(deadline): return current_locked(candidate)
+            def hold(_candidate):
+                self._held, self._issuance_open, self._hold_persisted = True, False, False
+                if self._mutex.acquire(blocking=False):
+                    try: self._hold()
+                    finally: self._mutex.release()
+            wire = []
+            def reserve(decision, digest):
+                with self._observation_mutex(deadline):
+                    current_locked(pins)
+                    self._journal.reserve_gate_issuance(self._launch_id, self._record(), pins, decision, digest)
+                    encoded = issue_decision(decision, signer)
+                    _require(hashlib.sha256(encoded).hexdigest() == digest)
+                    wire.append(encoded)
+                    return True
+            wall, tick = int(time.time() * 1000), time.monotonic()
+            decision = MountGateController(channel=channel, peer=peer, expected=pins, signing_key=signer,
+                verify_live=current, reserve_issuance=reserve, hold_uncertain=hold,
+                timeout_seconds=_remaining(deadline))
+            _require(decision.serve_once() == 'sent_unconfirmed' and len(wire) == 1)
+            def consume(value):
+                _check_gate_authority(authority_check); _remaining(deadline)
+                with self.open_gate_ledger_client(manifest_digest=manifest.digest(), timeout_seconds=_remaining(deadline)) as client:
+                    _check_gate_authority(authority_check); _remaining(deadline)
+                    return client.invoke('consume', value, deadline_monotonic=deadline)
+            consumer = MountGateConsumeController(channel=channel, peer=peer, expected=pins,
+                decision_wire=wire[0], signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
+                consume_challenge=consume, verify_live=current, hold_uncertain=hold,
+                exchange_wall_ms=wall, exchange_monotonic=tick, timeout_seconds=_remaining(deadline))
+            _require(consumer.serve_once() == 'sent_unconfirmed')
+            _remaining(deadline)
+            return pins
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def run_gate_operation(self, *, manifest, image, enrollment_file, controller_key_file,
+                           timeout_seconds, stop_requested, authority_check):
+        """Own one role-specific bootstrap and accepted health sequence.
+
+        All waits are bounded and observational. A timeout, stop, lost response
+        or failed effect holds original evidence; acceptance is never replayed.
+        The caller must retain supervisor lifetime and independently enforce the
+        enrolled host's exclusive-writer and direct-channel custody conditions.
+        """
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 120
+                 and callable(stop_requested) and callable(authority_check))
+        deadline = time.monotonic() + timeout_seconds
+        def wait():
+            stopped = stop_requested()
+            _require(type(stopped) is bool and not stopped)
+            remaining = _remaining(deadline)
+            time.sleep(min(.1, remaining))
+        try:
+            while not self._gate_ledger_handoff_ready(deadline):
+                _require(stop_requested() is False)
+                _check_gate_authority(authority_check); _remaining(deadline)
+                wait()
+            pins = None
+            while pins is None:
+                _require(stop_requested() is False)
+                _check_gate_authority(authority_check); _remaining(deadline)
+                pins = self.serve_pending_gate_bootstrap(manifest=manifest, image=image,
+                    enrollment_file=enrollment_file, controller_key_file=controller_key_file,
+                    timeout_seconds=min(5, _remaining(deadline)), authority_check=authority_check)
+                if pins is None: wait()
+            while True:
+                _require(stop_requested() is False and self._gate_accepted_peer is not None)
+                _check_gate_authority(authority_check); _remaining(deadline)
+                accepted = self.finish_pending_gate(peer=self._gate_accepted_peer, pins=pins, manifest=manifest,
+                    image=image, enrollment_file=enrollment_file, timeout_seconds=min(5, _remaining(deadline)),
+                    authority_check=authority_check)
+                if accepted is not None:
+                    _remaining(deadline)
+                    return {'identity': pins, 'acceptance': accepted}
+                wait()
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+
+    def _gate_ledger_handoff_ready(self, deadline):
+        """Observe the completed one-shot handoff before opening its socket."""
+        with self._observation_mutex(deadline):
+            self._validate_live(deadline)
+            if self._ledger_handoff_parent is None:
+                return False
+            self._ledger_handoff_path_check()
+            with self._journal.transaction() as db:
+                row = db.execute('SELECT binding FROM ledger_handoff WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+            _require(row is not None)
+            binding = _strict(row[0].encode(), MAX_RECEIPT_BYTES)
+            _require(binding['launch_id'] == self._launch_id
+                     and binding['launch_profile_digest'] == self.release.launch_profile_digest
+                     and (binding['path_device'], binding['path_inode']) == self._ledger_handoff_path_identity)
+            self._validate_live(deadline); self._ledger_handoff_path_check(); _remaining(deadline)
+            return True
+
+    def serve_one_gate_start_enrollment(self, *, channel, peer, expected_without_nonce,
+                                        manifest, image, enrollment_file, controller_key_file,
+                                        verify_live, timeout_seconds):
+        """Issue once through the v3 journal; trusted app/custody verification remains external.
+
+        The caller retains channel/peer ownership. No installed startup path
+        enables this method. A send is not a delivery acknowledgement; on any
+        error the supervisor holds, and an attempted reservation is never retried.
+        The callback must independently verify application identity, owner,
+        fence, mount custody and measured bootstrap under the host trust model.
+        It runs under the supervisor mutex and must not call any supervisor
+        method that acquires that mutex; recursive entry here is denied. It
+        must be bounded and synchronous: a blocked callback cannot be canceled
+        by this deadline, and the owner must hold the operation until it exits.
+        """
+        from .application_gate_enrollment import STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment
+        from .mount_gate_start_enrollment import MountGateStartEnrollmentController
+        _require(self._pid == os.getpid() and type(timeout_seconds) in (int, float)
+                 and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 5
+                 and getattr(self, '_gate_start_thread', None) != threading.get_ident())
+        deadline = time.monotonic() + timeout_seconds
+        if not self._mutex.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise LaunchSupervisorError()
+        try:
+            self._gate_start_thread = threading.get_ident()
+            held = False
+            def hold(_pins=None):
+                nonlocal held
+                if not held:
+                    held = True
+                    self._hold()
+            try:
+                _require(self._journal.start_mode)
+                _remaining(deadline)
+                base = json.loads(_canonical(expected_without_nonce))
+                self._validate_live(deadline)
+                enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                    image=image, supervisor=self)
+                _require(enrolled.schema in (STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA))
+                if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
+                    _require(enrolled == self._gate_enrollment
+                             and channel is self._gate_accepted_channel and peer is self._gate_accepted_peer
+                             and type(base) is dict
+                             and base.get('manifest_digest') == enrolled.manifest_digest
+                             and base.get('image_config_id') == enrolled.image_config_id
+                             and base.get('runnable_digest') == enrolled.runnable_digest
+                             and base.get('platform_manifest_digest') == enrolled.platform_manifest_digest
+                             and base.get('implementation_commit') == enrolled.source_commit)
+                    self._gate_socket_check(enrolled)
+                key_path = _path(controller_key_file)
+                key, key_identity = _root_file(key_path, 32)
+                _require(len(key) == 32)
+                signer = Ed25519PrivateKey.from_private_bytes(key)
+                del key
+                record = json.loads(_canonical(self._record()))
+                supervisor_id = self._launch_id
+                _require(type(supervisor_id) is str)
+
+                def current(pins):
+                    self._validate_live(deadline)
+                    if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
+                        self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                    if enrolled.schema == COMPLETION_SCHEMA:
+                        _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                    current_enrollment = load_application_gate_enrollment(enrollment_file,
+                        manifest=manifest, image=image, supervisor=self)
+                    _require(current_enrollment == enrolled and _root_file(key_path, 32)[1] == key_identity
+                             and self._launch_id == supervisor_id and self._record() == record
+                             and callable(verify_live) and verify_live(pins) is True)
+                    self._validate_live(deadline)
+                    _require(load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                        image=image, supervisor=self) == enrolled and _root_file(key_path, 32)[1] == key_identity
+                        and self._launch_id == supervisor_id and self._record() == record)
+                    if enrolled.schema in (SOCKET_SCHEMA, COMPLETION_SCHEMA):
+                        self._gate_socket_check(enrolled)
+                        self._gate_peer_engine_check(peer, pins, enrolled, deadline)
+                    if enrolled.schema == COMPLETION_SCHEMA:
+                        _measure_gate_process(peer, pins, enrolled.bootstrap_digest, deadline, bootstrap=True)
+                    _remaining(deadline)
+                    return True
+
+                controller = MountGateStartEnrollmentController(channel=channel, peer=peer,
+                    expected_without_nonce=base, bootstrap_digest=enrolled.bootstrap_digest,
+                    signing_key=signer, enrolled_public_key=enrolled.controller_public_key,
+                    verify_live=current,
+                    reserve_start=lambda payload, digest: self._journal.reserve_gate_start(
+                        supervisor_id, record, base, enrolled.bootstrap_digest, payload, digest),
+                    hold_uncertain=hold, timeout_seconds=min(timeout_seconds, _remaining(deadline)))
+                return controller.serve_once()
+            except BaseException:
+                if self._journal is not None:
+                    with self._journal._gate_lock:
+                        self._journal._gate_fresh = False
+                hold()
+                raise LaunchSupervisorError() from None
+        finally:
+            self._gate_start_thread = None
+            self._mutex.release()
+
+    def serve_one_coordinator_handoff(self, channel):
+        """Issue one measured-coordinator endpoint receipt; pair launch remains disabled."""
+        return self._serve_one_role_handoff(channel, 'coordinator')
+
+    def _serve_one_role_handoff(self, channel, role):
+        """One measured single-role FD receipt; pair launch remains hard-disabled.
+
+        Transfers ownership of an already connected channel to this method. The
+        trusted pair supervisor must have created and retained both ends; this
+        single-role step does not attest the other end, its owner, exclusive
+        custody, or pair identity and must never be treated as pair authentication
+        or launch approval. Constructor launch gates remain unchanged.
+        Its journal reservation is the same one-shot issuance as the ordinary
+        receipt, so neither version can be issued after the other. A lost/partial
+        send is held, never retried; this method always closes its channel copy.
+        """
+        _require(self._pid == os.getpid())
+        with self._mutex:
+            peer = None
+            reserved = False
+            try:
+                self._guard()
+                _require(type(channel) is socket.socket and channel.family == socket.AF_UNIX
+                         and channel.type & socket.SOCK_SEQPACKET == socket.SOCK_SEQPACKET
+                         and channel.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 0
+                         and (getattr(self.profile, 'role', None) or 'executor') == role
+                         and getattr(self.profile, 'command_channel', None) == 'inherited-seqpacket-v1'
+                         and self._issuance_open and time.monotonic() < self._expires)
+                channel.getpeername()
+                info = os.fstat(channel.fileno())
+                _require(stat.S_ISSOCK(info.st_mode))
+                deadline = min(self._expires, time.monotonic() + self._request_ms / 1000)
+                self._listener.settimeout(_remaining(deadline))
+                peer, _ = self._listener.accept()
+                credentials = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                _require(credentials == (self._consumer.pid, self._consumer_uid, self._consumer_gid))
+                self._validate_live(deadline)
+                size = struct.unpack('!I', self._receive(peer, 4, deadline))[0]
+                _require(0 < size <= MAX_REQUEST_BYTES)
+                request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
+                _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
+                         and request['protocol'] == ('engineering-hub.launch-channel-request.v1' if role == 'executor'
+                             else 'engineering-hub.coordinator-channel-request.v1')
+                         and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
+                peer.settimeout(_remaining(deadline))
+                _require(peer.recv(1) == b'')
+                self._validate_live(deadline)
+                manifest = self._handoff_manifest_digest()
+                self._journal.reserve_issuance(self._launch_id, request['nonce'])
+                reserved = True
+                self._issuance_open = False
+                self._validate_live(deadline)
+                now = int(time.time() * 1000)
+                remaining = int((self._expires - time.monotonic()) * 1000)
+                _require(remaining > 0)
+                payload = {'protocol': ('engineering-hub.launch-channel.v1' if role == 'executor'
+                                        else 'engineering-hub.coordinator-channel.v1'),
+                    'audience': ('engineering-hub.container-executor' if role == 'executor'
+                                 else 'engineering-hub.pilot-coordinator'), 'nonce': request['nonce'],
+                    'role': role, 'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
+                    'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
+                    'container_id': self._container_id, 'issuer_id': self.release.issuer_id,
+                    'implementation_commit': self.release.implementation_commit,
+                    'runnable_digest': self.release.runnable_digest,
+                    'platform_manifest_digest': self.release.platform_manifest_digest,
+                    'image_config_id': self.release.image_config_id,
+                    'platform': self.release.platform.model_dump(mode='json'),
+                    'launch_profile_digest': self.release.launch_profile_digest,
+                    'manifest_digest': manifest, 'channel_device': info.st_dev, 'channel_inode': info.st_ino,
+                    'issued_at_ms': now, 'expires_at_ms': min(now + remaining, self._approval_expires_at_ms)}
+                _require(payload['expires_at_ms'] > now)
+                domain = (b'engineering-hub-launch-channel-v1\x00' if role == 'executor'
+                          else b'engineering-hub-coordinator-channel-v1\x00')
+                sig = self._signer.sign(domain + _canonical(payload))
+                signature = base64.urlsafe_b64encode(sig).rstrip(b'=').decode('ascii')
+                raw = _canonical({'payload': payload, 'signature': signature})
+                _require(len(raw) <= MAX_RECEIPT_BYTES)
+                self._validate_live(deadline)
+                peer.settimeout(_remaining(deadline))
+                packet = struct.pack('!I', len(raw)) + raw
+                sent = peer.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                               array.array('i', [channel.fileno()]))])
+                _require(sent == len(packet))
+                _remaining(deadline)
+                receipt_hash = hashlib.sha256(raw).hexdigest()
+                self._journal.issuance_state(self._launch_id, 'sent', receipt_hash)
+                # This durable one-shot state is never reverted after the first
+                # descriptor send: final confirmation delivery can be unknown.
+                reserved = False
+                self._validate_live(deadline)
+                commit = {'protocol': ('engineering-hub.launch-channel-commit.v1' if role == 'executor'
+                                       else 'engineering-hub.coordinator-channel-commit.v1'),
+                          'nonce': request['nonce'], 'launch_id': self._launch_id,
+                          'receipt_digest': 'sha256:' + receipt_hash}
+                commit_domain = (b'engineering-hub-launch-channel-commit-v1\x00' if role == 'executor'
+                                 else b'engineering-hub-coordinator-channel-commit-v1\x00')
+                commit_sig = self._signer.sign(commit_domain + _canonical(commit))
+                commit_raw = _canonical({'payload': commit, 'signature':
+                    base64.urlsafe_b64encode(commit_sig).rstrip(b'=').decode('ascii')})
+                _require(len(commit_raw) <= MAX_RECEIPT_BYTES)
+                peer.settimeout(_remaining(deadline))
+                peer.sendall(struct.pack('!I', len(commit_raw)) + commit_raw)
+                peer.shutdown(socket.SHUT_WR)
+                self._receipt_served = True
+                return payload['launch_id']
+            except BaseException:
+                if reserved:
+                    try:
+                        self._journal.issuance_state(self._launch_id, 'held', None)
+                    except BaseException:
+                        pass
+                self._hold()
+                raise LaunchSupervisorError() from None
+            finally:
+                if peer is not None:
+                    peer.close()
+                if type(channel) is socket.socket:
+                    channel.close()
 
     @contextmanager
     def _observation_mutex(self, deadline, *, wait_window=False):
@@ -1092,6 +2837,7 @@ class LaunchSupervisor:
         """Only identity/authority failures here hold; wire input is checked outside."""
         try:
             self._guard()
+            _require(getattr(getattr(self, 'profile', None), 'role', None) not in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
             _require(self._receipt_served and not self._issuance_open)
             deadline = min(deadline, self._expires)
             _remaining(deadline)
@@ -1120,6 +2866,50 @@ class LaunchSupervisor:
             raw = _canonical({'payload': payload, 'signature': signature})
             _require(len(raw) <= current_observation.MAX_OBSERVATION_BYTES)
             self._validate_live(deadline)
+            _require(int(time.time() * 1000) < expires)
+            _remaining(deadline)
+            return raw
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+
+    def _observe_gate_mount_locked(self, nonce, deadline):
+        """Fresh signed gate-mount facts from this retained supervisor session."""
+        from .application_gate_enrollment import load_application_gate_enrollment
+        from .gate_mount_observation import DOMAIN, PROTOCOL
+        try:
+            self._guard()
+            _require(self._receipt_served and not self._issuance_open and self._gate_enrollment is not None)
+            deadline = min(deadline, self._expires)
+            self._validate_live(deadline)
+            enrolled = load_application_gate_enrollment(self._gate_policy_path, manifest=self._gate_manifest,
+                image=self._gate_image, supervisor=self)
+            _require(enrolled == self._gate_enrollment)
+            self._gate_socket_check(enrolled)
+            directory = os.fstat(self._gate_parent)
+            endpoint = os.stat('controller.sock', dir_fd=self._gate_parent, follow_symlinks=False)
+            now = int(time.time() * 1000)
+            _require(type(self._approval_expires_at_ms) is int and 0 < now < self._approval_expires_at_ms)
+            expires = min(now + min(5000, int(_remaining(self._expires) * 1000)), self._approval_expires_at_ms)
+            _require(now < expires)
+            payload = {'protocol': PROTOCOL, 'nonce': nonce, 'launch_id': self._launch_id,
+                'boot_id': self._consumer.boot, 'authenticated_host_pid': self._consumer.pid,
+                'process_start_ticks': self._consumer.start, 'container_id': self._container_id,
+                'manifest_digest': enrolled.manifest_digest, 'launch_profile_digest': self.release.launch_profile_digest,
+                'socket_source_directory': enrolled.socket_source_directory,
+                'policy_digest': 'sha256:' + enrolled.identity[1],
+                'directory_device': directory.st_dev, 'directory_inode': directory.st_ino,
+                'socket_device': endpoint.st_dev, 'socket_inode': endpoint.st_ino,
+                'role': enrolled.role, 'runnable_digest': enrolled.runnable_digest,
+                'platform_manifest_digest': enrolled.platform_manifest_digest,
+                'image_config_id': enrolled.image_config_id, 'source_commit': enrolled.source_commit,
+                'bootstrap_digest': enrolled.bootstrap_digest, 'issued_at_ms': now, 'expires_at_ms': expires}
+            raw = _canonical({'payload': payload, 'signature': self._signer.sign(DOMAIN + _canonical(payload)).hex()})
+            _require(len(raw) <= 8192)
+            self._validate_live(deadline)
+            _require(load_application_gate_enrollment(self._gate_policy_path, manifest=self._gate_manifest,
+                image=self._gate_image, supervisor=self) == enrolled)
+            self._gate_socket_check(enrolled)
             _require(int(time.time() * 1000) < expires)
             _remaining(deadline)
             return raw
@@ -1159,6 +2949,182 @@ class LaunchSupervisor:
         except _ObservationWaitExpired:
             return False
 
+    def _ledger_handoff_path_check(self):
+        """Check the retained root-only rendezvous, not app or signer custody."""
+        parent = self._ledger_handoff_parent
+        directory = self._ledger_handoff_directory
+        _require(parent is not None and directory is not None and self._ledger_handoff_path_identity is not None)
+        info = os.lstat(directory)
+        endpoint = os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+        _require(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                 and stat.S_IMODE(info.st_mode) == 0o711
+                 and _identity(info) == _identity(os.fstat(parent))
+                 and _identity(info) == self._source_pins['gate_channel_directory']
+                 and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == endpoint.st_gid == 0
+                 and stat.S_IMODE(endpoint.st_mode) == 0o600
+                 and _identity(endpoint) == self._ledger_handoff_path_identity)
+
+    @contextmanager
+    def open_gate_ledger_client(self, *, manifest_digest, timeout_seconds):
+        with self._open_gate_ledger_client(manifest_digest=manifest_digest, timeout_seconds=timeout_seconds,
+                                           lookup_only=False) as client:
+            yield client
+
+    @contextmanager
+    def _open_gate_ledger_client(self, *, manifest_digest, timeout_seconds, lookup_only):
+        """Own one connection to the reserved v5 listener and pinned executor.
+
+        This checks the protected path and per-packet executor credentials, but
+        relies on independently enforced host nondelegation and writer exclusion.
+        No result authorizes completion merely because this connection exists.
+        """
+        from .gate_ledger_channel import SupervisorLedgerClient
+        from .broker_seqpacket import PeerPin
+        _require(self._pid == os.getpid() and type(manifest_digest) is str and _SHA.fullmatch(manifest_digest)
+                 and type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds)
+                 and 0 < timeout_seconds <= 5)
+        deadline = time.monotonic() + timeout_seconds
+        channel = peer = None
+        try:
+            with self._observation_mutex(deadline):
+                if lookup_only:
+                    self._guard(allow_held=True); self._validate_live(deadline, allow_held=True)
+                    _require(not self._held or self._hold_persisted)
+                else:
+                    self._guard(); self._validate_live(deadline)
+                _require(self.profile.gate_ledger_channel in ('supervisor-listener-v1', 'pair-outcome-listener-v1')
+                         and self._journal.ledger_mode and self._handoff_manifest_digest() == manifest_digest
+                         and self._consumer is not None)
+                self._ledger_handoff_path_check()
+                with self._journal.transaction() as db:
+                    row = db.execute('SELECT binding FROM ledger_handoff WHERE supervisor_id=?', (self._launch_id,)).fetchone()
+                _require(row is not None)
+                binding = _strict(row[0].encode(), MAX_RECEIPT_BYTES)
+                _require(binding['manifest_digest'] == manifest_digest
+                         and binding['launch_profile_digest'] == self.release.launch_profile_digest
+                         and (binding['path_device'], binding['path_inode']) == self._ledger_handoff_path_identity)
+                endpoint = f'/proc/self/fd/{self._ledger_handoff_parent}/ledger.sock'
+                channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+                channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                channel.settimeout(_remaining(deadline)); channel.connect(endpoint)
+                _require(channel.getpeername() == endpoint)
+                peer = PeerPin(pid=self._consumer.pid, uid=self._consumer_uid, gid=self._consumer_gid,
+                               start_ticks=self._consumer.start)
+                if lookup_only: self._validate_live(deadline, allow_held=True)
+                else: self._validate_live(deadline)
+                self._ledger_handoff_path_check(); _remaining(deadline)
+                client = SupervisorLedgerClient(channel=channel, peer=peer, signing_key=self._signer,
+                    launch_binding=(self._launch_id, self._consumer.boot, self._consumer.pid,
+                                    self._consumer.start, self._container_id),
+                    manifest_digest=manifest_digest, timeout_seconds=min(timeout_seconds, _remaining(deadline)),
+                    lookup_only=lookup_only, pair_only=self.profile.gate_ledger_channel == 'pair-outcome-listener-v1')
+            yield client
+            with self._observation_mutex(deadline):
+                if lookup_only: self._validate_live(deadline, allow_held=True)
+                else: self._validate_live(deadline)
+                self._ledger_handoff_path_check(); peer.check(); _remaining(deadline)
+                client.confirm_pair_outcome()
+        except BaseException:
+            self._held, self._issuance_open, self._hold_persisted = True, False, False
+            if self._mutex.acquire(blocking=False):
+                try: self._hold()
+                finally: self._mutex.release()
+            raise LaunchSupervisorError() from None
+        finally:
+            if peer is not None: peer.close()
+            if channel is not None: channel.close()
+
+    def _issue_ledger_handoff_locked(self, peer, nonce, deadline, *, pair_only=False):
+        """Reserve once and deliver one protected listener to the exact executor.
+
+        Delivery may be uncertain; the durable reservation is never retryable.
+        Host isolation and exclusive descriptor custody remain external gates.
+        """
+        from .gate_ledger_handoff import PROTOCOL, AUDIENCE, DOMAIN, PAIR_PROTOCOL, PAIR_AUDIENCE, PAIR_DOMAIN
+        try:
+            self._guard()
+            _require(self._receipt_served and not self._issuance_open and self._journal.ledger_mode
+                     and self.profile.gate_ledger_channel == ('pair-outcome-listener-v1' if pair_only else 'supervisor-listener-v1')
+                     and self._ledger_handoff_parent is None and self._ledger_handoff_listener is None)
+            self._validate_live(deadline)
+            manifest = self._handoff_manifest_digest()
+            directory = _path(self._mounts['gate_channel_directory'].source)
+            parent = _root_parent(directory / 'ledger.sock', private=False)
+            self._ledger_handoff_parent, self._ledger_handoff_directory = parent, directory
+            info = os.fstat(parent)
+            _require(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+                     and stat.S_IMODE(info.st_mode) == 0o711
+                     and _identity(info) == _identity(os.lstat(directory))
+                     and _identity(info) == self._source_pins['gate_channel_directory'])
+            try:
+                os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaunchSupervisorError()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+            self._ledger_handoff_listener = listener
+            endpoint = f'/proc/self/fd/{parent}/ledger.sock'
+            _require(len(endpoint.encode()) <= 107)
+            listener.bind(endpoint)
+            initial = os.stat('ledger.sock', dir_fd=parent, follow_symlinks=False)
+            _require(stat.S_ISSOCK(initial.st_mode))
+            self._ledger_handoff_path_identity = _identity(initial)
+            os.chmod('ledger.sock', 0o600, dir_fd=parent, follow_symlinks=False)
+            listener.listen(1)
+            self._ledger_handoff_path_check()
+            fd_info = os.fstat(listener.fileno())
+            _require(stat.S_ISSOCK(fd_info.st_mode))
+            now = int(time.time() * 1000)
+            expires = min(now + 5000, now + int(_remaining(self._expires) * 1000),
+                          self._approval_expires_at_ms)
+            _require(now < expires)
+            binding = {'protocol': PAIR_PROTOCOL if pair_only else PROTOCOL, 'audience': PAIR_AUDIENCE if pair_only else AUDIENCE, 'nonce': nonce,
+                'launch_id': self._launch_id, 'boot_id': self._consumer.boot,
+                'authenticated_host_pid': self._consumer.pid, 'process_start_ticks': self._consumer.start,
+                'container_id': self._container_id, 'manifest_digest': manifest,
+                'launch_profile_digest': self.release.launch_profile_digest,
+                'listener_device': fd_info.st_dev, 'listener_inode': fd_info.st_ino,
+                'path_device': initial.st_dev, 'path_inode': initial.st_ino,
+                'issued_at_ms': now, 'expires_at_ms': expires}
+            signature = base64.urlsafe_b64encode(self._signer.sign((PAIR_DOMAIN if pair_only else DOMAIN) + _canonical(binding))).rstrip(b'=').decode()
+            raw = _canonical({'payload': binding, 'signature': signature})
+            profile_raw = _canonical(self.profile.enrollment_value())
+            _require(0 < len(raw) <= MAX_RECEIPT_BYTES and 0 < len(profile_raw) <= MAX_PROFILE_BYTES
+                     and 'sha256:' + hashlib.sha256(profile_raw).hexdigest() == self.release.launch_profile_digest)
+            record = json.loads(_canonical(self._record()))
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(self._handoff_manifest_digest() == manifest and int(time.time() * 1000) < expires)
+            self._journal.reserve_ledger_handoff(self._launch_id, record, binding, hashlib.sha256(raw).hexdigest())
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(self._handoff_manifest_digest() == manifest and int(time.time() * 1000) < expires)
+            frame = struct.pack('!I', len(raw)) + raw
+            peer.settimeout(_remaining(deadline))
+            _require(peer.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                       array.array('i', [listener.fileno()]))]) == len(frame))
+            peer.settimeout(_remaining(deadline))
+            peer.sendall(struct.pack('!I', len(profile_raw)) + profile_raw)
+            peer.shutdown(socket.SHUT_WR)
+            self._validate_live(deadline)
+            self._ledger_handoff_path_check()
+            _require(int(time.time() * 1000) < expires)
+            _remaining(deadline)
+            return True
+        except BaseException:
+            self._hold()
+            raise LaunchSupervisorError() from None
+        finally:
+            if self._ledger_handoff_listener is not None:
+                try:
+                    self._ledger_handoff_listener.close()
+                except BaseException:
+                    self._hold()
+                    raise LaunchSupervisorError() from None
+                finally:
+                    self._ledger_handoff_listener = None
+
     def _serve_current_peer_until(self, deadline):
         with self._observation_mutex(deadline, wait_window=True):
             peer = None
@@ -1172,7 +3138,8 @@ class LaunchSupervisor:
                 _require(0 < size <= MAX_REQUEST_BYTES)
                 request = _strict(self._receive(peer, size, deadline), MAX_REQUEST_BYTES)
                 _require(type(request) is dict and set(request) == {'protocol', 'nonce'}
-                         and request['protocol'] == CURRENT_REQUEST_PROTOCOL
+                         and request['protocol'] in (CURRENT_REQUEST_PROTOCOL, GATE_MOUNT_REQUEST_PROTOCOL,
+                                                     GATE_LEDGER_REQUEST_PROTOCOL, PAIR_LEDGER_REQUEST_PROTOCOL)
                          and type(request['nonce']) is str and _HEX.fullmatch(request['nonce']))
                 peer.settimeout(_remaining(deadline))
                 _require(peer.recv(1) == b'')
@@ -1185,7 +3152,13 @@ class LaunchSupervisor:
                     peer.close()
                 raise
             try:
-                raw = self._observe_current_launch_locked(request['nonce'], deadline)
+                if request['protocol'] == GATE_LEDGER_REQUEST_PROTOCOL:
+                    return self._issue_ledger_handoff_locked(peer, request['nonce'], deadline)
+                if request['protocol'] == PAIR_LEDGER_REQUEST_PROTOCOL:
+                    return self._issue_ledger_handoff_locked(peer, request['nonce'], deadline, pair_only=True)
+                raw = (self._observe_gate_mount_locked(request['nonce'], deadline)
+                       if request['protocol'] == GATE_MOUNT_REQUEST_PROTOCOL
+                       else self._observe_current_launch_locked(request['nonce'], deadline))
                 # A disconnected requester is not proof of a broken launch.
                 try:
                     peer.settimeout(_remaining(deadline))
@@ -1205,6 +3178,7 @@ class LaunchSupervisor:
         not the container; only the caller's explicit stop signal requests stop.
         """
         _require(self._pid == os.getpid())
+        _require(getattr(getattr(self, 'profile', None), 'role', None) not in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3'))
         _require(type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
                  and callable(stop_requested))
         deadline = time.monotonic() + timeout_ms / 1000
@@ -1242,6 +3216,37 @@ class LaunchSupervisor:
                 self._serve_current_until(min(
                     deadline, time.monotonic() + self._request_ms / 1000))
 
+    def wait_for_coordinator_stop(self, *, timeout_ms, stop_requested):
+        """Retain the measured coordinator without issuing executor observations.
+
+        This wait is not proof of queue drain or executor custody. The explicit
+        external stop policy and paired lifecycle remain separate obligations.
+        """
+        _require(self._pid == os.getpid()
+                 and getattr(getattr(self, 'profile', None), 'role', None) in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
+                 and type(timeout_ms) is int and 1 <= timeout_ms <= 3_600_000
+                 and callable(stop_requested))
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            requested = stop_requested()
+            _require(type(requested) is bool)
+            if requested: return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: return False
+            try:
+                with self._observation_mutex(deadline, wait_window=True):
+                    _require(not self._closed and not self._held and self._receipt_served
+                             and not self._issuance_open and self._consumer is not None)
+                    self._consumer.check()
+                    ready, _, _ = select.select([self._consumer.fd], [], [], min(.1, remaining))
+                    _require(self._consumer.fd not in ready)
+            except _ObservationWaitExpired:
+                return False
+            except BaseException:
+                with self._mutex:
+                    self._hold()
+                raise LaunchSupervisorError() from None
+
     def graceful_stop(self):
         """Explicit SIGTERM only. Timeout is held, never permission for SIGKILL."""
         _require(self._pid == os.getpid())
@@ -1261,6 +3266,83 @@ class LaunchSupervisor:
             except BaseException:
                 self._hold()
                 raise LaunchSupervisorError() from None
+
+    def graceful_stop_coordinator(self, *, timeout_ms):
+        """Request one stop, record local drain while peer lives, then await exit.
+
+        Timeout/lost acknowledgment holds the original launch. This does not
+        authorize executor stop, retry, release, or a new owner.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int
+                 and 1000 <= timeout_ms <= 86_415_000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        try:
+            with self._mutex:
+                self._guard()
+                _require(self.profile.role in ('supervised-local-coordinator-v2', 'supervised-local-coordinator-v3')
+                         and self._receipt_served and not self._issuance_open
+                         and not getattr(self, '_coordinator_stop_requested', False)
+                         and timeout_ms >= (self._coordinator_stop_grace * 1000
+                                            + self._coordinator_admission.timeout_ms + 5000))
+                self._validate_live(deadline)
+                self._journal.state(self._launch_id, 'term_reserved', self._record())
+                self._coordinator_stop_requested = True
+                self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
+                                  deadline, statuses=(204,))
+            self._serve_one_coordinator_drain(deadline)
+            with self._mutex:
+                _require(self._coordinator_drain is not None)
+                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                self._wait_stopped(deadline, require_exit_zero=True)
+                self._journal.state(self._launch_id, 'stopped', self._record())
+                self._remove_owned_socket()
+        except BaseException:
+            with self._mutex:
+                self._hold()
+            raise LaunchSupervisorError() from None
+
+    def graceful_stop_sealed_executor(self, *, pair_id, manifest_digest, timeout_ms):
+        """Stop once and retain authenticated post-drain ledger observations.
+
+        The result does not establish application or external writer quiescence,
+        resolve held effects, authorize release, or resist database rollback.
+        Any lost exchange or uncertain stop holds the original launch.
+        The original launch verifier must remain fresh through the exchange;
+        an expired approval fails held rather than being renewed.
+        """
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1000 <= timeout_ms <= 86_415_000
+                 and type(pair_id) is str and str(UUID(pair_id)) == pair_id)
+        deadline = time.monotonic() + timeout_ms / 1000
+        try:
+            # Verify the exact existing seal before the first stop effect.
+            with self.open_gate_ledger_client(manifest_digest=manifest_digest,
+                    timeout_seconds=min(5, _remaining(deadline))) as client:
+                _require(client.invoke('pair_outcome_v1', {'pair_id': pair_id}) is None)
+            with self._mutex:
+                self._guard()
+                _require(self.profile.gate_ledger_channel in ('supervisor-listener-v1', 'pair-outcome-listener-v1'))
+                self._validate_live(deadline)
+                self._journal.state(self._launch_id, 'term_reserved', self._record())
+                self._engine.json('POST', '/containers/' + self._container_id + '/kill?signal=SIGTERM',
+                                  deadline, statuses=(204,))
+            outcome = None
+            while outcome is None:
+                with self.open_gate_ledger_client(manifest_digest=manifest_digest,
+                        timeout_seconds=min(5, _remaining(deadline))) as client:
+                    outcome = client.invoke('pair_outcome_v1', {'pair_id': pair_id})
+                if outcome is None:
+                    time.sleep(min(.05, _remaining(deadline)))
+            with self._mutex:
+                _require(bool(select.select([self._consumer.fd], [], [], _remaining(deadline))[0]))
+                self._wait_stopped(deadline, require_exit_zero=True)
+                record = dict(self._record(), pair_id=pair_id, pair_outcome=outcome)
+                self._journal.state(self._launch_id, 'stopped', record)
+                self._remove_owned_socket()
+            return outcome
+        except BaseException:
+            with self._mutex:
+                self._hold()
+            raise LaunchSupervisorError() from None
 
     def _remove_owned_socket(self):
         _require(self._socket_parent is not None and self._socket_identity is not None
@@ -1288,11 +3370,13 @@ class LaunchSupervisor:
         self._issuance_open = False
         self._closed = True
         failed = False
-        for name in ('_listener', '_socket_parent', '_consumer', '_engine', '_journal'):
+        for name in ('_listener', '_socket_parent', '_gate_listener', '_gate_parent', '_ledger_handoff_listener',
+                     '_ledger_handoff_parent', '_gate_accepted_channel',
+                     '_gate_accepted_peer', '_consumer', '_engine', '_journal'):
             value = getattr(self, name, None)
             if value is not None:
                 try:
-                    if name == '_socket_parent':
+                    if name in ('_socket_parent', '_gate_parent', '_ledger_handoff_parent'):
                         os.close(value)
                     else:
                         value.close()

@@ -124,7 +124,8 @@ async def _owned_service(operation, stop):
 async def serve_private_coordinator(pair_factory, *, socket_path,
                                     agent_host='0.0.0.0', agent_port=8770,
                                     stop_event=None, on_ready=None,
-                                    install_signals=True, recover_socket=False):
+                                    install_signals=True, recover_socket=False,
+                                    allow_github=False, admission_verifier=None):
     """Bind agent TCP and protected browser UDS before constructing one owner.
 
     ``on_ready(agent_sockname, private_sockname)`` is an optional notification,
@@ -138,10 +139,14 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     rejection of every existing socket; no environment flag enables recovery.
     """
     _options(pair_factory, (agent_port,), stop_event, on_ready, install_signals)
+    if admission_verifier is not None:
+        from hub_container_executor.runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+        if type(admission_verifier) is not CoordinatorLaunchReceiptIdentityVerifier:
+            raise ValueError('Coordinator startup admission required')
     # The public-only process must not import the private application factory
     # or its database/executor dependencies merely to own a browser listener.
     from .frontends import HubFrontends
-    if type(recover_socket) is not bool:
+    if type(recover_socket) is not bool or type(allow_github) is not bool:
         raise ValueError('Explicit boolean endpoint recovery option required')
     try:
         if type(agent_host) is not str:
@@ -154,20 +159,24 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
     async def operation():
         if stop.is_set():
             return
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         with ExitStack() as stack:
             agent = stack.enter_context(_bind(agent_host, agent_port))
             socket_context = private_browser_socket
             if recover_socket:
                 from .recoverable_browser_socket import recoverable_browser_socket
                 socket_context = recoverable_browser_socket
+            if admission_verifier is not None: admission_verifier.implementation_commit()
             browser = stack.enter_context(socket_context(socket_path))
             if install_signals:
                 stack.enter_context(_signal_stop(stop))
+            if admission_verifier is not None: admission_verifier.implementation_commit()
             pair = pair_factory()
             if (type(pair) is not HubFrontends or pair.state != 'new'
                     or pair.settings.ingress_mode != 'combined'
-                    or pair.settings.auth_config.human_auth_mode != 'cloudflare_access'
-                    or pair.settings.auth_config.cloudflare_config is None):
+                    or pair.browser_auth_mode != ('github' if allow_github else 'cloudflare_access')
+                    or pair.settings.auth_config.human_auth_mode != pair.browser_auth_mode
+                    or (not allow_github and pair.settings.auth_config.cloudflare_config is None)):
                 raise SplitServerError()
             if (getattr(pair.core.state, 'staging_runtime', None) is not None
                     or getattr(pair.core.state, 'owned_pilot_service', None) is not None):
@@ -196,6 +205,9 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
                 pair.browser, agent_auth=pair.settings.agent_auth,
                 cloudflare_config=pair.settings.auth_config.cloudflare_config,
                 access_verifier=pair.access_verifier,
+                browser_auth_mode=pair.browser_auth_mode,
+                browser_auth_config=pair.settings.auth_config if allow_github else None,
+                browser_sessions=pair.core.state.sessions if allow_github else None,
                 preview_origin=getattr(pair.core.state, 'preview_origin', None),
                 preview_app=pair.browser if getattr(pair.core.state, 'preview_app', None) is not None else None)
             async with pair.lifespan():
@@ -216,7 +228,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
 
 async def serve_public_browser(client_factory, *, browser_port=8771,
                                stop_event=None, on_ready=None,
-                               install_signals=True, preview_origin=None):
+                               install_signals=True, preview_origin=None, allow_github=False):
     """Bind only literal loopback, then accept one dedicated private UDS client.
 
     ``on_ready(browser_sockname)`` runs only after listener startup. The factory
@@ -227,6 +239,8 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
     client closes only after requests drain, even on repeated cancellation.
     """
     _preview_host(preview_origin)  # Reject invalid opt-in before binding or accepting a client.
+    if type(allow_github) is not bool:
+        raise ValueError('Explicit GitHub gateway opt-in required')
     _options(client_factory, (browser_port,), stop_event, on_ready, install_signals)
     stop = stop_event if stop_event is not None else asyncio.Event()
 
@@ -241,7 +255,7 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
             if type(client) is not httpx.AsyncClient:
                 raise SplitServerError()
             try:
-                gateway = PublicBrowserGateway(client, preview_origin=preview_origin)
+                gateway = PublicBrowserGateway(client, preview_origin=preview_origin, allow_github=allow_github)
                 await _serve_listeners((gateway,), (browser,), stop, on_ready,
                                        (browser.getsockname(),))
             finally:

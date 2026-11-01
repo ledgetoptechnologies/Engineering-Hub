@@ -1,0 +1,13 @@
+# Local acceptance candidate only. FROM is resolved before RUN, so the RUN
+# check cannot prevent a pull or prove the resolved base. A trusted build driver
+# must independently ensure local-only resolution and verify the exact base ID.
+ARG CORE_IMAGE
+FROM ${CORE_IMAGE}
+USER root
+ARG CORE_IMAGE
+ARG GATE_SHA256
+COPY gate /usr/local/libexec/hub-application-gate
+RUN chmod 0755 /usr/local/libexec/hub-application-gate && python -I -B -c "import hashlib,os,re,sys; core=os.environ.get('CORE_IMAGE',''); expected=os.environ.get('GATE_SHA256',''); re.fullmatch('sha256:[0-9a-f]{64}',core) or sys.exit('immutable local core image ID required'); re.fullmatch('[0-9a-f]{64}',expected) or sys.exit('explicit gate SHA-256 required'); actual=hashlib.sha256(open('/usr/local/libexec/hub-application-gate','rb').read()).hexdigest(); actual == expected or sys.exit('gate digest mismatch')"
+USER 10001:10001
+ENTRYPOINT ["/usr/local/libexec/hub-application-gate"]
+CMD []

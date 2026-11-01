@@ -22,6 +22,7 @@ from .cloudflare_access import CloudflareAccessConfig, CloudflareIdentity
 
 DEFAULT_LOCAL_SESSION_TTL_SECONDS = 8 * 60 * 60
 CLOUDFLARE_LOCAL_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+MAX_OUTSTANDING_OAUTH_STATES = 128
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,8 @@ class AuthConfig:
             raise ValueError("Hub base URL must be an absolute origin")
         if url.scheme != "https" and url.hostname not in ("localhost", "127.0.0.1", "::1"):
             raise ValueError("Hub base URL requires HTTPS except on loopback")
-        if self.beau_github_id is not None and (type(self.beau_github_id) is not int or self.beau_github_id <= 0):
+        if self.beau_github_id is not None and (type(self.beau_github_id) is not int
+                                               or not 0 < self.beau_github_id < 2**63):
             raise ValueError("Allowlisted GitHub identity must be a positive numeric ID")
         if self.human_auth_mode not in {"github", "cloudflare_access"}:
             raise ValueError("Unknown human authentication mode")
@@ -158,6 +160,8 @@ class SessionStore:
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         with self._db() as db:
             db.execute("DELETE FROM auth_states WHERE expires <= ?", (self.clock(),))
+            if db.execute("SELECT COUNT(*) FROM auth_states").fetchone()[0] >= MAX_OUTSTANDING_OAUTH_STATES:
+                return None
             db.execute("INSERT INTO auth_states VALUES (?, ?, ?)", (_hash(state), verifier, self.clock() + self.state_ttl))
         return {"state": state, "verifier": verifier, "challenge": challenge}
 
@@ -168,6 +172,10 @@ class SessionStore:
         return row[0] if row and row[1] > self.clock() else None
 
     def create_session(self, github_id: int):
+        # SQLite INTEGER has a signed-64-bit binding range. Validate before any
+        # expired-session cleanup or randomness, including direct store callers.
+        if type(github_id) is not int or not 0 < github_id < 2**63:
+            raise ValueError('Invalid GitHub identity')
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
         with self._db() as db:
             db.execute("DELETE FROM auth_sessions WHERE expires <= ?", (self.clock(),))
@@ -370,6 +378,8 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
         if not config.github_client_id or not config.github_client_secret or config.beau_github_id is None:
             raise HTTPException(503, "Human sign-in is not configured")
         pending = auth_store.create_state()
+        if pending is None:
+            raise HTTPException(503, "Sign-in temporarily unavailable", headers={"Cache-Control": "no-store"})
         response = RedirectResponse("https://github.com/login/oauth/authorize?" + urlencode({
             "client_id": config.github_client_id, "redirect_uri": config.origin + "/api/hub/v1/auth/callback",
             "state": pending["state"], "code_challenge": pending["challenge"], "code_challenge_method": "S256",

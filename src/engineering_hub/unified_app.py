@@ -23,7 +23,7 @@ def create_unified_app(settings=None, *, bus_paths=None):
     return create_app(settings, bus_app=_create_unified_bus(settings, bus_paths=bus_paths))
 
 
-def _create_unified_bus(settings, *, bus_paths=None):
+def _create_unified_bus(settings, *, bus_paths=None, allow_github=False):
     """Internal composition seam; construct only the explicitly selected bus.
 
     No lifespan is entered here. The containing Hub remains its single owner.
@@ -33,9 +33,13 @@ def _create_unified_bus(settings, *, bus_paths=None):
     cleanup_flag = os.environ.get('HUB_BUS_STARTUP_CLEANUP', '0')
     if cleanup_flag not in {'0', '1'}:
         raise ValueError('HUB_BUS_STARTUP_CLEANUP must be 0 or 1')
-    if (settings.ingress_mode != 'combined'
-            or settings.auth_config.human_auth_mode != 'cloudflare_access'
-            or settings.auth_config.cloudflare_config is None):
+    auth = settings.auth_config
+    if (type(allow_github) is not bool or settings.ingress_mode != 'combined'
+            or (not allow_github and (auth.human_auth_mode != 'cloudflare_access'
+                or auth.cloudflare_config is None))
+            or (allow_github and (auth.human_auth_mode != 'github' or not auth.secure
+                or not auth.github_client_id or not auth.github_client_secret
+                or type(auth.beau_github_id) is not int or auth.beau_github_id <= 0))):
         raise ValueError('Unified Hub requires one shared split-frontends core')
     paths = {}
     for name in ('AGENT_BUS_DB', 'AGENT_BUS_AUDIT', 'AGENT_BUS_FILE_ROOT'):

@@ -361,3 +361,25 @@ async def test_changed_original_request_is_not_reconstructed_or_queried(rig):
     assert result['recovery'] == 'held'
     assert current.client.inspections == current.client.submissions == []
     assert reservations(current.repo, run['id'])[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_smoke_for_different_container_stays_held(rig):
+    _, run, _ = await rig.crash('smoke_container')
+    def foreign_failed(command, response):
+        if command.action != 'smoke_container':
+            return response
+        return response.model_copy(update={'state': 'failed', 'reason': 'health_failed',
+            'evidence': response.evidence.model_copy(update={'container_id': '1' * 64,
+                'health': 'unhealthy'})})
+    current = rig.restart(InspectClient(alter=foreign_failed))
+    result = await current.recovery.recover(run['id'])
+    assert result['recovery'] == 'held' and result['run']['status'] == 'held'
+    assert current.client.submissions == []
+    assert len(reservations(current.repo, run['id'])[0]) == 1
+
+
+def test_failed_smoke_without_container_evidence_retains_failure_semantics():
+    evidence = [dict(action='deploy_container', state='succeeded', container_id='e' * 64),
+                dict(action='smoke_container', state='failed', container_id=None)]
+    assert PilotRecovery._derive(evidence) == 'failed'

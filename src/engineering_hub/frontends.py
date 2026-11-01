@@ -24,6 +24,9 @@ class _FrontDoor:
             cloudflare_config=pair.settings.auth_config.cloudflare_config,
             legacy_bus_enabled=getattr(pair.core.state, 'embedded_bus', None) is not None,
             access_verifier=pair.access_verifier if mode == 'browser' else None,
+            browser_auth_mode=pair.browser_auth_mode if mode == 'browser' else 'cloudflare_access',
+            browser_auth_config=pair.settings.auth_config if mode == 'browser' and pair.browser_auth_mode == 'github' else None,
+            browser_sessions=pair.core.state.sessions if mode == 'browser' and pair.browser_auth_mode == 'github' else None,
             agent_sessions=getattr(bus.state, 'agent_sessions', None) if bus is not None else None,
             agent_sessions_config=getattr(bus.state, 'agent_sessions_config', None) if bus is not None else None,
         )
@@ -65,13 +68,22 @@ class HubFrontends:
     A failed/closed pair requires a new process/core under normal owner rules.
     """
 
-    def __init__(self, core, *, access_verifier=None):
+    def __init__(self, core, *, access_verifier=None, allow_github=False):
         if not isinstance(core, FastAPI):
             raise ValueError("Hub frontends require one existing FastAPI Hub core")
         settings = getattr(core.state, "settings", None)
+        if type(allow_github) is not bool:
+            raise ValueError('Explicit GitHub frontend opt-in required')
+        auth = settings.auth_config if isinstance(settings, Settings) else None
+        github = (allow_github and auth is not None and auth.human_auth_mode == 'github'
+                  and auth.secure and type(auth.github_client_id) is str and bool(auth.github_client_id)
+                  and type(auth.github_client_secret) is str and bool(auth.github_client_secret)
+                  and type(auth.beau_github_id) is int and auth.beau_github_id > 0
+                  and auth.cloudflare_config is None and access_verifier is None)
+        cloudflare = (auth is not None and auth.human_auth_mode == 'cloudflare_access'
+                      and auth.cloudflare_config is not None and not allow_github)
         if (not isinstance(settings, Settings) or settings.ingress_mode != "combined"
-                or settings.auth_config.human_auth_mode != "cloudflare_access"
-                or settings.auth_config.cloudflare_config is None):
+                or not (github or cloudflare)):
             raise ValueError("Shared Hub core requires combined ingress and configured Cloudflare Access")
         if getattr(core.state, "hub_frontends", None) is not None:
             raise ValueError("Hub core already has a frontend lifecycle coordinator")
@@ -81,6 +93,7 @@ class HubFrontends:
                     or access_verifier.config != settings.auth_config.cloudflare_config):
                 raise ValueError('explicit_access_verifier_binding_required')
         self.core, self.settings = core, settings
+        self.browser_auth_mode = 'github' if github else 'cloudflare_access'
         self.access_verifier = access_verifier
         self.state = "new"
         self.agents = _FrontDoor(self, "agents")

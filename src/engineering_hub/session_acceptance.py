@@ -425,3 +425,18 @@ def attach_session_acceptance_routes(app, *, broker, config, sessions):
             return JSONResponse(result, headers={'Cache-Control': 'no-store'})
         except SessionAcceptanceError as error:
             unavailable(error)
+
+    # The dashboard's root StaticFiles mount is a catch-all and may already
+    # exist when trusted composition attaches these routes. Keep all existing
+    # route order intact while placing only these two exact routes before it.
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+    routes = app.router.routes
+    added = routes[-2:]
+    _require(len(added) == 2 and all(getattr(route, 'path', None) == path for route in added))
+    root_mount = next((index for index, route in enumerate(routes[:-2])
+                       if isinstance(route, Mount) and isinstance(route.app, StaticFiles)
+                       and route.path in ('', '/')), len(routes) - 2)
+    if root_mount < len(routes) - 2:
+        del routes[-2:]
+        routes[root_mount:root_mount] = added

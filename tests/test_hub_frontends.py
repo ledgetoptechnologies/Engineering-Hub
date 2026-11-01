@@ -96,6 +96,46 @@ def test_constructor_requires_approved_existing_combined_core(config):
 
 
 @pytest.mark.asyncio
+async def test_explicit_github_frontend_oauth_keeps_agent_boundary(config):
+    from urllib.parse import parse_qs, urlsplit
+    from tests.test_hub_auth import FakeGitHub
+    auth = AuthConfig(ORIGIN, github_client_id='fixture-id', github_client_secret='fixture-secret',
+                      beau_github_id=123, human_auth_mode='github')
+    settings = replace(config, auth_config=auth)
+    with pytest.raises(ValueError):
+        HubFrontends(create_app(settings, github_client=FakeGitHub()))
+    core = create_app(settings, github_client=FakeGitHub())
+    @core.get('/api/hub/v1/new-optional-route')
+    async def optional_route():
+        return {'private': True}
+    core.router.routes.insert(0, core.router.routes.pop())  # Before the UI catch-all.
+    @core.get('/new-private-route')
+    async def optional_non_api_route():
+        return {'private': True}
+    core.router.routes.insert(0, core.router.routes.pop())
+    pair = HubFrontends(core, allow_github=True)
+    async with pair.lifespan():
+        async with clients(pair)[0] as browser, clients(pair)[1] as agent:
+            assert (await browser.get(BASE + '/auth/me')).json()['authenticated'] is False
+            assert (await browser.get(BASE + '/overview')).status_code == 401
+            assert (await browser.get(BASE + '/new-optional-route')).status_code == 401
+            assert (await browser.get('/new-private-route')).status_code == 401
+            assert (await browser.get('/openapi.json')).status_code == 401
+            assert (await browser.get('/assets/private-record')).status_code == 401
+            assert (await browser.get('/mcp')).status_code == 403
+            assert (await agent.get(BASE + '/auth/login', headers=CODEX)).status_code == 403
+            assert (await browser.get(BASE + '/auth/login', headers=CODEX)).status_code == 403
+            login = await browser.get(BASE + '/auth/login')
+            state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            callback = await browser.get(BASE + '/auth/callback', params={'state': state, 'code': 'fixture'})
+            assert callback.status_code == 303
+            assert (await browser.get(BASE + '/auth/me')).json()['actor'] == 'human:123'
+            assert (await browser.get(BASE + '/overview')).status_code == 200
+            assert (await browser.get(BASE + '/new-optional-route')).status_code == 200
+            assert (await browser.post(BASE + '/pause', json={'paused': True})).status_code in (401, 403)
+
+
+@pytest.mark.asyncio
 async def test_both_frontdoors_share_repository_sessions_feed_and_task_claim(config):
     feed = Feed()
     core = create_app(config, event_feed=feed)

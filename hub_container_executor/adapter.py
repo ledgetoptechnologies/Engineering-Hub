@@ -33,6 +33,7 @@ from .backend import (
     OperationObservation,
     PilotBackend,
     ProbeObservation,
+    GateHealthObservation,
     RunnerObservation,
     StateGeneration,
     TrustedDriverIdentityVerifier,
@@ -75,9 +76,22 @@ class HostAdapter:
                  provenance_verifier: TrustedBuildVerifier | None = None,
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
-                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None):
+                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
+                 gate_socket_directory: str | None = None, baseline_inspection_backend=None):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
+        if gate_socket_directory is not None:
+            from .daemon_backend import DockerEngineBackend
+            if (type(backend) is not DockerEngineBackend or backend._gate_mount_verifier is None
+                    or backend._gate_mount_verifier.source_directory != gate_socket_directory):
+                raise ValueError('authenticated gate mount authority required')
+        if baseline_inspection_backend is not None:
+            from .daemon_backend import DockerEngineBackend
+            from .baseline_inspection import BaselineInspectionBackend
+            if (type(backend) is not DockerEngineBackend or type(baseline_inspection_backend) is not BaselineInspectionBackend
+                    or baseline_inspection_backend.binding != backend.binding):
+                raise ValueError('separately enrolled baseline inspection backend required')
+        self.baseline_inspection_backend = baseline_inspection_backend
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
         self.manifest_digest = self.manifest.digest()
@@ -89,11 +103,13 @@ class HostAdapter:
         self.state_provisioner = state_provisioner
         self.secret_resolver = secret_resolver
         self.driver_identity_verifier = driver_identity_verifier
+        self.gate_socket_directory = gate_socket_directory
         self._owner_pid = os.getpid()
         self._lifecycle = threading.Condition()
         self._active_operations = 0
         self._active_threads = {}
         self._closing = False
+        self._finish_requested = False
         self._finalizing_close = False
         self._closed = False
         self.ledger = SQLiteLedger(
@@ -124,7 +140,7 @@ class HostAdapter:
                     self._active_threads[thread_id] = remaining
                 else:
                     del self._active_threads[thread_id]
-                if (self._closing and self._active_operations == 0
+                if (self._finish_requested and self._active_operations == 0
                         and not self._finalizing_close):
                     self._finalizing_close = True
                     finalize = True
@@ -141,6 +157,23 @@ class HostAdapter:
                 self._finalizing_close = False
                 self._lifecycle.notify_all()
 
+    def begin_drain(self):
+        """Reject new adapter calls and wait for accepted calls, retaining the ledger.
+
+        This is a local lifecycle boundary, not evidence that external effects or
+        writers are quiescent. The owner must subsequently call close().
+        """
+        if os.getpid() != self._owner_pid:
+            raise InheritedLedgerUse("adapter authority is bound to its creating process")
+        with self._lifecycle:
+            if self._active_threads.get(threading.get_ident(), 0):
+                raise RuntimeError("cannot drain from an active adapter call")
+            self._closing = True
+            while self._active_operations or self._finalizing_close:
+                self._lifecycle.wait()
+            if self._closed or self._finish_requested:
+                raise LedgerClosed("adapter is closed")
+
     def close(self):
         if os.getpid() != self._owner_pid:
             self._closed = True
@@ -151,6 +184,7 @@ class HostAdapter:
             if self._closed:
                 return
             self._closing = True
+            self._finish_requested = True
             # A callback may request shutdown reentrantly. Defer descriptor close
             # until its outer submit/reconcile lease has finished all ledger writes.
             if self._active_threads.get(thread_id, 0):
@@ -207,15 +241,28 @@ class HostAdapter:
         image = self._verified_image(role)
         self._check_runner(deadline)
         defaults = self._image_defaults(image, deadline)
+        if self.gate_socket_directory is not None:
+            from .application_gate_enrollment import STATIC_ENTRYPOINT
+            if defaults.entrypoint != STATIC_ENTRYPOINT or defaults.command != ():
+                raise _Held('image_unavailable')
         secrets = self._resolve_secrets()
 
         if request.action in {"deploy_container", "rollback_container"}:
             baseline = self._get_baseline()
             rollback_image = image if role == "rollback" else self._verified_image("rollback")
             rollback_defaults = defaults if role == "rollback" else self._image_defaults(rollback_image, deadline)
+            if self.gate_socket_directory is not None:
+                from .application_gate_enrollment import STATIC_ENTRYPOINT
+                if rollback_defaults.entrypoint != STATIC_ENTRYPOINT or rollback_defaults.command != ():
+                    raise _Held('image_unavailable')
             self._verify_baseline_container(baseline, rollback_image, rollback_defaults, secrets, deadline)
             method = (self.state_provisioner.prepare_candidate if role == "candidate"
                       else self.state_provisioner.prepare_rollback)
+            def state_receipt(state):
+                # A rejected provider result must never become a completed,
+                # authenticated operation receipt before validation.
+                self._validate_generation(state, baseline)
+                return self._state_receipt(state)
             state = self._effect(
                 request, "state_copy" if role == "candidate" else "rollback_state",
                 lambda operation_id, timeout: method(
@@ -223,13 +270,30 @@ class HostAdapter:
                     deadline_monotonic=deadline,
                 ),
                 self.manifest.timeouts.total_command_ms, deadline,
-                self._state_receipt,
+                state_receipt,
             )
-            self._validate_generation(state, baseline)
             profile = self._profile(image, defaults, state.generation_id, secrets)
             container_id = self._start_new_container(request, role, image, profile, state,
                                                      deadline)
+            if self.gate_socket_directory is not None:
+                # Separate durable intent: this readiness observation does not
+                # replace the subsequent independently admitted smoke phase.
+                probes = self.manifest.probes.candidate if role == 'candidate' else self.manifest.probes.rollback
+                observed = self._effect(
+                    request, 'gate_health',
+                    lambda operation_id, timeout: self.backend.run_gate_health(
+                        container_id, probes, operation_id, self._probe_timeouts(probes, deadline), timeout),
+                    self.manifest.timeouts.total_command_ms, deadline, self._gate_health_receipt)
+                if (type(observed) is not GateHealthObservation or type(observed.probe) is not ProbeObservation
+                        or observed.probe.container_id != container_id
+                        or observed.probe.image_config_id != image.image_config_id
+                        or observed.probe.profile_digest != self._probe_digest(probes)
+                        or observed.probe.health != 'healthy' or observed.probe.evidence_verified is not True):
+                    raise _Held('inspect_required')
             evidence = self._evidence(container_id, image.image_config_id, "unknown", True)
+            if self.gate_socket_directory is not None:
+                if not self.ledger.wait_for_gate_acceptance(request.command_id, min(deadline, time.monotonic() + 5.0)):
+                    raise _Held('inspect_required')
             self._timeout(deadline, self.manifest.timeouts.total_command_ms)
             return self.ledger.finish(request.command_id, state="succeeded", reason=None,
                                       evidence=evidence, generation_id=state.generation_id)
@@ -358,8 +422,9 @@ class HostAdapter:
         return result
 
     def _profile(self, image: VerifiedImage, defaults: ImageDefaults, generation_id: str,
-                 secrets: dict[str, str]) -> EffectiveProfile:
-        return derive_runtime_profile(self.manifest, defaults, generation_id, secrets)
+                 secrets: dict[str, str], *, gate=True) -> EffectiveProfile:
+        return derive_runtime_profile(self.manifest, defaults, generation_id, secrets,
+            gate_socket_directory=getattr(self, 'gate_socket_directory', None) if gate else None)
 
     def _get_baseline(self) -> BaselineIdentity:
         try:
@@ -386,9 +451,34 @@ class HostAdapter:
 
     def _verify_baseline_container(self, baseline: BaselineIdentity, image: VerifiedImage,
                                    defaults: ImageDefaults, secrets: dict[str, str], deadline: float):
-        profile = self._profile(image, defaults, baseline.state_generation_id, secrets)
-        self._inspect_container(baseline.container_id, image, profile,
-                                baseline.state_generation_id, {"running"}, deadline)
+        profile = derive_runtime_profile(self.manifest, defaults, baseline.state_generation_id, secrets,
+                                         gate_socket_directory=baseline.gate_socket_directory)
+        if self.gate_socket_directory is not None and baseline.gate_socket_directory is None:
+            raise _Held('recovery_required')
+        if baseline.gate_socket_directory is None:
+            self._inspect_container(baseline.container_id, image, profile,
+                                    baseline.state_generation_id, {"running"}, deadline)
+            return
+        backend = self.baseline_inspection_backend
+        if (backend is None or backend.source_directory != baseline.gate_socket_directory):
+            raise _Held('recovery_required')
+        try:
+            authority = backend.verify_authority(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+            observed_defaults = backend.inspect_image(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+            if observed_defaults != defaults:
+                raise ValueError()
+            actual = backend.inspect_container(baseline.container_id, self._timeout(deadline, self.manifest.timeouts.inspect_ms))
+            if backend.verify_authority(image, self._timeout(deadline, self.manifest.timeouts.inspect_ms)) != authority:
+                raise ValueError()
+        except Exception:
+            raise _Held('daemon_unavailable') from None
+        self._timeout(deadline, self.manifest.timeouts.inspect_ms)
+        expected = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
+                                        image.image_config_id, image.platform)
+        if (type(actual) is not ContainerObservation or actual.container_id != baseline.container_id
+                or actual.selected_image != expected or actual.profile != profile
+                or actual.state_generation_id != baseline.state_generation_id or actual.status != 'running'):
+            raise _Held('evidence_mismatch')
 
     def _validate_generation(self, state, baseline: BaselineIdentity):
         if (type(state) is not StateGeneration
@@ -402,10 +492,10 @@ class HostAdapter:
                 or state.baseline_unchanged is not True):
             raise _Held("evidence_mismatch")
 
-    def _effect(self, request, kind, callback, phase_limit, deadline, receipt_builder):
+    def _effect(self, request, kind, callback, phase_limit, deadline, receipt_builder, *, create_context=None):
         try:
             timeout = self._timeout(deadline, phase_limit)
-            operation_id = self.ledger.begin_operation(request.command_id, kind)
+            operation_id = self.ledger.begin_operation(request.command_id, kind, create_context=create_context)
         except PermissionError as error:
             if str(error) == "paused":
                 raise _Held("paused") from None
@@ -454,6 +544,17 @@ class HostAdapter:
                 "health": outcome.health,
                 "evidence_verified": outcome.evidence_verified}
 
+    @staticmethod
+    def _gate_health_receipt(outcome):
+        if (type(outcome) is not GateHealthObservation or type(outcome.probe) is not ProbeObservation
+                or type(outcome.daemon_pid) is not int or outcome.daemon_pid <= 0
+                or any(type(value) is not int for value in (outcome.started_at_ms, outcome.finished_at_ms, outcome.elapsed_ms))
+                or not 0 < outcome.started_at_ms <= outcome.finished_at_ms or not 0 <= outcome.elapsed_ms <= 120000):
+            raise _Held('evidence_mismatch')
+        return {**HostAdapter._probe_receipt(outcome.probe), 'daemon_pid': outcome.daemon_pid,
+                'started_at_ms': outcome.started_at_ms, 'finished_at_ms': outcome.finished_at_ms,
+                'elapsed_ms': outcome.elapsed_ms}
+
     def _start_new_container(self, request: ContainerPilotRequest, role: str,
                              image: VerifiedImage, profile: EffectiveProfile,
                              state: StateGeneration, deadline: float) -> str:
@@ -462,12 +563,24 @@ class HostAdapter:
                              immutable_reference=image.runnable_reference, pull=False,
                              profile=profile)
         timeout_field = self.manifest.timeouts.create_ms
+        create_operation = []
+        def create(operation_id, timeout):
+            create_operation.append(operation_id)
+            return self.backend.create_container(plan, operation_id, timeout)
         container_id = self._effect(
             request, "create_" + role,
-            lambda operation_id, timeout: self.backend.create_container(plan, operation_id, timeout),
+            create,
             timeout_field, deadline,
             lambda value: {"container_id": value} if isinstance(value, str) else
             (_raise_held("evidence_mismatch")),
+            create_context={"schema": 2, "manifest_digest": self.manifest_digest,
+                            "run_id": request.run_id, "fencing_generation": request.fencing_generation,
+                            "role": role, "runnable_reference": image.runnable_reference,
+                            "platform_manifest_digest": image.platform_manifest_digest,
+                            "image_config_id": image.image_config_id,
+                            "record_digest": image.record_digest,
+                            "generation_id": state.generation_id,
+                            "profile_commitment": self.ledger.profile_commitment(profile)},
         )
         if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
             raise _Held("container_conflict")
@@ -475,6 +588,10 @@ class HostAdapter:
                                 {"created"}, deadline)
         self.ledger.record_target_instance(request.command_id, container_id,
                                            image.image_config_id, state.generation_id)
+        if self.gate_socket_directory is not None:
+            if len(create_operation) != 1:
+                raise _Held('inspect_required')
+            self.ledger.require_gate_outcome(request.command_id, create_operation[0])
         self._effect(
             request, "start_" + role,
             lambda operation_id, timeout: self.backend.start_container(container_id, operation_id, timeout),
@@ -538,6 +655,29 @@ class HostAdapter:
         if not snapshot:
             return response
         for operation in snapshot["operations"]:
+            if operation["status"] == "invalid":
+                return response
+            if operation["kind"] in {"create_candidate", "create_rollback"}:
+                try:
+                    context = self.ledger.create_context(operation["operation_id"])
+                    role = operation["kind"].removeprefix("create_")
+                    image = self._verified_image(role)
+                    if (type(context) is not dict or context.get("schema") != 2
+                            or context.get("manifest_digest") != self.manifest_digest
+                            or context.get("role") != role
+                            or context.get("runnable_reference") != image.runnable_reference
+                            or context.get("platform_manifest_digest") != image.platform_manifest_digest
+                            or context.get("image_config_id") != image.image_config_id
+                            or context.get("record_digest") != image.record_digest
+                            or context.get("run_id") != operation["intent"].get("run_id")
+                            or context.get("fencing_generation") != operation["intent"].get("fencing_generation")):
+                        return response
+                    defaults = self._defaults_from_record(image)
+                    profile = self._profile(image, defaults, context["generation_id"], self._resolve_secrets())
+                    if not self.ledger.matches_profile_commitment(profile, context.get("profile_commitment")):
+                        return response
+                except Exception:
+                    return response
             if operation["status"] == "terminal_failed":
                 try:
                     observed = self.backend.inspect_operation(
@@ -555,6 +695,30 @@ class HostAdapter:
                 return response
             if operation["status"] == "completed":
                 receipt = operation.get("receipt") or {}
+                if operation["kind"] in {"create_candidate", "create_rollback"}:
+                    if (operation.get("receipt_authentic") is not True
+                            or type(receipt) is not dict or set(receipt) != {"container_id"}
+                            or type(receipt["container_id"]) is not str
+                            or not _CONTAINER_ID.fullmatch(receipt["container_id"])):
+                        return response
+                    try:
+                        plan = ContainerPlan(
+                            resource_name=f"{self.manifest.runtime.resource_name_prefix}-{context['run_id'][:12]}-{role}",
+                            image=image, immutable_reference=image.runnable_reference,
+                            pull=False, profile=profile)
+                        actual = self.backend.restore_container_context(
+                            plan, operation["operation_id"], receipt["container_id"],
+                            self.manifest.timeouts.inspect_ms)
+                        expected = ActualImageSelection(image.runnable_reference,
+                            image.platform_manifest_digest, image.image_config_id, image.platform)
+                        if (type(actual) is not ContainerObservation
+                                or actual.container_id != receipt["container_id"]
+                                or actual.selected_image != expected or actual.profile != profile
+                                or actual.state_generation_id != context["generation_id"]):
+                            return response
+                    except Exception:
+                        return response
+                    continue
                 container_id = receipt.get("container_id") if isinstance(receipt, dict) else None
                 if isinstance(container_id, str) and _CONTAINER_ID.fullmatch(container_id):
                     try:

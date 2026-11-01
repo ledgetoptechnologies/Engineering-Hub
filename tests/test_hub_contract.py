@@ -27,6 +27,10 @@ def test_contract_survives_typing_cache_eviction_and_equivalent_literal_order(tm
     script = '''
 import json, sys, typing
 from pathlib import Path
+source = Path(sys.argv[3]).resolve(strict=True)
+sys.path.insert(0, str(source))
+import engineering_hub.app
+assert Path(engineering_hub.app.__file__).resolve(strict=True).is_relative_to(source)
 from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from agent_message_bus.auth import AuthSettings
@@ -38,7 +42,8 @@ app = create_app(Settings(Path(sys.argv[1]),
     AuthConfig('https://hub.invalid')))
 assert app.openapi() == json.loads(Path(sys.argv[2]).read_text())
 '''
-    result = subprocess.run([sys.executable, '-c', script, str(tmp_path / 'cold.db'),
-        str(Path(__file__).parents[1] / 'contracts/hub-v1.openapi.json')],
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', script, str(tmp_path / 'cold.db'),
+        str(Path(__file__).parents[1] / 'contracts/hub-v1.openapi.json'),
+        str(Path(__file__).parents[1] / 'src')],
         capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr

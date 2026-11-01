@@ -38,10 +38,12 @@ def _port(value):
     return value
 
 
-async def run(socket_path, port=8771, *, preview_origin=None):
+async def run(socket_path, port=8771, *, preview_origin=None, allow_github=False):
     """Serve only the public browser proxy, with no implicit settings factory."""
     path = _socket_path(socket_path)
     _port(port)
+    if type(allow_github) is not bool:
+        raise ValueError('Explicit GitHub gateway opt-in required')
     from .private_gateway import _preview_host
     _preview_host(preview_origin)
     from .private_browser_socket import create_private_browser_client
@@ -51,6 +53,8 @@ async def run(socket_path, port=8771, *, preview_origin=None):
         return create_private_browser_client(path)
 
     options = {} if preview_origin is None else {'preview_origin': preview_origin}
+    if allow_github:
+        options['allow_github'] = True
     await serve_public_browser(client_factory, browser_port=port, **options)
 
 
@@ -66,6 +70,8 @@ def main(argv=None):
     parser.add_argument('--port', default=8771, type=int)
     parser.add_argument('--preview-origin', default=None,
                         help='Explicit separate HTTPS capability-preview origin (disabled by default)')
+    parser.add_argument('--allow-github', action='store_true',
+                        help='Allow the exact GitHub OAuth callback route (disabled by default)')
     args = parser.parse_args(argv)
     try:
         path, port = _socket_path(args.socket), _port(args.port)
@@ -75,6 +81,8 @@ def main(argv=None):
         parser.error('invalid explicit socket or port')
     try:
         options = {} if args.preview_origin is None else {'preview_origin': args.preview_origin}
+        if args.allow_github:
+            options['allow_github'] = True
         asyncio.run(run(path, port, **options))
     except Exception:
         print('Engineering Hub public browser unavailable.', file=sys.stderr)

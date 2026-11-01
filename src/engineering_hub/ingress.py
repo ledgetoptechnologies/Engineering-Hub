@@ -52,7 +52,11 @@ def validate_agent_hosts(hosts):
 
 class HubIngressMiddleware:
     def __init__(self, app, *, mode, agent_auth, cloudflare_config=None, legacy_bus_enabled=False,
-                 access_verifier=None, agent_sessions=None, agent_sessions_config=None):
+                 access_verifier=None, agent_sessions=None, agent_sessions_config=None,
+                 browser_auth_mode='cloudflare_access', browser_auth_config=None, browser_sessions=None):
+        if browser_auth_mode not in {'cloudflare_access', 'github'} or (browser_auth_mode == 'github'
+                and (cloudflare_config is not None or access_verifier is not None)):
+            raise ValueError('explicit_browser_auth_mode_required')
         if access_verifier is not None:
             if (mode != 'browser' or type(access_verifier) is not CloudflareAccessVerifier
                     or cloudflare_config is None or access_verifier.config != cloudflare_config):
@@ -71,8 +75,16 @@ class HubIngressMiddleware:
         if mode not in {"agents", "browser"}:
             raise ValueError("Separated Hub ingress mode required")
         self.checker = (access_verifier if access_verifier is not None else
-                        CloudflareAccessVerifier(cloudflare_config)) if mode == "browser" else None
+                        CloudflareAccessVerifier(cloudflare_config)) if mode == "browser" and browser_auth_mode == 'cloudflare_access' else None
         self.cloudflare_config = cloudflare_config
+        self.browser_auth_mode = browser_auth_mode
+        if browser_auth_mode == 'github':
+            from .auth import AuthConfig, SessionStore
+            if (mode != 'browser' or type(browser_auth_config) is not AuthConfig
+                    or browser_auth_config.human_auth_mode != 'github'
+                    or type(browser_sessions) is not SessionStore):
+                raise ValueError('explicit_browser_session_binding_required')
+        self.browser_auth_config, self.browser_sessions = browser_auth_config, browser_sessions
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "websocket":
@@ -143,6 +155,29 @@ class HubIngressMiddleware:
         else:
             if _within(path, "/mcp") or is_bus_api(path) or _within(path, '/api/admin'):
                 await deny()
+                return
+            if self.browser_auth_mode == 'github':
+                # Protect new routes by default. Only the fixed public login
+                # shell/assets and OAuth handshake bypass the human session.
+                public_auth = {('/api/hub/v1/auth/login', 'GET'),
+                               ('/api/hub/v1/auth/callback', 'GET'),
+                               ('/api/hub/v1/auth/me', 'GET')}
+                method = scope.get('method')
+                # This namespace is reserved for public packaged UI assets;
+                # never register private dynamic handlers under these names.
+                asset = re.fullmatch(r'/assets/[A-Za-z0-9_.-]{1,200}\.(?:js|css|svg|woff2|png|webp)', path)
+                public_shell = (method in {'GET', 'HEAD'} and
+                                (path in {'/', '/index.html', '/favicon.ico', '/hub.svg'}
+                                 or asset is not None))
+                if not public_shell and (path, method) not in public_auth:
+                    from .auth import require_human
+                    try:
+                        require_human(Request(scope), self.browser_auth_config, self.browser_sessions,
+                                      mutation=scope.get('method') not in {'GET', 'HEAD'})
+                    except HTTPException as error:
+                        await deny('browser_credentials_required', error.status_code)
+                        return
+                await self.app(scope, receive, send)
                 return
             assertions = [value for name, value in scope.get("headers", [])
                           if name.lower() == b"cf-access-jwt-assertion"]

@@ -135,10 +135,122 @@ def dependencies(monkeypatch):
 
 
 def construct(tmp_path, data=None):
-    profile = parse_profile(encode(profile_document()))
+    selected = document() if data is None else data
+    profile_data = profile_document()
+    if selected.get('schema') in (module.SCHEMA_V2, module.SCHEMA_V3):
+        profile_data.update(schema='engineering-hub.unified-pilot.v2', profile_mode='disjoint-v3')
+    profile = parse_profile(encode(profile_data))
     return module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
-        enrollment=module.parse_enrollment(encode(document() if data is None else data)),
+        enrollment=module.parse_enrollment(encode(selected)),
         ca_pem=b'captured-ca', credential=b'captured-executor-credential')
+
+
+def v2_document():
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import profile as launch_profile, policy
+    data = document()
+    raw = canonical(launch_profile(daemon_policy=policy(engine_id=data['launch']['engine_id'])))
+    data.update(schema=module.SCHEMA_V2, profile_mode='disjoint-v3', profile_json=raw.decode())
+    data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    return data
+
+
+def test_v2_enrollment_roundtrip_and_composition(tmp_path, dependencies):
+    data = v2_document()
+    enrollment = module.parse_enrollment(encode(data))
+    assert module.parse_enrollment(module.enrollment_bytes(enrollment)) == enrollment
+    composition = construct(tmp_path, data)
+    composition.close()
+    assert dependencies.events == ['transport', 'observer', 'observer-close']
+
+
+@pytest.mark.parametrize('case', ['missing', 'null', 'mode', 'mutation', 'wrong-pin', 'wrong-engine', 'legacy'])
+def test_v2_refuses_invalid_profile_before_transport(tmp_path, dependencies, case):
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import profile as launch_profile
+    data = v2_document()
+    if case == 'missing': del data['profile_json']
+    elif case == 'null': data['profile_json'] = None
+    elif case == 'mode': data['profile_mode'] = 'legacy'
+    elif case == 'mutation': data['profile_json'] += ' '
+    elif case == 'wrong-pin': data['release']['launch_profile_digest'] = 'sha256:' + '0' * 64
+    elif case == 'wrong-engine':
+        data['launch']['engine_id'] = 'different-engine'
+        data['report']['executor']['engine_id'] = 'different-engine'
+    elif case == 'legacy':
+        raw = canonical(launch_profile())
+        data['profile_json'] = raw.decode()
+        data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    with pytest.raises(module.TrustedSessionError):
+        construct(tmp_path, data)
+    assert dependencies.events == []
+
+
+def test_v1_remains_legacy_and_rejects_v2_fields():
+    data = document()
+    parsed = module.parse_enrollment(encode(data))
+    assert parsed.schema == module.SCHEMA and parsed.profile_bytes is None
+    assert module.parse_enrollment(module.enrollment_bytes(parsed)) == parsed
+    data['profile_mode'] = 'disjoint-v3'
+    with pytest.raises(module.TrustedSessionError):
+        module.parse_enrollment(encode(data))
+
+
+@pytest.mark.parametrize('enrollment_version', ['v1', 'v2'])
+def test_independent_pilot_mode_mismatch_denied_before_transport(tmp_path, dependencies, enrollment_version):
+    data = v2_document()
+    pilot = profile_document()
+    if enrollment_version == 'v1':
+        # The opaque digest is still the valid v3 digest; omission is denied.
+        data['schema'] = module.SCHEMA
+        del data['profile_mode'], data['profile_json']
+        pilot.update(schema='engineering-hub.unified-pilot.v2', profile_mode='disjoint-v3')
+    profile = parse_profile(encode(pilot))
+    with pytest.raises(module.TrustedSessionError):
+        module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
+            enrollment=module.parse_enrollment(encode(data)), ca_pem=b'ca', credential=b'credential')
+    assert dependencies.events == []
+
+
+@pytest.mark.parametrize('mode', [None, 'legacy', 'other'])
+def test_v2_pilot_profile_requires_disjoint_mode(mode):
+    from engineering_hub.unified_pilot_startup import UnifiedPilotStartupError
+    data = profile_document()
+    data.update(schema='engineering-hub.unified-pilot.v2', profile_mode=mode)
+    with pytest.raises(UnifiedPilotStartupError):
+        parse_profile(encode(data))
+
+
+def test_v1_pilot_profile_rejects_v2_mode_field():
+    from engineering_hub.unified_pilot_startup import UnifiedPilotStartupError
+    data = profile_document()
+    data['profile_mode'] = 'disjoint-v3'
+    with pytest.raises(UnifiedPilotStartupError):
+        parse_profile(encode(data))
+
+
+def test_composition_rejects_forged_profile_mode_before_transport(tmp_path, dependencies):
+    parsed = parse_profile(encode(profile_document()))
+    forged = replace(parsed, profile_mode='forged')
+    with pytest.raises(module.TrustedSessionError):
+        module.TrustedQueuedSessionComposition(profile=forged, database=tmp_path / 'hub.sqlite3',
+            enrollment=module.parse_enrollment(encode(document())), ca_pem=b'ca', credential=b'credential')
+    assert dependencies.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['disjoint-v3', 'forged-mode'])
+async def test_alternate_factories_cannot_bypass_v3_before_owner_or_credentials(monkeypatch, mode):
+    from engineering_hub import unified_pilot_startup as startup
+    from engineering_hub.app import Settings
+    parsed = parse_profile(encode(profile_document()))
+    forged = replace(parsed, profile_mode=mode)
+    monkeypatch.setattr(startup, 'validate_configuration', lambda *_: (object(), forged))
+    monkeypatch.setattr(Settings, 'from_env', lambda *_: pytest.fail('settings accessed'))
+    monkeypatch.setattr(startup, 'PilotOwner', lambda *_a, **_k: pytest.fail('owner accessed'))
+    monkeypatch.setattr(startup, 'read_protected_file', lambda *_a, **_k: pytest.fail('credential accessed'))
+    with pytest.raises(startup.UnifiedPilotStartupError):
+        await startup.serve_configuration('/config', '/pilot', reconciliation_factory=lambda *_: None)
 
 
 @pytest.mark.parametrize('change', ['stale', 'future', 'expired', 'manifest', 'driver', 'engine'])
@@ -166,6 +278,23 @@ def test_typed_enrollment_cannot_bypass_false_claims(tmp_path, dependencies):
         module.TrustedQueuedSessionComposition(profile=profile, database=tmp_path / 'hub.sqlite3',
             enrollment=replace(parsed, writers_excluded=False), ca_pem=b'ca', credential=b'token')
     assert dependencies.events == []
+
+
+@pytest.mark.parametrize('failure', ['wall_regression', 'monotonic_regression', 'wall_expiry', 'monotonic_expiry'])
+def test_session_freshness_failure_cannot_revive_after_clock_recovery(tmp_path, dependencies, monkeypatch, failure):
+    session = construct(tmp_path)
+    try:
+        initial_mono, initial_wall = session._last_mono, session._last_wall
+        mono = (initial_mono - 1 if failure == 'monotonic_regression' else
+                session._deadline if failure == 'monotonic_expiry' else initial_mono)
+        wall = (initial_wall - 1 if failure == 'wall_regression' else
+                session._enrollment.expires_at_ms if failure == 'wall_expiry' else initial_wall)
+        monkeypatch.setattr(module, '_clock', lambda: (mono, wall))
+        with pytest.raises(module.TrustedSessionError): session._fresh()
+        monkeypatch.setattr(module, '_clock', lambda: (initial_mono, initial_wall))
+        with pytest.raises(module.TrustedSessionError): session._fresh()
+    finally:
+        session.close()
 
 
 @contextmanager
@@ -389,3 +518,86 @@ def test_verified_absolute_wall_ceiling_clipped_to_original_report(tmp_path, dep
         assert proof.expires_monotonic <= composition._deadline
     finally:
         composition.close()
+
+
+def test_disjoint_enrollment_refuses_valid_broker_profile_before_transport(tmp_path, dependencies):
+    from engineering_hub.executor_launch_profile import canonical
+    from tests.test_executor_launch_profile import broker_profile
+    data = v2_document()
+    launch_profile = broker_profile()
+    launch_profile['daemon_policy']['engine_id'] = data['launch']['engine_id']
+    raw = canonical(launch_profile)
+    data['profile_json'] = raw.decode('utf-8')
+    data['release']['launch_profile_digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+    with pytest.raises(module.TrustedSessionError):
+        construct(tmp_path, data)
+    assert dependencies.events == []
+
+
+def test_v3_github_actor_roundtrip_is_versioned():
+    data = v2_document(); data.update(schema=module.SCHEMA_V3, operator_actor='human:123')
+    enrollment = module.parse_enrollment(encode(data))
+    assert module.parse_enrollment(module.enrollment_bytes(enrollment)) == enrollment
+    for actor in ('human:0', 'human:0123', 'human:cf:' + 'c' * 64, 'claude'):
+        data['operator_actor'] = actor
+        with pytest.raises(module.TrustedSessionError): module.parse_enrollment(encode(data))
+    data.update(schema=module.SCHEMA_V2, operator_actor='human:123')
+    with pytest.raises(module.TrustedSessionError): module.parse_enrollment(encode(data))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('auth_mode,configured_id,allowed', [
+    ('github', 123, True), ('github', 124, False), ('github', None, False),
+    ('cloudflare_access', None, False),
+])
+async def test_v3_acceptance_is_bound_to_actual_github_allowlist(tmp_path, dependencies, auth_mode, configured_id, allowed):
+    from urllib.parse import parse_qs, urlsplit
+    import httpx
+    data = v2_document(); data.update(schema=module.SCHEMA_V3, operator_actor='human:123')
+    tmp_path.chmod(0o700)
+    composition = construct(tmp_path, data)
+    class GitHub:
+        async def exchange(self, code, verifier):
+            assert code == 'synthetic-code' and verifier
+            return 123
+    with PilotOwner(tmp_path / 'hub.sqlite3', allow_ephemeral_test_storage=True) as owner:
+        try:
+            repo = HubRepository(tmp_path / 'hub.sqlite3', execution_principal='executor:container-pilot', pilot_owner=owner)
+            target = ContainerPilotTarget.from_manifest(parse_profile(encode(profile_document())).manifest)
+            gate = composition.reconciliation_factory(owner, target)
+            workflow = ContainerPilotWorkflow(repo, DistinctContainerClient(), [target], pilot_owner=owner)
+            queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project='engineering-hub')})
+            bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE, reconciliation=gate)
+            feed = NativeHubEventFeed(repo.path); runtime = QueuedPilotRuntime(bridge, feed)
+            if auth_mode == 'github':
+                auth = AuthConfig('https://hub.example', 'client', 'secret', configured_id)
+            else:
+                auth = AuthConfig('https://hub.example', human_auth_mode='cloudflare_access',
+                    cloudflare_issuer='https://fixture.cloudflareaccess.com', cloudflare_audience='fixture',
+                    cloudflare_allowed_emails=('beau@example.test',))
+            core = create_app(Settings(repo.path, AuthSettings('h', 'c', claude_token='cl'), auth,
+                staging_machine_id=MACHINE), repository=repo, event_feed=feed, work_queue=queue,
+                queued_pilot_runtime=runtime, github_client=GitHub())
+            if not allowed:
+                with pytest.raises(module.TrustedSessionError):
+                    composition.session_acceptance_factory(core, owner, repo, target, gate)
+                return
+            composition.session_acceptance_factory(core, owner, repo, target, gate)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core), base_url=auth.origin,
+                                         follow_redirects=False) as browser:
+                login = await browser.get('/api/hub/v1/auth/login')
+                assert login.status_code == 302
+                state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+                callback = await browser.get('/api/hub/v1/auth/callback', params={'state': state, 'code': 'synthetic-code'})
+                assert callback.status_code == 303
+                me = (await browser.get('/api/hub/v1/auth/me')).json()
+                assert me['authenticated'] is True and me['actor'] == 'human:123'
+                snapshot = await browser.get('/api/hub/v1/staging/session-reconciliation')
+                assert snapshot.status_code == 200
+                headers = {'Origin': auth.origin, 'X-Hub-CSRF': me['csrf_token']}
+                decision = {'request_id': snapshot.json()['request_id'], 'expected_revision': snapshot.json()['revision'],
+                            'action': 'accept'}
+                response = await browser.post('/api/hub/v1/staging/session-reconciliation', headers=headers, json=decision)
+                assert response.status_code == 200 and gate.admission_state == 'accepted'
+        finally:
+            composition.close()

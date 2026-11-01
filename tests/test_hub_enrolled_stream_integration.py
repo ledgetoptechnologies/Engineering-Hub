@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Real Linux owne
 @pytest.mark.asyncio
 async def test_current_enrollment_then_owned_native_stream_shutdown_retains_owner_and_source(ledger, tmp_path, monkeypatch):
     source, repo, *_ = ledger
-    auth, _ = signed_access(monkeypatch)
+    auth, _, _diagnostics = signed_access(monkeypatch)
     agent_auth = AuthSettings('synthetic-hermes', 'synthetic-codex', claude_token='synthetic-claude',
                                allowed_ips=frozenset({'127.0.0.1'}))
     original_app = create_app(Settings(source, agent_auth, auth), repository=repo)

@@ -17,12 +17,81 @@ or prove live NAS dispatch or reboot recovery.
 | `launcher_cli` | Explicit installed host-root command composing that existing API, one receipt exchange and a bounded wait for an explicit stop signal. No provisioning, implicit launch, force/retry, service registration or reboot recovery. |
 | `launch_transport.UnixLaunchReceiptTransport` | Consumer-owned synchronous transport taking explicit `socket_path`, `expected_issuer_uid` and `expected_issuer_gid`. `issue_receipt(nonce=..., timeout_ms=...)` makes one direct connection with no discovery, relay, TCP or retry. |
 | `installed_runner` | Fixed direct-init entry point `/opt/venv/bin/python -I -m hub_container_executor.installed_runner --config /operator/runner.json`. `load_configuration()` loads the protected read-only configuration; `run_installed_executor()` obtains verified launch identity before assembling providers and serving the private executor API. |
-| `installed_coordinator` | Separate opt-in colocated TEST pilot. `validate --config <path>` reads protected configuration and validates its data only; `serve --config <path>` resolves TEST credentials and selects the existing owned queued-pilot lifecycle through a fresh private Unix client. It does not replace the deployed unified MCP. |
+| `installed_coordinator` | `validate --config <path>` reads protected configuration and validates its data only. The standalone `serve` operation currently fails closed because it cannot supply the required reconciliation factory. The separately composed [trusted local coordinator](trusted-local-coordinator.md) supplies that dependency for an explicitly approved disposable TEST VM; neither entrypoint replaces the deployed unified MCP. |
 
 The supervisor consumes independent root-protected release/image/profile/daemon
 enrollment and an existing raw Ed25519 private key. It does not generate approval
-or keys. Its enrollment schema is `executor_launch_supervisor_v2`; v1 is rejected
-without fallback or implicit migration. The runner's
+or keys. The legacy `executor_launch_supervisor_v2` enrollment remains restricted
+to host daemon UID 10001. The separately reviewed `executor_launch_supervisor_v3`
+uses the same closed enrollment fields and configuration commitment, but pins a
+non-root daemon UID other than 10001 in the independently root-protected daemon
+record. It does not consume the offline selection record, establish disjoint
+storage or resources, or approve a host. Existing peer and process verification
+remain mandatory. V1 is rejected without fallback or implicit migration; v3
+requires a newly reviewed artifact and fresh independent enrollment.
+
+A v3 launch profile must carry `daemon_policy` (`kind: disjoint-v1`): the daemon's
+Engine ID, UID and GID, and its exact `uid_map` and `gid_map` rows. Because the
+policy is inside the profile, it is inside `launch_profile_digest`, which every
+receipt and current observation already signs and every verifier already pins.
+A v2 profile must not carry it, and its digest bytes are unchanged. The policy
+must map namespace root to the daemon account, map executor UID 10001 exactly
+once, and never reach host ID 0 or 10001.
+
+v3 also requires a separate root-protected `held_ranges_file`
+(`engineering-hub.held-id-ranges.v1`): the host UID and GID ranges retained for the
+held TEST account, with a digest of the evidence they came from. It must cover the
+held account itself, the policy's ranges must not overlap it, and its file identity
+is rechecked like the enrollment. It is never read from `/etc/subuid` or the host at
+runtime; without it, v3 refuses to start. It is an operator attestation: root
+ownership protects it once placed, but nothing here proves the ranges are complete
+or traces them to their source (the evidence digest is only checked for form). The
+overlap check is only as good as that attestation, so a reviewer must confirm the
+ranges against the retained hold record. The installed launcher takes it as
+`--held-ranges-file`; legacy invocations are unchanged.
+
+The profile model, the v3 policy and the digest live in the pure core module
+`engineering_hub.executor_launch_profile`; the supervisor imports and re-exports
+them, so there is one parser. Hub-side verifiers can use
+`verify_profile_bytes(raw, expected_digest)` to accept only exact canonical
+profile bytes whose digest equals one they already pin independently. That shows
+the bytes are that profile, not that the profile was approved, and it is not
+admission: the caller must still require the version it expects and bind the
+policy's Engine and daemon identity to its own independent pins. Path checks use
+POSIX rules on every host, every failure is one sanitized error, and the target
+table is read-only. The executor
+image's build-time import check includes this module, so an older core image
+without it fails the build rather than at launch.
+
+The explicitly selected manual-session enrollment supports a closed v2 form:
+`profile_mode` must be `disjoint-v3`, and `profile_json` contains the exact
+canonical profile as a UTF-8 JSON string. It must match the independently
+enrolled release digest and the launch and manifest Engine identities before
+transport construction. An independently protected unified-pilot v2 profile
+must explicitly select `profile_mode: disjoint-v3`; it requires manual-session
+v2. Legacy unified-pilot v1 requires manual-session v1, retaining its original
+behavior. The Hub verifies the pinned profile digest and Engine identities;
+the supervisor separately checks live daemon maps.
+This recognition is not proof of the held attestation or live isolation. The
+existing model trusts the protected file's owner; that owner can replace v2
+with v1, so this is not anti-rollback or an independent version authority.
+
+The policy's `held_ranges_digest` is the SHA-256 of the exact attestation bytes,
+and the supervisor refuses any other file. So the signed profile, and any verifier
+that pins it, records exactly which attestation the overlap check used. The digest
+identifies those bytes; it doesn't make them complete or show where they came from.
+
+Before binding the issuer socket or making any Engine request, `launch()` reads the
+pinned daemon process's `/proc/<pid>/uid_map` and `gid_map` and requires exact row
+equality with the policy; `_validate_live` repeats this and also requires the
+consumer's maps to match, since rootless containers are expected to share the
+daemon's user namespace. If they don't on the real host, launch fails closed;
+confirm the namespace layout during host acceptance.
+
+This does not establish issuer separation. A v3 launch can still be signed with a
+key that a verifier also trusts for v2 until the verifier enforces a distinct key
+against independently trusted legacy key evidence. Nor does it prove storage,
+cgroup or resource isolation, or approve any host change. The runner's
 separate closed configuration schema is `engineering-hub.installed-executor.v1`.
 Canonical JSON and matching hashes validate shape and consistency, not approval.
 The configuration's exact bytes are pinned by the required top-level root

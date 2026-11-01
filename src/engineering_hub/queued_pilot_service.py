@@ -9,6 +9,9 @@ recovered or replayed here. Existing listeners and default factories are intact.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import hashlib
+import hmac
 import inspect
 from pathlib import Path
 
@@ -52,7 +55,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None, access_verifier=None):
+                                 session_acceptance_factory=None, access_verifier=None,
+                                 inherited_broker=False, allow_github=False, admission_verifier=None, github_client=None, oauth_binding=None):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -60,6 +64,9 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     an invalid return or a factory that raises owns its own unaccepted resources.
     Freshness/exclusivity is the trusted factory's precondition, not something
     the exact-type check proves; never return a borrowed, reused or closed client.
+    The factory must not issue commands itself. In inherited mode the local hold
+    is reserved before invoking it. This hold does not fence older binaries or
+    restored databases; deployment requires an independent version/storage fence.
     This factory exposes no injected owner or ephemeral-storage override.
 
     The supervisor grace is an operator assertion, not a configured or verified
@@ -67,22 +74,63 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     closing the accepted client and finally its newly constructed PilotOwner.
     """
     try:
+        if github_client is not None or oauth_binding is not None:
+            from .github_oauth_broker import validate_broker_binding
+            if not allow_github or admission_verifier is None: raise ValueError()
+            validate_broker_binding(github_client,oauth_binding,client_id=settings.auth_config.github_client_id,
+                origin=settings.auth_config.origin,secret_digest='sha256:'+hashlib.sha256(settings.auth_config.github_client_secret.encode('ascii')).hexdigest())
         if (type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
-                or settings.auth_config.cloudflare_config is None
+                or type(allow_github) is not bool
+                or (not allow_github and (settings.auth_config.human_auth_mode != 'cloudflare_access'
+                    or settings.auth_config.cloudflare_config is None))
+                or (allow_github and (settings.auth_config.human_auth_mode != 'github'
+                    or not settings.auth_config.secure or not settings.auth_config.github_client_id
+                    or not settings.auth_config.github_client_secret
+                    or settings.auth_config.beau_github_id is None or access_verifier is not None))
                 or type(machine_id) is not str or machine_id != settings.staging_machine_id
                 or not _synchronous(client_factory) or not _synchronous(target_verifier)
                 or not _synchronous(reconciliation_factory)
+                or type(inherited_broker) is not bool
                 or session_acceptance_factory is not None and not _synchronous(session_acceptance_factory)
                 or stop_event is not None and type(stop_event) is not asyncio.Event
                 or type(supervisor_stop_grace_seconds) is not int
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
             raise ValueError()
         _key(action_key)
+        if admission_verifier is not None:
+            from hub_container_executor.runtime_identity import CoordinatorLaunchReceiptIdentityVerifier
+            if type(admission_verifier) is not CoordinatorLaunchReceiptIdentityVerifier: raise ValueError()
+            admission_verifier.implementation_commit()
         target = ContainerPilotTarget.from_manifest(manifest)
         if target.target_id != 'engineering-hub:staging':
             raise ValueError()
+        if allow_github:
+            from hub_container_executor.trusted_local_session import TrustedLocalQueuedSession
+            from .trusted_queued_session import SCHEMA_V3
+            session = getattr(reconciliation_factory, '__self__', None)
+            if type(session) is TrustedLocalQueuedSession:
+                github_digests = [digest for slot, version, digest in session._config.bindings
+                                  if (slot, version) == session._config.roles.get('github')]
+            else:
+                github_digests = []
+            if (type(session) is not TrustedLocalQueuedSession
+                    or getattr(reconciliation_factory, '__func__', None) is not TrustedLocalQueuedSession.reconciliation_factory
+                    or getattr(session_acceptance_factory, '__self__', None) is not session
+                    or getattr(session_acceptance_factory, '__func__', None) is not TrustedLocalQueuedSession.session_acceptance_factory
+                    or getattr(client_factory, '__self__', None) is not session
+                    or getattr(client_factory, '__func__', None) is not TrustedLocalQueuedSession.executor_client_factory
+                    or Path(settings.database) != session._database
+                    or session._config.auth != replace(settings.auth_config, github_client_secret='')
+                    or len(github_digests) != 1
+                    or not hmac.compare_digest('sha256:' + hashlib.sha256(
+                        settings.auth_config.github_client_secret.encode('ascii')).hexdigest(), github_digests[0])
+                    or session._enrollment.schema != SCHEMA_V3
+                    or session._enrollment.machine_id != machine_id
+                    or session._enrollment.manifest_digest != manifest.digest()
+                    or session._enrollment.operator_actor != f'human:{settings.auth_config.beau_github_id}'):
+                raise ValueError()
+            session._fresh()
         action = WorkAction(machine_id, frozenset({'staging'}),
                             project='engineering-hub', requires_execution_proof=True)
     except Exception:
@@ -95,10 +143,12 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             raise ValueError('explicit_access_verifier_binding_required')
 
     owner = client = reconciliation = acceptance_broker = None
+    local_runtime = None
     shared = staging_draft = None
     lifecycle_task = asyncio.current_task()
     rejected_reconciliation_tasks = []
     constructed = False
+    remote_cleanup_reserved = False
     stop = stop_event if stop_event is not None else asyncio.Event()
 
     def additional_veto(*args):
@@ -113,17 +163,23 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         return result is True
 
     def pair_factory():
-        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft
+        nonlocal owner, client, reconciliation, acceptance_broker, constructed, shared, staging_draft, remote_cleanup_reserved, local_runtime
         if constructed:
             raise QueuedPilotServiceError()
+        if admission_verifier is not None: admission_verifier.implementation_commit()
         constructed = True
         owner = PilotOwner(settings.database)
         reconciliation = _reconciliation(reconciliation_factory, owner, target,
                                          rejected_reconciliation_tasks, lifecycle_task)
+        if inherited_broker:
+            owner.reserve_remote_cleanup()
+            remote_cleanup_reserved = True
         accepted = client_factory()
         if type(accepted) is not ContainerPilotClient:
             raise QueuedPilotServiceError()
         client = accepted
+        if client.uses_inherited_broker is not inherited_broker:
+            raise QueuedPilotServiceError()
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
         workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
@@ -147,14 +203,16 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             staging_draft.policies.install()
         feed = NativeHubEventFeed(settings.database)
         runtime = QueuedPilotRuntime(bridge, feed)
+        local_runtime = runtime
         if staging_draft is not None:
             shared = SharedStagingLifecycle(owner, repo, queue, staging_draft.policies, runtime, staging_draft.module)
         core = create_app(settings, repository=repo, event_feed=feed,
-                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier)
+                          work_queue=queue, queued_pilot_runtime=runtime, shared_staging=shared, access_verifier=access_verifier,
+                          **({} if github_client is None else {'github_client':github_client}))
         if session_acceptance_factory is not None:
             acceptance_broker = _session_acceptance(session_acceptance_factory, core,
                 owner, repo, target, reconciliation, rejected_reconciliation_tasks, lifecycle_task)
-        return HubFrontends(core, access_verifier=access_verifier)
+        return HubFrontends(core, access_verifier=access_verifier, allow_github=allow_github)
 
     async def cleanup():
         failed = False
@@ -180,6 +238,13 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                 except BaseException:
                     failed = True
             if client is not None:
+                if client.uses_inherited_broker:
+                    try:
+                        await client.drain_inherited_broker()
+                        if remote_cleanup_reserved:
+                            owner.confirm_remote_cleanup()
+                    except BaseException:
+                        failed = True
                 try:
                     await client.aclose()
                 except BaseException:
@@ -198,7 +263,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
             await serve_private_coordinator(pair_factory, socket_path=socket_path,
                 agent_host=agent_host, agent_port=agent_port, stop_event=stop,
                 on_ready=on_ready, install_signals=install_signals,
-                recover_socket=recover_socket)
+                recover_socket=recover_socket, allow_github=allow_github,
+                **({} if admission_verifier is None else {'admission_verifier': admission_verifier}))
         finally:
             if owner is not None or client is not None:
                 await cleanup()
@@ -208,6 +274,15 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         # after cancellation. The existing helper requests stop and drains this
         # same task through repeated caller cancellation, including client close.
         await _owned_service(operation, stop)
+        if admission_verifier is not None:
+            if (not constructed or owner is None or not owner._closed or local_runtime is None
+                    or local_runtime.status['state'] != 'stopped' or local_runtime._source_failed
+                    or local_runtime._task is None or not local_runtime._task.done()
+                    or local_runtime._task.cancelled() or local_runtime._task.exception() is not None
+                    or local_runtime._active is not None):
+                raise QueuedPilotServiceError()
+            from hub_container_executor.coordinator_drain import LocalCoordinatorDrain
+            return LocalCoordinatorDrain(owner.epoch, manifest.digest())
     except Exception:
         raise QueuedPilotServiceError() from None
 

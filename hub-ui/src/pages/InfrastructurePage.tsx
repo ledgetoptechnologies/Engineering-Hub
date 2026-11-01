@@ -59,7 +59,7 @@ function useRead<T>(hub: Hub, read: (signal: AbortSignal) => Promise<T>, deps: u
 }
 
 export function InfrastructurePage({ hub, actions, deviceId }: { hub: Hub; actions: React.ReactNode; deviceId?: string }) {
-  return deviceId ? <DevicePage hub={hub} actions={actions} id={deviceId} /> : <DeviceListPage hub={hub} actions={actions} />;
+  return deviceId ? <DevicePage key={deviceId} hub={hub} actions={actions} id={deviceId} /> : <DeviceListPage hub={hub} actions={actions} />;
 }
 
 function Unavailable({ actions, children }: { actions: React.ReactNode; children?: React.ReactNode }) {

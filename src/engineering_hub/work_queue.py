@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import json
 import hashlib
 import inspect
+from agent_message_bus import session_hub_context as session_context
 import math
 import os
 import re
@@ -298,7 +299,7 @@ class WorkQueue:
             db.execute("UPDATE hub_work_jobs SET state='held' WHERE id=?", (row['id'],))
             self._event(db, 'work.held', row['id'], 'system:work-queue')
 
-    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None):
+    def _submission_fingerprint(self, *, actor, request_id, action_key, environment, target, approval_id):
         if type(actor) is not str or actor not in AGENTS:
             raise HubError('invalid_work_actor')
         _key(request_id)
@@ -313,18 +314,60 @@ class WorkQueue:
         self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
-        if not self._target_verified(actor, action_key, environment, target):
-            raise HubError('work_target_not_verified', 403)
         target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
+        return action, target_json, fingerprint
+
+    def _assert_submission_owner(self, db, *, actor, action, target):
+        task = self.repo._get(db, target.task_id, 'task')
+        if task.get('owner') != actor or not session_context.continuation_allowed(task, actor):
+            raise HubError('forbidden', 403)
+        if task.get('project') != action.project:
+            raise HubError('work_project_mismatch', 403)
+
+    def existing_submission(self, *, actor, request_id, action_key, environment, target, approval_id=None,
+                            require_task_owner=False):
+        """Read one actor's exact prior request; never create or admit work."""
+        if type(require_task_owner) is not bool:
+            raise HubError('invalid_work_target')
+        action, _, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
+            action_key=action_key, environment=environment, target=target, approval_id=approval_id)
+        with self.repo._connection() as db:
+            db.execute('BEGIN')
+            old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
+            if old is not None and require_task_owner:
+                self._assert_submission_owner(db, actor=actor, action=action, target=target)
+        if old is None:
+            return None
+        if old['fingerprint'] != fingerprint:
+            raise HubError('work_request_conflict', 409)
+        return self._public(old)
+
+    def submit(self, *, actor, request_id, action_key, environment, target, approval_id=None,
+               require_task_owner=False):
+        if type(require_task_owner) is not bool:
+            raise HubError('invalid_work_target')
+        action, target_json, fingerprint = self._submission_fingerprint(actor=actor, request_id=request_id,
+            action_key=action_key, environment=environment, target=target, approval_id=approval_id)
+        existing = self.existing_submission(actor=actor, request_id=request_id, action_key=action_key,
+            environment=environment, target=target, approval_id=approval_id,
+            require_task_owner=require_task_owner)
+        if existing is not None:
+            return existing
+        # The verifier stays outside the SQLite write transaction and still
+        # gates every genuinely new job. The transaction rechecks for a retry
+        # which committed while this verifier was running.
+        target_verified = self._target_verified(actor, action_key, environment, target)
         with self.repo._transaction() as db:
-            if not self.repo.task_allows_environment(target.task_id, environment, db=db):
-                raise HubError('work_target_not_verified', 403)
+            if require_task_owner:
+                self._assert_submission_owner(db, actor=actor, action=action, target=target)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
                 if old['fingerprint'] != fingerprint:
                     raise HubError('work_request_conflict', 409)
                 return self._public(old)
+            if not target_verified or not self.repo.task_allows_environment(target.task_id, environment, db=db):
+                raise HubError('work_target_not_verified', 403)
             if db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] >= self.max_jobs:
                 raise HubError('work_queue_capacity', 503)
             job_id = str(uuid.uuid4())
@@ -653,6 +696,35 @@ class WorkQueue:
         result['requires_reconciliation'] = (row['state'] == 'held'
             or row['state'] == 'claimed' and row['lease_until'] <= self._now())
         return result
+
+    def machine_reservation(self, machine_id):
+        """Read this queue's reservation, not host-wide availability."""
+        _key(machine_id)
+        if machine_id not in {action.machine_id for action in self.actions.values()}:
+            raise HubError('work_machine_not_found', 404)
+        now = self._now()
+        with self.repo._connection() as db:
+            row = db.execute('SELECT m.machine_id AS registered_row,m.job_id,m.generation,j.machine_id AS job_machine,'
+                'j.state,j.fence,j.lease_until,EXISTS(SELECT 1 FROM hub_work_jobs x '
+                "WHERE x.machine_id=k.machine_id AND x.state IN ('claimed','held') "
+                'AND (m.job_id IS NULL OR x.id != m.job_id)) AS stray '
+                'FROM (SELECT ? AS machine_id) k LEFT JOIN hub_work_machines m '
+                'ON m.machine_id=k.machine_id LEFT JOIN hub_work_jobs j ON j.id=m.job_id',
+                (machine_id,)).fetchone()
+        state = 'not_reserved'
+        if (row['stray'] or row['registered_row'] is not None and
+                (type(row['generation']) is not int or row['generation'] < 0)):
+            state = 'unknown'
+        elif row['job_id'] is not None:
+            state = 'unknown'
+            if (row['job_machine'] == machine_id and type(row['fence']) is int
+                    and row['fence'] > 0 and row['fence'] == row['generation']):
+                if row['state'] == 'held':
+                    state = 'held'
+                elif row['state'] == 'claimed' and type(row['lease_until']) in (int, float) and math.isfinite(row['lease_until']):
+                    state = 'held' if row['lease_until'] <= now else 'active'
+        return {'machine_id': machine_id, 'queue_reservation': state,
+                'requires_reconciliation': state == 'held' if state != 'unknown' else None}
 
     def status(self, *, limit=50):
         self._limit(limit)

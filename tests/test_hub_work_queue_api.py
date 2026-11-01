@@ -1,4 +1,5 @@
 """ASGI queue endpoints with real local repository/auth and synthetic tokens."""
+import json
 from uuid import uuid4
 
 import pytest
@@ -115,6 +116,31 @@ def test_reads_require_identity_and_all_agents_can_read(rig):
             assert client.get(BASE + path, headers=bearer(name)).status_code == 200
 
 
+def test_machine_reservation_requires_identity_and_exposes_no_job_details(rig):
+    client, _, _, build, _, submission, sessions, config = rig
+    path = BASE + '/machines/staging-pc'
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    session = sessions.create_session(42)
+    client.cookies.set(config.cookie_name, session['cookie_token'])
+    assert client.get(path).status_code == 200
+    assert client.get(path, headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert client.get(path, headers=[('Authorization', 'Bearer test-codex'),
+                                    ('Authorization', 'Bearer test-claude')]).status_code == 401
+    client.cookies.clear()
+    assert client.get(path, headers=bearer()).json() == {
+        'machine_id': 'staging-pc', 'queue_reservation': 'not_reserved',
+        'requires_reconciliation': False}
+    assert client.get(BASE + '/machines/unknown', headers=bearer()).status_code == 404
+    assert client.post(BASE + '/jobs', headers=bearer(), json=submission()).status_code == 201
+    assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).status_code == 200
+    assert client.get(path, headers=bearer()).json() == {
+        'machine_id': 'staging-pc', 'queue_reservation': 'active',
+        'requires_reconciliation': False}
+    with build(None) as unconfigured:
+        assert unconfigured.get(path, headers=bearer()).status_code == 423
+
+
 def test_unconfigured_returns423_after_auth_for_all_routes(rig):
     _, _, _, build, _, submission, *_ = rig
     with build(None) as client:
@@ -187,6 +213,78 @@ def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
     current = repo.get_task(staging['target']['task_id'])
     repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
+
+
+def test_submit_retry_reads_original_job_after_review_changes_without_readmitting(rig):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    first = client.post(BASE + '/jobs', headers=bearer(), json=payload)
+    assert first.status_code == 201
+    task = repo.get_task(payload['target']['task_id'])
+    repo.set_candidate('codex', task['id'], task['revision'], 'c' * 40)
+    retry = client.post(BASE + '/jobs', headers=bearer(), json=payload)
+    assert retry.status_code == 201 and retry.json()['id'] == first.json()['id']
+    changed = {**payload, 'target': {**payload['target'], 'artifact_digest': 'sha256:' + 'c' * 64}}
+    assert client.post(BASE + '/jobs', headers=bearer(), json=changed).status_code == 409
+    assert client.post(BASE + '/jobs', headers=bearer('hermes'), json=payload).status_code == 403
+    assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
+    assert len(queue.status()['jobs']) == 1
+
+
+def test_submit_retry_preserves_session_ownership_guard(rig, monkeypatch):
+    from engineering_hub import work_queue_api
+    client, _, _, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    monkeypatch.setattr(work_queue_api.session_context, 'continuation_allowed', lambda *_: False)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+
+
+def test_submit_retry_rechecks_owner_after_initial_task_read(rig, monkeypatch):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    original = queue.existing_submission
+    def transfer_then_lookup(**kwargs):
+        with repo._transaction() as db:
+            task = repo._get(db, payload['target']['task_id'], 'task')
+            task['owner'] = 'hermes'
+            db.execute('UPDATE hub_entities SET data=? WHERE id=? AND kind=?',
+                       (json.dumps(task), task['id'], 'task'))
+        return original(**kwargs)
+    monkeypatch.setattr(queue, 'existing_submission', transfer_then_lookup)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+
+
+def test_submit_retry_rechecks_session_after_initial_task_read(rig, monkeypatch):
+    from engineering_hub import work_queue_api
+    client, _, _, _, _, submission, *_ = rig
+    payload = submission()
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 201
+    checks = []
+    def changed_session(*_):
+        checks.append(True)
+        return len(checks) == 1
+    monkeypatch.setattr(work_queue_api.session_context, 'continuation_allowed', changed_session)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+    assert len(checks) == 2
+
+
+def test_new_submit_rechecks_owner_in_write_transaction(rig, monkeypatch):
+    client, repo, queue, _, _, submission, *_ = rig
+    payload = submission()
+    original = queue._target_verified
+    def verify_then_transfer(*args):
+        valid = original(*args)
+        with repo._transaction() as db:
+            task = repo._get(db, payload['target']['task_id'], 'task')
+            task['owner'] = 'hermes'
+            db.execute('UPDATE hub_entities SET data=? WHERE id=? AND kind=?',
+                       (json.dumps(task), task['id'], 'task'))
+        return valid
+    monkeypatch.setattr(queue, '_target_verified', verify_then_transfer)
+    assert client.post(BASE + '/jobs', headers=bearer(), json=payload).status_code == 403
+    assert not queue.status()['jobs']
 
 
 @pytest.mark.parametrize('evidence', [None, 'untrusted-evidence'])

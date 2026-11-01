@@ -1,10 +1,33 @@
 from urllib.parse import parse_qs, urlsplit
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from engineering_hub.auth import AuthConfig, SessionStore, build_auth_router, require_human
+from engineering_hub.auth import (AuthConfig, SessionStore, build_auth_router, require_human,
+                                  MAX_OUTSTANDING_OAUTH_STATES)
+
+
+@pytest.mark.parametrize('identity', [True, 0, -1, 2**63, 10**100, '123'])
+def test_github_identity_rejected_before_session_mutation(tmp_path, identity):
+    with pytest.raises(ValueError):
+        AuthConfig('https://hub.example', beau_github_id=identity)
+    store = SessionStore(tmp_path / 'hub.db')
+    original = store.create_session(123)
+    with pytest.raises(ValueError, match='^Invalid GitHub identity$'):
+        store.create_session(identity)
+    assert store.session_for(original['cookie_token'])['github_id'] == 123
+    with store._read_db() as db:
+        assert db.execute('SELECT COUNT(*) FROM auth_sessions').fetchone()[0] == 1
+
+
+def test_maximum_sqlite_github_identity_roundtrips(tmp_path):
+    identity = 2**63 - 1
+    assert AuthConfig('https://hub.example', beau_github_id=identity).beau_github_id == identity
+    store = SessionStore(tmp_path / 'hub.db')
+    session = store.create_session(identity)
+    assert store.session_for(session['cookie_token'])['github_id'] == identity
 
 
 class FakeGitHub:
@@ -107,6 +130,33 @@ def test_state_survives_reopen_and_is_one_use(tmp_path):
     reopened = SessionStore(tmp_path / "hub.db")
     assert reopened.consume_state(state["state"]) == state["verifier"]
     assert store.consume_state(state["state"]) is None
+
+
+def test_oauth_state_capacity_preserves_existing_and_recovers(tmp_path):
+    now = [1000]
+    client, _, store, _ = setup(tmp_path, clock=lambda: now[0])
+    state, _ = pending(client)
+    for _ in range(MAX_OUTSTANDING_OAUTH_STATES - 1):
+        assert store.create_state() is not None
+    denied = client.get('/api/hub/v1/auth/login')
+    assert denied.status_code == 503 and denied.headers['cache-control'] == 'no-store'
+    assert client.get('/api/hub/v1/auth/callback', params={'state': state, 'code': 'code'}).status_code == 303
+    assert store.create_state() is not None
+    now[0] += 601
+    assert store.create_state() is not None
+    with store._read_db() as db:
+        assert db.execute('SELECT COUNT(*) FROM auth_states').fetchone()[0] == 1
+
+
+def test_concurrent_oauth_admission_cannot_exceed_capacity(tmp_path):
+    store = SessionStore(tmp_path / 'hub.db')
+    for _ in range(MAX_OUTSTANDING_OAUTH_STATES - 1):
+        assert store.create_state() is not None
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: store.create_state(), range(4)))
+    assert sum(result is not None for result in results) == 1
+    with store._read_db() as db:
+        assert db.execute('SELECT COUNT(*) FROM auth_states').fetchone()[0] == MAX_OUTSTANDING_OAUTH_STATES
 
 
 def test_base_url_policy():

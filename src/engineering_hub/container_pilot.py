@@ -283,6 +283,42 @@ class ContainerPilotWorkflow:
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
 
+    def _correlate_smoke(self, db, run, target, command, response, state):
+        """Hold smoke evidence that does not identify its original deployment."""
+        predecessor = {'smoke_container': 'deploy_container',
+                       'smoke_container_rollback': 'rollback_container'}.get(command.action)
+        if predecessor is None or state not in {'succeeded', 'failed'}:
+            return state
+        if state == 'failed' and response.evidence.container_id is None:
+            return state
+        try:
+            row = db.execute('SELECT state,response_json FROM hub_container_pilot_commands '
+                             'WHERE run_id=? AND action=?', (run['id'], predecessor)).fetchone()
+            if row is None or row['state'] != 'succeeded' or type(row['response_json']) is not str:
+                return 'held'
+            prior = self._validated_response(ContainerPilotResponse.model_validate_json(row['response_json'], strict=True))
+            prior_command = self._request(run, target, predecessor)
+            if (self._verified_state(prior, prior_command, target) != 'succeeded'
+                    or not prior.evidence.container_id
+                    or response.evidence.container_id != prior.evidence.container_id):
+                return 'held'
+            return state
+        except Exception:
+            return 'held'
+
+    def _stored_command_state(self, db, run, target, command, row):
+        """Legacy terminal smoke rows without a verifiable receipt stay held."""
+        state = row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+        if command.action not in {'smoke_container', 'smoke_container_rollback'} or state == 'held':
+            return state
+        try:
+            response = self._validated_response(ContainerPilotResponse.model_validate_json(row['response_json'], strict=True))
+            if self._verified_state(response, command, target) != state:
+                return 'held'
+            return self._correlate_smoke(db, run, target, command, response, state)
+        except Exception:
+            return 'held'
+
     async def _command(self, run, target, action):
         bridge = getattr(self.repo, '_queued_pilot', None)
         if bridge is not None and bridge.async_admission_required:
@@ -293,14 +329,15 @@ class ContainerPilotWorkflow:
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
-            row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
+            row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
             if row:
                 if row['payload'] != canonical:
                     raise HubError('container_pilot_manifest_changed', 409)
-                return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+                return self._stored_command_state(db, run, target, command, row)
             db.execute('INSERT INTO hub_container_pilot_commands(run_id,action,payload,state) VALUES(?,?,?,?)',
                        (run['id'], action, canonical, 'unknown'))
         response_json = None
+        response = None
         self._assert_pilot_owner()
         self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         try:
@@ -316,6 +353,8 @@ class ContainerPilotWorkflow:
         self._assert_pilot_owner()
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
+            if response is not None:
+                state = self._correlate_smoke(db, run, target, command, response, state)
             db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                        (state, response_json, run['id'], action))
         return state
@@ -328,12 +367,12 @@ class ContainerPilotWorkflow:
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
         with self.repo._connection() as db:
-            row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+            row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
                              (run['id'], action)).fetchone()
-        if row is not None:
-            if row['payload'] != canonical:
-                raise HubError('container_pilot_manifest_changed', 409)
-            return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+            if row is not None:
+                if row['payload'] != canonical:
+                    raise HubError('container_pilot_manifest_changed', 409)
+                return self._stored_command_state(db, run, target, command, row)
         prepared, subject = await bridge.prepare_command(command)
         with bridge._consume(prepared, subject):
             self._assert_pilot_owner()
@@ -341,12 +380,12 @@ class ContainerPilotWorkflow:
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
                 self.repo._assert_queued_pilot('command', db=db, run_id=run['id'], action=action)
-                row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
                                  (run['id'], action)).fetchone()
                 if row is not None:
                     if row['payload'] != canonical:
                         raise HubError('container_pilot_manifest_changed', 409)
-                    return row['state'] if row['state'] in {'succeeded', 'failed'} else 'held'
+                    return self._stored_command_state(db, run, target, command, row)
                 db.execute('INSERT INTO hub_container_pilot_commands(run_id,action,payload,state) VALUES(?,?,?,?)',
                            (run['id'], action, canonical, 'unknown'))
             self._assert_pilot_owner()
@@ -356,6 +395,7 @@ class ContainerPilotWorkflow:
 
         async def exchange_and_retain():
             response_json = None
+            response = None
             try:
                 response = self._validated_response(await self.client.submit_command(command))
                 state = self._verified_state(response, command, target)
@@ -365,6 +405,8 @@ class ContainerPilotWorkflow:
             self._assert_pilot_owner()
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
+                if response is not None:
+                    state = self._correlate_smoke(db, run, target, command, response, state)
                 db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                            (state, response_json, run['id'], action))
             return state

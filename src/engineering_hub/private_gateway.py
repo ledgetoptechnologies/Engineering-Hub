@@ -5,7 +5,8 @@ UDS transport (no retries, proxy, event hooks, or default auth), and serve the
 receiver only on that UDS. This module neither creates nor proves that socket
 boundary. It does not open a database, own an executor, install a server, manage
 lifespans, or proxy agent/MCP requests. Agents retain their original listener
-and real source-IP checks. The private receiver verifies Access independently.
+and real source-IP checks. The private receiver independently enforces the
+selected Cloudflare Access or explicitly bound GitHub session boundary.
 """
 from __future__ import annotations
 
@@ -96,8 +97,10 @@ def _diagnostic_path(path, *, files_only=False):
             and all(part not in ('', '.', '..') for part in relative.split('/')))
 
 
-def browser_route_allowed(method, path):
+def browser_route_allowed(method, path, *, allow_github=False):
     """Closed browser surface; new backend routes are not exposed implicitly."""
+    if path == '/api/hub/v1/auth/callback':
+        return allow_github and method == 'GET'
     owner = '/api/hub/v1/agent-connections'
     installation = owner + '/installations/' + _UUID
     if method in {'GET', 'HEAD', 'PUT'} and path == owner + '/installation-scopes':
@@ -125,6 +128,7 @@ def browser_route_allowed(method, path):
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None
                 or re.fullmatch(r'/assets/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.(?:js|css|svg|png|ico|woff2)', path) is not None
                 or re.fullmatch(r'/api/hub/v1/(?:tasks|work/jobs)/' + _UUID, path) is not None
+                or method == 'GET' and re.fullmatch(r'/api/hub/v1/work/machines/' + _TOPIC, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID, path) is not None
                 or re.fullmatch(r'/api/hub/v1/projects/' + _PROJECT_ID + '/components', path) is not None
                 or re.fullmatch(r'/api/hub/v1/components/' + _UUID, path) is not None
@@ -171,7 +175,7 @@ async def _deny(scope, receive, send, code, status):
                        headers={'Cache-Control': 'no-store'})(scope, receive, send)
 
 
-def _scope_headers(scope, *, preview_host=None):
+def _scope_headers(scope, *, preview_host=None, allow_github=False):
     path = scope.get('path', '')
     try:
         canonical = path.encode('ascii')
@@ -185,7 +189,7 @@ def _scope_headers(scope, *, preview_host=None):
     if type(query) is not bytes or len(query) > 4096 or any(c < 32 or c == 127 for c in query):
         raise _Denied('gateway_invalid_query', 400)
     preview = _is_preview(scope, preview_host)
-    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path)):
+    if not (_preview_path(scope) if preview else browser_route_allowed(scope.get('method'), path, allow_github=allow_github)):
         raise _Denied('gateway_route_forbidden', 403)
     headers = scope.get('headers', [])
     if len(headers) > 64 or sum(len(k) + len(v) for k, v in headers) > 32768:
@@ -243,12 +247,17 @@ class PrivateBrowserGateway:
     as an unprotected TCP listener; no socket or deployment is created here.
     """
     def __init__(self, core, *, agent_auth, cloudflare_config, access_verifier=None,
-                 preview_origin=None, preview_app=None):
-        if cloudflare_config is None:
+                 preview_origin=None, preview_app=None, browser_auth_mode='cloudflare_access',
+                 browser_auth_config=None, browser_sessions=None):
+        if browser_auth_mode == 'cloudflare_access' and cloudflare_config is None:
             raise ValueError('Private browser gateway requires Cloudflare Access')
         self.ingress = HubIngressMiddleware(core, mode='browser', agent_auth=agent_auth,
                                             cloudflare_config=cloudflare_config,
-                                            access_verifier=access_verifier)
+                                            access_verifier=access_verifier,
+                                            browser_auth_mode=browser_auth_mode,
+                                            browser_auth_config=browser_auth_config,
+                                            browser_sessions=browser_sessions)
+        self.allow_github = browser_auth_mode == 'github'
         if ((preview_origin is None) != (preview_app is None)
                 or preview_app is not None and not callable(preview_app)):
             raise ValueError('Explicit preview origin and dispatch must be bound together')
@@ -261,7 +270,7 @@ class PrivateBrowserGateway:
         if scope['type'] != 'http':
             raise RuntimeError('Private browser gateway has no independent lifespan')
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_github=self.allow_github)
             preview = _is_preview(scope, self.preview_host)
             body = await _bounded_body(scope, receive, length, maximum=0 if preview else 65536, timeout=15.0)
         except _Denied as error:
@@ -279,7 +288,7 @@ class PrivateBrowserGateway:
             return await receive()
         if preview:
             # Capability-only separate origin, deliberately before the extra
-            # dashboard Access layer. The real broker owns session revocation.
+            # dashboard authentication layer. The real broker owns session revocation.
             clean_scope = dict(scope, headers=headers)
             async def preview_send(message):
                 if message['type'] == 'http.response.start':
@@ -299,9 +308,12 @@ class PublicBrowserGateway:
     domain's recovery mechanism. SSE is streamed without buffering a full body.
     """
     def __init__(self, client, *, max_body_bytes=65536, max_response_bytes=2097152,
-                 max_concurrency=16, request_timeout=15.0, preview_origin=None):
+                 max_concurrency=16, request_timeout=15.0, preview_origin=None, allow_github=False):
         if type(client) is not httpx.AsyncClient:
             raise ValueError('Explicit caller-owned AsyncClient required')
+        if type(allow_github) is not bool:
+            raise ValueError('Explicit GitHub gateway opt-in required')
+        self.allow_github = allow_github
         for value, maximum in ((max_body_bytes, 1048576), (max_response_bytes, 16777216),
                                (max_concurrency, 64)):
             if type(value) is not int or not 1 <= value <= maximum:
@@ -337,7 +349,7 @@ class PublicBrowserGateway:
                 started = True
             await send(message)
         try:
-            headers, length = _scope_headers(scope, preview_host=self.preview_host)
+            headers, length = _scope_headers(scope, preview_host=self.preview_host, allow_github=self.allow_github)
             preview = _is_preview(scope, self.preview_host)
             if length is not None and length > self.max_body_bytes:
                 raise _Denied('gateway_body_too_large', 413)

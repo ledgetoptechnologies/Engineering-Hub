@@ -11,7 +11,10 @@ import json
 import os
 import re
 import stat
+import struct
+import tarfile
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -32,6 +35,7 @@ from .backend import (
     ImageDefaults,
     OperationObservation,
     ProbeObservation,
+    GateHealthObservation,
     RunnerObservation,
 )
 from .build_record import VerifiedImage
@@ -63,6 +67,48 @@ _MAX_DESCRIPTORS = 64
 _MAX_PROBES = 3
 _MAX_EXEC_OUTPUT = 64 * 1024
 _FIXED_TMPFS_SIZE_MAX = 256 * 1024**2
+_MAX_GATE_BINARY = 8 * 1024**2
+
+
+def _static_gate_archive(raw, expected_digest, architecture):
+    """Validate one bounded USTAR regular file and a non-interpreted 64-bit ELF."""
+    try:
+        if (type(raw) is not bytes or len(raw) < 1536 or len(raw) % 512
+                or len(raw) > _MAX_GATE_BINARY + 65536
+                or raw[257:263] != b'ustar\0' or raw[263:265] != b'00'):
+            raise ValueError()
+        member = tarfile.TarInfo.frombuf(raw[:512], encoding='utf-8', errors='strict')
+        if (member.name != 'hub-application-gate' or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                or member.linkname or member.pax_headers or not 64 <= member.size <= _MAX_GATE_BINARY
+                or member.mode != 0o755):
+            raise ValueError()
+        end = 512 + member.size
+        padded = (end + 511) // 512 * 512
+        if padded + 1024 > len(raw) or any(raw[end:]):
+            raise ValueError()
+        binary = raw[512:end]
+        if 'sha256:' + hashlib.sha256(binary).hexdigest() != expected_digest:
+            raise ValueError()
+        header = struct.unpack_from('<16sHHIQQQIHHHHHH', binary)
+        ident, kind, machine, version, entry, phoff = header[:6]
+        phentsize, phnum = header[9], header[10]
+        if (ident[:7] != b'\x7fELF\x02\x01\x01' or kind not in (2, 3)
+                or machine != {'amd64': 62, 'arm64': 183}.get(architecture)
+                or version != 1 or header[8] != 64 or phentsize != 56
+                or not 1 <= phnum <= 128 or phoff < 64 or phoff + phentsize * phnum > len(binary)):
+            raise ValueError()
+        executable_entry = False
+        for index in range(phnum):
+            ptype, flags, offset, vaddr, _paddr, filesz, memsz, _align = struct.unpack_from(
+                '<IIQQQQQQ', binary, phoff + index * phentsize)
+            if ptype in (2, 3) or filesz > memsz or offset + filesz > len(binary):
+                raise ValueError()
+            if ptype == 1 and flags & 1 and vaddr <= entry < vaddr + memsz:
+                executable_entry = True
+        if not executable_entry:
+            raise ValueError()
+    except (ValueError, TypeError, struct.error, tarfile.TarError, OverflowError):
+        raise DaemonBackendError('application gate bootstrap unavailable') from None
 
 
 class ArchiveMetadataError(ValueError):
@@ -224,6 +270,7 @@ class TrustedPrivateOperationJournal(Protocol):
                   container_id: str | None = None) -> None: ...
 
     def inspect(self, operation_id: str) -> OperationObservation | None: ...
+    def inspect_create(self, operation_id: str, kind: str) -> OperationObservation | None: ...
 
 
 class _ChunkReader:
@@ -512,13 +559,19 @@ class DockerEngineBackend:
 
     def __init__(self, binding: DockerEngineBinding, *,
                  operation_journal: TrustedPrivateOperationJournal | None = None,
-                 test_transport: httpx.MockTransport | None = None):
+                 test_transport: httpx.MockTransport | None = None,
+                 gate_mount_verifier=None):
         if type(binding) is not DockerEngineBinding:
             raise TypeError("explicit DockerEngineBinding required")
         if test_transport is not None and type(test_transport) is not httpx.MockTransport:
             raise TypeError("only an explicit httpx.MockTransport test transport is accepted")
+        if gate_mount_verifier is not None:
+            from .gate_mount_observation import GateMountVerifier
+            if type(gate_mount_verifier) is not GateMountVerifier:
+                raise TypeError('verified gate mount authority required')
         self.binding = binding
         self.operation_journal = operation_journal
+        self._gate_mount_verifier = gate_mount_verifier
         self._using_test_transport = test_transport is not None
         transport = (test_transport if test_transport is not None
                      else httpx.HTTPTransport(uds=binding.unix_socket_path))
@@ -533,6 +586,7 @@ class DockerEngineBackend:
         self._container_images: dict[str, VerifiedImage] = {}
         self._container_profiles: dict[str, EffectiveProfile] = {}
         self._container_generations: dict[str, str] = {}
+        self._gate_bootstrap_digests: dict[str, str] = {}
 
     def close(self):
         if not self._closed:
@@ -901,7 +955,10 @@ class DockerEngineBackend:
         expected_mounts = (("state_generation", "/var/lib/hub", "rw", generation_id),
                            ("tmpfs", "/tmp", "rw", f"size={tmp_size}",
                             f"mode={tmp_mode:o}", "noexec", "nosuid"))
-        if profile.mounts != expected_mounts:
+        gate_mount = None if self._gate_mount_verifier is None else (
+            'gate_channel_directory', '/run/hub-gate', 'ro', self._gate_mount_verifier.source_directory)
+        permitted_mounts = (expected_mounts,) if gate_mount is None else (expected_mounts, expected_mounts + (gate_mount,))
+        if profile.mounts not in permitted_mounts:
             raise DaemonBackendError("runtime mounts are outside the closed profile")
         if actual_config.get("Volumes") not in (None, {}):
             raise DaemonBackendError("image declares unsupported volume mounts")
@@ -911,6 +968,10 @@ class DockerEngineBackend:
                 or not (entrypoint or command)
                 or any("\x00" in item for item in (*entrypoint, *command))):
             raise DaemonBackendError("runtime must preserve image-default entrypoint and command")
+        if gate_mount is not None and profile.mounts != expected_mounts:
+            from .application_gate_enrollment import STATIC_ENTRYPOINT
+            if profile.entrypoint != STATIC_ENTRYPOINT or profile.command != ():
+                raise DaemonBackendError('gate profile requires the enrolled static entrypoint')
         environment = self._profile_environment(profile, actual_defaults)
         return generation_id, environment
 
@@ -942,11 +1003,32 @@ class DockerEngineBackend:
                 or profile.cgroupns_mode != "private"
                 or profile.published_ports != () or profile.restart_policy != "no"):
             raise DaemonBackendError("runtime profile is outside the closed pilot policy")
+        if self._gate_mount_verifier is not None:
+            from .application_gate_enrollment import STATIC_ENTRYPOINT
+            expected_gate = ('gate_channel_directory', '/run/hub-gate', 'ro',
+                             self._gate_mount_verifier.source_directory)
+            if (type(profile.tmpfs) is not tuple or len(profile.tmpfs) != 1
+                    or type(profile.tmpfs[0]) is not tuple or len(profile.tmpfs[0]) != 5):
+                raise DaemonBackendError('gate profile binding is unavailable')
+            tmp_path, tmp_size, tmp_mode, noexec, nosuid = profile.tmpfs[0]
+            if (tmp_path != '/tmp' or type(tmp_size) is not int or type(tmp_mode) is not int
+                    or noexec is not True or nosuid is not True):
+                raise DaemonBackendError('gate profile binding is unavailable')
+            expected_mounts = (('state_generation', '/var/lib/hub', 'rw', profile.state_generation_id),
+                ('tmpfs', '/tmp', 'rw', f'size={tmp_size}', f'mode={tmp_mode:o}', 'noexec', 'nosuid'), expected_gate)
+            config = plan.image.image_config.get('config') if type(plan.image.image_config) is dict else None
+            if (profile.mounts != expected_mounts
+                    or profile.entrypoint != STATIC_ENTRYPOINT or profile.command != ()
+                    or type(config) is not dict or config.get('Entrypoint') != list(STATIC_ENTRYPOINT)
+                    or config.get('Cmd') not in ([], None)):
+                raise DaemonBackendError('gate profile binding is unavailable')
+        elif any(item and item[0] == 'gate_channel_directory' for item in profile.mounts):
+            raise DaemonBackendError('gate profile binding is unavailable')
 
     def _create_body(self, plan, source, environment):
         profile = plan.profile
         tmp_size, tmp_mode = profile.tmpfs[0][1], profile.tmpfs[0][2]
-        return {
+        result = {
             "Image": plan.immutable_reference,
             "User": "10001:10001",
             "Env": [f"{key}={value}" for key, value in environment],
@@ -971,11 +1053,30 @@ class DockerEngineBackend:
                 "AutoRemove": False,
             },
         }
+        if self._gate_mount_verifier is not None:
+            result['HostConfig']['Mounts'].append({'Type': 'bind',
+                'Source': self._gate_mount_verifier.source_directory,
+                'Target': '/run/hub-gate', 'ReadOnly': True})
+        return result
+
+    def _gate_digest(self, image, deadline):
+        try:
+            if self._gate_mount_verifier is None:
+                raise ValueError()
+            digest = self._gate_mount_verifier.verify_current(image,
+                timeout_ms=min(5000, self._remaining_ms(deadline)))
+            if type(digest) is not str or not DIGEST_RE.fullmatch(digest):
+                raise ValueError()
+            self._remaining(deadline)
+            return digest
+        except Exception:
+            raise DaemonBackendError('gate mount authority unavailable; hold original operation') from None
 
     def create_container(self, plan: ContainerPlan, operation_id: str, timeout_ms: int) -> str:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         self._static_profile_check(plan)
+        gate_digest = self._gate_digest(plan.image, deadline) if self._gate_mount_verifier is not None else None
         source = self._resolve_generation(plan.profile.state_generation_id, deadline)
         # Read-only identity and original archive metadata are rechecked using one
         # deadline immediately before the durable-intent-protected create request.
@@ -1000,6 +1101,8 @@ class DockerEngineBackend:
             # Name collisions, including exact labels/IDs, are ambiguous and never reused.
             raise DaemonBackendError("container resource name is already occupied")
         self._assert_runner(deadline)
+        if gate_digest is not None and self._gate_digest(plan.image, deadline) != gate_digest:
+            raise DaemonBackendError('gate mount authority changed; hold original operation')
         body = self._create_body(plan, source, environment)
         route = self._route("/containers/create")
         raw = self._read_response("POST", route, deadline, expected_status=201,
@@ -1027,8 +1130,76 @@ class DockerEngineBackend:
                 or actual.profile != plan.profile
                 or actual.state_generation_id != generation_id or actual.status != "created"):
             raise DaemonBackendError("created container effective profile differs from preflight")
+        if gate_digest is not None:
+            if self._gate_digest(plan.image, deadline) != gate_digest:
+                raise DaemonBackendError('gate mount authority changed; hold original operation')
+            self._gate_bootstrap_digests[container_id] = gate_digest
         self._remaining(deadline)
         return container_id
+
+    def restore_container_context(self, plan: ContainerPlan, operation_id: str,
+                                  container_id: str, timeout_ms: int) -> ContainerObservation:
+        """Read-only verification for an independently authenticated create context.
+
+        The caller must authenticate the original plan and ledger receipt. A
+        terminal journal receipt must independently identify the same container.
+        This never resolves a held command or replays an effect.
+        """
+        deadline = self._deadline(timeout_ms)
+        self._operation_id(operation_id)
+        self._static_profile_check(plan)
+        if type(container_id) is not str or not CONTAINER_ID_RE.fullmatch(container_id):
+            raise DaemonBackendError("invalid container identity")
+        mappings = (self._container_images, self._container_profiles, self._container_generations)
+        present = tuple(container_id in mapping for mapping in mappings)
+        if any(present) and (not all(present) or
+                (self._container_images[container_id], self._container_profiles[container_id],
+                 self._container_generations[container_id]) !=
+                (plan.image, plan.profile, plan.profile.state_generation_id)):
+            raise DaemonBackendError("container context conflicts with authenticated plan")
+        already_cached = all(present)
+        try:
+            self._remaining(deadline)
+            receipt = self.operation_journal.inspect_create(operation_id, "create_" + plan.image.role)
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError("exact completed create receipt required") from None
+        if (type(receipt) is not OperationObservation or receipt.operation_id != operation_id
+                or receipt.state != "completed" or receipt.terminal is not True
+                or receipt.container_id != container_id):
+            raise DaemonBackendError("exact completed create receipt required")
+        self._assert_runner(deadline)
+        defaults = self.inspect_image(plan.image, self._remaining_ms(deadline))
+        cached = self._images.get(plan.image.runnable_reference)
+        if cached is None:
+            raise DaemonBackendError("verified daemon image metadata is unavailable")
+        generation, _ = self._validate_profile(
+            plan, cached[1].get("config") or {},
+            {"Entrypoint": defaults.entrypoint, "Cmd": defaults.command,
+             "Env": defaults.environment,
+             "Volumes": (cached[1].get("config") or {}).get("Volumes")},
+        )
+        self._resolve_generation(generation, deadline)
+        self._container_images[container_id] = plan.image
+        self._container_profiles[container_id] = plan.profile
+        self._container_generations[container_id] = generation
+        try:
+            actual = self.inspect_container(container_id, self._remaining_ms(deadline))
+            expected = ActualImageSelection(plan.image.runnable_reference,
+                    plan.image.platform_manifest_digest, plan.image.image_config_id,
+                    plan.image.platform)
+            if (type(actual) is not ContainerObservation or actual.container_id != container_id
+                    or actual.selected_image != expected or actual.profile != plan.profile
+                    or actual.state_generation_id != generation):
+                raise DaemonBackendError("container differs from authenticated create context")
+            self._remaining(deadline)
+            return actual
+        except BaseException:
+            if not already_cached:
+                self._container_images.pop(container_id, None)
+                self._container_profiles.pop(container_id, None)
+                self._container_generations.pop(container_id, None)
+            raise
 
     def _safe_port_bindings(self, value):
         if value in (None, {}):
@@ -1109,18 +1280,24 @@ class DockerEngineBackend:
                          and state.get("StartedAt") == "0001-01-01T00:00:00Z")
         mounts = data.get("Mounts")
         host_mounts = host.get("Mounts")
-        if (not isinstance(mounts, list) or len(mounts) not in (1, 2)
-                or (len(mounts) == 1 and status == "created" and not never_started)
-                or not isinstance(host_mounts, list) or len(host_mounts) != 1):
+        if (not isinstance(mounts, list) or not isinstance(host_mounts, list)
+                or len(host_mounts) not in (1, 2)):
             raise DaemonBackendError("container has additional or missing mounts")
         bind_mounts = [item for item in mounts if isinstance(item, dict)
                        and item.get("Type") == "bind"]
         tmp_mounts = [item for item in mounts if isinstance(item, dict)
                       and item.get("Type") == "tmpfs"]
-        if (len(bind_mounts) != 1 or len(tmp_mounts) != len(mounts) - 1
+        state_binds = [item for item in bind_mounts if item.get('Destination') == '/var/lib/hub']
+        gate_binds = [item for item in bind_mounts if item.get('Destination') == '/run/hub-gate']
+        has_gate = len(gate_binds) == 1
+        if (len(state_binds) != 1 or len(gate_binds) > 1
+                or len(bind_mounts) != 1 + int(has_gate)
+                or len(tmp_mounts) != len(mounts) - len(bind_mounts)
+                or len(host_mounts) != len(bind_mounts)
+                or (not tmp_mounts and status == 'created' and not never_started)
                 or len(tmp_mounts) not in (0, 1)):
             raise DaemonBackendError("container mount types are unsupported")
-        bind = bind_mounts[0]
+        bind = state_binds[0]
         source_value = bind.get("Source")
         state_destination = bind.get("Destination")
         if (type(source_value) is not str or state_destination != "/var/lib/hub"
@@ -1137,7 +1314,11 @@ class DockerEngineBackend:
         enrolled_source = self._resolve_generation(generation_id, deadline)
         if source != enrolled_source:
             raise DaemonBackendError("container state mount is outside enrolled root")
-        configured_mount = host_mounts[0]
+        configured_state = [item for item in host_mounts if isinstance(item, dict) and item.get('Target') == '/var/lib/hub']
+        configured_gate = [item for item in host_mounts if isinstance(item, dict) and item.get('Target') == '/run/hub-gate']
+        if len(configured_state) != 1 or len(configured_gate) != int(has_gate):
+            raise DaemonBackendError('container host bind configuration differs')
+        configured_mount = configured_state[0]
         # Pinned Moby mount.Mount.ReadOnly is bool with json:",omitempty";
         # absent means false. Present null/0/strings are never that default.
         if (not isinstance(configured_mount, dict) or configured_mount.get("Type") != "bind"
@@ -1146,6 +1327,17 @@ class DockerEngineBackend:
                 or configured_mount.get("Target") != "/var/lib/hub"
                 or ("ReadOnly" in configured_mount and configured_mount["ReadOnly"] is not False)):
             raise DaemonBackendError("container host bind configuration differs")
+        if has_gate:
+            if self._gate_mount_verifier is None:
+                raise DaemonBackendError('unexpected gate bind')
+            source = self._gate_mount_verifier.source_directory
+            gate_bind, gate_host = gate_binds[0], configured_gate[0]
+            if (gate_bind.get('Source') != source or gate_bind.get('RW') is not False
+                    or gate_bind.get('Mode') not in ('', 'ro') or gate_bind.get('Propagation') != 'rprivate'
+                    or set(gate_host) - {'Type', 'Source', 'Target', 'ReadOnly'}
+                    or gate_host.get('Type') != 'bind' or gate_host.get('Source') != source
+                    or gate_host.get('ReadOnly') is not True):
+                raise DaemonBackendError('gate bind differs from enrolled profile')
         tmp_mount = tmp_mounts[0] if tmp_mounts else None
         if tmp_mount is not None and (tmp_mount.get("Destination") != "/tmp" or tmp_mount.get("RW") is not True
                 or tmp_mount.get("Source") not in ("", None)):
@@ -1248,7 +1440,9 @@ class DockerEngineBackend:
             pids_limit=host["PidsLimit"], tmpfs=tmp_profile,
             mounts=(("state_generation", "/var/lib/hub", "rw", generation_id),
                     ("tmpfs", "/tmp", "rw", f"size={tmp_size}",
-                     "mode=1777", "noexec", "nosuid")),
+                     "mode=1777", "noexec", "nosuid")) +
+                   ((('gate_channel_directory', '/run/hub-gate', 'ro',
+                      self._gate_mount_verifier.source_directory),) if has_gate else ()),
             state_destination="/var/lib/hub", state_mode="rw",
             state_generation_id=generation_id,
             environment=tuple(sorted(env.items())),
@@ -1267,6 +1461,50 @@ class DockerEngineBackend:
         self._container_generations.setdefault(container_id, generation_id)
         return ContainerObservation(container_id, expected_image, profile,
                                     generation_id, status)
+
+    def inspect_created_gate_bootstrap(self, container_id, *, manifest, image, supervisor,
+                                       enrollment_file, timeout_ms):
+        """Read exact created-container bootstrap under protected v2 enrollment.
+
+        This method has no caller in the enabled launch path. A successful
+        observation is not image provenance, host/daemon writer exclusion,
+        atomic check-to-exec, or permission to start. The owner must hold the
+        existing operation on any error or uncertain outcome, without retry.
+        """
+        from .application_gate_enrollment import (
+            STATIC_ENTRYPOINT, STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA, load_application_gate_enrollment,
+        )
+        try:
+            deadline = self._deadline(timeout_ms)
+            enrolled = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=supervisor)
+            if (enrolled.schema not in (STATIC_SCHEMA, SOCKET_SCHEMA, COMPLETION_SCHEMA) or type(container_id) is not str
+                    or not CONTAINER_ID_RE.fullmatch(container_id)
+                    or self._container_images.get(container_id) != image
+                    or container_id not in self._container_profiles
+                    or container_id not in self._container_generations):
+                raise ValueError()
+            self._assert_runner(deadline)
+            before = self._known_container(container_id, 'created', deadline)
+            if (before.selected_image != ActualImageSelection(image.runnable_reference,
+                    image.platform_manifest_digest, image.image_config_id, image.platform)
+                    or before.profile.entrypoint != STATIC_ENTRYPOINT or before.profile.command != ()):
+                raise ValueError()
+            raw = self._read_response('GET', self._route('/containers/' + container_id + '/archive'),
+                deadline, expected_status=200, params={'path': STATIC_ENTRYPOINT[0]},
+                body_limit=_MAX_GATE_BINARY + 65536)
+            _static_gate_archive(raw, enrolled.bootstrap_digest, image.platform.architecture)
+            self._assert_runner(deadline)
+            after = self._known_container(container_id, 'created', deadline)
+            if after != before:
+                raise ValueError()
+            current = load_application_gate_enrollment(enrollment_file, manifest=manifest,
+                image=image, supervisor=supervisor)
+            if current != enrolled:
+                raise ValueError()
+            self._remaining(deadline)
+        except Exception:
+            raise DaemonBackendError('application gate bootstrap unavailable; hold original operation') from None
 
     def inspect_container(self, container_id: str, timeout_ms: int) -> ContainerObservation | None:
         if type(container_id) is not str or not CONTAINER_ID_RE.fullmatch(container_id):
@@ -1298,8 +1536,25 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "created", deadline)
+        if self._gate_mount_verifier is not None:
+            from .application_gate_enrollment import STATIC_ENTRYPOINT
+            image = self._container_images.get(container_id)
+            expected_digest = self._gate_bootstrap_digests.get(container_id)
+            if (type(image) is not VerifiedImage or type(expected_digest) is not str
+                    or self._gate_digest(image, deadline) != expected_digest):
+                raise DaemonBackendError('gate bootstrap authority unavailable; hold original operation')
+            raw = self._read_response('GET', self._route('/containers/' + container_id + '/archive'),
+                deadline, expected_status=200, params={'path': STATIC_ENTRYPOINT[0]},
+                body_limit=_MAX_GATE_BINARY + 65536)
+            _static_gate_archive(raw, expected_digest, image.platform.architecture)
+            if (self._gate_digest(image, deadline) != expected_digest
+                    or self._known_container(container_id, 'created', deadline) != before):
+                raise DaemonBackendError('gate bootstrap changed; hold original operation')
         self._journal_begin(operation_id, "start")
         self._assert_runner(deadline)
+        if (self._gate_mount_verifier is not None
+                and self._gate_digest(image, deadline) != expected_digest):
+            raise DaemonBackendError('gate mount authority changed; hold original operation')
         route = self._route("/containers/" + container_id + "/start")
         self._read_response("POST", route, deadline, expected_status=204)
         self._journal_complete(operation_id, "start", container_id)
@@ -1423,6 +1678,53 @@ class DockerEngineBackend:
                 return None
             return False
         raise DaemonBackendError("compiled probe process outcome is ambiguous")
+
+    def run_gate_health(self, container_id, probes, operation_id, probe_timeouts, total_timeout_ms):
+        """Bracket the real compiled probe with exact daemon process observations.
+
+        PID is expressed in the daemon's namespace; the supervisor must compare
+        it with its retained live peer in a verified common PID namespace.
+        """
+        deadline = self._deadline(total_timeout_ms)
+        wall_start, monotonic_start = time.time(), time.monotonic()
+        if not math.isfinite(wall_start) or wall_start <= 0: raise DaemonBackendError('gate health unavailable')
+        def process():
+            observation = self._known_container(container_id, 'running', deadline)
+            image = self._container_images.get(container_id)
+            if type(image) is not VerifiedImage or observation.selected_image.image_config_id != image.image_config_id:
+                raise DaemonBackendError('gate health unavailable')
+            self._assert_runner(deadline)
+            data = self._json('GET', self._route('/containers/' + container_id + '/json'),
+                              deadline, expected_status=200, limit=_MAX_JSON)
+            state = data.get('State') if type(data) is dict else None
+            if (type(data) is not dict or data.get('Id') != container_id or data.get('Image') != image.image_config_id
+                    or type(state) is not dict or state.get('Running') is not True or state.get('Status') != 'running'
+                    or state.get('Paused') is not False or state.get('Restarting') is not False
+                    or state.get('Dead') is not False or type(state.get('Pid')) is not int or state['Pid'] <= 0):
+                raise DaemonBackendError('gate health unavailable')
+            self._assert_runner(deadline)
+            return state['Pid']
+        before = process()
+        if (type(probe_timeouts) is not tuple or type(probes) is not tuple or len(probes) != len(probe_timeouts)
+                or any(type(x) is not int or x < 1 for x in probe_timeouts)):
+            raise DaemonBackendError('gate health unavailable')
+        remaining = self._remaining_ms(deadline) - sum(p.startup_grace_ms for p in probes)
+        budgets = []
+        for i, original in enumerate(probe_timeouts):
+            budget = min(original, remaining - (len(probe_timeouts) - i - 1))
+            if budget < 1 or (any(p.startup_grace_ms for p in probes) and budget != original):
+                raise DaemonBackendError('gate health budget unavailable')
+            budgets.append(budget); remaining -= budget
+        result = self.run_compiled_probes(container_id, probes, operation_id, tuple(budgets))
+        after = process()
+        wall_end, monotonic_end = time.time(), time.monotonic()
+        self._remaining(deadline)
+        if (before != after or not all(math.isfinite(x) for x in (wall_end, monotonic_end))
+                or wall_end < wall_start or monotonic_end < monotonic_start
+                or abs((wall_end - wall_start) - (monotonic_end - monotonic_start)) > 1):
+            raise DaemonBackendError('gate health unavailable')
+        return GateHealthObservation(result, before, int(wall_start * 1000), int(wall_end * 1000),
+                                     int((monotonic_end - monotonic_start) * 1000))
 
     def run_compiled_probes(self, container_id: str, probes: tuple[Probe, ...],
                             operation_id: str, timeout_ms: tuple[int, ...]) -> ProbeObservation:

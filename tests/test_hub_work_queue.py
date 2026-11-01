@@ -51,6 +51,54 @@ def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):
         q.get_job(str(uuid.uuid4()))
 
 
+def test_machine_reservation_read_is_unbounded_by_job_listing_and_never_expires(setup_queue):
+    q, clock, repo, _ = setup_queue
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'not_reserved'
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    with repo._connection() as db:
+        before = db.execute('SELECT MAX(sequence) FROM hub_outbox').fetchone()[0]
+    assert q.machine_reservation('machine-one') == dict(machine_id='machine-one',
+        queue_reservation='active', requires_reconciliation=False)
+    clock[0] += 10
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'held'
+    assert q.get_job(job['id'])['state'] == 'claimed'
+    with repo._connection() as db:
+        assert db.execute('SELECT MAX(sequence) FROM hub_outbox').fetchone()[0] == before
+    finish_args = dict(job_id=claimed['id'], worker=w('codex'), fence=claimed['fence'])
+    with pytest.raises(HubError):
+        q.complete(**finish_args, outcome='failed')
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_jobs SET state='held' WHERE id=?", (job['id'],))
+    assert q.machine_reservation('machine-one')['requires_reconciliation'] is True
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_work_jobs SET fence=fence+1 WHERE id=?', (job['id'],))
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_machines SET job_id='missing' WHERE machine_id='machine-one'")
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    assert q.machine_reservation('machine-one')['requires_reconciliation'] is None
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_machines SET job_id=NULL WHERE machine_id='machine-one'")
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_jobs SET state='failed' WHERE id=?", (job['id'],))
+        db.execute("UPDATE hub_work_machines SET generation=-1 WHERE machine_id='machine-one'")
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_machines SET generation=0,job_id=? WHERE machine_id='machine-one'", (job['id'],))
+        db.execute("UPDATE hub_work_jobs SET state='held',fence=0 WHERE id=?", (job['id'],))
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    with repo._transaction() as db:
+        db.execute("UPDATE hub_work_machines SET generation=? ,job_id=? WHERE machine_id='machine-one'",
+                   (claimed['fence'], job['id']))
+        db.execute("UPDATE hub_work_jobs SET state='claimed',fence=?,lease_until=NULL WHERE id=?",
+                   (claimed['fence'], job['id']))
+    assert q.machine_reservation('machine-one')['queue_reservation'] == 'unknown'
+    with pytest.raises(HubError, match='work_machine_not_found'):
+        q.machine_reservation('unknown-machine')
+
+
 def test_live_admission_rechecks_policy_target_registry_and_ownership(setup_queue):
     q, clock, _, _ = setup_queue
     submit(q)
@@ -139,6 +187,28 @@ def test_idempotence_full_target_and_capacity(setup_queue):
         submit(q, target=target())
     with pytest.raises(HubError, match='work_queue_capacity'):
         submit(q, 'two')
+
+
+@pytest.mark.parametrize('changed', ['target_policy', 'task_scope'])
+def test_lost_submit_response_can_be_retried_after_admission_changes(setup_queue, monkeypatch, changed):
+    queue, _, repo, _ = setup_queue
+    work = target()
+    original = submit(queue, target=work)
+    verifier_calls = []
+    if changed == 'target_policy':
+        queue.target_verifier = lambda *args: verifier_calls.append(args) or False
+    else:
+        monkeypatch.setattr(repo, 'task_allows_environment', lambda *args, **kwargs: False)
+    # This is a readback of the original durable job, not renewed admission.
+    assert submit(queue, target=work) == original
+    assert verifier_calls == []
+    with pytest.raises(HubError, match='work_request_conflict'):
+        submit(queue, target=target())
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        submit(queue, 'new-request', target=work)
+    assert queue.claim(worker=w('codex')) is None
+    with repo._connection() as db:
+        assert db.execute('SELECT count(*) FROM hub_work_jobs').fetchone()[0] == 1
 
 
 def test_production_verifier_receives_exact_immutable_target(setup_queue):

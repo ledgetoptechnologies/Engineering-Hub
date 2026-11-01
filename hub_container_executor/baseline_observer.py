@@ -60,7 +60,7 @@ class BaselineObserver:
     def __init__(self, manifest, *, backend, record_store, metadata_store,
                  provenance_verifier, secret_resolver, snapshot, generation_root,
                  source_generation_id, frozen_leaf, container_id, owner_guard,
-                 allow_ephemeral_test_storage=False):
+                 allow_ephemeral_test_storage=False, baseline_gate_enrollment=None, baseline_gate_public_key=None):
         try:
             _require(type(manifest) is PilotManifest and type(backend) is DockerEngineBackend
                      and backend._using_test_transport is False
@@ -92,6 +92,18 @@ class BaselineObserver:
             self.provenance_verifier, self.secret_resolver = provenance_verifier, secret_resolver
             self.generation_id, self.frozen_leaf, self.container_id = source_generation_id, frozen_leaf, container_id
             self.owner_guard, self._test_storage = owner_guard, allow_ephemeral_test_storage
+            _require((baseline_gate_enrollment is None) == (baseline_gate_public_key is None))
+            self._gate_enrollment = self._gate_key = None
+            if baseline_gate_enrollment is not None:
+                from .baseline_gate_enrollment import verify_baseline_gate_enrollment
+                gate = verify_baseline_gate_enrollment(baseline_gate_enrollment, baseline_gate_public_key)
+                _require(gate['manifest_digest'] == self.manifest.digest()
+                         and gate['image_config_id'] == self.manifest.rollback.image_config_id
+                         and gate['container_id'] == self.container_id and gate['generation_id'] == self.generation_id
+                         and backend._gate_mount_verifier is not None
+                         and backend._gate_mount_verifier.source_directory == gate['gate_socket_directory'])
+                self._gate_enrollment = json.loads(json.dumps(baseline_gate_enrollment))
+                self._gate_key = bytes(baseline_gate_public_key)
             self._pid, self._attempted = os.getpid(), False
         except Exception:
             raise BaselineObservationError('explicit_baseline_observer_configuration_required') from None
@@ -196,14 +208,32 @@ class BaselineObserver:
                          and not any(ord(char) < 32 or ord(char) == 127 for char in value))
                 secrets[name] = value
                 self._scope(deadline)
-            profile = derive_runtime_profile(self.manifest, defaults, self.generation_id, secrets)
+            gate = None
+            if self._gate_enrollment is not None:
+                from .baseline_gate_enrollment import verify_baseline_gate_enrollment
+                gate = verify_baseline_gate_enrollment(self._gate_enrollment, self._gate_key)
+            profile = derive_runtime_profile(self.manifest, defaults, self.generation_id, secrets,
+                                             gate_socket_directory=gate['gate_socket_directory'] if gate else None)
+            if gate is not None:
+                from .application_gate_enrollment import STATIC_ENTRYPOINT
+                _require(defaults.entrypoint == STATIC_ENTRYPOINT and defaults.command == ()
+                         and runtime_profile_digest(profile) == gate['runtime_profile_digest'])
             expected_image = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest,
                                                   image.image_config_id, image.platform)
             def container():
+                authority = None
+                if gate is not None:
+                    authority = self.backend._gate_mount_verifier.verify_current(
+                        image, timeout_ms=self._budget(deadline, self.manifest.timeouts.inspect_ms))
+                    self._scope(deadline)
                 actual = self._call(deadline, self.backend.inspect_container, self.container_id)
                 _require(type(actual) is ContainerObservation and actual.container_id == self.container_id
                          and actual.selected_image == expected_image and actual.profile == profile
                          and actual.state_generation_id == self.generation_id and actual.status == 'running')
+                if gate is not None:
+                    _require(self.backend._gate_mount_verifier.verify_current(
+                        image, timeout_ms=self._budget(deadline, self.manifest.timeouts.inspect_ms)) == authority)
+                    self._scope(deadline)
             container()
             _require(self._storage(root_fd, root_identity, generation_fd, generation_identity, deadline) == frozen_identity)
             probes = self.manifest.probes.rollback
@@ -238,6 +268,9 @@ class BaselineObserver:
                 observation=dict(health='healthy', evidence_verified=True, observed_at=int(now)),
                 baseline_inventory=[dict(name=name, size_bytes=size, digest=digest)
                                     for name, size, digest in self.snapshot.source_inventory])
+            if gate is not None:
+                row['schema'] = 'hub_baseline_receipt_v2'
+                row['gate_enrollment'] = self._gate_enrollment
             raw = json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
             _require(len(raw) <= 65536)
             self._scope(deadline)

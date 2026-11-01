@@ -7,6 +7,7 @@ This helper creates no files, enrollments, providers, sockets or authority.
 from dataclasses import dataclass
 import hashlib
 import json
+from pathlib import PurePosixPath
 
 from .installed_runner import parse_configuration
 from .runtime_identity import ExecutorReleaseEnrollment
@@ -39,3 +40,117 @@ def configuration_commitment(raw: bytes) -> ConfigurationCommitment:
     return ConfigurationCommitment(
         'sha256:' + hashlib.sha256(DOMAIN + canonical).hexdigest(),
         'sha256:' + hashlib.sha256(raw).hexdigest(), parsed.release)
+
+
+COORDINATOR_DOMAIN = b'engineering-hub.coordinator-configuration-commitment.v1\x00'
+
+
+@dataclass(frozen=True)
+class CoordinatorConfigurationCommitment:
+    content_digest: str
+    raw_digest: str
+    manifest_digest: str
+
+
+def coordinator_configuration_commitment(raw: bytes) -> CoordinatorConfigurationCommitment:
+    """Commit the exact closed coordinator config, including its pilot manifest.
+
+    This is not enrollment or process proof. A trusted launch authority must pin
+    both digests in a signed profile and root policy, respectively. The current
+    supervisor continues to refuse coordinator launch until pair trust exists.
+    """
+    from .installed_coordinator import parse_configuration as parse_coordinator
+    parsed = parse_coordinator(raw)
+    return CoordinatorConfigurationCommitment(
+        'sha256:' + hashlib.sha256(COORDINATOR_DOMAIN + raw).hexdigest(),
+        'sha256:' + hashlib.sha256(raw).hexdigest(), parsed.manifest.digest())
+
+
+def trusted_local_coordinator_commitment(profile, config_raw: bytes, enrollment_raw: bytes):
+    """Cross-check signed profile bytes and independently captured local inputs.
+
+    This pure validation is not wired to the refused supervisor launch path and
+    does not prove host custody, mount identity or operator approval.
+    """
+    return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,'trusted-local-coordinator-v1')
+
+
+def _trusted_local_coordinator_commitment(profile, config_raw, enrollment_raw, expected_role):
+    from engineering_hub.executor_launch_profile import (ExecutorLaunchProfile,
+        TRUSTED_LOCAL_COORDINATOR_TARGETS, verify_profile_bytes)
+    from engineering_hub.trusted_queued_session import parse_enrollment, SCHEMA_V3
+    from .installed_coordinator import parse_configuration as parse_coordinator
+    if type(profile) is not ExecutorLaunchProfile or profile.role != expected_role:
+        raise ValueError('trusted local coordinator commitment invalid')
+    try:
+        if ExecutorLaunchProfile.model_validate(profile.enrollment_value()) != profile:
+            raise ValueError()
+        config = parse_coordinator(config_raw)
+        enrollment = parse_enrollment(enrollment_raw)
+        executor_profile = verify_profile_bytes(enrollment.profile_bytes, enrollment.release.launch_profile_digest)
+        mounts = {mount.role: mount for mount in profile.mounts}
+        targets = TRUSTED_LOCAL_COORDINATOR_TARGETS
+        require = (
+            config.auth.human_auth_mode == 'github' and config.auth.github_client_secret == ''
+            and enrollment.schema == SCHEMA_V3
+            and enrollment.operator_actor == f'human:{config.auth.beau_github_id}'
+            and enrollment.machine_id == 'staging-pc'
+            and enrollment.target_id == config.manifest.target_id
+            and enrollment.manifest_digest == config.manifest.digest()
+            and enrollment.release.implementation_commit == config.manifest.driver.implementation_commit
+            and enrollment.release.platform == config.manifest.runner_binding.platform
+            and enrollment.launch.engine_id == config.manifest.runner_binding.daemon_identity
+            and profile.daemon_policy.engine_id == enrollment.launch.engine_id
+            and executor_profile.broker_mode is None and executor_profile.role is None
+            and executor_profile.command_channel is None and executor_profile.daemon_policy is not None
+            and executor_profile.daemon_policy.engine_id == enrollment.launch.engine_id
+            and executor_profile.daemon_policy == profile.daemon_policy
+            and PurePosixPath(config.database).parent == PurePosixPath(targets['local_state'])
+            and PurePosixPath(config.coordinator_socket).parent == PurePosixPath(targets['local_browser_directory'])
+            and PurePosixPath(config.executor_socket).parent == PurePosixPath(targets['local_executor_directory'])
+            and config.secret_root == targets['local_secrets']
+            and mounts['local_config'].content_digest == 'sha256:' + hashlib.sha256(config_raw).hexdigest()
+            and mounts['local_enrollment'].content_digest == 'sha256:' + hashlib.sha256(enrollment_raw).hexdigest())
+        if not require:
+            raise ValueError()
+        return coordinator_configuration_commitment(config_raw)
+    except Exception:
+        raise ValueError('trusted local coordinator commitment invalid') from None
+
+
+def supervised_local_coordinator_commitment(profile, config_raw: bytes, enrollment_raw: bytes,
+                                             admission_raw: bytes, *, root_raw_digest: str,
+                                             independent_release):
+    """Bind all captured coordinator inputs to independently protected pins.
+
+    This pure check grants no launch authority or mount custody. The root-owned
+    supervisor policy must independently supply the raw digest and complete
+    coordinator release; neither may come from the admission being checked.
+    """
+    from engineering_hub.executor_launch_profile import ExecutorLaunchProfile
+    from .coordinator_admission import admission_commitment, parse_admission
+    from .runtime_identity import CoordinatorReleaseEnrollment
+    try:
+        if (type(profile) is not ExecutorLaunchProfile or profile.role not in ('supervised-local-coordinator-v2','supervised-local-coordinator-v3')
+            or type(independent_release) is not CoordinatorReleaseEnrollment): raise ValueError()
+        expected=CoordinatorReleaseEnrollment(**{name:getattr(independent_release,name)
+                    for name in CoordinatorReleaseEnrollment.__dataclass_fields__})
+        commitment,raw_digest=admission_commitment(admission_raw)
+        admission=parse_admission(admission_raw)
+        mounts={mount.role:mount for mount in profile.mounts}
+        if (type(root_raw_digest) is not str or raw_digest!=root_raw_digest
+            or mounts['local_admission'].content_digest!=commitment
+            or admission.release!=expected or expected.launch_profile_digest!=profile.digest()
+            or admission.config_digest!='sha256:'+hashlib.sha256(config_raw).hexdigest()
+            or admission.session_digest!='sha256:'+hashlib.sha256(enrollment_raw).hexdigest()): raise ValueError()
+        if profile.role=='supervised-local-coordinator-v3':
+            from .installed_coordinator import parse_configuration
+            config=parse_configuration(config_raw); oauth=admission.oauth_broker
+            digests=[digest for slot,version,digest in config.bindings if (slot,version)==config.roles.get('github')]
+            if (oauth is None or len(digests)!=1 or oauth.client_id!=config.auth.github_client_id
+                or oauth.origin!=config.auth.origin or oauth.secret_digest!=digests[0]
+                or oauth.socket_path!=mounts['local_oauth_socket'].target):raise ValueError()
+        elif admission.oauth_broker is not None:raise ValueError()
+        return _trusted_local_coordinator_commitment(profile,config_raw,enrollment_raw,profile.role)
+    except Exception:
+        raise ValueError('supervised local coordinator commitment invalid') from None

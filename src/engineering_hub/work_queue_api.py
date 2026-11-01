@@ -11,6 +11,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from agent_message_bus import session_hub_context as session_context
 
 from .repository import AGENTS, HubError
 from .work_queue import WorkTarget, WorkWorker
@@ -107,10 +108,16 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
         raise HubError('work_queue_not_configured', 423)
     task = repo.get_task(payload.target.task_id)
     review = task.get('review')
-    if task.get('owner') != principal:
+    if task.get('owner') != principal or not session_context.continuation_allowed(task, principal):
         raise HubError('forbidden', 403)
     if queue.action_project(payload.action_key) != task.get('project'):
         raise HubError('work_project_mismatch', 403)
+    target = WorkTarget(**payload.target.model_dump())
+    existing = queue.existing_submission(actor=principal, request_id=payload.request_id,
+        action_key=payload.action_key, environment=payload.environment,
+        target=target, approval_id=payload.approval_id, require_task_owner=True)
+    if existing is not None:
+        return existing
     if (task.get('status') != 'verified' or task.get('candidate_commit') != payload.target.source_commit
             or type(review) is not dict or review.get('verdict') != 'approve'
             or review.get('actor') not in AGENTS or review.get('actor') == principal
@@ -118,7 +125,7 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
         raise HubError('review_required', 409)
     return queue.submit(actor=principal, request_id=payload.request_id,
                         action_key=payload.action_key, environment=payload.environment,
-                        target=WorkTarget(**payload.target.model_dump()), approval_id=payload.approval_id)
+                        target=target, approval_id=payload.approval_id, require_task_owner=True)
 
 
 def _authorization(request):
@@ -154,6 +161,11 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
     def jobs(request: Request, limit: int = Query(default=50, ge=1, le=100)):
         identity(request, actor)
         return {'items': configured().status(limit=limit)['jobs']}
+
+    @app.get('/api/hub/v1/work/machines/{machine_id}')
+    def machine_reservation(machine_id: Key, request: Request):
+        identity(request, actor)
+        return configured().machine_reservation(machine_id)
 
     @app.get('/api/hub/v1/work/jobs/{job_id}')
     def get_job(job_id: JobID, request: Request):

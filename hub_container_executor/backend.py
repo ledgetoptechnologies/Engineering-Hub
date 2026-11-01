@@ -93,6 +93,16 @@ class ProbeObservation:
 
 
 @dataclass(frozen=True)
+class GateHealthObservation:
+    """Bounded pre-finish probe bracketed by daemon PID inspections."""
+    probe: ProbeObservation
+    daemon_pid: int
+    started_at_ms: int
+    finished_at_ms: int
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
 class OperationObservation:
     operation_id: str
     state: Literal["pending", "unknown", "completed", "terminal_failed"]
@@ -109,6 +119,7 @@ class BaselineIdentity:
     state_generation_id: str
     healthy_at_enrollment: bool
     proof_id: str
+    gate_socket_directory: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,12 +158,16 @@ class PilotBackend(Protocol):
     def inspect_runner(self, timeout_ms: int) -> RunnerObservation: ...
     def inspect_image(self, image: VerifiedImage, timeout_ms: int) -> ImageDefaults: ...
     def inspect_container(self, container_id: str, timeout_ms: int) -> ContainerObservation | None: ...
+    def restore_container_context(self, plan: ContainerPlan, operation_id: str,
+                                  container_id: str, timeout_ms: int) -> ContainerObservation: ...
     def create_container(self, plan: ContainerPlan, operation_id: str,
                          timeout_ms: int) -> str: ...
     def start_container(self, container_id: str, operation_id: str, timeout_ms: int) -> None: ...
     def stop_container(self, container_id: str, operation_id: str, timeout_ms: int) -> None: ...
     def run_compiled_probes(self, container_id: str, probes: tuple[Probe, ...],
                             operation_id: str, timeout_ms: tuple[int, ...]) -> ProbeObservation: ...
+    def run_gate_health(self, container_id: str, probes: tuple[Probe, ...], operation_id: str,
+                        probe_timeouts: tuple[int, ...], total_timeout_ms: int) -> GateHealthObservation: ...
     def inspect_operation(self, operation_id: str, timeout_ms: int) -> OperationObservation: ...
 
 

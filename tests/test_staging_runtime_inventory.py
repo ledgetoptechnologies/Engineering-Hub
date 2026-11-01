@@ -366,3 +366,179 @@ def test_collector_wheel_entrypoint_uses_single_packaged_implementation():
     launcher = Path('scripts/collect_staging_runtime.py').read_text()
     assert 'from hub_staging_service.collector import main' in launcher
     assert 'collect_host' not in launcher and 'publish_host' not in launcher
+
+@pytest.mark.parametrize(('failure', 'expected'), [
+    ('docker_capture', 'staging_runtime_docker_capture_failed'),
+    ('docker_parse', 'staging_runtime_docker_parse_failed'),
+    ('service_capture', 'staging_runtime_service_capture_failed'),
+    ('service_parse', 'staging_runtime_service_parse_failed'),
+])
+def test_host_failure_diagnostic_is_fixed_and_snapshot_fail_closed(failure, expected):
+    secret = 'SECRET /private/path credential-and-service-name'
+    messages = []
+    def capture(command):
+        if command == inventory.HOST_DOCKER_COMMAND:
+            if failure == 'docker_capture':
+                raise RuntimeError(secret)
+            return secret.encode() if failure == 'docker_parse' else wire(container())
+        if failure == 'service_capture':
+            raise RuntimeError(secret)
+        return secret.encode() if failure == 'service_parse' else b'[]'
+    result = inventory.collect_host(now=NOW, capture=capture, diagnostic=messages.append)
+    assert messages == [expected]
+    assert result == {'schema': inventory.SCHEMA, 'observed_at': inventory._timestamp(NOW),
+                      'sources': [inventory._source('host', 'unavailable')],
+                      'containers': [], 'services': []}
+    assert secret not in json.dumps(result) + str(messages)
+
+
+def test_host_success_has_no_failure_diagnostic_and_diagnostic_failure_is_safe():
+    messages = []
+    result = inventory.collect_host(now=NOW, capture=lambda command: b'' if command == inventory.HOST_DOCKER_COMMAND else b'[]',
+                                    diagnostic=messages.append)
+    assert result['sources'][0]['state'] == 'observed'
+    assert messages == []
+    def broken(_):
+        raise RuntimeError('SECRET')
+    result = inventory.collect_host(now=NOW, capture=lambda command: (_ for _ in ()).throw(ValueError('SECRET')),
+                                    diagnostic=broken)
+    assert result['sources'][0]['state'] == 'unavailable'
+    assert 'SECRET' not in json.dumps(result)
+
+
+def test_collector_emits_only_fixed_stage_to_stderr(monkeypatch, capsys):
+    from hub_staging_service import collector
+    monkeypatch.setattr(collector.os, 'geteuid', lambda: 0, raising=False)
+    monkeypatch.setattr(sys, 'argv', ['collector', '--output', '/synthetic/path', '--once'])
+    monkeypatch.setattr(collector, 'publish_host', lambda snapshot, path: None)
+    def collect(*, diagnostic):
+        diagnostic('staging_runtime_docker_capture_failed')
+        return {}
+    monkeypatch.setattr(collector, 'collect_host', collect)
+    assert collector.main() == 0
+    assert capsys.readouterr().err == 'staging_runtime_docker_capture_failed\n'
+
+
+def test_host_snapshot_size_failure_has_fixed_diagnostic(monkeypatch):
+    monkeypatch.setattr(inventory, 'MAX_BYTES', 8)
+    codes = []
+    result = inventory.collect_host(now=NOW, capture=lambda command: b'' if command == inventory.HOST_DOCKER_COMMAND else b'[]',
+                                    diagnostic=codes.append)
+    assert codes == ['staging_runtime_snapshot_size_failed']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert result['containers'] == result['services'] == []
+
+
+@pytest.mark.skipif(os.name != 'posix' or getattr(os, 'geteuid', lambda: -1)() != 0,
+                    reason='requires root POSIX protected temporary directory')
+def test_collector_main_publishes_real_fail_closed_snapshot(monkeypatch, capsys):
+    from hub_staging_service import collector
+    secret = 'SECRET /private/path credential-and-service-name'
+    with tempfile.TemporaryDirectory(prefix='eh-runtime-test-', dir='/root') as name:
+        path = Path(name) / 'snapshot.json'
+        monkeypatch.setattr(sys, 'argv', ['collector', '--output', str(path), '--once'])
+        def capture(command):
+            assert command == inventory.HOST_DOCKER_COMMAND
+            raise RuntimeError(secret)
+        def real_collect(*, diagnostic):
+            return inventory.collect_host(now=NOW, capture=capture, diagnostic=diagnostic)
+        monkeypatch.setattr(collector, 'collect_host', real_collect)
+        assert collector.main() == 0
+        output = capsys.readouterr()
+        assert output.out == ''
+        assert output.err == 'staging_runtime_docker_capture_failed\n'
+        snapshot = json.loads(path.read_text())
+        assert snapshot['sources'] == [inventory._source('host', 'unavailable')]
+        assert snapshot['containers'] == snapshot['services'] == []
+        assert secret not in output.err + path.read_text()
+
+@pytest.mark.parametrize('kind', ['spawn', 'timeout', 'overflow', 'reader', 'exit'])
+def test_capture_failure_subcodes_are_fixed_and_snapshot_stays_unavailable(monkeypatch, kind):
+    secret = 'SECRET-command-output-and-path'
+    child = CapturedProcess(b'x' * 5 if kind == 'overflow' else b'', running=kind == 'timeout')
+    if kind == 'exit':
+        child.returncode = 17
+    if kind == 'reader':
+        class BrokenStream(io.BytesIO):
+            def read(self, size):
+                raise OSError(secret)
+        child.stdout = BrokenStream()
+    def start(*args, **kwargs):
+        if kind == 'spawn':
+            raise OSError(secret)
+        return child
+    monkeypatch.setattr(subprocess, 'Popen', start)
+    if kind == 'timeout':
+        ticks = iter([0, 9])
+        monkeypatch.setattr(inventory.time, 'monotonic', lambda: next(ticks))
+    messages = []
+    def capture(command):
+        return inventory.capture_fixed(command, maximum=4)
+    result = inventory.collect_host(now=NOW, capture=capture, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_' + kind]
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert result['containers'] == result['services'] == []
+    assert secret not in str(messages) + json.dumps(result)
+
+
+def test_capture_failure_service_subcode_and_untrusted_error_fallback():
+    messages = []
+    def capture(command):
+        if command == inventory.HOST_DOCKER_COMMAND:
+            return b''
+        raise inventory._CaptureFailure('exit')
+    result = inventory.collect_host(now=NOW, capture=capture, diagnostic=messages.append)
+    assert messages == ['staging_runtime_service_capture_failed_exit']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    messages.clear()
+    def untrusted(command):
+        raise RuntimeError('SECRET')
+    inventory.collect_host(now=NOW, capture=untrusted, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed']
+
+
+def test_capture_internal_failure_emits_fixed_subcode_and_reaps(monkeypatch):
+    child = CapturedProcess(b'', running=True)
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    def broken_thread(**kwargs):
+        raise RuntimeError('SECRET lifecycle detail')
+    monkeypatch.setattr(inventory.threading, 'Thread', broken_thread)
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_internal']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.killed and child.wait_count == 1 and child.stdout.closed
+    assert 'SECRET' not in str(messages) + json.dumps(result)
+
+
+def test_capture_reader_close_failure_is_silent_and_fails_closed(monkeypatch, capsys):
+    class BrokenClose(io.BytesIO):
+        def close(self):
+            super().close()
+            raise OSError('SECRET close detail')
+    child = CapturedProcess(b'')
+    child.stdout = BrokenClose()
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_reader']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.stdout.closed and child.wait_count >= 1
+    assert 'SECRET' not in str(messages) + json.dumps(result) + capsys.readouterr().err
+
+
+def test_capture_unstarted_reader_close_failure_stays_internal(monkeypatch, capsys):
+    class BrokenClose(io.BytesIO):
+        def close(self):
+            super().close()
+            raise OSError('SECRET close detail')
+    child = CapturedProcess(b'', running=True)
+    child.stdout = BrokenClose()
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: child)
+    monkeypatch.setattr(inventory.threading, 'Thread', lambda **kwargs: (_ for _ in ()).throw(RuntimeError('SECRET')))
+    messages = []
+    result = inventory.collect_host(now=NOW, diagnostic=messages.append)
+    assert messages == ['staging_runtime_docker_capture_failed_internal']
+    assert result['sources'] == [inventory._source('host', 'unavailable')]
+    assert child.killed and child.wait_count == 1 and child.stdout.closed
+    assert 'SECRET' not in str(messages) + json.dumps(result) + capsys.readouterr().err

@@ -426,3 +426,15 @@ async def test_concrete_factory_runs_in_owned_listener_and_exits_off_loop(rig):
     assert observed["exit_thread"] != main_thread
     assert observed["adapter"]._closed and observed["adapter"].backend._client.is_closed
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
+
+
+@pytest.mark.parametrize('options', [
+    {'baseline_gate_public_key': b'x' * 32},
+    {'baseline_gate_mount_verifier': object()},
+    {'baseline_gate_public_key': b'x' * 31, 'baseline_gate_mount_verifier': object()},
+])
+def test_baseline_v2_requires_both_independent_authorities(rig, options):
+    with pytest.raises(module.LocalResourcesError):
+        with build(rig, **options):
+            pass
+    assert not rig.constructed

@@ -831,3 +831,71 @@ async def test_changed_runtime_policy_has_new_digest_and_cannot_advance_old_run(
         rows = db.execute('SELECT manifest_digest,binding FROM hub_container_pilot_manifest_views').fetchall()
     assert {row['manifest_digest'] for row in rows} == {MANIFEST, changed_target.manifest_digest}
     assert json.loads(next(row['binding'] for row in rows if row['manifest_digest'] == MANIFEST))['canonical_manifest'] == target.canonical_manifest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase,state', [
+    ('smoke_container', 'succeeded'), ('smoke_container', 'failed'),
+    ('smoke_container_rollback', 'succeeded'), ('smoke_container_rollback', 'failed'),
+])
+async def test_smoke_container_mismatch_holds_before_following_effect(repo, target, phase, state):
+    class MismatchedClient(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if command.action == phase:
+                return response.model_copy(update={'state': state, 'evidence':
+                    response.evidence.model_copy(update={'container_id': '1' * 64})})
+            return response
+    outcomes = {'smoke_container': 'failed'} if phase == 'smoke_container_rollback' else {}
+    client = MismatchedClient(outcomes)
+    workflow, run = ready_run(repo, target, client)
+    result = await workflow.advance(run['id'])
+    assert result['status'] == 'held'
+    expected = ACTIONS[:2] if phase == 'smoke_container' else ACTIONS[:4]
+    assert [item.action for item in client.submissions] == expected
+    with repo._connection() as db:
+        assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                          (run['id'], phase)).fetchone()['state'] == 'held'
+
+
+@pytest.mark.asyncio
+async def test_saved_smoke_response_is_rechecked_against_deployment(repo, target):
+    client = FakeClient()
+    workflow, run = ready_run(repo, target, client)
+    assert (await workflow.advance(run['id']))['status'] == 'succeeded'
+    with repo._transaction() as db:
+        row = db.execute('SELECT response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                         (run['id'], 'smoke_container')).fetchone()
+        payload = json.loads(row['response_json'])
+        payload['evidence']['container_id'] = '1' * 64
+        db.execute('UPDATE hub_container_pilot_commands SET response_json=? WHERE run_id=? AND action=?',
+                   (json.dumps(payload), run['id'], 'smoke_container'))
+    assert await workflow._command(run, target, 'smoke_container') == 'held'
+    assert len(client.submissions) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_smoke_without_container_can_take_original_rollback_path(repo, target):
+    class NoContainerFailure(FakeClient):
+        def response(self, command):
+            response = super().response(command)
+            if command.action == 'smoke_container':
+                return response.model_copy(update={'state': 'failed', 'evidence':
+                    response.evidence.model_copy(update={'container_id': None})})
+            return response
+    client = NoContainerFailure()
+    workflow, run = ready_run(repo, target, client)
+    assert (await workflow.advance(run['id']))['status'] == 'rolled_back'
+    assert [item.action for item in client.submissions] == ACTIONS
+
+
+@pytest.mark.asyncio
+async def test_legacy_terminal_smoke_without_receipt_stays_held(repo, target):
+    client = FakeClient()
+    workflow, run = ready_run(repo, target, client)
+    assert (await workflow.advance(run['id']))['status'] == 'succeeded'
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_container_pilot_commands SET response_json=NULL WHERE run_id=? AND action=?',
+                   (run['id'], 'smoke_container'))
+    assert await workflow._command(run, target, 'smoke_container') == 'held'
+    assert len(client.submissions) == 2

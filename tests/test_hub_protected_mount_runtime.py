@@ -45,7 +45,7 @@ async def test_fixed_mount_owned_restart_preserves_tasks_and_shared_state(tmp_pa
     (bus_root / 'files').mkdir()
     paths = {'AGENT_BUS_DB': bus_db, 'AGENT_BUS_AUDIT': bus_root / 'audit.jsonl',
              'AGENT_BUS_FILE_ROOT': bus_root / 'files'}
-    auth, assertion = signed_access(monkeypatch)
+    auth, assertion, _diagnostics = signed_access(monkeypatch)
     selected = Settings(database, AuthSettings('test-hermes', 'test-codex',
         claude_token='test-claude', allowed_ips=frozenset({'127.0.0.1'})), auth,
         require_owned_ledger=True)

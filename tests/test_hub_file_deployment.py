@@ -41,6 +41,27 @@ def test_file_settings_override_only_deployment_values_not_tokens(deployment, mo
     assert result.work_queue_enabled is result.registry_enabled is False
 
 
+def test_github_file_settings_resolve_only_secret_from_existing_environment(deployment, monkeypatch):
+    from dataclasses import replace
+    from engineering_hub.auth import AuthConfig
+    config, _ = deployment
+    config = replace(config, auth_config=AuthConfig('https://hub.example', human_auth_mode='github',
+        github_client_id='Iv1_public-fixture', beau_github_id=42))
+    monkeypatch.setenv('HUB_GITHUB_CLIENT_SECRET', 'synthetic-oauth-secret')
+    monkeypatch.setenv('HUB_GITHUB_CLIENT_ID', 'wrong-client')
+    monkeypatch.setenv('HUB_BEAU_GITHUB_ID', '999')
+    monkeypatch.setenv('HUB_HUMAN_AUTH_MODE', 'cloudflare_access')
+    result = Settings.from_env(config)
+    assert result.auth_config.human_auth_mode == 'github'
+    assert result.auth_config.github_client_id == 'Iv1_public-fixture'
+    assert result.auth_config.beau_github_id == 42
+    assert result.auth_config.github_client_secret == 'synthetic-oauth-secret'
+    assert config.auth_config.github_client_secret == ''
+    assert result.agent_auth.codex_token == 'synthetic-file-codex'
+    monkeypatch.delenv('HUB_GITHUB_CLIENT_SECRET')
+    assert Settings.from_env(config).auth_config.github_client_secret == ''
+
+
 def test_config_cli_selects_unified_pair_and_passes_same_typed_config(deployment, monkeypatch):
     from engineering_hub import __main__ as cli, frontends, server, unified_app
     config, path = deployment

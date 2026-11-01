@@ -71,6 +71,23 @@ async def test_public_closed_route_table_never_calls_owner(method, path):
     await run()
 
 
+async def test_github_callback_is_explicit_get_only_and_preserves_query():
+    calls = []
+    async def upstream(request):
+        calls.append(request)
+        return httpx.Response(302, headers={'location': '/done'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = PublicBrowserGateway(client, allow_github=True)
+        path = BASE + '/auth/callback'
+        assert status(await exchange(gateway, path, query=b'code=example&state=nonce')) == 302
+        assert calls[0].url.query == b'code=example&state=nonce'
+        for method in ('HEAD', 'POST', 'PUT'):
+            assert status(await exchange(gateway, path, method=method)) == 403
+        assert status(await exchange(gateway, path + '/')) == 403
+        assert status(await exchange(gateway, path, headers=[(b'authorization', b'Bearer token')])) == 403
+        assert len(calls) == 1
+
+
 async def test_image_version_status_is_read_only_through_closed_gateway():
     calls = []
     async def upstream(request):
@@ -87,6 +104,26 @@ async def test_image_version_status_is_read_only_through_closed_gateway():
             denied = await exchange(gateway, BASE + '/image-versions', method=method)
             assert status(denied) == 403
         assert len(calls) == 1
+
+
+async def test_machine_reservation_route_is_exact_get_only():
+    calls = []
+    async def upstream(request):
+        calls.append((request.method, request.url.path))
+        assert 'authorization' not in request.headers
+        return httpx.Response(200, json={'machine_id': request.url.path.rsplit('/', 1)[-1]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = PublicBrowserGateway(client)
+        valid = ['staging-pc', 'A', 'x' * 128, 'a.b_c:d-1']
+        for machine in valid:
+            response = await exchange(gateway, BASE + '/work/machines/' + machine)
+            assert status(response) == 200
+        assert calls == [('GET', BASE + '/work/machines/' + machine) for machine in valid]
+        for method in ('HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'):
+            assert status(await exchange(gateway, BASE + '/work/machines/staging-pc', method=method)) == 403
+        for suffix in ('', '/x', 'x/', 'x/y', '-bad', '.bad', 'x' * 129, 'bad%2fpath', 'bad path'):
+            assert status(await exchange(gateway, BASE + '/work/machines/' + suffix)) in {400, 403}
+        assert len(calls) == len(valid)
 
 
 async def test_runtime_inventory_reaches_owner_through_read_only_browser_gateway():

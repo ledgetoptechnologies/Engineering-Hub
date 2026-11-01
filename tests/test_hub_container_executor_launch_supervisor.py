@@ -902,6 +902,73 @@ def test_launcher_reserves_exact_single_create_and_start_before_fake_engine_effe
         authority.close()
 
 
+@pytest.mark.parametrize('deny_at', [1, 2, 3])
+def test_v3_pair_authority_checked_before_bind_create_and_start(root_journal, monkeypatch, deny_at):
+    authority,events=synthetic_launcher(root_journal)
+    authority.profile=authority.profile.model_copy(update={'role':'supervised-local-coordinator-v3'})
+    checks=[]
+    def check(_):
+        checks.append(len(authority._engine.effect_calls))
+        if len(checks)==deny_at: raise launch.LaunchSupervisorError()
+    monkeypatch.setattr(authority,'_check_retained_pair',check)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError): authority.launch(retained_pair=object())
+        effects=[route for method,route in authority._engine.effect_calls if method=='POST']
+        assert len(checks)==deny_at
+        assert len(effects)==(1 if deny_at==3 else 0)
+        if effects: assert '/create?' in effects[0]
+        if deny_at==1: assert 'bind-fixture' not in events
+    finally:authority.close()
+
+
+def test_v3_pair_hook_consuming_launch_deadline_denies_bind(root_journal,monkeypatch):
+    import time as real_time
+    authority,events=synthetic_launcher(root_journal)
+    authority.profile=authority.profile.model_copy(update={'role':'supervised-local-coordinator-v3'})
+    clock=SimpleNamespace(offset=0)
+    monkeypatch.setattr(launch,'time',SimpleNamespace(monotonic=lambda:real_time.monotonic()+clock.offset,
+                                                     time=real_time.time,sleep=real_time.sleep))
+    monkeypatch.setattr(authority,'_check_retained_pair',lambda _:setattr(clock,'offset',2))
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):authority.launch(retained_pair=object())
+        assert 'bind-fixture' not in events and authority._engine.effect_calls==[]
+    finally:authority.close()
+
+
+def test_launcher_consumes_enrolled_pair_id_before_create(root_journal):
+    authority, events = synthetic_launcher(root_journal)
+    identity = str(uuid4())
+    class ReservedPair:
+        def _claim(self, supervisor):
+            assert supervisor is authority
+            assert not authority._engine.effect_calls
+            events.append('pair-claim')
+            return identity
+        def _check_launch(self, supervisor):
+            assert supervisor._launch_id == identity
+            assert not supervisor._engine.effect_calls
+    reservation = ReservedPair()
+    authority._pair_reservation = reservation
+    try:
+        assert authority.launch(pair_reservation=reservation) == 'a' * 64
+        assert authority._launch_id == identity
+        assert 'bind-fixture' not in events  # already bound by pair preflight
+        assert 'pair-claim' in events
+        assert any(identity in route for method, route in authority._engine.effect_calls if method == 'POST')
+    finally:
+        authority.close()
+
+
+def test_launcher_rejects_unenrolled_pair_reservation_before_effect(root_journal):
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.launch(pair_reservation=object())
+        assert authority._engine.effect_calls == []
+    finally:
+        authority.close()
+
+
 @pytest.mark.parametrize('failure', ['ambiguous-create', 'ambiguous-start', 'privileged-inspect',
                                    'tag-config', 'wrong-tmpfs', 'invented-tmpfs-entry'])
 def test_fake_effect_ambiguity_or_wrong_effective_profile_holds_without_retry_or_adoption(root_journal, failure):
@@ -1054,6 +1121,17 @@ def test_daemon_pin_rejects_any_host_uid_except_allocated_rootless_pilot(uid):
         launch._DaemonPin('/run/synthetic.sock', 1, 1, uid, 10001, 'synthetic', '1.54')
 
 
+@pytest.mark.parametrize('uid', [0, 10001])
+def test_disjoint_daemon_pin_rejects_root_and_held_account(uid):
+    with pytest.raises(RuntimeError):
+        launch._DaemonPin('/run/synthetic.sock', 1, 1, uid, 10002, 'synthetic', '1.54', disjoint=True)
+
+
+def test_disjoint_daemon_pin_accepts_independently_enrolled_uid():
+    pin = launch._DaemonPin('/run/synthetic.sock', 1, 1, 10002, 10002, 'synthetic', '1.54', disjoint=True)
+    assert pin.uid == 10002
+
+
 def test_fake_engine_missing_rootless_identity_denied_before_image_fetch(short_root):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs, rootless=False) as (pin, requests):
@@ -1095,7 +1173,7 @@ def test_synthetic_kernel_profile_denies_engine_claims_not_supported_by_proc(mut
     if mutation == 'uid-map': uid_map = '0 10001 1\n1 200001 65536\n'
     elif mutation == 'gid-map': gid_map = '0 10001 1\n1 200001 65536\n'
     elif mutation in {'unmapped-group', 'missing-group'}:
-        raw = profile.model_dump(mode='json')
+        raw = profile.enrollment_value()
         raw['supplementary_groups'] = [999999 if mutation == 'unmapped-group' else 10002]
         profile = launch.ExecutorLaunchProfile.model_validate(raw)
     elif mutation == 'extra-group': status['Groups'] += ' 110002'
@@ -1113,7 +1191,7 @@ def test_synthetic_kernel_profile_denies_engine_claims_not_supported_by_proc(mut
 
 def test_synthetic_kernel_profile_translates_declared_supplementary_group():
     profile, status, uid_map, gid_map, mounts = kernel_profile_fixture()
-    raw = profile.model_dump(mode='json')
+    raw = profile.enrollment_value()
     raw['supplementary_groups'] = [10002]
     profile = launch.ExecutorLaunchProfile.model_validate(raw)
     status['Groups'] = '110001 110002'
@@ -1121,11 +1199,12 @@ def test_synthetic_kernel_profile_translates_declared_supplementary_group():
 
 
 @contextmanager
-def root_file_constructor_fixture(short_root, root_journal):
+def root_file_constructor_fixture(short_root, root_journal, *, daemon_policy=None):
     """Actual protected files/journal/proc constructor, synthetic release/key/HTTP.
 
     Fake image is deliberately NOT an approved installed runner; constructor
     must not perform effects or turn these test pins into deployment approval.
+    A daemon_policy is signed into the profile before every digest is derived.
     """
     private = short_root / 'authority'
     private.mkdir(mode=0o700)
@@ -1135,6 +1214,8 @@ def root_file_constructor_fixture(short_root, root_journal):
     _, image, blobs = verified_image()
     with fake_engine_http(short_root, image=image, blobs=blobs) as (pin, requests):
         raw_profile = profile_data(str(short_root / 'hub-pilot-constructor'))
+        if daemon_policy is not None:
+            raw_profile['daemon_policy'] = daemon_policy
         issuer_path = str(short_root / 'issuer' / 'issuer.sock')
         Path(issuer_path).parent.mkdir(mode=0o700)
         issuer = socket.socket(socket.AF_UNIX)
@@ -1193,7 +1274,7 @@ def root_file_constructor_fixture(short_root, root_journal):
         config_path.write_bytes(runner_raw)
         data = dict(schema='executor_launch_supervisor_v2', configuration_raw_digest=commitment.raw_digest,
             release=release_data,
-            image=image_data, profile=profile.model_dump(mode='json'), daemon=asdict(pin),
+            image=image_data, profile=profile.enrollment_value(), daemon=asdict(pin),
             socket_path=issuer_path, consumer_host_uid=110001, consumer_host_gid=110001,
             receipt_lifetime_seconds=30, request_timeout_ms=1000, launch_timeout_ms=1000)
         enrollment, key, journal = private / 'enrollment.json', private / 'signing.key', journal_parent / 'launch.sqlite3'
@@ -1223,6 +1304,366 @@ def test_whole_constructor_reads_protected_root_files_without_engine_effects(sho
             authority.close()
         assert Path(kwargs['signing_key_file']).is_file() and Path(kwargs['enrollment_file']).is_file()
         assert requests == []
+
+
+@pytest.mark.parametrize(('schema', 'uid', 'extra'), [
+    ('executor_launch_supervisor_v2', 10002, False),
+    ('executor_launch_supervisor_v3', 10001, False),
+    ('executor_launch_supervisor_v3', 0, False),
+    ('executor_launch_supervisor_v1', 10002, False),
+    ('executor_launch_supervisor_v4', 10002, False),
+    ('executor_launch_supervisor_v3', 10002, True),
+])
+def test_protected_enrollment_rejects_invalid_daemon_policy(short_root, root_journal, schema, uid, extra):
+    legacy_check = launch._rootless_daemon_uid
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['schema'], data['daemon']['uid'] = schema, uid
+        if extra:
+            data['daemon']['disjoint'] = True
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        # The fake Engine fixture bypasses legacy UID admission; restore the
+        # real check so this exercises the actual protected enrollment parser.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(launch, '_rootless_daemon_uid', legacy_check)
+            with pytest.raises(launch.LaunchSupervisorError):
+                launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+# A separate daemon account 10002 whose namespace maps executor uid 10001 to
+# host 110001, exactly the consumer host identity the fixture enrolls.
+DISJOINT_MAP = [[0, 10002, 1], [1, 100001, 65536]]
+
+
+def held_ranges(**changes):
+    # Synthetic stand-in for an operator attestation about the held account.
+    return {'schema': launch.HELD_RANGES_SCHEMA, 'uid_ranges': [[10001, 1], [200000, 65536]],
+            'gid_ranges': [[10001, 1], [200000, 65536]], 'evidence_sha256': 'c' * 64, **changes}
+
+
+def held_digest(held=None):
+    return 'sha256:' + hashlib.sha256(launch._canonical(held_ranges() if held is None else held)).hexdigest()
+
+
+def disjoint_policy(**changes):
+    return {'kind': 'disjoint-v1', 'engine_id': 'test-daemon', 'daemon_uid': 10002, 'daemon_gid': 10002,
+            'uid_map': deepcopy(DISJOINT_MAP), 'gid_map': deepcopy(DISJOINT_MAP),
+            'held_ranges_digest': held_digest(), **changes}
+
+
+@contextmanager
+def v3_constructor(short_root, root_journal, *, policy=None, held=None, daemon=None, pinned_digest=None):
+    held = held_ranges() if held is None else held
+    # The signed profile names the exact attestation bytes placed below, unless a test pins other bytes.
+    policy = disjoint_policy() if policy is None else policy
+    policy = {**policy, 'held_ranges_digest': pinned_digest or held_digest(held)}
+    with root_file_constructor_fixture(short_root, root_journal, daemon_policy=policy) as (data, kwargs, requests):
+        data['schema'] = 'executor_launch_supervisor_v3'
+        data['daemon'].update({'uid': 10002, 'gid': 10002, **(daemon or {})})
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        held_path = Path(kwargs['enrollment_file']).parent / 'held-ranges.json'
+        held_path.write_bytes(launch._canonical(held))
+        held_path.chmod(0o600)
+        yield data, dict(kwargs, held_ranges_file=str(held_path)), requests
+
+
+def test_v3_protected_enrollment_still_authenticates_engine_peer(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            assert authority._daemon_pin.uid == 10002
+            assert authority.profile.daemon_policy.uid_map == ((0, 10002, 1), (1, 100001, 65536))
+            authority._guard()
+            authority._pin_sources()
+            # Synthetic server runs as root, not the enrolled UID; no HTTP
+            # request can pass the kernel SO_PEERCRED check.
+            with pytest.raises(RuntimeError):
+                authority._engine.json('GET', '/info', time.monotonic() + 1)
+            assert requests == []
+            profile, status, uid_map, gid_map, mounts = kernel_profile_fixture()
+            launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110001, 110001)
+            with pytest.raises(RuntimeError):
+                launch._kernel_profile(profile, status, uid_map, gid_map, mounts, 110002, 110001)
+        finally:
+            authority.close()
+
+
+@pytest.mark.parametrize('mode', ['missing', 'denied', 'authorized'])
+def test_v4_coordinator_constructor_requires_exact_retained_owner_before_journal(short_root, root_journal, monkeypatch, mode):
+    from hub_container_executor.retained_oauth_pair import RetainedOAuthPair
+    from tests.test_executor_launch_profile import supervised_local_oauth_profile
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        data['schema'] = 'coordinator_launch_supervisor_v4'
+        data['admission_raw_digest'] = 'sha256:' + 'd'*64
+        data['profile'] = supervised_local_oauth_profile()
+        data['profile']['daemon_policy'] = disjoint_policy()
+        next(m for m in data['profile']['mounts'] if m['role'] == 'local_issuer_socket')['source'] = data['socket_path']
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        raw = launch._canonical(data); Path(kwargs['enrollment_file']).write_bytes(raw)
+        seen = []
+        monkeypatch.setattr(launch.LaunchSupervisor, '_pin_trusted_local_inputs', lambda self: seen.append('capture'))
+        def authorize(owner, supervisor, *, enrollment_raw, enrollment_digest):
+            assert enrollment_raw == raw and enrollment_digest == 'sha256:' + hashlib.sha256(raw).hexdigest()
+            assert not Path(kwargs['journal_file']).exists() and requests == []
+            seen.append('owner-authorized')
+            if mode == 'denied': raise ValueError('stale owner')
+        monkeypatch.setattr(RetainedOAuthPair, '_authorize_coordinator_construction', authorize, raising=False)
+        if mode == 'missing':
+            with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor(**kwargs)
+            assert seen == [] and not Path(kwargs['journal_file']).exists() and requests == []
+        elif mode == 'denied':
+            owner = object.__new__(RetainedOAuthPair)
+            with pytest.raises(launch.LaunchSupervisorError): launch.LaunchSupervisor(**kwargs, retained_pair=owner)
+            assert seen == ['capture', 'owner-authorized'] and not Path(kwargs['journal_file']).exists() and requests == []
+        else:
+            owner = object.__new__(RetainedOAuthPair)
+            authority = launch.LaunchSupervisor(**kwargs, retained_pair=owner)
+            try:
+                assert seen == ['capture', 'owner-authorized']
+                assert isinstance(authority.release, launch.CoordinatorReleaseEnrollment)
+                assert authority._retained_pair is owner and requests == []
+            finally: authority.close()
+
+
+def test_supervisor_uses_the_one_shared_profile_parser():
+    from engineering_hub import executor_launch_profile as core
+    assert launch.ExecutorLaunchProfile is core.ExecutorLaunchProfile
+    assert launch.ExecutorLaunchMount is core.ExecutorLaunchMount
+    assert launch.DisjointDaemonPolicy is core.DisjointDaemonPolicy
+    assert launch._TARGETS is core.LAUNCH_TARGETS
+    for value in (profile_data(), {**profile_data(), 'daemon_policy': disjoint_policy()}):
+        # The supervisor's own canonical form must stay byte-identical to the shared one.
+        assert launch._canonical(value) == core.canonical(value)
+        raw = core.canonical(value)
+        expected = 'sha256:' + hashlib.sha256(raw).hexdigest()
+        assert core.verify_profile_bytes(raw, expected).digest() == launch.ExecutorLaunchProfile.model_validate(value).digest()
+
+
+@pytest.mark.parametrize('bad', ['garbage\n', '0 10002 1\n', '',
+    # Over Python's int-string limit: must refuse closed, never raise a raw ValueError.
+    '0 10002 1\n1 ' + '9' * 5000 + ' 65536\n', '0 10002 1\n1 10000000000 65536\n'])
+def test_supervisor_map_errors_keep_the_supervisor_error_type(bad):
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    exact = '0 10002 1\n1 100001 65536\n'
+    with pytest.raises(launch.LaunchSupervisorError) as caught:
+        launch._live_maps(policy, bad, exact)
+    assert type(caught.value) is launch.LaunchSupervisorError
+    # The legacy single-id mapper refuses the same oversized fields closed.
+    if '9' * 20 in bad or '10000000000' in bad:
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch._mapped_id(bad, 10001)
+
+
+def test_legacy_profile_digest_bytes_are_unchanged():
+    raw = profile_data()
+    # The digest every existing v2 enrollment, receipt and verifier already pins.
+    legacy = 'sha256:' + hashlib.sha256(launch._canonical(raw)).hexdigest()
+    profile = launch.ExecutorLaunchProfile.model_validate(raw)
+    assert profile.digest() == legacy
+    # The enrolled form is byte-identical to the legacy input and round-trips.
+    assert launch._canonical(profile.enrollment_value()) == launch._canonical(raw)
+    assert launch.ExecutorLaunchProfile.model_validate(profile.enrollment_value()).digest() == legacy
+
+
+def test_legacy_input_still_refuses_an_explicit_null_policy():
+    # Before v3 any unknown key, null included, was refused; that stays true.
+    with pytest.raises(RuntimeError):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': None})
+
+
+def test_policy_is_part_of_the_signed_profile_digest():
+    base = profile_data()
+    legacy = launch.ExecutorLaunchProfile.model_validate(base).digest()
+    disjoint = launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': disjoint_policy()}).digest()
+    assert disjoint != legacy
+    moved = disjoint_policy(uid_map=[[0, 10002, 1], [1, 100002, 65536]])
+    assert launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': moved}).digest() != disjoint
+    # Naming a different held attestation is a different signed profile.
+    other = disjoint_policy(held_ranges_digest=held_digest(held_ranges(evidence_sha256='d' * 64)))
+    assert launch.ExecutorLaunchProfile.model_validate({**base, 'daemon_policy': other}).digest() != disjoint
+
+
+def test_policy_must_name_its_held_attestation():
+    policy = disjoint_policy()
+    del policy['held_ranges_digest']
+    with pytest.raises((RuntimeError, ValueError)):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': policy})
+
+
+def test_v3_constructor_refuses_held_bytes_the_profile_does_not_name(short_root, root_journal):
+    # Equally valid, non-overlapping attestation, but not the one the signed profile pinned.
+    with v3_constructor(short_root, root_journal,
+                        pinned_digest=held_digest(held_ranges(evidence_sha256='d' * 64))) as (data, kwargs, requests):
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+@pytest.mark.parametrize('change', [
+    {'kind': 'disjoint-v2'}, {'engine_id': 'bad id'}, {'daemon_uid': 0}, {'daemon_uid': 10001},
+    {'daemon_uid': 65534}, {'daemon_gid': 10001}, {'daemon_uid': True},
+    {'uid_map': [[0, 10003, 1], [1, 100001, 65536]]},                    # root isn't the daemon account
+    {'uid_map': [[1, 100001, 65536], [0, 10002, 1]]},                    # not canonical order
+    {'uid_map': [[0, 10002, 1], [1, 100001, 65536], [2, 300000, 1]]},    # overlapping inside
+    {'uid_map': [[0, 10002, 1], [1, 10002, 5]]},                         # overlapping outside
+    {'uid_map': [[0, 10002, 1], [1, 5000, 65536]]},                      # reaches held host uid 10001
+    {'gid_map': [[0, 10002, 1], [1, 0, 65536]]},                         # reaches host root
+    {'uid_map': [[0, 10002, 1], [1, 100001, 9000]]},                     # executor uid 10001 unmapped
+    {'uid_map': [[0, 10002, 1]]}, {'uid_map': [[0, 10002, 1]] + [[i, 100000 + i, 1] for i in range(1, 9)]},
+    {'uid_map': [[0, 10002, 1], [1, 100001, True]]}, {'uid_map': [[0, 10002, 1], [1, 100001]]},
+    {'uid_map': [[0, 10002, 1], [1, 2**32 - 10, 65536]]}, {'extra': 1},
+    {'held_ranges_digest': 'c' * 64}, {'held_ranges_digest': 'sha256:' + 'C' * 64}, {'held_ranges_digest': None},
+])
+def test_policy_refuses_unsafe_or_ambiguous_maps(change):
+    # LaunchSupervisorError is a RuntimeError; pydantic's ValidationError is a ValueError.
+    with pytest.raises((RuntimeError, ValueError)):
+        launch.ExecutorLaunchProfile.model_validate({**profile_data(), 'daemon_policy': disjoint_policy(**change)})
+
+
+def test_live_maps_need_exact_equality_with_the_policy():
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    exact = '         0      10002          1\n         1     100001      65536\n'
+    launch._live_maps(policy, exact, exact)
+    reordered = '1 100001 65536\n0 10002 1\n'
+    launch._live_maps(policy, reordered, reordered)
+    for wrong in ('0 10002 1\n1 100001 65535\n', '0 10002 1\n1 100001 65536\n70000 400000 1\n',
+                  '0 10002 1\n', '0 10002 1\n1 100001 x\n', ''):
+        with pytest.raises(RuntimeError):
+            launch._live_maps(policy, wrong, exact)
+        with pytest.raises(RuntimeError):
+            launch._live_maps(policy, exact, wrong)
+
+
+def test_real_init_namespace_map_never_satisfies_a_policy():
+    # The test process isn't in the policy's namespace (normally it's the
+    # initial one, a single identity row), so its real maps must never pass.
+    policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+    actual = Path('/proc/self/uid_map').read_text()
+    with pytest.raises(RuntimeError):
+        launch._live_maps(policy, actual, Path('/proc/self/gid_map').read_text())
+
+
+def test_real_kernel_user_namespace_maps_match_exactly():
+    if os.geteuid() != 0 or not hasattr(os, 'unshare'):
+        pytest.skip('needs root and os.unshare to create a mapped user namespace')
+    ready_read, ready_write = os.pipe()
+    done_read, done_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(ready_read)
+            os.close(done_write)
+            try:
+                os.unshare(os.CLONE_NEWUSER)
+                os.write(ready_write, b'1')
+            except OSError:
+                os.write(ready_write, b'0')
+            os.read(done_read, 1)
+        finally:
+            os._exit(0)
+    os.close(ready_write)
+    os.close(done_read)
+    try:
+        if os.read(ready_read, 1) != b'1':
+            pytest.skip('user namespaces are not permitted here')
+        for name in ('uid_map', 'gid_map'):
+            Path(f'/proc/{child}/{name}').write_text('0 10002 1\n1 100001 65536\n')
+        policy = launch.DisjointDaemonPolicy.model_validate(disjoint_policy())
+        uid_map = Path(f'/proc/{child}/uid_map').read_text()
+        gid_map = Path(f'/proc/{child}/gid_map').read_text()
+        launch._live_maps(policy, uid_map, gid_map)
+        with pytest.raises(RuntimeError):
+            launch._live_maps(launch.DisjointDaemonPolicy.model_validate(
+                disjoint_policy(uid_map=[[0, 10002, 1], [1, 100002, 65536]])), uid_map, gid_map)
+    finally:
+        os.close(ready_read)
+        os.close(done_write)
+        os.waitpid(child, 0)
+
+
+@pytest.mark.parametrize('held', [
+    held_ranges(schema='engineering-hub.held-id-ranges.v2'), held_ranges(evidence_sha256='C' * 64),
+    held_ranges(uid_ranges=[[20000, 5]]),           # doesn't describe the held account at all
+    held_ranges(gid_ranges=[]), held_ranges(uid_ranges=[[10001, 0]]), held_ranges(uid_ranges=[[True, 1]]),
+    held_ranges(uid_ranges=[[10001, 1, 2]]), {**held_ranges(), 'extra': 1},
+])
+def test_held_range_evidence_is_closed(held):
+    with pytest.raises(RuntimeError):
+        launch._held_ranges(launch._canonical(held))
+
+
+def test_v3_constructor_accepts_only_a_consistent_signed_policy(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        launch.LaunchSupervisor(**kwargs).close()
+        assert requests == []
+
+
+@pytest.mark.parametrize('case', ['no-held-file', 'pin-uid', 'pin-gid', 'engine-id', 'overlaps-held',
+                                  'consumer-mismatch', 'held-not-root-mode'])
+def test_v3_constructor_refuses_inconsistent_policy(short_root, root_journal, case):
+    # Overlap: the held evidence claims a range inside the policy's 100001.. block,
+    # while the policy itself stays valid and still maps 10001 to the enrolled 110001.
+    held = {'overlaps-held': held_ranges(uid_ranges=[[10001, 1], [120000, 16]])}.get(case)
+    daemon = {'pin-uid': {'uid': 10003}, 'pin-gid': {'gid': 10003}, 'engine-id': {'daemon_id': 'other-daemon'}}.get(case)
+    with v3_constructor(short_root, root_journal, held=held, daemon=daemon) as (data, kwargs, requests):
+        if case == 'no-held-file':
+            kwargs.pop('held_ranges_file')
+        if case == 'consumer-mismatch':
+            data['consumer_host_uid'] = 110002
+            Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        if case == 'held-not-root-mode':
+            Path(kwargs['held_ranges_file']).chmod(0o644)
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == [] and not Path(kwargs['journal_file']).exists()
+
+
+def test_legacy_enrollment_refuses_a_signed_policy(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal, daemon_policy=disjoint_policy()) as (data, kwargs, requests):
+        assert data['schema'] == 'executor_launch_supervisor_v2'
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+
+
+def test_legacy_enrollment_refuses_held_evidence(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        held_path = Path(kwargs['enrollment_file']).parent / 'held-ranges.json'
+        held_path.write_bytes(launch._canonical(held_ranges()))
+        held_path.chmod(0o600)
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs, held_ranges_file=str(held_path))
+        assert requests == []
+
+
+def test_v3_launch_refuses_wrong_live_maps_before_any_effect(short_root, root_journal):
+    # The fake daemon is this test process, in the initial user namespace:
+    # its live maps can't equal the policy, so launch stops before binding the
+    # issuer socket or sending any Engine request.
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.launch()
+            assert requests == [] and authority._launch_id is None and authority._listener is None
+        finally:
+            authority.close()
+
+
+def test_held_evidence_replacement_after_construction_is_refused(short_root, root_journal):
+    with v3_constructor(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            held_path = Path(kwargs['held_ranges_file'])
+            replacement = held_path.with_name('held-ranges.new')
+            replacement.write_bytes(launch._canonical(held_ranges(evidence_sha256='d' * 64)))
+            replacement.chmod(0o600)
+            os.replace(replacement, held_path)
+            with pytest.raises(RuntimeError):
+                authority._guard()
+        finally:
+            authority.close()
 
 
 @pytest.mark.parametrize('mutation', ['public-key', 'profile-pin', 'extra-field', 'consumer-mapping',
@@ -1303,6 +1744,54 @@ def test_configuration_rewrite_after_first_verified_pin_is_rejected(short_root, 
             authority.close()
 
 
+def test_paired_runner_cannot_use_legacy_signed_profile(short_root, root_journal):
+    from hub_container_executor.installed_runner import PAIR_SCHEMA
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        mount = next(m for m in data['profile']['mounts'] if m['role'] == 'config')
+        path = Path(mount['source'])
+        runner = json.loads(path.read_bytes())
+        runner['schema'] = PAIR_SCHEMA
+        runner['pair'] = {'authority_public_key_hex': 'b' * 64, 'peer_uid': 10002, 'peer_gid': 10002}
+        mount['content_digest'] = configuration_commitment(launch._canonical(runner)).content_digest
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        assert profile.command_channel is None
+        data['release']['launch_profile_digest'] = runner['release_enrollment']['launch_profile_digest'] = profile.digest()
+        raw = launch._canonical(runner)
+        path.write_bytes(raw)
+        data['configuration_raw_digest'] = configuration_commitment(raw).raw_digest
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            # Exercise the independent manifest-reading path even if a caller
+            # had previously captured this exact file's identity.
+            authority._source_pins['config'] = launch._identity(path.lstat())
+            with pytest.raises(RuntimeError):
+                authority._handoff_manifest_digest()
+            assert requests == [] and authority._consumer is None and authority._listener is None
+        finally:
+            authority.close()
+
+
+def test_legacy_runner_cannot_use_inherited_channel_profile(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (_, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            # Exercise the executor mode guard directly: this synthetic profile
+            # does not authorize launch and is never sent to the Engine.
+            authority.profile = authority.profile.model_copy(update={'command_channel': 'inherited-seqpacket-v1'})
+            path = Path(authority._mounts['config'].source)
+            with pytest.raises(RuntimeError):
+                authority._pin_sources()
+            authority._source_pins['config'] = launch._identity(path.lstat())
+            with pytest.raises(RuntimeError):
+                authority._handoff_manifest_digest()
+            assert requests == [] and authority._consumer is None
+        finally:
+            authority.close()
+
+
 @pytest.mark.parametrize('terminate', [True, False])
 @pytest.mark.parametrize('accounting_lag', [0, 2])
 def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
@@ -1364,3 +1853,337 @@ def test_graceful_stop_exact_sigterm_quiescence_or_timeout_never_forces_cleanup(
             child.terminate()  # Fixture teardown, NOT supervisor timeout escalation.
             child.wait(timeout=3)
         authority.close()
+
+
+def test_broker_profile_refused_before_journal_or_engine_access(short_root, root_journal):
+    from tests.test_executor_launch_profile import broker_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = broker_profile()
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()
+
+
+def test_generation_isolation_refused_before_journal_socket_or_engine(short_root, root_journal, monkeypatch):
+    from tests.test_executor_launch_profile import gate_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = gate_profile()
+        data['profile']['gate_completion'] = {
+            'candidate_executable_digest': 'sha256:' + 'a' * 64,
+            'rollback_executable_digest': 'sha256:' + 'b' * 64,
+            'health_contract': 'engineering-hub.health-json-build-commit.v1'}
+        data['profile']['gate_ledger_channel'] = 'supervisor-listener-v1'
+        data['profile']['generation_isolation'] = {
+            'kind': 'separate-provider-v1', 'app_uid': 10002, 'app_gid': 10002,
+            'provider_host_uid': 200000, 'provider_host_gid': 200000,
+            'provider_public_key': '1' * 64}
+        parsed = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = parsed.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        bind_calls = []
+        monkeypatch.setattr(socket.socket, 'bind', lambda *args: bind_calls.append(args))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs, gate_start_mode=True)
+        assert bind_calls == []
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()
+
+
+@pytest.mark.parametrize('variant', ['coordinator', 'command_channel', 'trusted_local', 'supervised_local', 'supervised_oauth'])
+def test_coordinator_and_inherited_channel_profiles_refused_before_journal_or_engine_access(
+        short_root, root_journal, variant):
+    from tests.test_executor_launch_profile import channel_profile, coordinator_profile, trusted_local_profile, supervised_local_profile, supervised_local_oauth_profile
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        data['profile'] = (coordinator_profile() if variant == 'coordinator' else
+                           trusted_local_profile() if variant == 'trusted_local' else
+                           supervised_local_profile() if variant == 'supervised_local' else
+                           supervised_local_oauth_profile() if variant == 'supervised_oauth' else channel_profile())
+        profile = launch.ExecutorLaunchProfile.model_validate(data['profile'])
+        data['release']['launch_profile_digest'] = profile.digest()
+        Path(kwargs['enrollment_file']).write_bytes(launch._canonical(data))
+        with pytest.raises(launch.LaunchSupervisorError):
+            launch.LaunchSupervisor(**kwargs)
+        assert requests == []
+        assert not Path(kwargs['journal_file']).exists()
+
+
+def test_dedicated_executor_endpoint_binds_runner_socket_parent(monkeypatch):
+    from tests.test_executor_launch_profile import profile, policy
+    from hub_container_executor import installed_runner
+    value = profile(daemon_policy=policy(), executor_endpoint='protected-uds-v1')
+    value['mounts'].append(dict(role='executor_endpoint_directory',source=value['fixture_root']+'/endpoint',
+        target='/run/hub-executor',kind='directory',read_only=False,uid=110001,gid=110001,mode=0o700,content_digest=None))
+    signed = launch.ExecutorLaunchProfile.model_validate(value)
+    subject = SimpleNamespace(profile=signed, _mounts={m.role:m for m in signed.mounts})
+    parsed = SimpleNamespace(pair=None,gate_socket_directory=None,gate_ledger_channel=False,pair_ledger_directory=None,
+                             socket_path='/run/hub-executor/executor.sock')
+    monkeypatch.setattr(installed_runner, 'parse_configuration', lambda raw: parsed)
+    assert launch.LaunchSupervisor._runner_configuration(subject, b'fixture') is parsed
+    parsed.socket_path = '/elsewhere/executor.sock'
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch.LaunchSupervisor._runner_configuration(subject, b'fixture')
+
+
+def test_executor_channel_issuance_real_rights_and_durable_once(synthetic_issuer):
+    """Synthetic launch authority; real kernel stream, signature, pidfd and FD."""
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            results.append(authority.serve_one_executor_handoff(issued))
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    fd = None
+    try:
+        fd = transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and results == [authority._launch_id]
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        received = socket.socket(fileno=fd)
+        fd = None
+        try:
+            received.send(b'fixture')
+            assert other.recv(16) == b'fixture'
+        finally:
+            received.close()
+        with pytest.raises(RuntimeError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_executor_handoff_denies_legacy_profile_and_closes_fd(synthetic_issuer):
+    authority, _, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel=None)
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.serve_one_executor_handoff(issued)
+        assert issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone()[0] == 0
+    finally:
+        other.close()
+
+
+def test_handoff_journal_failure_after_fd_send_quarantines_receiver(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    original = authority._journal.issuance_state
+    def fail_commit(identity, state, digest):
+        if state == 'sent':
+            raise OSError('injected commit failure')
+        return original(identity, state, digest)
+    authority._journal.issuance_state = fail_commit
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            authority.serve_one_executor_handoff(issued)
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and len(results) == 1 and authority._held
+        assert issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('held',)
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_handoff_lost_final_confirmation_never_returns_fd_or_retries(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role=None, command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    signer = authority._signer
+    class LoseConfirmation:
+        def sign(self, value):
+            if value.startswith(b'engineering-hub-launch-channel-commit-v1\x00'):
+                raise OSError('synthetic lost confirmation')
+            return signer.sign(value)
+    authority._signer = LoseConfirmation()
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    results = []
+    def serve():
+        try:
+            authority.serve_one_executor_handoff(issued)
+        except Exception as error:
+            results.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        thread.join(5)
+        assert not thread.is_alive() and len(results) == 1 and authority._held
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000)
+        second, second_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            with pytest.raises(launch.LaunchSupervisorError):
+                authority.serve_one_executor_handoff(second)
+            assert second.fileno() == -1
+            with authority._journal.transaction() as db:
+                assert db.execute('SELECT count(*),min(state) FROM issuance').fetchone() == (1, 'sent')
+        finally:
+            second_peer.close()
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_handoff_manifest_is_derived_from_pinned_runner_config(short_root, root_journal):
+    with root_file_constructor_fixture(short_root, root_journal) as (data, kwargs, requests):
+        authority = launch.LaunchSupervisor(**kwargs)
+        try:
+            authority._pin_sources()
+            from hub_container_executor.installed_runner import parse_configuration
+            path = Path(next(m['source'] for m in data['profile']['mounts'] if m['role'] == 'config'))
+            assert authority._handoff_manifest_digest() == parse_configuration(path.read_bytes()).manifest.digest()
+            path.write_bytes(path.read_bytes() + b' ')
+            with pytest.raises(Exception):
+                authority._handoff_manifest_digest()
+            assert requests == []
+        finally:
+            authority.close()
+
+
+def test_coordinator_channel_issuance_uses_role_specific_signed_receipt(synthetic_issuer):
+    """Actual kernel peer and FD exchange; Engine/launch measurement synthetic."""
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role='coordinator', command_channel='inherited-seqpacket-v1')
+    manifest_digest = 'sha256:' + 'a' * 64
+    authority._handoff_manifest_digest = lambda: manifest_digest
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    result = []
+    def serve():
+        try:
+            result.append(authority.serve_one_coordinator_handoff(issued))
+        except Exception as error:
+            result.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    fd = None
+    try:
+        fd = transport.issue_verified_channel(enrollment=authority.release, manifest_digest=manifest_digest,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000, role='coordinator')
+        thread.join(5)
+        assert not thread.is_alive() and result == [authority._launch_id]
+        assert issued.fileno() == -1 and not authority._issuance_open
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT state FROM issuance').fetchone() == ('sent',)
+        received = socket.socket(fileno=fd)
+        fd = None
+        try:
+            received.send(b'coordinator')
+            assert other.recv(16) == b'coordinator'
+        finally:
+            received.close()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        other.close()
+        transport.close()
+        thread.join(5)
+
+
+def test_coordinator_profile_maps_its_own_distinct_kernel_uid():
+    from tests.test_executor_launch_profile import coordinator_profile
+    profile = launch.ExecutorLaunchProfile.model_validate(coordinator_profile())
+    mapped = 110002
+    status = {'Uid': '\t'.join([str(mapped)] * 4), 'Gid': '\t'.join([str(mapped)] * 4),
+              'Groups': str(mapped), 'NoNewPrivs': '1'}
+    status.update({name: '0000000000000000' for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')})
+    mapping = '0 10001 1\n1 100001 65536\n'
+    rows = ['1 0 0:1 / / ro - overlay overlay rw',
+            '2 1 0:2 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw']
+    for index, mount in enumerate(profile.mounts, 3):
+        rows.append(f'{index} 1 0:{index} / {mount.target} {"ro" if mount.read_only else "rw"} - ext4 fixture rw')
+    mounts = ('\n'.join(rows) + '\n').encode()
+    launch._kernel_profile(profile, status, mapping, mapping, mounts, mapped, mapped)
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._kernel_profile(profile, status, mapping, mapping, mounts, 110001, 110001)
+    # Even self-consistent /proc status for the executor UID cannot stand in
+    # for coordinator UID 10002 in the signed namespace map.
+    status['Uid'] = status['Gid'] = '\t'.join(['110001'] * 4)
+    status['Groups'] = '110001'
+    with pytest.raises(launch.LaunchSupervisorError):
+        launch._kernel_profile(profile, status, mapping, mapping, mounts, 110001, 110001)
+
+
+def test_coordinator_handoff_refuses_executor_role_request(synthetic_issuer):
+    from hub_container_executor.runtime_identity import RuntimeIdentityError
+    authority, path, _ = synthetic_issuer
+    authority.profile = SimpleNamespace(role='coordinator', command_channel='inherited-seqpacket-v1')
+    authority._handoff_manifest_digest = lambda: 'sha256:' + 'a' * 64
+    issued, other = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    failures = []
+    def serve():
+        try:
+            authority.serve_one_coordinator_handoff(issued)
+        except Exception as error:
+            failures.append(error)
+    thread = threading.Thread(target=serve)
+    thread.start()
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                          expected_issuer_gid=os.getgid())
+    try:
+        with pytest.raises(RuntimeIdentityError):
+            transport.issue_verified_channel(enrollment=authority.release, manifest_digest='sha256:' + 'a' * 64,
+                    max_receipt_lifetime_seconds=30, timeout_ms=1000, role='executor')
+        thread.join(5)
+        assert not thread.is_alive() and len(failures) == 1 and issued.fileno() == -1
+        with authority._journal.transaction() as db:
+            assert db.execute('SELECT count(*) FROM issuance').fetchone()[0] == 0
+    finally:
+        other.close()
+        transport.close()
+        thread.join(5)

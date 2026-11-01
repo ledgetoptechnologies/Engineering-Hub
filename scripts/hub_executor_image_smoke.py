@@ -47,8 +47,13 @@ assert pathlib.Path(helper.__file__) == root / 'scripts/inspect_hub_image_identi
 assert hashlib.sha256(pathlib.Path(helper.__file__).read_bytes()).hexdigest() == record['source_files']['src/scripts/inspect_hub_image_identity.py']
 from engineering_hub.container_pilot_client import ContainerPilotClient
 assert callable(getattr(ContainerPilotClient, 'for_private_unix', None)), 'incompatible core'
+# The supervisor and the core image must share one launch profile parser.
+from engineering_hub import executor_launch_profile as shared_profile
+assert pathlib.Path(shared_profile.__file__).is_relative_to(root), 'incompatible core'
+supervisor = importlib.import_module('hub_container_executor.launch_supervisor')
+assert supervisor.ExecutorLaunchProfile is shared_profile.ExecutorLaunchProfile, 'incompatible core'
 print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names),
-                  'private_unix_client': True, 'installed_artifact': 'passed'}))
+                  'private_unix_client': True, 'shared_launch_profile': True, 'installed_artifact': 'passed'}))
 '''
 
 
@@ -123,7 +128,8 @@ def smoke(image, commit):
                 or host.get('PublishAllPorts')
                 or report.get('source_commit') != commit
                 or report.get('installed_artifact') != 'passed'
-                or report.get('private_unix_client') is not True):
+                or report.get('private_unix_client') is not True
+                or report.get('shared_launch_profile') is not True):
             raise RuntimeError('Installed executor fixture did not pass')
         return {**report, 'image_id': image_id, 'network': 'none', 'host_mounts': 0,
                 'issuer_exchange': 'not_tested', 'staging_pilot': 'not_tested',

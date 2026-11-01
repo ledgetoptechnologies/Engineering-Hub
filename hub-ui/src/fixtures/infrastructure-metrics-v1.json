@@ -124,6 +124,11 @@
           "mount": "/",
           "size_bytes": 500000000000,
           "free_bytes": 125000000000
+        },
+        {
+          "mount": "/data",
+          "size_bytes": 1000,
+          "free_bytes": null
         }
       ],
       "gpus": [],

@@ -29,6 +29,7 @@ from .repository import AGENTS
 
 
 SCHEMA = 'engineering-hub.unified-pilot.v1'
+SCHEMA_V2 = 'engineering-hub.unified-pilot.v2'
 ACTION = 'engineering-hub:container-pilot'
 ERROR = 'Unified pilot configuration or startup unavailable'
 
@@ -73,6 +74,7 @@ class PilotProfile:
     credential_file: Path = field(repr=False)
     credential_sha256: str = field(repr=False)
     grace_seconds: int
+    profile_mode: str = 'legacy'
 
 
 def parse_profile(raw):
@@ -88,9 +90,12 @@ def parse_profile(raw):
         def reject(_):
             raise UnifiedPilotStartupError()
         value = json.loads(raw, object_pairs_hook=unique, parse_constant=reject, parse_float=reject)
+        _require(type(value) is dict and value.get('schema') in (SCHEMA, SCHEMA_V2))
+        schema = value['schema']
         _object(value, {'schema', 'manifest', 'machine_id', 'action_key', 'allowed_actors',
-                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'})
-        _require(value['schema'] == SCHEMA and value['action_key'] == ACTION
+                        'allowed_task_ids', 'executor', 'supervisor_stop_grace_seconds'} |
+                ({'profile_mode'} if schema == SCHEMA_V2 else set()))
+        _require((schema == SCHEMA or value['profile_mode'] == 'disjoint-v3') and value['action_key'] == ACTION
                  and value['machine_id'] == 'staging-pc')
         manifest = PilotManifest.from_bytes(json.dumps(value['manifest'], separators=(',', ':')).encode())
         _require(manifest.target_id == 'engineering-hub:staging')
@@ -115,7 +120,8 @@ def parse_profile(raw):
         _require(type(grace) is int and REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS <= grace <= 86400)
         return PilotProfile(manifest, frozenset(actors), frozenset(tasks), value['machine_id'],
             origin, _path(executor['ca_file']), _digest(executor['ca_sha256']),
-            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace)
+            _path(executor['credential_file']), _digest(executor['credential_sha256']), grace,
+            'legacy' if schema == SCHEMA else value['profile_mode'])
     except Exception:
         raise UnifiedPilotStartupError() from None
 
@@ -240,8 +246,27 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
                      and isinstance(session_enrollment_path, (str, Path))
                      and Path(session_enrollment_path).is_absolute())
         deployment, profile = validate_configuration(config_path, profile_path)
+        # Only the fixed protected-enrollment path supplies mandatory v3
+        # recognition. Arbitrary trusted callbacks have no equivalent contract.
+        _require(type(profile) is PilotProfile and profile.profile_mode in ('legacy', 'disjoint-v3'))
+        _require(profile.profile_mode != 'disjoint-v3' or session_enrollment_path is not None)
         from .app import Settings
         settings = Settings.from_env(deployment)
+        github = settings.auth_config.human_auth_mode == 'github'
+        enrollment = None
+        if github:
+            # Only the explicitly versioned GitHub deployment plus protected
+            # disjoint-session enrollment selects this provider. No callback or
+            # environment-only provider switch can select it here.
+            _require(profile.profile_mode == 'disjoint-v3' and session_enrollment_path is not None
+                     and settings.auth_config.secure and settings.auth_config.github_client_id
+                     and settings.auth_config.github_client_secret
+                     and settings.auth_config.beau_github_id is not None)
+            from .trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES, SCHEMA_V3
+            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                                                              maximum_bytes=MAX_ENROLLMENT_BYTES))
+            _require(enrollment.schema == SCHEMA_V3
+                     and enrollment.operator_actor == f'human:{settings.auth_config.beau_github_id}')
         # Must precede credentials, TLS transport allocation and listener binds.
         owner = PilotOwner(settings.database, require_existing=True)
         credential = read_protected_file(profile.credential_file, maximum_bytes=4096)
@@ -253,8 +278,9 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
         if session_enrollment_path is not None:
             from .trusted_queued_session import (parse_enrollment, MAX_ENROLLMENT_BYTES,
                                                  TrustedQueuedSessionComposition)
-            enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
-                                                               maximum_bytes=MAX_ENROLLMENT_BYTES))
+            if enrollment is None:
+                enrollment = parse_enrollment(read_protected_file(Path(session_enrollment_path),
+                                                                   maximum_bytes=MAX_ENROLLMENT_BYTES))
             composition = TrustedQueuedSessionComposition(profile=profile, database=settings.database,
                 enrollment=enrollment, ca_pem=ca, credential=credential)
             reconciliation_factory = composition.reconciliation_factory
@@ -275,7 +301,8 @@ async def serve_configuration(config_path, profile_path, *, reconciliation_facto
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             supervisor_stop_grace_seconds=profile.grace_seconds,
-            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771)
+            agent_host='0.0.0.0', agent_port=8770, browser_host='0.0.0.0', browser_port=8771,
+            allow_github=github)
     except Exception:
         raise UnifiedPilotStartupError() from None
     finally:

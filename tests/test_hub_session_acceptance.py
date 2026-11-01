@@ -444,3 +444,32 @@ async def test_direct_asgi_slow_body_has_bounded_sanitized_timeout(browser, monk
     assert start['status'] == 408 and b'PRIVATE' not in body
     assert json.loads(body)['detail']['code'] == 'session_acceptance_unavailable'
     assert cancelled and c.records == [] and c.gate.admission_state == 'pending'
+
+
+def test_late_session_routes_precede_existing_dashboard_static_mount(case, tmp_path):
+    from urllib.parse import parse_qs, urlsplit
+    from tests.test_hub_auth import FakeGitHub
+    ui = tmp_path / 'dashboard'; ui.mkdir(); (ui / 'index.html').write_text('synthetic dashboard')
+    (ui / 'assets').mkdir(); (ui / 'assets' / 'fixture.js').write_text('fixture')
+    config = AuthConfig('https://hub.example', github_client_id='fixture-client',
+                        github_client_secret='fixture-secret', beau_github_id=123)
+    app = create_app(Settings(tmp_path / 'static-browser.sqlite3',
+        AuthSettings('test-hermes', 'test-codex', claude_token='test-claude'), config, ui_directory=ui),
+        github_client=FakeGitHub())
+    case.broker._operator = 'human:123'
+    attach_session_acceptance_routes(app, broker=case.broker, config=config, sessions=app.state.sessions)
+    with TestClient(app, base_url=config.origin, follow_redirects=False) as client:
+        assert client.get('/').status_code == 200
+        assert client.get('/assets/fixture.js').status_code == 200
+        assert client.get('/unrelated-nonexistent').status_code == 404
+        assert client.get(BASE).status_code == 401
+        login = client.get('/api/hub/v1/auth/login')
+        state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+        assert client.get('/api/hub/v1/auth/callback', params={'state':state, 'code':'fixture'}).status_code == 303
+        me = client.get('/api/hub/v1/auth/me').json()
+        snapshot = client.get(BASE)
+        assert snapshot.status_code == 200
+        decision = {'request_id': snapshot.json()['request_id'], 'expected_revision': snapshot.json()['revision'], 'action':'accept'}
+        assert client.post(BASE, json=decision).status_code == 403
+        assert client.post(BASE, json=decision, headers={'Origin':config.origin, 'X-Hub-CSRF':me['csrf_token']}).status_code == 200
+        assert client.get('/').status_code == 200

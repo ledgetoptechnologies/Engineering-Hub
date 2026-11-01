@@ -133,6 +133,32 @@ test("a lost sign-in clears the workspace", async ({ page }) => {
   await expect(page.getByText("Sign in to Engineering Hub.")).toBeVisible();
 });
 
+test("switching devices does not display the previous device while the next read is pending", async ({ page }) => {
+  await fixture(page);
+  let release!: () => void;
+  let started!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const requested = new Promise<void>(resolve => { started = resolve; });
+  await page.route("**/api/hub/v1/infrastructure/devices/camera-hub", async route => {
+    started();
+    await pending;
+    await route.fulfill({ json: { device: devices()[1], capabilities: { device_write: false, maintenance_write: true },
+      maintenance: { items: [], truncated: false } } });
+  });
+  try {
+    await page.goto("/#/infrastructure/build-pc");
+    await expect(page.getByRole("heading", { name: "Build PC" })).toBeVisible();
+    await page.evaluate(() => { location.hash = "#/infrastructure/camera-hub"; });
+    await requested;
+    await expect(page.getByRole("status")).toContainText("Reading this device");
+    await expect(page.getByRole("heading", { name: "Build PC" })).toHaveCount(0);
+    release();
+    await expect(page.getByRole("heading", { name: "Camera hub" })).toBeVisible();
+  } finally {
+    release();
+  }
+});
+
 test("a device page shows declared facts, checks and the journal as plain text", async ({ page }) => {
   await fixture(page);
   await page.goto("/#/infrastructure/build-pc");
@@ -257,6 +283,18 @@ const healthPanel = (page: Page) => page.getByRole("region", { name: "Machine he
 const metrics = (change: (value: any) => void = () => {}) => {
   const value = JSON.parse(JSON.stringify(metricsFixture)); change(value); return { status: 200, body: value };
 };
+
+test("machine health labels its fixed snapshot and scrape ages as snapshot-relative", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-10-30T17:00:00Z") });
+  const state = await fixture(page, { metrics: [metrics()] });
+  await page.goto("/#/infrastructure");
+  const panel = healthPanel(page);
+  await expect(panel.locator('time')).toHaveAttribute('datetime', '2026-10-29T17:00:00Z');
+  await expect(panel).toContainText("elapsed scrape ages refer to this snapshot");
+  const desk = panel.getByRole("listitem").filter({ hasText: "desk" });
+  await expect(desk).toContainText("Reporting at snapshot · 10s ago");
+  expect(state.metrics).toBe(1);
+});
 
 test("machine health groups each machine's exporters, says what's missing and reads only when asked", async ({ page }) => {
   const state = await fixture(page, { metrics: [metrics()] });
