@@ -3,6 +3,7 @@
  * in a note is shown as text. Links render only for https: URLs and Hub paths.
  */
 import { Fragment, type ReactNode } from "react";
+import { link } from "./router";
 
 export function safeHref(url: string): string | null {
   if (/^\/(?!\/)[A-Za-z0-9/_.#?=&%-]*$/.test(url)) return url;
@@ -30,9 +31,11 @@ export function inline(text: string, keyPrefix = ""): ReactNode[] {
     else if (match[3]) out.push(<em key={key}>{token.slice(1, -1)}</em>);
     else {
       const [, label, url] = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(token)!;
-      const href = safeHref(url);
+      const safe = safeHref(url);
+      // In-app routes follow the current routing mode (hash or path) and keep demo mode.
+      const href = safe && /^\/(?!api\/)[^?#]*$/.test(safe) ? link(safe) : safe;
       out.push(href
-        ? <a key={key} href={href} target={href.startsWith("/") ? undefined : "_blank"} rel="noopener noreferrer">{label}</a>
+        ? <a key={key} href={href} target={safe!.startsWith("/") ? undefined : "_blank"} rel="noopener noreferrer">{label}</a>
         : `${label} (${url})`);
     }
     last = match.index + token.length;
