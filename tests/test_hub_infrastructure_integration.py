@@ -132,6 +132,7 @@ def test_missing_optional_settings_do_not_open_inventory(tmp_path):
         assert not (tmp_path / 'infrastructure').exists()
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='Infrastructure storage composition requires POSIX directory handles')
 def test_owner_metrics_navigation_does_not_require_inventory_read_grant(tmp_path):
     config = settings(tmp_path)
     operator = json.loads(config.infrastructure_config_path.read_text())
