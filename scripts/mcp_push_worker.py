@@ -92,6 +92,23 @@ class QueueFull(WorkerError):
     """Refuse to advance a cursor if the bounded durable queue cannot accept a full page."""
 
 
+class _ReadinessStream(httpx.AsyncByteStream):
+    """Close admission as soon as an authenticated GET stream ends or fails."""
+    def __init__(self, inner: httpx.AsyncByteStream, ready: asyncio.Event):
+        self.inner, self.ready = inner, ready
+
+    async def __aiter__(self):
+        try:
+            async for chunk in self.inner:
+                yield chunk
+        finally:
+            self.ready.clear()
+
+    async def aclose(self):
+        self.ready.clear()
+        await self.inner.aclose()
+
+
 @dataclass(frozen=True)
 class QueuedJob:
     message_id: str
@@ -345,6 +362,15 @@ def _route_key(body: Any, allowed_topics: set[str], allowed_hubs: set[str]) -> s
     return f"{field}:{value}"
 
 
+def _route_issue_reason(body: Any) -> str:
+    """Return a fixed, non-content-bearing reason for an actionable unrouted item."""
+    if not isinstance(body, dict) or ("topic" not in body and "hub" not in body):
+        return "missing_route"
+    if "topic" in body and "hub" in body:
+        return "ambiguous_route"
+    return "route_not_allowed"
+
+
 def _thread_key(route_key: str, correlation_id: str | None, message_id: str, sender: str) -> str:
     discriminator = correlation_id if isinstance(correlation_id, str) and correlation_id else f"message:{message_id}"
     raw = json.dumps([PROFILE, sender, route_key, discriminator], ensure_ascii=False, separators=(",", ":"))
@@ -393,7 +419,42 @@ class WorkerState:
                     status TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_queue_status_seq ON queue(status, seq);
+                CREATE TABLE IF NOT EXISTS routing_issues (
+                    message_id TEXT PRIMARY KEY,
+                    seq INTEGER NOT NULL,
+                    reason TEXT NOT NULL CHECK(reason IN (
+                        'missing_route','ambiguous_route','route_not_allowed','invalid_correlation'
+                    ))
+                );
+                CREATE INDEX IF NOT EXISTS idx_routing_issues_seq ON routing_issues(seq);
+                CREATE TABLE IF NOT EXISTS routing_recoveries (
+                    message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL
+                );
             """)
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='routing_issues'"
+            ).fetchone()
+            if schema is not None and "invalid_correlation" not in schema[0]:
+                # Keep existing local diagnostics readable while widening the fixed
+                # reason enum. SQLite cannot alter a CHECK constraint in place.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("ALTER TABLE routing_issues RENAME TO routing_issues_legacy")
+                    conn.execute("""CREATE TABLE routing_issues (
+                        message_id TEXT PRIMARY KEY,
+                        seq INTEGER NOT NULL,
+                        reason TEXT NOT NULL CHECK(reason IN (
+                            'missing_route','ambiguous_route','route_not_allowed','invalid_correlation'
+                        ))
+                    )""")
+                    conn.execute("""INSERT INTO routing_issues(message_id,seq,reason)
+                        SELECT message_id,seq,reason FROM routing_issues_legacy""")
+                    conn.execute("DROP TABLE routing_issues_legacy")
+                    conn.execute("CREATE INDEX idx_routing_issues_seq ON routing_issues(seq)")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
         if os.name != "nt":
             os.chmod(self.path, 0o600)
             for suffix in ("-wal", "-shm"):
@@ -467,6 +528,18 @@ class WorkerState:
 
                 pending_count = int(conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0])
                 admitted: list[tuple[dict[str, Any], str, str, str]] = []
+                newly_quarantined: list[tuple[str, int, str]] = []
+
+                def record_routing_issue(message: dict[str, Any], reason: str) -> None:
+                    message_id = message["id"]
+                    seq = int(message["seq"])
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO routing_issues(message_id,seq,reason) VALUES(?,?,?)",
+                        (message_id, seq, reason),
+                    )
+                    if cursor.rowcount:
+                        newly_quarantined.append((message_id, seq, reason))
+
                 for message in messages:
                     message_id = message.get("id")
                     if not isinstance(message_id, str) or not UUID_RE.fullmatch(message_id):
@@ -477,12 +550,15 @@ class WorkerState:
                     if not isinstance(sender, str) or sender == identity or sender not in allowed_senders:
                         continue
                     kind = str(message.get("message_type", "")).upper()
-                    route = _route_key(message.get("body"), allowed_topics, allowed_hubs)
                     correlation = message.get("correlation_id")
                     if correlation is not None and (not isinstance(correlation, str) or len(correlation) > 256):
+                        if kind in {"TASK", "REQUEST"}:
+                            record_routing_issue(message, "invalid_correlation")
                         continue
+                    route = _route_key(message.get("body"), allowed_topics, allowed_hubs)
                     if kind in {"TASK", "REQUEST"}:
                         if route is None:
+                            record_routing_issue(message, _route_issue_reason(message.get("body")))
                             continue
                         thread = _thread_key(route, correlation, message_id, sender)
                         admitted.append((message, kind, route, thread))
@@ -540,9 +616,30 @@ class WorkerState:
                     conn.execute("INSERT INTO queue(message_id,seq,thread_key,status) VALUES(?,?,?,'queued')",
                                  (message_id, int(message["seq"]), thread))
                     accepted.append(message_id)
+                routing_issue_count = int(conn.execute("SELECT COUNT(*) FROM routing_issues").fetchone()[0])
+                overflow = max(0, routing_issue_count - MAX_RETAINED_ITEMS)
+                if overflow:
+                    expired = [row[0] for row in conn.execute(
+                        "SELECT message_id FROM routing_issues ORDER BY seq ASC LIMIT ?", (overflow,)
+                    )]
+                    conn.executemany("DELETE FROM routing_issues WHERE message_id=?",
+                                     ((message_id,) for message_id in expired))
+                    dropped_row = conn.execute(
+                        "SELECT value FROM state WHERE key='routing_issues_dropped'"
+                    ).fetchone()
+                    dropped = (int(dropped_row[0]) if dropped_row is not None else 0) + len(expired)
+                    conn.execute(
+                        "INSERT INTO state(key,value) VALUES('routing_issues_dropped',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(dropped),)
+                    )
                 self._prune_terminal_history(conn)
                 conn.execute("UPDATE state SET value=? WHERE key='cursor'", (str(next_cursor),))
                 conn.commit()
+                for message_id, seq, reason in newly_quarantined:
+                    logging.warning(
+                        "Actionable MCP message needs routing (id=%s seq=%s reason=%s)",
+                        message_id, seq, reason,
+                    )
                 return accepted
             except Exception:
                 conn.rollback()
@@ -642,6 +739,73 @@ class WorkerState:
     def queued_count(self) -> int:
         with self._connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0])
+
+    def routing_issues(self) -> list[dict[str, Any]]:
+        """Return durable, content-free routing diagnostics for operator review."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT message_id,seq,reason FROM routing_issues ORDER BY seq"
+            ).fetchall()
+            return [{"message_id": row[0], "seq": int(row[1]), "reason": row[2]} for row in rows]
+
+    def recover_routing_issue(self, message_id: str, message: dict[str, Any], *, identity: str,
+                              allowed_senders: set[str], allowed_topics: set[str],
+                              allowed_hubs: set[str]) -> None:
+        """Consume one diagnosed UUID atomically; the authenticated caller supplies its fresh record."""
+        if not UUID_RE.fullmatch(message_id) or not isinstance(message, dict) or message.get('id') != message_id:
+            raise WorkerError('invalid recovery message')
+        sender, correlation = message.get('sender'), message.get('correlation_id')
+        kind = str(message.get('message_type', '')).upper()
+        route = _route_key(message.get('body'), allowed_topics, allowed_hubs)
+        if (message.get('recipient') != identity or message.get('status') != 'pending'
+                or not isinstance(sender, str) or sender not in allowed_senders or sender == identity
+                or kind not in {'TASK', 'REQUEST'} or route is None
+                or correlation is not None and (not isinstance(correlation, str) or len(correlation) > 256)):
+            raise WorkerError('diagnosed message is not eligible for recovery')
+        thread = _thread_key(route, correlation, message_id, sender)
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                issue = conn.execute('SELECT seq FROM routing_issues WHERE message_id=?', (message_id,)).fetchone()
+                if issue is None or conn.execute('SELECT 1 FROM items WHERE message_id=?', (message_id,)).fetchone():
+                    raise WorkerError('diagnosed message already consumed or unavailable')
+                if type(message.get('seq')) is not int or message['seq'] != issue['seq']:
+                    raise WorkerError('diagnosed message sequence mismatch')
+                if conn.execute('SELECT COUNT(*) FROM routing_recoveries').fetchone()[0] >= MAX_RETAINED_ITEMS:
+                    raise WorkerError('routing recovery receipt capacity exhausted')
+                if conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0] >= self.max_queue:
+                    raise QueueFull('durable worker queue is full')
+                prior = conn.execute('SELECT status,profile FROM threads WHERE thread_key=?', (thread,)).fetchone()
+                if prior is not None and (prior['profile'] != PROFILE or prior['status'] == 'uncertain'):
+                    raise UnsafeResume('previous worker outcome/session is uncertain')
+                seq = int(issue['seq'])
+                conn.execute('INSERT OR IGNORE INTO threads(thread_key,topic_key,correlation_id,sender,session_id,status,profile,updated_seq) VALUES(?,?,?,?,?,?,?,?)',
+                             (thread, route, correlation, sender, None, 'new', PROFILE, seq))
+                conn.execute('INSERT INTO items(message_id,seq,thread_key,topic_key,message_type,in_reply_to,status,profile) VALUES(?,?,?,?,?,?,?,?)',
+                             (message_id, seq, thread, route, kind, message.get('in_reply_to') if isinstance(message.get('in_reply_to'), str) else None, 'queued', PROFILE))
+                conn.execute("INSERT INTO queue(message_id,seq,thread_key,status) VALUES(?,?,?,'queued')", (message_id, seq, thread))
+                conn.execute('INSERT INTO routing_recoveries(message_id,seq) VALUES(?,?)', (message_id, seq))
+                conn.execute('DELETE FROM routing_issues WHERE message_id=?', (message_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def routing_recovered(self, message_id: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute('SELECT 1 FROM routing_recoveries WHERE message_id=?', (message_id,)).fetchone() is not None
+
+    def routing_issue_sequence(self, message_id: str) -> int:
+        with self._connect() as conn:
+            issue = conn.execute('SELECT seq FROM routing_issues WHERE message_id=?', (message_id,)).fetchone()
+            if issue is None or type(issue['seq']) is not int or issue['seq'] < 1:
+                raise WorkerError('diagnosed message unavailable')
+            return issue['seq']
+
+    def routing_issues_dropped(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM state WHERE key='routing_issues_dropped'").fetchone()
+            return int(row[0]) if row is not None else 0
 
     def item_status(self, message_id: str) -> str | None:
         with self._connect() as conn:
@@ -810,6 +974,13 @@ def _is_network_error(exc: BaseException) -> bool:
             return True
         if isinstance(current, socket.gaierror):
             return True
+        if isinstance(current, BaseExceptionGroup):
+            # AnyIO/MCP can surface a transport disconnect nested in a task group.
+            # Retry only when every leaf is network-related; mixed groups may
+            # contain a protocol/capability failure that must remain terminal.
+            return bool(current.exceptions) and all(
+                _is_network_error(child) for child in current.exceptions
+            )
         if isinstance(current, OSError) and current.errno in {
             errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH,
             errno.ENETUNREACH, errno.ETIMEDOUT, errno.EPIPE,
@@ -821,6 +992,36 @@ def _is_network_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_recoverable_connection_error(
+    exc: BaseException, *, expected_endpoint: str | None = None,
+) -> bool:
+    """Allow transport errors and stale authenticated MCP sessions to reconnect.
+
+    A 404 is recoverable only when it is tied to an existing MCP session ID;
+    an endpoint/path 404 remains a permanent configuration failure.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _is_recoverable_connection_error(child, expected_endpoint=expected_endpoint)
+            for child in exc.exceptions
+        )
+    if _is_network_error(exc):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        return (
+            exc.response.status_code == 404
+            and bool(request.headers.get("mcp-session-id"))
+            and request.method in {"GET", "POST", "DELETE"}
+            and (expected_endpoint is None or request.url == httpx.URL(expected_endpoint))
+        )
+    for linked in (exc.__cause__, exc.__context__):
+        if (isinstance(linked, BaseException)
+                and _is_recoverable_connection_error(linked, expected_endpoint=expected_endpoint)):
+            return True
+    return False
+
+
 class PushWorker:
     """Subscribe once, read on push/catch-up events, persist before dispatch, and never poll."""
 
@@ -828,7 +1029,8 @@ class PushWorker:
                  runner: HermesRunner, allowed_senders: set[str], allowed_topics: set[str],
                  allowed_hubs: set[str], allow_loopback_http: bool = False,
                  allow_private_http: bool = False,
-                 reconnect_base_seconds: float = 1.0, reconnect_max_seconds: float = 60.0):
+                 reconnect_base_seconds: float = 1.0, reconnect_max_seconds: float = 60.0,
+                 recover_routing_ids: tuple[str, ...] = ()):
         validate_url(url, allow_loopback_http=allow_loopback_http,
                      allow_private_http=allow_private_http)
         if identity not in {"hermes", "codex", "claude"} or not token:
@@ -852,8 +1054,12 @@ class PushWorker:
         self.drain_event = asyncio.Event()
         self.stop_event = asyncio.Event()
         self.subscription_failure_event = asyncio.Event()
+        self.ready_once_event = asyncio.Event()
         self._catchup_pending = False
         self._active_session: ClientSession | None = None
+        if len(recover_routing_ids) > 32 or len(set(recover_routing_ids)) != len(recover_routing_ids) or any(not UUID_RE.fullmatch(value) for value in recover_routing_ids):
+            raise CapabilityError('invalid explicit recovery IDs')
+        self.recover_routing_ids = list(recover_routing_ids)
 
     async def on_mcp_message(self, message: Any) -> None:
         if not isinstance(message, types.ServerNotification):
@@ -869,6 +1075,7 @@ class PushWorker:
         data = getattr(params, "data", None)
         if isinstance(data, dict) and data.get("event") == "resource_subscriptions_unavailable":
             logging.error("MCP server reported native resource subscriptions unavailable")
+            self.ready_once_event.clear()
             self.subscription_failure_event.set()
 
     def _raise_if_subscription_unavailable(self) -> None:
@@ -887,7 +1094,7 @@ class PushWorker:
         except CapabilityError:
             raise
         except Exception as exc:
-            if _is_network_error(exc):
+            if _is_recoverable_connection_error(exc, expected_endpoint=self.url):
                 raise
             raise CapabilityError("one-time inbox head snapshot is unavailable") from exc
         snapshot_messages = payload.get("messages", [])
@@ -927,6 +1134,8 @@ class PushWorker:
                 )
             except QueueFull:
                 # Keep the catch-up pending; resume only after an already-queued task drains.
+                if not self.ready_once_event.is_set():
+                    raise QueueFull('catch-up blocked by a full queue; operator action required')
                 return
             if accepted:
                 self.queue_event.set()
@@ -938,8 +1147,32 @@ class PushWorker:
         if pages >= MAX_PAGES_PER_CATCHUP and not self.stop_event.is_set():
             self.drain_event.set()
 
+    async def _recover_routing(self, session: ClientSession) -> None:
+        while self.recover_routing_ids:
+            message_id = self.recover_routing_ids[0]
+            if self.state.routing_recovered(message_id):
+                self.recover_routing_ids.pop(0)
+                continue
+            seq = self.state.routing_issue_sequence(message_id)
+            uri = AnyUrl(f'{BASE_INBOX_URI.format(self.identity)}?after={seq - 1}&limit=1')
+            payload = _resource_payload(await session.read_resource(uri))
+            messages = payload.get('messages')
+            if not isinstance(messages, list) or len(messages) != 1:
+                raise WorkerError('diagnosed message unavailable')
+            message = messages[0]
+            self.state.recover_routing_issue(message_id, message, identity=self.identity,
+                allowed_senders=self.allowed_senders, allowed_topics=self.allowed_topics,
+                allowed_hubs=self.allowed_hubs)
+            self.recover_routing_ids.pop(0)
+            self.queue_event.set()
+
     async def _dispatch_queue(self) -> None:
+        # Persisted work may survive a prior process, but do not execute it until
+        # this process has authenticated, subscribed, and completed its first
+        # durable inbox catch-up. A transient connection drop closes this gate for
+        # new jobs but does not cancel the child that is already running.
         while not self.stop_event.is_set():
+            await self.ready_once_event.wait()
             job = self.state.next_job()
             if job is None:
                 self.queue_event.clear()
@@ -973,10 +1206,10 @@ class PushWorker:
             if self.state.queued_count():
                 self.queue_event.set()
 
-    async def _wait_for_input(self) -> None:
+    async def _wait_for_input(self, transport_reopened_event: asyncio.Event) -> None:
         tasks = [asyncio.create_task(event.wait()) for event in (
             self.notification_event, self.drain_event, self.stop_event,
-            self.subscription_failure_event,
+            self.subscription_failure_event, transport_reopened_event,
         )]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -992,7 +1225,28 @@ class PushWorker:
     async def run_connection(self) -> None:
         timeout = httpx.Timeout(connect=15, read=SSE_READ_IDLE_TIMEOUT_SECONDS, write=15, pool=15)
         headers = {"Authorization": f"Bearer {self.token}"}
-        async with httpx.AsyncClient(headers=headers, timeout=timeout, trust_env=False) as http_client:
+        transport_reopened_event = asyncio.Event()
+        get_stream_count = 0
+
+        async def observe_mcp_request(request: httpx.Request) -> None:
+            nonlocal get_stream_count
+            if (request.method == "GET" and request.url == httpx.URL(self.url)
+                    and request.headers.get("mcp-session-id")):
+                get_stream_count += 1
+                if get_stream_count > 1:
+                    self.ready_once_event.clear()
+                    transport_reopened_event.set()
+
+        async def observe_mcp_response(response: httpx.Response) -> None:
+            request = response.request
+            if (request.method == 'GET' and request.url == httpx.URL(self.url)
+                    and request.headers.get('mcp-session-id')):
+                response.stream = _ReadinessStream(response.stream, self.ready_once_event)
+
+        async with httpx.AsyncClient(
+            headers=headers, timeout=timeout, trust_env=False,
+            event_hooks={"request": [observe_mcp_request], "response": [observe_mcp_response]},
+        ) as http_client:
             async with streamable_http_client(
                 self.url, http_client=http_client, terminate_on_close=True,
             ) as (read_stream, write_stream, _get_session_id):
@@ -1002,7 +1256,6 @@ class PushWorker:
                 ) as session:
                     inbox_uri = AnyUrl(BASE_INBOX_URI.format(self.identity))
                     subscribed = False
-                    dispatcher: asyncio.Task | None = None
                     self.notification_event.clear()
                     try:
                         initialized = await session.initialize()
@@ -1015,30 +1268,41 @@ class PushWorker:
                             await self._bootstrap_cursor(session)
                         if not self.subscription_failure_event.is_set():
                             await self._read_catchup(session)
+                        if not self.subscription_failure_event.is_set() and not self._catchup_pending:
+                            await self._recover_routing(session)
+                            self.ready_once_event.set()
                         if not self.subscription_failure_event.is_set():
-                            dispatcher = asyncio.create_task(self._dispatch_queue())
                             while not self.stop_event.is_set():
-                                await self._wait_for_input()
+                                await self._wait_for_input(transport_reopened_event)
                                 if (self.stop_event.is_set()
                                         or self.subscription_failure_event.is_set()):
                                     break
-                                if self.notification_event.is_set() or self.drain_event.is_set():
+                                if transport_reopened_event.is_set():
+                                    transport_reopened_event.clear()
+                                    # The MCP SDK reopens GET streams internally without
+                                    # replaying resources/subscribe. Refresh the server's
+                                    # recipient subscription, then recover any messages
+                                    # committed while the old stream was unusable.
+                                    await session.subscribe_resource(inbox_uri)
+                                    await self._read_catchup(session)
+                                elif self.notification_event.is_set() or self.drain_event.is_set():
                                     self.notification_event.clear()
                                     self.drain_event.clear()
                                     await self._read_catchup(session)
+                                if not self._catchup_pending:
+                                    await self._recover_routing(session)
+                                    self.ready_once_event.set()
                         if subscribed and not self.subscription_failure_event.is_set():
                             await session.unsubscribe_resource(inbox_uri)
                     except Exception:
                         if not self.subscription_failure_event.is_set():
                             raise
                     finally:
-                        if dispatcher is not None:
-                            dispatcher.cancel()
-                            await asyncio.gather(dispatcher, return_exceptions=True)
+                        self.ready_once_event.clear()
                         self._active_session = None
         self._raise_if_subscription_unavailable()
 
-    async def run_forever(self) -> None:
+    async def _run_connections(self) -> None:
         delay = self.reconnect_base_seconds
         while not self.stop_event.is_set():
             try:
@@ -1052,15 +1316,46 @@ class PushWorker:
             except WorkerError:
                 raise
             except Exception as exc:
-                if not _is_network_error(exc):
+                self.ready_once_event.clear()
+                if not _is_recoverable_connection_error(exc, expected_endpoint=self.url):
                     raise WorkerError("MCP push connection failed for a non-network reason") from None
-                logging.warning("MCP push network unavailable; reconnecting in %.1f seconds", delay)
+                logging.warning("MCP push transport or session stale; reconnecting in %.1f seconds", delay)
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
                     return
                 except asyncio.TimeoutError:
                     pass
                 delay = min(self.reconnect_max_seconds, delay * 2)
+
+    async def run_forever(self) -> None:
+        # The durable dispatcher belongs to the worker process, not an individual
+        # SSE/MCP connection. A transient disconnect must not cancel an in-flight
+        # child run and turn an otherwise recoverable job into an uncertain one.
+        dispatcher = asyncio.create_task(self._dispatch_queue())
+        connections = asyncio.create_task(self._run_connections())
+        try:
+            done, _pending = await asyncio.wait(
+                {dispatcher, connections}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if dispatcher in done:
+                if self.stop_event.is_set():
+                    await connections
+                    return
+                # Surface an unexpected dispatcher failure and stop the connection
+                # loop; silently losing the only queue consumer would strand work.
+                dispatcher.result()
+                raise WorkerError("durable queue dispatcher stopped unexpectedly")
+            connections.result()
+            if not self.stop_event.is_set():
+                raise WorkerError("MCP connection loop stopped unexpectedly")
+        finally:
+            # Process shutdown retains the existing fail-closed behavior for a
+            # child whose final outcome cannot be observed. Network reconnects do
+            # not reach this path, so the child continues across those gaps.
+            self.stop_event.set()
+            dispatcher.cancel()
+            connections.cancel()
+            await asyncio.gather(dispatcher, connections, return_exceptions=True)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1081,6 +1376,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-budget", type=int, default=120)
     parser.add_argument("--max-turns", type=int, default=2)
     parser.add_argument("--max-queue", type=int, default=MAX_QUEUE)
+    parser.add_argument("--recover-routing-id", action="append", default=[],
+                        help="explicitly reconsider one diagnosed pending UUID using the current allowlist")
     return parser.parse_args(argv)
 
 
@@ -1107,6 +1404,7 @@ async def _run_from_args(args: argparse.Namespace) -> None:
         url=args.url, token=token, identity=args.agent, state=state, runner=runner,
         allowed_senders=set(args.allow_sender), allowed_topics=set(args.allow_topic),
         allowed_hubs=set(args.allow_hub), allow_private_http=args.allow_private_http,
+        recover_routing_ids=tuple(args.recover_routing_id),
     )
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
