@@ -564,6 +564,9 @@ class WorkerState:
                                  (message_id, int(message["seq"]), thread))
                     conn.execute("DELETE FROM routing_issues WHERE message_id=?", (message_id,))
                     accepted.append(message_id)
+                routing_issue_count = int(conn.execute("SELECT COUNT(*) FROM routing_issues").fetchone()[0])
+                if routing_issue_count > MAX_RETAINED_ITEMS:
+                    raise QueueFull("durable worker routing issue ledger is full")
                 self._prune_terminal_history(conn)
                 conn.execute("UPDATE state SET value=? WHERE key='cursor'", (str(next_cursor),))
                 conn.commit()
