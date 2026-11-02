@@ -405,10 +405,36 @@ class WorkerState:
                 CREATE TABLE IF NOT EXISTS routing_issues (
                     message_id TEXT PRIMARY KEY,
                     seq INTEGER NOT NULL,
-                    reason TEXT NOT NULL CHECK(reason IN ('missing_route','ambiguous_route','route_not_allowed'))
+                    reason TEXT NOT NULL CHECK(reason IN (
+                        'missing_route','ambiguous_route','route_not_allowed','invalid_correlation'
+                    ))
                 );
                 CREATE INDEX IF NOT EXISTS idx_routing_issues_seq ON routing_issues(seq);
             """)
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='routing_issues'"
+            ).fetchone()
+            if schema is not None and "invalid_correlation" not in schema[0]:
+                # Keep existing local diagnostics readable while widening the fixed
+                # reason enum. SQLite cannot alter a CHECK constraint in place.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("ALTER TABLE routing_issues RENAME TO routing_issues_legacy")
+                    conn.execute("""CREATE TABLE routing_issues (
+                        message_id TEXT PRIMARY KEY,
+                        seq INTEGER NOT NULL,
+                        reason TEXT NOT NULL CHECK(reason IN (
+                            'missing_route','ambiguous_route','route_not_allowed','invalid_correlation'
+                        ))
+                    )""")
+                    conn.execute("""INSERT INTO routing_issues(message_id,seq,reason)
+                        SELECT message_id,seq,reason FROM routing_issues_legacy""")
+                    conn.execute("DROP TABLE routing_issues_legacy")
+                    conn.execute("CREATE INDEX idx_routing_issues_seq ON routing_issues(seq)")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
         if os.name != "nt":
             os.chmod(self.path, 0o600)
             for suffix in ("-wal", "-shm"):
@@ -483,6 +509,17 @@ class WorkerState:
                 pending_count = int(conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0])
                 admitted: list[tuple[dict[str, Any], str, str, str]] = []
                 newly_quarantined: list[tuple[str, int, str]] = []
+
+                def record_routing_issue(message: dict[str, Any], reason: str) -> None:
+                    message_id = message["id"]
+                    seq = int(message["seq"])
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO routing_issues(message_id,seq,reason) VALUES(?,?,?)",
+                        (message_id, seq, reason),
+                    )
+                    if cursor.rowcount:
+                        newly_quarantined.append((message_id, seq, reason))
+
                 for message in messages:
                     message_id = message.get("id")
                     if not isinstance(message_id, str) or not UUID_RE.fullmatch(message_id):
@@ -493,19 +530,15 @@ class WorkerState:
                     if not isinstance(sender, str) or sender == identity or sender not in allowed_senders:
                         continue
                     kind = str(message.get("message_type", "")).upper()
-                    route = _route_key(message.get("body"), allowed_topics, allowed_hubs)
                     correlation = message.get("correlation_id")
                     if correlation is not None and (not isinstance(correlation, str) or len(correlation) > 256):
+                        if kind in {"TASK", "REQUEST"}:
+                            record_routing_issue(message, "invalid_correlation")
                         continue
+                    route = _route_key(message.get("body"), allowed_topics, allowed_hubs)
                     if kind in {"TASK", "REQUEST"}:
                         if route is None:
-                            reason = _route_issue_reason(message.get("body"))
-                            cursor = conn.execute(
-                                "INSERT OR IGNORE INTO routing_issues(message_id,seq,reason) VALUES(?,?,?)",
-                                (message_id, int(message["seq"]), reason),
-                            )
-                            if cursor.rowcount:
-                                newly_quarantined.append((message_id, int(message["seq"]), reason))
+                            record_routing_issue(message, _route_issue_reason(message.get("body")))
                             continue
                         thread = _thread_key(route, correlation, message_id, sender)
                         admitted.append((message, kind, route, thread))
@@ -562,11 +595,23 @@ class WorkerState:
                     )
                     conn.execute("INSERT INTO queue(message_id,seq,thread_key,status) VALUES(?,?,?,'queued')",
                                  (message_id, int(message["seq"]), thread))
-                    conn.execute("DELETE FROM routing_issues WHERE message_id=?", (message_id,))
                     accepted.append(message_id)
                 routing_issue_count = int(conn.execute("SELECT COUNT(*) FROM routing_issues").fetchone()[0])
-                if routing_issue_count > MAX_RETAINED_ITEMS:
-                    raise QueueFull("durable worker routing issue ledger is full")
+                overflow = max(0, routing_issue_count - MAX_RETAINED_ITEMS)
+                if overflow:
+                    expired = [row[0] for row in conn.execute(
+                        "SELECT message_id FROM routing_issues ORDER BY seq ASC LIMIT ?", (overflow,)
+                    )]
+                    conn.executemany("DELETE FROM routing_issues WHERE message_id=?",
+                                     ((message_id,) for message_id in expired))
+                    dropped_row = conn.execute(
+                        "SELECT value FROM state WHERE key='routing_issues_dropped'"
+                    ).fetchone()
+                    dropped = (int(dropped_row[0]) if dropped_row is not None else 0) + len(expired)
+                    conn.execute(
+                        "INSERT INTO state(key,value) VALUES('routing_issues_dropped',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(dropped),)
+                    )
                 self._prune_terminal_history(conn)
                 conn.execute("UPDATE state SET value=? WHERE key='cursor'", (str(next_cursor),))
                 conn.commit()
@@ -682,6 +727,11 @@ class WorkerState:
                 "SELECT message_id,seq,reason FROM routing_issues ORDER BY seq"
             ).fetchall()
             return [{"message_id": row[0], "seq": int(row[1]), "reason": row[2]} for row in rows]
+
+    def routing_issues_dropped(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM state WHERE key='routing_issues_dropped'").fetchone()
+            return int(row[0]) if row is not None else 0
 
     def item_status(self, message_id: str) -> str | None:
         with self._connect() as conn:
