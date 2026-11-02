@@ -810,6 +810,13 @@ def _is_network_error(exc: BaseException) -> bool:
             return True
         if isinstance(current, socket.gaierror):
             return True
+        if isinstance(current, BaseExceptionGroup):
+            # AnyIO/MCP can surface a transport disconnect nested in a task group.
+            # Retry only when every leaf is network-related; mixed groups may
+            # contain a protocol/capability failure that must remain terminal.
+            return bool(current.exceptions) and all(
+                _is_network_error(child) for child in current.exceptions
+            )
         if isinstance(current, OSError) and current.errno in {
             errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH,
             errno.ENETUNREACH, errno.ETIMEDOUT, errno.EPIPE,
@@ -818,6 +825,36 @@ def _is_network_error(exc: BaseException) -> bool:
         for linked in (current.__cause__, current.__context__):
             if isinstance(linked, BaseException):
                 pending.append(linked)
+    return False
+
+
+def _is_recoverable_connection_error(
+    exc: BaseException, *, expected_endpoint: str | None = None,
+) -> bool:
+    """Allow transport errors and stale authenticated MCP sessions to reconnect.
+
+    A 404 is recoverable only when it is tied to an existing MCP session ID;
+    an endpoint/path 404 remains a permanent configuration failure.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _is_recoverable_connection_error(child, expected_endpoint=expected_endpoint)
+            for child in exc.exceptions
+        )
+    if _is_network_error(exc):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        return (
+            exc.response.status_code == 404
+            and bool(request.headers.get("mcp-session-id"))
+            and request.method in {"GET", "POST", "DELETE"}
+            and (expected_endpoint is None or request.url == httpx.URL(expected_endpoint))
+        )
+    for linked in (exc.__cause__, exc.__context__):
+        if (isinstance(linked, BaseException)
+                and _is_recoverable_connection_error(linked, expected_endpoint=expected_endpoint)):
+            return True
     return False
 
 
@@ -888,7 +925,7 @@ class PushWorker:
         except CapabilityError:
             raise
         except Exception as exc:
-            if _is_network_error(exc):
+            if _is_recoverable_connection_error(exc, expected_endpoint=self.url):
                 raise
             raise CapabilityError("one-time inbox head snapshot is unavailable") from exc
         snapshot_messages = payload.get("messages", [])
@@ -980,10 +1017,10 @@ class PushWorker:
             if self.state.queued_count():
                 self.queue_event.set()
 
-    async def _wait_for_input(self) -> None:
+    async def _wait_for_input(self, transport_reopened_event: asyncio.Event) -> None:
         tasks = [asyncio.create_task(event.wait()) for event in (
             self.notification_event, self.drain_event, self.stop_event,
-            self.subscription_failure_event,
+            self.subscription_failure_event, transport_reopened_event,
         )]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -999,7 +1036,21 @@ class PushWorker:
     async def run_connection(self) -> None:
         timeout = httpx.Timeout(connect=15, read=SSE_READ_IDLE_TIMEOUT_SECONDS, write=15, pool=15)
         headers = {"Authorization": f"Bearer {self.token}"}
-        async with httpx.AsyncClient(headers=headers, timeout=timeout, trust_env=False) as http_client:
+        transport_reopened_event = asyncio.Event()
+        get_stream_count = 0
+
+        async def observe_mcp_request(request: httpx.Request) -> None:
+            nonlocal get_stream_count
+            if (request.method == "GET" and request.url == httpx.URL(self.url)
+                    and request.headers.get("mcp-session-id")):
+                get_stream_count += 1
+                if get_stream_count > 1:
+                    transport_reopened_event.set()
+
+        async with httpx.AsyncClient(
+            headers=headers, timeout=timeout, trust_env=False,
+            event_hooks={"request": [observe_mcp_request]},
+        ) as http_client:
             async with streamable_http_client(
                 self.url, http_client=http_client, terminate_on_close=True,
             ) as (read_stream, write_stream, _get_session_id):
@@ -1025,11 +1076,19 @@ class PushWorker:
                             self.ready_once_event.set()
                         if not self.subscription_failure_event.is_set():
                             while not self.stop_event.is_set():
-                                await self._wait_for_input()
+                                await self._wait_for_input(transport_reopened_event)
                                 if (self.stop_event.is_set()
                                         or self.subscription_failure_event.is_set()):
                                     break
-                                if self.notification_event.is_set() or self.drain_event.is_set():
+                                if transport_reopened_event.is_set():
+                                    transport_reopened_event.clear()
+                                    # The MCP SDK reopens GET streams internally without
+                                    # replaying resources/subscribe. Refresh the server's
+                                    # recipient subscription, then recover any messages
+                                    # committed while the old stream was unusable.
+                                    await session.subscribe_resource(inbox_uri)
+                                    await self._read_catchup(session)
+                                elif self.notification_event.is_set() or self.drain_event.is_set():
                                     self.notification_event.clear()
                                     self.drain_event.clear()
                                     await self._read_catchup(session)
@@ -1056,9 +1115,9 @@ class PushWorker:
             except WorkerError:
                 raise
             except Exception as exc:
-                if not _is_network_error(exc):
+                if not _is_recoverable_connection_error(exc, expected_endpoint=self.url):
                     raise WorkerError("MCP push connection failed for a non-network reason") from None
-                logging.warning("MCP push network unavailable; reconnecting in %.1f seconds", delay)
+                logging.warning("MCP push transport or session stale; reconnecting in %.1f seconds", delay)
                 try:
                     await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
                     return

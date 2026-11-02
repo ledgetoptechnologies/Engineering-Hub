@@ -34,6 +34,8 @@ from scripts.mcp_push_worker import (
     validate_readonly_profile_config,
     validate_url,
     _parse_args,
+    _is_network_error,
+    _is_recoverable_connection_error,
 )
 
 
@@ -687,6 +689,49 @@ async def test_only_network_failures_reconnect_with_backoff(tmp_path):
     await scenario()
 
 
+def test_exception_groups_retry_only_when_all_causes_are_network_errors():
+    network_group = ExceptionGroup("transport shutdown", [httpx.ReadError("socket closed")])
+    mixed_group = ExceptionGroup("mixed failure", [
+        httpx.ReadError("socket closed"), CapabilityError("subscription unavailable"),
+    ])
+    assert _is_network_error(network_group)
+    assert not _is_network_error(mixed_group)
+
+
+def test_only_session_scoped_mcp_404_is_recoverable():
+    stale_request = httpx.Request(
+        "POST", "https://bus.example.test/mcp", headers={"mcp-session-id": "expired"},
+    )
+    stale_session = httpx.HTTPStatusError(
+        "expired MCP session", request=stale_request,
+        response=httpx.Response(404, request=stale_request),
+    )
+    endpoint_request = httpx.Request("POST", "https://bus.example.test/mcp")
+    missing_endpoint = httpx.HTTPStatusError(
+        "missing endpoint", request=endpoint_request,
+        response=httpx.Response(404, request=endpoint_request),
+    )
+    unauthorized_request = httpx.Request(
+        "POST", "https://bus.example.test/mcp", headers={"mcp-session-id": "current"},
+    )
+    unauthorized = httpx.HTTPStatusError(
+        "invalid credentials", request=unauthorized_request,
+        response=httpx.Response(401, request=unauthorized_request),
+    )
+    wrong_endpoint_request = httpx.Request(
+        "GET", "https://bus.example.test/wrong-path", headers={"mcp-session-id": "expired"},
+    )
+    wrong_endpoint = httpx.HTTPStatusError(
+        "not the configured MCP endpoint", request=wrong_endpoint_request,
+        response=httpx.Response(404, request=wrong_endpoint_request),
+    )
+    endpoint = "https://bus.example.test/mcp"
+    assert _is_recoverable_connection_error(stale_session, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(missing_endpoint, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(unauthorized, expected_endpoint=endpoint)
+    assert not _is_recoverable_connection_error(wrong_endpoint, expected_endpoint=endpoint)
+
+
 @pytest.mark.asyncio
 async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
     finished = asyncio.Event()
@@ -854,6 +899,197 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
     assert state.cursor == repository.sequence_for(incoming.id)
     assert state.item_status(incoming.id) == "succeeded"
     assert state.item_status(old.id) is None
+
+
+@pytest.mark.asyncio
+async def test_real_streamable_http_disconnect_reopens_stream_without_replaying_running_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
+    db_path = tmp_path / "reconnect-bus.sqlite3"
+    audit_path = tmp_path / "reconnect-audit.jsonl"
+    app = create_app(db_path=db_path, audit_path=audit_path, auth=TEST_AUTH,
+                     push_events_operational=True)
+
+    class BlockingRunner:
+        def __init__(self):
+            self.calls = []
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, message_id, resume_session_id=None):
+            self.calls.append((message_id, resume_session_id))
+            self.entered.set()
+            await self.release.wait()
+            return RunOutcome("succeeded", SESSION)
+
+    class ObservedState(WorkerState):
+        def finish_job(self, job, *, outcome, session_id, expected_resume=None):
+            final = super().finish_job(job, outcome=outcome, session_id=session_id,
+                                       expected_resume=expected_resume)
+            if final == "succeeded":
+                finished.set()
+                if getattr(self, "second_job_id", None) == job.message_id:
+                    second_finished.set()
+            return final
+
+    class DropFirstSSE:
+        """End one real server-side MCP SSE response after a job starts."""
+        def __init__(self, wrapped_app):
+            self.wrapped_app = wrapped_app
+            self.streams = 0
+            self.session_ids = []
+            self.stream_reopened = asyncio.Event()
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http" or scope.get("method") != "GET" or scope.get("path") != "/mcp":
+                await self.wrapped_app(scope, receive, send)
+                return
+            self.streams += 1
+            session_id = next(
+                (value.decode("latin1") for name, value in scope.get("headers", [])
+                 if name.lower() == b"mcp-session-id"),
+                None,
+            )
+            self.session_ids.append(session_id)
+            if self.streams > 1:
+                self.stream_reopened.set()
+                await self.wrapped_app(scope, receive, send)
+                return
+
+            response_started = asyncio.Event()
+            connection_task = asyncio.current_task()
+
+            async def watched_send(message):
+                if message.get("type") == "http.response.start":
+                    response_started.set()
+                await send(message)
+
+            async def drop_response():
+                await response_started.wait()
+                await runner.entered.wait()
+                try:
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                finally:
+                    connection_task.cancel()
+
+            drop_task = asyncio.create_task(drop_response())
+            try:
+                await self.wrapped_app(scope, receive, watched_send)
+            except asyncio.CancelledError:
+                # The test intentionally closes this one persistent HTTP stream.
+                raise
+            finally:
+                drop_task.cancel()
+                await asyncio.gather(drop_task, return_exceptions=True)
+
+    runner = BlockingRunner()
+    finished = asyncio.Event()
+    second_finished = asyncio.Event()
+    state = ObservedState(tmp_path / "reconnect-worker.sqlite3")
+
+    class ReconnectingWorker(PushWorker):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.connections = 0
+            self.catchups = 0
+            self.expected_cursor = None
+            self.expected_cursor_reached = asyncio.Event()
+
+        async def run_connection(self):
+            self.connections += 1
+            await super().run_connection()
+
+        async def _read_catchup(self, session):
+            await super()._read_catchup(session)
+            self.catchups += 1
+            if self.expected_cursor is not None and self.state.cursor >= self.expected_cursor:
+                self.expected_cursor_reached.set()
+
+    worker = ReconnectingWorker(
+        url="http://127.0.0.1:8765/mcp", token=TEST_AUTH.hermes_token, identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), allow_loopback_http=True, reconnect_base_seconds=0.01,
+        reconnect_max_seconds=0.05,
+    )
+    subscriptions = []
+    resubscription_complete = asyncio.Event()
+    original_subscribe = app.state.push_publisher.subscribe
+
+    async def observe_subscribe(session_id, recipient, session):
+        await original_subscribe(session_id, recipient, session)
+        subscriptions.append((session_id, recipient))
+        if len(subscriptions) >= 2:
+            resubscription_complete.set()
+
+    monkeypatch.setattr(app.state.push_publisher, "subscribe", observe_subscribe)
+    app_with_drop = DropFirstSSE(app)
+    async with _loopback_mcp(app_with_drop) as url:
+        worker.url = url
+        task = asyncio.create_task(worker.run_forever())
+        try:
+            await asyncio.wait_for(worker.ready_once_event.wait(), timeout=5)
+            incoming = app.state.repository.insert(
+                sender="codex", recipient="hermes", message_type="REQUEST",
+                body={"topic": "qa", "description": "disconnect while active"},
+                correlation_id="real-disconnect-job",
+            )
+            await asyncio.wait_for(runner.entered.wait(), timeout=5)
+            assert state.item_status(incoming.id) == "running"
+            assert state.cursor == app.state.repository.sequence_for(incoming.id)
+
+            try:
+                await asyncio.wait_for(app_with_drop.stream_reopened.wait(), timeout=5)
+            except TimeoutError as exc:
+                failure = None
+                if task.done():
+                    try:
+                        failure = type(task.exception()).__name__
+                    except asyncio.CancelledError:
+                        failure = "cancelled"
+                raise AssertionError(
+                    f"stream reopen stalled: connections={worker.connections}, "
+                    f"catchups={worker.catchups}, streams={app_with_drop.streams}, "
+                    f"subscription_failed={worker.subscription_failure_event.is_set()}, "
+                    f"task_done={task.done()}, task_failure={failure}"
+                ) from exc
+            assert app_with_drop.streams >= 2
+            assert app_with_drop.session_ids[0]
+            assert app_with_drop.session_ids[1] == app_with_drop.session_ids[0]
+            await asyncio.wait_for(resubscription_complete.wait(), timeout=5)
+            assert subscriptions[:2] == [
+                (app_with_drop.session_ids[0], "hermes"),
+                (app_with_drop.session_ids[0], "hermes"),
+            ]
+            assert runner.calls == [(incoming.id, None)]
+            assert state.item_status(incoming.id) == "running"
+            assert app.state.push_publisher.subscription_count == 1
+
+            after_reconnect = app.state.repository.insert(
+                sender="codex", recipient="hermes", message_type="REQUEST",
+                body={"topic": "qa", "description": "arrived after stream reopen"},
+                correlation_id="post-reconnect-job",
+            )
+            worker.expected_cursor = app.state.repository.sequence_for(after_reconnect.id)
+            if state.cursor >= worker.expected_cursor:
+                worker.expected_cursor_reached.set()
+            await asyncio.wait_for(worker.expected_cursor_reached.wait(), timeout=5)
+            assert state.item_status(after_reconnect.id) == "queued"
+            assert runner.calls == [(incoming.id, None)]
+
+            runner.release.set()
+            await asyncio.wait_for(finished.wait(), timeout=5)
+            state.second_job_id = after_reconnect.id
+            if state.item_status(after_reconnect.id) != "succeeded":
+                await asyncio.wait_for(second_finished.wait(), timeout=5)
+            assert state.item_status(incoming.id) == "succeeded"
+            assert state.item_status(after_reconnect.id) == "succeeded"
+            assert runner.calls == [(incoming.id, None), (after_reconnect.id, None)]
+        finally:
+            worker.stop_event.set()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
