@@ -610,6 +610,7 @@ async def test_queue_arrives_while_worker_is_busy_and_survives_shutdown(tmp_path
         worker = PushWorker(url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
                             state=state, runner=runner, allowed_senders={"codex"},
                             allowed_topics={"qa"}, allowed_hubs=set())
+        worker.ready_once_event.set()
         dispatcher = asyncio.create_task(worker._dispatch_queue())
         await asyncio.wait_for(runner.entered.wait(), timeout=1)
 
@@ -640,6 +641,7 @@ async def test_empty_queue_never_calls_model_runner(tmp_path):
         worker = PushWorker(url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
                             state=WorkerState(tmp_path / "state.sqlite3"), runner=runner,
                             allowed_senders={"codex"}, allowed_topics={"qa"}, allowed_hubs=set())
+        worker.ready_once_event.set()
         dispatcher = asyncio.create_task(worker._dispatch_queue())
         await asyncio.sleep(0.02)
         assert runner.calls == 0
@@ -687,6 +689,16 @@ async def test_only_network_failures_reconnect_with_backoff(tmp_path):
 
 @pytest.mark.asyncio
 async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
+    finished = asyncio.Event()
+
+    class ObservedState(WorkerState):
+        def finish_job(self, job, *, outcome, session_id, expected_resume=None):
+            final = super().finish_job(job, outcome=outcome, session_id=session_id,
+                                       expected_resume=expected_resume)
+            if final == "succeeded":
+                finished.set()
+            return final
+
     class BlockingRunner:
         def __init__(self):
             self.entered = asyncio.Event()
@@ -699,7 +711,7 @@ async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
             await self.release.wait()
             return RunOutcome("succeeded", SESSION)
 
-    state = WorkerState(tmp_path / "disconnect-state.sqlite3")
+    state = ObservedState(tmp_path / "disconnect-state.sqlite3")
     state.set_initial_cursor(0)
     item = message(1, correlation_id="disconnect-recovery")
     state.ingest_page([item], 1, identity="hermes", allowed_senders={"codex"},
@@ -714,10 +726,12 @@ async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
             if self.connections == 1:
                 # Drop the MCP session while the independently owned queue
                 # dispatcher is waiting on an active child job.
+                self.ready_once_event.set()
                 await asyncio.wait_for(runner.entered.wait(), timeout=1)
                 raise httpx.ConnectError("fixture transient disconnect")
             await asyncio.wait_for(runner.entered.wait(), timeout=1)
             runner.release.set()
+            await asyncio.wait_for(finished.wait(), timeout=1)
             self.stop_event.set()
 
     worker = DisconnectOnceWorker(
@@ -729,6 +743,37 @@ async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
     assert worker.connections == 2
     assert runner.calls == 1
     assert state.item_status(item["id"]) == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_queued_jobs_wait_for_first_successful_connection(tmp_path):
+    state = WorkerState(tmp_path / "not-ready-state.sqlite3")
+    state.set_initial_cursor(0)
+    item = message(1, correlation_id="not-ready")
+    state.ingest_page([item], 1, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set())
+
+    class PermanentFailureWorker(PushWorker):
+        async def run_connection(self):
+            raise CapabilityError("fixture missing subscription support")
+
+    class CountingRunner:
+        calls = 0
+
+        async def run(self, *_args, **_kwargs):
+            self.calls += 1
+            return RunOutcome("succeeded", SESSION)
+
+    runner = CountingRunner()
+    worker = PermanentFailureWorker(
+        url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), reconnect_base_seconds=0.01,
+    )
+    with pytest.raises(CapabilityError):
+        await worker.run_forever()
+    assert runner.calls == 0
+    assert state.item_status(item["id"]) == "queued"
 
 
 @pytest.mark.asyncio

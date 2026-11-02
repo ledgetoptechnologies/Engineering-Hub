@@ -852,6 +852,7 @@ class PushWorker:
         self.drain_event = asyncio.Event()
         self.stop_event = asyncio.Event()
         self.subscription_failure_event = asyncio.Event()
+        self.ready_once_event = asyncio.Event()
         self._catchup_pending = False
         self._active_session: ClientSession | None = None
 
@@ -939,6 +940,12 @@ class PushWorker:
             self.drain_event.set()
 
     async def _dispatch_queue(self) -> None:
+        # Persisted work may survive a prior process, but do not execute it until
+        # this process has authenticated, subscribed, and completed its first
+        # durable inbox catch-up. A transient connection drop after readiness does
+        # not clear the event, so in-flight jobs remain independent of the SSE
+        # connection.
+        await self.ready_once_event.wait()
         while not self.stop_event.is_set():
             job = self.state.next_job()
             if job is None:
@@ -1014,6 +1021,8 @@ class PushWorker:
                             await self._bootstrap_cursor(session)
                         if not self.subscription_failure_event.is_set():
                             await self._read_catchup(session)
+                        if not self.subscription_failure_event.is_set():
+                            self.ready_once_event.set()
                         if not self.subscription_failure_event.is_set():
                             while not self.stop_event.is_set():
                                 await self._wait_for_input()
