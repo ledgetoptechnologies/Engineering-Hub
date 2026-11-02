@@ -107,3 +107,30 @@ The status command opens the existing database read-only and prints the cursor,
 queued count, dropped-record count and up to 100 recent routing issues. Use
 `--limit 1..1000` to change the displayed issue count. It does not create a
 missing state database, change the cursor, or claim/acknowledge Hub messages.
+
+## Explicit recovery of a diagnosed message
+
+After correcting the worker's allowed topic or hub, an operator can add
+`--recover-routing-id <message-uuid>` to its existing worker command. At the
+next authenticated subscription and complete inbox catch-up, the worker reads
+that exact message from the Hub and checks that it is still pending, addressed
+to the configured agent, sent by an allowed sender, and has exactly one route
+in the current allowlist. It then atomically consumes the local diagnostic and
+queues the original UUID, retaining a durable recovery receipt. Repeating the
+same flag after a restart does not enqueue that UUID again. This is local
+exactly-once queue admission; it is not proof of execution or cross-device
+deduplication, and removal or replacement of the worker database loses it.
+The receipt ledger has a 10,000-record cap and refuses further recovery rather
+than discard receipts. No message body or credential is written to the ledger.
+
+Missing, ambiguous or invalid fields cannot be fixed by widening an allowlist.
+Have the sender issue a corrected message and explicitly resolve the old one;
+this command never rewrites a message, overrides a route, or acknowledges it.
+Diagnostics that were already evicted cannot be recovered with this command.
+Remove completed recovery flags from the service configuration after checking
+the result; at most 32 UUIDs may be requested in one start.
+
+New queue starts pause on an MCP stream loss until an authenticated subscription
+and cursor catch-up complete. An already-running child keeps running. If the
+durable queue is full before catch-up can complete, the worker stops closed and
+requires operator inspection rather than silently dropping or starting work.

@@ -37,6 +37,8 @@ from scripts.mcp_push_worker import (
     _parse_args,
     _is_network_error,
     _is_recoverable_connection_error,
+    WorkerError,
+    _ReadinessStream,
 )
 from scripts.mcp_push_worker_status import main as status_main
 
@@ -97,6 +99,125 @@ def message(seq: int, message_type: str = "TASK", *, topic: str = "qa", sender: 
         "correlation_id": correlation_id, "in_reply_to": in_reply_to,
         "body": {"topic": topic, "description": "UNTRUSTED BODY MUST NOT BE PASSED TO CLI"},
     }
+
+
+def test_explicit_routing_recovery_requires_pending_and_current_allowlist_once(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    for changed in ({**item, 'status': 'acknowledged'}, {**item, 'sender': 'claude'}, item):
+        with pytest.raises(WorkerError):
+            state.recover_routing_issue(item['id'], changed, identity='hermes',
+                allowed_senders={'codex'}, allowed_topics={'qa'}, allowed_hubs=set())
+    assert len(state.routing_issues()) == 1 and state.cursor == 1
+    state.recover_routing_issue(item['id'], item, identity='hermes',
+        allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [item['id']] and not state.routing_issues()
+    with pytest.raises(WorkerError):
+        WorkerState(tmp_path / 'state.sqlite3').recover_routing_issue(item['id'], item,
+            identity='hermes', allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [item['id']] and state.cursor == 1
+
+
+@pytest.mark.parametrize('changed_seq', [True, '1', None, 2])
+def test_explicit_routing_recovery_rejects_changed_sequence_without_consuming(tmp_path, changed_seq):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    with pytest.raises(WorkerError, match='sequence mismatch'):
+        state.recover_routing_issue(item['id'], {**item, 'seq': changed_seq}, identity='hermes',
+            allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.routing_issues()[0]['message_id'] == item['id']
+    assert not state.routing_recovered(item['id']) and state.queued_ids() == [] and state.cursor == 1
+
+
+def test_explicit_routing_recovery_preserves_diagnostic_when_queue_full(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3', max_queue=1)
+    state.set_initial_cursor(0)
+    diagnosed, accepted = message(1, topic='new-topic'), message(2, topic='qa')
+    state.ingest_page([diagnosed, accepted], 2, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    with pytest.raises(QueueFull):
+        state.recover_routing_issue(diagnosed['id'], diagnosed, identity='hermes',
+            allowed_senders={'codex'}, allowed_topics={'new-topic'}, allowed_hubs=set())
+    assert state.queued_ids() == [accepted['id']]
+    assert state.routing_issues()[0]['message_id'] == diagnosed['id']
+    assert not state.routing_recovered(diagnosed['id']) and state.cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_end_closes_dispatch_gate():
+    ready = asyncio.Event()
+    ready.set()
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'chunk'
+    assert [part async for part in _ReadinessStream(Stream(), ready)] == [b'chunk']
+    assert not ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_reads_exact_message_and_restart_uses_receipt(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    item = message(1, topic='new-topic')
+    state.ingest_page([item], 1, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    class Session:
+        calls = []
+        async def read_resource(self, uri):
+            self.calls.append(str(uri))
+            return SimpleNamespace(contents=[SimpleNamespace(text=json.dumps({'messages': [item], 'next_cursor': 1}))])
+    def worker():
+        return PushWorker(url='https://bus.example.test/mcp', token='fixture', identity='hermes',
+            state=state, runner=object(), allowed_senders={'codex'}, allowed_topics={'new-topic'},
+            allowed_hubs=set(), recover_routing_ids=(item['id'],))
+    session = Session()
+    await worker()._recover_routing(session)
+    await worker()._recover_routing(session)
+    assert session.calls == ['agentbus://inbox/hermes?after=0&limit=1']
+    assert state.queued_ids() == [item['id']] and state.routing_recovered(item['id'])
+
+
+@pytest.mark.asyncio
+async def test_disconnected_worker_finishes_active_job_but_waits_to_start_next(tmp_path):
+    state = WorkerState(tmp_path / 'state.sqlite3')
+    state.set_initial_cursor(0)
+    first, second = message(1, correlation_id='first'), message(2, correlation_id='second')
+    state.ingest_page([first, second], 2, identity='hermes', allowed_senders={'codex'},
+                      allowed_topics={'qa'}, allowed_hubs=set())
+    entered, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    class Runner:
+        async def run(self, message_id, resume_session_id=None):
+            if message_id == first['id']:
+                entered.set()
+                await release.wait()
+            else:
+                second_started.set()
+            return RunOutcome('succeeded', SESSION)
+    worker = PushWorker(url='https://bus.example.test/mcp', token='fixture', identity='hermes',
+        state=state, runner=Runner(), allowed_senders={'codex'}, allowed_topics={'qa'}, allowed_hubs=set())
+    worker.ready_once_event.set()
+    dispatcher = asyncio.create_task(worker._dispatch_queue())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        worker.ready_once_event.clear()
+        release.set()
+        for _ in range(100):
+            if state.item_status(first['id']) == 'succeeded':
+                break
+            await asyncio.sleep(.001)
+        assert state.item_status(first['id']) == 'succeeded'
+        assert state.item_status(second['id']) == 'queued' and not second_started.is_set()
+        worker.ready_once_event.set()
+        await asyncio.wait_for(second_started.wait(), 1)
+    finally:
+        dispatcher.cancel()
+        await asyncio.gather(dispatcher, return_exceptions=True)
 
 
 def test_page_queue_and_cursor_commit_together_and_dedupe(tmp_path):

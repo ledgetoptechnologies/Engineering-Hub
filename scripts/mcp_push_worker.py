@@ -92,6 +92,23 @@ class QueueFull(WorkerError):
     """Refuse to advance a cursor if the bounded durable queue cannot accept a full page."""
 
 
+class _ReadinessStream(httpx.AsyncByteStream):
+    """Close admission as soon as an authenticated GET stream ends or fails."""
+    def __init__(self, inner: httpx.AsyncByteStream, ready: asyncio.Event):
+        self.inner, self.ready = inner, ready
+
+    async def __aiter__(self):
+        try:
+            async for chunk in self.inner:
+                yield chunk
+        finally:
+            self.ready.clear()
+
+    async def aclose(self):
+        self.ready.clear()
+        await self.inner.aclose()
+
+
 @dataclass(frozen=True)
 class QueuedJob:
     message_id: str
@@ -410,6 +427,9 @@ class WorkerState:
                     ))
                 );
                 CREATE INDEX IF NOT EXISTS idx_routing_issues_seq ON routing_issues(seq);
+                CREATE TABLE IF NOT EXISTS routing_recoveries (
+                    message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL
+                );
             """)
             schema = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='routing_issues'"
@@ -728,6 +748,60 @@ class WorkerState:
             ).fetchall()
             return [{"message_id": row[0], "seq": int(row[1]), "reason": row[2]} for row in rows]
 
+    def recover_routing_issue(self, message_id: str, message: dict[str, Any], *, identity: str,
+                              allowed_senders: set[str], allowed_topics: set[str],
+                              allowed_hubs: set[str]) -> None:
+        """Consume one diagnosed UUID atomically; the authenticated caller supplies its fresh record."""
+        if not UUID_RE.fullmatch(message_id) or not isinstance(message, dict) or message.get('id') != message_id:
+            raise WorkerError('invalid recovery message')
+        sender, correlation = message.get('sender'), message.get('correlation_id')
+        kind = str(message.get('message_type', '')).upper()
+        route = _route_key(message.get('body'), allowed_topics, allowed_hubs)
+        if (message.get('recipient') != identity or message.get('status') != 'pending'
+                or not isinstance(sender, str) or sender not in allowed_senders or sender == identity
+                or kind not in {'TASK', 'REQUEST'} or route is None
+                or correlation is not None and (not isinstance(correlation, str) or len(correlation) > 256)):
+            raise WorkerError('diagnosed message is not eligible for recovery')
+        thread = _thread_key(route, correlation, message_id, sender)
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                issue = conn.execute('SELECT seq FROM routing_issues WHERE message_id=?', (message_id,)).fetchone()
+                if issue is None or conn.execute('SELECT 1 FROM items WHERE message_id=?', (message_id,)).fetchone():
+                    raise WorkerError('diagnosed message already consumed or unavailable')
+                if type(message.get('seq')) is not int or message['seq'] != issue['seq']:
+                    raise WorkerError('diagnosed message sequence mismatch')
+                if conn.execute('SELECT COUNT(*) FROM routing_recoveries').fetchone()[0] >= MAX_RETAINED_ITEMS:
+                    raise WorkerError('routing recovery receipt capacity exhausted')
+                if conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0] >= self.max_queue:
+                    raise QueueFull('durable worker queue is full')
+                prior = conn.execute('SELECT status,profile FROM threads WHERE thread_key=?', (thread,)).fetchone()
+                if prior is not None and (prior['profile'] != PROFILE or prior['status'] == 'uncertain'):
+                    raise UnsafeResume('previous worker outcome/session is uncertain')
+                seq = int(issue['seq'])
+                conn.execute('INSERT OR IGNORE INTO threads(thread_key,topic_key,correlation_id,sender,session_id,status,profile,updated_seq) VALUES(?,?,?,?,?,?,?,?)',
+                             (thread, route, correlation, sender, None, 'new', PROFILE, seq))
+                conn.execute('INSERT INTO items(message_id,seq,thread_key,topic_key,message_type,in_reply_to,status,profile) VALUES(?,?,?,?,?,?,?,?)',
+                             (message_id, seq, thread, route, kind, message.get('in_reply_to') if isinstance(message.get('in_reply_to'), str) else None, 'queued', PROFILE))
+                conn.execute("INSERT INTO queue(message_id,seq,thread_key,status) VALUES(?,?,?,'queued')", (message_id, seq, thread))
+                conn.execute('INSERT INTO routing_recoveries(message_id,seq) VALUES(?,?)', (message_id, seq))
+                conn.execute('DELETE FROM routing_issues WHERE message_id=?', (message_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def routing_recovered(self, message_id: str) -> bool:
+        with self._connect() as conn:
+            return conn.execute('SELECT 1 FROM routing_recoveries WHERE message_id=?', (message_id,)).fetchone() is not None
+
+    def routing_issue_sequence(self, message_id: str) -> int:
+        with self._connect() as conn:
+            issue = conn.execute('SELECT seq FROM routing_issues WHERE message_id=?', (message_id,)).fetchone()
+            if issue is None or type(issue['seq']) is not int or issue['seq'] < 1:
+                raise WorkerError('diagnosed message unavailable')
+            return issue['seq']
+
     def routing_issues_dropped(self) -> int:
         with self._connect() as conn:
             row = conn.execute("SELECT value FROM state WHERE key='routing_issues_dropped'").fetchone()
@@ -955,7 +1029,8 @@ class PushWorker:
                  runner: HermesRunner, allowed_senders: set[str], allowed_topics: set[str],
                  allowed_hubs: set[str], allow_loopback_http: bool = False,
                  allow_private_http: bool = False,
-                 reconnect_base_seconds: float = 1.0, reconnect_max_seconds: float = 60.0):
+                 reconnect_base_seconds: float = 1.0, reconnect_max_seconds: float = 60.0,
+                 recover_routing_ids: tuple[str, ...] = ()):
         validate_url(url, allow_loopback_http=allow_loopback_http,
                      allow_private_http=allow_private_http)
         if identity not in {"hermes", "codex", "claude"} or not token:
@@ -982,6 +1057,9 @@ class PushWorker:
         self.ready_once_event = asyncio.Event()
         self._catchup_pending = False
         self._active_session: ClientSession | None = None
+        if len(recover_routing_ids) > 32 or len(set(recover_routing_ids)) != len(recover_routing_ids) or any(not UUID_RE.fullmatch(value) for value in recover_routing_ids):
+            raise CapabilityError('invalid explicit recovery IDs')
+        self.recover_routing_ids = list(recover_routing_ids)
 
     async def on_mcp_message(self, message: Any) -> None:
         if not isinstance(message, types.ServerNotification):
@@ -997,6 +1075,7 @@ class PushWorker:
         data = getattr(params, "data", None)
         if isinstance(data, dict) and data.get("event") == "resource_subscriptions_unavailable":
             logging.error("MCP server reported native resource subscriptions unavailable")
+            self.ready_once_event.clear()
             self.subscription_failure_event.set()
 
     def _raise_if_subscription_unavailable(self) -> None:
@@ -1055,6 +1134,8 @@ class PushWorker:
                 )
             except QueueFull:
                 # Keep the catch-up pending; resume only after an already-queued task drains.
+                if not self.ready_once_event.is_set():
+                    raise QueueFull('catch-up blocked by a full queue; operator action required')
                 return
             if accepted:
                 self.queue_event.set()
@@ -1066,14 +1147,32 @@ class PushWorker:
         if pages >= MAX_PAGES_PER_CATCHUP and not self.stop_event.is_set():
             self.drain_event.set()
 
+    async def _recover_routing(self, session: ClientSession) -> None:
+        while self.recover_routing_ids:
+            message_id = self.recover_routing_ids[0]
+            if self.state.routing_recovered(message_id):
+                self.recover_routing_ids.pop(0)
+                continue
+            seq = self.state.routing_issue_sequence(message_id)
+            uri = AnyUrl(f'{BASE_INBOX_URI.format(self.identity)}?after={seq - 1}&limit=1')
+            payload = _resource_payload(await session.read_resource(uri))
+            messages = payload.get('messages')
+            if not isinstance(messages, list) or len(messages) != 1:
+                raise WorkerError('diagnosed message unavailable')
+            message = messages[0]
+            self.state.recover_routing_issue(message_id, message, identity=self.identity,
+                allowed_senders=self.allowed_senders, allowed_topics=self.allowed_topics,
+                allowed_hubs=self.allowed_hubs)
+            self.recover_routing_ids.pop(0)
+            self.queue_event.set()
+
     async def _dispatch_queue(self) -> None:
         # Persisted work may survive a prior process, but do not execute it until
         # this process has authenticated, subscribed, and completed its first
-        # durable inbox catch-up. A transient connection drop after readiness does
-        # not clear the event, so in-flight jobs remain independent of the SSE
-        # connection.
-        await self.ready_once_event.wait()
+        # durable inbox catch-up. A transient connection drop closes this gate for
+        # new jobs but does not cancel the child that is already running.
         while not self.stop_event.is_set():
+            await self.ready_once_event.wait()
             job = self.state.next_job()
             if job is None:
                 self.queue_event.clear()
@@ -1135,11 +1234,18 @@ class PushWorker:
                     and request.headers.get("mcp-session-id")):
                 get_stream_count += 1
                 if get_stream_count > 1:
+                    self.ready_once_event.clear()
                     transport_reopened_event.set()
+
+        async def observe_mcp_response(response: httpx.Response) -> None:
+            request = response.request
+            if (request.method == 'GET' and request.url == httpx.URL(self.url)
+                    and request.headers.get('mcp-session-id')):
+                response.stream = _ReadinessStream(response.stream, self.ready_once_event)
 
         async with httpx.AsyncClient(
             headers=headers, timeout=timeout, trust_env=False,
-            event_hooks={"request": [observe_mcp_request]},
+            event_hooks={"request": [observe_mcp_request], "response": [observe_mcp_response]},
         ) as http_client:
             async with streamable_http_client(
                 self.url, http_client=http_client, terminate_on_close=True,
@@ -1162,7 +1268,8 @@ class PushWorker:
                             await self._bootstrap_cursor(session)
                         if not self.subscription_failure_event.is_set():
                             await self._read_catchup(session)
-                        if not self.subscription_failure_event.is_set():
+                        if not self.subscription_failure_event.is_set() and not self._catchup_pending:
+                            await self._recover_routing(session)
                             self.ready_once_event.set()
                         if not self.subscription_failure_event.is_set():
                             while not self.stop_event.is_set():
@@ -1182,12 +1289,16 @@ class PushWorker:
                                     self.notification_event.clear()
                                     self.drain_event.clear()
                                     await self._read_catchup(session)
+                                if not self._catchup_pending:
+                                    await self._recover_routing(session)
+                                    self.ready_once_event.set()
                         if subscribed and not self.subscription_failure_event.is_set():
                             await session.unsubscribe_resource(inbox_uri)
                     except Exception:
                         if not self.subscription_failure_event.is_set():
                             raise
                     finally:
+                        self.ready_once_event.clear()
                         self._active_session = None
         self._raise_if_subscription_unavailable()
 
@@ -1205,6 +1316,7 @@ class PushWorker:
             except WorkerError:
                 raise
             except Exception as exc:
+                self.ready_once_event.clear()
                 if not _is_recoverable_connection_error(exc, expected_endpoint=self.url):
                     raise WorkerError("MCP push connection failed for a non-network reason") from None
                 logging.warning("MCP push transport or session stale; reconnecting in %.1f seconds", delay)
@@ -1264,6 +1376,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-budget", type=int, default=120)
     parser.add_argument("--max-turns", type=int, default=2)
     parser.add_argument("--max-queue", type=int, default=MAX_QUEUE)
+    parser.add_argument("--recover-routing-id", action="append", default=[],
+                        help="explicitly reconsider one diagnosed pending UUID using the current allowlist")
     return parser.parse_args(argv)
 
 
@@ -1290,6 +1404,7 @@ async def _run_from_args(args: argparse.Namespace) -> None:
         url=args.url, token=token, identity=args.agent, state=state, runner=runner,
         allowed_senders=set(args.allow_sender), allowed_topics=set(args.allow_topic),
         allowed_hubs=set(args.allow_hub), allow_private_http=args.allow_private_http,
+        recover_routing_ids=tuple(args.recover_routing_id),
     )
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
