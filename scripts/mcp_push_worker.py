@@ -1002,7 +1002,6 @@ class PushWorker:
                 ) as session:
                     inbox_uri = AnyUrl(BASE_INBOX_URI.format(self.identity))
                     subscribed = False
-                    dispatcher: asyncio.Task | None = None
                     self.notification_event.clear()
                     try:
                         initialized = await session.initialize()
@@ -1016,7 +1015,6 @@ class PushWorker:
                         if not self.subscription_failure_event.is_set():
                             await self._read_catchup(session)
                         if not self.subscription_failure_event.is_set():
-                            dispatcher = asyncio.create_task(self._dispatch_queue())
                             while not self.stop_event.is_set():
                                 await self._wait_for_input()
                                 if (self.stop_event.is_set()
@@ -1032,13 +1030,10 @@ class PushWorker:
                         if not self.subscription_failure_event.is_set():
                             raise
                     finally:
-                        if dispatcher is not None:
-                            dispatcher.cancel()
-                            await asyncio.gather(dispatcher, return_exceptions=True)
                         self._active_session = None
         self._raise_if_subscription_unavailable()
 
-    async def run_forever(self) -> None:
+    async def _run_connections(self) -> None:
         delay = self.reconnect_base_seconds
         while not self.stop_event.is_set():
             try:
@@ -1061,6 +1056,36 @@ class PushWorker:
                 except asyncio.TimeoutError:
                     pass
                 delay = min(self.reconnect_max_seconds, delay * 2)
+
+    async def run_forever(self) -> None:
+        # The durable dispatcher belongs to the worker process, not an individual
+        # SSE/MCP connection. A transient disconnect must not cancel an in-flight
+        # child run and turn an otherwise recoverable job into an uncertain one.
+        dispatcher = asyncio.create_task(self._dispatch_queue())
+        connections = asyncio.create_task(self._run_connections())
+        try:
+            done, _pending = await asyncio.wait(
+                {dispatcher, connections}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if dispatcher in done:
+                if self.stop_event.is_set():
+                    await connections
+                    return
+                # Surface an unexpected dispatcher failure and stop the connection
+                # loop; silently losing the only queue consumer would strand work.
+                dispatcher.result()
+                raise WorkerError("durable queue dispatcher stopped unexpectedly")
+            connections.result()
+            if not self.stop_event.is_set():
+                raise WorkerError("MCP connection loop stopped unexpectedly")
+        finally:
+            # Process shutdown retains the existing fail-closed behavior for a
+            # child whose final outcome cannot be observed. Network reconnects do
+            # not reach this path, so the child continues across those gaps.
+            self.stop_event.set()
+            dispatcher.cancel()
+            connections.cancel()
+            await asyncio.gather(dispatcher, connections, return_exceptions=True)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

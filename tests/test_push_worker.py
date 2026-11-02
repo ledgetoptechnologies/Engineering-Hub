@@ -686,6 +686,52 @@ async def test_only_network_failures_reconnect_with_backoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_job_survives_transient_mcp_disconnect(tmp_path):
+    class BlockingRunner:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def run(self, _message_id, resume_session_id=None):
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return RunOutcome("succeeded", SESSION)
+
+    state = WorkerState(tmp_path / "disconnect-state.sqlite3")
+    state.set_initial_cursor(0)
+    item = message(1, correlation_id="disconnect-recovery")
+    state.ingest_page([item], 1, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set())
+    runner = BlockingRunner()
+
+    class DisconnectOnceWorker(PushWorker):
+        connections = 0
+
+        async def run_connection(self):
+            self.connections += 1
+            if self.connections == 1:
+                # Drop the MCP session while the independently owned queue
+                # dispatcher is waiting on an active child job.
+                await asyncio.wait_for(runner.entered.wait(), timeout=1)
+                raise httpx.ConnectError("fixture transient disconnect")
+            await asyncio.wait_for(runner.entered.wait(), timeout=1)
+            runner.release.set()
+            self.stop_event.set()
+
+    worker = DisconnectOnceWorker(
+        url="https://bus.example.test/mcp", token="fixture-only", identity="hermes",
+        state=state, runner=runner, allowed_senders={"codex"}, allowed_topics={"qa"},
+        allowed_hubs=set(), reconnect_base_seconds=0.01,
+    )
+    await asyncio.wait_for(worker.run_forever(), timeout=2)
+    assert worker.connections == 2
+    assert runner.calls == 1
+    assert state.item_status(item["id"]) == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_connector_uses_real_streamable_http_push_without_replaying_old_work(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_BUS_ALLOWED_HOSTS", "127.0.0.1:*")
     app = create_app(db_path=tmp_path / "bus.sqlite3", audit_path=tmp_path / "audit.jsonl",
@@ -728,7 +774,7 @@ async def test_connector_uses_real_streamable_http_push_without_replaying_old_wo
                                 body={"topic": "qa", "description": "old pending fixture"},
                                 correlation_id="old-job")
         worker.url = url
-        task = asyncio.create_task(worker.run_connection())
+        task = asyncio.create_task(worker.run_forever())
         try:
             await asyncio.wait_for(worker.snapshot_done.wait(), timeout=5)
             await asyncio.wait_for(worker.initial_catchup_done.wait(), timeout=5)
