@@ -149,6 +149,23 @@ def test_unrouted_actionable_items_are_durably_reported_without_body_content(tmp
     assert WorkerState(path).routing_issues() == state.routing_issues()
 
 
+def test_full_routing_issue_ledger_holds_cursor(tmp_path, monkeypatch):
+    monkeypatch.setattr("scripts.mcp_push_worker.MAX_RETAINED_ITEMS", 1)
+    state = WorkerState(tmp_path / "state.sqlite3")
+    state.set_initial_cursor(0)
+    first = message(1)
+    second = message(2)
+    first["body"] = {"description": "missing route"}
+    second["body"] = {"description": "missing route"}
+
+    with pytest.raises(QueueFull, match="routing issue ledger is full"):
+        state.ingest_page([first, second], 2, identity="hermes", allowed_senders={"codex"},
+                          allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
+
+    assert state.cursor == 0
+    assert state.routing_issues() == []
+
+
 def test_hub_optin_requires_one_exact_local_route(tmp_path):
     state = WorkerState(tmp_path / "state.sqlite3")
     state.set_initial_cursor(0)
