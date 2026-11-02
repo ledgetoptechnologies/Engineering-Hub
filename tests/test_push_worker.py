@@ -127,6 +127,28 @@ def test_topics_senders_and_non_actionable_types_are_filtered(tmp_path):
     assert state.cursor == 8
 
 
+def test_unrouted_actionable_items_are_durably_reported_without_body_content(tmp_path, caplog):
+    path = tmp_path / "state.sqlite3"
+    state = WorkerState(path)
+    state.set_initial_cursor(0)
+    missing = message(1, topic="not-opted-in")
+    missing["body"] = {"description": "private untrusted text must not be copied", "topic": "not-opted-in"}
+    ambiguous = message(2)
+    ambiguous["body"] = {"topic": "qa", "hub": "qa-hub", "description": "also untrusted"}
+
+    assert state.ingest_page([missing, ambiguous], 2, identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.cursor == 2
+    assert state.queued_ids() == []
+    assert state.routing_issues() == [
+        {"message_id": missing["id"], "seq": 1, "reason": "route_not_allowed"},
+        {"message_id": ambiguous["id"], "seq": 2, "reason": "ambiguous_route"},
+    ]
+    assert "private untrusted text" not in caplog.text
+    assert missing["id"] in caplog.text and ambiguous["id"] in caplog.text
+    assert WorkerState(path).routing_issues() == state.routing_issues()
+
+
 def test_hub_optin_requires_one_exact_local_route(tmp_path):
     state = WorkerState(tmp_path / "state.sqlite3")
     state.set_initial_cursor(0)
