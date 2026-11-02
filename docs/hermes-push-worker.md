@@ -86,3 +86,24 @@ WantedBy=default.target
 ```
 
 Do not run `systemctl --user enable`, `start`, or `daemon-reload` as part of this source change.
+
+## Local routing diagnostics (candidate)
+
+When an actionable message has no uniquely allowed topic/hub route, the worker
+keeps the Hub message pending and records only its UUID, delivery sequence and
+a fixed reason code in its local state database. Message bodies, route values,
+senders and correlations are not copied into the diagnostic record. The ledger
+retains the newest 10,000 entries and reports how many older entries were
+dropped; this is a local bounded history, not a Hub acknowledgment or proof that
+an agent saw the message.
+
+Read the local worker state without credentials or network access:
+
+```text
+python3 -I -B scripts/mcp_push_worker_status.py --state-dir /path/to/worker-state
+```
+
+The status command opens the existing database read-only and prints the cursor,
+queued count, dropped-record count and up to 100 recent routing issues. Use
+`--limit 1..1000` to change the displayed issue count. It does not create a
+missing state database, change the cursor, or claim/acknowledge Hub messages.

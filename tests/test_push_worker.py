@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 import socket
+import sqlite3
 import stat
 import uuid
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ from scripts.mcp_push_worker import (
     _is_network_error,
     _is_recoverable_connection_error,
 )
+from scripts.mcp_push_worker_status import main as status_main
 
 
 PROFILE = "mcp-worker"
@@ -133,21 +135,32 @@ def test_unrouted_actionable_items_are_durably_reported_without_body_content(tmp
     path = tmp_path / "state.sqlite3"
     state = WorkerState(path)
     state.set_initial_cursor(0)
-    missing = message(1, topic="not-opted-in")
-    missing["body"] = {"description": "private untrusted text must not be copied", "topic": "not-opted-in"}
-    ambiguous = message(2)
+    missing = message(1)
+    missing["body"] = {"description": "private untrusted text must not be copied"}
+    non_dict = message(2)
+    non_dict["body"] = "untrusted text"
+    ambiguous = message(3)
     ambiguous["body"] = {"topic": "qa", "hub": "qa-hub", "description": "also untrusted"}
+    unapproved_hub = message(4)
+    unapproved_hub["body"] = {"hub": "other-hub"}
+    invalid_correlation = message(5)
+    invalid_correlation["correlation_id"] = "x" * 257
 
-    assert state.ingest_page([missing, ambiguous], 2, identity="hermes", allowed_senders={"codex"},
+    assert state.ingest_page([missing, non_dict, ambiguous, unapproved_hub, invalid_correlation], 5,
+                             identity="hermes", allowed_senders={"codex"},
                              allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
-    assert state.cursor == 2
+    assert state.cursor == 5
     assert state.queued_ids() == []
     assert state.routing_issues() == [
-        {"message_id": missing["id"], "seq": 1, "reason": "route_not_allowed"},
-        {"message_id": ambiguous["id"], "seq": 2, "reason": "ambiguous_route"},
+        {"message_id": missing["id"], "seq": 1, "reason": "missing_route"},
+        {"message_id": non_dict["id"], "seq": 2, "reason": "missing_route"},
+        {"message_id": ambiguous["id"], "seq": 3, "reason": "ambiguous_route"},
+        {"message_id": unapproved_hub["id"], "seq": 4, "reason": "route_not_allowed"},
+        {"message_id": invalid_correlation["id"], "seq": 5, "reason": "invalid_correlation"},
     ]
+    assert state.routing_issues_dropped() == 0
     assert "private untrusted text" not in caplog.text
-    assert missing["id"] in caplog.text and ambiguous["id"] in caplog.text
+    assert all(item["message_id"] in caplog.text for item in state.routing_issues())
     assert WorkerState(path).routing_issues() == state.routing_issues()
 
 
@@ -160,12 +173,63 @@ def test_full_routing_issue_ledger_holds_cursor(tmp_path, monkeypatch):
     first["body"] = {"description": "missing route"}
     second["body"] = {"description": "missing route"}
 
-    with pytest.raises(QueueFull, match="routing issue ledger is full"):
-        state.ingest_page([first, second], 2, identity="hermes", allowed_senders={"codex"},
-                          allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
+    assert state.ingest_page([first, second], 2, identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.cursor == 2
+    assert state.routing_issues() == [
+        {"message_id": second["id"], "seq": 2, "reason": "missing_route"}
+    ]
+    assert state.routing_issues_dropped() == 1
 
-    assert state.cursor == 0
-    assert state.routing_issues() == []
+
+def test_existing_routing_issue_ledger_migrates_for_invalid_correlation(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("CREATE TABLE threads (thread_key TEXT PRIMARY KEY, topic_key TEXT NOT NULL, correlation_id TEXT, sender TEXT NOT NULL, session_id TEXT, status TEXT NOT NULL, profile TEXT NOT NULL, updated_seq INTEGER NOT NULL)")
+        conn.execute("CREATE TABLE items (message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, thread_key TEXT NOT NULL, topic_key TEXT NOT NULL, message_type TEXT NOT NULL, in_reply_to TEXT, status TEXT NOT NULL, profile TEXT NOT NULL)")
+        conn.execute("CREATE TABLE queue (message_id TEXT PRIMARY KEY REFERENCES items(message_id), seq INTEGER NOT NULL, thread_key TEXT NOT NULL, status TEXT NOT NULL)")
+        conn.execute("CREATE INDEX idx_queue_status_seq ON queue(status, seq)")
+        conn.execute("CREATE TABLE routing_issues (message_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, reason TEXT NOT NULL CHECK(reason IN ('missing_route','ambiguous_route','route_not_allowed')))")
+        conn.execute("CREATE INDEX idx_routing_issues_seq ON routing_issues(seq)")
+        conn.execute("INSERT INTO routing_issues VALUES(?,?,?)",
+                     (str(uuid.uuid4()), 1, "missing_route"))
+        conn.commit()
+
+    state = WorkerState(path)
+    old_issue = state.routing_issues()[0]
+    state.set_initial_cursor(1)
+    invalid = message(2)
+    invalid["correlation_id"] = "x" * 257
+    assert state.ingest_page([invalid], 2, identity="hermes", allowed_senders={"codex"},
+                             allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE) == []
+    assert state.routing_issues()[0] == old_issue
+    assert state.routing_issues()[1]["reason"] == "invalid_correlation"
+
+
+def test_worker_status_cli_reads_content_free_issue_details_without_creating_state(tmp_path, capsys):
+    state_dir = tmp_path / "worker-state"
+    state_dir.mkdir()
+    state = WorkerState(state_dir / "mcp-push-worker.sqlite3")
+    state.set_initial_cursor(4)
+    item = message(5)
+    item["body"] = {"description": "private body is not in the status output"}
+    state.ingest_page([item], 5, identity="hermes", allowed_senders={"codex"},
+                      allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
+
+    assert status_main(["--state-dir", str(state_dir)]) == 0
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+    assert parsed["cursor"] == 5
+    assert parsed["queued_count"] == 0
+    assert parsed["routing_issues"] == [
+        {"message_id": item["id"], "seq": 5, "reason": "missing_route"}
+    ]
+    assert "private body" not in output
+
+    missing_state = tmp_path / "missing-state"
+    assert status_main(["--state-dir", str(missing_state)]) == 2
+    assert not (missing_state / "mcp-push-worker.sqlite3").exists()
 
 
 def test_hub_optin_requires_one_exact_local_route(tmp_path):
