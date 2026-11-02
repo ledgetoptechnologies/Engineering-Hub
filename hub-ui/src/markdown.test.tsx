@@ -31,7 +31,8 @@ describe("safe markdown", () => {
 
   it("links only https and Hub paths", () => {
     expect(html("[ok](https://example.com/a)")).toContain('href="https://example.com/a"');
-    expect(html("[hub](/projects/treedar)")).toContain('href="/projects/treedar"');
+    expect(html("[hub](/projects/treedar)")).toContain('href="#/projects/treedar"');
+    expect(html("[file](/api/hub/v1/attachments/x)")).toContain('href="/api/hub/v1/attachments/x"');
     for (const bad of ["javascript:alert(1)", "http://example.com", "data:text/html,x", "//evil.example"]) {
       const out = html(`[x](${bad})`);
       expect(out).not.toContain("href=");

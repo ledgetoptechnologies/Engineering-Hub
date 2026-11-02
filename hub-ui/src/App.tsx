@@ -745,12 +745,20 @@ export function HubApp() {
             <section className="login-panel">
               <span className="login-symbol">H</span>
               <p className="eyebrow">YOUR PRIVATE CONTROL PLANE</p>
-              <h2>{loading ? "Opening your workspace…" : "Sign in to Engineering Hub."}</h2>
+              <h2>{loading ? "Opening your workspace…"
+                : session?.authenticated ? "Your workspace could not be loaded." : "Sign in to Engineering Hub."}</h2>
+              {!loading && session?.authenticated ? (
+                <>
+                  <p>You are signed in, but the Hub did not return your workspace. The notice above has the reason.</p>
+                  <button type="button" className="primary" onClick={() => void refresh()}>Try again</button>
+                </>
+              ) : (
               <p>
                 Use your authorized account to see assigned work and record decisions. Agent credentials never
                 belong in this browser.
               </p>
-              {!loading && (
+              )}
+              {!loading && !session?.authenticated && (
                 <>
                   <a className="primary" href="/api/hub/v1/auth/login">Sign in securely <Icon kind="arrow" /></a>
                   <p className="small-text">
