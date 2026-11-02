@@ -345,6 +345,15 @@ def _route_key(body: Any, allowed_topics: set[str], allowed_hubs: set[str]) -> s
     return f"{field}:{value}"
 
 
+def _route_issue_reason(body: Any) -> str:
+    """Return a fixed, non-content-bearing reason for an actionable unrouted item."""
+    if not isinstance(body, dict) or ("topic" not in body and "hub" not in body):
+        return "missing_route"
+    if "topic" in body and "hub" in body:
+        return "ambiguous_route"
+    return "route_not_allowed"
+
+
 def _thread_key(route_key: str, correlation_id: str | None, message_id: str, sender: str) -> str:
     discriminator = correlation_id if isinstance(correlation_id, str) and correlation_id else f"message:{message_id}"
     raw = json.dumps([PROFILE, sender, route_key, discriminator], ensure_ascii=False, separators=(",", ":"))
@@ -393,6 +402,12 @@ class WorkerState:
                     status TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_queue_status_seq ON queue(status, seq);
+                CREATE TABLE IF NOT EXISTS routing_issues (
+                    message_id TEXT PRIMARY KEY,
+                    seq INTEGER NOT NULL,
+                    reason TEXT NOT NULL CHECK(reason IN ('missing_route','ambiguous_route','route_not_allowed'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_routing_issues_seq ON routing_issues(seq);
             """)
         if os.name != "nt":
             os.chmod(self.path, 0o600)
@@ -467,6 +482,7 @@ class WorkerState:
 
                 pending_count = int(conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0])
                 admitted: list[tuple[dict[str, Any], str, str, str]] = []
+                newly_quarantined: list[tuple[str, int, str]] = []
                 for message in messages:
                     message_id = message.get("id")
                     if not isinstance(message_id, str) or not UUID_RE.fullmatch(message_id):
@@ -483,6 +499,13 @@ class WorkerState:
                         continue
                     if kind in {"TASK", "REQUEST"}:
                         if route is None:
+                            reason = _route_issue_reason(message.get("body"))
+                            cursor = conn.execute(
+                                "INSERT OR IGNORE INTO routing_issues(message_id,seq,reason) VALUES(?,?,?)",
+                                (message_id, int(message["seq"]), reason),
+                            )
+                            if cursor.rowcount:
+                                newly_quarantined.append((message_id, int(message["seq"]), reason))
                             continue
                         thread = _thread_key(route, correlation, message_id, sender)
                         admitted.append((message, kind, route, thread))
@@ -539,10 +562,16 @@ class WorkerState:
                     )
                     conn.execute("INSERT INTO queue(message_id,seq,thread_key,status) VALUES(?,?,?,'queued')",
                                  (message_id, int(message["seq"]), thread))
+                    conn.execute("DELETE FROM routing_issues WHERE message_id=?", (message_id,))
                     accepted.append(message_id)
                 self._prune_terminal_history(conn)
                 conn.execute("UPDATE state SET value=? WHERE key='cursor'", (str(next_cursor),))
                 conn.commit()
+                for message_id, seq, reason in newly_quarantined:
+                    logging.warning(
+                        "Actionable MCP message needs routing (id=%s seq=%s reason=%s)",
+                        message_id, seq, reason,
+                    )
                 return accepted
             except Exception:
                 conn.rollback()
@@ -642,6 +671,14 @@ class WorkerState:
     def queued_count(self) -> int:
         with self._connect() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM queue WHERE status='queued'").fetchone()[0])
+
+    def routing_issues(self) -> list[dict[str, Any]]:
+        """Return durable, content-free routing diagnostics for operator review."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT message_id,seq,reason FROM routing_issues ORDER BY seq"
+            ).fetchall()
+            return [{"message_id": row[0], "seq": int(row[1]), "reason": row[2]} for row in rows]
 
     def item_status(self, message_id: str) -> str | None:
         with self._connect() as conn:
