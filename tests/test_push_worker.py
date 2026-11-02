@@ -390,7 +390,7 @@ def test_readonly_capability_gate_requires_exact_server_tool_whitelist():
 
 def test_coordination_capability_gate_requires_exact_five_bus_tools():
     config = {"mcp_servers": {"agent-bus-production": {
-        "url": "http://192.168.50.80:8765/mcp",
+        "url": "http://192.168.50.80:8770/mcp",
         "tools": {
             "include": ["get_message", "claim_message", "ack_message", "send_message", "bus_info"],
             "resources": False,
@@ -398,7 +398,7 @@ def test_coordination_capability_gate_requires_exact_five_bus_tools():
         },
     }}}
     validate_readonly_profile_config(
-        config, mode="coordination", expected_url="http://192.168.50.80:8765/mcp")
+        config, mode="coordination", expected_url="http://192.168.50.80:8770/mcp")
 
     for changed in (
         {**config["mcp_servers"]["agent-bus-production"]["tools"],
@@ -419,8 +419,9 @@ def test_coordination_capability_gate_requires_exact_five_bus_tools():
 
 def test_private_http_requires_explicit_rfc1918_ipv4_opt_in():
     validate_url("https://bus.example.test/mcp")
-    validate_url("http://192.168.50.80:8765/mcp", allow_private_http=True)
+    validate_url("http://192.168.50.80:8770/mcp", allow_private_http=True)
     for url in (
+        "http://192.168.50.80:8765/mcp",
         "http://8.8.8.8:8765/mcp",
         "http://10.5.6.7:8765/mcp",
         "http://bus.example.test:8765/mcp",
@@ -552,7 +553,7 @@ async def test_fake_cli_coordination_launch_is_shell_free_profile_and_toolset_bo
         hermes_root = tmp_path / "isolated-hermes"
         profile_root = hermes_root / "profiles" / PROFILE
         profile_root.mkdir(parents=True)
-        endpoint = "http://192.168.50.80:8765/mcp"
+        endpoint = "http://192.168.50.80:8770/mcp"
         config = {
             "mcp_servers": {
                 "agent-bus-production": {
