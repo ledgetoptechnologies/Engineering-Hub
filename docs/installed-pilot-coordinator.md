@@ -44,6 +44,40 @@ The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 - `supervisor_stop_grace_seconds`: at least the existing1120-second requirement.
   This assertion does not install or verify a supervisor.
 
+## Explicit manual-session selector
+
+The installed CLI remains closed by default. Bare `serve --config <absolute-path>`
+fails before resolving TEST secrets because JSON and CLI arguments cannot create
+the trusted reconciliation and owner-acceptance callbacks. A bounded TEST
+session must be explicitly selected with both protected files:
+
+```text
+serve --config <coordinator.json> --session-profile <pilot.json> \
+      --session-enrollment <manual-session.json>
+```
+
+`--session-profile` uses the existing fixed `engineering-hub.unified-pilot.v1`
+profile. `--session-enrollment` uses the closed
+`engineering-hub.manual-staging-session.v1` data format. The selector accepts
+absolute paths only, reads each file through the existing no-follow,
+stable-identity protected-file reader, and resolves no module, callback, provider,
+or approval flag from those files. The profile manifest, machine and shutdown
+grace must match the installed TEST coordinator. The selected actors and task IDs
+further narrow the coordinator's exact-candidate veto. Current-UID TEST
+credential slots remain separate from the TLS credential captured for the
+identity observer; credential reuse is rejected.
+
+The fixed `TrustedQueuedSessionComposition` binds a fresh owner/process challenge,
+current executor identity observer and owner-only manual acceptance broker to
+the same manifest and database. Admission starts pending/closed. Human
+acceptance only opens this bounded admission gate; repository task ownership,
+independent review, queue fencing, exact candidate identity and current
+reconciliation checks remain required before effects. The accepted composition
+is closed only after the owned service drains accepted work, including
+cancellation. Restart or expiry requires a fresh enrollment and owner decision.
+The report's inventory/writer attestations remain operator claims, not automatic
+proof of host state.
+
 ## Existing authority remains mandatory
 
 The concrete additional target policy only permits an allowed actor, this action,

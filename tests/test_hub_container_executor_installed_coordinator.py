@@ -3,7 +3,9 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import replace
 import json
+import hashlib
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +174,110 @@ def test_concrete_factory_and_service_lifetime(monkeypatch, with_acceptance):
     assert events == ['process', 'secrets-enter', 'secrets-close', 'serve', 'client', 'client', 'drained']
 
 
+@pytest.mark.parametrize('terminal', ['success', 'failure', 'cancel'])
+def test_explicit_protected_session_selector_binds_exact_profile_and_closes_after_drain(
+        monkeypatch, tmp_path, terminal):
+    events, captured = [], {}
+    config = parse()
+    task_id = '1398cf6d-cebd-4f79-a913-be70321970c9'
+    profile_path = tmp_path / 'pilot.json'
+    enrollment_path = tmp_path / 'manual-session.json'
+    ca_path = tmp_path / 'ca.pem'
+    credential_path = tmp_path / 'executor.token'
+    for path in (profile_path, enrollment_path, ca_path, credential_path):
+        path.write_bytes(b'protected-test-data')
+        path.chmod(0o600)
+    profile = SimpleNamespace(manifest=config.manifest, machine_id='staging-pc',
+        grace_seconds=config.stop_grace, actors=frozenset({'codex'}), task_ids=frozenset({task_id}),
+        origin='https://staging-executor.example.test', ca_file=ca_path,
+        ca_sha256='sha256:' + hashlib.sha256(b'fixture-ca').hexdigest(),
+        credential_file=credential_path,
+        credential_sha256='sha256:' + hashlib.sha256(b'fixture-tls').hexdigest())
+    monkeypatch.setattr(module, '_process', lambda: events.append('process'))
+
+    def load_profile(path):
+        events.append(('profile', str(path)))
+        return profile
+    def read_protected_file(path, *, maximum_bytes, private=True):
+        events.append(('read', str(path), maximum_bytes, private))
+        return {str(credential_path): b'fixture-tls', str(ca_path): b'fixture-ca',
+                str(enrollment_path): b'fixture-enrollment'}[str(path)]
+    monkeypatch.setattr('engineering_hub.unified_pilot_startup.load_profile', load_profile)
+    monkeypatch.setattr('engineering_hub.unified_pilot_startup.read_protected_file', read_protected_file)
+    monkeypatch.setattr('engineering_hub.trusted_queued_session.parse_enrollment',
+        lambda raw: events.append(('enrollment', raw)) or object())
+
+    class Composition:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            events.append('composition')
+        def reconciliation_factory(self, *_):
+            return 'same-reconciliation'
+        def session_acceptance_factory(self, *_):
+            return 'same-acceptance'
+        def close(self):
+            events.append('composition-close')
+    monkeypatch.setattr('engineering_hub.trusted_queued_session.TrustedQueuedSessionComposition', Composition)
+
+    @contextmanager
+    def secrets(root, *, bindings):
+        events.append('secrets-enter')
+        try:
+            yield SimpleNamespace(resolve_test_secret=lambda slot, version: 'fixture-' + slot)
+        finally:
+            events.append('secrets-close')
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', secrets)
+
+    class Client:
+        @staticmethod
+        def for_private_unix(path, token):
+            assert path == '/pilot/executor/host.sock' and token == 'fixture-test-executor'
+            events.append('client')
+            return object()
+    monkeypatch.setattr(module, 'ContainerPilotClient', Client)
+
+    async def serve(settings, manifest, client_factory, **kwargs):
+        events.append('serve')
+        assert kwargs['reconciliation_factory'].__self__.__class__ is Composition
+        assert kwargs['session_acceptance_factory'].__self__ is kwargs['reconciliation_factory'].__self__
+        assert captured['database'] == Path(config.database)
+        assert captured['ca_pem'] == b'fixture-ca' and captured['credential'] == b'fixture-tls'
+        assert settings.agent_auth.admin_token is None
+        target = WorkTarget(task_id, manifest.candidate.source_commit,
+                            manifest.candidate.image_config_id)
+        assert kwargs['target_verifier']('codex', module.ACTION, 'staging', target)
+        assert not kwargs['target_verifier']('claude', module.ACTION, 'staging', target)
+        assert not kwargs['target_verifier']('codex', module.ACTION, 'staging',
+            replace(target, task_id='2398cf6d-cebd-4f79-a913-be70321970c9'))
+        client_factory()
+        try:
+            if terminal == 'failure':
+                raise RuntimeError('private failure detail')
+            if terminal == 'cancel':
+                raise asyncio.CancelledError()
+            events.append('drained')
+        finally:
+            if terminal != 'success':
+                events.append('drained')
+    monkeypatch.setattr(module, 'serve_owned_queued_pilot', serve)
+
+    operation = module.run_installed_coordinator(config,
+        session_profile_path=profile_path,
+        session_enrollment_path=enrollment_path)
+    if terminal == 'failure':
+        with pytest.raises(module.InstalledCoordinatorError):
+            run_owned_loop(operation)
+    elif terminal == 'cancel':
+        with pytest.raises(asyncio.CancelledError):
+            run_owned_loop(operation)
+    else:
+        run_owned_loop(operation)
+    assert events[0] == 'process'
+    assert events.index('composition') < events.index('secrets-enter') < events.index('serve')
+    assert events.index('secrets-close') < events.index('composition-close')
+    assert events.index('drained') < events.index('composition-close')
+
+
 @pytest.mark.parametrize('kind', ['bool', 'object', 'async-function', 'async-callable', 'async-generator'])
 def test_invalid_acceptance_factory_denied_before_secret_provider(monkeypatch, kind):
     async def async_function(*_):
@@ -226,6 +332,48 @@ def test_validate_never_serves_or_resolves_secrets(monkeypatch):
     monkeypatch.setattr(module, 'ImmutableTestSecretResolver', lambda *args, **kwargs: pytest.fail('secret effect'))
     monkeypatch.setattr(module, 'run_installed_coordinator', lambda *args: pytest.fail('service effect'))
     assert module.main(['validate', '--config', '/operator/coordinator.json']) == 0
+
+
+def test_bare_installed_serve_stays_closed_before_test_secret_provider(monkeypatch, capsys):
+    monkeypatch.setattr(module, 'load_configuration', lambda _: parse())
+    monkeypatch.setattr(module, '_process', lambda: None)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver',
+        lambda *args, **kwargs: pytest.fail('bare CLI must not read TEST secrets'))
+    assert module.main(['serve', '--config', '/operator/coordinator.json']) == 2
+    assert capsys.readouterr().err == 'Installed pilot coordinator unavailable\n'
+
+
+def test_cli_explicitly_selects_only_the_fixed_profile_and_enrollment(monkeypatch):
+    captured = []
+    monkeypatch.setattr(module, 'load_configuration', lambda _: parse())
+    async def serve(config, **kwargs):
+        captured.append((config, kwargs))
+    monkeypatch.setattr(module, 'run_installed_coordinator', serve)
+    assert module.main(['serve', '--config', '/operator/coordinator.json',
+        '--session-profile', '/operator/pilot.json',
+        '--session-enrollment', '/operator/manual-session.json']) == 0
+    assert captured == [(parse(), {'session_profile_path': '/operator/pilot.json',
+                                   'session_enrollment_path': '/operator/manual-session.json'})]
+
+
+def test_explicit_profile_manifest_mismatch_fails_before_secrets_or_owner(monkeypatch):
+    events = []
+    config = parse()
+    profile = SimpleNamespace(manifest=SimpleNamespace(digest=lambda: 'sha256:' + 'f' * 64,
+        target_id='engineering-hub:staging'),
+        machine_id='staging-pc', grace_seconds=config.stop_grace, actors=config.actors)
+    monkeypatch.setattr(module, '_process', lambda: events.append('process'))
+    monkeypatch.setattr('engineering_hub.unified_pilot_startup.load_profile',
+        lambda path: events.append(('profile', path)) or profile)
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver',
+        lambda *args, **kwargs: pytest.fail('mismatched profile must fail before TEST secret reads'))
+    monkeypatch.setattr(module, 'serve_owned_queued_pilot',
+        lambda *args, **kwargs: pytest.fail('mismatched profile must fail before owner/service'))
+    with pytest.raises(module.InstalledCoordinatorError):
+        run_owned_loop(module.run_installed_coordinator(config,
+            session_profile_path='/operator/pilot.json',
+            session_enrollment_path='/operator/manual-session.json'))
+    assert events == ['process', ('profile', '/operator/pilot.json')]
 
 
 @pytest.mark.parametrize('method,bad', [('getuid', 0), ('geteuid', 0), ('getgid', 0),
