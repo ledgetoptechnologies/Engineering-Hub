@@ -1,0 +1,289 @@
+{
+  "list": {
+    "schema": "hub-orchestration.v1",
+    "truncated": false,
+    "items": [
+      {
+        "request_id": "req-demo-viewer-refresh",
+        "title": "Refresh the operations viewer landing page",
+        "asked_at": "2026-11-03T09:00:00Z",
+        "updated_at": "2026-11-03T10:40:00Z",
+        "dispatch_count": 5,
+        "done_count": 1,
+        "waiting_decision_count": 1,
+        "stale_count": 0
+      },
+      {
+        "request_id": "req-demo-billing-export",
+        "title": "Add a monthly billing export",
+        "asked_at": "2026-11-02T14:00:00Z",
+        "updated_at": "2026-11-03T08:15:00Z",
+        "dispatch_count": 3,
+        "done_count": 0,
+        "waiting_decision_count": 0,
+        "stale_count": 1
+      }
+    ]
+  },
+  "details": [
+    {
+      "schema": "hub-orchestration.v1",
+      "request": {
+        "request_id": "req-demo-viewer-refresh",
+        "title": "Refresh the operations viewer landing page",
+        "asked_at": "2026-11-03T09:00:00Z",
+        "updated_at": "2026-11-03T10:40:00Z"
+      },
+      "decisions": [
+        {
+          "decision_id": "dec-demo-hero-copy",
+          "question": "Keep the current hero wording, or use the shorter <b>draft</b> from the docs role?",
+          "asked_by_role": "integration",
+          "asked_at": "2026-11-03T10:30:00Z"
+        }
+      ],
+      "roles": [
+        { "role": "ui", "lease_holder": "session-demo-ui-01", "lease_expires_at": "2026-11-03T11:30:00Z" },
+        { "role": "backend-review", "lease_holder": "session-demo-review-02", "lease_expires_at": "2026-11-03T11:30:00Z" },
+        { "role": "integration", "lease_holder": "session-demo-integ-03", "lease_expires_at": "2026-11-03T11:30:00Z" },
+        { "role": "ops", "lease_holder": null, "lease_expires_at": null },
+        { "role": "business-docs", "lease_holder": null, "lease_expires_at": null }
+      ],
+      "projects": [
+        { "id": "ledge-top-ops", "name": "Ledge Top Ops", "created_by": "human:1", "origin_request_id": null }
+      ],
+      "dispatches": [
+        {
+          "request_id": "req-demo-viewer-refresh",
+          "dispatch_id": "dsp-demo-ui",
+          "task_id": "task-demo-ui",
+          "role": "ui",
+          "state": "working",
+          "dispatched_at": "2026-11-03T09:05:00Z",
+          "updated_at": "2026-11-03T10:35:00Z",
+          "task": {
+            "task_id": "task-demo-ui",
+            "title": "Rebuild the landing page layout",
+            "project": "ledge-top-ops",
+            "created_by": "human:1",
+            "origin_request_id": "req-demo-viewer-refresh",
+            "checklist": [
+              { "text": "Sketch the new layout", "done": true },
+              { "text": "Build the header and job summary", "done": true },
+              { "text": "Build the recent deliveries list", "done": false },
+              { "text": "Check phone width", "done": false },
+              { "text": "Render tests", "done": false }
+            ],
+            "eta_seconds": 5400,
+            "agent_eta_guess_seconds": 3600,
+            "status_line": "Header done; working on the deliveries list.",
+            "blocked_on": null,
+            "updated_at": "2026-11-03T10:35:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-viewer-refresh",
+          "dispatch_id": "dsp-demo-review",
+          "task_id": "task-demo-review",
+          "role": "backend-review",
+          "state": "blocked",
+          "dispatched_at": "2026-11-03T09:05:00Z",
+          "updated_at": "2026-11-03T10:10:00Z",
+          "task": {
+            "task_id": "task-demo-review",
+            "title": "Review the summary endpoint change",
+            "project": "ledge-top-ops",
+            "created_by": "human:1",
+            "origin_request_id": "req-demo-viewer-refresh",
+            "checklist": [
+              { "text": "Read the diff", "done": true },
+              { "text": "Run the contract tests", "done": false }
+            ],
+            "eta_seconds": null,
+            "agent_eta_guess_seconds": null,
+            "status_line": "Waiting for the ui branch to push the endpoint change.",
+            "blocked_on": "ui role: summary endpoint branch not pushed yet",
+            "updated_at": "2026-11-03T10:10:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-viewer-refresh",
+          "dispatch_id": "dsp-demo-integration",
+          "task_id": "task-demo-integration",
+          "role": "integration",
+          "state": "asked",
+          "dispatched_at": "2026-11-03T09:05:00Z",
+          "updated_at": "2026-11-03T10:30:00Z",
+          "task": {
+            "task_id": "task-demo-integration",
+            "title": "Wire the new page into the viewer shell",
+            "project": "ledge-top-ops",
+            "created_by": "human:1",
+            "origin_request_id": "req-demo-viewer-refresh",
+            "checklist": [
+              { "text": "Add the route", "done": true },
+              { "text": "Confirm the hero wording", "done": false },
+              { "text": "Staging smoke test", "done": false }
+            ],
+            "eta_seconds": 7200,
+            "agent_eta_guess_seconds": null,
+            "status_line": "Asked Beau which hero wording to keep.",
+            "blocked_on": "Decision: hero wording",
+            "updated_at": "2026-11-03T10:30:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-viewer-refresh",
+          "dispatch_id": "dsp-demo-ops",
+          "task_id": "task-demo-ops",
+          "role": "ops",
+          "state": "dispatched",
+          "dispatched_at": "2026-11-03T09:05:00Z",
+          "updated_at": "2026-11-03T09:05:00Z",
+          "task": {
+            "task_id": "task-demo-ops",
+            "title": "Plan the staging rollout",
+            "project": "ledge-top-ops",
+            "created_by": "human:1",
+            "origin_request_id": "req-demo-viewer-refresh",
+            "checklist": [],
+            "eta_seconds": null,
+            "agent_eta_guess_seconds": null,
+            "status_line": "",
+            "blocked_on": null,
+            "updated_at": "2026-11-03T09:05:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-viewer-refresh",
+          "dispatch_id": "dsp-demo-docs",
+          "task_id": "task-demo-docs",
+          "role": "business-docs",
+          "state": "done",
+          "dispatched_at": "2026-11-03T09:05:00Z",
+          "updated_at": "2026-11-03T10:00:00Z",
+          "task": {
+            "task_id": "task-demo-docs",
+            "title": "Draft the release note",
+            "project": "ledge-top-ops",
+            "created_by": "human:1",
+            "origin_request_id": "req-demo-viewer-refresh",
+            "checklist": [
+              { "text": "Draft", "done": true },
+              { "text": "Proofread", "done": true }
+            ],
+            "eta_seconds": 0,
+            "agent_eta_guess_seconds": null,
+            "status_line": "Release note drafted. <script>alert(1)</script> stays plain text.",
+            "blocked_on": null,
+            "updated_at": "2026-11-03T10:00:00Z",
+            "stale": false
+          }
+        }
+      ]
+    },
+    {
+      "schema": "hub-orchestration.v1",
+      "request": {
+        "request_id": "req-demo-billing-export",
+        "title": "Add a monthly billing export",
+        "asked_at": "2026-11-02T14:00:00Z",
+        "updated_at": "2026-11-03T08:15:00Z"
+      },
+      "decisions": [],
+      "roles": [
+        { "role": "ui", "lease_holder": "session-demo-ui-04", "lease_expires_at": "2026-11-03T12:00:00Z" },
+        { "role": "backend-review", "lease_holder": null, "lease_expires_at": null },
+        { "role": "ops", "lease_holder": "session-demo-ops-05", "lease_expires_at": "2026-11-03T09:00:00Z" }
+      ],
+      "projects": [
+        { "id": "billing-export", "name": "Billing export", "created_by": "orchestrator", "origin_request_id": "req-demo-billing-export" }
+      ],
+      "dispatches": [
+        {
+          "request_id": "req-demo-billing-export",
+          "dispatch_id": "dsp-demo-export-ui",
+          "task_id": "task-demo-export-ui",
+          "role": "ui",
+          "state": "working",
+          "dispatched_at": "2026-11-02T14:10:00Z",
+          "updated_at": "2026-11-03T08:15:00Z",
+          "task": {
+            "task_id": "task-demo-export-ui",
+            "title": "Add an Export button to the billing page",
+            "project": "billing-export",
+            "created_by": "orchestrator",
+            "origin_request_id": "req-demo-billing-export",
+            "checklist": [
+              { "text": "Button and file name", "done": true },
+              { "text": "Progress while exporting", "done": false },
+              { "text": "Tests", "done": false }
+            ],
+            "eta_seconds": 200000,
+            "agent_eta_guess_seconds": 45,
+            "status_line": "Button works; adding progress while the file builds.",
+            "blocked_on": null,
+            "updated_at": "2026-11-03T08:15:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-billing-export",
+          "dispatch_id": "dsp-demo-export-review",
+          "task_id": "task-demo-export-review",
+          "role": "backend-review",
+          "state": "failed",
+          "dispatched_at": "2026-11-02T14:10:00Z",
+          "updated_at": "2026-11-02T18:00:00Z",
+          "task": {
+            "task_id": "task-demo-export-review",
+            "title": "Review the export query",
+            "project": "billing-export",
+            "created_by": "codex",
+            "origin_request_id": "req-demo-billing-export",
+            "checklist": [
+              { "text": "Read the query", "done": true },
+              { "text": "Check totals against the ledger", "done": false }
+            ],
+            "eta_seconds": null,
+            "agent_eta_guess_seconds": null,
+            "status_line": "Totals did not match the ledger for October; sent back.",
+            "blocked_on": null,
+            "updated_at": "2026-11-02T18:00:00Z",
+            "stale": false
+          }
+        },
+        {
+          "request_id": "req-demo-billing-export",
+          "dispatch_id": "dsp-demo-export-ops",
+          "task_id": "task-demo-export-ops",
+          "role": "ops",
+          "state": "stale",
+          "dispatched_at": "2026-11-02T14:10:00Z",
+          "updated_at": "2026-11-02T16:00:00Z",
+          "task": {
+            "task_id": "task-demo-export-ops",
+            "title": "Schedule the monthly export job",
+            "project": "billing-export",
+            "created_by": "orchestrator",
+            "origin_request_id": "req-demo-billing-export",
+            "checklist": [
+              { "text": "Write the schedule", "done": true },
+              { "text": "Dry run on staging", "done": false }
+            ],
+            "eta_seconds": 1800,
+            "agent_eta_guess_seconds": 900,
+            "status_line": "Started the staging dry run.",
+            "blocked_on": null,
+            "updated_at": "2026-11-02T16:00:00Z",
+            "stale": true
+          }
+        }
+      ]
+    }
+  ]
+}

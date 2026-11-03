@@ -14,6 +14,8 @@ import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
+import { OrchestrationPage } from "./pages/OrchestrationPage";
+import { orchestrationEnabled } from "./orchestrationApi";
 import { acceptsAnswer, retainsAnswerDraft, openDecisions } from "./pages/decisions";
 import { LabelSetPage } from "./pages/LabelSets";
 import { ReviewPage } from "./ReviewsPanel";
@@ -612,14 +614,19 @@ export function HubApp() {
     // Global, not per-project, so it appears only when the Hub grants this caller infrastructure access.
     ...(demo || data?.capabilities.infrastructure === true
       ? [{ route: { page: "infrastructure" } as Route, label: "Infrastructure", icon: "network" as IconKind }] : []),
+    // Fixture-backed preview: demo mode only until the backend exists.
+    ...(orchestrationEnabled(demo ? "demo" : "live")
+      ? [{ route: { page: "orchestration" } as Route, label: "Orchestration", icon: "work" as IconKind }] : []),
   ];
   const isCurrent = (target: Route) => target.page === route.page
     || (target.page === "projects" && (route.page === "project" || route.page === "labels" || route.page === "review"))
-    || (target.page === "infrastructure" && route.page === "device");
+    || (target.page === "infrastructure" && route.page === "device")
+    || (target.page === "orchestration" && route.page === "orchestration-request");
   const pageTitle = route.page === "project" ? projectName(route.id)
     : route.page === "labels" ? `${projectName(route.project)} labeling`
     : route.page === "review" ? `${projectName(route.project)} review`
     : route.page === "device" ? "Infrastructure"
+    : route.page === "orchestration-request" ? "Orchestration"
     : nav.find((item) => item.route.page === route.page)?.label ?? "Home";
   const actions = (
     <>
@@ -794,6 +801,8 @@ export function HubApp() {
             {route.page === "staging" && <StagingPage hub={hub} actions={actions} />}
             {route.page === "infrastructure" && <InfrastructurePage hub={hub} actions={actions} />}
             {route.page === "device" && <InfrastructurePage hub={hub} actions={actions} deviceId={route.id} />}
+            {route.page === "orchestration" && <OrchestrationPage hub={hub} actions={actions} />}
+            {route.page === "orchestration-request" && <OrchestrationPage hub={hub} actions={actions} requestId={route.id} />}
           </div>
         )}
         <footer className="page-footer">

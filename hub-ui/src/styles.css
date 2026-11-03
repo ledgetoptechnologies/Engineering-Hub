@@ -4236,3 +4236,26 @@ button.text-button.danger { color: #a3402f; }
 .work-owner-text { display: grid; gap: 3px; min-width: 0; }
 .work-owner-text strong { font-size: 14px; overflow-wrap: anywhere; }
 .work-owner-text small { font-size: 12px; color: var(--muted); }
+
+/* Orchestration (demo only): requests and their per-role dispatches. */
+.orchestration-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 1100px) { .orchestration-layout { grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); align-items: start; } }
+.orchestration-requests, .orchestration-dispatches { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.orchestration-request { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--ink); text-decoration: none; background: var(--surface); }
+.orchestration-request:hover { border-color: #bac3d7; }
+.orchestration-request.selected { border-color: var(--forest); box-shadow: inset 0 0 0 1px var(--forest); }
+.orchestration-request strong { font-size: 14px; overflow-wrap: anywhere; }
+.orchestration-request small { font-size: 12px; color: var(--muted); }
+.orchestration-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.orchestration-badges:empty { display: none; }
+.orchestration-decisions { border-left: 3px solid var(--amber); background: var(--amber-bg, #fff6e5); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
+.orchestration-decisions h3 { margin: 0 0 6px; font-size: 13px; }
+.orchestration-decisions ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; overflow-wrap: anywhere; }
+.orchestration-dispatch { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.orchestration-dispatch-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.orchestration-role { font-size: 14px; }
+.orchestration-lease { margin-left: auto; font-size: 12px; }
+.orchestration-dispatch p { margin: 0; font-size: 13px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.orchestration-task { font-weight: 600; }
+.orchestration-blocked { color: var(--ink); border-left: 3px solid var(--amber); padding-left: 8px; }
