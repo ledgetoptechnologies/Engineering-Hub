@@ -271,7 +271,7 @@ It does not defend against root on the staging host, as before.
 **Age bound: what can and cannot be asserted.** The executor uses `time.monotonic()` for deadlines (`adapter.py:182,274`, `asgi.py:137-184`). On Linux that is `CLOCK_MONOTONIC`, which **does not advance during system suspend**. Measured that way, an admission's age would undercount a suspend. Requirements:
 - **Clock.** Measure the admit-to-effect age with `CLOCK_BOOTTIME` (`time.clock_gettime(time.CLOCK_BOOTTIME)`), which counts suspend. Start it before the admission request is sent, so network delay counts too. The Hub's clock and wall-clock jumps play no part in the executor's check. Wall clock is used only for audit, with the existing `CLOCK_SKEW_MS=5000` noted.
 - **Restart.** Admissions live in memory and are tied to the launch counter and `boot_id`. After a restart, any admitted-but-not-effected operation is treated as expired and the command is `held`, as with the existing never-repeat intent. It is never redone without a new intent.
-- **Process suspension (SIGSTOP, scheduler stall) between the final age check and the Docker request.** User space cannot prevent this, so the bound cannot be asserted across it. Mitigations: do the check immediately before the Docker call; record the `CLOCK_BOOTTIME` at effect start in the signed receipt; have the Hub flag any receipt whose effect started later than the bound after its admission as `bound_exceeded`, visible to the owner. The design therefore claims only "exposure ≤ age bound + one operation timeout, **except** an undetected stall between the final check and the Docker call, which is detected after the fact from the signed receipt".
+- **Process suspension (SIGSTOP, scheduler stall) between the final age check and the Docker request.** User space cannot prevent this, so the bound cannot be asserted across it. Mitigations: do the check immediately before the Docker call; record the `CLOCK_BOOTTIME` at effect start in the signed receipt; have the Hub flag any receipt whose effect started later than the bound after its admission as `bound_exceeded`, visible to the owner. **The residual stall window is unbounded** unless host enforcement establishes otherwise (see 8.y). The signed receipt only detects a stall after the fact.
 
 **Threat and acceptance tests:**
 - `test_same_uid_socket_substitution_refused`: a fake server at the socket path with a different pid and inode; the Hub refuses its responses and records no effect.
@@ -285,3 +285,32 @@ It does not defend against root on the staging host, as before.
 - `test_stall_after_final_check_flagged_bound_exceeded_from_receipt`.
 
 **Still unverified:** that the installed supervisor can sign arbitrary attestation fields and nonces; whether the Hub-side client shares a host with the command socket in the pilot layout; staging-host reachability to the Hub.
+
+### 8.y Supervisor-owned broker compared with the attested key (second review)
+
+Codex's review: signed responses do not defeat a *transparent* same-UID relay. Such a relay forwards genuine signed messages unchanged, but it can observe, delay, drop or reorder them, and delay alone widens the stall window. A same-UID process may also read an in-memory key unless the executor is protected from ptrace.
+
+| | Attested ephemeral key (8.x) | Supervisor-owned fixed-route broker |
+|---|---|---|
+| Path | The Hub connects to a filesystem socket the executor's UID can replace or relay | The Hub connects only to the root supervisor's endpoint. The supervisor reaches the executor over a **socketpair created at launch and inherited by the executor**, with no filesystem path to substitute. |
+| Peer identity | Signatures over messages, plus an optional `SO_PEERCRED` check when co-located | The supervisor verifies its own child: a pidfd from the launch, the start time and `boot_id`, the inherited fd. Re-verified on every Hub connection, and bound to the verified launch record. |
+| Transparent relay | Not defeated: it can delay, drop or observe | Defeated for the Hub-to-executor path: no same-UID path exists |
+| Key custody | Private key in executor memory. Same UID can read it unless `PR_SET_DUMPABLE=0` and Yama ptrace scope are enforced, and that is unverified on the host. | No executor secret needed for routing. Supervisor keys stay root-owned. Signed receipts may stay as evidence, not as the routing defence. |
+| PID namespaces | `SO_PEERCRED` pids are translated into the receiver's namespace; a containerised executor reports namespace-local pids and the attestation must match the supervisor's view | The supervisor runs in the host namespace and holds a pidfd, so translation does not matter; it never trusts a pid reported by the executor |
+| Disconnect and restart | New key and a higher launch counter; old-key messages refused | Executor exit closes the inherited fd. The broker marks the launch ended and refuses until a new verified launch. A Hub reconnect is re-verified against the current launch. In-flight admissions die with the launch: held, never redone. |
+| Cost | Executor and Hub signing code | Supervisor gains a small routing component: more root code to review |
+
+**Recommendation: the broker.** It removes the substitutable path instead of trying to detect it. Signed receipts remain as audit evidence. The attestation design is kept only as a fallback if the supervisor cannot own the route.
+
+**Stall window with host enforcement.** The window can be bounded only if the component that makes the effect enforces the age. If the supervisor broker also mediates the executor's Docker API access, it can check admission age on `CLOCK_BOOTTIME` at the moment it forwards each mutating Docker request, and refuse expired ones. The residual then becomes a stall inside the root broker itself, which the design treats as trusted but still states. Without broker-mediated Docker access, the window remains **unbounded** and is only detected after the fact.
+
+**Added threat tests:**
+- `test_broker_refuses_hub_connection_when_launch_ended`
+- `test_broker_reverifies_pidfd_starttime_per_connection`
+- `test_no_filesystem_command_socket_exists_for_executor_uid`
+- `test_transparent_relay_has_no_path_in_broker_layout`
+- `test_executor_exit_closes_route_and_inflight_admissions_hold`
+- `test_pid_namespace_executor_identity_from_pidfd_not_reported_pid`
+- `test_broker_refuses_expired_admission_at_docker_forward` (only if Docker mediation is adopted)
+
+**Unverified:** whether the supervisor can hold a pidfd (kernel 5.3 or later, plus a Python API); whether it can mediate the Docker API without changing the rootless engine setup; and the host's ptrace and dumpable policy.
