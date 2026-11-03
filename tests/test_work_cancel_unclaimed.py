@@ -164,3 +164,40 @@ def test_reserved_modular_namespace_denies_without_controller_state(setup_queue)
     job=submit(queue,'reserved',action='modular.synthetic')
     with pytest.raises(HubError,match='work_controller_cancel_required'):
         queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+
+
+@pytest.mark.parametrize('match', ['actor_request', 'submission_id', 'recorded_job_id'])
+def test_each_persisted_staging_ownership_predicate_is_independently_enforced(setup_queue, match):
+    import json
+    from uuid import uuid4
+    queue, _, repo, _=setup_queue
+    source=WorkTarget(str(uuid4()),'a'*40,'sha256:'+'b'*64)
+    request='staging:owned-request' if match=='actor_request' else 'other-request'
+    job=submit(queue,request,target=source)
+    submission_id=str(uuid4())
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_staging_submissions(id TEXT PRIMARY KEY,actor TEXT,request_id TEXT,data TEXT)')
+        if match=='submission_id':
+            target=dict(job['target'],submission_id=submission_id)
+            db.execute('UPDATE hub_work_jobs SET target=? WHERE id=?',(json.dumps(target),job['id']))
+        data={'job_id':job['id'] if match=='recorded_job_id' else None,'source_id':'retained'}
+        db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?)',
+                   (submission_id,'codex','owned-request' if match=='actor_request' else 'unrelated',json.dumps(data)))
+    with pytest.raises(HubError,match='work_controller_cancel_required'):
+        queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+    assert queue.get_job(job['id'])['state']=='queued'
+    with repo._connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM hub_audit WHERE entity_id=? AND action='work.cancelled'",(job['id'],)).fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM hub_staging_submissions').fetchone()[0]==1
+
+
+def test_corrupt_staging_record_denies_cancellation_with_fixed_error(setup_queue):
+    from uuid import uuid4
+    queue, _, repo, _=setup_queue
+    job=submit(queue,'ordinary')
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_staging_submissions(id TEXT PRIMARY KEY,actor TEXT,request_id TEXT,data TEXT)')
+        db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?)',(str(uuid4()),'other','other','{invalid'))
+    with pytest.raises(HubError,match='work_controller_cancel_required') as failure:
+        queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+    assert failure.value.status==409 and queue.get_job(job['id'])['state']=='queued'
