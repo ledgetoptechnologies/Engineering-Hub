@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
-    HUB_PROOF_AUDIENCE, HUB_PROOF_DOMAIN, HUB_PROOF_PROTOCOL, HubDispatchProofVerifier,
+    HUB_PROOF_AUDIENCE, HUB_PROOF_DOMAIN, HUB_PROOF_PROTOCOL, DispatchChallengeVerifier, HubDispatchProofVerifier,
     RESERVE_AUDIENCE, RESERVE_DOMAIN, RESERVE_PROTOCOL, SIGNATURE_DOMAIN, DispatchCounterGate,
     ReservationReceiptVerifier, ReservationSigner, ReservationUncertain, RouteEpoch, RouteReservation,
     SupervisorRouteBusy, SupervisorRouteError, SupervisorRouteRejected, binding_digest, binding_for,
@@ -66,6 +66,9 @@ def two(world):
     world["hub_verifier"] = HubDispatchProofVerifier(public_key=world["hub"].public_key,
                                                      key_id=world["hub"].key_id)
     world["clock"] = FakeBootClock()
+    world["challenger"] = FixtureSigner(key_id="test-challenge-key")
+    world["challenge_verifier"] = DispatchChallengeVerifier(public_key=world["challenger"].public_key,
+                                                            key_id=world["challenger"].key_id)
     return world
 
 
@@ -73,7 +76,18 @@ def make(two, **overrides):
     overrides.setdefault("backend", two["sender"])
     overrides.setdefault("dispatch_proof_verifier", two["hub_verifier"])
     overrides.setdefault("boot_clock", two["clock"])
+    overrides.setdefault("challenge_signer", two["challenger"])
     return two["make"](reservation_signer=two["signer"], **overrides)
+
+
+CHALLENGE_HASHES = {}  # nonce -> SHA-256 of the exact signed challenge bytes the "Hub" received.
+
+
+def nonce_of(raw):
+    """Hub side: remember the exact challenge bytes' hash; return its nonce."""
+    nonce = json.loads(raw)["payload"]["nonce"]
+    CHALLENGE_HASHES[nonce] = hashlib.sha256(raw).hexdigest()
+    return nonce
 
 
 def proof_payload(two, receipt, cmd, nonce, **changes):
@@ -88,6 +102,7 @@ def proof_payload(two, receipt, cmd, nonce, **changes):
             "fence": cmd.queue_fence,
             "lease_epoch": 1, "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
             "command_id": cmd.command_id, "counter": counter, "executor": executor, "challenge_nonce": nonce,
+            "challenge_sha256": CHALLENGE_HASHES.get(nonce, "0" * 64),
             "supervisor_boot_id": two["clock"].boot_id, **changes}
 
 
@@ -102,11 +117,11 @@ def unknown_nonce():
 def challenge_for(two, route, cmd):
     """A fresh challenge, or an unknown nonce where none can be issued."""
     try:
-        return route.issue_dispatch_challenge(cmd.command_id).nonce
+        return nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     except SupervisorRouteBusy:
         two["clock"].now += WINDOW_NS + 1  # Let earlier live challenges lapse, then retry.
         route.expire_challenges()
-        return route.issue_dispatch_challenge(cmd.command_id).nonce
+        return nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     except SupervisorRouteError:
         return unknown_nonce()
 
@@ -376,7 +391,7 @@ def test_concurrent_dispatches_send_exactly_once(two):
     route = make(two, timeout_ms=2000)
     cmd = command(two["epoch"])
     receipt = route.reserve(cmd).receipt
-    proof = hub_proof(two, receipt, cmd, route.issue_dispatch_challenge(cmd.command_id).nonce)  # ONE proof.
+    proof = hub_proof(two, receipt, cmd, nonce_of(route.issue_dispatch_challenge(cmd.command_id)))  # ONE proof.
     results, barrier = [], threading.Barrier(8)
 
     def go():
@@ -393,7 +408,7 @@ def test_concurrent_dispatches_send_exactly_once(two):
     other = command(two["epoch"])
     other_receipt = route.reserve(other).receipt
     binding = binding_for(other, two["pin"])
-    other_proof = hub_proof(two, other_receipt, other, route.issue_dispatch_challenge(other.command_id).nonce)
+    other_proof = hub_proof(two, other_receipt, other, nonce_of(route.issue_dispatch_challenge(other.command_id)))
     claim = two["hub_verifier"].verify(other_proof)
     outcomes, barrier = [], threading.Barrier(8)
 

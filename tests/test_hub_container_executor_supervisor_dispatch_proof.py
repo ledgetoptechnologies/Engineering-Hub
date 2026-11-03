@@ -1,5 +1,6 @@
 """Supervisor half of the one-use dispatch claim proof (docs/supervisor-dispatch-claim-proof.md)."""
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -12,22 +13,24 @@ pytest.importorskip("fcntl", reason="Route journal requires actual Linux kernel 
 
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
-    CHALLENGE_PROTOCOL, EXPIRED_AUDIENCE, EXPIRED_DOMAIN, EXPIRED_PROTOCOL, HUB_PROOF_DOMAIN, RESERVE_DOMAIN,
-    ChallengeStatementSigner, DispatchChallenge, ExpiredStatementVerifier, HubDispatchProofVerifier,
-    SupervisorRouteBusy, SupervisorRouteError, SupervisorRouteRejected,
+    CHALLENGE_AUDIENCE, CHALLENGE_DOMAIN, CHALLENGE_PROTOCOL, EXPIRED_AUDIENCE, EXPIRED_DOMAIN, EXPIRED_PROTOCOL,
+    HUB_PROOF_DOMAIN, RESERVE_DOMAIN, BackendPin, ChallengeStatementSigner, DispatchChallengeSigner,
+    DispatchChallengeVerifier, ExpiredStatementVerifier, HubDispatchProofVerifier, RouteEpoch, SupervisorRouteBusy,
+    SupervisorRouteError, SupervisorRouteRejected, challenge_expectation,
 )
 from tests.test_hub_container_executor_supervisor_route import LINUX, command, world  # noqa: F401
 from tests.test_hub_container_executor_supervisor_launch_counter import _raw
 from tests.test_hub_container_executor_supervisor_reservation import (  # noqa: F401  (two is a fixture)
-    WINDOW_NS, FixtureSigner, forge, hub_proof, make, proof_payload, two, unknown_nonce,
+    CHALLENGE_HASHES, WINDOW_NS, FixtureSigner, forge, hub_proof, make, nonce_of, proof_payload, two,
+    unknown_nonce,
 )
 
 
 class CountingSigner(FixtureSigner):
-    """TEST-ONLY statement signer that records every signing call."""
+    """TEST-ONLY signer that records every signing call."""
 
-    def __init__(self):
-        super().__init__(key_id="test-statement-key")
+    def __init__(self, key_id="test-statement-key"):
+        super().__init__(key_id=key_id)
         self.calls = 0
 
     def sign(self, message):
@@ -62,6 +65,12 @@ def sends(proof):
     return len(proof["sender"].calls)
 
 
+def bound_hash(path, nonce):
+    with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT challenge_sha256 FROM supervisor_route_challenge WHERE nonce=?",
+                          (nonce,)).fetchone()[0]
+
+
 # ---------------------------------------------------------------- defaults
 
 @LINUX
@@ -86,7 +95,7 @@ def test_defaults_refuse_challenge_dispatch_proof_and_statement(proof):
     assert challenge_rows(proof["path"]) == [] and sends(proof) == 0
     route.close()
     for bad in (dict(dispatch_proof_verifier=object()), dict(statement_signer=ChallengeStatementSigner()),
-                dict(boot_clock="not callable")):
+                dict(challenge_signer=DispatchChallengeSigner()), dict(boot_clock="not callable")):
         with pytest.raises(SupervisorRouteError):
             route_for(proof, create=False, **bad)
 
@@ -97,13 +106,18 @@ def test_defaults_refuse_challenge_dispatch_proof_and_statement(proof):
 def test_challenge_is_recorded_sends_nothing_and_requires_a_live_reservation(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    challenge = route.issue_dispatch_challenge(cmd.command_id)
-    assert type(challenge) is DispatchChallenge and sends(proof) == 0
-    assert challenge.as_dict() == {"protocol": CHALLENGE_PROTOCOL, "nonce": challenge.nonce,
-                                   "command_id": cmd.command_id, "counter": 1, "executor": proof["pin"].container_id,
-                                   "supervisor_boot_id": proof["clock"].boot_id, "proof_window_ms": 5000}
-    assert json.loads(challenge.canonical()) == challenge.as_dict()
-    assert route.inspect_challenge(challenge.nonce) == ("outstanding", cmd.command_id, 1, proof["clock"].boot_id)
+    raw = route.issue_dispatch_challenge(cmd.command_id)
+    assert type(raw) is bytes and sends(proof) == 0
+    payload = proof["challenge_verifier"].verify(raw, expected=challenge_expectation(receipt, proof["pin"],
+                                                                                     proof["epoch"]))
+    assert payload == {"protocol": CHALLENGE_PROTOCOL, "audience": CHALLENGE_AUDIENCE, "key_id": "test-challenge-key",
+                       "nonce": payload["nonce"], "command_id": cmd.command_id, "counter": 1,
+                       "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+                       "executor": proof["pin"].container_id, "pin": proof["pin"].as_dict(),
+                       "epoch": proof["epoch"].as_dict(), "supervisor_boot_id": proof["clock"].boot_id,
+                       "proof_window_ms": 5000}
+    assert route.inspect_challenge(payload["nonce"]) == ("outstanding", cmd.command_id, 1, proof["clock"].boot_id)
+    assert bound_hash(proof["path"], payload["nonce"]) == hashlib.sha256(raw).hexdigest()
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.issue_dispatch_challenge(str(uuid4()))
     assert raised.value.reason == "reservation_missing"
@@ -113,7 +127,7 @@ def test_challenge_is_recorded_sends_nothing_and_requires_a_live_reservation(pro
         route.issue_dispatch_challenge(retired.command_id)
     assert raised.value.reason == "reservation_abandoned"
     newer, newer_receipt = reserved(proof, route)
-    newer_nonce = route.issue_dispatch_challenge(newer.command_id).nonce
+    newer_nonce = nonce_of(route.issue_dispatch_challenge(newer.command_id))
     assert route.dispatch(newer_receipt, newer, hub_proof(proof, newer_receipt, newer, newer_nonce)).state == "completed"
     for stale, reason in ((cmd, "reservation_superseded"), (newer, "reservation_dispatched")):
         with pytest.raises(SupervisorRouteRejected) as raised:
@@ -146,9 +160,9 @@ def test_outstanding_challenges_are_capped_per_executor(proof):
 def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consumed(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     other_cmd, _ = reserved(proof, route)
-    other_nonce = route.issue_dispatch_challenge(other_cmd.command_id).nonce
+    other_nonce = nonce_of(route.issue_dispatch_challenge(other_cmd.command_id))
     binding_cases = {  # Checked against the receipt, reservation row, command and boot in the dispatch txn.
         "fence": dict(fence=cmd.queue_fence + 1),
         "counter": dict(counter=2),
@@ -200,7 +214,7 @@ def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consum
 def test_replayed_proof_and_concurrent_dispatch_send_exactly_once(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    signed = hub_proof(proof, receipt, cmd, route.issue_dispatch_challenge(cmd.command_id).nonce)
+    signed = hub_proof(proof, receipt, cmd, nonce_of(route.issue_dispatch_challenge(cmd.command_id)))
     results, barrier = [], threading.Barrier(6)
 
     def go():
@@ -223,7 +237,7 @@ def test_replayed_proof_and_concurrent_dispatch_send_exactly_once(proof):
 def test_window_exceeded_is_held_then_expires_with_a_verifiable_statement(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     signed = hub_proof(proof, receipt, cmd, nonce)
     proof["clock"].now += WINDOW_NS + 1
     late = route.dispatch(receipt, cmd, signed)
@@ -253,7 +267,7 @@ def test_window_exceeded_is_held_then_expires_with_a_verifiable_statement(proof)
 def test_window_boundary_on_the_supervisor_clock(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     proof["clock"].now += WINDOW_NS  # Exactly the window: still fresh.
     assert route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce)).state == "completed"
     route.close()
@@ -268,12 +282,12 @@ def test_authority_is_barrier_held_ownership_not_the_hub_wall_clock_lease(proof)
     route = route_for(proof)
     hub_lease_ns = 2 * 10**9
     delayed, delayed_receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(delayed.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(delayed.command_id))
     signed = hub_proof(proof, delayed_receipt, delayed, nonce)  # Signed while the Hub lease was valid.
     proof["clock"].now += hub_lease_ns + 10**9  # Hub suspended past its own lease expiry.
     assert route.dispatch(delayed_receipt, delayed, signed).state == "completed"
     later, later_receipt = reserved(proof, route)
-    later_nonce = route.issue_dispatch_challenge(later.command_id).nonce
+    later_nonce = nonce_of(route.issue_dispatch_challenge(later.command_id))
     later_signed = hub_proof(proof, later_receipt, later, later_nonce)
     proof["clock"].now += WINDOW_NS + 1  # Past the supervisor window.
     assert route.dispatch(later_receipt, later, later_signed).error == "challenge_expired"
@@ -285,7 +299,7 @@ def test_authority_is_barrier_held_ownership_not_the_hub_wall_clock_lease(proof)
 def test_previous_boot_challenge_is_refused_and_expirable(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     old_boot = proof["clock"].boot_id
     route.close()
     proof["clock"].boot_id = str(uuid4())  # Host rebooted; same journal.
@@ -307,13 +321,13 @@ def test_previous_boot_challenge_is_refused_and_expirable(proof):
 def test_consumed_and_expired_are_mutually_exclusive(proof):
     route = route_for(proof)
     used_cmd, used_receipt = reserved(proof, route)
-    used = route.issue_dispatch_challenge(used_cmd.command_id).nonce
+    used = nonce_of(route.issue_dispatch_challenge(used_cmd.command_id))
     assert route.dispatch(used_receipt, used_cmd, hub_proof(proof, used_receipt, used_cmd, used)).state == "completed"
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.expired_statement(used)  # A consumed nonce never gets an expired statement.
     assert raised.value.reason == "challenge_used" and proof["statements"].calls == 0
     dead_cmd, dead_receipt = reserved(proof, route)
-    dead = route.issue_dispatch_challenge(dead_cmd.command_id).nonce
+    dead = nonce_of(route.issue_dispatch_challenge(dead_cmd.command_id))
     route.expired_statement(dead)  # Revoked (reservation retired) while still inside the window.
     late = route.dispatch(dead_receipt, dead_cmd, hub_proof(proof, dead_receipt, dead_cmd, dead))
     assert late.error == "reservation_abandoned" and sends(proof) == 1
@@ -327,13 +341,13 @@ def test_consumed_and_expired_are_mutually_exclusive(proof):
                           (f"UPDATE {t} SET issued_boottime_ns=issued_boottime_ns+1 WHERE nonce=?", (used,)),
                           (f"DELETE FROM {t}", ()),
                           (f"INSERT OR REPLACE INTO {t} SELECT nonce, command_id, executor_id, counter, "
-                           f"issued_boottime_ns, boot_id, 'outstanding', NULL FROM {t} WHERE nonce=?", (used,)),
-                          (f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'consumed', 'x')",
+                           f"issued_boottime_ns, boot_id, 'outstanding', NULL, NULL FROM {t} WHERE nonce=?", (used,)),
+                          (f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'consumed', 'x', '4444')",
                            (unknown_nonce(), str(uuid4()), "a" * 64, str(uuid4())))):
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(sql, args)
         fresh = unknown_nonce()
-        db.execute(f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'outstanding', NULL)",
+        db.execute(f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'outstanding', NULL, NULL)",
                    (fresh, str(uuid4()), "a" * 64, str(uuid4())))
         with pytest.raises(sqlite3.IntegrityError):  # Consuming needs the proof hash (CHECK).
             db.execute(f"UPDATE {t} SET state='consumed' WHERE nonce=?", (fresh,))
@@ -351,7 +365,7 @@ def test_consumed_and_expired_are_mutually_exclusive(proof):
 def test_dispatch_and_expiry_race_resolve_exactly_one_way(proof, monkeypatch, first):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     signed = hub_proof(proof, receipt, cmd, nonce)
     journal = route._journal
     paused, resume, outcome = threading.Event(), threading.Event(), {}
@@ -397,8 +411,8 @@ def test_dispatch_and_expiry_race_resolve_exactly_one_way(proof, monkeypatch, fi
 def test_statement_for_one_nonce_retires_the_reservation_against_its_other_nonce(proof, monkeypatch, first):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    stated = route.issue_dispatch_challenge(cmd.command_id).nonce
-    other = route.issue_dispatch_challenge(cmd.command_id).nonce  # A second live challenge, same reservation.
+    stated = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+    other = nonce_of(route.issue_dispatch_challenge(cmd.command_id))  # A second live challenge, same reservation.
     signed_other = hub_proof(proof, receipt, cmd, other)
     journal = route._journal
     paused, resume, outcome = threading.Event(), threading.Event(), {}
@@ -499,7 +513,7 @@ class _RewritingDb:
 def test_consume_is_read_back_before_any_byte_is_sent(proof, monkeypatch, mode):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     original = route._journal._connection
 
     @contextmanager
@@ -521,7 +535,7 @@ def test_consume_is_read_back_before_any_byte_is_sent(proof, monkeypatch, mode):
 def test_statement_is_signed_only_after_a_durable_commit(proof, monkeypatch, failure):
     route = route_for(proof)
     cmd, _ = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     if failure == "before_commit":
         original = route._journal._schema
         calls = []
@@ -552,7 +566,7 @@ def test_statement_is_signed_only_after_a_durable_commit(proof, monkeypatch, fai
 def test_challenges_and_consumption_survive_restart(proof):
     route = route_for(proof)
     cmd, receipt = reserved(proof, route)
-    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
     route.close()
     restarted = route_for(proof, create=False)
     assert restarted.inspect_challenge(nonce)[0] == "outstanding"
@@ -565,3 +579,179 @@ def test_challenges_and_consumption_survive_restart(proof):
     with pytest.raises(SupervisorRouteRejected):
         again.expired_statement(nonce)
     again.close()
+
+
+# ---------------------------------------------------------------- signed challenge
+
+@LINUX
+def test_challenge_signer_and_verifier_default_refuse(proof):
+    route = route_for(proof, challenge_signer=None)  # Verifier configured, no challenge signer.
+    cmd, receipt = reserved(proof, route)
+    with pytest.raises(SupervisorRouteError) as raised:
+        route.issue_dispatch_challenge(cmd.command_id)
+    assert "challenge signer not configured" in str(raised.value)
+    assert challenge_rows(proof["path"]) == []  # Refused before the journal: nothing recorded.
+    with pytest.raises(SupervisorRouteError):
+        DispatchChallengeSigner().sign(b"x")
+    route.close()
+    route = route_for(proof, create=False)
+    raw = route.issue_dispatch_challenge(cmd.command_id)
+    with pytest.raises(SupervisorRouteError):
+        DispatchChallengeVerifier().verify(raw, expected=challenge_expectation(receipt, proof["pin"], proof["epoch"]))
+    route.close()
+
+
+@LINUX
+def test_challenge_verifier_refuses_wrong_key_binding_tamper_and_non_canonical(proof):
+    route = route_for(proof)
+    cmd, receipt = reserved(proof, route)
+    raw = route.issue_dispatch_challenge(cmd.command_id)
+    verifier = proof["challenge_verifier"]
+    expected = challenge_expectation(receipt, proof["pin"], proof["epoch"])
+    payload = verifier.verify(raw, expected=expected)
+    other_pin = BackendPin(proof["pin"].container_id, proof["pin"].host_pid + 1, proof["pin"].process_start_ticks,
+                           proof["pin"].uid, proof["pin"].gid, proof["pin"].engine_id, proof["pin"].engine_pid,
+                           proof["pin"].engine_start_ticks)  # Same container, different process.
+    for wrong in ({**expected, "pin": other_pin.as_dict()},
+                  {**expected, "epoch": RouteEpoch(str(uuid4()), 5, proof["epoch"].boot_id).as_dict()},
+                  {**expected, "counter": 2}, {**expected, "executor": "b" * 64},
+                  {**expected, "reservation_receipt_sha256": "0" * 64}, {**expected, "command_id": str(uuid4())},
+                  {**expected, "counter": True}, {**expected, "extra": 1},
+                  {k: v for k, v in expected.items() if k != "pin"}):
+        with pytest.raises(SupervisorRouteError):
+            verifier.verify(raw, expected=wrong)
+    with pytest.raises(SupervisorRouteError):  # The helper itself refuses a receipt for another pin/epoch.
+        challenge_expectation(receipt, other_pin, proof["epoch"])
+    other_key = FixtureSigner(key_id="test-challenge-key")
+    bad = [
+        raw + b" ", json.dumps(json.loads(raw)).encode(),  # Non-canonical.
+        canonical_with(raw, proof_window_ms=30000), canonical_with(raw, nonce=unknown_nonce()),  # Tampered.
+        forge(payload, signer=other_key, domain=CHALLENGE_DOMAIN),  # Wrong key.
+        forge(payload, signer=proof["challenger"], domain=HUB_PROOF_DOMAIN),  # Wrong domain.
+        forge({**payload, "issued_boottime_ns": 1}, signer=proof["challenger"], domain=CHALLENGE_DOMAIN),
+        forge({k: v for k, v in payload.items() if k != "epoch"}, signer=proof["challenger"], domain=CHALLENGE_DOMAIN),
+        forge({**payload, "audience": "other"}, signer=proof["challenger"], domain=CHALLENGE_DOMAIN),
+        forge({**payload, "proof_window_ms": 999}, signer=proof["challenger"], domain=CHALLENGE_DOMAIN),
+        forge({**payload, "executor": "b" * 64}, signer=proof["challenger"], domain=CHALLENGE_DOMAIN),
+    ]
+    for value in bad:
+        with pytest.raises(SupervisorRouteError):
+            verifier.verify(value, expected=expected)
+    for pinned in (DispatchChallengeVerifier(public_key=other_key.public_key, key_id="test-challenge-key"),
+                   DispatchChallengeVerifier(public_key=proof["challenger"].public_key, key_id="other-key")):
+        with pytest.raises(SupervisorRouteError):
+            pinned.verify(raw, expected=expected)
+    route.close()
+
+
+def canonical_with(raw, **changes):
+    envelope = json.loads(raw)
+    return json.dumps({**envelope, "payload": {**envelope["payload"], **changes}}, sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+@LINUX
+def test_challenge_for_one_reservation_cannot_be_replayed_for_another(proof):
+    route = route_for(proof)
+    a, a_receipt = reserved(proof, route)
+    b, b_receipt = reserved(proof, route)
+    a_raw = route.issue_dispatch_challenge(a.command_id)
+    a_nonce = nonce_of(a_raw)
+    with pytest.raises(SupervisorRouteError):  # Hub verifier: bound to A's reservation and counter.
+        proof["challenge_verifier"].verify(a_raw, expected=challenge_expectation(b_receipt, proof["pin"],
+                                                                                 proof["epoch"]))
+    replay = route.dispatch(b_receipt, b, hub_proof(proof, b_receipt, b, a_nonce))  # A's nonce + hash for B.
+    assert replay.error == "challenge_unknown"
+    b_nonce = nonce_of(route.issue_dispatch_challenge(b.command_id))
+    swapped = hub_proof(proof, b_receipt, b, b_nonce, challenge_sha256=hashlib.sha256(a_raw).hexdigest())
+    assert route.dispatch(b_receipt, b, swapped).error == "proof_mismatch"  # B's nonce, A's challenge bytes.
+    assert sends(proof) == 0 and route.inspect_challenge(b_nonce)[0] == "outstanding"
+    assert route.dispatch(b_receipt, b, hub_proof(proof, b_receipt, b, b_nonce)).state == "completed"
+    route.close()
+
+
+@LINUX
+def test_proof_with_wrong_challenge_hash_is_held_with_zero_bytes(proof):
+    route = route_for(proof)
+    cmd, receipt = reserved(proof, route)
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+    for wrong in ("0" * 64, hashlib.sha256(b"other").hexdigest()):
+        result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce, challenge_sha256=wrong))
+        assert (result.state, result.error) == ("held", "proof_mismatch")
+    for invalid in ("A" * 64, "0" * 63, 7):  # Wrong type/shape: refused by the proof verifier.
+        result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce, challenge_sha256=invalid))
+        assert result.error == "proof_invalid"
+    assert sends(proof) == 0 and route.inspect_challenge(nonce)[0] == "outstanding"
+    assert route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce)).state == "completed"
+    route.close()
+
+
+@LINUX
+@pytest.mark.parametrize("failure", ["issue_rolled_back", "issue_fsync", "bind_fails"])
+def test_challenge_is_signed_only_after_its_row_commit_is_durable(proof, monkeypatch, failure):
+    signer = CountingSigner(key_id="test-challenge-key")
+    route = route_for(proof, challenge_signer=signer)
+    cmd, receipt = reserved(proof, route)
+    journal = route._journal
+    if failure == "issue_rolled_back":
+        original, calls = journal._schema, []
+
+        def failing_schema(db):
+            if journal.last_phase == "in_transaction" and not calls:
+                calls.append(1)
+                raise sqlite3.OperationalError("disk I/O error")
+            return original(db)
+        monkeypatch.setattr(journal, "_schema", failing_schema)
+    elif failure == "issue_fsync":
+        monkeypatch.setattr(route_module.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync")))
+    else:
+        def bind_fails(*args):
+            raise route_module.RouteJournalError("disk")
+        monkeypatch.setattr(journal, "bind_challenge", bind_fails)
+    with pytest.raises(SupervisorRouteError):
+        route.issue_dispatch_challenge(cmd.command_id)
+    monkeypatch.undo()
+    rows = challenge_rows(proof["path"])
+    if failure == "issue_rolled_back":
+        assert rows == [] and signer.calls == 0  # Nothing committed, nothing signed.
+    elif failure == "issue_fsync":
+        assert [s for _, s in rows] == ["outstanding"] and signer.calls == 0  # Committed, not proved durable.
+    else:
+        assert [s for _, s in rows] == ["outstanding"] and signer.calls == 1  # Signed, hash not bound: withheld.
+    if rows:
+        nonce = rows[0][0]
+        assert bound_hash(proof["path"], nonce) is None
+        # Whatever bytes a signer may have produced, an unbound challenge can never be consumed.
+        forged_hash = CHALLENGE_HASHES.get(nonce, "0" * 64)
+        result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce, challenge_sha256=forged_hash))
+        assert result.error == "proof_mismatch" and sends(proof) == 0
+    raw = route.issue_dispatch_challenge(cmd.command_id)  # Healthy again: a fresh signed challenge works.
+    assert route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce_of(raw))).state == "completed"
+    route.close()
+
+
+@LINUX
+def test_challenge_hash_is_bound_once_and_required_for_consumption(proof):
+    route = route_for(proof)
+    cmd, _ = reserved(proof, route)
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+    t = "supervisor_route_challenge"
+    db = _raw(proof["path"])
+    try:
+        for sql, args in ((f"UPDATE {t} SET challenge_sha256=? WHERE nonce=?", ("1" * 64, nonce)),  # Rebind.
+                          (f"UPDATE {t} SET challenge_sha256=NULL WHERE nonce=?", (nonce,)),
+                          (f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'outstanding', NULL, ?)",
+                           (unknown_nonce(), str(uuid4()), "a" * 64, str(uuid4()), "2" * 64))):  # Pre-bound.
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute(sql, args)
+        unbound = unknown_nonce()
+        db.execute(f"INSERT INTO {t} VALUES (?, ?, ?, 1, 0, ?, 'outstanding', NULL, NULL)",
+                   (unbound, str(uuid4()), "a" * 64, str(uuid4())))
+        with pytest.raises(sqlite3.IntegrityError):  # Consuming needs a bound challenge hash (CHECK).
+            db.execute(f"UPDATE {t} SET state='consumed', proof_sha256='x' WHERE nonce=?", (unbound,))
+        db.execute(f"UPDATE {t} SET state='expired' WHERE nonce=?", (unbound,))  # Unbound may only expire.
+        with pytest.raises(sqlite3.IntegrityError):  # And can never be bound afterwards.
+            db.execute(f"UPDATE {t} SET challenge_sha256=? WHERE nonce=?", ("3" * 64, unbound))
+    finally:
+        db.close()
+    route.close()
