@@ -3,7 +3,7 @@ import { HubApiError } from "./api";
 import {
   demoAgentConnections, httpAgentConnections, MAX_SESSION_HISTORY, parseAudit, parseCapabilities, parseInstallation, parseInstallations, parseSessions, writeFailureText,
 } from "./agentConnectionsApi";
-import { actorName, untilText } from "./AgentConnectionsPanel";
+import { actorName, liveSessionText, untilText } from "./AgentConnectionsPanel";
 import backend from "./fixtures/agent-connections-wire-v1.json";
 import persistentBackend from "./fixtures/agent-connections-persistent-wire-v1.json";
 
@@ -126,6 +126,18 @@ describe("untilText", () => {
     expect(untilText("2026-10-27T22:07:10Z", now)).toBe("in 8 min");
     expect(untilText("2026-10-28T20:00:00Z", now)).toBe("in 22 h");
     expect(untilText("2026-10-27T21:59:00Z", now)).toBe("ended");
+  });
+});
+
+describe("disconnect session wording", () => {
+  it("always says disconnecting ends every session, including ones set to last until revoked", () => {
+    const sessions = parseSessions(wire.sessions.body, wire.sessions.installation_id).map(session => ({ ...session, state: "active" as const }));
+    const before = Math.min(...sessions.map(session => Date.parse(session.issued_at)));
+    for (const entry of [undefined, { state: "loading" as const, items: [] }, { state: "failed" as const, items: [] }])
+      expect(liveSessionText(entry, before)).toMatch(/All of them end, including any set to last until revoked\.$/);
+    expect(liveSessionText({ state: "loaded", items: sessions }, before))
+      .toBe(`Its ${sessions.length} live sessions end now, including any set to last until revoked.`);
+    expect(liveSessionText({ state: "loaded", items: [] }, before)).toBe("It has no live sessions right now.");
   });
 });
 

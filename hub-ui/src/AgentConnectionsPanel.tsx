@@ -421,13 +421,15 @@ function SessionList({ installation, entry, now, canChange, busy, onRevoke }: {
 /** How long any one panel read may take before it is cancelled and reported. */
 export const REFRESH_DEADLINE_MS = 15_000;
 
-/** How many of an installation's sessions are live, only when its session list has actually loaded. */
+/** Session wording for the disconnect dialog: disconnecting ends every session, so this never says one outlasts it. */
+const sessionEnds = (session: { expires_at: string | null }) => session.expires_at === null ? Infinity : Date.parse(session.expires_at);
 export function liveSessionText(entry: { state: "loading" | "loaded" | "failed"; items: Session[] } | undefined, now: number): string {
-  if (!entry) return "Its sessions haven't been loaded on this page, so the count isn't shown. All of them end.";
-  if (entry.state === "loading") return "Its sessions are still loading, so the count isn't shown. All of them end.";
-  if (entry.state === "failed") return "Its sessions couldn't be read, so the count isn't shown. All of them end.";
-  const live = entry.items.filter(session => session.state === "active" && Date.parse(session.expires_at) > now).length;
-  return live === 0 ? "It has no live sessions right now." : `Its ${live} live session${live === 1 ? "" : "s"} end${live === 1 ? "s" : ""}.`;
+  if (!entry) return "Its sessions haven't been loaded on this page, so the count isn't shown. All of them end, including any set to last until revoked.";
+  if (entry.state === "loading") return "Its sessions are still loading, so the count isn't shown. All of them end, including any set to last until revoked.";
+  if (entry.state === "failed") return "Its sessions couldn't be read, so the count isn't shown. All of them end, including any set to last until revoked.";
+  const live = entry.items.filter(session => session.state === "active" && sessionEnds(session) > now).length;
+  return live === 0 ? "It has no live sessions right now."
+    : `Its ${live} live session${live === 1 ? "" : "s"} end${live === 1 ? "s" : ""} now, including any set to last until revoked.`;
 }
 
 function DisconnectDialog({ item, entry, now, others, canChange, busy, error, onConfirm, onClose }: {
