@@ -82,6 +82,9 @@ def main(argv=None):
     parser.add_argument('--stale-days', type=int, default=STALE_DAYS)
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
+    if run('git', 'rev-parse', '--is-shallow-repository', cwd=args.repo).strip() == 'true':
+        # Reachability and merge bases stop at the graft, so only PR-head matches are reliable.
+        print('warning: shallow clone; merged and overlap findings may be incomplete', file=sys.stderr)
     prs = read_prs(args.repo)
     findings = sweep(now=datetime.now(timezone.utc), branches=read_branches(args.repo, args.base, prs),
                      prs=prs, worktrees=read_worktrees(args.repo), stale_days=args.stale_days)
