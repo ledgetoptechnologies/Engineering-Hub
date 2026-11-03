@@ -41,7 +41,8 @@ def engine_rig(rig, monkeypatch):
     monkeypatch.setattr(engine, '_pid_start', lambda _: '1234')
     monkeypatch.setattr(engine, '_terminal', lambda *_a: True)
     monkeypatch.setattr(engine, 'run', lambda _value, argv, **_k: effects.append(tuple(argv)) or '')
-    stop = lambda: engine.stop(layout, engine_id='engine-identity-123', invocation_id='a' * 32)
+    stop = lambda anchor=rig.external: engine.stop(layout, engine_id='engine-identity-123',
+                                                   invocation_id='a' * 32, external_anchor=anchor)
     return engine, layout, stop, effects
 
 
@@ -142,3 +143,23 @@ def test_ambiguous_or_restored_enrollment_refuses_stop_without_effects(rig, monk
     with pytest.raises(engine.EngineError):
         stop()
     assert effects == [] and not (rig.engine / 'STOPPING.json').exists()
+
+
+def test_enrolled_stop_refuses_without_external_anchor_reader(rig, monkeypatch):
+    finalized_attempt(rig)
+    engine, _layout, stop, effects = engine_rig(rig, monkeypatch)
+    with pytest.raises(engine.EngineError):
+        stop(None)
+    assert effects == []
+
+
+def test_coordinated_journal_and_anchor_rollback_refuses_stop(rig, monkeypatch):
+    finalized_attempt(rig)
+    assert rig.external.highest_fence(rig.generation) == 1
+    shutil.copy(rig.tmp / 'journal-backup.sqlite3', rig.journal)
+    shutil.copy(rig.tmp / 'anchor-backup.json', rig.anchor)
+    engine, _layout, stop, effects = engine_rig(rig, monkeypatch)
+    for reader in (None, rig.external):  # default refuses; external fence 1 > journal 0
+        with pytest.raises(engine.EngineError):
+            stop(reader)
+    assert effects == []

@@ -76,6 +76,26 @@ class UnsafeTestOnlyTerminalVerifier:
         return terminal['descendants_empty'] is True
 
 
+class RigClaimConfirmer:
+    """Test-only host->Hub confirmation path (in-process). Manual host-only
+    starts (job 'manual-job') get a test-signed answer with a live lease."""
+    def __init__(self, rig):
+        self.rig = rig
+
+    def confirm(self, challenge, credential):
+        if challenge['job_id'] == 'manual-job':
+            return claim_answer(self.rig, challenge)
+        return self.rig.bridge.answer_challenge(challenge, credential)
+
+
+def claim_answer(rig, challenge, *, lease_until=None):
+    statement = {'nonce': challenge['nonce'], 'attempt_id': challenge['attempt_id'],
+                 'job_id': challenge['job_id'], 'fence': challenge['fence'], 'generation': challenge['generation'],
+                 'lease_until': rig.clock[0] + 600 if lease_until is None else lease_until,
+                 'state': 'claim_current'}
+    return statement, rig.auth.sign('claim', statement)
+
+
 class Runner:
     def __init__(self):
         self.calls = []
@@ -87,6 +107,7 @@ class Runner:
         self.calls.append(request)
         if self.during is not None:
             self.during()
+            guard()  # the next effect needs a fresh current-claim answer
         if self.fail:
             raise RuntimeError('host crashed before terminal')
         return {'container_id': 'f' * 64,
@@ -118,6 +139,9 @@ class Channel:
     async def inspect(self, payload, credential):
         return self.rig.host.inspect(payload, credential)
 
+    async def challenge(self, payload, credential):
+        return self.rig.host.challenge(payload, credential)
+
     async def finalize(self, payload, credential):
         if 'finalize' in self.block:
             raise ConnectionError('blocked')
@@ -145,12 +169,14 @@ def _queue(repo, clock):
 RIG = object()
 
 
-def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=RIG, enable=True):
+def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=RIG, claim_confirmer=RIG,
+              enable=True):
     pick = lambda value, default: default if value is RIG else value
     return CIHostHandoff(rig.journal, rig.anchor, rig.engine, manifest_digest=rig.manifest.digest,
         runner=rig.runner, authenticator=pick(authenticator, rig.auth),
         external_anchor=pick(external_anchor, rig.external),
         terminal_verifier=pick(terminal_verifier, UnsafeTestOnlyTerminalVerifier()),
+        claim_confirmer=pick(claim_confirmer, RigClaimConfirmer(rig)), clock=lambda: rig.clock[0],
         enable_durable_handoff=enable)
 
 
@@ -247,13 +273,17 @@ def release_of(rig, row):
     return {'release': release, 'credential': rig.auth.sign('release', release)}
 
 
-def start_request(rig, fence, *, prior='latest', **changes):
+def start_request(rig, fence, *, prior='latest', host=None, lease_until=None, **changes):
+    """Manual start with a fresh challenge from ``host`` (default rig.host)."""
     if prior == 'latest':
         rows = host_rows(rig)
         prior = release_of(rig, rows[-1]) if rows else None
-    request = {'attempt_id': str(uuid.uuid4()), 'job_id': 'manual-job', 'fence': fence,
-               'generation': rig.generation, 'manifest_digest': rig.manifest.digest, 'source_commit': 'c' * 40,
-               'prior_release': prior}
+    binding = {'attempt_id': str(uuid.uuid4()), 'job_id': 'manual-job', 'fence': fence}
+    challenge, _ = (host or rig.host).challenge(binding, rig.auth.sign('challenge', binding))
+    statement, credential = claim_answer(rig, challenge, lease_until=lease_until)
+    request = {**binding, 'generation': rig.generation, 'manifest_digest': rig.manifest.digest,
+               'source_commit': 'c' * 40, 'prior_release': prior,
+               'claim': {'statement': statement, 'credential': credential}}
     request.update(changes)
     return request, rig.auth.sign('start', request)
 
@@ -284,8 +314,9 @@ async def test_finalized_reserved_admits_nothing_without_hub_start_even_after_re
     host = make_host(rig)  # host process restart: nothing runs by itself
     assert host_rows(rig) == before and len(rig.runner.calls) == 1
     payload, credential = rig.channel.starts[0]
-    with pytest.raises(HandoffRefused, match='handoff_fence_stale'):
-        host.start(payload, credential)  # exact replay of the original start
+    for target in (host, rig.host):  # replayed claim answer: nonce unknown/used
+        with pytest.raises(HandoffRefused, match='handoff_claim_nonce_unknown'):
+            target.start(payload, credential)
     assert host_rows(rig) == before and len(rig.runner.calls) == 1
 
 
@@ -313,7 +344,7 @@ async def test_higher_fence_refused_while_earlier_attempt_unfinalized(rig, stage
     host = make_host(rig)  # restart: still held, no replay
     before = host_rows(rig)
     with pytest.raises(HandoffRefused, match='handoff_slot_held'):
-        host.start(*start_request(rig, 99, prior=None))
+        host.start(*start_request(rig, 99, prior=None, host=host))
     assert host_rows(rig) == before and len(rig.runner.calls) == 1
     assert (await rig.bridge.run_once())['state'] == 'held'
     assert reservation(rig) == job['id'] and len(rig.runner.calls) == 1
@@ -619,8 +650,9 @@ async def test_coordinated_rollback_of_anchor_and_journal_refused_until_reconcil
     finalized = host_rows(rig)[0]
     shutil.copy(rig.tmp / 'journal-backup.sqlite3', rig.journal)  # coordinated local rollback
     shutil.copy(rig.tmp / 'anchor-backup.json', rig.anchor)
+    refusing = make_host(rig, external_anchor=None)
     with pytest.raises(HandoffRefused, match='handoff_external_anchor_unavailable'):
-        make_host(rig, external_anchor=None).start(*start_request(rig, 5, prior=None))
+        refusing.start(*start_request(rig, 5, prior=None, host=refusing))
     with pytest.raises(HandoffRefused, match='handoff_journal_restored'):
         rig.host.start(*start_request(rig, 5, prior=None))
     info = os.stat(rig.journal)
@@ -641,8 +673,9 @@ async def test_coordinated_rollback_of_anchor_and_journal_refused_until_reconcil
 
 
 def test_default_external_anchor_refuses_admission(rig):
+    refusing = make_host(rig, external_anchor=None)
     with pytest.raises(HandoffRefused, match='handoff_external_anchor_unavailable'):
-        make_host(rig, external_anchor=None).start(*start_request(rig, 1))
+        refusing.start(*start_request(rig, 1, host=refusing))
     assert host_rows(rig) == [] and not rig.runner.calls
 
 
@@ -691,3 +724,62 @@ async def test_disabled_by_default_and_enrollment_requires_attestation(rig, tmp_
         make_bridge(rig, rig.queue, rig.owner, enable=False)
     assert getattr(rig.repo, '_development_ci', None) is None
     assert rig.queue.completion_verifier is None and rig.queue.reconciliation_verifier is None
+
+
+# --- current-claim challenge -----------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_delayed_start_after_job_reassignment_is_refused(rig, monkeypatch):
+    first = submit(rig, 'first')
+    delayed = []
+    async def capture(payload, credential):
+        delayed.append((payload, credential))
+        raise ConnectionError('start delayed in transit')
+    monkeypatch.setattr(rig.channel, 'start', capture)
+    assert (await rig.bridge.run_once())['state'] == 'held'
+    monkeypatch.undo()
+    rig.clock[0] += 601
+    operator = WorkQueue(rig.repo, dict(ACTIONS), reconciliation_verifier=lambda *args: True,
+                         target_verifier=_verifier(rig.repo), clock=lambda: rig.clock[0])
+    operator.reconcile(job_id=first['id'], evidence_id='operator-inspected', outcome='cancelled')
+    second = submit(rig, 'second')
+    with pytest.raises(HandoffRefused, match='handoff_claim_nonce_stale'):
+        rig.host.start(*delayed[0])
+    result = await rig.bridge.run_once()
+    assert result['id'] == second['id'] and result['state'] == 'succeeded'
+    with pytest.raises(HandoffRefused, match='handoff_claim_nonce_unknown'):
+        rig.host.start(*delayed[0])
+    assert [row['job_id'] for row in host_rows(rig)] == [second['id']] and len(rig.runner.calls) == 1
+
+
+def test_stale_nonce_expired_lease_and_mismatched_claim_are_refused(rig):
+    stale = start_request(rig, 1)
+    rig.clock[0] += 31
+    with pytest.raises(HandoffRefused, match='handoff_claim_nonce_stale'):
+        rig.host.start(*stale)
+    with pytest.raises(HandoffRefused, match='handoff_claim_lease_expired'):
+        rig.host.start(*start_request(rig, 1, lease_until=rig.clock[0] + 3))  # within 5s skew bound
+    with pytest.raises(HandoffRefused, match='handoff_claim_mismatch'):
+        rig.host.start(*start_request(rig, 1, job_id='other-job'))
+    forged = start_request(rig, 1)
+    forged[0]['claim']['credential'] = 'forged'
+    with pytest.raises(HandoffRefused, match='handoff_unauthenticated|handoff_claim_unauthenticated'):
+        rig.host.start(forged[0], rig.auth.sign('start', forged[0]))
+    assert host_rows(rig) == [] and not rig.runner.calls
+
+
+@pytest.mark.asyncio
+async def test_each_effect_requires_a_fresh_current_claim(rig):
+    job = submit(rig)
+    rig.runner.during = lambda: rig.clock.__setitem__(0, rig.clock[0] + 601)  # Hub lease lost mid-run
+    assert (await rig.bridge.run_once())['state'] in ('held', 'claimed')
+    assert host_state(rig) == ['running'] and len(rig.runner.calls) == 1
+    assert reservation(rig) == job['id'] and releases(rig, job['id']) == 0
+
+
+@pytest.mark.asyncio
+async def test_default_claim_confirmer_refuses_every_effect(rig):
+    job = submit(rig)
+    rig.host = make_host(rig, claim_confirmer=None)
+    assert (await rig.bridge.run_once())['state'] == 'held'
+    assert host_state(rig) == ['running'] and not rig.runner.calls and reservation(rig) == job['id']

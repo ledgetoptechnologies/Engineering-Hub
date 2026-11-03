@@ -22,15 +22,21 @@ Protocol:
 Authorities NOT supplied by this repository (each defaults to refusing, so every
 attempt stays held until it exists): an authenticated Hub<->host channel and
 keys (``RefusingAuthenticator``), an external non-rollback fence anchor
-(``RefusingExternalAnchor``), a terminal verifier that re-inspects the original
+(``RefusingExternalAnchor``), a host->Hub current-claim confirmation path
+(``RefusingClaimConfirmer``), a terminal verifier that re-inspects the original
 container and pinned cgroup (``RefusingTerminalVerifier``), and the operator
 attestation that legacy controllers are uninstalled (``enroll_host``).
 
 Writer exclusion is ONLY the shared validated engine admission flock. The
 ``HANDOFF_ENROLLED.json`` marker is advisory to new code; older installed
-controllers do not read it and must be uninstalled before enrollment. Ledger
-triggers stop old queue writers and accidental SQL, not a writer with raw
-database access.
+controllers do not read it and must be uninstalled before enrollment. SQL
+triggers cannot verify cryptography: they stop old queue writers and accidental
+SQL, not a direct SQLite writer, which must be excluded externally.
+
+Every admission and every guarded effect needs a fresh single-use host nonce
+answered by a Hub-signed statement of the CURRENT live claim and lease (read
+from the real WorkQueue at signing time), so a delayed or replayed start is
+refused.
 """
 from __future__ import annotations
 
@@ -111,6 +117,17 @@ class RefusingTerminalVerifier:
     """
     def verify(self, start_request, terminal):
         return False
+
+
+class RefusingClaimConfirmer:
+    """No host->Hub channel exists to confirm the CURRENT claim per effect.
+
+    ``confirm(challenge, credential)`` must deliver the host's fresh challenge
+    to the Hub and return the Hub's signed ``(statement, credential)`` answer
+    (``DurableDevelopmentCIHandoff.answer_challenge``), or None.
+    """
+    def confirm(self, challenge, credential):
+        return None
 
 
 @dataclass(frozen=True)
@@ -202,8 +219,12 @@ def _release(value):
     return value
 
 
+_CLAIM_KEYS = {'nonce', 'attempt_id', 'job_id', 'fence', 'generation', 'lease_until', 'state'}
+
+
 def _start_request(value):
-    keys = {'attempt_id', 'job_id', 'fence', 'generation', 'manifest_digest', 'source_commit', 'prior_release'}
+    keys = {'attempt_id', 'job_id', 'fence', 'generation', 'manifest_digest', 'source_commit', 'prior_release',
+            'claim'}
     if (type(value) is not dict or set(value) != keys
             or not isinstance(value['attempt_id'], str) or not _ID.fullmatch(value['attempt_id'])
             or not isinstance(value['job_id'], str) or not _ID.fullmatch(value['job_id'])
@@ -211,6 +232,10 @@ def _start_request(value):
             or not isinstance(value['generation'], str) or not _GENERATION.fullmatch(value['generation'])
             or not isinstance(value['manifest_digest'], str) or not _DIGEST.fullmatch(value['manifest_digest'])
             or not isinstance(value['source_commit'], str) or not _COMMIT.fullmatch(value['source_commit'])):
+        raise HandoffRefused('handoff_request_invalid')
+    claim = value['claim']
+    if (type(claim) is not dict or set(claim) != {'statement', 'credential'}
+            or type(claim['statement']) is not dict or set(claim['statement']) != _CLAIM_KEYS):
         raise HandoffRefused('handoff_request_invalid')
     prior = value['prior_release']
     if prior is not None:
@@ -484,6 +509,7 @@ class CIHostHandoff:
     """
     def __init__(self, journal_path, anchor_path, engine_directory, *, manifest_digest,
                  runner, authenticator=None, external_anchor=None, terminal_verifier=None,
+                 claim_confirmer=None, clock=time.time, max_clock_skew=5.0, nonce_validity=30.0,
                  enable_durable_handoff=False):
         if enable_durable_handoff is not True:
             raise HandoffRefused('handoff_disabled')
@@ -500,6 +526,16 @@ class CIHostHandoff:
                                           'handoff_external_anchor_unavailable')
         self.terminal_verifier = _authority(terminal_verifier, RefusingTerminalVerifier, ('verify',),
                                             'handoff_terminal_verifier_required')
+        self.claim_confirmer = _authority(claim_confirmer, RefusingClaimConfirmer, ('confirm',),
+                                          'handoff_claim_confirmer_required')
+        if (not callable(clock) or type(max_clock_skew) not in (int, float) or not 0 <= max_clock_skew <= 60
+                or type(nonce_validity) not in (int, float) or not 0 < nonce_validity <= 120):
+            raise HandoffRefused('handoff_host_composition_required')
+        self.clock, self.max_clock_skew, self.nonce_validity = clock, max_clock_skew, nonce_validity
+        # Process-local and single-use: a host restart forgets every nonce, so
+        # an in-flight answer is refused rather than trusted.
+        self._nonces = {}
+        self._nonce_lock = threading.Lock()
         self._local = threading.Lock()
         with self._db(write=False):
             pass  # validates exact schema on open
@@ -566,6 +602,65 @@ class CIHostHandoff:
                 'generation': row['generation'], 'manifest_digest': row['manifest_digest'],
                 'source_commit': row['source_commit']}
 
+    # -- fresh current-claim challenge -------------------------------------
+    def _now(self):
+        value = self.clock()
+        if type(value) not in (int, float) or value != value:
+            raise HandoffRefused('handoff_clock_unavailable')
+        return value
+
+    def _issue(self, binding):
+        with self._db(write=False) as db:
+            generation, _ = self._generation(db)
+        nonce = secrets.token_hex(32)
+        challenge = {**binding, 'generation': generation, 'nonce': nonce,
+                     'expires_at': self._now() + self.nonce_validity}
+        with self._nonce_lock:
+            self._nonces[nonce] = challenge
+        return self._signed('challenge_result', challenge)
+
+    def challenge(self, request, credential):
+        """Issue a fresh single-use nonce for one (attempt, job, fence)."""
+        if (type(request) is not dict or set(request) != {'attempt_id', 'job_id', 'fence'}
+                or not isinstance(request['attempt_id'], str) or not _ID.fullmatch(request['attempt_id'])
+                or not isinstance(request['job_id'], str) or not _ID.fullmatch(request['job_id'])
+                or not _int(request['fence'], 1)):
+            raise HandoffRefused('handoff_request_invalid')
+        self._verify('challenge', request, credential)
+        return self._issue(_plain(request))
+
+    def _check_claim(self, claim, binding, generation):
+        """Hub's signed answer: fresh nonce, exact binding, live lease."""
+        statement = claim.get('statement') if type(claim) is dict else None
+        if type(statement) is not dict or not _verified(self.authenticator, 'claim', statement,
+                                                        claim.get('credential')):
+            raise HandoffRefused('handoff_claim_unauthenticated')
+        with self._nonce_lock:
+            issued = self._nonces.pop(statement.get('nonce'), None)  # single use, even on refusal
+        if issued is None:
+            raise HandoffRefused('handoff_claim_nonce_unknown')
+        now = self._now()
+        if now > issued['expires_at']:
+            raise HandoffRefused('handoff_claim_nonce_stale')
+        expected = {**binding, 'generation': generation}
+        if (any(issued.get(key) != value for key, value in expected.items())
+                or any(statement.get(key) != value for key, value in expected.items())
+                or statement.get('state') != 'claim_current'):
+            raise HandoffRefused('handoff_claim_mismatch')
+        lease = statement.get('lease_until')
+        if type(lease) not in (int, float) or lease - self.max_clock_skew <= now:
+            raise HandoffRefused('handoff_claim_lease_expired')
+
+    def _confirm_current(self, binding, generation):
+        challenge, credential = self._issue(binding)
+        try:
+            answer = self.claim_confirmer.confirm(challenge, credential)
+        except Exception:
+            answer = None
+        if type(answer) is not tuple or len(answer) != 2:
+            raise HandoffRefused('handoff_claim_unconfirmed')
+        self._check_claim({'statement': _plain(answer[0]), 'credential': answer[1]}, binding, generation)
+
     def start(self, request, credential):
         """Admit at most one new attempt; any doubt refuses before an effect."""
         request = _start_request(request)
@@ -604,6 +699,12 @@ class CIHostHandoff:
             raise HandoffRefused('handoff_prior_release_mismatch')
 
     def _start_locked(self, request):
+        binding = {key: request[key] for key in ('attempt_id', 'job_id', 'fence')}
+        with self._db(write=False) as db:
+            generation, _ = self._generation(db)
+        # Fresh proof that this is the Hub's CURRENT live claim, checked first:
+        # a delayed or replayed signed start is refused before anything else.
+        self._check_claim(request['claim'], binding, generation)
         with self._db(write=True) as db:
             generation, floor = self._generation(db)
             self._enrolled(generation)
@@ -645,6 +746,8 @@ class CIHostHandoff:
             self._enrolled(current)
             if row is None or row['state'] != 'running' or current != generation:
                 raise HandoffRefused('handoff_admission_lost')
+            # Before every effect: a fresh Hub answer that the claim is current.
+            self._confirm_current(binding, generation)
 
         # Any runner failure or unverified observation leaves the row 'running'.
         terminal = _terminal(_plain(self.runner(dict(request), guard)))
@@ -799,7 +902,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
             raise HubError('development_ci_handoff_disabled', 409)
         if (not isinstance(host_generation, str) or not _GENERATION.fullmatch(host_generation)
                 or any(not inspect.iscoroutinefunction(getattr(channel, name, None))
-                       for name in ('start', 'inspect', 'finalize'))):
+                       for name in ('challenge', 'start', 'inspect', 'finalize'))):
             raise HubError('development_ci_handoff_composition_required', 409)
         try:
             self.authenticator = _authority(authenticator, RefusingAuthenticator, ('sign', 'verify'),
@@ -871,6 +974,30 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                              "WHERE h.state!='finalized' AND j.state IN ('claimed','held') "
                              "AND j.machine_id=? ORDER BY h.fence LIMIT 1", (self.manifest.machine_id,)).fetchone()
         return None if row is None else row['job_id']
+
+    def answer_challenge(self, challenge, credential):
+        """Sign that the challenged attempt is the CURRENT live queue claim.
+
+        Reads the actual WorkQueue (``live_claim`` via the attempt binding) at
+        signing time; refuses for any lost, expired, reassigned or paused claim.
+        """
+        challenge = _plain(challenge)
+        if (not _verified(self.authenticator, 'challenge_result', challenge, credential)
+                or type(challenge) is not dict
+                or set(challenge) != {'attempt_id', 'job_id', 'fence', 'generation', 'nonce', 'expires_at'}
+                or challenge['generation'] != self.host_generation):
+            raise HubError('development_ci_handoff_challenge_invalid', 409)
+        row = self._row(challenge['job_id'])
+        if row is None or row['attempt_id'] != challenge['attempt_id'] or row['fence'] != challenge['fence']:
+            raise HubError('development_ci_handoff_challenge_invalid', 409)
+        attempt = DevelopmentCIAttempt(**json.loads(row['attempt']))
+        if row['state'] != 'intent' or attempt.epoch != self.epoch:
+            raise HubError('development_ci_handoff_claim_not_current', 409)
+        job = self._bound(attempt)  # live_claim on the real queue, review, binding
+        statement = {'nonce': challenge['nonce'], 'attempt_id': attempt.attempt_id, 'job_id': attempt.job_id,
+                     'fence': attempt.fence, 'generation': self.host_generation,
+                     'lease_until': job['lease_until'], 'state': 'claim_current'}
+        return statement, self._sign('claim', statement)
 
     def _prior_release(self):
         """Hub-signed release of the latest attempt whose queue job was released."""
@@ -1088,7 +1215,11 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                             attempt.epoch, self.host_generation, attempt.manifest_digest))
             guard = lambda: self._bound(attempt)
             guard()
-            start = {**self._start_payload(attempt), 'prior_release': self._prior_release()}
+            challenge, challenge_credential = await self._call(
+                'challenge', {'attempt_id': attempt.attempt_id, 'job_id': attempt.job_id, 'fence': attempt.fence})
+            statement, claim_credential = self.answer_challenge(challenge, challenge_credential)
+            start = {**self._start_payload(attempt), 'prior_release': self._prior_release(),
+                     'claim': {'statement': statement, 'credential': claim_credential}}
             reported, _ = await self._supervise(job, guard, self._call('start', start))
             observed = self._host_record(attempt, reported)
             if observed is None:

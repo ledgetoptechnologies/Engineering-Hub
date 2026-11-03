@@ -118,21 +118,36 @@ What is enforced in source:
   EXTERNAL anchor, every earlier attempt `finalized_reserved`, and a Hub-signed
   release statement for exactly the host's latest attempt tuple (the Hub signs
   it only after its queue released that job).
+- Current claim: every admission, and every effect step the runner guards,
+  needs a fresh single-use host nonce (default validity 30 s, process-local)
+  answered by the Hub's signed statement binding nonce, attempt, job, fence,
+  generation and the live lease expiry read from the real `WorkQueue` at
+  signing time. The host refuses unknown, used or stale nonces, any binding
+  mismatch, and a lease not beyond host time plus the skew bound (default 5 s).
+  A delayed or replayed signed start is refused. Per-effect confirmation needs
+  a host->Hub `claim_confirmer`; the default refuses, so runs stay held.
 - Hub: `receipt_committed` binds the authenticated host inspection to the
   original claim/attempt. The authenticated host ack is recorded with its
   credential (`host_acked`) and re-verified before release; a ledger trigger
   refuses any `succeeded`/`failed` transition of a handoff job without that
   record. This stops old queue writers and raw SQL that do not also forge the
   record; normal WorkQueue APIs already need a context-local completion permit.
-  A writer with raw ledger access can still forge rows; the forged ack fails
-  credential re-verification, so the Hub itself never releases on it.
+  SQL triggers cannot verify cryptography: a direct SQLite writer can forge a
+  record that satisfies every trigger and then update the queue row itself.
+  The Hub's own code re-verifies the recorded credential and never releases
+  on a forged ack, but direct writers to the Hub ledger and the host journal
+  must be excluded externally (file ownership/permissions, no other process
+  holding the database), which this source does not provide.
 - Enrollment, start, reconciliation and `scripts/staging_ci_engine.py stop` use
   the same validated engine `admission.lock` (current-UID 0700 directory,
   current-UID 0600 single-link inode, name still bound) as
   `scripts/local_development_ci.py`. While enrolled, engine stop opens the
   journal read-only and refuses unless every attempt is `finalized_reserved`,
   and fails closed on a missing/corrupt/mismatched journal, marker or anchor or
-  a journal below the anchor. Unenrolled hosts keep the old behaviour.
+  a journal below the anchor. It also requires the same external anchor reader
+  as admission (`stop(..., external_anchor=...)`); without one, including from
+  the CLI today, every enrolled stop refuses. Unenrolled hosts keep the old
+  behaviour.
 
 What is NOT supplied (each default refuses, so attempts stay held):
 
@@ -140,6 +155,7 @@ What is NOT supplied (each default refuses, so attempts stay held):
 - An external non-rollback anchor (`RefusingExternalAnchor`). The local JSON
   anchor can be rolled back together with the journal and is only a hint; a
   coordinated local rollback is undetectable without the external anchor.
+- A host->Hub claim confirmation channel (`RefusingClaimConfirmer`).
 - A terminal verifier that re-inspects the original container and pinned
   cgroup (`RefusingTerminalVerifier`). A runner's observation is not proof.
 - A host runner adapter around `scripts/local_development_ci.py`; that script

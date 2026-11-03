@@ -438,12 +438,15 @@ def _bounded_json(path):
     return value
 
 
-def _handoff_veto(value):
+def _handoff_veto(value, external_anchor=None):
     """Enrolled durable CI handoff: never stop under an unfinalized attempt.
 
     Runs under the engine admission flock that the handoff host also holds for
     admission and execution. Fails closed on a missing, corrupt, ambiguous or
-    restored (below-anchor) journal; reads only, never repairs.
+    restored (below-anchor) journal; reads only, never repairs. The local JSON
+    anchor can be rolled back with the journal, so the SAME external anchor
+    reader used for admission must confirm the highest fence. None (the CLI
+    default) refuses every enrolled stop.
     """
     marker = value.runtime / HANDOFF_MARKER
     if not _present(marker):
@@ -462,6 +465,12 @@ def _handoff_veto(value):
         fence = anchored.get('highest_fence')
         if anchored.get('generation') != generation or type(fence) is not int or fence < 0:
             raise EngineError()
+        if external_anchor is None:
+            raise EngineError()
+        external = external_anchor.highest_fence(generation)
+        if type(external) is not int or external < 0:
+            raise EngineError()
+        fence = max(fence, external)
         before = os.lstat(journal)
         if not stat.S_ISREG(before.st_mode):
             raise EngineError()
@@ -487,11 +496,11 @@ def _handoff_veto(value):
         raise EngineError() from None
 
 
-def _stop_locked(value, parent, *, engine_id, invocation_id):
+def _stop_locked(value, parent, *, engine_id, invocation_id, external_anchor=None):
     global _DEADLINE
     if _present(value.runtime / 'STOPPING.json') or _present(value.runtime / 'HELD.json'):
         raise EngineError()
-    _handoff_veto(value)
+    _handoff_veto(value, external_anchor)
     before = inspect(value)
     if before['engine_id'] != engine_id or before['invocation_id'] != invocation_id:
         raise EngineError()
@@ -545,10 +554,11 @@ def _stop_locked(value, parent, *, engine_id, invocation_id):
         'terminal_verified': terminal, 'retained_data_root': str(value.data)}
 
 
-def stop(value, *, engine_id, invocation_id):
+def stop(value, *, engine_id, invocation_id, external_anchor=None):
     directories(value)
     with admission_lock(value) as parent:
-        return _stop_locked(value, parent, engine_id=engine_id, invocation_id=invocation_id)
+        return _stop_locked(value, parent, engine_id=engine_id, invocation_id=invocation_id,
+                            external_anchor=external_anchor)
 
 
 def main(argv=None):
