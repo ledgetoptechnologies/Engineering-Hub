@@ -6,6 +6,12 @@ Nothing runs at import and there is no default instance, factory or listener.
 into the launch supervisor, the executor ASGI app, the Hub, any composition or
 any service; constructing it is an explicit operator/test act.
 
+Only the executor's submit operation (POST /v1/container-pilot/commands with a
+strict ``ContainerPilotRequest`` body) is routed: it is the only executor
+operation whose bytes carry both the command_id and the fence. The outer
+command_id/fence must equal those inside the exact body, checked before any
+journal write. GET/reconcile carry no fence and are rejected as unsupported.
+
 What it does: each forwarded command is bound to its HTTP method, path,
 SHA-256 of the exact body bytes, command_id, queue fence, the enrolled launch
 epoch (launch_id + persisted monotonic launch counter + boot_id) and the pinned
@@ -15,35 +21,57 @@ journal, parent-directory fsync, ``PilotOwner`` single-owner lock, as in
 ``operation_journal``) in the same transaction that checks the epoch high-water
 mark and command_id uniqueness BEFORE anything is forwarded. Identical replay
 returns the recorded outcome, ``in_progress`` or ``held``; a different binding
-under a known command_id is a conflict and is never forwarded. Ambiguity
-(transport loss, timeout, malformed backend reply, backend 5xx, epoch change
-mid-command, observer/command backend mismatch, failure to record the outcome)
-is durably ``unknown`` where possible and always reported ``held``; it is never
-redispatched automatically. ``inspect`` is read-only and never forwards. A
-definite outcome is returned with an Ed25519 record signed by the SAME enrolled
-issuer key the caller already holds (verified against the enrolled public key),
-under a distinct signature domain, including an observation nonce derived from
-the binding digest. No key material is generated or discovered here.
+under a known command_id is a conflict and is never forwarded.
+
+The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
+against the pin immediately after connect and BEFORE any request byte is
+written; a mismatch closes the socket with zero bytes sent and durably records
+``refused`` (definitely not forwarded; a new command_id is required). The
+caller-supplied executor bearer is sent as ``Authorization`` and is never
+stored in journal rows, records, results, errors or reprs.
+
+Response classification: 2xx with a strict ContainerPilotResponse echoing the
+request -> ``completed`` (outcome accepted). 4xx with an exact executor error
+body whose code matches the status (400/413 invalid_payload, 401 unauthorized,
+403 forbidden, 404 command_not_found, 408 request_timeout) -> ``rejected``, a
+definitive signed non-acceptance: PilotASGI answers these before invoking its
+adapter. 401/403 therefore means "fix the credential and submit a NEW
+command_id"; the old command_id stays terminally rejected, it is not held.
+Everything else (5xx, other statuses or codes, malformed bodies, transport
+loss, epoch change mid-command, a reply peer differing from the pin, failure
+to record the outcome) -> durably ``unknown`` where possible and always
+reported ``held``; never redispatched automatically. ``inspect`` is read-only
+and never forwards. Definite outcomes carry an Ed25519 record signed by the
+SAME enrolled issuer key the caller already holds (verified against the
+enrolled public key), under a distinct signature domain, including an
+observation nonce derived from the binding digest. No key material is
+generated or discovered here.
 
 Explicit limits (this foundation grants no authority by itself):
 
 * SO_PEERCRED identifies the process that created/listened on the backend
-  socket at connect time, not later holders of that socket or its FDs.
+  socket at connect time, not later holders of that socket or its FDs. The
+  pin's container_id and Engine fields are NOT observable through the socket;
+  only pid/uid/gid/start ticks are compared per exchange.
 * FD delegation inside the container is unresolved: a pinned init process can
   pass its listening socket or connections to another process undetected.
 * Independent Docker writers on the engine are not fenced; the queue fence and
   epoch bind only commands that pass through this route.
 * The persisted monotonic launch counter is NOT produced by the launch
   supervisor today (its launch journal holds exactly one launch row and no
-  counter). This route only persists and enforces the highest counter it has
-  SEEN; the counter's authoritative source is a caller-supplied epoch source.
+  counter). The epoch, including its counter, comes from a caller-supplied
+  epoch source; this route only persists and enforces the highest counter it
+  has SEEN (its own high-water mark), which is not an authoritative source.
 * The executor does not sign its command responses (it holds no key). Backend
-  reply authenticity rests only on the SO_PEERCRED/pidfd peer check of the
-  pinned init process; the signed record attests what the supervisor forwarded
-  and received, not independent proof of Docker effects or health.
+  reply authenticity rests only on the SO_PEERCRED/pidfd peer check and the
+  bearer; the signed record attests what the supervisor forwarded and
+  received, not independent proof of Docker effects or health.
+* A custom backend object must honour the contract that ``PeerMismatch`` is
+  raised only before any byte is written; ``UnixSocketBackend`` does.
 * The actual supervisor/engine wiring (who constructs this, which socket the
-  executor serves commands on, handing the supervisor's retained signer to it)
-  and the Hub-side client integration are NOT implemented.
+  executor serves commands on, handing the supervisor's retained signer and
+  the executor bearer to it) and the Hub-side client integration (calling
+  ``verify_route_record``) are NOT implemented.
 * Same-UID/root administrators remain trusted; the private-path guards do not
   sandbox hostile same-UID processes racing filesystem replacement.
 """
@@ -71,6 +99,7 @@ from uuid import UUID
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+from engineering_hub.container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
 from engineering_hub.current_executor_observation import CurrentExecutorReleasePins, CurrentLaunchPins
 
 
@@ -83,6 +112,7 @@ _NONCE_DOMAIN = b'engineering-hub-supervisor-route-observation-nonce-v1\x00'
 MAX_BODY_BYTES = 8192
 MAX_RESPONSE_BYTES = 16 * 1024
 MAX_RECORD_BYTES = 64 * 1024
+SUBMIT_PATH = '/v1/container-pilot/commands'
 _BUSY_MS = 250
 _METHODS = frozenset({'GET', 'POST'})
 _PATH = re.compile(r'/v1/container-pilot/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+){0,3}\Z')
@@ -95,13 +125,26 @@ _INTENT = ('CREATE TABLE supervisor_route_intent (command_id TEXT PRIMARY KEY, '
 _EPOCH = ('CREATE TABLE supervisor_route_epoch (id INTEGER PRIMARY KEY CHECK(id=1), '
           'launch_counter INTEGER NOT NULL, launch_id TEXT NOT NULL, boot_id TEXT NOT NULL)')
 _TABLES = {'hub_pilot_owner', 'hub_pilot_owner_epochs', 'supervisor_route_intent', 'supervisor_route_epoch'}
-_STATES = frozenset({'intent', 'completed', 'unknown'})
+_STATES = frozenset({'intent', 'completed', 'rejected', 'refused', 'unknown'})
+_RECORDED = frozenset({'completed', 'rejected'})
 _ERRORS = frozenset({'transport_lost', 'malformed_response', 'backend_ambiguous', 'epoch_changed',
                      'backend_identity_mismatch', 'outcome_unrecorded', 'interrupted', 'signing_failed'})
+# PilotASGI error codes emitted BEFORE its adapter is invoked, keyed by status.
+# 403 is reserved for an explicit forbidden answer from a fronting executor.
+_DEFINITIVE_REJECTIONS = {400: 'invalid_payload', 401: 'unauthorized', 403: 'forbidden',
+                          404: 'command_not_found', 408: 'request_timeout', 413: 'invalid_payload'}
+_PAYLOAD_KEYS = frozenset({'protocol', 'audience', 'issuer_id', 'binding', 'binding_digest',
+                           'observation_nonce', 'outcome', 'backend_status', 'response_sha256',
+                           'observed_peer', 'recorded_at_ms'})
+_BINDING_KEYS = frozenset({'method', 'path', 'body_sha256', 'command_id', 'queue_fence', 'epoch', 'backend'})
+_EPOCH_KEYS = frozenset({'launch_id', 'launch_counter', 'boot_id'})
+_BACKEND_KEYS = frozenset({'container_id', 'host_pid', 'process_start_ticks', 'uid', 'gid',
+                           'engine_id', 'engine_pid', 'engine_start_ticks'})
+_PEER_KEYS = frozenset({'pid', 'uid', 'gid', 'start_ticks'})
 
 
 class SupervisorRouteError(RuntimeError):
-    """Sanitized denial; never reflects paths, bodies, keys or backend text."""
+    """Sanitized denial; never reflects paths, bodies, keys, tokens or backend text."""
 
 
 class SupervisorRouteDisabled(SupervisorRouteError):
@@ -109,7 +152,7 @@ class SupervisorRouteDisabled(SupervisorRouteError):
 
 
 class SupervisorRouteRejected(SupervisorRouteError):
-    """Definitely NOT forwarded (invalid, stale epoch, or conflicting replay)."""
+    """Definitely NOT forwarded (invalid, stale epoch, mismatch, or conflicting replay)."""
 
     def __init__(self, reason):
         self.reason = reason
@@ -125,6 +168,10 @@ class SupervisorRouteRefused(SupervisorRouteError):
 
 class RouteJournalError(SupervisorRouteError):
     pass
+
+
+class PeerMismatch(Exception):
+    """Backend contract: raised after connect and BEFORE any request byte is sent."""
 
 
 def _require(condition, error=None):
@@ -151,7 +198,7 @@ def _strict_json(raw, maximum):
 
     def reject(_):
         raise ValueError
-    return json.loads(raw, object_pairs_hook=unique, parse_constant=reject)
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=reject, parse_float=reject)
 
 
 def _uuid(value, *, v4=False):
@@ -166,10 +213,20 @@ def _positive(value, upper=2**63 - 1):
     return type(value) is int and 0 < value <= upper
 
 
+def _id32(value):
+    return type(value) is int and 0 <= value < 2**32 - 1
+
+
 def _now_ms():
     wall = time.time()
     _require(type(wall) in (int, float) and math.isfinite(wall) and wall > 0, SupervisorRouteError('clock'))
     return int(wall * 1000)
+
+
+def _bearer(value):
+    _require(type(value) is str and 0 < len(value) <= 4096 and all(33 <= ord(c) <= 126 for c in value),
+             SupervisorRouteError('executor bearer credential required'))
+    return value
 
 
 @dataclass(frozen=True)
@@ -203,7 +260,7 @@ class BackendPin:
                  and type(self.engine_id) is str and _ID.fullmatch(self.engine_id)
                  and all(_positive(v) for v in (self.host_pid, self.process_start_ticks,
                                                 self.engine_pid, self.engine_start_ticks))
-                 and all(type(v) is int and 0 <= v < 2**32 - 1 for v in (self.uid, self.gid)))
+                 and _id32(self.uid) and _id32(self.gid))
 
     @classmethod
     def from_launch_pins(cls, pins, *, uid, gid):
@@ -217,6 +274,9 @@ class BackendPin:
                 'process_start_ticks': self.process_start_ticks, 'uid': self.uid, 'gid': self.gid,
                 'engine_id': self.engine_id, 'engine_pid': self.engine_pid,
                 'engine_start_ticks': self.engine_start_ticks}
+
+    def peer_dict(self):
+        return {'pid': self.host_pid, 'uid': self.uid, 'gid': self.gid, 'start_ticks': self.process_start_ticks}
 
 
 @dataclass(frozen=True)
@@ -258,6 +318,26 @@ class RouteCommand:
                  and type(self.epoch) is RouteEpoch)
 
 
+def _submitted_request(command):
+    """Parse the exact forwarded bytes per the executor submit contract.
+
+    Raises Rejected unless the outer command_id/fence equal the inner ones.
+    """
+    if command.method != 'POST' or command.path != SUBMIT_PATH:
+        raise SupervisorRouteRejected('unsupported_operation')
+    try:
+        value = _strict_json(command.body, MAX_BODY_BYTES)
+        _require(type(value) is dict and set(value) == set(ContainerPilotRequest.model_fields))
+        request = ContainerPilotRequest.model_validate(value)
+    except Exception:
+        raise SupervisorRouteRejected('invalid_body') from None
+    if request.command_id != command.command_id:
+        raise SupervisorRouteRejected('command_id_mismatch')
+    if request.fencing_generation != command.queue_fence:
+        raise SupervisorRouteRejected('fence_mismatch')
+    return request
+
+
 def binding_for(command, pin):
     """Canonical binding over every forwarded/attested field."""
     _require(type(command) is RouteCommand and type(pin) is BackendPin)
@@ -278,7 +358,11 @@ def observation_nonce(digest):
 
 @dataclass(frozen=True)
 class RouteResult:
-    """state: completed | in_progress | held. Only completed carries a record."""
+    """state: completed | rejected | refused | in_progress | held.
+
+    Only completed (accepted) and rejected (definitive non-acceptance) carry a
+    signed record. refused = verified never sent. held = uncertain.
+    """
     state: str
     command_id: str
     binding_digest: str
@@ -298,28 +382,70 @@ class SupervisorRouteConfig:
     allow_ephemeral_test_storage: bool = False
 
 
-def verify_route_record(raw, *, public_key, expected_binding, issuer_id):
+def _shape(value, keys):
+    return type(value) is dict and set(value) == keys
+
+
+def _valid_binding(binding):
+    return (_shape(binding, _BINDING_KEYS) and binding['method'] in _METHODS
+            and type(binding['path']) is str and _PATH.fullmatch(binding['path'])
+            and type(binding['body_sha256']) is str and _HEX.fullmatch(binding['body_sha256'])
+            and _uuid(binding['command_id']) and _positive(binding['queue_fence'])
+            and _shape(binding['epoch'], _EPOCH_KEYS)
+            and _uuid(binding['epoch']['launch_id'], v4=True) and _uuid(binding['epoch']['boot_id'])
+            and _positive(binding['epoch']['launch_counter'])
+            and _shape(binding['backend'], _BACKEND_KEYS)
+            and type(binding['backend']['container_id']) is str
+            and _HEX.fullmatch(binding['backend']['container_id'])
+            and type(binding['backend']['engine_id']) is str and _ID.fullmatch(binding['backend']['engine_id'])
+            and all(_positive(binding['backend'][k]) for k in ('host_pid', 'process_start_ticks',
+                                                              'engine_pid', 'engine_start_ticks'))
+            and _id32(binding['backend']['uid']) and _id32(binding['backend']['gid']))
+
+
+def verify_route_record(raw, *, public_key, issuer_id, expected_binding, received_status, received_body):
     """Hub-side verification interface (not yet wired into any Hub client).
 
-    Returns the verified payload or raises SupervisorRouteError. The caller
-    supplies the binding it intended plus the independently enrolled key.
+    ``expected_binding`` is what the Hub intended (its own command bytes, epoch
+    and the independently enrolled backend pin); ``received_status`` and
+    ``received_body`` are what the Hub actually got back. Enforces the exact
+    record shape and types, the signature under the enrolled key, the binding,
+    nonce, response hash, status/outcome and that the observed peer equals the
+    pinned backend. Returns the verified payload or raises.
     """
     error = SupervisorRouteError('supervisor route record unverified')
     try:
+        _require(_valid_binding(expected_binding) and type(received_status) is int
+                 and type(received_body) is bytes, error)
         envelope = _strict_json(raw, MAX_RECORD_BYTES)
-        _require(_canonical(envelope) == raw and type(envelope) is dict
-                 and set(envelope) == {'payload', 'signature'}, error)
+        _require(_canonical(envelope) == raw and _shape(envelope, {'payload', 'signature'}), error)
         payload, signature = envelope['payload'], envelope['signature']
-        _require(type(payload) is dict and type(signature) is str and _SIGNATURE.fullmatch(signature), error)
+        _require(_shape(payload, _PAYLOAD_KEYS) and type(signature) is str
+                 and _SIGNATURE.fullmatch(signature), error)
         decoded = base64.urlsafe_b64decode(signature + '==')
-        _require(len(decoded) == 64, error)
+        _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b'=').decode() == signature,
+                 error)
         Ed25519PublicKey.from_public_bytes(public_key).verify(decoded, SIGNATURE_DOMAIN + _canonical(payload))
         digest = binding_digest(expected_binding)
-        _require(payload.get('protocol') == PROTOCOL and payload.get('audience') == AUDIENCE
-                 and payload.get('issuer_id') == issuer_id
-                 and payload.get('binding') == expected_binding
-                 and payload.get('binding_digest') == digest
-                 and payload.get('observation_nonce') == observation_nonce(digest), error)
+        peer = payload['observed_peer']
+        status = payload['backend_status']
+        _require(payload['protocol'] == PROTOCOL and payload['audience'] == AUDIENCE
+                 and type(payload['issuer_id']) is str and payload['issuer_id'] == issuer_id
+                 and _valid_binding(payload['binding'])
+                 and _canonical(payload['binding']) == _canonical(expected_binding)
+                 and payload['binding_digest'] == digest
+                 and payload['observation_nonce'] == observation_nonce(digest)
+                 and type(status) is int and status == received_status
+                 and type(payload['response_sha256']) is str
+                 and payload['response_sha256'] == hashlib.sha256(received_body).hexdigest()
+                 and _shape(peer, _PEER_KEYS) and all(type(v) is int for v in peer.values())
+                 and peer == {'pid': expected_binding['backend']['host_pid'],
+                              'uid': expected_binding['backend']['uid'],
+                              'gid': expected_binding['backend']['gid'],
+                              'start_ticks': expected_binding['backend']['process_start_ticks']}
+                 and _positive(payload['recorded_at_ms'])
+                 and ((payload['outcome'] == 'accepted' and 200 <= status < 300)
+                      or (payload['outcome'] == 'rejected' and status in _DEFINITIVE_REJECTIONS)), error)
         return payload
     except SupervisorRouteError:
         raise
@@ -333,7 +459,8 @@ class RouteJournal:
     Mirrors ``operation_journal.SQLiteOperationJournal`` durability: PilotOwner
     flock/enrollment, BEGIN IMMEDIATE, synchronous=FULL, rollback journal,
     parent fsync after commit, 250ms busy bound per wait. Any failure raises
-    RouteJournalError and the transaction is rolled back.
+    RouteJournalError and the transaction is rolled back. No credential is
+    ever passed to or stored by the journal.
     """
 
     def __init__(self, database_path, *, create, allow_ephemeral_test_storage=False):
@@ -414,7 +541,6 @@ class RouteJournal:
         _require(not self._closed and self._owner is not None and os.getpid() == self._pid,
                  RouteJournalError('inactive'))
         self._owner.assert_active(self.path)
-        self._owner._check_paths()
         self._sidecars(_private_file)
 
     @contextmanager
@@ -437,9 +563,7 @@ class RouteJournal:
                         db.rollback()
                         raise
                 self._active()
-            except RouteJournalError:
-                raise
-            except SupervisorRouteRejected:
+            except (RouteJournalError, SupervisorRouteRejected):
                 raise
             except Exception:
                 raise RouteJournalError('route journal unavailable') from None
@@ -450,7 +574,7 @@ class RouteJournal:
                          'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
         if row is not None:
             _require(row[3] in _STATES and _HEX.fullmatch(row[1]) and (row[5] is None or row[5] in _ERRORS)
-                     and (row[3] == 'completed') == (row[6] is not None), RouteJournalError('row'))
+                     and (row[3] in _RECORDED) == (row[6] is not None), RouteJournalError('row'))
         return row
 
     def admit(self, command_id, digest, binding, epoch):
@@ -478,22 +602,30 @@ class RouteJournal:
                        (command_id, digest, _canonical(binding).decode(), self._owner.epoch))
             return 'new', None
 
-    def record_completed(self, command_id, digest, record, response):
+    def record_outcome(self, command_id, digest, state, record, response):
+        _require(state in _RECORDED, RouteJournalError('state'))
         with self._transaction() as db:
             row = self._row(db, command_id)
             _require(row is not None and row[1] == digest and row[3] == 'intent', RouteJournalError('state'))
-            db.execute("UPDATE supervisor_route_intent SET state='completed', record=?, response=? "
-                       "WHERE command_id=? AND state='intent'", (record.decode(), response, command_id))
+            db.execute("UPDATE supervisor_route_intent SET state=?, record=?, response=? "
+                       "WHERE command_id=? AND state='intent'", (state, record.decode(), response, command_id))
 
-    def mark_unknown(self, command_id, digest, error):
+    def _mark(self, command_id, digest, state, error):
         _require(error in _ERRORS, RouteJournalError('error'))
         with self._transaction() as db:
             row = self._row(db, command_id)
-            _require(row is not None and row[1] == digest and row[3] in {'intent', 'unknown'},
+            _require(row is not None and row[1] == digest and row[3] in {'intent', state},
                      RouteJournalError('state'))
             if row[3] == 'intent':
-                db.execute("UPDATE supervisor_route_intent SET state='unknown', error=? WHERE command_id=?",
-                           (error, command_id))
+                db.execute('UPDATE supervisor_route_intent SET state=?, error=? WHERE command_id=?',
+                           (state, error, command_id))
+
+    def mark_unknown(self, command_id, digest, error):
+        self._mark(command_id, digest, 'unknown', error)
+
+    def mark_refused(self, command_id, digest, error):
+        """Verified NOT sent (zero bytes written); terminal for this command_id."""
+        self._mark(command_id, digest, 'refused', error)
 
     def read(self, command_id):
         """Read-only inspection: a read transaction, no writes, no forwarding."""
@@ -525,21 +657,41 @@ def _proc_start(pid):
 
 
 class UnixSocketBackend:
-    """One-shot HTTP/1.1 over an explicit Unix socket; observes SO_PEERCRED.
+    """One-shot HTTP/1.1 over an explicit Unix socket to the executor ASGI.
 
-    The peer PID is held by pidfd across the exchange and its start time is
-    rechecked, so PID reuse during the exchange is detected. No retries, no
-    reconnects, no redirects. Raises on any transport uncertainty.
+    After connect and BEFORE writing any byte, the peer's SO_PEERCRED
+    pid/uid/gid and pidfd-held start ticks must equal the pin, else
+    PeerMismatch (zero bytes sent). The peer is rechecked after the reply.
+    Sends the caller-supplied executor bearer; never stores it elsewhere,
+    never includes it in repr or exceptions. No retries/reconnects/redirects.
     """
 
-    def __init__(self, socket_path):
+    def __init__(self, socket_path, *, bearer_token):
         _require(sys.platform == 'linux' and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'),
                  SupervisorRouteError('linux'))
         _require(type(socket_path) is str and socket_path.startswith('/')
                  and os.path.normpath(socket_path) == socket_path, SupervisorRouteError('path'))
         self._path = socket_path
+        self.__authorization = 'Bearer ' + _bearer(bearer_token)
 
-    def forward(self, *, method, path, body, timeout_ms):
+    def __repr__(self):
+        return 'UnixSocketBackend(<redacted>)'
+
+    __str__ = __repr__
+
+    def __reduce__(self):
+        raise TypeError('UnixSocketBackend is not serializable')
+
+    def forward(self, *, method, path, body, timeout_ms, pin):
+        try:
+            return self._forward(method, path, body, timeout_ms, pin)
+        except PeerMismatch:
+            raise PeerMismatch() from None
+        except Exception:
+            # Sanitized: no header, token or backend text in the exception chain.
+            raise SupervisorRouteError('backend exchange unavailable') from None
+
+    def _forward(self, method, path, body, timeout_ms, pin):
         deadline = time.monotonic() + timeout_ms / 1000
 
         def remaining():
@@ -553,17 +705,25 @@ class UnixSocketBackend:
             peer.settimeout(remaining())
             peer.connect(self._path)
             pid, uid, gid = struct.unpack('=iII', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-            _require(pid > 0, SupervisorRouteError('peer'))
-            before = _proc_start(pid)
-            pidfd = os.pidfd_open(pid, 0)
-            start = _proc_start(pid)
-            _require(before == start, SupervisorRouteError('peer'))
+            if pid <= 0:
+                raise PeerMismatch()
+            try:
+                before = _proc_start(pid)
+                pidfd = os.pidfd_open(pid, 0)
+                start = _proc_start(pid)
+            except Exception:
+                raise PeerMismatch() from None
+            observed = ObservedPeer(pid, uid, gid, start)
+            if before != start or not observed.matches(pin):
+                raise PeerMismatch()  # Socket closed in finally; nothing was written.
             connection = http.client.HTTPConnection('supervisor-route', timeout=remaining())
             connection.sock = peer
-            headers = {'Host': 'supervisor-route', 'Accept-Encoding': 'identity', 'Connection': 'close'}
+            headers = {'Host': 'supervisor-route', 'Accept-Encoding': 'identity', 'Connection': 'close',
+                       'Authorization': self.__authorization}
             if method == 'POST':
                 headers['Content-Type'] = 'application/json'
             connection.request(method, path, body=body if method == 'POST' else None, headers=headers)
+            del headers
             peer.settimeout(remaining())
             response = connection.getresponse()
             _require(response.getheader('Transfer-Encoding') is None
@@ -574,11 +734,37 @@ class UnixSocketBackend:
             remaining()
             _require(not select.select([pidfd], [], [], 0)[0] and _proc_start(pid) == start,
                      SupervisorRouteError('peer'))
-            return BackendReply(response.status, raw, ObservedPeer(pid, uid, gid, start))
+            return BackendReply(response.status, raw, observed)
         finally:
             if pidfd is not None:
                 os.close(pidfd)
             peer.close()
+
+
+def _classify(request, reply):
+    """('accepted'|'rejected', None) for definitive replies, else (None, error)."""
+    status, body = reply.status, reply.body
+    if type(status) is not int or type(body) is not bytes:
+        return None, 'malformed_response'
+    if 200 <= status < 300:
+        try:
+            value = _strict_json(body, MAX_RESPONSE_BYTES)
+            _require(type(value) is dict and set(value) == set(ContainerPilotResponse.model_fields))
+            response = ContainerPilotResponse.model_validate(value)
+            _require(all(getattr(response, name) == getattr(request, name)
+                         for name in ContainerPilotRequest.model_fields))
+        except Exception:
+            return None, 'malformed_response'
+        return 'accepted', None
+    if status in _DEFINITIVE_REJECTIONS:
+        try:
+            value = _strict_json(body, MAX_RESPONSE_BYTES)
+            _require(_shape(value, {'error'}) and _shape(value['error'], {'code'})
+                     and value['error']['code'] == _DEFINITIVE_REJECTIONS[status])
+        except Exception:
+            return None, 'malformed_response'
+        return 'rejected', None
+    return None, 'backend_ambiguous'
 
 
 class SupervisorRoute:
@@ -586,10 +772,12 @@ class SupervisorRoute:
 
     ``epoch_source()`` must return the supervisor's CURRENT (RouteEpoch,
     BackendPin); it is consulted before admission and again after forwarding.
-    ``backend.forward(method=, path=, body=, timeout_ms=)`` returns a
-    BackendReply or raises. ``signing_key`` is the already-enrolled issuer
-    Ed25519 key and must match ``release.public_key``; none is created here.
-    Commands are serialized by one mutex; this is a foundation, not a server.
+    ``backend.forward(method=, path=, body=, timeout_ms=, pin=)`` returns a
+    BackendReply, raises PeerMismatch before sending, or raises otherwise.
+    ``signing_key`` is the already-enrolled issuer Ed25519 key and must match
+    ``release.public_key``; none is created here. Any executor bearer belongs
+    to the backend object, never to this route. Commands are serialized by one
+    mutex; this is a foundation, not a server.
     """
 
     def __init__(self, *, config, release, signing_key, epoch_source, backend):
@@ -610,15 +798,20 @@ class SupervisorRoute:
         self._journal = RouteJournal(config.journal_path, create=config.create_journal,
                                      allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
 
+    def __repr__(self):
+        return 'SupervisorRoute(<enabled>)'
+
     def _current(self):
         epoch, pin = self._epoch_source()
         _require(type(epoch) is RouteEpoch and type(pin) is BackendPin, SupervisorRouteError('epoch'))
         return epoch, pin
 
-    def _held_from_row(self, row, *, replayed):
+    def _from_row(self, row, *, replayed):
         command_id, digest, _, state, owner_epoch, error, record, response = row
-        if state == 'completed':
-            return RouteResult('completed', command_id, digest, replayed, None, record.encode(), response)
+        if state in _RECORDED:
+            return RouteResult(state, command_id, digest, replayed, None, record.encode(), response)
+        if state == 'refused':
+            return RouteResult('refused', command_id, digest, replayed, error)
         if state == 'intent' and owner_epoch == self._journal.owner_epoch and command_id in self._inflight:
             return RouteResult('in_progress', command_id, digest, replayed)
         # An intent left by an earlier owner (restart) or whose outcome this
@@ -628,6 +821,8 @@ class SupervisorRoute:
     def submit(self, command):
         _require(os.getpid() == self._pid, SupervisorRouteError('process'))
         _require(type(command) is RouteCommand)
+        # Contract check on the exact bytes BEFORE any journal access.
+        request = _submitted_request(command)
         with self._mutex:
             try:
                 epoch, pin = self._current()
@@ -647,10 +842,10 @@ class SupervisorRoute:
             except Exception:
                 raise SupervisorRouteRefused() from None
             if outcome == 'replay':
-                return self._held_from_row(row, replayed=True)
+                return self._from_row(row, replayed=True)
             self._inflight.add(command.command_id)
             try:
-                return self._forward(command, binding, digest, epoch, pin)
+                return self._forward(command, request, binding, digest, epoch, pin)
             finally:
                 self._inflight.discard(command.command_id)
 
@@ -662,10 +857,16 @@ class SupervisorRoute:
             pass
         return RouteResult('held', command.command_id, digest, False, error)
 
-    def _forward(self, command, binding, digest, epoch, pin):
+    def _forward(self, command, request, binding, digest, epoch, pin):
         try:
             reply = self._backend.forward(method=command.method, path=command.path, body=command.body,
-                                          timeout_ms=self._timeout)
+                                          timeout_ms=self._timeout, pin=pin)
+        except PeerMismatch:
+            try:
+                self._journal.mark_refused(command.command_id, digest, 'backend_identity_mismatch')
+            except Exception:
+                return RouteResult('held', command.command_id, digest, False, 'backend_identity_mismatch')
+            return RouteResult('refused', command.command_id, digest, False, 'backend_identity_mismatch')
         except Exception:
             return self._hold(command, digest, 'transport_lost')
         try:
@@ -678,18 +879,13 @@ class SupervisorRoute:
             return self._hold(command, digest, 'malformed_response')
         if not reply.peer.matches(pin):
             return self._hold(command, digest, 'backend_identity_mismatch')
-        try:
-            _require(type(reply.status) is int and 200 <= reply.status < 500
-                     and type(reply.body) is bytes)
-            parsed = _strict_json(reply.body, MAX_RESPONSE_BYTES)
-            _require(type(parsed) is dict)
-        except Exception:
-            server_error = type(reply.status) is int and 500 <= reply.status < 600
-            return self._hold(command, digest, 'backend_ambiguous' if server_error else 'malformed_response')
+        outcome, error = _classify(request, reply)
+        if outcome is None:
+            return self._hold(command, digest, error)
         try:
             payload = {'protocol': PROTOCOL, 'audience': AUDIENCE, 'issuer_id': self._release.issuer_id,
                        'binding': binding, 'binding_digest': digest,
-                       'observation_nonce': observation_nonce(digest),
+                       'observation_nonce': observation_nonce(digest), 'outcome': outcome,
                        'backend_status': reply.status,
                        'response_sha256': hashlib.sha256(reply.body).hexdigest(),
                        'observed_peer': {'pid': reply.peer.pid, 'uid': reply.peer.uid,
@@ -701,12 +897,13 @@ class SupervisorRoute:
             _require(len(record) <= MAX_RECORD_BYTES)
         except Exception:
             return self._hold(command, digest, 'signing_failed')
+        state = 'completed' if outcome == 'accepted' else 'rejected'
         try:
-            self._journal.record_completed(command.command_id, digest, record, reply.body)
+            self._journal.record_outcome(command.command_id, digest, state, record, reply.body)
         except Exception:
             # Forwarded, but not durably recorded: NEVER report success.
             return self._hold(command, digest, 'outcome_unrecorded')
-        return RouteResult('completed', command.command_id, digest, False, None, record, reply.body)
+        return RouteResult(state, command.command_id, digest, False, None, record, reply.body)
 
     def inspect(self, command_id):
         """Read-only recorded state; never forwards, never writes."""
@@ -716,7 +913,7 @@ class SupervisorRoute:
             row = self._journal.read(command_id)
         except Exception:
             raise SupervisorRouteRefused() from None
-        return None if row is None else self._held_from_row(row, replayed=True)
+        return None if row is None else self._from_row(row, replayed=True)
 
     def close(self):
         self._signer = None

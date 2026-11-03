@@ -1,14 +1,18 @@
 """Engine-free evidence for the disabled-by-default supervisor route foundation."""
+import base64
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
+import pickle
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler
-import socketserver
+import time
 from uuid import uuid4
 
 import pytest
@@ -18,34 +22,55 @@ pytest.importorskip("fcntl", reason="Route journal requires actual Linux kernel 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from engineering_hub.container_pilot_client import ContainerPilotResponse
 from engineering_hub.container_pilot_manifest import Platform
 from engineering_hub.current_executor_observation import CurrentExecutorReleasePins, CurrentLaunchPins
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
-    BackendPin, BackendReply, ObservedPeer, RouteCommand, RouteEpoch, RouteJournal, SupervisorRoute,
-    SupervisorRouteConfig, SupervisorRouteDisabled, SupervisorRouteRefused, SupervisorRouteRejected,
-    UnixSocketBackend, binding_digest, binding_for, observation_nonce, verify_route_record,
+    BackendPin, BackendReply, ObservedPeer, PeerMismatch, RouteCommand, RouteEpoch, SupervisorRoute,
+    SupervisorRouteConfig, SupervisorRouteDisabled, SupervisorRouteError, SupervisorRouteRefused,
+    SupervisorRouteRejected, UnixSocketBackend, SUBMIT_PATH, SIGNATURE_DOMAIN, binding_digest,
+    binding_for, observation_nonce, verify_route_record,
 )
 
 LINUX = pytest.mark.skipif(sys.platform != "linux", reason="Actual private Linux journal ownership")
-PATH = "/v1/container-pilot/commands"
 BOOT = str(uuid4())
 LAUNCH = str(uuid4())
+TOKEN = "route-test-bearer-" + "Zq7" * 10
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def request_dict(command_id, fence, run_id=None):
+    return {"schema_version": "container_pilot_v1", "command_id": command_id,
+            "run_id": run_id or "11111111-1111-4111-8111-111111111111",
+            "target_id": "engineering-hub:staging", "action": "deploy_container",
+            "manifest_digest": "sha256:" + "5" * 64, "candidate_commit": "d" * 40,
+            "policy_revision": 3, "fencing_generation": fence}
+
+
+def echo(request):
+    return {**request, "state": "pending", "reason": None, "replayed": False,
+            "evidence": {"container_id": None, "image_config_id": None, "health": "unknown",
+                         "evidence_verified": False}}
 
 
 class Backend:
     def __init__(self, pin):
         self.calls = []
         self.peer = ObservedPeer(pin.host_pid, pin.uid, pin.gid, pin.process_start_ticks)
-        self.status, self.body, self.error, self.after = 202, b'{"state":"pending"}', None, None
+        self.status, self.body, self.error, self.after = 200, None, None, None
 
-    def forward(self, *, method, path, body, timeout_ms):
+    def forward(self, *, method, path, body, timeout_ms, pin):
         self.calls.append((method, path, body))
         if self.after is not None:
             self.after()
         if self.error is not None:
             raise self.error
-        return BackendReply(self.status, self.body, self.peer)
+        raw = self.body if self.body is not None else canonical(echo(json.loads(body)))
+        return BackendReply(self.status, raw, self.peer)
 
 
 class Epochs:
@@ -69,8 +94,7 @@ def world(tmp_path):
         "existing-issuer", key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
         "c" * 40, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64,
         Platform(os="linux", architecture="amd64", variant=None), "sha256:" + "4" * 64)
-    pins = CurrentLaunchPins(LAUNCH, BOOT, 4321, 98765, "a" * 64, "engine:pinned", 500, 123,
-                             2**40)
+    pins = CurrentLaunchPins(LAUNCH, BOOT, 4321, 98765, "a" * 64, "engine:pinned", 500, 123, 2**40)
     pin = BackendPin.from_launch_pins(pins, uid=10001, gid=10001)
     epoch = RouteEpoch(LAUNCH, 5, BOOT)
     backend = Backend(pin)
@@ -88,11 +112,28 @@ def world(tmp_path):
     return state
 
 
-def command(epoch, *, command_id=None, body=b'{"command":"deploy"}', fence=7, path=PATH, method="POST"):
-    return RouteCommand(method, path, body, command_id or str(uuid4()), fence, epoch)
+def command(epoch, *, command_id=None, fence=7, body=None, inner_id=None, inner_fence=None,
+            run_id=None, path=SUBMIT_PATH, method="POST"):
+    command_id = command_id or str(uuid4())
+    if body is None:
+        body = canonical(request_dict(inner_id or command_id, inner_fence or fence, run_id))
+    return RouteCommand(method, path, body, command_id, fence, epoch)
 
 
-def test_disabled_by_default_refuses_construction(world, tmp_path):
+def intent_rows(path):
+    with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT command_id, state FROM supervisor_route_intent").fetchall()
+
+
+def verify(world, result, cmd, *, pin=None, status=200, body=None):
+    return verify_route_record(result.record, public_key=world["release"].public_key,
+                               issuer_id="existing-issuer",
+                               expected_binding=binding_for(cmd, pin or world["pin"]),
+                               received_status=status,
+                               received_body=result.response if body is None else body)
+
+
+def test_disabled_by_default_refuses_construction(world):
     assert SupervisorRouteConfig().enabled is False
     base = dict(release=world["release"], signing_key=world["key"], epoch_source=world["epochs"],
                 backend=world["backend"])
@@ -133,21 +174,40 @@ def test_completed_record_signed_over_full_binding_and_idempotent_replay(world):
     route = world["make"]()
     cmd = command(world["epoch"])
     result = route.submit(cmd)
-    assert result.state == "completed" and result.response == world["backend"].body
-    binding = binding_for(cmd, world["pin"])
-    payload = verify_route_record(result.record, public_key=world["release"].public_key,
-                                  expected_binding=binding, issuer_id="existing-issuer")
-    assert payload["binding"]["body_sha256"] == __import__("hashlib").sha256(cmd.body).hexdigest()
+    assert result.state == "completed"
+    payload = verify(world, result, cmd)
+    assert payload["outcome"] == "accepted"
+    assert payload["binding"]["body_sha256"] == hashlib.sha256(cmd.body).hexdigest()
     assert payload["binding"]["epoch"] == {"launch_id": LAUNCH, "launch_counter": 5, "boot_id": BOOT}
     assert payload["binding"]["backend"]["container_id"] == "a" * 64
-    assert payload["observation_nonce"] == observation_nonce(binding_digest(binding))
-    other = binding_for(command(world["epoch"], command_id=cmd.command_id, fence=8), world["pin"])
-    with pytest.raises(route_module.SupervisorRouteError):
-        verify_route_record(result.record, public_key=world["release"].public_key,
-                            expected_binding=other, issuer_id="existing-issuer")
+    assert payload["observation_nonce"] == observation_nonce(binding_digest(binding_for(cmd, world["pin"])))
+    with pytest.raises(SupervisorRouteError):
+        verify(world, result, command(world["epoch"], command_id=cmd.command_id, fence=8))
     again = route.submit(cmd)
     assert again.state == "completed" and again.replayed and again.record == result.record
     assert len(world["backend"].calls) == 1
+    route.close()
+
+
+@LINUX
+@pytest.mark.parametrize("mismatch", ["command_id", "fence"])
+def test_outer_ids_must_match_exact_body_before_any_journal_write(world, mismatch):
+    route = world["make"]()
+    outer = str(uuid4())
+    if mismatch == "command_id":
+        cmd = command(world["epoch"], command_id=outer, inner_id=str(uuid4()))
+    else:
+        cmd = command(world["epoch"], command_id=outer, fence=7, inner_fence=9)
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        route.submit(cmd)
+    assert raised.value.reason == mismatch + "_mismatch"
+    assert route.inspect(outer) is None and intent_rows(world["path"]) == []
+    for bad in (command(world["epoch"], body=b'{"command_id":"x"}'),
+                command(world["epoch"], method="GET", body=b"", path=SUBMIT_PATH + "/" + outer),
+                command(world["epoch"], path=SUBMIT_PATH + "/" + outer + "/reconcile", body=b"")):
+        with pytest.raises(SupervisorRouteRejected):
+            route.submit(bad)
+    assert intent_rows(world["path"]) == [] and world["backend"].calls == []
     route.close()
 
 
@@ -161,6 +221,20 @@ def test_mismatched_observer_and_command_backend_is_held(world):
     assert result.state == "held" and result.error == "backend_identity_mismatch" and result.record is None
     assert route.inspect(cmd.command_id).state == "held"
     assert route.submit(cmd).state == "held"
+    assert len(world["backend"].calls) == 1
+    route.close()
+
+
+@LINUX
+def test_peer_mismatch_before_send_is_refused_terminally(world):
+    route = world["make"]()
+    world["backend"].error = PeerMismatch()
+    cmd = command(world["epoch"])
+    result = route.submit(cmd)
+    assert result.state == "refused" and result.error == "backend_identity_mismatch"
+    world["backend"].error = None
+    assert route.submit(cmd).state == "refused"  # Not redispatched under the same command_id.
+    assert route.inspect(cmd.command_id).state == "refused"
     assert len(world["backend"].calls) == 1
     route.close()
 
@@ -181,8 +255,7 @@ def test_restart_with_lost_response_replays_held_without_second_forward(world, l
     route.close()  # Process "restarts" with the same durable journal.
     world["backend"].error = None
     restarted = world["make"](create=False)
-    first = restarted.inspect(cmd.command_id)
-    assert first.state == "held"
+    assert restarted.inspect(cmd.command_id).state == "held"
     replay = restarted.submit(cmd)
     assert replay.state == "held" and replay.replayed
     assert replay.error == ("interrupted" if lost == "crash" else "transport_lost")
@@ -191,13 +264,12 @@ def test_restart_with_lost_response_replays_held_without_second_forward(world, l
 
 
 @LINUX
-@pytest.mark.parametrize("change", ["body", "fence", "path", "method"])
+@pytest.mark.parametrize("change", ["body", "fence"])
 def test_conflicting_replay_rejected_without_forward(world, change):
     route = world["make"]()
     cmd = command(world["epoch"])
     assert route.submit(cmd).state == "completed"
-    variant = {"body": dict(body=b'{"command":"other"}'), "fence": dict(fence=8),
-               "path": dict(path=PATH + "/x/reconcile"), "method": dict(method="GET", body=b"")}[change]
+    variant = {"body": dict(run_id=str(uuid4())), "fence": dict(fence=8)}[change]
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.submit(command(world["epoch"], command_id=cmd.command_id, **variant))
     assert raised.value.reason == "binding_conflict"
@@ -236,7 +308,7 @@ def test_journal_failure_after_forward_is_held_not_success(world, monkeypatch, s
 
     def fail(*args, **kwargs):
         raise route_module.RouteJournalError("disk")
-    monkeypatch.setattr(journal, "record_completed", fail)
+    monkeypatch.setattr(journal, "record_outcome", fail)
     if scope == "whole_journal":
         monkeypatch.setattr(journal, "mark_unknown", fail)
     cmd = command(world["epoch"])
@@ -259,8 +331,7 @@ def test_older_epoch_rejected_durably_and_never_forwarded(world):
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.submit(command(older))  # Hub claims an older epoch than current.
     assert raised.value.reason == "stale_epoch"
-    # Even if the epoch source itself regresses, the durable high-water rejects.
-    world["epochs"].value = (older, world["pin"])
+    world["epochs"].value = (older, world["pin"])  # Even a regressed epoch source is rejected.
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.submit(command(older))
     assert raised.value.reason == "stale_epoch"
@@ -278,7 +349,7 @@ def test_older_epoch_rejected_durably_and_never_forwarded(world):
 
 
 @LINUX
-def test_epoch_change_mid_command_and_malformed_reply_are_held(world):
+def test_response_classification(world):
     route = world["make"]()
     newer = RouteEpoch(str(uuid4()), 6, BOOT)
     world["backend"].after = lambda: setattr(world["epochs"], "value", (newer, world["pin"]))
@@ -286,14 +357,26 @@ def test_epoch_change_mid_command_and_malformed_reply_are_held(world):
     assert route.submit(first).state == "held"
     assert route.inspect(first.command_id).error == "epoch_changed"
     world["backend"].after = None
-    for body, status, error in ((b'{"a":1,"a":2}', 200, "malformed_response"),
-                                (b"not json", 200, "malformed_response"),
-                                (b'{"x":1}', 503, "backend_ambiguous")):
-        world["backend"].body, world["backend"].status = body, status
+    other = canonical(echo(request_dict(str(uuid4()), 7)))
+    cases = ((200, b'{"a":1,"a":2}', "held", "malformed_response"),
+             (200, b"not json", "held", "malformed_response"),
+             (200, other, "held", "malformed_response"),  # Does not echo this command.
+             (503, b'{"error":{"code":"command_busy"}}', "held", "backend_ambiguous"),
+             (500, b'{"error":{"code":"internal_error"}}', "held", "backend_ambiguous"),
+             (401, b'{"error":{"code":"invalid_payload"}}', "held", "malformed_response"),
+             (401, b'{"error":{"code":"unauthorized"}}', "rejected", None),
+             (403, b'{"error":{"code":"forbidden"}}', "rejected", None),
+             (400, b'{"error":{"code":"invalid_payload"}}', "rejected", None))
+    for status, body, state, error in cases:
+        world["backend"].status, world["backend"].body = status, body
         cmd = command(newer)
         result = route.submit(cmd)
-        assert result.state == "held" and result.error == error
-    assert len(world["backend"].calls) == 4
+        assert (result.state, result.error) == (state, error), (status, body)
+        if state == "rejected":
+            payload = verify(world, result, cmd, status=status)
+            assert payload["outcome"] == "rejected"
+            assert route.submit(cmd).state == "rejected"  # Terminal, not held, not re-forwarded.
+    assert len(world["backend"].calls) == 1 + len(cases)
     route.close()
 
 
@@ -318,54 +401,207 @@ def test_in_progress_reported_for_concurrent_identical_replay(world):
     route = world["make"]()
     cmd = command(world["epoch"])
     seen = {}
-    world["backend"].after = lambda: seen.setdefault("row", route._held_from_row(
+    world["backend"].after = lambda: seen.setdefault("row", route._from_row(
         route._journal.read(cmd.command_id), replayed=True))
     assert route.submit(cmd).state == "completed"
     assert seen["row"].state == "in_progress"
     route.close()
 
 
-def _proc_start():
+def resign(world, payload):
+    signature = base64.urlsafe_b64encode(world["key"].sign(
+        SIGNATURE_DOMAIN + canonical(payload))).rstrip(b"=").decode()
+    return canonical({"payload": payload, "signature": signature})
+
+
+@LINUX
+def test_verifier_enforces_shape_hash_status_and_pinned_peer(world):
+    route = world["make"]()
+    cmd = command(world["epoch"])
+    result = route.submit(cmd)
+    genuine = verify(world, result, cmd)
+    route.close()
+
+    def args(**kwargs):
+        values = dict(public_key=world["release"].public_key, issuer_id="existing-issuer",
+                      expected_binding=binding_for(cmd, world["pin"]), received_status=200,
+                      received_body=result.response)
+        values.update(kwargs)
+        return values
+
+    def check(raw, **kwargs):
+        with pytest.raises(SupervisorRouteError):
+            verify_route_record(raw, **args(**kwargs))
+    assert verify_route_record(resign(world, genuine), **args()) == genuine  # Re-sign baseline is valid.
+    check(resign(world, {**genuine, "extra": 1}))  # Extra key.
+    check(resign(world, {k: v for k, v in genuine.items() if k != "recorded_at_ms"}))  # Missing key.
+    check(resign(world, {**genuine, "binding": {**genuine["binding"], "extra": 1}}))
+    check(resign(world, {**genuine, "backend_status": "200"}))  # Wrong type.
+    check(resign(world, {**genuine, "observed_peer": {**genuine["observed_peer"], "extra": 0}}))
+    envelope = json.loads(result.record)
+    check(canonical({**envelope, "extra": 1}))
+    check(result.record, received_body=result.response + b" ")  # Tampered response bytes.
+    check(resign(world, {**genuine, "response_sha256": "0" * 64}))  # Tampered recorded hash.
+    check(result.record, received_status=201)  # Status mismatch.
+    check(resign(world, {**genuine, "backend_status": 201}))
+    check(resign(world, {**genuine, "outcome": "rejected"}))
+    wrong_peer = {**genuine["observed_peer"], "pid": genuine["observed_peer"]["pid"] + 1}
+    check(resign(world, {**genuine, "observed_peer": wrong_peer}))  # Observed peer != pinned.
+    other_pin = BackendPin("b" * 64, 4321, 98765, 10001, 10001, "engine:pinned", 500, 123)
+    check(result.record, expected_binding=binding_for(cmd, other_pin))
+    other_key = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    check(result.record, public_key=other_key)
+
+
+def _self_ticks():
     raw = Path("/proc/self/stat").read_text()
     return int(raw[raw.rfind(")") + 2:].split()[19])
 
 
+def _own_pin(ticks_offset=0):
+    return BackendPin("a" * 64, os.getpid(), _self_ticks() + ticks_offset, os.getuid(), os.getgid(),
+                      "engine:pinned", 500, 123)
+
+
+_COUNTING_SERVER = r'''
+import socket, sys
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1]); listener.listen(1)
+print('ready', flush=True)
+peer, _ = listener.accept(); peer.settimeout(10)
+total = 0
+while True:
+    part = peer.recv(65536)
+    if not part:
+        break
+    total += len(part)
+print(total, flush=True)
+'''
+
+
 @LINUX
-@pytest.mark.parametrize("pinned", ["exact", "wrong_start"])
-def test_real_unix_socket_peer_identity(world, pinned):
+@pytest.mark.parametrize("wrong", ["start_ticks_same_process", "different_process"])
+def test_wrong_peer_receives_zero_bytes(world, wrong):
     directory = tempfile.mkdtemp(dir="/tmp")
     path = os.path.join(directory, "b.sock")
+    received = []
+    server = thread = process = None
+    try:
+        if wrong == "different_process":
+            process = subprocess.Popen([sys.executable, "-c", _COUNTING_SERVER, path], stdout=subprocess.PIPE,
+                                       text=True)
+            assert process.stdout.readline().strip() == "ready"
+            pin = _own_pin()  # Exact pin for THIS process; the listener is another PID.
+        else:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
 
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+            def serve():
+                peer, _ = server.accept()
+                peer.settimeout(10)
+                total = 0
+                while True:
+                    part = peer.recv(65536)
+                    if not part:
+                        break
+                    total += len(part)
+                received.append(total)
+                peer.close()
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            pin = _own_pin(ticks_offset=1)
+        world["epochs"].value = (world["epoch"], pin)
+        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN))
+        cmd = command(world["epoch"])
+        result = route.submit(cmd)
+        assert result.state == "refused" and result.error == "backend_identity_mismatch"
+        assert route.inspect(cmd.command_id).state == "refused"
+        route.close()
+        if process is not None:
+            out, _ = process.communicate(timeout=15)
+            received.append(int(out.strip()))
+        else:
+            thread.join(10)
+        assert received == [0]  # One connection, zero request bytes, so zero requests handled.
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+        if server is not None:
+            server.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        os.rmdir(directory)
 
-        def do_POST(self):
-            self.rfile.read(int(self.headers["Content-Length"]))
-            body = b'{"state":"pending"}'
-            self.send_response(202)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
-        def log_message(self, *args):
-            pass
+class _Adapter:
+    def __init__(self):
+        self.submitted = []
 
-    server = socketserver.UnixStreamServer(path, Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    def submit(self, request):
+        self.submitted.append(request)
+        return ContainerPilotResponse.model_validate(echo(request.model_dump(mode="json")))
+
+    def get(self, command_id):
+        return None
+
+    def reconcile(self, command_id):
+        return None
+
+
+@LINUX
+def test_real_pilot_asgi_bearer_classification_and_token_never_recorded(world, caplog):
+    uvicorn = pytest.importorskip("uvicorn")
+    from hub_container_executor.asgi import create_app
+    caplog.set_level(logging.DEBUG)
+    directory = tempfile.mkdtemp(dir="/tmp")
+    path = os.path.join(directory, "executor.sock")
+    adapter = _Adapter()
+    server = uvicorn.Server(uvicorn.Config(create_app(adapter, bearer_token=TOKEN), uds=path,
+                                           lifespan="off", log_level="debug", access_log=True))
+    thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     try:
-        ticks = _proc_start() + (0 if pinned == "exact" else 1)
-        pin = BackendPin("a" * 64, os.getpid(), ticks, os.getuid(), os.getgid(), "engine:pinned", 500, 123)
-        world["epochs"].value = (world["epoch"], pin)
-        route = world["make"](backend=UnixSocketBackend(path))
-        result = route.submit(command(world["epoch"]))
-        if pinned == "exact":
-            assert result.state == "completed" and result.response == b'{"state":"pending"}'
-        else:
-            assert result.state == "held" and result.error == "backend_identity_mismatch"
+        for _ in range(200):
+            if server.started:
+                break
+            time.sleep(0.025)
+        assert server.started
+        world["epochs"].value = (world["epoch"], _own_pin())
+        good = UnixSocketBackend(path, bearer_token=TOKEN)
+        first_journal = world["path"]
+        route = world["make"](backend=good)
+        cmd = command(world["epoch"])
+        accepted = route.submit(cmd)
+        assert accepted.state == "completed" and len(adapter.submitted) == 1
+        assert verify(world, accepted, cmd, pin=_own_pin())["outcome"] == "accepted"
+        route_repr = repr(route)
         route.close()
+        world["path"] = first_journal + "-2"
+        route = world["make"](backend=UnixSocketBackend(path, bearer_token="wrong-" + TOKEN))
+        denied = command(world["epoch"])
+        rejected = route.submit(denied)
+        assert rejected.state == "rejected" and rejected.error is None
+        assert verify(world, rejected, denied, pin=_own_pin(), status=401)["outcome"] == "rejected"
+        assert route.submit(denied).state == "rejected" and len(adapter.submitted) == 1
+        route.close()
+        missing = UnixSocketBackend(os.path.join(directory, "absent.sock"), bearer_token=TOKEN)
+        with pytest.raises(SupervisorRouteError) as raised:
+            missing.forward(method="POST", path=SUBMIT_PATH, body=cmd.body, timeout_ms=500, pin=_own_pin())
+        chain, error = [], raised.value
+        while error is not None:
+            chain += [str(error), repr(error), repr(error.args)]
+            error = error.__cause__ or error.__context__
+        stored = b"".join(Path(p).read_bytes() for p in (first_journal, world["path"]))
+        texts = [*chain, repr(good), str(good), route_repr, repr(accepted), repr(rejected),
+                 accepted.record.decode(), rejected.record.decode(), caplog.text,
+                 stored.decode("latin-1")]
+        assert all(TOKEN not in text for text in texts)
+        with pytest.raises(TypeError):
+            pickle.dumps(good)
     finally:
-        server.shutdown()
-        server.server_close()
-        os.unlink(path)
+        server.should_exit = True
+        thread.join(10)
+        if os.path.exists(path):
+            os.unlink(path)
         os.rmdir(directory)
