@@ -215,17 +215,92 @@ def test_dispatch_consumes_once_and_sends_with_reserved_counter(two):
     route = make(two)
     early, late = command(two["epoch"]), command(two["epoch"])
     early_r, late_r = route.reserve(early), route.reserve(late)
-    result = route.dispatch(late_r.receipt, late)
+    result = route.dispatch(early_r.receipt, early)
     assert result.state == "completed" and len(two["sender"].calls) == 1
-    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == late_r.counter == 2
-    assert route.inspect_reservation(late.command_id)[0] == "dispatched"
-    again = route.dispatch(late_r.receipt, late)
+    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == early_r.counter == 1
+    assert route.inspect_reservation(early.command_id)[0] == "dispatched"
+    again = route.dispatch(early_r.receipt, early)
     assert (again.state, again.error) == ("held", "already_dispatched")
-    assert route.inspect(late.command_id).state == "completed" and len(two["sender"].calls) == 1
-    assert route.dispatch(early_r.receipt, early).state == "completed"  # Its own reserved counter.
-    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 1
+    assert route.inspect(early.command_id).state == "completed" and len(two["sender"].calls) == 1
+    assert route.dispatch(late_r.receipt, late).state == "completed"  # Its own reserved counter.
+    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 2
     assert tables(two["path"]) == ([(early.command_id, 1, "dispatched"), (late.command_id, 2, "dispatched")],
                                    [(early.command_id, "completed", 1), (late.command_id, "completed", 2)])
+    route.close()
+
+
+@LINUX
+def test_older_reservation_superseded_after_newer_dispatch_with_zero_bytes(two):
+    route = make(two)
+    a, b = command(two["epoch"]), command(two["epoch"])
+    a_r, b_r = route.reserve(a), route.reserve(b)
+    assert route.dispatch(b_r.receipt, b).state == "completed"
+    late = route.dispatch(a_r.receipt, a)
+    assert (late.state, late.error, late.record) == ("held", "reservation_superseded", None)
+    assert len(two["sender"].calls) == 1  # Zero bytes for A.
+    assert route.inspect_reservation(a.command_id)[0] == "reserved"  # Nothing marked.
+    assert route.inspect(a.command_id) is None
+    assert route.dispatch(a_r.receipt, a).error == "reservation_superseded"  # Stays refused.
+    assert route.abandon_reservation(a.command_id) is True  # The Hub can retire it explicitly.
+    route.close()
+
+
+@LINUX
+def test_direct_submit_after_reserve_supersedes_the_earlier_reservation(two):
+    route = make(two)
+    reserved = command(two["epoch"])
+    reserved_r = route.reserve(reserved)
+    direct = command(two["epoch"])
+    assert route.submit(direct).state == "completed"  # Allocates and sends counter 2.
+    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 2
+    result = route.dispatch(reserved_r.receipt, reserved)
+    assert (result.state, result.error) == ("held", "reservation_superseded")
+    assert len(two["sender"].calls) == 1 and route.inspect_reservation(reserved.command_id)[0] == "reserved"
+    later = command(two["epoch"])
+    assert route.dispatch(route.reserve(later).receipt, later).state == "completed"  # 3 > 2: allowed.
+    route.close()
+
+
+@LINUX
+def test_abandoned_or_undispatched_lower_reservations_do_not_block_a_higher_one(two):
+    route = make(two)
+    a, b, c = command(two["epoch"]), command(two["epoch"]), command(two["epoch"])
+    route.reserve(a)
+    b_r = route.reserve(b)
+    c_r = route.reserve(c)
+    assert route.abandon_reservation(a.command_id) is True
+    assert route.dispatch(c_r.receipt, c).state == "completed"  # 1 abandoned, 2 never dispatched: gaps.
+    assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 3
+    assert route.dispatch(b_r.receipt, b).error == "reservation_superseded"
+    assert len(two["sender"].calls) == 1
+    db = _raw(two["path"])
+    try:
+        for sql in ("UPDATE supervisor_route_dispatched SET counter=2", "DELETE FROM supervisor_route_dispatched",
+                    "UPDATE supervisor_route_dispatched SET counter=3"):
+            with pytest.raises(sqlite3.IntegrityError):  # Dispatched high-water never goes back.
+                db.execute(sql)
+    finally:
+        db.close()
+    route.close()
+
+
+@LINUX
+def test_reserve_repeat_reports_state_and_refuses_terminal_reservations(two):
+    route = make(two)
+    pending, sent, retired = command(two["epoch"]), command(two["epoch"]), command(two["epoch"])
+    fresh = route.reserve(pending)
+    assert (fresh.state, fresh.replayed) == ("reserved", False)
+    repeat = route.reserve(pending)
+    assert (repeat.state, repeat.replayed, repeat.receipt) == ("reserved", True, fresh.receipt)
+    assert route.dispatch(route.reserve(sent).receipt, sent).state == "completed"
+    route.reserve(retired)
+    assert route.abandon_reservation(retired.command_id) is True
+    for cmd, reason in ((sent, "reservation_dispatched"), (retired, "reservation_abandoned")):
+        with pytest.raises(SupervisorRouteRejected) as raised:
+            route.reserve(cmd)  # A terminal reservation never replays as if fresh.
+        assert raised.value.reason == reason
+        assert route.inspect_reservation(cmd.command_id)[0] == reason.split("_")[1]
+    assert len(two["sender"].calls) == 1
     route.close()
 
 
@@ -354,7 +429,7 @@ def test_abandoned_reservation_never_dispatches_and_counter_stays_consumed(two):
 
 
 @LINUX
-def test_out_of_order_dispatch_is_refused_by_the_executor_gate(two, tmp_path):
+def test_out_of_order_dispatch_is_refused_before_reaching_the_executor_gate(two, tmp_path):
     exec_dir = tmp_path / "executor"
     exec_dir.mkdir(mode=0o700)
     gate = DispatchCounterGate(config=gate_config(exec_dir / "gate.sqlite"))
@@ -363,10 +438,10 @@ def test_out_of_order_dispatch_is_refused_by_the_executor_gate(two, tmp_path):
     first, second = command(two["epoch"]), command(two["epoch"])
     first_r, second_r = route.reserve(first), route.reserve(second)
     assert route.dispatch(second_r.receipt, second).state == "completed"
-    late = route.dispatch(first_r.receipt, first)  # Lower counter after a higher one acted.
-    assert late.state == "held" and late.record is None
+    late = route.dispatch(first_r.receipt, first)  # Lower counter after a higher one was sent.
+    assert (late.state, late.error) == ("held", "reservation_superseded")
+    assert len(two["sender"].dispatches) == 1  # Refused sender-side: never reached the executor.
     assert gate.inspect() == {"accepted": 2, "started": 2, "in_flight": None}
-    assert len(two["sender"].calls) == 1  # The executor never acted on the stale counter.
     route.close()
     gate.close()
 

@@ -59,8 +59,14 @@ the command_id is refused. The Hub verifies it with its pinned
 calls ``dispatch(receipt, command)`` once: the route re-verifies the receipt,
 requires the exact ``reserved`` row, marks it ``dispatched`` and records the
 intent in ONE transaction before any byte is sent, then sends with the
-reserved counter. Every failure, mismatch, repeat or uncertainty is ``held``
-and never retried under a new counter. ``abandon_reservation`` retires an
+reserved counter. A dispatch whose counter is not above every counter
+already recorded for sending to that executor, by either path, is
+``reservation_superseded`` (sender-side fence; trigger-protected dispatched
+high-water), so an older reservation can never be sent after a newer one.
+Every failure, mismatch, repeat or uncertainty is ``held`` and never retried
+under a new counter. A repeat ``reserve`` returns the receipt only while the
+reservation is still ``reserved``; a receipt proves a past allocation, never
+current state. ``abandon_reservation`` retires an
 unsent reservation; reserved, abandoned and never-dispatched counters stay
 consumed (gaps). Rows are trigger-protected: inserted once, only as
 ``reserved``, with a counter above every earlier reservation for that
@@ -746,11 +752,16 @@ class ReservationReceiptVerifier:
 @dataclass(frozen=True)
 class RouteReservation:
     """A durable reservation: ``receipt`` is the exact signed bytes to commit
-    and later pass to ``dispatch``; ``replayed`` for an identical repeat."""
+    and later pass to ``dispatch``; ``replayed`` for an identical repeat.
+    ``state`` is the durable state read in the same transaction; reserve()
+    only ever returns ``reserved`` (terminal states are refused). A receipt
+    proves only that the counter WAS allocated for this binding, never its
+    current state: use ``inspect_reservation`` for that."""
     command_id: str
     counter: int
     receipt: bytes
     replayed: bool
+    state: str = 'reserved'
 
 
 @dataclass(frozen=True)
@@ -1018,15 +1029,22 @@ class RouteJournal(_DurableStore):
     consumes the next per-executor dispatch counter in the SAME transaction
     (see ``admit``); two-phase reservations draw from the same counter (see
     ``reserve`` / ``dispatch_reserved``). A journal created with an earlier
-    schema (no attempt or dispatch_counter column, no dispatch or reservation
-    table/triggers, user_version below 3) fails the exact schema check and is
-    refused today (fail closed); adopting one would require an offline
-    migration/reconciliation step, which is NOT implemented.
+    schema (no attempt or dispatch_counter column, no dispatch, dispatched or
+    reservation table/triggers, user_version below 4) fails the exact schema
+    check and is refused today (fail closed); adopting one would require an
+    offline migration/reconciliation step, which is NOT implemented.
+
+    Two per-executor high-waters, both monotonic and trigger-protected:
+    ``supervisor_route_dispatch`` = highest counter ALLOCATED (admit or
+    reserve); ``supervisor_route_dispatched`` = highest counter whose intent
+    was recorded for sending (one-step admit or reservation dispatch). A
+    reservation may only be dispatched above the latter.
     """
     _SCHEMA = {'supervisor_route_intent': _INTENT, 'supervisor_route_epoch': _EPOCH,
                **_counter_schema('supervisor_route_dispatch'),
+               **_counter_schema('supervisor_route_dispatched'),
                'supervisor_route_reservation': _RESERVATION, **_RESERVATION_TRIGGERS}
-    _VERSION = 3
+    _VERSION = 4
 
     @staticmethod
     def _row(db, command_id):
@@ -1062,9 +1080,25 @@ class RouteJournal(_DurableStore):
                 raise SupervisorRouteRejected('reserved_command')  # Only dispatch() may send it.
             self._advance_epoch(db, epoch)
             counter = self._next_counter(db, binding['backend']['container_id'])
+            self._mark_dispatched(db, binding['backend']['container_id'], counter)
             db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
                        (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt, counter))
             return 'new', counter
+
+    @staticmethod
+    def _mark_dispatched(db, executor, counter):
+        """Sender-side supersession fence (inside the caller's transaction):
+        ``counter`` must exceed every counter already recorded for sending to
+        ``executor`` by either path; advances that dispatched high-water."""
+        last = db.execute('SELECT counter FROM supervisor_route_dispatched WHERE executor_id=?',
+                          (executor,)).fetchone()
+        _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
+        if last is not None and not counter > last[0]:
+            raise SupervisorRouteRejected('reservation_superseded')
+        if last is None:
+            db.execute('INSERT INTO supervisor_route_dispatched VALUES (?,?)', (executor, counter))
+        else:
+            db.execute('UPDATE supervisor_route_dispatched SET counter=? WHERE executor_id=?', (counter, executor))
 
     @staticmethod
     def _advance_epoch(db, epoch):
@@ -1110,14 +1144,19 @@ class RouteJournal(_DurableStore):
         transaction, so a signing failure consumes nothing).
 
         Returns ('new', receipt) or ('replay', receipt) - the SAME stored bytes
-        - for an identical binding. Raises Rejected for a different binding
-        under the command_id or a command_id already admitted one-step.
+        - for an identical binding whose row is still 'reserved'. Raises
+        Rejected for a different binding (``binding_conflict``), a command_id
+        already admitted one-step (``already_admitted``), or an identical
+        binding whose reservation is terminal (``reservation_dispatched`` /
+        ``reservation_abandoned``): a repeat never looks like a fresh one.
         """
         with self._transaction() as db:
             row = self._reservation(db, command_id)
             if row is not None:
                 if row[2] != digest or row[3] != _canonical(binding).decode():
                     raise SupervisorRouteRejected('binding_conflict')
+                if row[5] != 'reserved':
+                    raise SupervisorRouteRejected('reservation_' + row[5])
                 return 'replay', row[6].encode()
             if self._row(db, command_id) is not None:
                 raise SupervisorRouteRejected('already_admitted')
@@ -1135,9 +1174,13 @@ class RouteJournal(_DurableStore):
         exactly this binding, these receipt bytes and this counter, and the
         epoch high-water must still be the receipt's epoch. Marks it
         'dispatched' and inserts the intent row (with the reserved counter)
-        BEFORE the caller may send. Raises Rejected(reason) otherwise:
+        BEFORE the caller may send. Its counter must also exceed every
+        counter already recorded for sending to that executor by EITHER path
+        (dispatched high-water); a lower one is refused and nothing is
+        marked. Lower reservations that were abandoned or never dispatched
+        do not block a higher one (gaps). Raises Rejected(reason) otherwise:
         reservation_missing / reservation_mismatch / already_dispatched /
-        reservation_abandoned / epoch_changed."""
+        reservation_abandoned / epoch_changed / reservation_superseded."""
         _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
         with self._transaction() as db:
             row = self._reservation(db, command_id)
@@ -1155,6 +1198,7 @@ class RouteJournal(_DurableStore):
                 raise SupervisorRouteRejected('epoch_changed')
             if self._row(db, command_id) is not None:
                 raise SupervisorRouteRejected('already_dispatched')
+            self._mark_dispatched(db, row[1], counter)
             db.execute("UPDATE supervisor_route_reservation SET state='dispatched' "
                        "WHERE command_id=? AND state='reserved'", (command_id,))
             db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
@@ -1906,8 +1950,11 @@ class SupervisorRoute:
         this command (method, path, body SHA-256, command_id, fence, launch
         epoch, current backend pin) and records it 'reserved' with a receipt
         signed by the configured reservation signer. An identical repeat
-        returns the SAME receipt bytes (``replayed``); a different binding
-        under the command_id, or one already sent one-step, is Rejected.
+        returns the SAME receipt bytes (``replayed``) only while the row is
+        still ``reserved``; once dispatched or abandoned it is Rejected
+        (``reservation_dispatched`` / ``reservation_abandoned``). A different
+        binding under the command_id, or one already sent one-step, is
+        Rejected. A receipt proves a past allocation, not current state.
         Raises SupervisorRouteBusy, SupervisorRouteRefused (epoch source
         failed, nothing journaled) or ReservationUncertain (repeat reserve).
         """
@@ -1944,7 +1991,7 @@ class SupervisorRoute:
             except Exception:
                 raise ReservationUncertain() from None
             return RouteReservation(command.command_id, json.loads(receipt)['payload']['counter'], receipt,
-                                    outcome == 'replay')
+                                    outcome == 'replay', 'reserved')
         finally:
             self._release_exclusive()
 
@@ -1956,7 +2003,10 @@ class SupervisorRoute:
         matching 'reserved' journal row exists with these exact receipt bytes.
         The row is marked 'dispatched' (consume-once) and the intent recorded
         in ONE transaction BEFORE any byte is sent; the send then uses the
-        reserved counter and is classified exactly like ``submit``. Every
+        reserved counter and is classified exactly like ``submit``. A
+        reservation whose counter is not above every counter already sent to
+        that executor (either path) is ``held``/``reservation_superseded``
+        with zero bytes and nothing marked. Every
         failure, mismatch, missing row, repeat or uncertain journal outcome
         is reported ``held`` (or ``busy``, nothing touched): never retried and
         never re-sent under a new counter. Use ``inspect`` for the outcome.
