@@ -158,16 +158,25 @@ launch counter, pinned backend), the attempt's exact ``dispatch_claim``
 launch epoch: the dispatch header's fields and canonical JSON, consistent with
 the binding), the expected supervisor key id and a fresh nonce. The reply
 is read with the same strict bounded framing and one total deadline.
-``SupervisorInspectionResponder`` answers only from the route journal row:
-``launched`` / ``refused`` / ``not_found`` / ``unknown``, Ed25519-signed
-under its own domain over an exact echo of the request. The Hub verifies
+``SupervisorInspectionResponder`` answers only from ONE read snapshot of the
+route journal (intent, reservation and challenge rows): ``launched`` /
+``refused`` (the recorded outcome of the one-step intent or of the
+DISPATCHED reservation's intent), ``not_dispatched`` (a reserved or
+abandoned/retired reservation, ONLY when the snapshot proves no challenge
+was consumed and no intent exists; otherwise ``unknown``), ``not_found``
+or ``unknown``, Ed25519-signed under its own domain over an exact echo of
+the request plus a ``reservation`` field binding the reservation receipt's
+SHA-256, its state and, when dispatched, the ONE consumed challenge's
+``challenge_sha256`` and proof hash. The Hub verifies
 through an ``InspectionVerifier`` (the base class refuses everything;
 ``PinnedKeyInspectionVerifier`` checks one pinned key). ``InspectionResolver``
 records a verified signed terminal status matching the binding exactly as an
 OBSERVATION in ``InspectionLedger`` (``observed_launched`` /
 ``observed_refused``); timeout, framing, HTTP denial, unsigned, bad
 signature, wrong key, any binding mismatch, ``unknown`` and signed
-``not_found`` record nothing and stay held. This module provides
+``not_found`` / ``not_dispatched`` record nothing and stay held:
+inspection never releases an undispatched reservation; the Hub barrier's
+``expired_unconsumed`` statement is that release path. This module provides
 VERIFICATION and OBSERVATION STORAGE only and never decides: the
 authoritative step is ``HeldAttemptSource.record_observation_in_hub_transaction``,
 a callback the Hub executes inside ITS OWN DB transaction together with its
@@ -2906,13 +2915,15 @@ INSPECTION_PATH = '/v1/supervisor-route/inspect'
 # can stand in for the other.
 INSPECTION_TOKEN_PREFIX = 'ehri1.'
 MAX_INSPECTION_REQUEST_BYTES = 8192
-INSPECTION_STATUSES = frozenset({'launched', 'refused', 'not_found', 'unknown'})
+INSPECTION_STATUSES = frozenset({'launched', 'refused', 'not_dispatched', 'not_found', 'unknown'})
+_RESERVATION_INFO_KEYS = frozenset({'reservation_receipt_sha256', 'reservation_state', 'challenge_sha256',
+                                    'proof_sha256'})
 # Terminal inspection status -> route journal states it may stand for.
 _TERMINAL = {'launched': frozenset({'completed'}), 'refused': frozenset({'rejected', 'refused'})}
 _INSPECTION_REQUEST_KEYS = frozenset({'protocol', 'audience', 'scope', 'binding', 'binding_digest', 'dispatch',
                                       'key_id', 'request_nonce'})
 _INSPECTION_ANSWER_KEYS = frozenset({'protocol', 'audience', 'key_id', 'request', 'request_sha256', 'status',
-                                     'route_state', 'answered_at_ms'})
+                                     'route_state', 'reservation', 'answered_at_ms'})
 _REQUEST_NONCE = re.compile(r'[0-9a-f]{32}\Z')
 _INSPECTION_ERRORS = frozenset({'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status',
                                 'unverified', 'not_found', 'unknown', 'observation_unrecorded',
@@ -2960,14 +2971,45 @@ def _valid_inspection_request(request):
             is not None)
 
 
-def _read_inspection_row(journal, command_id, budget_ms):
-    """Read-only (binding_digest, binding, state, dispatch_counter) or None
-    from the route journal under ONE time budget; never writes or forwards.
+def _valid_reservation_info(status, info):
+    """Signed ``reservation`` field: None (one-step path / no reservation) or
+    exactly {receipt hash, state, challenge hash, proof hash}, consistent
+    with the status: not_found -> None; not_dispatched -> reserved/abandoned
+    without challenge or proof; launched/refused -> None or dispatched WITH
+    both hashes; unknown -> None or any well-formed value."""
+    if info is None:
+        return status != 'not_dispatched'
 
-    The journal mutex is only TRIED for the budget, the private read-only
-    connection's busy timeout is what remains of it, and a progress handler
-    aborts any statement (schema/quick_check included) once it is spent, so a
-    slow or locked journal makes this raise instead of pinning a worker.
+    def digest(value, optional):
+        return (optional and value is None) or (type(value) is str and _HEX.fullmatch(value) is not None)
+    if not (_shape(info, _RESERVATION_INFO_KEYS) and digest(info['reservation_receipt_sha256'], False)
+            and info['reservation_state'] in ('reserved', 'dispatched', 'abandoned')
+            and digest(info['challenge_sha256'], True) and digest(info['proof_sha256'], True)
+            and (info['challenge_sha256'] is None) == (info['proof_sha256'] is None)):
+        return False
+    if status == 'not_found':
+        return False
+    if status == 'not_dispatched':
+        return info['reservation_state'] in ('reserved', 'abandoned') and info['challenge_sha256'] is None
+    if status in _TERMINAL:
+        return info['reservation_state'] == 'dispatched' and info['challenge_sha256'] is not None
+    return True
+
+
+def _read_inspection_row(journal, command_id, budget_ms):
+    """Read-only snapshot ``(intent, reservation, challenges)`` for ONE
+    command_id from the route journal under ONE time budget, in ONE read
+    transaction (so the three agree); never writes or forwards.
+
+    ``intent`` = (binding_digest, binding, state, dispatch_counter) or None;
+    ``reservation`` = (executor_id, binding_digest, binding, counter, state,
+    receipt) or None; ``challenges`` = [(state, challenge_sha256,
+    proof_sha256)] for that command_id. The journal mutex is only TRIED for
+    the budget, the private read-only connection's busy timeout is what
+    remains of it, and a progress handler aborts any statement (schema/
+    quick_check included) once it is spent, so a slow or locked journal makes
+    this raise instead of pinning a worker. A journal not in rollback-journal
+    mode is refused, as everywhere else in this module.
     """
     _require(type(journal) is RouteJournal and os.getpid() == journal._pid
              and type(budget_ms) is int and budget_ms > 0, RouteJournalError('process'))
@@ -2984,14 +3026,28 @@ def _read_inspection_row(journal, command_id, budget_ms):
             db.execute(f'PRAGMA busy_timeout={max(1, int(remaining * 1000))}')
             db.execute('PRAGMA trusted_schema=OFF')
             db.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
-            journal._schema(db)
-            if journal._row(db, command_id) is None:
-                return None
-            row = db.execute('SELECT binding_digest,binding,state,dispatch_counter '
-                             'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
-            _require(row is not None and _positive(row[3], MAX_DISPATCH_COUNTER), RouteJournalError('row'))
+            _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',), RouteJournalError('mode'))
+            db.execute('BEGIN')
+            try:
+                journal._schema(db)
+                intent = None
+                if journal._row(db, command_id) is not None:
+                    intent = db.execute('SELECT binding_digest,binding,state,dispatch_counter '
+                                        'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
+                    _require(intent is not None and _positive(intent[3], MAX_DISPATCH_COUNTER),
+                             RouteJournalError('row'))
+                reservation = journal._reservation(db, command_id)
+                if reservation is not None:
+                    reservation = (reservation[1], reservation[2], reservation[3], reservation[4], reservation[5],
+                                   reservation[6])
+                challenges = db.execute('SELECT state,challenge_sha256,proof_sha256 FROM supervisor_route_challenge '
+                                        'WHERE command_id=? ORDER BY nonce', (command_id,)).fetchall()
+                _require(all(row[0] in ('outstanding', 'consumed', 'expired') for row in challenges),
+                         RouteJournalError('challenge'))
+            finally:
+                db.execute('ROLLBACK')
             _require(time.monotonic() <= deadline, RouteJournalError('route journal busy'))
-            return row
+            return intent, reservation, challenges
         finally:
             db.close()
     except RouteJournalError:
@@ -3000,6 +3056,54 @@ def _read_inspection_row(journal, command_id, budget_ms):
         raise RouteJournalError('route journal unavailable') from None
     finally:
         journal._mutex.release()
+
+
+def _inspection_status(request, snapshot):
+    """(status, route_state, reservation) from ONE journal snapshot.
+
+    One-step path (no reservation row): the intent's recorded outcome, else
+    ``unknown``; no row at all -> ``not_found``. Two-phase path: the
+    reservation must carry exactly the request's binding, executor and
+    counter, else ``unknown``. ``dispatched`` -> the dispatched intent's
+    outcome (launched/refused) with the ONE consumed challenge's hash and
+    proof hash, else ``unknown``. ``reserved``/``abandoned`` (retired) ->
+    ``not_dispatched`` ONLY when the snapshot proves no challenge was
+    consumed and no intent exists; otherwise ``unknown``. Everything else is
+    ``unknown``.
+    """
+    intent, reservation, challenges = snapshot
+    binding, counter = _canonical(request['binding']).decode(), request['dispatch']['counter']
+
+    def matches(row):
+        return row[0] == request['binding_digest'] and row[1] == binding and row[3] == counter
+
+    def outcome(row):
+        if row[2] == 'completed':
+            return 'launched', 'completed'
+        if row[2] in ('rejected', 'refused'):
+            return 'refused', row[2]
+        return 'unknown', None
+    if reservation is None:
+        if intent is None:
+            # Absence is NOT proof of no effect (restored or replaced journal).
+            return 'not_found', None, None
+        return (*outcome(intent), None) if matches(intent) else ('unknown', None, None)
+    executor, digest, reserved_binding, reserved_counter, state, receipt = reservation
+    if executor != request['dispatch']['executor_id'] or not matches((digest, reserved_binding, None,
+                                                                       reserved_counter)):
+        return 'unknown', None, None
+    info = {'reservation_receipt_sha256': hashlib.sha256(receipt.encode()).hexdigest(),
+            'reservation_state': state, 'challenge_sha256': None, 'proof_sha256': None}
+    consumed = [row for row in challenges if row[0] == 'consumed']
+    if state in ('reserved', 'abandoned'):
+        if consumed or intent is not None:
+            return 'unknown', None, info
+        return 'not_dispatched', None, info
+    if state != 'dispatched' or len(consumed) != 1 or intent is None or not matches(intent):
+        return 'unknown', None, info
+    info['challenge_sha256'], info['proof_sha256'] = consumed[0][1], consumed[0][2]
+    status, route_state = outcome(intent)
+    return status, route_state, info
 
 
 class InspectionAuthenticator:
@@ -3089,6 +3193,7 @@ class PinnedKeyInspectionVerifier(InspectionVerifier):
                      and payload['request_sha256'] == hashlib.sha256(_canonical(request)).hexdigest()
                      and type(status) is str and status in INSPECTION_STATUSES
                      and (route_state in _TERMINAL[status] if status in _TERMINAL else route_state is None)
+                     and _valid_reservation_info(status, payload['reservation'])
                      and _positive(payload['answered_at_ms']), error)
             return payload
         except SupervisorRouteError:
@@ -3135,10 +3240,13 @@ class SupervisorInspectionResponder:
     Authenticates the caller FIRST (inspection scope only), then parses the
     exact canonical request, then reads ONLY the route journal row for the
     command_id (read-only; never forwards, writes, relaunches or releases).
-    Status: ``launched`` (row completed), ``refused`` (row rejected or
-    refused), ``not_found`` (no row), ``unknown`` (intent/unknown, or ANY
-    difference between the row and the request's binding or dispatch
-    claim counter). Signed with the explicitly supplied supervisor key over the
+    Status (see ``_inspection_status``): ``launched`` / ``refused`` from the
+    one-step intent's or the dispatched reservation's recorded outcome,
+    ``not_dispatched`` for a reserved/abandoned reservation only when no
+    challenge was consumed, ``not_found`` when there is neither a
+    reservation nor an intent, ``unknown`` for everything else (intent or
+    unknown rows, ANY difference from the request's binding, executor or
+    claim counter, inconsistent challenge/reservation rows). Signed with the explicitly supplied supervisor key over the
     full request echo; denials (401/400/404/503) are unsigned.
 
     Bounds (independent of the client's deadline). CONCURRENCY is bounded:
@@ -3226,21 +3334,16 @@ class SupervisorInspectionResponder:
             row = _read_inspection_row(self._route._journal, request['binding']['command_id'], budget_ms)
         except Exception:
             return self._denied(503, 'unavailable')
-        status, route_state = 'unknown', None
-        if row is None:
-            # Absence is NOT proof of no effect (restored or replaced journal).
-            status = 'not_found'
-        elif (row[0] == request['binding_digest'] and row[1] == _canonical(request['binding']).decode()
-              and row[3] == request['dispatch']['counter']):
-            if row[2] == 'completed':
-                status, route_state = 'launched', 'completed'
-            elif row[2] in ('rejected', 'refused'):
-                status, route_state = 'refused', row[2]
+        try:
+            status, route_state, reservation = _inspection_status(request, row)
+        except Exception:
+            return self._denied(503, 'unavailable')
         try:
             payload = {'protocol': INSPECTION_ANSWER_PROTOCOL, 'audience': INSPECTION_AUDIENCE,
                        'key_id': self.key_id, 'request': request,
                        'request_sha256': hashlib.sha256(_canonical(request)).hexdigest(),
-                       'status': status, 'route_state': route_state, 'answered_at_ms': _now_ms()}
+                       'status': status, 'route_state': route_state, 'reservation': reservation,
+                       'answered_at_ms': _now_ms()}
             signature = base64.urlsafe_b64encode(self._signer.sign(
                 INSPECTION_SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
             raw = _canonical({'payload': payload, 'signature': signature})
@@ -3541,6 +3644,7 @@ class InspectionObservation:
     historical: bool
     request: bytes = field(repr=False)
     answer: bytes = field(repr=False)
+    reservation: dict | None = None
 
 
 class HeldAttemptSource:
@@ -3714,9 +3818,11 @@ class InspectionResolver:
 
     @staticmethod
     def _observation(request, payload, answer, historical, sent):
+        reservation = payload['reservation']
         return InspectionObservation(request['binding']['command_id'], payload['status'], payload['route_state'],
                                      payload['answered_at_ms'], payload['key_id'], request['binding_digest'],
-                                     json.loads(_canonical(request['dispatch'])), historical, sent, answer)
+                                     json.loads(_canonical(request['dispatch'])), historical, sent, answer,
+                                     None if reservation is None else dict(reservation))
 
     def inspect(self, command, pin, dispatch_counter):
         request = self._client.request_for(command, pin, dispatch_counter)
@@ -3739,8 +3845,10 @@ class InspectionResolver:
         answer = self._client.inspect(request)
         if not answer.verified:
             return held(answer.error if answer.error in _INSPECTION_ERRORS else 'unverified')
-        if answer.status in ('not_found', 'unknown'):
-            # Signed, but absence or ambiguity is never proof of no effect.
+        if answer.status in ('not_found', 'unknown', 'not_dispatched'):
+            # Signed, but none of these is proof of no effect and none releases
+            # anything: the Hub barrier's expired_unconsumed statement is the
+            # release path for an undispatched reservation, not this module.
             return held(answer.status, answer.status)
         payload = answer.payload
         if (answer.status not in _TERMINAL or answer.route_state not in _TERMINAL[answer.status]
