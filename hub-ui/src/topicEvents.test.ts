@@ -112,8 +112,9 @@ describe("canonical topic event channel", () => {
     expect(state.accept).toHaveBeenCalledWith(newer);
     expect(state.failed).not.toHaveBeenCalled();
   });
-  it("opens every topic the backend contract allows, unencoded, and fails others", () => {
-    for (const name of ["Hermes:review", "eh.release-2", "test-topic"]) {
+  it("opens only registry topics, which the events route requires, and fails others without a request", () => {
+    // The events route exists only in registry mode, which accepts lowercase letters, digits, "_" and "-".
+    for (const name of ["test-topic", "eh_release-2"]) {
       const sources: Source[] = [];
       const failed = vi.fn();
       watchTopicRegistry({ topic: name, epoch, fetchSnapshot: vi.fn(async () => snapshot), accept: vi.fn(), invalidate: vi.fn(), failed,
@@ -121,7 +122,7 @@ describe("canonical topic event channel", () => {
       expect(failed).not.toHaveBeenCalled();
       expect(sources[0].url).toBe(`/api/hub/v1/topics/${name}/events`);
     }
-    for (const name of ["", "-lead", "a/b", "a b", "x".repeat(129)]) {
+    for (const name of ["", "-lead", "Hermes:review", "eh.release-2", "a/b", "a b", "x".repeat(129)]) {
       const failed = vi.fn(), source = vi.fn();
       watchTopicRegistry({ topic: name, epoch, fetchSnapshot: vi.fn(async () => snapshot), accept: vi.fn(), invalidate: vi.fn(), failed, source });
       expect(failed).toHaveBeenCalledOnce();
