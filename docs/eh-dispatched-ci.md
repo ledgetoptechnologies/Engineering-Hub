@@ -77,7 +77,8 @@ creates a credential or changes billing. Each of those needs Beau.
    credential and host approvals above.
 5. Move `hub-control.yml` verify to the chosen path. Keep publication on
    hosted runners until a trusted build record binds source commit to image
-   config ID; the release-evidence view already says CI is not verified there.
+   config ID. The candidate release-evidence view (not yet on main) will say
+   that CI is not verified there.
 
 Agents keep running the suites locally before review, as today. A local run is
 not a CI result for release purposes.
