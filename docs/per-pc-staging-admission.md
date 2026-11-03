@@ -141,7 +141,7 @@ Apply the same rule to the candidate. A legacy owner's `candidate_family` must e
 
 ## 7. Decisions (Codex, 2026-11-03) and open questions
 
-Decided: revoking a session stops new effects for that session's jobs and keeps reconciliation and evidence. Execution grants are explicit and narrow. Admission pins the exact revision, and harmless edits are distinguished from narrowing ones (`authority_epoch`). Cross-database atomicity is not claimed; the Hub-database fence plus a stated one-effect bound replaces it. Terminal outcomes are recorded truthfully without granting revoked authority.
+Decided: revoking a session stops new effects for that session's jobs and keeps reconciliation and evidence. Execution grants are explicit and narrow. Admission pins the exact revision, and harmless edits are distinguished from narrowing ones (`authority_epoch`). Cross-database atomicity is not claimed; a Hub-database fence written before the session revoke replaces it, and no bound on the residual window is claimed until the executor enforces one. Terminal outcomes are recorded truthfully without granting revoked authority.
 
 Decided (second round): use a dedicated execution grant, one fail-closed revoke path that writes the fence first, a dispatch-side re-check, and recovery kept available.
 
