@@ -1,5 +1,6 @@
 """Two-phase reserve/dispatch for the disabled-by-default supervisor route."""
 import base64
+import hashlib
 import json
 from pathlib import Path
 import secrets
@@ -16,6 +17,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
+    HUB_PROOF_AUDIENCE, HUB_PROOF_DOMAIN, HUB_PROOF_PROTOCOL, HubDispatchProofVerifier,
     RESERVE_AUDIENCE, RESERVE_DOMAIN, RESERVE_PROTOCOL, SIGNATURE_DOMAIN, DispatchCounterGate,
     ReservationReceiptVerifier, ReservationSigner, ReservationUncertain, RouteEpoch, RouteReservation,
     SupervisorRouteBusy, SupervisorRouteError, SupervisorRouteRejected, binding_digest, binding_for,
@@ -41,18 +43,76 @@ class FixtureSigner:
         return self.key.sign(message)
 
 
+class FakeBootClock:
+    """TEST-ONLY stand-in for (boot_id, CLOCK_BOOTTIME ns)."""
+
+    def __init__(self):
+        self.boot_id, self.now = str(uuid4()), 10**12
+
+    def __call__(self):
+        return self.boot_id, self.now
+
+
+WINDOW_NS = 5000 * 10**6  # SupervisorRouteConfig().proof_window_ms default.
+
+
 @pytest.fixture
 def two(world):
     world["signer"] = FixtureSigner()
     world["verifier"] = ReservationReceiptVerifier(public_key=world["signer"].public_key,
                                                    key_id=world["signer"].key_id)
     world["sender"] = DispatchBackend(world["pin"])
+    world["hub"] = FixtureSigner(key_id="test-hub-dispatch-key")
+    world["hub_verifier"] = HubDispatchProofVerifier(public_key=world["hub"].public_key,
+                                                     key_id=world["hub"].key_id)
+    world["clock"] = FakeBootClock()
     return world
 
 
 def make(two, **overrides):
     overrides.setdefault("backend", two["sender"])
+    overrides.setdefault("dispatch_proof_verifier", two["hub_verifier"])
+    overrides.setdefault("boot_clock", two["clock"])
     return two["make"](reservation_signer=two["signer"], **overrides)
+
+
+def proof_payload(two, receipt, cmd, nonce, **changes):
+    """The claim the Hub would sign inside its barrier transaction."""
+    try:
+        reserved = json.loads(receipt)["payload"]
+        counter, executor = reserved["counter"], reserved["pin"]["container_id"]
+    except Exception:
+        counter, executor = 1, two["pin"].container_id
+    return {"protocol": HUB_PROOF_PROTOCOL, "audience": HUB_PROOF_AUDIENCE, "hub_key_id": two["hub"].key_id,
+            "job_id": "job-1", "run_id": "run-1", "worker": "worker-1", "fence": cmd.queue_fence,
+            "lease_epoch": 1, "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+            "command_id": cmd.command_id, "counter": counter, "executor": executor, "challenge_nonce": nonce,
+            "supervisor_boot_id": two["clock"].boot_id, **changes}
+
+
+def hub_proof(two, receipt, cmd, nonce, **changes):
+    return forge(proof_payload(two, receipt, cmd, nonce, **changes), signer=two["hub"], domain=HUB_PROOF_DOMAIN)
+
+
+def unknown_nonce():
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+
+
+def challenge_for(two, route, cmd):
+    """A fresh challenge, or an unknown nonce where none can be issued."""
+    try:
+        return route.issue_dispatch_challenge(cmd.command_id).nonce
+    except SupervisorRouteBusy:
+        two["clock"].now += WINDOW_NS + 1  # Let earlier live challenges lapse, then retry.
+        route.expire_challenges()
+        return route.issue_dispatch_challenge(cmd.command_id).nonce
+    except SupervisorRouteError:
+        return unknown_nonce()
+
+
+def send(two, route, receipt, cmd):
+    """Hub flow: challenge, signed one-use proof, dispatch."""
+    return route.dispatch(receipt, cmd, hub_proof(two, receipt, cmd, challenge_for(two, route, cmd)))
 
 
 def forge(payload, *, signer, domain=RESERVE_DOMAIN):
@@ -82,7 +142,7 @@ def test_default_signer_refuses_reserve_and_dispatch_without_effect(two):
         route.reserve(cmd)
     assert "not configured" in str(raised.value)
     with pytest.raises(SupervisorRouteError):
-        route.dispatch(b"{}", cmd)
+        route.dispatch(b"{}", cmd, b"{}")
     with pytest.raises(SupervisorRouteError):
         ReservationSigner().sign(b"anything")
     assert tables(two["path"]) == ([], []) and two["sender"].calls == []
@@ -117,7 +177,7 @@ def test_reserve_sends_zero_bytes_signs_binding_and_is_idempotent_across_restart
     restarted = make(two, create=False)
     repeat = restarted.reserve(cmd)
     assert repeat.receipt == first.receipt and repeat.replayed
-    assert restarted.dispatch(first.receipt, cmd).state == "completed"  # Reserved before the restart.
+    assert send(two, restarted, first.receipt, cmd).state == "completed"  # Reserved before the restart.
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 1
     restarted.close()
 
@@ -215,14 +275,14 @@ def test_dispatch_consumes_once_and_sends_with_reserved_counter(two):
     route = make(two)
     early, late = command(two["epoch"]), command(two["epoch"])
     early_r, late_r = route.reserve(early), route.reserve(late)
-    result = route.dispatch(early_r.receipt, early)
+    result = send(two, route, early_r.receipt, early)
     assert result.state == "completed" and len(two["sender"].calls) == 1
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == early_r.counter == 1
     assert route.inspect_reservation(early.command_id)[0] == "dispatched"
-    again = route.dispatch(early_r.receipt, early)
+    again = send(two, route, early_r.receipt, early)
     assert (again.state, again.error) == ("held", "already_dispatched")
     assert route.inspect(early.command_id).state == "completed" and len(two["sender"].calls) == 1
-    assert route.dispatch(late_r.receipt, late).state == "completed"  # Its own reserved counter.
+    assert send(two, route, late_r.receipt, late).state == "completed"  # Its own reserved counter.
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 2
     assert tables(two["path"]) == ([(early.command_id, 1, "dispatched"), (late.command_id, 2, "dispatched")],
                                    [(early.command_id, "completed", 1), (late.command_id, "completed", 2)])
@@ -234,13 +294,13 @@ def test_older_reservation_superseded_after_newer_dispatch_with_zero_bytes(two):
     route = make(two)
     a, b = command(two["epoch"]), command(two["epoch"])
     a_r, b_r = route.reserve(a), route.reserve(b)
-    assert route.dispatch(b_r.receipt, b).state == "completed"
-    late = route.dispatch(a_r.receipt, a)
+    assert send(two, route, b_r.receipt, b).state == "completed"
+    late = send(two, route, a_r.receipt, a)
     assert (late.state, late.error, late.record) == ("held", "reservation_superseded", None)
     assert len(two["sender"].calls) == 1  # Zero bytes for A.
     assert route.inspect_reservation(a.command_id)[0] == "reserved"  # Nothing marked.
     assert route.inspect(a.command_id) is None
-    assert route.dispatch(a_r.receipt, a).error == "reservation_superseded"  # Stays refused.
+    assert send(two, route, a_r.receipt, a).error == "reservation_superseded"  # Stays refused.
     assert route.abandon_reservation(a.command_id) is True  # The Hub can retire it explicitly.
     route.close()
 
@@ -253,11 +313,11 @@ def test_direct_submit_after_reserve_supersedes_the_earlier_reservation(two):
     direct = command(two["epoch"])
     assert route.submit(direct).state == "completed"  # Allocates and sends counter 2.
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 2
-    result = route.dispatch(reserved_r.receipt, reserved)
+    result = send(two, route, reserved_r.receipt, reserved)
     assert (result.state, result.error) == ("held", "reservation_superseded")
     assert len(two["sender"].calls) == 1 and route.inspect_reservation(reserved.command_id)[0] == "reserved"
     later = command(two["epoch"])
-    assert route.dispatch(route.reserve(later).receipt, later).state == "completed"  # 3 > 2: allowed.
+    assert send(two, route, route.reserve(later).receipt, later).state == "completed"  # 3 > 2: allowed.
     route.close()
 
 
@@ -269,9 +329,9 @@ def test_abandoned_or_undispatched_lower_reservations_do_not_block_a_higher_one(
     b_r = route.reserve(b)
     c_r = route.reserve(c)
     assert route.abandon_reservation(a.command_id) is True
-    assert route.dispatch(c_r.receipt, c).state == "completed"  # 1 abandoned, 2 never dispatched: gaps.
+    assert send(two, route, c_r.receipt, c).state == "completed"  # 1 abandoned, 2 never dispatched: gaps.
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 3
-    assert route.dispatch(b_r.receipt, b).error == "reservation_superseded"
+    assert send(two, route, b_r.receipt, b).error == "reservation_superseded"
     assert len(two["sender"].calls) == 1
     db = _raw(two["path"])
     try:
@@ -292,7 +352,7 @@ def test_reserve_repeat_reports_state_and_refuses_terminal_reservations(two):
     assert (fresh.state, fresh.replayed) == ("reserved", False)
     repeat = route.reserve(pending)
     assert (repeat.state, repeat.replayed, repeat.receipt) == ("reserved", True, fresh.receipt)
-    assert route.dispatch(route.reserve(sent).receipt, sent).state == "completed"
+    assert send(two, route, route.reserve(sent).receipt, sent).state == "completed"
     route.reserve(retired)
     assert route.abandon_reservation(retired.command_id) is True
     for cmd, reason in ((sent, "reservation_dispatched"), (retired, "reservation_abandoned")):
@@ -309,11 +369,12 @@ def test_concurrent_dispatches_send_exactly_once(two):
     route = make(two, timeout_ms=2000)
     cmd = command(two["epoch"])
     receipt = route.reserve(cmd).receipt
+    proof = hub_proof(two, receipt, cmd, route.issue_dispatch_challenge(cmd.command_id).nonce)  # ONE proof.
     results, barrier = [], threading.Barrier(8)
 
     def go():
         barrier.wait(10)
-        results.append(route.dispatch(receipt, cmd).state)
+        results.append(route.dispatch(receipt, cmd, proof).state)
     threads = [threading.Thread(target=go) for _ in range(8)]
     for thread in threads:
         thread.start()
@@ -325,6 +386,8 @@ def test_concurrent_dispatches_send_exactly_once(two):
     other = command(two["epoch"])
     other_receipt = route.reserve(other).receipt
     binding = binding_for(other, two["pin"])
+    other_proof = hub_proof(two, other_receipt, other, route.issue_dispatch_challenge(other.command_id).nonce)
+    claim = two["hub_verifier"].verify(other_proof)
     outcomes, barrier = [], threading.Barrier(8)
 
     def consume():
@@ -332,7 +395,9 @@ def test_concurrent_dispatches_send_exactly_once(two):
         for _ in range(50):
             try:
                 route._journal.dispatch_reserved(other.command_id, binding_digest(binding), binding,
-                                                 other_receipt, 2, two["epoch"], secrets.token_hex(16))
+                                                 other_receipt, 2, two["epoch"], secrets.token_hex(16),
+                                                 proof=claim, proof_sha256=hashlib.sha256(other_proof).hexdigest(),
+                                                 clock=two["clock"], window_ns=WINDOW_NS)
                 outcomes.append("consumed")
                 return
             except SupervisorRouteRejected as error:
@@ -369,14 +434,14 @@ def test_forged_or_mismatched_receipt_held_with_zero_bytes(two):
         (resigned, cmd, "reservation_mismatch"),  # Not the exact stored receipt bytes.
     ]
     for value, target, reason in cases:
-        result = route.dispatch(value, target)
+        result = send(two, route, value, target)
         assert (result.state, result.error, result.record) == ("held", reason, None), reason
     two["epochs"].value = (RouteEpoch(str(uuid4()), 6, BOOT), two["pin"])
-    assert route.dispatch(receipt, cmd).error == "epoch_changed"  # Current epoch moved on.
+    assert send(two, route, receipt, cmd).error == "epoch_changed"  # Current epoch moved on.
     two["epochs"].value = (two["epoch"], two["pin"])
     assert two["sender"].calls == [] and tables(two["path"])[1] == []  # Zero bytes, nothing consumed.
     assert route.inspect_reservation(cmd.command_id)[0] == "reserved"
-    assert route.dispatch(receipt, cmd).state == "completed"  # The genuine one still works once.
+    assert send(two, route, receipt, cmd).state == "completed"  # The genuine one still works once.
     route.close()
 
 
@@ -387,7 +452,7 @@ def test_crash_between_dispatched_mark_and_send_stays_held(two, monkeypatch):
     crashed_r, faulted_r = route.reserve(crashed), route.reserve(faulted)
     two["sender"].before_send = Crash()  # Dispatched + intent committed; dies before any byte.
     with pytest.raises(Crash):
-        route.dispatch(crashed_r.receipt, crashed)
+        send(two, route, crashed_r.receipt, crashed)
     two["sender"].before_send = None
     original = route._journal.dispatch_reserved
 
@@ -395,7 +460,7 @@ def test_crash_between_dispatched_mark_and_send_stays_held(two, monkeypatch):
         original(*args, **kwargs)  # Dispatched mark + intent COMMITTED here.
         raise OSError()
     monkeypatch.setattr(route._journal, "dispatch_reserved", commit_then_fault)
-    result = route.dispatch(faulted_r.receipt, faulted)
+    result = send(two, route, faulted_r.receipt, faulted)
     assert (result.state, result.error) == ("held", "admission_uncertain")
     monkeypatch.undo()
     route.close()
@@ -405,7 +470,7 @@ def test_crash_between_dispatched_mark_and_send_stays_held(two, monkeypatch):
         assert restarted.inspect_reservation(cmd.command_id)[0] == "dispatched"
         held = restarted.inspect(cmd.command_id)
         assert (held.state, held.error) == ("held", error)
-        assert restarted.dispatch(receipt, cmd).error == "already_dispatched"  # Never resent.
+        assert send(two, restarted, receipt, cmd).error == "already_dispatched"  # Never resent.
     assert two["sender"].calls == []
     assert restarted.reserve(command(two["epoch"])).counter == 3  # Never reused.
     restarted.close()
@@ -418,11 +483,11 @@ def test_abandoned_reservation_never_dispatches_and_counter_stays_consumed(two):
     receipt = route.reserve(cmd).receipt
     assert route.abandon_reservation(cmd.command_id) is True
     assert route.abandon_reservation(cmd.command_id) is False
-    assert route.dispatch(receipt, cmd).error == "reservation_abandoned"
+    assert send(two, route, receipt, cmd).error == "reservation_abandoned"
     assert route.abandon_reservation(str(uuid4())) is False
     nxt = command(two["epoch"])
     assert route.reserve(nxt).counter == 2  # Gap: 1 consumed, never sent.
-    assert route.dispatch(route.inspect_reservation(nxt.command_id)[2], nxt).state == "completed"
+    assert send(two, route, route.inspect_reservation(nxt.command_id)[2], nxt).state == "completed"
     assert route.abandon_reservation(nxt.command_id) is False  # Dispatched is final.
     assert len(two["sender"].calls) == 1
     route.close()
@@ -437,8 +502,8 @@ def test_out_of_order_dispatch_is_refused_before_reaching_the_executor_gate(two,
     route = make(two)
     first, second = command(two["epoch"]), command(two["epoch"])
     first_r, second_r = route.reserve(first), route.reserve(second)
-    assert route.dispatch(second_r.receipt, second).state == "completed"
-    late = route.dispatch(first_r.receipt, first)  # Lower counter after a higher one was sent.
+    assert send(two, route, second_r.receipt, second).state == "completed"
+    late = send(two, route, first_r.receipt, first)  # Lower counter after a higher one was sent.
     assert (late.state, late.error) == ("held", "reservation_superseded")
     assert len(two["sender"].dispatches) == 1  # Refused sender-side: never reached the executor.
     assert gate.inspect() == {"accepted": 2, "started": 2, "in_flight": None}
@@ -451,7 +516,7 @@ def test_reservation_triggers_refuse_tamper(two):
     route = make(two)
     one, two_cmd = command(two["epoch"]), command(two["epoch"])
     route.reserve(one)
-    route.dispatch(route.reserve(two_cmd).receipt, two_cmd)
+    send(two, route, route.reserve(two_cmd).receipt, two_cmd)
     db = _raw(two["path"])
     t = "supervisor_route_reservation"
     try:
@@ -489,11 +554,11 @@ def test_busy_route_refuses_reserve_and_dispatch_without_effect(two):
     try:
         with pytest.raises(SupervisorRouteBusy):
             route.reserve(command(two["epoch"]))
-        assert route.dispatch(receipt, cmd).state == "busy"
+        assert send(two, route, receipt, cmd).state == "busy"
         with pytest.raises(SupervisorRouteBusy):
             route.abandon_reservation(cmd.command_id)
     finally:
         route._mutex.release()
     assert tables(two["path"])[0] == [(cmd.command_id, 1, "reserved")] and two["sender"].calls == []
-    assert route.dispatch(receipt, cmd).state == "completed"
+    assert send(two, route, receipt, cmd).state == "completed"
     route.close()
