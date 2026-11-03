@@ -1,6 +1,8 @@
 """Hub -> supervisor original-command inspection: authenticated, bounded, read-only."""
 import base64
+from contextlib import contextmanager
 import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,6 +36,12 @@ from hub_container_executor.supervisor_route import (
 from tests.test_hub_container_executor_supervisor_route import (  # noqa: F401  (world is a fixture)
     BOOT, LAUNCH, LINUX, TOKEN, _COUNTING_SERVER, _self_ticks, canonical, command, world,
 )
+from tests.test_hub_container_executor_supervisor_reservation import (  # noqa: F401  (two is a fixture)
+    WINDOW_NS, hub_proof, nonce_of, two,
+)
+from tests.test_hub_container_executor_supervisor_dispatch_proof import (  # noqa: F401  (proof is a fixture)
+    proof, reserved, route_for,
+)
 
 INSPECT_TOKEN = "ehri1." + "Insp3ct" * 6  # Test-only inspection credential.
 REJECTION = b'{"error":{"code":"unauthorized"}}'
@@ -53,7 +61,7 @@ class JobStore(HeldAttemptSource):
 
     def __init__(self, verifier):
         self.lock, self.versions, self.jobs, self.applied, self.hub_calls = threading.Lock(), {}, {}, {}, []
-        self.verifier, self.fail_next_hold = verifier, False
+        self.verifier, self.fail_next_hold, self.receipts = verifier, False, {}
 
     def hold_version(self, command, pin, dispatch_counter):
         with self.lock:
@@ -79,11 +87,15 @@ class JobStore(HeldAttemptSource):
                 payload = self.verifier.verify(observation.answer, request=request)  # Own pinned key.
                 command_id = request["binding"]["command_id"]
                 signed = (command_id, payload["status"], payload["route_state"], request["binding_digest"],
-                          request["dispatch"], payload["answered_at_ms"], payload["key_id"])
+                          request["dispatch"], payload["answered_at_ms"], payload["key_id"], payload["reservation"])
                 hints = (observation.command_id, observation.status, observation.route_state,
                          observation.binding_digest, observation.dispatch, observation.answered_at_ms,
-                         observation.key_id)
+                         observation.key_id, observation.reservation)
                 if hints != signed or (request["binding"], request["dispatch"]) != self.jobs[command_id]:
+                    return False
+                receipt = self.receipts.get(command_id)  # The Hub committed this receipt when reserving.
+                if receipt is not None and (payload["reservation"] is None or payload["reservation"][
+                        "reservation_receipt_sha256"] != hashlib.sha256(receipt).hexdigest()):
                     return False
                 if self.versions[command_id] != version:
                     return False
@@ -169,12 +181,11 @@ class _Supervisor:
             thread.join(10)
 
 
-@pytest.fixture
-def insp(world, tmp_path):
+@contextmanager
+def _inspection_env(route, tmp_path):
     hub = tmp_path / "hub"
     hub.mkdir(mode=0o700)
     key = Ed25519PrivateKey.generate()  # Test-only supervisor inspection key.
-    route = world["make"]()
     responder = SupervisorInspectionResponder(config=InspectionResponderConfig(enabled=True), route=route,
                                               authenticator=InspectionTokenAuthenticator(INSPECT_TOKEN),
                                               signing_key=key)
@@ -211,6 +222,19 @@ def insp(world, tmp_path):
         server.close()
         os.unlink(path)
         os.rmdir(directory)
+
+
+@pytest.fixture
+def insp(world, tmp_path):
+    with _inspection_env(world["make"](), tmp_path) as state:
+        yield state
+
+
+@pytest.fixture
+def rinsp(proof, tmp_path):
+    """Inspection over a two-phase route in durable PROOF MODE (submit refused)."""
+    with _inspection_env(route_for(proof), tmp_path) as state:
+        yield state
 
 
 def counter_of(world, command_id):
@@ -1211,14 +1235,16 @@ def _tamper_hint(field):
             return dataclasses.replace(observation, request=canonical(request))
         values = {"status": "refused", "route_state": "rejected", "binding_digest": "0" * 64,
                   "command_id": str(uuid4()), "answered_at_ms": observation.answered_at_ms + 1,
-                  "key_id": "f" * 64, "dispatch": {**observation.dispatch, "counter": 99}}
+                  "key_id": "f" * 64, "dispatch": {**observation.dispatch, "counter": 99},
+                  "reservation": {"reservation_receipt_sha256": "0" * 64, "reservation_state": "dispatched",
+                                  "challenge_sha256": "1" * 64, "proof_sha256": "2" * 64}}
         return dataclasses.replace(observation, **{field: values[field]})
     return tamper
 
 
 @LINUX
 @pytest.mark.parametrize("field", ["status", "route_state", "binding_digest", "command_id", "answered_at_ms",
-                                   "key_id", "dispatch", "request"])
+                                   "key_id", "dispatch", "request", "reservation"])
 @pytest.mark.parametrize("historical", [False, True])
 def test_hub_refuses_observation_whose_hints_disagree_with_signed_bytes(world, insp, monkeypatch, field,
                                                                         historical):
@@ -1309,3 +1335,175 @@ def test_readback_mismatch_after_write_rolls_back_and_stays_held(world, insp, mo
     monkeypatch.undo()
     assert ledger_state(insp, cmd.command_id) == ("held", None)  # Rolled back: nothing persisted.
     assert insp["store"].hub_calls == [] and len(calls) == 3  # Read, check, read-back; nothing offered.
+
+
+
+# --- Two-phase reserve/dispatch (proof mode): answers from reservation + challenge rows
+
+def _journal_challenges(proof, command_id):
+    with sqlite3.connect(Path(proof["path"]).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT nonce, state, challenge_sha256, proof_sha256 FROM supervisor_route_challenge "
+                          "WHERE command_id=?", (command_id,)).fetchall()
+
+
+def two_phase(proof, rinsp, state):
+    """Drive one reservation into ``state`` through the real route; returns (cmd, receipt, counter)."""
+    route, sender = rinsp["route"], proof["sender"]
+    cmd, receipt = reserved(proof, route)
+    counter = json.loads(receipt)["payload"]["counter"]
+    if state == "challenged":
+        nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+    elif state == "abandoned":
+        route.abandon_reservation(cmd.command_id)
+    elif state == "retired":  # Hub barrier path: expired_unconsumed statement retires the reservation.
+        nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+        proof["clock"].now += WINDOW_NS + 1
+        route.expire_challenges()
+        route.expired_statement(nonce)
+    elif state in ("dispatched_completed", "dispatched_rejected", "dispatched_lost"):
+        nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+        if state == "dispatched_rejected":
+            sender.status, sender.body = 401, REJECTION
+        elif state == "dispatched_lost":
+            sender.error = OSError()
+        result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce))
+        sender.status, sender.body, sender.error = 200, None, None
+        assert result.state == {"dispatched_completed": "completed", "dispatched_rejected": "rejected",
+                                "dispatched_lost": "held"}[state]
+    elif state == "consumed_but_reserved":  # Corrupt/restored journal: consumed nonce, reservation not dispatched.
+        nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+        db = sqlite3.connect(Path(proof["path"]).as_uri() + "?mode=rw", uri=True, isolation_level=None)
+        try:
+            db.execute("UPDATE supervisor_route_challenge SET state='consumed', proof_sha256=? WHERE nonce=?",
+                       ("3" * 64, nonce))
+        finally:
+            db.close()
+    elif state == "consumed_but_abandoned":
+        nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+        db = sqlite3.connect(Path(proof["path"]).as_uri() + "?mode=rw", uri=True, isolation_level=None)
+        try:
+            db.execute("UPDATE supervisor_route_challenge SET state='consumed', proof_sha256=? WHERE nonce=?",
+                       ("3" * 64, nonce))
+            db.execute("UPDATE supervisor_route_reservation SET state='abandoned' WHERE command_id=?",
+                       (cmd.command_id,))
+        finally:
+            db.close()
+    return cmd, receipt, counter
+
+
+_TWO_PHASE = {  # state -> (signed status, route_state, reservation_state, challenge/proof hashes present)
+    "reserved": ("not_dispatched", None, "reserved", False),
+    "challenged": ("not_dispatched", None, "reserved", False),
+    "abandoned": ("not_dispatched", None, "abandoned", False),
+    "retired": ("not_dispatched", None, "abandoned", False),
+    "dispatched_completed": ("launched", "completed", "dispatched", True),
+    "dispatched_rejected": ("refused", "rejected", "dispatched", True),
+    "dispatched_lost": ("unknown", None, "dispatched", True),
+    "consumed_but_reserved": ("unknown", None, "reserved", False),
+    "consumed_but_abandoned": ("unknown", None, "abandoned", False),
+}
+
+
+@LINUX
+@pytest.mark.parametrize("state", sorted(_TWO_PHASE))
+def test_two_phase_answer_from_reservation_and_challenge_rows(proof, rinsp, state):
+    cmd, receipt, counter = two_phase(proof, rinsp, state)
+    status, route_state, reservation_state, hashes = _TWO_PHASE[state]
+    client = rinsp["client"]()
+    answer = client.inspect(client.request_for(cmd, proof["pin"], counter))
+    assert answer.verified and (answer.status, answer.route_state) == (status, route_state), state
+    info = answer.payload["reservation"]
+    assert info["reservation_receipt_sha256"] == hashlib.sha256(receipt).hexdigest()  # Signed binding.
+    assert info["reservation_state"] == reservation_state
+    consumed = [row for row in _journal_challenges(proof, cmd.command_id) if row[1] == "consumed"]
+    if hashes:  # The ONE consumed challenge's signed-bytes hash and the proof hash are bound.
+        assert (info["challenge_sha256"], info["proof_sha256"]) == consumed[0][2:]
+    else:
+        assert (info["challenge_sha256"], info["proof_sha256"]) == (None, None)
+    if state.startswith("consumed_but"):
+        assert consumed  # A consumed challenge is never reported as not_dispatched.
+
+
+@LINUX
+@pytest.mark.parametrize("state", sorted(_TWO_PHASE))
+def test_two_phase_hub_moves_only_on_a_dispatched_outcome(proof, rinsp, state):
+    cmd, receipt, counter = two_phase(proof, rinsp, state)
+    status, route_state, _, _ = _TWO_PHASE[state]
+    store = rinsp["store"]
+    resolver = rinsp["resolver"]()
+    resolver.hold(cmd, proof["pin"], counter)
+    store.receipts[cmd.command_id] = receipt
+    result = resolver.inspect(cmd, proof["pin"], counter)
+    if status in ("launched", "refused"):
+        assert (result.state, result.status, result.observation.route_state) == ("applied", status, route_state)
+        assert result.observation.reservation["reservation_receipt_sha256"] == hashlib.sha256(receipt).hexdigest()
+        return
+    # not_dispatched / unknown: held, nothing recorded, nothing offered - never a release.
+    assert (result.state, result.error, result.status, result.applied) == ("held", status, status, False)
+    assert ledger_state(rinsp, cmd.command_id) == ("held", None) and store.hub_calls == []
+
+
+@LINUX
+def test_hub_refuses_answer_for_another_receipt(proof, rinsp):
+    cmd, receipt, counter = two_phase(proof, rinsp, "dispatched_completed")
+    resolver = rinsp["resolver"]()
+    resolver.hold(cmd, proof["pin"], counter)
+    rinsp["store"].receipts[cmd.command_id] = receipt + b" "  # The Hub committed a different receipt.
+    result = resolver.inspect(cmd, proof["pin"], counter)
+    assert (result.state, result.error) == ("held", "hub_not_recorded") and rinsp["store"].applied == {}
+
+
+@LINUX
+@pytest.mark.parametrize("field", ["counter", "fence", "executor"])
+def test_two_phase_binding_mismatch_is_unknown(proof, rinsp, field):
+    cmd, receipt, counter = two_phase(proof, rinsp, "dispatched_completed")
+    pin = proof["pin"]
+    asked = {"counter": (cmd, pin, counter + 1),
+             "fence": (command(proof["epoch"], command_id=cmd.command_id, fence=8), pin, counter),
+             "executor": (cmd, BackendPin("b" * 64, pin.host_pid, pin.process_start_ticks, pin.uid, pin.gid,
+                                          pin.engine_id, pin.engine_pid, pin.engine_start_ticks), counter)}[field]
+    client = rinsp["client"]()
+    answer = client.inspect(client.request_for(*asked))
+    assert answer.verified and (answer.status, answer.payload["reservation"]) == ("unknown", None)
+
+
+@LINUX
+def test_proof_mode_journal_refuses_submit_but_stays_inspectable(proof, rinsp):
+    route = rinsp["route"]
+    direct = command(proof["epoch"])
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        route.submit(direct)
+    assert raised.value.reason == "proof_required"
+    client = rinsp["client"]()
+    refused = client.inspect(client.request_for(direct, proof["pin"], 1))
+    assert refused.verified and refused.status == "not_found"  # Never admitted; still held Hub-side.
+    cmd, receipt, counter = two_phase(proof, rinsp, "dispatched_completed")
+    route.close()
+    reopened = route_for(proof, create=False)  # Restart: proof mode is permanent, inspection still works.
+    rinsp["route"] = rinsp["responder"]._route = reopened
+    with pytest.raises(SupervisorRouteRejected):
+        reopened.submit(command(proof["epoch"]))
+    answer = client.inspect(client.request_for(cmd, proof["pin"], counter))
+    assert answer.verified and answer.status == "launched"
+    assert answer.payload["reservation"]["reservation_state"] == "dispatched"
+
+
+@LINUX
+def test_verifier_requires_reservation_field_consistent_with_status(proof, rinsp):
+    cmd, receipt, counter = two_phase(proof, rinsp, "dispatched_completed")
+    client = rinsp["client"]()
+    request = client.request_for(cmd, proof["pin"], counter)
+    payload = json.loads(genuine(canonical(request), rinsp["responder"]))["payload"]
+    verifier = PinnedKeyInspectionVerifier(raw_key(rinsp["key"]))
+    assert verifier.verify(sign(rinsp["key"], payload), request=request)["status"] == "launched"
+    info = payload["reservation"]
+    for bad in ({**payload, "reservation": {**info, "challenge_sha256": None, "proof_sha256": None}},
+                {**payload, "reservation": {**info, "reservation_state": "reserved"}},
+                {**payload, "status": "not_dispatched", "route_state": None},
+                {**payload, "status": "not_found", "route_state": None},
+                {**payload, "status": "not_dispatched", "route_state": None, "reservation": None},
+                {**payload, "reservation": {**info, "extra": 1}},
+                {**payload, "reservation": {**info, "proof_sha256": None}},
+                {k: v for k, v in payload.items() if k != "reservation"}):
+        with pytest.raises(SupervisorRouteError):
+            verifier.verify(sign(rinsp["key"], bad), request=request)
