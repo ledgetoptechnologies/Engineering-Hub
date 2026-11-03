@@ -681,9 +681,10 @@ def _now_ms():
 
 
 def _bearer(value):
-    # An inspection-scoped credential can never be used as the launch bearer.
+    # No scoped credential (inspection or any transport scope: ehri1./ehrr1./
+    # ehrc1./ehrd1./ehre1.) can ever be used as the launch bearer.
     _require(type(value) is str and 0 < len(value) <= 4096 and all(33 <= ord(c) <= 126 for c in value)
-             and not value.startswith(INSPECTION_TOKEN_PREFIX),
+             and not value.startswith(_SCOPED_PREFIXES),
              SupervisorRouteError('executor bearer credential required'))
     return value
 
@@ -3917,3 +3918,694 @@ class InspectionResolver:
 
     def close(self):
         self._ledger.close()
+
+
+# --- Hub -> supervisor transport for reserve / challenge / dispatch / expiry --
+#
+# docs/supervisor-dispatch-transport.md. DISABLED BY DEFAULT and default-
+# refusing throughout; nothing constructs, wires or listens. Authority comes
+# from the signed envelopes (verified by the Hub with its own pinned
+# verifiers), never from this channel: the transport only adds WHO MAY ASK
+# (per-scope bearers), WHO ANSWERS (pinned peer / machine identity) and
+# BOUNDED COST (strict framing, one total deadline, non-blocking pools).
+
+TRANSPORT_RESERVE_PATH = '/v1/supervisor-route/reserve'
+TRANSPORT_CHALLENGE_PATH = '/v1/supervisor-route/challenge'
+TRANSPORT_DISPATCH_PATH = '/v1/supervisor-route/dispatch'
+TRANSPORT_EXPIRE_PATH = '/v1/supervisor-route/expired-statement'
+RESERVE_SCOPE = 'supervisor-route.reserve'
+CHALLENGE_SCOPE = 'supervisor-route.challenge'
+DISPATCH_SCOPE = 'supervisor-route.dispatch'
+EXPIRE_SCOPE = 'supervisor-route.expire'
+# Scope -> credential prefix. Each prefix is refused by ``_bearer`` (the
+# launch/executor credential) and by every other scope.
+TRANSPORT_TOKEN_PREFIXES = {RESERVE_SCOPE: 'ehrr1.', CHALLENGE_SCOPE: 'ehrc1.', DISPATCH_SCOPE: 'ehrd1.',
+                            EXPIRE_SCOPE: 'ehre1.', INSPECTION_SCOPE: INSPECTION_TOKEN_PREFIX}
+_SCOPED_PREFIXES = tuple(TRANSPORT_TOKEN_PREFIXES.values())
+# path -> (scope, route group, request body cap). Groups have separate pools:
+# the Hub's dispatch path and its resolver path cannot starve each other.
+_TRANSPORT_ROUTES = {
+    TRANSPORT_RESERVE_PATH: (RESERVE_SCOPE, 'dispatch_path', 16 * 1024),
+    TRANSPORT_CHALLENGE_PATH: (CHALLENGE_SCOPE, 'dispatch_path', 512),
+    TRANSPORT_DISPATCH_PATH: (DISPATCH_SCOPE, 'dispatch_path', 32 * 1024),
+    TRANSPORT_EXPIRE_PATH: (EXPIRE_SCOPE, 'resolver', 512),
+    INSPECTION_PATH: (INSPECTION_SCOPE, 'resolver', MAX_INSPECTION_REQUEST_BYTES),
+}
+_UNKNOWN_PATH_CAP = 512
+_COMMAND_KEYS = frozenset({'method', 'path', 'body', 'command_id', 'queue_fence', 'epoch'})
+_B64 = re.compile(r'[A-Za-z0-9_-]*\Z')
+_HINT_KEYS = frozenset({'state', 'command_id', 'binding_digest', 'replayed', 'error'})
+_HINT_STATES = frozenset({'completed', 'rejected', 'refused', 'in_progress', 'held', 'busy'})
+_REASON = re.compile(r'[a-z][a-z0-9_]{0,63}\Z')
+
+
+def _scoped_bearer(value, scope):
+    prefix = TRANSPORT_TOKEN_PREFIXES[scope]
+    _require(type(value) is str and value.startswith(prefix) and 32 <= len(value) - len(prefix)
+             and len(value) <= 4096 and all(33 <= ord(c) <= 126 for c in value),
+             SupervisorRouteError('scoped transport credential required'))
+    return value
+
+
+def _b64(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode('ascii')
+
+
+def _unb64(value, maximum):
+    """Strict unpadded base64url -> bytes (canonical round trip, size-capped)."""
+    _require(type(value) is str and _B64.fullmatch(value) and len(value) <= maximum * 4 // 3 + 4
+             and len(value) % 4 != 1)
+    raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+    _require(_b64(raw) == value and len(raw) <= maximum)
+    return raw
+
+
+def transport_command(command):
+    """The exact wire form of a RouteCommand (body as unpadded base64url)."""
+    _require(type(command) is RouteCommand)
+    return {'method': command.method, 'path': command.path, 'body': _b64(command.body),
+            'command_id': command.command_id, 'queue_fence': command.queue_fence, 'epoch': command.epoch.as_dict()}
+
+
+def _command_from(value):
+    _require(_shape(value, _COMMAND_KEYS) and _shape(value['epoch'], _EPOCH_KEYS))
+    epoch = value['epoch']
+    return RouteCommand(value['method'], value['path'], _unb64(value['body'], MAX_BODY_BYTES), value['command_id'],
+                        value['queue_fence'], RouteEpoch(epoch['launch_id'], epoch['launch_counter'], epoch['boot_id']))
+
+
+def transport_request(path, **fields):
+    """Canonical request body for ``path``; bytes fields go as base64url."""
+    if path == TRANSPORT_RESERVE_PATH:
+        value = {'command': transport_command(fields['command'])}
+    elif path == TRANSPORT_CHALLENGE_PATH:
+        value = {'command_id': fields['command_id']}
+    elif path == TRANSPORT_DISPATCH_PATH:
+        _require(type(fields['receipt']) is bytes and type(fields['proof']) is bytes)
+        value = {'receipt': _b64(fields['receipt']), 'command': transport_command(fields['command']),
+                 'proof': _b64(fields['proof'])}
+    elif path == TRANSPORT_EXPIRE_PATH:
+        value = {'nonce': fields['nonce']}
+    else:
+        raise SupervisorRouteRejected('unknown_route')
+    return _canonical(value)
+
+
+class RouteTokenAuthenticator:
+    """Accepts only the ONE enrolled bearer of ONE transport scope (constant-time).
+
+    Only a SHA-256 of the token is kept. The token must carry its scope's
+    prefix, so a token of another scope (or the launch/executor bearer, which
+    can never carry a scoped prefix) is refused before any comparison. For
+    ``supervisor-route.inspect`` use InspectionTokenAuthenticator.
+    """
+
+    def __init__(self, scope, token):
+        _require(scope in TRANSPORT_TOKEN_PREFIXES and scope != INSPECTION_SCOPE,
+                 SupervisorRouteError('transport scope'))
+        self.scope = scope
+        self.__digest = hashlib.sha256(_scoped_bearer(token, scope).encode('ascii')).digest()
+
+    def __repr__(self):
+        return f'RouteTokenAuthenticator({self.scope}, <redacted>)'
+
+    def __reduce__(self):
+        raise TypeError('RouteTokenAuthenticator is not serializable')
+
+    def authenticate(self, authorization):
+        denied = SupervisorRouteError('transport caller not authenticated')
+        scheme, _, token = authorization.partition(' ') if type(authorization) is str else ('', '', '')
+        try:
+            _scoped_bearer(token, self.scope)
+        except SupervisorRouteError:
+            raise denied from None
+        if scheme != 'Bearer' or not hmac.compare_digest(hashlib.sha256(token.encode('ascii')).digest(),
+                                                         self.__digest):
+            raise denied
+        return self.scope
+
+
+@dataclass(frozen=True)
+class TransportResponderConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no responder exists.
+
+    Per route group (``dispatch_path``: reserve/challenge/dispatch;
+    ``resolver``: expired-statement/inspect), ``max_authenticating`` (1..8)
+    callers may be in the authenticator and ``max_concurrent`` (1..8)
+    authenticated calls may run; any other caller gets an unsigned 503
+    ``busy`` at once (never queued). ``answer_budget_ms`` (20..5000) is a
+    return-time check: no signed reply is returned after it."""
+    enabled: bool = False
+    max_authenticating: int = 2
+    max_concurrent: int = 2
+    answer_budget_ms: int = 1000
+
+
+class SupervisorTransportResponder:
+    """DISABLED-BY-DEFAULT supervisor side of the transport routes.
+
+    ``answer(method=, path=, authorization=, body=)`` -> (http_status, bytes).
+    Route by path (unknown -> unsigned 404), take a non-blocking PRE-AUTH slot
+    of the route's group, authenticate with exactly that route's scope (a
+    missing authenticator authenticates nobody), take a POST-AUTH slot, parse
+    the exact canonical request, call the route operation and reply:
+
+    * reserve -> 200 the exact signed reservation receipt bytes;
+    * challenge -> 200 the exact signed dispatch challenge bytes;
+    * expired-statement -> 200 the exact signed expired_unconsumed statement;
+    * dispatch -> 200 an UNSIGNED hint {"hint": {state, command_id,
+      binding_digest, replayed, error}}; never authority for anything;
+    * inspect -> delegated unchanged to the SupervisorInspectionResponder.
+
+    Denials are unsigned: 401 unauthorized, 400 invalid_payload, 404,
+    409 {"error": {"code": "rejected", "reason": <route reason>}}, 503 busy /
+    unavailable. A signed 200 is not returned after ``answer_budget_ms``
+    (best-effort, as for inspection: the route operation itself cannot be
+    interrupted and has already taken effect, e.g. an issued challenge).
+    Pools are PER INSTANCE.
+    """
+
+    def __init__(self, *, config, route, authenticators=(), inspection=None):
+        if type(config) is not TransportResponderConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor transport responder is disabled')
+        authenticators = tuple(authenticators)
+        _require(type(route) is SupervisorRoute
+                 and all(type(a) is RouteTokenAuthenticator for a in authenticators)
+                 and len({a.scope for a in authenticators}) == len(authenticators)
+                 and (inspection is None or type(inspection) is SupervisorInspectionResponder)
+                 and type(config.max_authenticating) is int and 1 <= config.max_authenticating <= 8
+                 and type(config.max_concurrent) is int and 1 <= config.max_concurrent <= 8
+                 and type(config.answer_budget_ms) is int and 20 <= config.answer_budget_ms <= 5000,
+                 SupervisorRouteError('invalid supervisor transport responder'))
+        self._route, self._inspection = route, inspection
+        self._authenticators = {a.scope: a for a in authenticators}
+        self._auth_slots = {group: threading.BoundedSemaphore(config.max_authenticating)
+                            for group in ('dispatch_path', 'resolver')}
+        self._slots = {group: threading.BoundedSemaphore(config.max_concurrent)
+                       for group in ('dispatch_path', 'resolver')}
+        self._budget = config.answer_budget_ms / 1000
+
+    def __repr__(self):
+        return 'SupervisorTransportResponder(<enabled>)'
+
+    @staticmethod
+    def body_cap(path):
+        return _TRANSPORT_ROUTES[path][2] if path in _TRANSPORT_ROUTES else _UNKNOWN_PATH_CAP
+
+    @staticmethod
+    def _denied(status, code, reason=None):
+        error = {'code': code} if reason is None else {'code': code, 'reason': reason}
+        return status, _canonical({'error': error})
+
+    def answer(self, *, method, path, authorization, body):
+        deadline = time.monotonic() + self._budget
+        if method != 'POST' or path not in _TRANSPORT_ROUTES:
+            return self._denied(404, 'not_found')
+        scope, group, cap = _TRANSPORT_ROUTES[path]
+        if type(body) is not bytes or len(body) > cap:
+            return self._denied(413, 'too_large')
+        if not self._auth_slots[group].acquire(blocking=False):
+            return self._denied(503, 'busy')
+        try:
+            if scope == INSPECTION_SCOPE:
+                if self._inspection is None:
+                    return self._denied(404, 'not_found')
+                # Unchanged inspection semantics (own authenticator and pools).
+                return self._inspection.answer(method=method, path=path, authorization=authorization, body=body)
+            try:
+                authenticator = self._authenticators.get(scope)
+                _require(authenticator is not None and authenticator.authenticate(authorization) == scope)
+            except Exception:
+                return self._denied(401, 'unauthorized')
+        finally:
+            self._auth_slots[group].release()
+        if not self._slots[group].acquire(blocking=False):
+            return self._denied(503, 'busy')
+        try:
+            status, raw, signed = self._call(path, body)
+        finally:
+            self._slots[group].release()
+        if status == 200 and signed and not time.monotonic() <= deadline:
+            return self._denied(503, 'unavailable')  # Return-time check on signed replies.
+        return status, raw
+
+    def _call(self, path, body):
+        try:
+            value = _strict_json(body, self.body_cap(path))
+            _require(_canonical(value) == body)
+            if path == TRANSPORT_RESERVE_PATH:
+                _require(_shape(value, {'command'}))
+                command = _command_from(value['command'])  # Parsed here: any invalid field is a 400.
+                call, signed = (lambda: self._route.reserve(command).receipt), True
+            elif path == TRANSPORT_CHALLENGE_PATH:
+                _require(_shape(value, {'command_id'}) and _uuid(value['command_id']))
+                call, signed = (lambda: self._route.issue_dispatch_challenge(value['command_id'])), True
+            elif path == TRANSPORT_DISPATCH_PATH:
+                _require(_shape(value, {'receipt', 'command', 'proof'}))
+                receipt, proof = _unb64(value['receipt'], MAX_RECORD_BYTES), _unb64(value['proof'], MAX_RECORD_BYTES)
+                command = _command_from(value['command'])
+                call, signed = (lambda: self._route.dispatch(receipt, command, proof)), False
+            else:
+                _require(_shape(value, {'nonce'}) and _valid_nonce(value['nonce']))
+                call, signed = (lambda: self._route.expired_statement(value['nonce'])), True
+        except Exception:
+            return (*self._denied(400, 'invalid_payload'), False)
+        try:
+            result = call()
+        except SupervisorRouteRejected as rejected:
+            reason = rejected.reason if type(rejected.reason) is str and _REASON.fullmatch(rejected.reason) \
+                else 'invalid'
+            return (*self._denied(409, 'rejected', reason), False)
+        except SupervisorRouteBusy:
+            return (*self._denied(503, 'busy'), False)
+        except Exception:
+            return (*self._denied(503, 'unavailable'), False)
+        if signed:
+            _require(type(result) is bytes)
+            return 200, result, True
+        hint = {'state': result.state, 'command_id': result.command_id, 'binding_digest': result.binding_digest,
+                'replayed': result.replayed, 'error': result.error}
+        return 200, _canonical({'hint': hint, 'unsigned': True}), False
+
+
+MAX_TRANSPORT_REQUEST_BYTES = 32 * 1024
+_REQUEST_LINE = re.compile(rb'(POST|GET) (/[A-Za-z0-9/_.-]{0,255}) HTTP/1\.1\Z')
+
+
+class _Oversize(Exception):
+    pass
+
+
+def _read_request(peer, remaining, cap_for):
+    """Strict bounded HTTP/1.1 request reader under ONE total deadline (the
+    server-side twin of ``_read_response``): request line, at most
+    MAX_HEADERS headers / MAX_HEADER_BYTES, exactly one decimal
+    Content-Length within the route's cap (else _Oversize BEFORE reading the
+    body), at most one Authorization, no Transfer-Encoding, exactly that many
+    body bytes. Returns (method, path, authorization, body)."""
+    def receive(size):
+        peer.settimeout(remaining())
+        part = peer.recv(size)
+        if not part:
+            raise _framing()
+        return part
+    buffer = bytearray()
+    while True:
+        end = buffer.find(b'\r\n\r\n')
+        if end >= 0:
+            break
+        if len(buffer) > MAX_HEADER_BYTES:
+            raise _framing()
+        buffer += receive(MAX_HEADER_BYTES + 4 - len(buffer) if len(buffer) < MAX_HEADER_BYTES else 4)
+    if end > MAX_HEADER_BYTES:
+        raise _framing()
+    head, body = bytes(buffer[:end]), bytearray(buffer[end + 4:])
+    lines = head.split(b'\r\n')
+    match = _REQUEST_LINE.fullmatch(lines[0])
+    if match is None or len(lines) - 1 > MAX_HEADERS:
+        raise _framing()
+    method, path = match[1].decode('ascii'), match[2].decode('ascii')
+    lengths, authorizations = [], []
+    for line in lines[1:]:
+        header = _HEADER_LINE.fullmatch(line)
+        if header is None:
+            raise _framing()
+        name = header[1].lower()
+        if name == b'transfer-encoding':
+            raise _framing()
+        if name == b'content-length':
+            lengths.append(header[2] or b'')
+        if name == b'authorization':
+            authorizations.append((header[2] or b'').decode('ascii'))
+    if len(lengths) != 1 or not _LENGTH.fullmatch(lengths[0]) or len(authorizations) > 1:
+        raise _framing()
+    length = int(lengths[0])
+    if length > min(cap_for(path), MAX_TRANSPORT_REQUEST_BYTES):
+        raise _Oversize()
+    if len(body) > length:
+        raise _framing()
+    while len(body) < length:
+        body += receive(length - len(body))
+    return method, path, (authorizations[0] if authorizations else None), bytes(body)
+
+
+def spki_sha256(certificate):
+    """SHA-256 hex of a certificate's SubjectPublicKeyInfo (DER or PEM bytes)."""
+    from cryptography import x509
+    _require(type(certificate) is bytes and certificate, SupervisorRouteError('certificate'))
+    cert = (x509.load_pem_x509_certificate(certificate) if certificate.startswith(b'-----BEGIN')
+            else x509.load_der_x509_certificate(certificate))
+    return hashlib.sha256(cert.public_key().public_bytes(serialization.Encoding.DER,
+                                                         serialization.PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+
+
+def _tls_context(*, server, certificate_path, private_key_path, anchor_path):
+    """TLS 1.3 only, mutual. OpenSSL needs a verification anchor to request and
+    accept the peer's certificate: ``anchor_path`` should hold exactly the
+    enrolled peer's self-signed certificate (no CA, no system store, no
+    hostname check). The peer's SPKI is pinned on top, after the handshake,
+    so an over-broad anchor file still cannot admit another key."""
+    import ssl
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+    if not server:
+        context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_verify_locations(cafile=anchor_path)
+    context.load_cert_chain(certificate_path, private_key_path)
+    return context
+
+
+def _check_spki(tls, expected):
+    der = tls.getpeercert(binary_form=True)
+    if not der or not hmac.compare_digest(spki_sha256(der), expected):
+        raise PeerMismatch()
+
+
+def _valid_path(value):
+    return type(value) is str and value.startswith('/') and os.path.normpath(value) == value
+
+
+@dataclass(frozen=True)
+class HubUnixIdentity:
+    """Enrolled Hub service identity for the Unix-socket channel (SO_PEERCRED)."""
+    uid: int
+    gid: int
+
+    def __post_init__(self):
+        _require(_id32(self.uid) and _id32(self.gid))
+
+
+@dataclass(frozen=True)
+class TlsServerIdentity:
+    """Supervisor TLS listener identity: its own TLS key (separate from every
+    signing key) and the Hub host's pinned client SPKI."""
+    certificate_path: str
+    private_key_path: str
+    client_anchor_path: str
+    client_spki_sha256: str
+
+    def __post_init__(self):
+        _require(all(_valid_path(p) for p in (self.certificate_path, self.private_key_path,
+                                               self.client_anchor_path))
+                 and type(self.client_spki_sha256) is str and _HEX.fullmatch(self.client_spki_sha256))
+
+
+@dataclass(frozen=True)
+class TransportServerConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no server exists.
+
+    ``request_timeout_ms`` bounds the handshake plus the request read and
+    ``reply_timeout_ms`` the reply write, each ONE total deadline."""
+    enabled: bool = False
+    request_timeout_ms: int = 2000
+    reply_timeout_ms: int = 2000
+
+
+class SupervisorTransportServer:
+    """DISABLED-BY-DEFAULT per-connection handler for the supervisor transport.
+
+    ``serve_connection(conn)`` takes ONE accepted connection (AF_UNIX for a
+    HubUnixIdentity, TCP for a TlsServerIdentity), checks the caller's
+    machine identity BEFORE reading any application byte (Unix: SO_PEERCRED
+    uid/gid equal to the enrolled Hub; TLS: TLS 1.3 mutual handshake, then the
+    client certificate's SPKI SHA-256 equal to the pin), reads ONE request
+    with strict framing (per-route body cap), hands it to the responder,
+    writes the reply and closes. Returns a short outcome string. No accept
+    loop or listener is provided: the operator owns binding (one dedicated
+    socket/interface) and threads. Supervisor TLS key material is used ONLY
+    for the channel; it must be separate from every signing key (checked for
+    Ed25519 keys against ``signing_public_keys``).
+    """
+
+    def __init__(self, *, config, responder, identity, signing_public_keys=()):
+        if type(config) is not TransportServerConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor transport server is disabled')
+        _require(type(responder) is SupervisorTransportResponder
+                 and type(identity) in (HubUnixIdentity, TlsServerIdentity)
+                 and type(config.request_timeout_ms) is int and 100 <= config.request_timeout_ms <= 60000
+                 and type(config.reply_timeout_ms) is int and 100 <= config.reply_timeout_ms <= 60000,
+                 SupervisorRouteError('invalid supervisor transport server'))
+        self._responder, self._identity = responder, identity
+        self._request_timeout, self._reply_timeout = config.request_timeout_ms / 1000, config.reply_timeout_ms / 1000
+        self._tls = None
+        if type(identity) is TlsServerIdentity:
+            certificate = Path(identity.certificate_path).read_bytes()
+            from cryptography import x509
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as _Ed
+            key = x509.load_pem_x509_certificate(certificate).public_key()
+            if isinstance(key, _Ed):
+                raw = key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                _require(raw not in set(signing_public_keys), SupervisorRouteError('tls key reuses a signing key'))
+            self._tls = _tls_context(server=True, certificate_path=identity.certificate_path,
+                                     private_key_path=identity.private_key_path,
+                                     anchor_path=identity.client_anchor_path)
+
+    def __repr__(self):
+        return 'SupervisorTransportServer(<enabled>)'
+
+    def serve_connection(self, conn):
+        deadline = time.monotonic() + self._request_timeout
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if not value > 0:
+                raise TimeoutError
+            return value
+        peer = conn
+        try:
+            try:
+                peer = self._accept_identity(conn, remaining)  # Nothing read yet.
+            except Exception:
+                return 'peer_refused'
+            try:
+                method, path, authorization, body = _read_request(peer, remaining, self._responder.body_cap)
+            except _Oversize:
+                self._reply(peer, *SupervisorTransportResponder._denied(413, 'too_large'))
+                return 'too_large'
+            except TimeoutError:
+                return 'timeout'
+            except Exception:
+                return 'framing'
+            status, raw = self._responder.answer(method=method, path=path, authorization=authorization, body=body)
+            self._reply(peer, status, raw)
+            return 'answered'
+        finally:
+            try:
+                peer.close()
+            finally:
+                if peer is not conn:
+                    conn.close()
+
+    def _accept_identity(self, conn, remaining):
+        if self._tls is None:
+            pid, uid, gid = struct.unpack('=iII', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if pid <= 0 or (uid, gid) != (self._identity.uid, self._identity.gid):
+                raise PeerMismatch()
+            return conn
+        conn.settimeout(remaining())
+        tls = self._tls.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+        tls.settimeout(remaining())
+        tls.do_handshake()
+        _check_spki(tls, self._identity.client_spki_sha256)
+        return tls
+
+    def _reply(self, peer, status, raw):
+        """Writes one response under the reply deadline (test seam: overridable)."""
+        try:
+            peer.settimeout(self._reply_timeout)
+            peer.sendall(f'HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\n'
+                         'Connection: close\r\n\r\n'.encode('ascii') + raw)
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class UnixTransportChannel:
+    """Same host: the supervisor's Unix socket and its enrolled peer pin."""
+    socket_path: str
+    supervisor_peer: SupervisorPeerPin
+
+    def __post_init__(self):
+        _require(_valid_path(self.socket_path) and type(self.supervisor_peer) is SupervisorPeerPin)
+
+
+@dataclass(frozen=True)
+class TlsTransportChannel:
+    """Different hosts: TLS 1.3 mutual auth; the Hub's pinned client key is its
+    machine identity and the supervisor's SPKI is pinned (no CA, no hostname)."""
+    host: str
+    port: int
+    client_certificate_path: str
+    client_private_key_path: str
+    server_anchor_path: str
+    server_spki_sha256: str
+
+    def __post_init__(self):
+        _require(type(self.host) is str and 0 < len(self.host) <= 253 and type(self.port) is int
+                 and 0 < self.port < 65536
+                 and all(_valid_path(p) for p in (self.client_certificate_path, self.client_private_key_path,
+                                                   self.server_anchor_path))
+                 and type(self.server_spki_sha256) is str and _HEX.fullmatch(self.server_spki_sha256))
+
+
+@dataclass(frozen=True)
+class TransportClientConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no client exists."""
+    enabled: bool = False
+    timeout_ms: int = 2000
+
+
+@dataclass(frozen=True)
+class TransportReply:
+    """One exchange. ``raw`` = the exact 200 body or None; ``hint`` = the
+    parsed UNSIGNED dispatch hint (dispatch only).
+
+    ``held`` is True unless this is a signed-route 200 whose bytes the Hub
+    must now verify with its own pinned verifier. A dispatch reply is ALWAYS
+    held: its hint never moves Hub state; only a verified inspection answer
+    recorded in the Hub's own transaction settles the attempt."""
+    raw: bytes | None = field(default=None, repr=False)
+    status: int | None = None
+    error: str | None = None
+    hint: dict | None = None
+
+    @property
+    def held(self):
+        return self.raw is None or self.hint is not None
+
+
+class SupervisorTransportClient:
+    """DISABLED-BY-DEFAULT Hub side: one method per route, one exchange each.
+
+    ``credentials`` maps scope -> bearer; a component gets only the scopes it
+    needs (dispatch path: reserve/challenge/dispatch; resolver:
+    expire/inspect). The supervisor's identity is verified BEFORE any
+    application byte is written (Unix: SupervisorPeerPin via SO_PEERCRED +
+    pidfd start ticks, re-checked after the reply; TLS: pinned SPKI after the
+    handshake) - a mismatch sends zero bytes. One total deadline per
+    exchange with the strict ``_read_response`` framing. Every failure is a
+    held TransportReply with ``error`` (peer_mismatch / transport_lost /
+    http_status / malformed), never raised and never a state move. The Hub
+    MUST still verify every 200 body with its own pinned verifiers.
+    """
+
+    def __init__(self, *, config, channel, credentials):
+        if type(config) is not TransportClientConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor transport client is disabled')
+        _require(type(channel) in (UnixTransportChannel, TlsTransportChannel)
+                 and type(config.timeout_ms) is int and 100 <= config.timeout_ms <= 120000
+                 and isinstance(credentials, dict) and credentials
+                 and all(scope in TRANSPORT_TOKEN_PREFIXES for scope in credentials),
+                 SupervisorRouteError('invalid supervisor transport client'))
+        self.__authorizations = {scope: 'Bearer ' + _scoped_bearer(token, scope)
+                                 for scope, token in credentials.items()}
+        self._channel, self._timeout = channel, config.timeout_ms
+        self._tls = None
+        if type(channel) is TlsTransportChannel:
+            self._tls = _tls_context(server=False, certificate_path=channel.client_certificate_path,
+                                     private_key_path=channel.client_private_key_path,
+                                     anchor_path=channel.server_anchor_path)
+
+    def __repr__(self):
+        return 'SupervisorTransportClient(<redacted>)'
+
+    __str__ = __repr__
+
+    def __reduce__(self):
+        raise TypeError('SupervisorTransportClient is not serializable')
+
+    def reserve(self, command):
+        return self._call(TRANSPORT_RESERVE_PATH, transport_request(TRANSPORT_RESERVE_PATH, command=command))
+
+    def challenge(self, command_id):
+        return self._call(TRANSPORT_CHALLENGE_PATH, transport_request(TRANSPORT_CHALLENGE_PATH,
+                                                                      command_id=command_id))
+
+    def dispatch(self, receipt, command, proof):
+        reply = self._call(TRANSPORT_DISPATCH_PATH, transport_request(TRANSPORT_DISPATCH_PATH, receipt=receipt,
+                                                                      command=command, proof=proof))
+        if reply.raw is None:
+            return reply
+        try:
+            value = _strict_json(reply.raw, MAX_RESPONSE_BYTES)
+            hint = value['hint']
+            _require(_shape(value, {'hint', 'unsigned'}) and value['unsigned'] is True
+                     and _shape(hint, _HINT_KEYS) and hint['state'] in _HINT_STATES)
+        except Exception:
+            return TransportReply(None, reply.status, 'malformed')
+        return TransportReply(reply.raw, reply.status, None, hint)
+
+    def expired_statement(self, nonce):
+        return self._call(TRANSPORT_EXPIRE_PATH, transport_request(TRANSPORT_EXPIRE_PATH, nonce=nonce))
+
+    def inspect(self, request):
+        _require(_valid_inspection_request(request))
+        return self._call(INSPECTION_PATH, _canonical(request))
+
+    def _call(self, path, body):
+        scope = _TRANSPORT_ROUTES[path][0]
+        authorization = self.__authorizations.get(scope)
+        _require(authorization is not None, SupervisorRouteError('no credential for ' + scope))
+        try:
+            status, raw = self._exchange(path, authorization, body)
+        except PeerMismatch:
+            return TransportReply(None, None, 'peer_mismatch')
+        except Exception:
+            return TransportReply(None, None, 'transport_lost')
+        if status != 200:
+            return TransportReply(None, status, 'http_status')
+        return TransportReply(raw, status)
+
+    def _exchange(self, path, authorization, body):
+        deadline = time.monotonic() + self._timeout / 1000
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if not value > 0:
+                raise TimeoutError
+            return value
+        request = ('\r\n'.join([f'POST {path} HTTP/1.1', 'Host: supervisor-route', 'Accept-Encoding: identity',
+                                'Connection: close', 'Content-Type: application/json',
+                                f'Content-Length: {len(body)}', 'Authorization: ' + authorization])
+                   + '\r\n\r\n').encode('ascii') + body
+        pidfd = peer = None
+        try:
+            if self._tls is None:
+                peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                peer.settimeout(remaining())
+                peer.connect(self._channel.socket_path)
+                pid, pidfd, start = _check_supervisor_peer(peer, self._channel.supervisor_peer)
+            else:
+                import ssl
+                raw_socket = socket.create_connection((self._channel.host, self._channel.port), timeout=remaining())
+                try:
+                    peer = self._tls.wrap_socket(raw_socket, server_hostname=None, do_handshake_on_connect=False)
+                except BaseException:
+                    raw_socket.close()
+                    raise
+                peer.settimeout(remaining())
+                try:
+                    peer.do_handshake()
+                except ssl.SSLCertVerificationError:
+                    raise PeerMismatch() from None
+                _check_spki(peer, self._channel.server_spki_sha256)
+            # Identity verified: only now is any application byte written.
+            peer.settimeout(remaining())
+            peer.sendall(request)
+            status, raw = _read_response(peer, remaining)
+            if pidfd is not None:
+                _require(not select.select([pidfd], [], [], 0)[0] and _proc_start(pid) == start,
+                         SupervisorRouteError('peer'))
+            return status, raw
+        except PeerMismatch:
+            raise PeerMismatch() from None
+        except Exception:
+            # Sanitized: no header, token or supervisor text in the chain.
+            raise SupervisorRouteError('transport exchange unavailable') from None
+        finally:
+            del request
+            if pidfd is not None:
+                os.close(pidfd)
+            if peer is not None:
+                peer.close()
