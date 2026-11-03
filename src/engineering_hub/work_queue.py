@@ -358,7 +358,7 @@ class WorkQueue:
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
     def cancel_unclaimed(self, *, actor, job_id):
-        """Cancel the caller's provably never-claimed queue entry; no host effect."""
+        """Cancel an eligible never-claimed queue entry; controller resources are separate."""
         if type(actor) is not str or actor not in AGENTS:
             raise HubError('invalid_work_actor')
         _key(job_id)
@@ -372,6 +372,17 @@ class WorkQueue:
             # Legacy agents may clear an archived project's unclaimed job;
             # installation principals are not supported by this queue yet.
             self.repo._project(row['project'], db, require_active=False)
+            # Modular source deposits and resource registration straddle queue
+            # insertion; only the controller can safely cancel that lifecycle.
+            # A durable submission precedes queue admission in both schemas.
+            target = json.loads(row['target'])
+            staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
+            if (row['action_key'].startswith(('modular.', 'staging-service.'))
+                    or staging_table and db.execute(
+                        "SELECT 1 FROM hub_staging_submissions WHERE id IN (?,?) OR json_extract(data,'$.job_id')=? OR (actor=? AND request_id=?) LIMIT 1",
+                        (target.get('task_id'), target.get('submission_id'), job_id, actor,
+                         row['request_id'][len('staging:'):] if row['request_id'].startswith('staging:') else None)).fetchone()):
+                raise HubError('work_controller_cancel_required', 409)
             if row['state'] == 'cancelled':
                 return self._public(row)
             if (row['state'] != 'queued' or row['revision'] != 1
