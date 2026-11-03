@@ -381,6 +381,7 @@ async def test_direct_agents_ingress_uses_exact_session_service_and_keeps_legacy
                         await session.initialize()
                         assert sdk_data(await session.call_tool('session_identity', {}))['installation_id'] == pending['id']
                         assert (await session.call_tool('hub_overview', {})).isError
+                        assert (await session.call_tool('hub_overview', {'active_only': True, 'project': 'treedar'})).isError
             assert (await http.get('/api/hub/v1/overview', headers=headers(token))).status_code == 401
             assert (await http.get('/api/hub/v1/overview', headers=headers(AUTH.codex_token))).status_code == 200
             assert (await http.get('/api/messages', headers=headers(AUTH.codex_token))).status_code == 200

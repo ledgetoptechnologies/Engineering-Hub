@@ -157,8 +157,12 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
         With no arguments, everything is returned. active_only keeps tasks that
         aren't withdrawn, open decisions and runs that still hold their task
-        (pending, running, held or failed); project keeps one project's items.
-        'omitted' counts what a filter left out, so an agent knows to ask again.
+        (pending, running, held or failed); project keeps one project's tasks,
+        decisions and runs. 'omitted' counts what a filter left out, so an agent
+        knows to ask again.
+
+        Presentation only, not access control: the caller can already read every
+        project, and paused, agents, autonomy and image_versions stay global.
         """
         identity(ctx)
         if type(active_only) is not bool or (project is not None and (type(project) is not str or not project)):
