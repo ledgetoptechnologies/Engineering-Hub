@@ -145,16 +145,28 @@ What is enforced in source:
   `REPLACE` (which with the default `recursive_triggers=OFF` would delete the
   conflicting row without DELETE triggers) and upserts that collide with an
   in-flight job (by id, sequence or actor/request id) or its machine row.
-- The signing transaction reads only through its own connection and runs no
-  operator callback (those run in the precheck), so nothing can wait on the
-  write lock it holds. It refuses if a shared execution policy is composed.
+- The signing transaction reads only through its own connection. The queue's
+  own operator callbacks run only in the precheck. The ONE callback inside the
+  transaction is the target authorizer below, which is restricted, read-only
+  and time-bounded. Signing refuses if a shared execution policy is composed.
 - Target authorization at signing: the queue's configured target verifier is an
   arbitrary callback and only runs in the precheck. Inside the signing
-  transaction an explicitly supplied `target_authorization.authorized_in_txn(db,
-  ...)` must decide from durable rows read through that same connection; its
-  author documents which rows constitute authorization. The default
-  (`RefusingTargetAuthorization`) refuses, so without one nothing is signed. The
-  test-only implementation reads the task row in `hub_entities`.
+  transaction an explicitly supplied `target_authorization.authorized_in_txn(view,
+  ...)` must decide as a PURE function of rows read through
+  `ReadOnlyAuthorizationView.execute(select, params)`: no blocking or external
+  I/O, no mutable process state. For the call an sqlite3 authorizer allows only
+  SELECT, functions and reads of `hub_entities`, `hub_work_jobs`,
+  `hub_work_machines` and `hub_work_policy`; transaction control, writes,
+  ATTACH and PRAGMA are denied. Any denial (even if swallowed), any change in
+  `total_changes`, a lost savepoint/transaction or a call longer than
+  `authorization_budget` (default 0.25 s, measured after the fact; a blocking
+  call cannot be pre-empted) aborts the whole transaction: no mark, no
+  signature. The object must declare `equivalent_target_verifier` as the exact
+  queue target verifier it reproduces; any other value refuses composition.
+  That equivalence is declared, not proven, and must be concretely reviewed
+  before enabling. The default (`RefusingTargetAuthorization`) declares none, so
+  composition refuses. The test-only implementation reads the task row and a
+  revocation row in `hub_entities`.
   Pre-existing: `WorkQueue` invokes target/claim callbacks inside its own
   transactions; a callback that tries to write there waits for the
   connection's busy timeout and then fails closed.

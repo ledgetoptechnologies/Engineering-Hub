@@ -183,19 +183,26 @@ def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=
 
 
 class TaskRowAuthorization:
-    """Test-only transactional authorization: the durable task row, read via
-    the signing connection. ``deny`` simulates a flipped decision."""
+    """Test-only transactional authorization reproducing ``_verifier``: the
+    durable task row plus an absent revocation row, read via the view.
+    ``deny`` simulates a flipped decision; ``action`` a hostile authorizer."""
     def __init__(self):
         self.deny = False
+        self.action = None
+        self.equivalent_target_verifier = None
 
-    def authorized_in_txn(self, db, actor, action_key, environment, target):
-        row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
-        task = json.loads(row[0])
-        return (not self.deny and task['owner'] == actor and task['status'] == 'verified'
+    def authorized_in_txn(self, view, actor, action_key, environment, target):
+        if self.action is not None:
+            self.action(view)
+        task = json.loads(view.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'",
+                                       (target.task_id,))[0][0])
+        revoked = view.execute("SELECT 1 FROM hub_entities WHERE id='ci-authorization-revoked'")
+        return (not self.deny and not revoked and task['owner'] == actor and task['status'] == 'verified'
                 and task['candidate_commit'] == target.source_commit)
 
 
 def make_bridge(rig, queue, owner, *, authenticator=RIG, target_authorization=RIG, enable=True):
+    rig.authorization.equivalent_target_verifier = queue.target_verifier
     return DurableDevelopmentCIHandoff(queue, owner, rig.manifest, rig.channel, action_key=ACTION,
         host_generation=rig.generation, authenticator=rig.auth if authenticator is RIG else authenticator,
         target_authorization=rig.authorization if target_authorization is RIG else target_authorization,
@@ -1071,6 +1078,7 @@ async def test_signing_transaction_runs_no_callback_that_could_wait_on_its_lock(
         return original_target(*args)
     rig.bridge._binding_in_txn = binding
     rig.bridge._target = writing_callback
+    rig.authorization.equivalent_target_verifier = writing_callback  # keep declared equivalence
     started = clock.monotonic()
     result = await asyncio.wait_for(rig.bridge.run_once(), timeout=20)
     assert result['id'] == job['id'] and result['state'] == 'succeeded'
@@ -1086,7 +1094,11 @@ async def test_target_authorization_change_after_precheck_records_no_mark(rig, m
     job = rig.queue.submit(actor='codex', request_id='authz', action_key=ACTION, environment='staging',
                            target=WorkTarget(task['id'], task['candidate_commit'], rig.manifest.digest))
     if change == 'default':
-        restart_hub(rig, target_authorization=None)
+        # The default authorization declares no equivalent verifier: refused.
+        with pytest.raises(HubError, match='development_ci_handoff_authorization_mismatch'):
+            restart_hub(rig, target_authorization=None)
+        assert getattr(rig.repo, '_development_ci', None) is None and reservation(rig) is None
+        return
     original, calls = rig.bridge._bound, []
     def bound_then_change(attempt):
         result = original(attempt)  # the queue's callback verifier said True here
@@ -1107,3 +1119,87 @@ async def test_target_authorization_change_after_precheck_records_no_mark(rig, m
         assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
     assert not rig.channel.starts and not rig.runner.calls and host_rows(rig) == []
     assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and reservation(rig) == job['id']
+
+
+def _hostile(kind):
+    def act(view):
+        raw = view._connection
+        try:
+            if kind == 'commit':
+                view.execute('COMMIT')
+            elif kind == 'raw_commit':
+                raw.commit()
+            elif kind == 'rollback':
+                raw.execute('ROLLBACK')
+            elif kind == 'insert':
+                raw.execute("INSERT INTO hub_entities VALUES('hostile','policy','{}')")
+            elif kind == 'update':
+                raw.execute("UPDATE hub_work_policy SET revision=revision+1")
+            elif kind == 'delete':
+                raw.execute("DELETE FROM hub_entities WHERE id='pause'")
+            elif kind == 'attach':
+                raw.execute("ATTACH DATABASE ':memory:' AS other")
+            elif kind == 'unhook_write':
+                raw.set_authorizer(None)
+                raw.execute("INSERT INTO hub_entities VALUES('hostile','policy','{}')")
+        except Exception:
+            pass  # swallowing the denial must not help
+    return act
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['commit', 'raw_commit', 'rollback', 'insert', 'update', 'delete', 'attach',
+                                  'unhook_write'])
+async def test_hostile_authorizer_is_refused_and_txn_aborted_cleanly(rig, kind):
+    job = submit(rig)
+    with rig.repo._connection() as db:
+        before = db.execute('SELECT revision FROM hub_work_policy WHERE id=1').fetchone()[0]
+    rig.authorization.action = _hostile(kind)
+    await rig.bridge.run_once()
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM hub_entities WHERE id='hostile'").fetchone()[0] == 0
+        assert db.execute('SELECT revision FROM hub_work_policy WHERE id=1').fetchone()[0] == before
+    assert not rig.channel.starts and not rig.runner.calls
+    assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and reservation(rig) == job['id']
+
+
+@pytest.mark.asyncio
+async def test_cross_connection_revocation_before_signing_txn_is_refused(rig, monkeypatch):
+    job = submit(rig)
+    original, calls = rig.bridge._bound, []
+    def bound_then_revoke(attempt):
+        result = original(attempt)
+        calls.append(1)
+        if len(calls) == 2:
+            raw = sqlite3.connect(rig.path, timeout=5)
+            raw.execute("INSERT INTO hub_entities VALUES('ci-authorization-revoked','policy','{}')")
+            raw.commit()
+            raw.close()
+        return result
+    monkeypatch.setattr(rig.bridge, '_bound', bound_then_revoke)
+    await rig.bridge.run_once()
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+    assert not rig.channel.starts and not rig.runner.calls and reservation(rig) == job['id']
+
+
+def test_authorization_policy_identity_mismatch_is_refused(rig):
+    restart_hub(rig, compose=False)
+    rig.authorization.equivalent_target_verifier = lambda *args: True  # not the queue's verifier
+    with pytest.raises(HubError, match='development_ci_handoff_authorization_mismatch'):
+        DurableDevelopmentCIHandoff(rig.queue, rig.owner, rig.manifest, rig.channel, action_key=ACTION,
+            host_generation=rig.generation, authenticator=rig.auth, target_authorization=rig.authorization,
+            enable_durable_handoff=True)
+    assert getattr(rig.repo, '_development_ci', None) is None
+
+
+@pytest.mark.asyncio
+async def test_slow_authorizer_over_budget_is_refused(rig):
+    import time as clock
+    job = submit(rig)
+    rig.authorization.action = lambda view: clock.sleep(0.4)  # budget 0.25 s
+    await rig.bridge.run_once()
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+    assert not rig.channel.starts and not rig.runner.calls and reservation(rig) == job['id']

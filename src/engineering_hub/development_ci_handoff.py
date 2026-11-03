@@ -125,12 +125,49 @@ class RefusingTargetAuthorization:
 
     The queue's configured target verifier is an arbitrary callback whose
     answer can change after the precheck. Signing therefore also needs
-    ``authorized_in_txn(db, actor, action_key, environment, target)`` that
-    decides ONLY from rows read through the given signing connection ``db``
-    (durable authorization state), never via callbacks or other connections.
+    ``authorized_in_txn(view, actor, action_key, environment, target)``: a
+    PURE function of rows read through ``view.execute(select_sql, params)``
+    (a read-only view of the signing connection). It must not block, do
+    external I/O or depend on mutable process state. It must also declare
+    ``equivalent_target_verifier``: the exact queue target verifier object
+    whose policy it reproduces; that equivalence must be concretely reviewed
+    before enabling.
     """
-    def authorized_in_txn(self, db, actor, action_key, environment, target):
+    equivalent_target_verifier = None
+
+    def authorized_in_txn(self, view, actor, action_key, environment, target):
         return False
+
+
+AUTHORIZATION_TABLES = frozenset({'hub_entities', 'hub_work_jobs', 'hub_work_machines', 'hub_work_policy'})
+
+
+class ReadOnlyAuthorizationView:
+    """SELECT-only access to the signing connection for the authorizer call.
+
+    An sqlite3 authorizer installed for the call's duration denies everything
+    except SELECT, function calls and reads of ``AUTHORIZATION_TABLES`` in the
+    main database (no transaction control, writes, ATTACH or PRAGMA). Any
+    denial is recorded and refuses the signature even if the caller swallowed
+    the error.
+    """
+    def __init__(self, connection):
+        self._connection = connection
+        self.denied = False
+
+    def execute(self, sql, params=()):
+        if not isinstance(sql, str) or not sql.lstrip()[:6].upper() == 'SELECT':
+            self.denied = True
+            raise HandoffRefused('handoff_authorization_read_only')
+        return [tuple(row) for row in self._connection.execute(sql, params).fetchall()]
+
+    def _authorize(self, action, first, second, database, trigger):
+        if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_READ and first in AUTHORIZATION_TABLES and database == 'main':
+            return sqlite3.SQLITE_OK
+        self.denied = True
+        return sqlite3.SQLITE_DENY
 
 
 class RefusingClaimConfirmer:
@@ -1003,8 +1040,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
     _handoff_mode = True
 
     def __init__(self, queue, owner, manifest, channel, *, action_key, host_generation,
-                 authenticator=None, target_authorization=None, enable_durable_handoff=False,
-                 renew_interval=120,
+                 authenticator=None, target_authorization=None, authorization_budget=0.25,
+                 enable_durable_handoff=False, renew_interval=120,
                  monotonic=time.monotonic):
         if enable_durable_handoff is not True:
             raise HubError('development_ci_handoff_disabled', 409)
@@ -1023,10 +1060,18 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         except HandoffRefused:
             raise HubError('development_ci_handoff_composition_required', 409) from None
         self._target_authorization = self.target_authorization
+        if (type(authorization_budget) not in (int, float) or not math.isfinite(authorization_budget)
+                or not 0 < authorization_budget <= 2):
+            raise HubError('development_ci_handoff_composition_required', 409)
+        self.authorization_budget = authorization_budget
         self.channel, self.host_generation = channel, host_generation
         super().__init__(queue, owner, manifest, _UnusedProvider(), action_key=action_key,
                          renew_interval=renew_interval, monotonic=monotonic)
         try:
+            # Policy equivalence: the authorizer must name the exact configured
+            # queue target verifier it reproduces (reviewed before enabling).
+            if getattr(self.target_authorization, 'equivalent_target_verifier', None) is not self._target:
+                raise HubError('development_ci_handoff_authorization_mismatch', 409)
             with self.repo._transaction() as db:
                 enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                       "AND name='hub_development_ci_handoff_policy'").fetchone()
@@ -1143,6 +1188,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         """
         try:
             if (self._composition_changed() or self.target_authorization is not self._target_authorization
+                    or getattr(self.target_authorization, 'equivalent_target_verifier', None) is not self._target
                     or not _schema_matches(db, _HUB_EXPECTED)):
                 return False
             task = self.repo._get(db, attempt.task_id, 'task')
@@ -1181,10 +1227,36 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                     and action.environments == frozenset({'staging'}) and action.requires_execution_proof
                     and not self.queue._shared_policy_present()
                     and self.repo.task_allows_environment(attempt.task_id, 'staging', db=db) is True
-                    and self.target_authorization.authorized_in_txn(
-                        db, attempt.actor, self.action_key, 'staging', target) is True)
+                    and self._authorized_in_txn(db, attempt, target))
         except Exception:
             return False
+
+    def _authorized_in_txn(self, db, attempt, target):
+        """The one restricted, read-only, time-bounded callback in the signing txn."""
+        view = ReadOnlyAuthorizationView(db)
+        changes = db.total_changes
+        db.execute('SAVEPOINT handoff_authorization')
+        started = time.monotonic()
+        db.set_authorizer(view._authorize)
+        try:
+            decision = self.target_authorization.authorized_in_txn(
+                view, attempt.actor, self.action_key, 'staging', target)
+        except Exception:
+            decision = False
+        finally:
+            db.set_authorizer(None)
+        elapsed = time.monotonic() - started
+        try:
+            # Same transaction, no writes: the savepoint must still exist.
+            intact = db.in_transaction and db.total_changes == changes
+            db.execute('RELEASE handoff_authorization')
+        except Exception:
+            intact = False
+        if not intact or view.denied:
+            # Abort the whole signing txn (rolls back anything an escaped
+            # authorizer wrote); no mark, no signature.
+            raise HubError('development_ci_handoff_authorization_tampered', 409)
+        return decision is True and elapsed <= self.authorization_budget
 
     def _prior_release(self):
         """Hub-signed release of the latest attempt whose queue job was released."""
