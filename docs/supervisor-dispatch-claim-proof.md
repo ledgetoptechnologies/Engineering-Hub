@@ -31,8 +31,11 @@ challenge_nonce, issued_at, state)`, guarded by triggers:
 - At most one non-terminal row per job (unique while `state = 'in_flight'`).
 - A row is inserted in the **same Hub transaction** that checks, against the
   authoritative job store, the current owner, lease, fence, run and that the
-  reservation receipt is committed for this job. That transaction also signs the
-  claim proof (B), and the proof is returned only after commit.
+  reservation receipt is committed for this job. The claim proof (B) is signed
+  for that row, but no usable proof bytes leave the signer, are logged, or are
+  returned until the barrier row's commit is durable (committed and synced). If
+  the commit or sync fails, the proof is discarded and never released. Tests
+  cover commit failure and fsync failure.
 - Leaving `in_flight` needs evidence: `dispatched` / `refused` only from a
   verified signed supervisor observation recorded in the Hub transaction (the
   inspection transport); `expired_unsent` only from a signed supervisor statement
@@ -71,14 +74,51 @@ challenge_nonce, issued_at, state)`, guarded by triggers:
    - consumes the nonce (one use) and marks the reservation dispatched, then sends.
    Any failure is held with zero bytes.
 4. **Expiry is one-sided and provable.** A nonce not consumed within `proof_window`
-   is dead for good. The supervisor records that, and can sign
-   `{nonce, reservation, status: expired_unconsumed}`. That signed statement is
-   the only thing that lets the Hub move the barrier row to `expired_unsent`
-   without an operator.
-5. **Hub-side bound.** The Hub issues a proof only if the worker's lease has at
-   least `proof_window + transit_margin + skew_margin` left. Because of A, the lease
-   doesn't actually lapse while the row is in flight; the margin just keeps the
-   normal case from turning into an operator hold.
+   is dead for good. In **one** supervisor journal transaction the supervisor
+   checks that the nonce is not consumed and its reservation not dispatched, and
+   marks the nonce expired (revoked). Only after that commit can it sign
+   `{nonce, reservation, status: expired_unconsumed}`. A dispatch racing the
+   expiry either consumes first (expiry then refuses) or finds it expired (held);
+   both orders are race-tested. That signed statement is the only thing that lets
+   the Hub move the barrier row to `expired_unsent` without an operator. A
+   restored or rolled-back supervisor journal could resurrect an outstanding
+   nonce; that stays an open anchor gap.
+5. **Hub-side margin, not a proof.** The Hub issues a proof only if the worker's
+   lease has at least `proof_window + transit_margin + skew_margin` left. This
+   does **not** prove the lease is unexpired when the bytes are sent: the proof can
+   be delayed arbitrarily (Hub suspend, slow network) and the window only runs on
+   the supervisor's clock from challenge issue. The margin only keeps the normal
+   case from becoming an operator hold. What the supervisor actually verifies is
+   described under "Authority model".
+
+### Authority model
+
+The authority a dispatch carries is **retained original ownership under the
+barrier**, not an unexpired wall-clock lease.
+
+- While a barrier row is `in_flight`, the original owner keeps authority to have
+  that one reservation dispatched, even if its wall-clock lease expires or the Hub
+  is suspended. Lease expiry during that time doesn't revoke it; it only makes the
+  job `held` for everything else (no renewal, no reclaim, no reassignment).
+- So a proof delayed past the Hub-side lease expiry, or across a Hub suspend, may
+  still be accepted, provided the supervisor-side window and nonce checks pass.
+  That is the defined behaviour, and it is tested as such.
+- The only way to end that authority without the supervisor's signed outcome is
+  the supervisor-side expiry in B.4. Nothing in the Hub can end it unilaterally.
+- If a deployment needs "never send after wall-clock lease expiry", that requires
+  an expiry check the host can enforce itself (a supervisor-trusted clock or a
+  supervisor-held lease). It is out of scope here and isn't provided by this design.
+
+### Revocation is coordinated, not immediate
+
+Session and grant revocation live in a separate database from the job store. So:
+
+- Every revoke and expiry path (session revoke, grant revoke, installation
+  revoke, emergency halt, lease expiry) must coordinate with the Hub job store,
+  with pending semantics: it records the revocation, blocks new proofs at once,
+  and the affected jobs reach `revoke_pending` until their barrier rows resolve.
+- There is no promise of an immediate halt of a dispatch already authorised by a
+  proof. Halting work already sent is the executor effect fence's job.
 
 ### Why both
 
@@ -114,6 +154,10 @@ the operator. This is strictly weaker and should only be a stopgap.
 
 ## Open (unchanged)
 
+- Old or direct writers (anything that changes job ownership, leases or
+  reservations without going through the barrier checks) and restores of either
+  database break these guarantees. They need enforced exclusion (single writer,
+  schema/trigger checks, refusing old schema versions), not just convention.
 - No external non-rollback anchor for the Hub DB or the supervisor journal.
 - Detached executor work isn't fenced by any of this.
 - Keys: Hub dispatch key, supervisor reservation and inspection keys; enrollment
