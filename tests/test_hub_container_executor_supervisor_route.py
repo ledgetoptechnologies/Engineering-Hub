@@ -728,21 +728,23 @@ _BAD_RESPONSES = {
 }
 
 
-class _StretchedServer(_ScriptedServer):
-    """Scripted peer whose delays are stretched and interruptible on close.
+class _BarrierServer(_ScriptedServer):
+    """Scripted peer with an explicit, test-owned barrier on its FIRST connection.
 
-    Each connection's script finishing is recorded, so a test can show that the
-    ROUTE's own deadline ended an exchange while the peer was still mid-script,
-    instead of racing wall-clock time against a tight bound."""
-    STRETCH = 5  # 3 s stalls / 60 x 0.05 s trickles become >= 15 s.
+    After reading the request it records ``entered_at`` and sets ``entered``,
+    sends any undelayed chunks, and at its first delay sets ``blocked`` and
+    waits on ``release``, which only the test sets (``_PEER_GUARD_S`` is a hang
+    guard). It never completes or closes that script on its own, so ``left``
+    (set only when the first connection's handler returns) stays clear until
+    the test releases it: any earlier end of the exchange was the route's."""
 
     def __init__(self, path, scripts):
-        self.stop, self.finished = threading.Event(), []
+        self.entered, self.blocked, self.release, self.left = (threading.Event() for _ in range(4))
+        self.entered_at, self._first = None, True
         super().__init__(path, scripts)
 
     def _serve(self, peer, script):
-        done = threading.Event()
-        self.finished.append(done)
+        first, self._first = self._first, False
         try:
             peer.settimeout(10)
             data = b""
@@ -753,24 +755,32 @@ class _StretchedServer(_ScriptedServer):
                          .split(b":")[1])
             while len(body) < length:
                 body += peer.recv(65536)
+            if first:
+                self.entered_at = time.monotonic()
+                self.entered.set()
             for delay, chunk in script(body):
-                if self.stop.wait(delay * self.STRETCH):
+                if delay and first:
+                    self.blocked.set()
+                    self.release.wait(_PEER_GUARD_S)
                     return
+                time.sleep(delay)
                 peer.sendall(chunk)
         except OSError:
             pass
         finally:
             peer.close()
-            done.set()
+            if first:
+                self.left.set()
 
     def close(self):
-        self.stop.set()
+        self.release.set()
         super().close()
 
 
 # Cases only the route's total deadline can end (the peer is slow or silent, not malformed).
 _DEADLINE_ENDED = frozenset({"trickle_headers", "trickle_body", "stalled_headers", "stalled_body", "no_eof"})
-_HANG_GUARD_S = 5.0  # Generous: catches a missing deadline (peer needs >= 15 s), not scheduling noise.
+_HANG_GUARD_S = 10.0  # Generous upper bound on the exchange: catches a missing deadline, not load.
+_PEER_GUARD_S = 15.0  # The barrier server gives up only after this (hang guard of last resort).
 
 
 @LINUX
@@ -778,23 +788,26 @@ _HANG_GUARD_S = 5.0  # Generous: catches a missing deadline (peer needs >= 15 s)
 def test_bounded_strict_response_framing_is_held_and_releases_lock(world, case):
     directory = tempfile.mkdtemp(dir="/tmp")
     path = os.path.join(directory, "s.sock")
-    server = _StretchedServer(path, [_BAD_RESPONSES[case], _good])
+    server = _BarrierServer(path, [_BAD_RESPONSES[case], _good])
     try:
         deadline_s = 0.6
         world["epochs"].value = (world["epoch"], _own_pin())
         route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=int(deadline_s * 1000))
         cmd = command(world["epoch"])
-        started = time.monotonic()
         result = route.submit(cmd)
-        elapsed = time.monotonic() - started
+        returned_at = time.monotonic()
         assert result.state == "held" and result.record is None, case
+        assert server.entered.is_set(), case  # The exchange really reached the peer.
         if case in _DEADLINE_ENDED:
-            # Ended by the configured deadline: never before it, and while the
-            # peer was still mid-script (it needs >= 15 s to finish or close).
-            # Load can only make the route later, never the peer earlier.
-            assert elapsed >= deadline_s - 0.05, (case, elapsed)
-            assert not server.finished[0].is_set(), case
-        assert elapsed < deadline_s + _HANG_GUARD_S, (case, elapsed)
+            # The peer cannot finish or close on its own (test-owned barrier),
+            # so only the route's own deadline can have ended the exchange.
+            # Independent of EPIPE: the peer sends nothing while blocked.
+            assert not server.left.is_set() and not server.release.is_set(), case
+            assert server.blocked.wait(_PEER_GUARD_S), case  # It did reach the barrier, not EOF.
+            elapsed = returned_at - server.entered_at  # From exchange entry, not before forwarding.
+            assert 0 <= elapsed < deadline_s + _HANG_GUARD_S, (case, elapsed)
+        server.release.set()
+        assert server.left.wait(_PEER_GUARD_S), case
         assert route._mutex.acquire(blocking=False)
         route._mutex.release()
         assert route.submit(cmd).state == "held"  # Never redispatched.
