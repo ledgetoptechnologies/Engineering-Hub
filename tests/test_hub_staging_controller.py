@@ -668,3 +668,25 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
     finally:
         await client.aclose()
         service.close()
+
+@pytest.mark.asyncio
+async def test_cancel_during_submit_resource_registration_never_abandons_deposit(env):
+    controller, client, resources, _, repo = env
+    original=controller.queue.submit
+    observed=[]
+    def interrupted(*args, **kwargs):
+        job=original(*args, **kwargs)
+        with repo._connection() as db:
+            row=db.execute('SELECT data FROM hub_staging_submissions').fetchone()
+            assert json.loads(row['data'])['job_id'] is None
+        with pytest.raises(HubError, match='work_controller_cancel_required'):
+            controller.queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+        observed.append(job['id'])
+        return job
+    controller.queue.submit=interrupted
+    submitted=await controller.submit('codex',payload())
+    assert observed==[submitted['job']['id']]
+    assert submitted['job']['state']=='queued'
+    assert submitted['source_id'] and len(submitted['resource_ids'])==4
+    assert client.deposits==1 and client.posts==0
+    assert (await controller.run_once())['job']['state']=='succeeded'

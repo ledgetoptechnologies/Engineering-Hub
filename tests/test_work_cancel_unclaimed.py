@@ -139,3 +139,28 @@ def test_concurrent_same_task_only_one_submission(setup_queue):
     with ThreadPoolExecutor(max_workers=2) as pool:
         first,second=pool.submit(run,'a'),pool.submit(run,'b')
         assert sorted([first.result(),second.result()]) == ['queued','work_task_already_queued']
+
+
+def test_durable_modular_submission_denies_custom_action_cancel(setup_queue):
+    import json
+    queue, _, repo, _=setup_queue
+    source=target=WorkTarget(str(__import__('uuid').uuid4()),'a'*40,'sha256:'+'b'*64)
+    with repo._transaction() as db:
+        db.execute('CREATE TABLE hub_staging_submissions(id TEXT PRIMARY KEY,actor TEXT,request_id TEXT,data TEXT)')
+        db.execute('INSERT INTO hub_staging_submissions VALUES(?,?,?,?)',
+            (source.task_id,'codex','source-request',json.dumps({'job_id':None,'source_id':'deposited'})))
+    job=submit(queue,'staging:source-request',target=target)
+    with pytest.raises(HubError,match='work_controller_cancel_required'):
+        queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+    assert queue.get_job(job['id'])['state']=='queued'
+    with repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_staging_submissions').fetchone()[0]==1
+
+
+def test_reserved_modular_namespace_denies_without_controller_state(setup_queue):
+    from engineering_hub.work_queue import WorkAction
+    queue, _, _, _=setup_queue
+    queue.actions['modular.synthetic']=WorkAction('machine-one',project='engineering-hub')
+    job=submit(queue,'reserved',action='modular.synthetic')
+    with pytest.raises(HubError,match='work_controller_cancel_required'):
+        queue.cancel_unclaimed(actor='codex',job_id=job['id'])
