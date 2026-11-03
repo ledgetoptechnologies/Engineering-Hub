@@ -96,3 +96,22 @@ def test_errors_do_not_reflect_peer_input(hub):
     assert response["isError"] is True
     assert sentinel not in str(response)
     assert "not_found" in str(response)
+
+
+def test_overview_filters_keep_active_items_and_count_the_rest(hub):
+    client, repo = hub
+    kept = repo.create_task("human:123", "3d-viewer", "Active fixture", "request-active")
+    gone = repo.create_task("human:123", "3d-viewer", "Withdrawn fixture", "request-gone")
+    repo.withdraw("human:123", "task", gone["id"], gone["revision"], "fixture")
+    other = repo.create_task("human:123", "treedar", "Other project", "request-other")
+    full = call(client, "hub_overview")["structuredContent"]
+    assert "omitted" not in full and {item["id"] for item in full["tasks"]} >= {kept["id"], other["id"]}
+    scoped = call(client, "hub_overview", {"project": "3d-viewer"})["structuredContent"]
+    assert other["id"] not in {item["id"] for item in scoped["tasks"]}
+    assert scoped["omitted"]["tasks"] >= 1
+    active = call(client, "hub_overview", {"active_only": True})["structuredContent"]
+    assert all(item["status"] != "withdrawn" for item in active["tasks"])
+    assert all(item["status"] == "open" for item in active["decisions"])
+    assert set(active["omitted"]) == {"tasks", "decisions", "runs"}
+    for bad in ({"active_only": "yes"}, {"project": ""}):
+        assert call(client, "hub_overview", bad)["isError"] is True
