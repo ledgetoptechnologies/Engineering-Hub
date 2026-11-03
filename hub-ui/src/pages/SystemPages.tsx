@@ -43,7 +43,31 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
   );
 }
 
-export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+/** Agent installations on their own page: pairing, sessions and Hub access, apart from the status overview. */
+function AgentInstallationsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+  return (
+    <>
+      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations"
+        subtitle="Each agent installation, its sessions and its Hub access. No passwords or tokens are shown here.">
+        {actions}
+      </PageHeader>
+      <div id="agents" className="agents-page">
+        {/* Keyed on the signed-in actor: a different person gets a fresh panel, with nothing of the previous owner's kept or late-filled. */}
+        <AgentConnectionsPanel key={hub.session?.actor ?? "signed-out"} hub={hub} />
+        <p className="panel-footnote">
+          Installations are listed only when this Hub runs agent sessions. Stream observations and topic readiness
+          are on the <a className="text-link" href={link("/agents")}>Agents overview</a>.
+        </p>
+      </div>
+    </>
+  );
+}
+
+export function AgentsPage({ hub, actions, view = "overview" }: { hub: Hub; actions: React.ReactNode; view?: "overview" | "installations" }) {
+  return view === "installations" ? <AgentInstallationsPage hub={hub} actions={actions} /> : <AgentsOverview hub={hub} actions={actions} />;
+}
+
+function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const { peers, demo, stale, topicStale } = hub;
   const [serverTopics, setServerTopics] = useState<TopicEntry[] | null>(null);
   const [remembered, setRemembered] = useState<string[]>(rememberedTopics);
@@ -80,8 +104,9 @@ export function AgentsPage({ hub, actions }: { hub: Hub; actions: React.ReactNod
         client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
         offline. Topic readiness is checked separately.
       </p>
-      {/* Keyed on the signed-in actor: a different person gets a fresh panel, with nothing of the previous owner's kept or late-filled. */}
-      <AgentConnectionsPanel key={hub.session?.actor ?? "signed-out"} hub={hub} />
+      <p className="panel-footnote">
+        Agent installations, their sessions and Hub access are under <a className="text-link" href={link("/agents/installations")}>Installations</a>.
+      </p>
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
         <div className="topics-layout">
@@ -172,12 +197,49 @@ export function stagingSummary(projects: { executor_enabled: boolean }[]): strin
   return `${ready} of ${projects.length} project${projects.length === 1 ? " has" : "s have"} a staging target enabled.`;
 }
 
-export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
+export function StagingPage({ hub, actions, view = "overview" }: {
+  hub: Hub; actions: React.ReactNode; view?: "overview" | "queues" | "resources";
+}) {
   const { data } = hub;
+  if (view === "queues") return (
+    <>
+      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions"
+        subtitle="The shared staging queue, staging session review and the software validation queue. Software only.">
+        {actions}
+      </PageHeader>
+      <div className="staging-layout single">
+        {(hub.demo || hub.session?.authenticated) && (
+          <SharedStagingPanel mode={hub.demo ? "demo" : "live"} csrf={hub.session?.csrf_token ?? null}
+            writable={hub.writable} stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+        )}
+        {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
+          <SessionReconciliationPanel csrf={hub.session.csrf_token}
+            enabled={true} writable={hub.writable} stale={hub.stale}
+            onAuthError={hub.clearPrivateWorkspace} />
+        )}
+        <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
+          stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
+      </div>
+    </>
+  );
+  if (view === "resources") return (
+    <>
+      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources"
+        subtitle="What is kept on staging, held jobs and clean-up. Software only.">
+        {actions}
+      </PageHeader>
+      <div className="staging-layout single">
+        <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
+          csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
+          projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
+          viewerActor={hub.session?.actor ?? null} onUnauthorized={hub.clearPrivateWorkspace} />
+      </div>
+    </>
+  );
   return (
     <>
       <PageHeader eyebrow="STAGING" title="Staging"
-        subtitle="Staging targets, the emergency pause, execution evidence and the validation queue. Software only.">
+        subtitle="Staging targets, the emergency pause, execution evidence and what is running on the staging PC. Software only.">
         {actions}
       </PageHeader>
       <div className="staging-layout">
@@ -239,22 +301,11 @@ export function StagingPage({ hub, actions }: { hub: Hub; actions: React.ReactNo
         {(hub.demo || hub.session?.authenticated) && (
           <StagingRuntimePanel mode={hub.demo ? "demo" : "live"} onUnauthorized={hub.clearPrivateWorkspace} />
         )}
-        {(hub.demo || hub.session?.authenticated) && (
-          <SharedStagingPanel mode={hub.demo ? "demo" : "live"} csrf={hub.session?.csrf_token ?? null}
-            writable={hub.writable} stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
-        )}
-        {!hub.demo && data.autonomy.configured && hub.session?.authenticated && (
-          <SessionReconciliationPanel csrf={hub.session.csrf_token}
-            enabled={true} writable={hub.writable} stale={hub.stale}
-            onAuthError={hub.clearPrivateWorkspace} />
-        )}
-        <WorkQueuePanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
-          stale={hub.stale} onUnauthorized={hub.clearPrivateWorkspace} />
-        <StagingResourcesPanel mode={hub.demo ? "demo" : "live"} refreshToken={data}
-          csrf={hub.session?.csrf_token ?? null} writable={hub.writable} stale={hub.stale}
-          projects={data.projects.filter((item) => !item.archived).map((item) => ({ id: item.id, name: item.name }))}
-          viewerActor={hub.session?.actor ?? null} onUnauthorized={hub.clearPrivateWorkspace} />
       </div>
+      <p className="panel-footnote">
+        Queues and session review are under <a className="text-link" href={link("/staging/queues")}>Queues &amp; sessions</a>;
+        kept items and clean-up are under <a className="text-link" href={link("/staging/resources")}>Kept resources</a>.
+      </p>
     </>
   );
 }
