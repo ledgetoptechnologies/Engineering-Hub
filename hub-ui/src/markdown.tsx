@@ -32,8 +32,9 @@ export function inline(text: string, keyPrefix = ""): ReactNode[] {
     else {
       const [, label, url] = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(token)!;
       const safe = safeHref(url);
-      // In-app routes follow the current routing mode (hash or path) and keep demo mode.
-      const href = safe && /^\/(?!api\/)[^?#]*$/.test(safe) ? link(safe) : safe;
+      // In-app routes follow the current routing mode (hash or path) and keep demo mode. Routes are
+      // path-only, so a supplied query or fragment is dropped rather than sent to the server as a raw path.
+      const href = safe?.startsWith("/") && !safe.startsWith("/api/") ? link(safe.split(/[?#]/)[0]) : safe;
       out.push(href
         ? <a key={key} href={href} target={safe!.startsWith("/") ? undefined : "_blank"} rel="noopener noreferrer">{label}</a>
         : `${label} (${url})`);

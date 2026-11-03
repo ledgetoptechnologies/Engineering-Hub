@@ -33,6 +33,9 @@ describe("safe markdown", () => {
     expect(html("[ok](https://example.com/a)")).toContain('href="https://example.com/a"');
     expect(html("[hub](/projects/treedar)")).toContain('href="#/projects/treedar"');
     expect(html("[file](/api/hub/v1/attachments/x)")).toContain('href="/api/hub/v1/attachments/x"');
+    expect(html("[tab](/projects/treedar?tab=work)")).toContain('href="#/projects/treedar"');
+    expect(html("[part](/notes#later)")).toContain('href="#/notes"');
+    expect(html("[file](/api/hub/v1/attachments/x?download=1)")).toContain('href="/api/hub/v1/attachments/x?download=1"');
     for (const bad of ["javascript:alert(1)", "http://example.com", "data:text/html,x", "//evil.example"]) {
       const out = html(`[x](${bad})`);
       expect(out).not.toContain("href=");
