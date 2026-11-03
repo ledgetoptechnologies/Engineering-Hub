@@ -382,6 +382,12 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
         data = work_input(WorkSubmission, payload)
         return invoke(lambda: submit_reviewed_work(repo, configured_work(), principal, data))
 
+    def hub_work_cancel_unclaimed(payload: dict, ctx: Context) -> dict:
+        """Cancel only this agent's never-claimed job; never releases a running reservation."""
+        principal = identity(ctx)
+        data = work_input(WorkGet, payload)
+        return invoke(lambda: configured_work().cancel_unclaimed(actor=principal, job_id=data.job_id))
+
     def hub_work_claim(payload: dict, ctx: Context) -> dict:
         """Reserve one eligible job for this agent and process-instance UUID."""
         principal = identity(ctx)
@@ -410,7 +416,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     # must not advertise an unconfigured worker/admission capability.
     if work_queue is not None:
         for operation in (hub_work_status, hub_work_jobs, hub_work_get, hub_work_submit,
-                          hub_work_claim, hub_work_renew, hub_work_complete):
+                          hub_work_cancel_unclaimed, hub_work_claim, hub_work_renew, hub_work_complete):
             mcp.add_tool(operation)
 
     if label_sets is not None:

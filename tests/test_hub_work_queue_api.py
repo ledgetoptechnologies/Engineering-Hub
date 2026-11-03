@@ -192,13 +192,17 @@ def test_submit_binds_owned_reviewed_task_and_registered_project(rig, case):
     assert client.get(BASE + '/jobs', headers=bearer()).json()['items'] == []
 
 
-def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
+def test_production_priority_is_not_approval_and_active_review_is_frozen(rig):
     client, repo, _, _, _, submission, *_ = rig
     prod = submission(environment='production', approval_id='not-real-approval')
     assert client.post(BASE + '/jobs', headers=bearer(), json=prod).status_code == 201
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
     staging = submission()
     assert client.post(BASE + '/jobs', headers=bearer(), json=staging).status_code == 201
+    current = repo.get_task(staging['target']['task_id'])
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+    assert repo.get_task(current['id'])['candidate_commit'] == COMMIT
     corrupt_review_after_active_work(repo, staging['target']['task_id'])
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
 

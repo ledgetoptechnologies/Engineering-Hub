@@ -139,8 +139,11 @@ async def test_private_worker_only_and_fence_cannot_be_forged(rig):
 
 
 @pytest.mark.asyncio
-async def test_changed_review_prevents_claim_and_any_host_submission(rig):
+async def test_open_job_freezes_reviewed_task_and_allows_its_pilot(rig):
     task, _ = submit(rig)
+    current = rig.repo.get_task(task['id'])
+    with pytest.raises(HubError, match='active_work_job'):
+        rig.repo.set_candidate('codex', task['id'], current['revision'], 'f' * 40)
     corrupt_review_after_active_work(rig.repo, task["id"])
     assert await rig.bridge.run_once() is None
     assert rig.client.submissions == [] and rig.repo.list_runs() == []

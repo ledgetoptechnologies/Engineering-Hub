@@ -196,13 +196,17 @@ def test_mcp_closed_input_sanitizes_validation(tool, payload, rig):
     assert 'private-input' not in str(result)
 
 
-def test_production_remains_blocked_and_stale_review_not_claimable(rig):
+def test_production_remains_blocked_and_active_review_is_frozen(rig):
     client, repo, _, _, _, payload = rig
     production = call(client, 'hub_work_submit', payload(environment='production', approval_id='ordinary-decision-id'))
     assert production['state'] == 'queued'
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
     body = payload()
     call(client, 'hub_work_submit', body)
+    item = repo.get_task(body['target']['task_id'])
+    with pytest.raises(HubError, match='active_work_job'):
+        repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
+    assert repo.get_task(item['id'])['candidate_commit'] == COMMIT
     corrupt_review_after_active_work(repo, body['target']['task_id'])
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
 
