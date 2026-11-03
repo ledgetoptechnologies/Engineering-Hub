@@ -177,10 +177,13 @@ test("late success cannot overwrite a newer overview and sign-out clears a held 
   s.releases[1](); await page.clock.runFor(30_000); expect(count(s)).toBe(2);
   await expect(rows(page)).toHaveCount(0);
 });
-test("agent refresh on staging does not refetch queue, resource or runtime observations", async ({ page }) => {
-  const s = await fixture(page); await page.goto("/#/staging");
-  await expect(page.getByRole("region", { name: "Staging resources", exact: true }).getByRole("button", { name: "Check", exact: true })).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Check queue", exact: true })).toBeEnabled();
+// Resources and the validation queue are separate staging sub-pages now; each is checked on its own page.
+for (const [path, ready] of [
+  ["/#/staging/resources", (page: Page) => page.getByRole("region", { name: "Staging resources", exact: true }).getByRole("button", { name: "Check", exact: true })],
+  ["/#/staging/queues", (page: Page) => page.getByRole("button", { name: "Check queue", exact: true })],
+] as const) test(`agent refresh on ${path} does not refetch queue, resource or runtime observations`, async ({ page }) => {
+  const s = await fixture(page); await page.goto(path);
+  await expect(ready(page)).toBeEnabled();
   const baseline = [...s.reads];
   await page.clock.runFor(15_000); await expect.poll(() => count(s)).toBe(1);
   expect(s.reads.filter(p => !p.endsWith("/agents"))).toEqual(baseline);

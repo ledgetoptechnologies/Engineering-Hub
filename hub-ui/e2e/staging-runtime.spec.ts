@@ -138,12 +138,12 @@ test("a page left open goes out of date by its own clock, without reading again"
 test("steps aside for people who aren't the staging admin, and on Hubs without it", async ({ page }) => {
   await fixture(page, [{ status: 403, body: { detail: { code: "staging_admin_required" } } }]);
   await page.goto("/#/staging");
-  await expect(page.getByRole("region", { name: "Staging resources" })).toBeVisible();
+  await expect(page.locator("#staging")).toBeVisible();
   await expect(panel(page)).toHaveCount(0);
   await page.unrouteAll();
   await fixture(page, [{ status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]);
   await page.reload();
-  await expect(page.getByRole("region", { name: "Staging resources" })).toBeVisible();
+  await expect(page.locator("#staging")).toBeVisible();
   await expect(panel(page)).toHaveCount(0);
 });
 
