@@ -38,15 +38,28 @@ INSPECT_TOKEN = "ehri1." + "Insp3ct" * 6  # Test-only inspection credential.
 REJECTION = b'{"error":{"code":"unauthorized"}}'
 
 
-class Vouching(HeldAttemptSource):
-    """Test-only stand-in for a Hub job store: vouches while ``allow`` is True."""
+class JobStore(HeldAttemptSource):
+    """Test-only authoritative Hub job store with an atomic, idempotent
+    compare-and-set under its own lock (what a real source must provide)."""
 
     def __init__(self):
-        self.allow, self.calls = True, []
+        self.lock, self.versions, self.applied, self.cas_calls = threading.Lock(), {}, {}, []
 
-    def vouch(self, command, pin, dispatch_counter):
-        self.calls.append((command.command_id, dispatch_counter))
-        return self.allow
+    def hold_version(self, command, pin, dispatch_counter):
+        with self.lock:
+            return self.versions.setdefault(command.command_id, "v1." + command.command_id)
+
+    def change(self, command_id):  # The job moved on (re-queued, cancelled, re-pinned...).
+        with self.lock:
+            self.versions[command_id] += "+"
+
+    def apply_observation_if_unchanged(self, version, observation):
+        with self.lock:
+            self.cas_calls.append((version, observation))
+            if self.versions.get(observation.command_id) != version:
+                return False
+            previous = self.applied.setdefault(observation.command_id, observation.status)
+            return previous == observation.status
 
 
 def raw_key(key):
@@ -138,7 +151,8 @@ def insp(world, tmp_path):
     path = os.path.join(directory, "inspect.sock")
     server = _Supervisor(path, responder)
     state = {"key": key, "route": route, "responder": responder, "server": server, "socket": path,
-             "ledger": str(hub / "inspection.sqlite"), "resolvers": []}
+             "ledger": str(hub / "inspection.sqlite"), "resolvers": [],
+             "store": JobStore()}  # The authoritative job store outlives any resolver.
 
     def client(peer=None, verifier=None, credential=INSPECT_TOKEN, timeout_ms=600, socket_path=path):
         return SupervisorInspectionClient(
@@ -149,7 +163,7 @@ def insp(world, tmp_path):
     def resolver(create=True, ledger=None, source=None, **kwargs):
         made = InspectionResolver(config=InspectionResolverConfig(
             enabled=True, ledger_path=ledger or state["ledger"], create_ledger=create,
-            allow_ephemeral_test_storage=True), client=client(**kwargs), source=source or Vouching())
+            allow_ephemeral_test_storage=True), client=client(**kwargs), source=source or state["store"])
         state["resolvers"].append(made)
         return made
     state["client"], state["resolver"] = client, resolver
@@ -269,10 +283,10 @@ def test_default_refusing_verifier_and_authenticator_keep_everything_held(world,
     class Unconfigured(InspectionVerifier):
         key_id = inspection_key_id(raw_key(insp["key"]))  # Right key id, but verify() is not overridden.
     resolver, cmd, counter = held_attempt(world, insp, verifier=Unconfigured())
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "unverified")
     insp["responder"]._authenticator = InspectionAuthenticator()  # Default-refusing authenticator.
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "http_status")
     assert ledger_state(insp, cmd.command_id) == ("held", None)
 
@@ -300,7 +314,7 @@ def test_launch_bearer_never_authorizes_inspection_and_vice_versa(world, insp):
     other = "ehri1." + "0ther" * 8  # Well-formed inspection credential that is not enrolled.
     resolver = insp["resolver"](credential=other)
     resolver.hold(cmd, world["pin"], counter)
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "http_status")
     assert ledger_state(insp, cmd.command_id) == ("held", None)
 
@@ -308,22 +322,25 @@ def test_launch_bearer_never_authorizes_inspection_and_vice_versa(world, insp):
 # --- Positive cases ----------------------------------------------------------
 
 @LINUX
-def test_signed_launched_moves_held_attempt_and_persists_across_restart(world, insp):
+def test_signed_launched_observed_and_applied_only_via_cas_across_restart(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
     before, calls = route_rows(world), list(world["backend"].calls)
-    result = resolver.resolve(cmd, world["pin"], counter)
-    assert (result.state, result.route_state, result.error) == ("launched", "completed", None)
-    assert ledger_state(insp, cmd.command_id) == ("launched", "completed")
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.status, result.observation.route_state, result.error) == (
+        "applied", "launched", "completed", None)
+    assert result.observation.historical is False
+    assert ledger_state(insp, cmd.command_id) == ("observed_launched", "completed")
     assert route_rows(world) == before and world["backend"].calls == calls  # Read-only: nothing forwarded.
     connections = len(insp["server"].received)
-    again = resolver.resolve(cmd, world["pin"], counter)
-    assert (again.state, again.replayed) == ("launched", True)
+    again = resolver.inspect(cmd, world["pin"], counter)
+    assert (again.state, again.observation.historical) == ("applied", True)
     assert len(insp["server"].received) == connections  # Recorded outcome; supervisor not contacted.
     resolver.close()
     insp["resolvers"].remove(resolver)
     reopened = insp["resolver"](create=False)
-    after = reopened.resolve(cmd, world["pin"], counter)
-    assert (after.state, after.route_state, after.replayed) == ("launched", "completed", True)
+    after = reopened.inspect(cmd, world["pin"], counter)
+    assert (after.state, after.observation.route_state, after.observation.historical) == (
+        "applied", "completed", True)
     assert len(insp["server"].received) == connections
     with pytest.raises(SupervisorRouteRejected):  # A recorded attempt never re-binds.
         reopened.hold(cmd, world["pin"], counter + 1)
@@ -331,29 +348,29 @@ def test_signed_launched_moves_held_attempt_and_persists_across_restart(world, i
 
 @LINUX
 @pytest.mark.parametrize("outcome", ["rejected", "refused"])
-def test_signed_refused_moves_held_attempt_to_matching_outcome(world, insp, outcome):
+def test_signed_refused_observed_and_applied_only_via_cas(world, insp, outcome):
     resolver, cmd, counter = held_attempt(world, insp, outcome)
-    result = resolver.resolve(cmd, world["pin"], counter)
-    assert (result.state, result.route_state) == ("refused", outcome)
-    assert ledger_state(insp, cmd.command_id) == ("refused", outcome)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.status, result.observation.route_state) == ("applied", "refused", outcome)
+    assert ledger_state(insp, cmd.command_id) == ("observed_refused", outcome)
 
 
 @LINUX
-def test_held_restart_then_resolve(world, insp):
+def test_held_restart_then_inspect(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
     resolver.close()
     insp["resolvers"].remove(resolver)
     reopened = insp["resolver"](create=False)  # The held row survives restart.
     assert ledger_state(insp, cmd.command_id) == ("held", None)
-    assert reopened.resolve(cmd, world["pin"], counter).state == "launched"
+    assert reopened.inspect(cmd, world["pin"], counter).state == "applied"
 
 
 # --- Held cases (each individually) ------------------------------------------
 
 def _assert_held(world, insp, resolver, cmd, counter, error, status=None):
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error, result.status) == ("held", error, status)
-    assert result.route_state is None
+    assert result.observation is None and not result.applied
     assert ledger_state(insp, cmd.command_id) == ("held", None)
     return result
 
@@ -453,7 +470,7 @@ def test_unverified_answers_stay_held(world, insp, case):
     insp["server"].script = scripted(_UNVERIFIED[case])
     _assert_held(world, insp, resolver, cmd, counter, "unverified")
     insp["server"].script = None
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"  # Held, not poisoned.
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"  # Held, not poisoned.
 
 
 @LINUX
@@ -492,9 +509,9 @@ def test_failure_to_record_resolution_stays_held(world, insp, monkeypatch):
 
     def fail(*args, **kwargs):
         raise OSError()
-    monkeypatch.setattr(resolver._ledger, "resolve", fail)
-    result = resolver.resolve(cmd, world["pin"], counter)
-    assert (result.state, result.error, result.status) == ("held", "resolution_unrecorded", "launched")
+    monkeypatch.setattr(resolver._ledger, "record_observation", fail)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error, result.status) == ("held", "observation_unrecorded", "launched")
     assert ledger_state(insp, cmd.command_id) == ("held", None)
 
 
@@ -502,10 +519,10 @@ def test_failure_to_record_resolution_stays_held(world, insp, monkeypatch):
 def test_no_held_row_sends_nothing(world, insp):
     cmd, counter = launch(world, insp)
     resolver = insp["resolver"]()
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "no_held_attempt")
     resolver.hold(cmd, world["pin"], counter)
-    other = resolver.resolve(cmd, world["pin"], counter + 1)  # Different binding than the held row.
+    other = resolver.inspect(cmd, world["pin"], counter + 1)  # Different binding than the held row.
     assert (other.state, other.error) == ("held", "no_held_attempt")
     assert insp["server"].received == []  # Never connected.
     with pytest.raises(SupervisorRouteRejected):
@@ -534,7 +551,7 @@ def test_replayed_answer_for_another_binding_stays_held(world, insp, field):
     resolver = insp["resolver"]()
     resolver.hold(*asked)
     insp["server"].script = lambda body, responder: [(0, _http(200, captured.raw))]  # Replay verbatim.
-    result = resolver.resolve(*asked)
+    result = resolver.inspect(*asked)
     assert (result.state, result.error) == ("held", "unverified")
     assert ledger_state(insp, asked[0].command_id) == ("held", None)
 
@@ -639,7 +656,7 @@ def test_bad_or_slow_responses_held_within_total_deadline(world, insp, case):
 def test_exact_framing_accepted(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
     insp["server"].script = lambda body, responder: [(0, _http(200, _answer(body, responder)))]
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"
 
 
 # --- Ledger invariants -------------------------------------------------------
@@ -649,29 +666,31 @@ def test_ledger_triggers_refuse_rewrites_and_schema_tamper(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
     held_cmd, held_counter = launch(world, insp, "unknown")
     resolver.hold(held_cmd, world["pin"], held_counter)
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"
     db = sqlite3.connect(Path(insp["ledger"]).as_uri() + "?mode=rw", uri=True, isolation_level=None)
     try:
         table = "supervisor_route_inspection"
         for sql, args in (
                 (f"UPDATE {table} SET state='held', route_state=NULL, key_id=NULL, answer=NULL "
                  "WHERE command_id=?", (cmd.command_id,)),
-                (f"UPDATE {table} SET state='refused', route_state='rejected' WHERE command_id=?",
+                (f"UPDATE {table} SET state='observed_refused', route_state='rejected' WHERE command_id=?",
                  (cmd.command_id,)),
-                (f"UPDATE {table} SET dispatch_counter=99, state='launched', route_state='completed', "
+                (f"UPDATE {table} SET dispatch_counter=99, state='observed_launched', route_state='completed', "
                  "key_id='k', answer='a' WHERE command_id=?", (held_cmd.command_id,)),
-                (f"UPDATE {table} SET state='launched', route_state='rejected', key_id='k', answer='a' "
+                (f"UPDATE {table} SET state='observed_launched', route_state='rejected', key_id='k', answer='a' "
                  "WHERE command_id=?", (held_cmd.command_id,)),
                 (f"DELETE FROM {table}", ()),
-                (f"INSERT OR REPLACE INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'held', NULL, NULL, NULL, NULL)",
-                 (cmd.command_id,)),
-                (f"INSERT INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'launched', 'completed', 'k', 'a', 'r')",
-                 (str(uuid4()),)),
+                (f"INSERT OR REPLACE INTO {table} VALUES (?, 'd', 'b', 'e', 1, NULL, 'held', NULL, NULL, NULL, "
+                 "NULL)", (cmd.command_id,)),
+                (f"INSERT INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'v', 'observed_launched', 'completed', 'k', "
+                 "'a', 'r')", (str(uuid4()),)),
+                (f"UPDATE {table} SET hold_version='other', state='observed_launched', route_state='completed', "
+                 "key_id='k', answer='a', request='r' WHERE command_id=?", (held_cmd.command_id,)),
                 (f"UPDATE {table} SET request=NULL WHERE command_id=?", (cmd.command_id,))):
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(sql, args)
         assert db.execute(f"SELECT command_id, state FROM {table} ORDER BY state").fetchall() == [
-            (held_cmd.command_id, "held"), (cmd.command_id, "launched")]
+            (held_cmd.command_id, "held"), (cmd.command_id, "observed_launched")]
         db.execute(f"DROP TRIGGER {table}_no_delete")
     finally:
         db.close()
@@ -715,11 +734,11 @@ def test_request_reuses_dispatch_claim_and_refuses_inconsistent_claims(world, in
                                         authorization="Bearer " + INSPECT_TOKEN, body=body)[0] == 400
 
 
-# --- Review fixes: replay re-verification, vouching source, bounded responder --
+# --- Replay re-verification, held-attempt source CAS, bounded responder -------
 
 def _resolved(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"
     return resolver, cmd, counter
 
 
@@ -734,11 +753,11 @@ def test_replay_after_key_rotation_is_held(world, insp):
     resolver, cmd, counter = _resolved(world, insp)
     rotated = PinnedKeyInspectionVerifier(raw_key(Ed25519PrivateKey.generate()))
     reopened = _reopen(insp, resolver, verifier=rotated)
-    result = reopened.resolve(cmd, world["pin"], counter)
+    result = reopened.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "replay_unverified")  # Never the stored terminal.
-    assert ledger_state(insp, cmd.command_id) == ("launched", "completed")  # Evidence kept, not trusted.
+    assert ledger_state(insp, cmd.command_id) == ("observed_launched", "completed")  # Kept, not trusted.
     back = _reopen(insp, reopened)  # Original pinned key: the same evidence verifies again.
-    assert back.resolve(cmd, world["pin"], counter).state == "launched"
+    assert back.inspect(cmd, world["pin"], counter).state == "applied"
 
 
 @LINUX
@@ -750,12 +769,12 @@ def test_replay_after_restart_with_different_pin_is_held(world, insp):
                        pin.engine_id, pin.engine_pid, pin.engine_start_ticks)
     for args in ((cmd, moved, counter), (cmd, pin, counter + 1),
                  (command(world["epoch"], command_id=cmd.command_id, fence=8), pin, counter)):
-        result = reopened.resolve(*args)
+        result = reopened.inspect(*args)
         assert (result.state, result.error) == ("held", "no_held_attempt")
-    assert reopened.resolve(cmd, pin, counter).state == "launched"
+    assert reopened.inspect(cmd, pin, counter).state == "applied"
 
 
-_TRIGGER = "supervisor_route_inspection_resolve_once"
+_TRIGGER = "supervisor_route_inspection_observe_once"
 
 
 def _flip(text, index):
@@ -775,7 +794,7 @@ def _tamper_answer_signature(row):
 
 
 def _tamper_status(row):
-    return {"state": "refused", "route_state": "rejected"}
+    return {"state": "observed_refused", "route_state": "rejected"}
 
 
 def _tamper_request(row):
@@ -816,59 +835,105 @@ def test_tampered_terminal_row_replays_held(world, insp, case):
         db.execute(f"DROP TRIGGER {_TRIGGER}")
         db.execute(f"UPDATE supervisor_route_inspection SET {sets} WHERE command_id=?",
                    (*changes.values(), cmd.command_id))
-        db.execute(route_module._RESOLUTION_SCHEMA[_TRIGGER])
+        db.execute(route_module._OBSERVATION_SCHEMA[_TRIGGER])
         db.execute("COMMIT")
     finally:
         db.close()
     connections = len(insp["server"].received)
-    result = resolver.resolve(cmd, world["pin"], counter)
+    result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error) == ("held", "replay_unverified"), case
     reopened = _reopen(insp, resolver)  # Exact schema still matches; replay still held after restart.
-    assert reopened.resolve(cmd, world["pin"], counter).state == "held"
+    assert reopened.inspect(cmd, world["pin"], counter).state == "held"
     assert len(insp["server"].received) == connections  # Replay never re-asks the supervisor.
 
 
-class _Refusing(HeldAttemptSource):
-    def __init__(self, value):
-        self.value = value
+class _Source(HeldAttemptSource):
+    """Versions like JobStore but with a scripted CAS result."""
 
-    def vouch(self, command, pin, dispatch_counter):
-        if isinstance(self.value, BaseException):
-            raise self.value
-        return self.value
+    def __init__(self, result, version="v1"):
+        self.result, self.version, self.calls = result, version, []
+
+    def hold_version(self, command, pin, dispatch_counter):
+        return self.version
+
+    def apply_observation_if_unchanged(self, version, observation):
+        self.calls.append(version)
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
 
 
 @LINUX
-@pytest.mark.parametrize("source", ["default", "false", "truthy", "raises"])
-def test_held_attempt_source_refuses_by_default(world, insp, source):
-    chosen = {"default": HeldAttemptSource(), "false": _Refusing(False), "truthy": _Refusing(1),
-              "raises": _Refusing(OSError())}[source]
-    cmd, counter = launch(world, insp)
-    resolver = insp["resolver"](source=chosen)
-    with pytest.raises(SupervisorRouteRejected) as raised:
-        resolver.hold(cmd, world["pin"], counter)
-    assert raised.value.reason == "unvouched"
-    assert ledger_state(insp, cmd.command_id) is None
-    result = resolver.resolve(cmd, world["pin"], counter)
-    assert (result.state, result.error) == ("held", "unvouched")
-    assert insp["server"].received == []  # Never contacted.
+@pytest.mark.parametrize("source,error", [
+    ("default", "cas_unavailable"), ("bad_version", "cas_unavailable"), ("cas_false", "cas_not_applied"),
+    ("cas_truthy", "cas_not_applied"), ("cas_raises", "cas_not_applied")])
+def test_observation_recorded_but_held_without_source_cas(world, insp, source, error):
+    chosen = {"default": HeldAttemptSource(), "bad_version": _Source(True, version="has space"),
+              "cas_false": _Source(False), "cas_truthy": _Source(1), "cas_raises": _Source(OSError())}[source]
+    resolver, cmd, counter = held_attempt(world, insp, source=chosen)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error, result.status, result.applied) == ("held", error, "launched", False)
+    assert result.observation.status == "launched" and result.observation.historical is False
+    assert ledger_state(insp, cmd.command_id) == ("observed_launched", "completed")  # Observation only.
+    connections = len(insp["server"].received)
+    replay = resolver.inspect(cmd, world["pin"], counter)
+    assert (replay.state, replay.error, replay.observation.historical) == ("held", error, True)
+    assert len(insp["server"].received) == connections
     with pytest.raises(SupervisorRouteError):
         InspectionResolver(config=InspectionResolverConfig(enabled=True, ledger_path=insp["ledger"]),
                            client=insp["client"](), source=None)
 
 
 @LINUX
-def test_source_must_vouch_on_every_resolve_and_replay(world, insp):
-    source = Vouching()
-    resolver, cmd, counter = held_attempt(world, insp, source=source)
-    source.allow = False
-    assert resolver.resolve(cmd, world["pin"], counter).error == "unvouched"
-    assert insp["server"].received == []
-    source.allow = True
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
-    source.allow = False
-    assert resolver.resolve(cmd, world["pin"], counter).error == "unvouched"  # Replay needs it too.
-    assert source.calls[-1] == (cmd.command_id, counter)
+@pytest.mark.parametrize("when", ["before_inspection", "while_answer_in_flight"])
+def test_source_change_refuses_cas_and_stays_held(world, insp, when):
+    store = JobStore()
+    resolver, cmd, counter = held_attempt(world, insp, source=store)
+    held_version = store.versions[cmd.command_id]
+    if when == "before_inspection":
+        store.change(cmd.command_id)
+    else:
+        def in_flight(body, responder):
+            store.change(cmd.command_id)  # The job changes after hold_version, before the CAS.
+            return [(0, _http(200, genuine(body, responder)))]
+        insp["server"].script = in_flight
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error, result.status) == ("held", "cas_not_applied", "launched")
+    assert store.applied == {} and store.cas_calls[-1][0] == held_version  # CAS used the HOLD version.
+    assert ledger_state(insp, cmd.command_id) == ("observed_launched", "completed")  # Observed, not released.
+
+
+@LINUX
+def test_cas_receives_exact_signed_observation(world, insp):
+    store = JobStore()
+    resolver, cmd, counter = held_attempt(world, insp, source=store)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert result.applied
+    version, observation = store.cas_calls[-1]
+    binding = binding_for(cmd, world["pin"])
+    assert version == "v1." + cmd.command_id
+    assert (observation.command_id, observation.binding_digest, observation.dispatch) == (
+        cmd.command_id, binding_digest(binding), dispatch_claim(binding, counter))
+    assert observation.key_id == inspection_key_id(raw_key(insp["key"]))
+    signed = json.loads(observation.answer)["payload"]
+    assert observation.answered_at_ms == signed["answered_at_ms"] and signed["status"] == "launched"
+
+
+@LINUX
+def test_replay_is_historical_and_needs_a_fresh_cas(world, insp):
+    store = JobStore()
+    resolver, cmd, counter = held_attempt(world, insp, source=store)
+    first = resolver.inspect(cmd, world["pin"], counter)
+    assert first.applied and not first.observation.historical
+    calls = len(store.cas_calls)
+    replay = resolver.inspect(cmd, world["pin"], counter)
+    assert replay.applied and replay.observation.historical  # Idempotent CAS accepted it again...
+    assert replay.observation.answered_at_ms == first.observation.answered_at_ms  # ...as the OLD signed fact.
+    assert len(store.cas_calls) == calls + 1  # Replay went through the CAS.
+    store.change(cmd.command_id)
+    stale = resolver.inspect(cmd, world["pin"], counter)
+    assert (stale.state, stale.error, stale.observation.historical) == ("held", "cas_not_applied", True)
+    assert len(insp["server"].received) == 1  # Replays never re-ask the supervisor.
 
 
 def _responder(insp, **config):
@@ -960,10 +1025,10 @@ def test_slow_journal_read_is_bounded_and_held(world, insp, lock):
             raw.execute("ROLLBACK")
             raw.close()
     assert _ask(responder, body)[0] == 200
-    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"
 
 
-# --- Review fixes 2: signed-reply deadline, bounded auth, atomic re-vouch ------
+# --- Return-time deadline and bounded authentication -------------------------
 
 class _SlowAuthenticator(InspectionTokenAuthenticator):
     """Delegates to the enrolled token, but blocks (then denies) "Bearer slow"
@@ -984,7 +1049,7 @@ class _SlowAuthenticator(InspectionTokenAuthenticator):
 
 @LINUX
 @pytest.mark.parametrize("outcome", ["not_found", "completed", "unknown", "slow_auth"])
-def test_late_answer_is_never_signed(world, insp, monkeypatch, outcome):
+def test_late_signed_answer_is_not_returned(world, insp, monkeypatch, outcome):
     if outcome == "not_found":
         cmd, counter = command(world["epoch"]), 1  # Missing-row branch.
     else:
@@ -1042,41 +1107,3 @@ def test_slow_authenticator_is_bounded_and_cannot_take_authenticated_slots(world
     assert results["s"][0] == 401
     monkeypatch.undo()
     assert _ask(responder, body)[0] == 200  # Both pools released.
-
-
-class _Identity(HeldAttemptSource):
-    """Test-only Hub job store: vouches only for the attempt it currently holds."""
-
-    def __init__(self):
-        self.current, self.phases, self.ledger = None, [], None
-
-    def vouch(self, command, pin, dispatch_counter):
-        self.phases.append(getattr(self.ledger, "last_phase", None))
-        return self.current == (command.command_id, pin, dispatch_counter)
-
-
-@LINUX
-@pytest.mark.parametrize("change", ["stops_vouching", "identity_changed", "unchanged"])
-def test_source_revalidated_atomically_with_recording(world, insp, change):
-    cmd, counter = launch(world, insp)
-    source = _Identity()
-    source.current = (cmd.command_id, world["pin"], counter)
-    resolver = insp["resolver"](source=source)
-    source.ledger = resolver._ledger
-    resolver.hold(cmd, world["pin"], counter)
-
-    def in_flight(body, responder):
-        if change == "stops_vouching":
-            source.current = None
-        elif change == "identity_changed":  # Job store now names another attempt for this command.
-            source.current = (cmd.command_id, world["pin"], counter + 1)
-        return [(0, _http(200, genuine(body, responder)))]
-    insp["server"].script = in_flight
-    result = resolver.resolve(cmd, world["pin"], counter)
-    if change == "unchanged":
-        assert result.state == "launched"
-        assert source.phases[-1] == "in_transaction"  # Re-vouched inside the recording transaction.
-        return
-    assert (result.state, result.error, result.status) == ("held", "unvouched", "launched")
-    assert ledger_state(insp, cmd.command_id) == ("held", None)  # Nothing recorded.
-    assert source.phases[-1] == "in_transaction"

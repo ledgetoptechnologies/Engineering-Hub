@@ -66,12 +66,16 @@ is read with the same strict bounded framing and one total deadline.
 under its own domain over an exact echo of the request. The Hub verifies
 through an ``InspectionVerifier`` (the base class refuses everything;
 ``PinnedKeyInspectionVerifier`` checks one pinned key). ``InspectionResolver``
-moves a durably held attempt (``InspectionLedger``) to ``launched`` or
-``refused`` ONLY on a verified signed terminal status matching the binding
-exactly; timeout, framing, HTTP denial, unsigned, bad signature, wrong key,
-any binding mismatch, ``unknown`` and signed ``not_found`` all stay held.
-Inspection never relaunches, resubmits or releases, and no result of it
-permits a resubmit or release.
+records a verified signed terminal status matching the binding exactly as an
+OBSERVATION in ``InspectionLedger`` (``observed_launched`` /
+``observed_refused``); timeout, framing, HTTP denial, unsigned, bad
+signature, wrong key, any binding mismatch, ``unknown`` and signed
+``not_found`` record nothing and stay held. An observation never moves or
+releases the Hub job: the only authoritative step is the
+``HeldAttemptSource``'s own compare-and-set (``hold_version`` captured at
+hold, ``apply_observation_if_unchanged``), which the default source
+refuses. Inspection never relaunches, resubmits or releases, and no result
+of it permits a resubmit or release.
 
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
 against the pin immediately after connect and BEFORE any request byte is
@@ -199,21 +203,26 @@ Explicit limits (this foundation grants no authority by itself):
   not provisioned anywhere, and the Hub must supply the held attempt's
   dispatch counter itself (``RouteResult`` does not carry it). Nothing
   constructs the client, responder or resolver.
-* The resolver's held row is caller-supplied and does NOT prove it is the
-  original authoritative Hub job: ``InspectionResolver`` requires a
-  ``HeldAttemptSource`` to vouch for each attempt, and the only one provided
-  (the base class) refuses everything, so there is no production use until a
-  source bound to the Hub job store exists. Recorded terminal rows are
-  re-verified (exact request + signed answer, current pinned key and
-  binding) on every replay, else held.
+* The inspection ledger is NOT the Hub job store and shares no transaction or
+  lock with it: its held row is caller-supplied and its observed rows are
+  only signed observations. Any authoritative move of the Hub job must go
+  through ``HeldAttemptSource.apply_observation_if_unchanged`` with the hold
+  version captured at hold time, and ATOMICITY IS ONLY AS STRONG AS THAT
+  SOURCE'S CAS; nothing in this module provides it. The only source provided
+  (the base class) refuses, so there is no production use until one bound to
+  the Hub job store exists. A replayed observation is historical (signed
+  ``answered_at_ms``, not fresh host/job state), re-verified (exact request
+  + signed answer, current pinned key and binding), and still needs the CAS.
 * The responder's CONCURRENCY is bounded (separate non-blocking pre-auth and
   post-auth slot pools) but its TIME is best-effort: contention is cut by
   try-acquire and SQLite busy/progress timeouts, while filesystem calls,
   connection open/close and a custom authenticator are not interruptible.
-  Only the check of its own deadline immediately before every signed reply
-  is guaranteed (late -> unsigned 503). Work a departed client no longer
-  waits for can still complete (detached work), and same-UID FD delegation
-  and rollback anchoring remain open as above.
+  Its own deadline is checked as a best-effort RETURN-TIME check: a signed
+  answer is not returned after the deadline (an unsigned 503 is), although
+  the signer may already have produced the bytes. Limits are PER INSTANCE:
+  separate responder instances do not share slot pools. Work a departed
+  client no longer waits for can still complete (detached work), and
+  same-UID FD delegation and rollback anchoring remain open as above.
 """
 from __future__ import annotations
 
@@ -1688,8 +1697,8 @@ _INSPECTION_ANSWER_KEYS = frozenset({'protocol', 'audience', 'key_id', 'request'
                                      'route_state', 'answered_at_ms'})
 _REQUEST_NONCE = re.compile(r'[0-9a-f]{32}\Z')
 _INSPECTION_ERRORS = frozenset({'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status',
-                                'unverified', 'not_found', 'unknown', 'resolution_unrecorded', 'unvouched',
-                                'replay_unverified'})
+                                'unverified', 'not_found', 'unknown', 'observation_unrecorded',
+                                'replay_unverified', 'cas_unavailable', 'cas_not_applied'})
 
 
 def inspection_key_id(public_key):
@@ -1890,8 +1899,7 @@ class InspectionResponderConfig:
     and ``max_concurrent`` (1..8) authenticated answers may run at once; any
     other caller gets an unsigned 503 ``busy`` immediately (never queued).
     ``answer_budget_ms`` (20..2000, at least ``read_budget_ms``) is the
-    responder's own deadline per call, checked immediately before any signed
-    reply; ``read_budget_ms`` (10..1000) caps each durable journal read.
+    responder's own deadline per call, a return-time check on signed answers; ``read_budget_ms`` (10..1000) caps each durable journal read.
     Keep both well under the client's total deadline.
     """
     enabled: bool = False
@@ -1924,11 +1932,12 @@ class SupervisorInspectionResponder:
     read tries its mutex for at most the remaining budget and SQLite busy /
     progress timeouts stop contended statements, but filesystem calls,
     connection open/close and a custom authenticator are not interruptible.
-    What IS guaranteed: the responder's own deadline (``answer_budget_ms``
-    from entry) is checked immediately before every signed reply, whatever
-    the status, and a late answer is replaced by an unsigned 503
-    ``unavailable``, so no signed ``not_found``/``unknown``/terminal leaves
-    after the deadline. Detached work is still possible (a client that gave
+    The responder's own deadline (``answer_budget_ms`` from entry) is a
+    best-effort RETURN-TIME check: whatever the status, a signed answer is
+    not returned after it; an unsigned 503 ``unavailable`` is returned
+    instead (the signer may already have produced the bytes, which are
+    dropped). Slot pools are PER INSTANCE: separate responder instances do
+    not share limits. Detached work is still possible (a client that gave
     up is not noticed). No listener or HTTP server is provided and nothing
     constructs this.
     """
@@ -1977,7 +1986,7 @@ class SupervisorInspectionResponder:
         finally:
             self._slots.release()
         if status == 200 and not time.monotonic() <= deadline:
-            # Checked immediately before EVERY signed reply: late is unsigned.
+            # Return-time check: a signed answer is not returned after the deadline.
             return self._denied(503, 'unavailable')
         return status, raw
 
@@ -2154,55 +2163,67 @@ class SupervisorInspectionClient:
             peer.close()
 
 
-_RESOLUTION = ('CREATE TABLE supervisor_route_inspection (command_id TEXT PRIMARY KEY, '
-               'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, executor_id TEXT NOT NULL, '
-               "dispatch_counter INTEGER NOT NULL CHECK(typeof(dispatch_counter)='integer' "
-               'AND dispatch_counter > 0), '
-               "state TEXT NOT NULL CHECK(state IN ('held','launched','refused')), route_state TEXT, "
-               'key_id TEXT, answer TEXT, request TEXT, '
-               "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL "
-               'AND request IS NULL) '
-               "OR (state='launched' AND route_state='completed' AND key_id IS NOT NULL AND answer IS NOT NULL "
-               'AND request IS NOT NULL) '
-               "OR (state='refused' AND route_state IN ('rejected','refused') AND key_id IS NOT NULL "
-               'AND answer IS NOT NULL AND request IS NOT NULL)))')
-_RESOLUTION_SCHEMA = {
-    'supervisor_route_inspection': _RESOLUTION,
+_OBSERVED = {'launched': 'observed_launched', 'refused': 'observed_refused'}
+_MAX_HOLD_VERSION = 256
+_OBSERVATION = ('CREATE TABLE supervisor_route_inspection (command_id TEXT PRIMARY KEY, '
+                'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, executor_id TEXT NOT NULL, '
+                "dispatch_counter INTEGER NOT NULL CHECK(typeof(dispatch_counter)='integer' "
+                'AND dispatch_counter > 0), hold_version TEXT, '
+                "state TEXT NOT NULL CHECK(state IN ('held','observed_launched','observed_refused')), "
+                'route_state TEXT, key_id TEXT, answer TEXT, request TEXT, '
+                "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL "
+                'AND request IS NULL) '
+                "OR (state='observed_launched' AND route_state='completed' AND key_id IS NOT NULL "
+                'AND answer IS NOT NULL AND request IS NOT NULL) '
+                "OR (state='observed_refused' AND route_state IN ('rejected','refused') AND key_id IS NOT NULL "
+                'AND answer IS NOT NULL AND request IS NOT NULL)))')
+_OBSERVATION_SCHEMA = {
+    'supervisor_route_inspection': _OBSERVATION,
     'supervisor_route_inspection_insert_held': (
         'CREATE TRIGGER supervisor_route_inspection_insert_held BEFORE INSERT ON supervisor_route_inspection '
         "WHEN NEW.state IS NOT 'held' OR EXISTS (SELECT 1 FROM supervisor_route_inspection "
         'WHERE command_id = NEW.command_id) '
         "BEGIN SELECT RAISE(ABORT, 'inspection rows are inserted once, held'); END"),
-    'supervisor_route_inspection_resolve_once': (
-        'CREATE TRIGGER supervisor_route_inspection_resolve_once BEFORE UPDATE ON supervisor_route_inspection '
-        "WHEN OLD.state IS NOT 'held' OR NEW.state NOT IN ('launched','refused') "
+    'supervisor_route_inspection_observe_once': (
+        'CREATE TRIGGER supervisor_route_inspection_observe_once BEFORE UPDATE ON supervisor_route_inspection '
+        "WHEN OLD.state IS NOT 'held' OR NEW.state NOT IN ('observed_launched','observed_refused') "
         'OR NEW.command_id IS NOT OLD.command_id OR NEW.binding_digest IS NOT OLD.binding_digest '
         'OR NEW.binding IS NOT OLD.binding OR NEW.executor_id IS NOT OLD.executor_id '
-        'OR NEW.dispatch_counter IS NOT OLD.dispatch_counter '
-        "BEGIN SELECT RAISE(ABORT, 'only a held inspection row moves, once'); END"),
+        'OR NEW.dispatch_counter IS NOT OLD.dispatch_counter OR NEW.hold_version IS NOT OLD.hold_version '
+        "BEGIN SELECT RAISE(ABORT, 'only a held inspection row records one observation'); END"),
     'supervisor_route_inspection_no_delete': (
         'CREATE TRIGGER supervisor_route_inspection_no_delete BEFORE DELETE ON supervisor_route_inspection '
         "BEGIN SELECT RAISE(ABORT, 'inspection rows are permanent'); END"),
 }
 
 
+def _valid_hold_version(value):
+    return (type(value) is str and 0 < len(value) <= _MAX_HOLD_VERSION
+            and all(33 <= ord(c) <= 126 for c in value))
+
+
 class InspectionLedger(_DurableStore):
-    """Hub-side durable record of held attempts and their inspected outcome.
+    """Hub-side durable record of held attempts and the supervisor's signed
+    OBSERVATIONS of them. It is NOT the Hub job store and never resolves,
+    releases or authorizes anything.
 
     Same durability as the route journal (single owner, BEGIN IMMEDIATE,
     synchronous=FULL, parent fsync, exact schema incl. triggers). Triggers
-    make rows insert-once as ``held``, movable once only from ``held`` to
-    ``launched``/``refused`` with every binding column unchanged, and never
-    deleted. A terminal row keeps the EXACT canonical request bytes that were
-    sent and the EXACT signed answer bytes (payload + signature) with its key
-    id; they are evidence to re-verify on every read, never trusted as stored.
-    Like every local SQLite file it is UNANCHORED: it cannot prove it was not
-    rolled back, restored or edited by a same-UID process.
+    make rows insert-once as ``held`` (with the source's opaque hold version,
+    if it gave one), movable once only from ``held`` to ``observed_launched``
+    / ``observed_refused`` with every binding column and the hold version
+    unchanged, and never deleted. An observed row means only "the supervisor
+    signed this status for this exact binding at its signed answered_at_ms";
+    it keeps the EXACT canonical request bytes and the EXACT signed answer
+    bytes (payload + signature) with its key id, as evidence re-verified on
+    every read and never trusted as stored. Like every local SQLite file it
+    is UNANCHORED: it cannot prove it was not rolled back, restored or edited
+    by a same-UID process.
     """
-    _SCHEMA = _RESOLUTION_SCHEMA
+    _SCHEMA = _OBSERVATION_SCHEMA
     _VERSION = 1
-    _COLUMNS = ('command_id,binding_digest,binding,executor_id,dispatch_counter,state,route_state,key_id,answer,'
-                'request')
+    _COLUMNS = ('command_id,binding_digest,binding,executor_id,dispatch_counter,hold_version,state,route_state,'
+                'key_id,answer,request')
 
     @staticmethod
     def _key(request):
@@ -2213,8 +2234,10 @@ class InspectionLedger(_DurableStore):
         return db.execute(f'SELECT {self._COLUMNS} FROM supervisor_route_inspection WHERE command_id=?',
                           (command_id,)).fetchone()
 
-    def hold(self, request):
-        """Record a held attempt; idempotent for the identical binding."""
+    def hold(self, request, hold_version):
+        """Record a held attempt; idempotent for the identical binding (the
+        first hold version recorded is kept)."""
+        _require(hold_version is None or _valid_hold_version(hold_version), RouteJournalError('version'))
         command_id = request['binding']['command_id']
         with self._transaction() as db:
             row = self._select(db, command_id)
@@ -2222,8 +2245,8 @@ class InspectionLedger(_DurableStore):
                 if row[1:5] != self._key(request):
                     raise SupervisorRouteRejected('binding_conflict')
                 return
-            db.execute("INSERT INTO supervisor_route_inspection VALUES (?,?,?,?,?,'held',NULL,NULL,NULL,NULL)",
-                       (command_id, *self._key(request)))
+            db.execute('INSERT INTO supervisor_route_inspection VALUES '
+                       "(?,?,?,?,?,?,'held',NULL,NULL,NULL,NULL)", (command_id, *self._key(request), hold_version))
 
     def read(self, command_id):
         _require(os.getpid() == self._pid, RouteJournalError('process'))
@@ -2238,45 +2261,67 @@ class InspectionLedger(_DurableStore):
             except Exception:
                 raise RouteJournalError('inspection ledger unavailable') from None
 
-    def resolve(self, request, state, route_state, key_id, answer, *, confirm):
-        """held -> launched/refused for the EXACT binding; an identical repeat
-        is a no-op, anything else raises and changes nothing.
-
-        ``confirm()`` is called INSIDE the write transaction, after the row
-        checks and before the UPDATE; unless it returns exactly True the
-        transaction is rolled back (``SupervisorRouteRejected('unvouched')``).
-        """
-        _require(state in _TERMINAL and route_state in _TERMINAL[state] and type(answer) is bytes,
+    def record_observation(self, request, status, route_state, key_id, answer):
+        """held -> observed_<status> for the EXACT binding; an identical
+        repeat is a no-op, anything else raises and changes nothing."""
+        _require(status in _TERMINAL and route_state in _TERMINAL[status] and type(answer) is bytes,
                  RouteJournalError('state'))
-        command_id = request['binding']['command_id']
+        state, command_id = _OBSERVED[status], request['binding']['command_id']
         with self._transaction() as db:
             row = self._select(db, command_id)
             _require(row is not None and row[1:5] == self._key(request), RouteJournalError('binding'))
-            if row[5] != 'held':
-                _require(row[5:8] == (state, route_state, key_id), RouteJournalError('resolution_conflict'))
+            if row[6] != 'held':
+                _require(row[6:9] == (state, route_state, key_id), RouteJournalError('observation_conflict'))
                 return
-            if confirm() is not True:
-                raise SupervisorRouteRejected('unvouched')
             db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, answer=?, '
                        "request=? WHERE command_id=? AND state='held'",
                        (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'),
                         command_id))
 
 
-class HeldAttemptSource:
-    """DEFAULT-REFUSING authority that a held attempt is the ORIGINAL,
-    authoritative Hub job (its command_id, exact command bytes, fence, epoch,
-    backend pin and dispatch counter).
+@dataclass(frozen=True)
+class InspectionObservation:
+    """A verified signed supervisor statement about ONE exact binding.
 
-    The resolver's own ledger row is caller-supplied and proves nothing about
-    which Hub job it stands for. ``vouch(command, pin, dispatch_counter)``
-    must return exactly True, and only an implementation bound to the Hub's
-    durable job store may do so. The base class refuses everything, so the
-    resolver cannot hold or resolve anything until such a source exists
-    (none does today).
+    It is evidence of what the supervisor's journal said at ``answered_at_ms``
+    (signed), not fresh host or Hub job state. ``historical`` is True when it
+    was replayed from the ledger rather than answered in this call.
+    """
+    command_id: str
+    status: str
+    route_state: str
+    answered_at_ms: int
+    key_id: str
+    binding_digest: str
+    dispatch: dict
+    historical: bool
+    answer: bytes = field(repr=False)
+
+
+class HeldAttemptSource:
+    """DEFAULT-REFUSING interface to the AUTHORITATIVE Hub job store.
+
+    Nothing in this module can move, resolve or release a Hub job; only the
+    source can, in ITS OWN store, through an enforceable compare-and-set:
+
+    * ``hold_version(command, pin, dispatch_counter)`` -> an opaque version
+      string (printable ASCII, at most 256 chars) naming the exact held
+      attempt as it is now; captured when the attempt is held.
+    * ``apply_observation_if_unchanged(version, observation)`` -> exactly True
+      only if the source ATOMICALLY (in its own transaction/lock) verified
+      that the job still has ``version`` and applied the observation;
+      anything else means nothing was applied.
+
+    Atomicity is ONLY as strong as the source's CAS; this module provides
+    none (the inspection ledger shares no transaction or lock with the job
+    store). The base class refuses both, so every attempt stays held until a
+    source bound to the Hub job store exists (none does today).
     """
 
-    def vouch(self, command, pin, dispatch_counter):
+    def hold_version(self, command, pin, dispatch_counter):
+        raise SupervisorRouteError('held attempt source not configured')
+
+    def apply_observation_if_unchanged(self, version, observation):
         raise SupervisorRouteError('held attempt source not configured')
 
 
@@ -2291,44 +2336,50 @@ class InspectionResolverConfig:
 
 @dataclass(frozen=True)
 class InspectionResolution:
-    """state: launched | refused | held.
+    """state: held | applied.
 
-    ``held`` is the answer for anything not proved and NEVER permits
-    resubmitting, redispatching or releasing. launched/refused only record the
-    original command_id's outcome; they authorize nothing further either.
+    ``applied`` means only that the source's own compare-and-set accepted the
+    observation in the authoritative job store; ``held`` is everything else
+    (including a verified observation whose CAS was refused, unavailable or
+    not attempted). ``observation`` is the verified signed observation, if
+    any (``historical`` when replayed). Nothing here permits resubmitting,
+    redispatching or releasing.
     """
     state: str
     command_id: str
-    status: str | None = None
-    route_state: str | None = None
+    observation: InspectionObservation | None = None
     error: str | None = None
-    replayed: bool = False
+    status: str | None = None
+
+    @property
+    def applied(self):
+        return self.state == 'applied'
 
 
 class InspectionResolver:
-    """DISABLED-BY-DEFAULT Hub-side resolution of HELD attempts by inspection.
+    """DISABLED-BY-DEFAULT Hub-side inspection of HELD attempts.
 
-    ``hold(command, pin, dispatch_counter)`` durably records a held attempt.
-    ``resolve(...)`` contacts the supervisor only for a row that is held with
-    the identical binding; a verified, signed ``launched``/``refused`` whose
-    echoed request equals the held row's binding and dispatch claim moves
-    the row, once, to that outcome. Everything else (no row, transport,
-    framing, HTTP denial, unsigned, bad signature, wrong key, any binding
-    mismatch, ``unknown``, signed ``not_found``, failure to record) returns
-    ``held`` and changes nothing. Not wired into any Hub service.
+    ``hold(command, pin, dispatch_counter)`` durably records a held attempt
+    with the source's opaque ``hold_version`` (none if the source refuses).
+    ``inspect(...)`` contacts the supervisor only for a row held with the
+    identical binding. A verified, signed ``launched``/``refused`` whose
+    echoed request equals the held binding and dispatch claim is recorded as
+    an OBSERVATION; everything else (no row, transport, framing, HTTP denial,
+    unsigned, bad signature, wrong key, any binding mismatch, ``unknown``,
+    signed ``not_found``) records nothing and returns ``held``.
 
-    IMPORTANT: the ledger row alone does NOT prove that the held attempt is
-    the original authoritative Hub job; a caller could hold any binding.
-    Every ``hold`` and ``resolve`` therefore first requires the
-    ``HeldAttemptSource`` to vouch for the exact attempt (default: refuses,
-    so nothing can be held or resolved in production until a source bound to
-    the Hub job store exists). Because the source can change while the
-    supervisor answer is in flight, it is asked again INSIDE the ledger
-    transaction that records a terminal outcome; if it no longer vouches,
-    nothing is recorded and the attempt stays held. A recorded terminal row is NOT returned as
-    stored: its exact request and signed answer are re-verified against the
-    CURRENT pinned key and the CURRENT binding on every replay; key rotation,
-    a different pin or binding, a tampered or missing byte returns ``held``.
+    The observation never moves the Hub job by itself. The only authoritative
+    step is ``source.apply_observation_if_unchanged(hold_version, obs)``,
+    which the source must implement as an atomic compare-and-set in its own
+    store; only its exact True yields ``applied``. No hold version, a
+    refused/raising CAS or the default source -> ``held`` (with the
+    observation attached). Atomicity is only as strong as the source's CAS.
+
+    A recorded observation is replayed as HISTORICAL (signed answered_at_ms),
+    re-verified against the CURRENT pinned key and binding (key rotation,
+    another pin or binding, tampered or missing bytes -> ``held``), and again
+    needs the source's CAS with its version check; replay never moves
+    anything on its own. Not wired into any Hub service.
     """
 
     def __init__(self, *, config, client, source):
@@ -2344,22 +2395,18 @@ class InspectionResolver:
     def __repr__(self):
         return 'InspectionResolver(<enabled>)'
 
-    def _vouched(self, command, pin, dispatch_counter):
-        try:
-            return self._source.vouch(command, pin, dispatch_counter) is True
-        except Exception:
-            return False
-
     def hold(self, command, pin, dispatch_counter):
         request = self._client.request_for(command, pin, dispatch_counter)
-        if not self._vouched(command, pin, dispatch_counter):
-            raise SupervisorRouteRejected('unvouched')
-        self._ledger.hold(request)
+        try:
+            version = self._source.hold_version(command, pin, dispatch_counter)
+        except Exception:
+            version = None
+        self._ledger.hold(request, version if _valid_hold_version(version) else None)
 
     def _replay(self, row, request):
-        """Re-verify a recorded terminal row; returns its state or None."""
+        """Re-verify a recorded observation; returns (status, payload, answer) or None."""
         try:
-            command_id, state, route_state, key_id, answer, sent = row[0], *row[5:10]
+            command_id, state, route_state, key_id, answer, sent = row[0], *row[6:11]
             _require(type(sent) is str and type(answer) is str and key_id == request['key_id'])
             raw = sent.encode('ascii')
             stored = _strict_json(raw, MAX_INSPECTION_REQUEST_BYTES)
@@ -2368,31 +2415,52 @@ class InspectionResolver:
                      == _canonical({**request, 'request_nonce': None})
                      and stored['binding']['command_id'] == command_id)
             payload = self._client._verifier.verify(answer.encode('ascii'), request=stored)
-            _require(state in _TERMINAL and (payload['status'], payload['route_state'], payload['key_id'])
-                     == (state, route_state, key_id) and route_state in _TERMINAL[state])
-            return state, route_state
+            status = payload['status']
+            _require(status in _TERMINAL and (_OBSERVED[status], payload['route_state'], payload['key_id'])
+                     == (state, route_state, key_id) and route_state in _TERMINAL[status])
+            return payload, answer.encode('ascii')
         except Exception:
             return None
 
-    def resolve(self, command, pin, dispatch_counter):
+    def _apply(self, row, observation):
+        """The ONLY path to ``applied``: the source's own compare-and-set."""
+        version = row[5]
+        if not _valid_hold_version(version):
+            return InspectionResolution('held', observation.command_id, observation, 'cas_unavailable',
+                                        observation.status)
+        try:
+            applied = self._source.apply_observation_if_unchanged(version, observation) is True
+        except Exception:
+            applied = False
+        if not applied:
+            return InspectionResolution('held', observation.command_id, observation, 'cas_not_applied',
+                                        observation.status)
+        return InspectionResolution('applied', observation.command_id, observation, None, observation.status)
+
+    @staticmethod
+    def _observation(request, payload, answer, historical):
+        return InspectionObservation(request['binding']['command_id'], payload['status'], payload['route_state'],
+                                     payload['answered_at_ms'], payload['key_id'], request['binding_digest'],
+                                     json.loads(_canonical(request['dispatch'])), historical, answer)
+
+    def inspect(self, command, pin, dispatch_counter):
         request = self._client.request_for(command, pin, dispatch_counter)
         command_id = command.command_id
 
-        def held(error, status=None):
-            return InspectionResolution('held', command_id, status, None, error)
-        if not self._vouched(command, pin, dispatch_counter):
-            return held('unvouched')  # Nothing read or sent.
+        def held(error, status=None, observation=None):
+            return InspectionResolution('held', command_id, observation, error, status)
         try:
             row = self._ledger.read(command_id)
         except Exception:
             return held('no_held_attempt')
         if row is None or row[1:5] != InspectionLedger._key(request):
             return held('no_held_attempt')  # Nothing sent.
-        if row[5] != 'held':
+        if row[6] != 'held':
             replayed = self._replay(row, request)
             if replayed is None:
-                return held('replay_unverified')  # Never the stored terminal unverified.
-            return InspectionResolution(replayed[0], command_id, replayed[0], replayed[1], None, True)
+                return held('replay_unverified')  # Never the stored observation unverified.
+            # Historical evidence only: authoritative effect still needs the CAS.
+            return self._apply(row, self._observation(request, replayed[0], replayed[1], True))
         answer = self._client.inspect(request)
         if not answer.verified:
             return held(answer.error if answer.error in _INSPECTION_ERRORS else 'unverified')
@@ -2404,16 +2472,13 @@ class InspectionResolver:
                 or _canonical(payload['request']) != _canonical(request)
                 or payload['key_id'] != request['key_id']):
             return held('unverified')
+        observation = self._observation(request, payload, answer.raw, False)
         try:
-            # The source may have changed during the network wait: it must
-            # vouch AGAIN inside the very transaction that records the outcome.
-            self._ledger.resolve(request, answer.status, answer.route_state, payload['key_id'], answer.raw,
-                                 confirm=lambda: self._vouched(command, pin, dispatch_counter))
-        except SupervisorRouteRejected:
-            return held('unvouched', answer.status)
+            self._ledger.record_observation(request, answer.status, answer.route_state, payload['key_id'],
+                                            answer.raw)
         except Exception:
-            return held('resolution_unrecorded', answer.status)
-        return InspectionResolution(answer.status, command_id, answer.status, answer.route_state)
+            return held('observation_unrecorded', answer.status, observation)
+        return self._apply(row, observation)
 
     def close(self):
         self._ledger.close()
