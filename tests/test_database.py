@@ -162,7 +162,37 @@ def test_claim_ack_and_duplicate_claim_are_atomic(tmp_path):
     with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "hermes")
     done = repo.acknowledge(msg.id, "codex")
     assert done.status == "acknowledged" and done.acknowledged_at
+    # A retried ack (lost response, restart) returns the committed result, unchanged.
+    assert repo.acknowledge(msg.id, "codex") == done
+    with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "hermes")
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "late")
+
+
+def test_retried_reject_is_idempotent_only_for_the_same_reason(tmp_path):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    repo.claim(msg.id, "codex")
+    done = repo.reject(msg.id, "codex", "out of scope")
+    assert repo.reject(msg.id, "codex", "out of scope") == done
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "another reason")
     with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "codex")
+
+
+def test_unclaimed_message_still_cannot_be_finished(tmp_path):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "codex")
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "x")
+    assert repo.get(msg.id).status == "pending"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_json_numbers_are_refused_at_send_and_never_stored(tmp_path, value):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    with pytest.raises(MessageError, match="not valid JSON"):
+        repo.insert(sender="hermes", recipient="codex", message_type="x", body={"n": value})
+    with repo.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
 
 
 def test_expired_claim_can_be_retried(tmp_path):
