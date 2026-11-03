@@ -206,11 +206,14 @@ Explicit limits (this foundation grants no authority by itself):
   source bound to the Hub job store exists. Recorded terminal rows are
   re-verified (exact request + signed answer, current pinned key and
   binding) on every replay, else held.
-* The responder bounds its own work (``max_concurrent`` non-blocking slots,
-  ``read_budget_ms`` per journal read) independently of the client deadline,
-  but work a departed client no longer waits for still completes inside that
-  budget (detached work), and same-UID FD delegation and rollback anchoring
-  remain open as above.
+* The responder's CONCURRENCY is bounded (separate non-blocking pre-auth and
+  post-auth slot pools) but its TIME is best-effort: contention is cut by
+  try-acquire and SQLite busy/progress timeouts, while filesystem calls,
+  connection open/close and a custom authenticator are not interruptible.
+  Only the check of its own deadline immediately before every signed reply
+  is guaranteed (late -> unsigned 503). Work a departed client no longer
+  waits for can still complete (detached work), and same-UID FD delegation
+  and rollback anchoring remain open as above.
 """
 from __future__ import annotations
 
@@ -1867,14 +1870,19 @@ class SupervisorPeerPin:
 class InspectionResponderConfig:
     """Explicit configuration. ``enabled`` defaults to False: no responder exists.
 
-    ``max_concurrent`` (1..8) answers may run at once; another caller gets an
-    unsigned 503 ``busy`` immediately (never queued). ``read_budget_ms``
-    (10..1000) bounds each durable journal read; keep it well under the
-    client's total deadline.
+    ``max_authenticating`` (1..8) callers may be in the authenticator at once
+    and ``max_concurrent`` (1..8) authenticated answers may run at once; any
+    other caller gets an unsigned 503 ``busy`` immediately (never queued).
+    ``answer_budget_ms`` (20..2000, at least ``read_budget_ms``) is the
+    responder's own deadline per call, checked immediately before any signed
+    reply; ``read_budget_ms`` (10..1000) caps each durable journal read.
+    Keep both well under the client's total deadline.
     """
     enabled: bool = False
     max_concurrent: int = 2
     read_budget_ms: int = 100
+    max_authenticating: int = 2
+    answer_budget_ms: int = 250
 
 
 class SupervisorInspectionResponder:
@@ -1888,12 +1896,24 @@ class SupervisorInspectionResponder:
     refused), ``not_found`` (no row), ``unknown`` (intent/unknown, or ANY
     difference between the row and the request's binding or dispatch
     claim counter). Signed with the explicitly supplied supervisor key over the
-    full request echo; denials (401/400/404/503) are unsigned. Work is
-    bounded independently of the client's deadline: at most
-    ``max_concurrent`` answers at once (non-blocking: ``busy`` otherwise) and
-    each journal read within ``read_budget_ms`` (``unavailable`` otherwise).
-    Detached work is still possible inside the budget (a client that gave up
-    is not noticed). No listener or HTTP server is provided and nothing
+    full request echo; denials (401/400/404/503) are unsigned.
+
+    Bounds (independent of the client's deadline). CONCURRENCY is bounded:
+    two separate non-blocking slot pools, ``max_authenticating`` around the
+    authenticator callback and ``max_concurrent`` around the authenticated
+    work, so a slow or flooded authenticator can never occupy the slots of
+    already-authenticated answers (unauthenticated callers can still contend
+    for the pre-auth pool and make new callers ``busy``; that is the chosen
+    trade-off). TIME is best-effort, not a hard wall-clock bound: the journal
+    read tries its mutex for at most the remaining budget and SQLite busy /
+    progress timeouts stop contended statements, but filesystem calls,
+    connection open/close and a custom authenticator are not interruptible.
+    What IS guaranteed: the responder's own deadline (``answer_budget_ms``
+    from entry) is checked immediately before every signed reply, whatever
+    the status, and a late answer is replaced by an unsigned 503
+    ``unavailable``, so no signed ``not_found``/``unknown``/terminal leaves
+    after the deadline. Detached work is still possible (a client that gave
+    up is not noticed). No listener or HTTP server is provided and nothing
     constructs this.
     """
 
@@ -1903,11 +1923,16 @@ class SupervisorInspectionResponder:
         _require(type(route) is SupervisorRoute and isinstance(authenticator, InspectionAuthenticator)
                  and isinstance(signing_key, Ed25519PrivateKey)
                  and type(config.max_concurrent) is int and 1 <= config.max_concurrent <= 8
-                 and type(config.read_budget_ms) is int and 10 <= config.read_budget_ms <= 1000,
+                 and type(config.read_budget_ms) is int and 10 <= config.read_budget_ms <= 1000
+                 and type(config.max_authenticating) is int and 1 <= config.max_authenticating <= 8
+                 and type(config.answer_budget_ms) is int
+                 and max(20, config.read_budget_ms) <= config.answer_budget_ms <= 2000,
                  SupervisorRouteError('invalid supervisor inspection responder'))
         self._route, self._authenticator, self._signer = route, authenticator, signing_key
+        self._auth_slots = threading.BoundedSemaphore(config.max_authenticating)
         self._slots = threading.BoundedSemaphore(config.max_concurrent)
         self._read_budget_ms = config.read_budget_ms
+        self._answer_budget = config.answer_budget_ms / 1000
         self.key_id = inspection_key_id(signing_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw))
 
@@ -1919,19 +1944,28 @@ class SupervisorInspectionResponder:
         return status, _canonical({'error': {'code': code}})
 
     def answer(self, *, method, path, authorization, body):
+        deadline = time.monotonic() + self._answer_budget
+        # Bounded concurrency: never queue; a saturated pool answers busy.
+        if not self._auth_slots.acquire(blocking=False):
+            return self._denied(503, 'busy')
         try:
             _require(self._authenticator.authenticate(authorization) == INSPECTION_SCOPE)
         except Exception:
             return self._denied(401, 'unauthorized')
-        # Bounded concurrency: never queue; a saturated responder answers busy.
+        finally:
+            self._auth_slots.release()
         if not self._slots.acquire(blocking=False):
             return self._denied(503, 'busy')
         try:
-            return self._answer(method, path, body)
+            status, raw = self._answer(method, path, body, deadline)
         finally:
             self._slots.release()
+        if status == 200 and not time.monotonic() <= deadline:
+            # Checked immediately before EVERY signed reply: late is unsigned.
+            return self._denied(503, 'unavailable')
+        return status, raw
 
-    def _answer(self, method, path, body):
+    def _answer(self, method, path, body, deadline):
         if method != 'POST' or path != INSPECTION_PATH:
             return self._denied(404, 'not_found')
         try:
@@ -1941,9 +1975,11 @@ class SupervisorInspectionResponder:
             return self._denied(400, 'invalid_payload')
         if request['key_id'] != self.key_id:
             return self._denied(400, 'wrong_key')
+        budget_ms = min(self._read_budget_ms, int((deadline - time.monotonic()) * 1000))
+        if budget_ms <= 0:
+            return self._denied(503, 'unavailable')
         try:
-            row = _read_inspection_row(self._route._journal, request['binding']['command_id'],
-                                       self._read_budget_ms)
+            row = _read_inspection_row(self._route._journal, request['binding']['command_id'], budget_ms)
         except Exception:
             return self._denied(503, 'unavailable')
         status, route_state = 'unknown', None
@@ -2186,9 +2222,14 @@ class InspectionLedger(_DurableStore):
             except Exception:
                 raise RouteJournalError('inspection ledger unavailable') from None
 
-    def resolve(self, request, state, route_state, key_id, answer):
+    def resolve(self, request, state, route_state, key_id, answer, *, confirm):
         """held -> launched/refused for the EXACT binding; an identical repeat
-        is a no-op, anything else raises and changes nothing."""
+        is a no-op, anything else raises and changes nothing.
+
+        ``confirm()`` is called INSIDE the write transaction, after the row
+        checks and before the UPDATE; unless it returns exactly True the
+        transaction is rolled back (``SupervisorRouteRejected('unvouched')``).
+        """
         _require(state in _TERMINAL and route_state in _TERMINAL[state] and type(answer) is bytes,
                  RouteJournalError('state'))
         command_id = request['binding']['command_id']
@@ -2198,6 +2239,8 @@ class InspectionLedger(_DurableStore):
             if row[5] != 'held':
                 _require(row[5:8] == (state, route_state, key_id), RouteJournalError('resolution_conflict'))
                 return
+            if confirm() is not True:
+                raise SupervisorRouteRejected('unvouched')
             db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, answer=?, '
                        "request=? WHERE command_id=? AND state='held'",
                        (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'),
@@ -2263,7 +2306,10 @@ class InspectionResolver:
     Every ``hold`` and ``resolve`` therefore first requires the
     ``HeldAttemptSource`` to vouch for the exact attempt (default: refuses,
     so nothing can be held or resolved in production until a source bound to
-    the Hub job store exists). A recorded terminal row is NOT returned as
+    the Hub job store exists). Because the source can change while the
+    supervisor answer is in flight, it is asked again INSIDE the ledger
+    transaction that records a terminal outcome; if it no longer vouches,
+    nothing is recorded and the attempt stays held. A recorded terminal row is NOT returned as
     stored: its exact request and signed answer are re-verified against the
     CURRENT pinned key and the CURRENT binding on every replay; key rotation,
     a different pin or binding, a tampered or missing byte returns ``held``.
@@ -2343,7 +2389,12 @@ class InspectionResolver:
                 or payload['key_id'] != request['key_id']):
             return held('unverified')
         try:
-            self._ledger.resolve(request, answer.status, answer.route_state, payload['key_id'], answer.raw)
+            # The source may have changed during the network wait: it must
+            # vouch AGAIN inside the very transaction that records the outcome.
+            self._ledger.resolve(request, answer.status, answer.route_state, payload['key_id'], answer.raw,
+                                 confirm=lambda: self._vouched(command, pin, dispatch_counter))
+        except SupervisorRouteRejected:
+            return held('unvouched', answer.status)
         except Exception:
             return held('resolution_unrecorded', answer.status)
         return InspectionResolution(answer.status, command_id, answer.status, answer.route_state)

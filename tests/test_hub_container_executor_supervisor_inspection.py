@@ -885,7 +885,10 @@ def _ask(responder, body):
 @LINUX
 def test_responder_bounds_validated(world, insp):
     for bad in ({"max_concurrent": 0}, {"max_concurrent": 9}, {"max_concurrent": True},
-                {"read_budget_ms": 9}, {"read_budget_ms": 1001}, {"read_budget_ms": 50.0}):
+                {"read_budget_ms": 9}, {"read_budget_ms": 1001}, {"read_budget_ms": 50.0},
+                {"max_authenticating": 0}, {"max_authenticating": 9}, {"max_authenticating": 1.0},
+                {"answer_budget_ms": 19}, {"answer_budget_ms": 2001}, {"answer_budget_ms": 99},
+                {"answer_budget_ms": True}):
         with pytest.raises(SupervisorRouteError):
             _responder(insp, **bad)
 
@@ -894,7 +897,7 @@ def test_responder_bounds_validated(world, insp):
 def test_saturated_responder_answers_busy_without_queueing(world, insp, monkeypatch):
     cmd, counter = launch(world, insp)
     body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
-    responder = _responder(insp, max_concurrent=2)
+    responder = _responder(insp, max_concurrent=2, answer_budget_ms=2000)
     original, entered, release = route_module._read_inspection_row, threading.Semaphore(0), threading.Event()
 
     def slow(*args):
@@ -958,3 +961,122 @@ def test_slow_journal_read_is_bounded_and_held(world, insp, lock):
             raw.close()
     assert _ask(responder, body)[0] == 200
     assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+
+
+# --- Review fixes 2: signed-reply deadline, bounded auth, atomic re-vouch ------
+
+class _SlowAuthenticator(InspectionTokenAuthenticator):
+    """Delegates to the enrolled token, but blocks (then denies) "Bearer slow"
+    and optionally sleeps before authenticating everyone else."""
+
+    def __init__(self, token, *, delay=0.0):
+        super().__init__(token)
+        self.entered, self.release, self.delay = threading.Event(), threading.Event(), delay
+
+    def authenticate(self, authorization):
+        if authorization == "Bearer slow":
+            self.entered.set()
+            assert self.release.wait(10)
+            raise SupervisorRouteError("denied")
+        time.sleep(self.delay)
+        return super().authenticate(authorization)
+
+
+@LINUX
+@pytest.mark.parametrize("outcome", ["not_found", "completed", "unknown", "slow_auth"])
+def test_late_answer_is_never_signed(world, insp, monkeypatch, outcome):
+    if outcome == "not_found":
+        cmd, counter = command(world["epoch"]), 1  # Missing-row branch.
+    else:
+        cmd, counter = launch(world, insp, "completed" if outcome == "slow_auth" else outcome)
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    responder = _responder(insp, read_budget_ms=10, answer_budget_ms=50)
+    assert _ask(responder, body)[0] == 200  # In time: signed.
+    if outcome == "slow_auth":
+        responder._authenticator = _SlowAuthenticator(INSPECT_TOKEN, delay=0.08)
+    else:
+        original = route_module._read_inspection_row
+
+        def finishes_late(*args):
+            row = original(*args)  # Completes within its own budget...
+            time.sleep(0.08)  # ...but an uninterruptible step (fs call, close) overruns the deadline.
+            return row
+        monkeypatch.setattr(route_module, "_read_inspection_row", finishes_late)
+    assert _ask(responder, body) == (503, b'{"error":{"code":"unavailable"}}')  # Unsigned.
+    resolver = insp["resolver"]()
+    resolver.hold(cmd, world["pin"], counter)
+    insp["server"].responder = responder
+    _assert_held(world, insp, resolver, cmd, counter, "http_status")
+
+
+@LINUX
+def test_slow_authenticator_is_bounded_and_cannot_take_authenticated_slots(world, insp, monkeypatch):
+    cmd, counter = launch(world, insp)
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    responder = _responder(insp, max_authenticating=1, max_concurrent=1, answer_budget_ms=2000)
+    slow = _SlowAuthenticator(INSPECT_TOKEN)
+    responder._authenticator = slow
+    original, reading, read_release = route_module._read_inspection_row, threading.Event(), threading.Event()
+
+    def blocked_read(*args):
+        reading.set()
+        assert read_release.wait(10)
+        return original(*args)
+    monkeypatch.setattr(route_module, "_read_inspection_row", blocked_read)
+    results = {}
+    authenticated = threading.Thread(target=lambda: results.update(a=_ask(responder, body)))
+    authenticated.start()
+    assert reading.wait(5)  # Past auth, holding the only post-auth slot.
+    stuck = threading.Thread(target=lambda: results.update(s=responder.answer(
+        method="POST", path=INSPECTION_PATH, authorization="Bearer slow", body=body)))
+    stuck.start()
+    assert slow.entered.wait(5)  # Holding the only pre-auth slot.
+    started = time.monotonic()
+    assert _ask(responder, body) == (503, b'{"error":{"code":"busy"}}')  # Bounded: no queueing.
+    assert time.monotonic() - started < 0.2
+    read_release.set()
+    authenticated.join(10)
+    assert results["a"][0] == 200  # The slow authenticator never touched the authenticated slot.
+    slow.release.set()
+    stuck.join(10)
+    assert results["s"][0] == 401
+    monkeypatch.undo()
+    assert _ask(responder, body)[0] == 200  # Both pools released.
+
+
+class _Identity(HeldAttemptSource):
+    """Test-only Hub job store: vouches only for the attempt it currently holds."""
+
+    def __init__(self):
+        self.current, self.phases, self.ledger = None, [], None
+
+    def vouch(self, command, pin, dispatch_counter):
+        self.phases.append(getattr(self.ledger, "last_phase", None))
+        return self.current == (command.command_id, pin, dispatch_counter)
+
+
+@LINUX
+@pytest.mark.parametrize("change", ["stops_vouching", "identity_changed", "unchanged"])
+def test_source_revalidated_atomically_with_recording(world, insp, change):
+    cmd, counter = launch(world, insp)
+    source = _Identity()
+    source.current = (cmd.command_id, world["pin"], counter)
+    resolver = insp["resolver"](source=source)
+    source.ledger = resolver._ledger
+    resolver.hold(cmd, world["pin"], counter)
+
+    def in_flight(body, responder):
+        if change == "stops_vouching":
+            source.current = None
+        elif change == "identity_changed":  # Job store now names another attempt for this command.
+            source.current = (cmd.command_id, world["pin"], counter + 1)
+        return [(0, _http(200, genuine(body, responder)))]
+    insp["server"].script = in_flight
+    result = resolver.resolve(cmd, world["pin"], counter)
+    if change == "unchanged":
+        assert result.state == "launched"
+        assert source.phases[-1] == "in_transaction"  # Re-vouched inside the recording transaction.
+        return
+    assert (result.state, result.error, result.status) == ("held", "unvouched", "launched")
+    assert ledger_state(insp, cmd.command_id) == ("held", None)  # Nothing recorded.
+    assert source.phases[-1] == "in_transaction"
