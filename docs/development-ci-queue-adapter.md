@@ -134,11 +134,24 @@ What is enforced in source:
   reports terminal (`receipt_committed` marks them `reported`). Pause, revoke
   or lease loss only stop new signatures. There is no operator path to clear an
   unreported mark; an attempt whose host never reports stays held.
+  While a mark is open, further triggers also refuse clearing, reassigning,
+  re-generating or deleting the `hub_work_machines` reservation, deleting the
+  job, and changing any job identity column (only `state` to `held`, `lease_until`
+  and `revision` may change). The signing transaction re-reads the full binding
+  (task revision, review, candidate commit, manifest, both policy rows, attempt
+  rows, registry and target verification) under `BEGIN IMMEDIATE`; any drift
+  records no mark and signs nothing.
+- Triggers bind cooperative writers only. A writer that drops or bypasses
+  triggers (any direct SQLite access to the ledger or journal) is outside every
+  guarantee here; the exclusive-writer boundary must be enforced externally.
 - Host nonces: at most `max_nonces` (default 64, 1..1024) live entries; expired
   entries are pruned by `time.monotonic()`, a full store refuses new challenges
   rather than evicting live ones, and each nonce is removed after one use
   whether confirmation succeeds or fails. Clock values, skew and leases must be
-  finite (NaN and infinities refuse).
+  finite (NaN and infinities refuse). Finite values are not skew or rollback
+  protection: nonce expiry uses the host's monotonic clock, but comparing the
+  Hub's lease expiry with host wall-clock time still ASSUMES the two clocks
+  differ by no more than `max_clock_skew`; nothing here measures or enforces it.
 - Hub: `receipt_committed` binds the authenticated host inspection to the
   original claim/attempt. The authenticated host ack is recorded with its
   credential (`host_acked`) and re-verified before release; a ledger trigger

@@ -886,3 +886,69 @@ def test_non_finite_clocks_are_refused(rig, value, which):
     for bad in (float('nan'), float('inf')):
         with pytest.raises(HandoffRefused, match='composition_required'):
             make_host(rig, max_clock_skew=bad)
+
+
+@pytest.mark.asyncio
+async def test_raw_reservation_and_identity_writes_are_aborted_while_in_flight(rig):
+    job = submit(rig)
+    other = submit(rig, 'other')
+    statements = (
+        ('UPDATE hub_work_machines SET job_id=NULL WHERE machine_id=?', (MACHINE,)),
+        ('UPDATE hub_work_machines SET job_id=? WHERE machine_id=?', (other['id'], MACHINE)),
+        ('UPDATE hub_work_machines SET generation=generation+1 WHERE machine_id=?', (MACHINE,)),
+        ('DELETE FROM hub_work_machines WHERE machine_id=?', (MACHINE,)),
+        ('DELETE FROM hub_work_jobs WHERE id=?', (job['id'],)),
+        ('UPDATE hub_work_jobs SET fence=fence+1 WHERE id=?', (job['id'],)),
+        ("UPDATE hub_work_jobs SET worker='codex:other' WHERE id=?", (job['id'],)),
+        ("UPDATE hub_work_jobs SET target='{}' WHERE id=?", (job['id'],)),
+        ("UPDATE hub_work_jobs SET state='queued' WHERE id=?", (job['id'],)))
+    refused = []
+    def raw_writer():
+        for statement, values in statements:
+            try:
+                with rig.repo._transaction() as hub:
+                    hub.execute(statement, values)
+                refused.append(False)
+            except sqlite3.IntegrityError as error:
+                refused.append('development_ci_effect_in_flight' in str(error))
+    rig.runner.during = raw_writer
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert refused == [True] * len(statements)
+    assert len(rig.runner.calls) == 1 and releases(rig, job['id']) == 1
+    # After the normal path closes the marks, cooperative writes are allowed again.
+    with rig.repo._transaction() as hub:
+        hub.execute("UPDATE hub_work_jobs SET worker='codex:other' WHERE id=?", (job['id'],))
+        hub.execute('DELETE FROM hub_work_jobs WHERE id=?', (job['id'],))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['review', 'policy', 'manifest'])
+async def test_binding_drift_before_signing_txn_records_no_mark_and_no_effect(rig, monkeypatch, drift):
+    task = reviewed_task(rig.repo, 'drift')
+    job = rig.queue.submit(actor='codex', request_id='drift', action_key=ACTION, environment='staging',
+                           target=WorkTarget(task['id'], task['candidate_commit'], rig.manifest.digest))
+    original = rig.bridge._bound
+    calls = []
+    def bound_then_drift(attempt):
+        result = original(attempt)
+        calls.append(1)
+        if len(calls) == 2:  # the precheck inside answer_challenge, just before BEGIN
+            if drift == 'review':
+                with rig.repo._transaction() as db:
+                    data = rig.repo._get(db, task['id'], 'task')
+                    data['review']['actor'] = 'hermes'
+                    rig.repo._save(db, 'hermes', 'test.review-drift', 'task', data)
+            elif drift == 'policy':
+                with rig.repo._transaction() as db:
+                    db.execute("UPDATE hub_development_ci_policy SET manifest_digest=?", ('sha256:' + '0' * 64,))
+            else:
+                from dataclasses import replace
+                rig.bridge.manifest = replace(rig.manifest, budget_seconds=899)
+        return result
+    monkeypatch.setattr(rig.bridge, '_bound', bound_then_drift)
+    await rig.bridge.run_once()
+    assert len(calls) >= 2
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+    assert not rig.channel.starts and not rig.runner.calls and host_rows(rig) == []
+    assert reservation(rig) == job['id'] and releases(rig, job['id']) == 0

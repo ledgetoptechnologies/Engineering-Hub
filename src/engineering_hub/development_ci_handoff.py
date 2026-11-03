@@ -58,7 +58,7 @@ import time
 import uuid
 
 from .development_ci import DevelopmentCIAttempt, QueuedDevelopmentCI, _canonical
-from .repository import HubError
+from .repository import AGENTS, HubError
 from .work_queue import SOFTWARE_VALIDATION_EXECUTOR, WorkTarget, WorkWorker
 
 HANDOFF_MARKER = 'HANDOFF_ENROLLED.json'
@@ -913,6 +913,33 @@ CREATE TRIGGER IF NOT EXISTS hub_ci_effect_release_guard BEFORE UPDATE OF state 
 WHEN NEW.state NOT IN ('claimed','held')
   AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=NEW.id AND state='in_flight')
 BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_job_identity BEFORE UPDATE ON hub_work_jobs
+WHEN EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.id AND state='in_flight') AND (NEW.sequence IS NOT OLD.sequence
+  OR NEW.id IS NOT OLD.id
+  OR NEW.actor IS NOT OLD.actor
+  OR NEW.request_id IS NOT OLD.request_id
+  OR NEW.fingerprint IS NOT OLD.fingerprint
+  OR NEW.action_key IS NOT OLD.action_key
+  OR NEW.environment IS NOT OLD.environment
+  OR NEW.machine_id IS NOT OLD.machine_id
+  OR NEW.project IS NOT OLD.project
+  OR NEW.approval_id IS NOT OLD.approval_id
+  OR NEW.target IS NOT OLD.target
+  OR NEW.requires_execution_proof IS NOT OLD.requires_execution_proof
+  OR NEW.fence IS NOT OLD.fence
+  OR NEW.worker IS NOT OLD.worker
+  OR NEW.created_at IS NOT OLD.created_at)
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_job_delete BEFORE DELETE ON hub_work_jobs
+WHEN EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.id AND state='in_flight')
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_machine_update BEFORE UPDATE ON hub_work_machines
+WHEN OLD.job_id IS NOT NULL AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.job_id AND state='in_flight')
+  AND (NEW.job_id IS NOT OLD.job_id OR NEW.generation IS NOT OLD.generation OR NEW.machine_id IS NOT OLD.machine_id)
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_machine_delete BEFORE DELETE ON hub_work_machines
+WHEN OLD.job_id IS NOT NULL AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.job_id AND state='in_flight')
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_release_guard BEFORE UPDATE OF state ON hub_work_jobs
 WHEN NEW.state IN ('succeeded','failed')
   AND EXISTS(SELECT 1 FROM hub_development_ci_handoff WHERE job_id=NEW.id)
@@ -924,7 +951,12 @@ WHEN NEW.state IN ('succeeded','failed')
 BEGIN UPDATE hub_development_ci_handoff SET state='finalized'
       WHERE job_id=NEW.id AND state='host_acked' AND outcome=NEW.state; END;
 '''
-_HUB_EXPECTED = _reference_schema(_HUB_SCHEMA, ('CREATE TABLE hub_work_jobs (id TEXT, state TEXT)',))
+_HUB_EXPECTED = _reference_schema(_HUB_SCHEMA, (
+    'CREATE TABLE hub_work_jobs (sequence INTEGER, id TEXT, actor TEXT, request_id TEXT, fingerprint TEXT, '
+    'action_key TEXT, environment TEXT, machine_id TEXT, project TEXT, approval_id TEXT, target TEXT, '
+    'requires_execution_proof INTEGER, state TEXT, revision INTEGER, worker TEXT, fence INTEGER, '
+    'lease_until REAL, created_at REAL)',
+    'CREATE TABLE hub_work_machines (machine_id TEXT, generation INTEGER, job_id TEXT)'))
 
 
 class _UnusedProvider:
@@ -1060,7 +1092,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                     or job['fence'] != attempt.fence or not job['lease_until'] > now
                     or machine is None or tuple(machine) != (attempt.fence, attempt.job_id)
                     or db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0]
-                    or self.repo._paused(db)):
+                    or self.repo._paused(db)
+                    or not self._binding_in_txn(db, attempt, job)):
                 raise HubError('development_ci_handoff_claim_not_current', 409)
             db.execute("INSERT INTO hub_development_ci_effects VALUES(?,?,?,?,'in_flight')",
                        (challenge['nonce'], attempt.job_id, attempt.attempt_id, attempt.fence))
@@ -1069,6 +1102,54 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                      'fence': attempt.fence, 'generation': self.host_generation,
                      'lease_until': lease_until, 'state': 'claim_current'}
         return statement, self._sign('claim', statement)
+
+    def _binding_in_txn(self, db, attempt, job):
+        """The full _bound binding, re-read INSIDE the signing transaction.
+
+        BEGIN IMMEDIATE holds the write lock, so the committed task, review,
+        policy and attempt rows read here cannot change before the mark and
+        signature are recorded.
+        """
+        try:
+            self._guard()  # composition, manifest/provider identity, registry, schema
+            task = self.repo._get(db, attempt.task_id, 'task')
+            review = task.get('review')
+            target = WorkTarget(**json.loads(job['target']))
+            saved = db.execute('SELECT attempt FROM hub_development_ci_attempts WHERE job_id=?',
+                               (attempt.job_id,)).fetchone()
+            handoff = db.execute('SELECT attempt,state,fence FROM hub_development_ci_handoff WHERE job_id=?',
+                                 (attempt.job_id,)).fetchone()
+            policy = db.execute('SELECT action_key,machine_id,manifest_digest FROM hub_development_ci_policy '
+                                'WHERE id=1').fetchone()
+            enrolled = db.execute('SELECT action_key,machine_id,manifest_digest,host_generation '
+                                  'FROM hub_development_ci_handoff_policy WHERE id=1').fetchone()
+            action = self.queue.actions.get(self.action_key)
+            original = _canonical(asdict(attempt))
+            return (task['project'] == 'engineering-hub' and task['owner'] == attempt.actor
+                    and task['status'] == 'verified' and task['candidate_commit'] == attempt.source_commit
+                    and task['revision'] == attempt.task_revision
+                    and type(review) is dict and review.get('actor') in AGENTS
+                    and review.get('actor') != attempt.actor and review.get('verdict') == 'approve'
+                    and review.get('commit') == attempt.source_commit and _canonical(review) == attempt.review
+                    and target == WorkTarget(attempt.task_id, attempt.source_commit, attempt.manifest_digest)
+                    and target.artifact_digest == self.manifest.digest == attempt.manifest_digest
+                    and job['actor'] == attempt.actor and job['action_key'] == self.action_key
+                    and job['environment'] == 'staging' and job['machine_id'] == self.manifest.machine_id
+                    and bool(job['requires_execution_proof']) is True
+                    and saved is not None and saved['attempt'] == original
+                    and handoff is not None and handoff['attempt'] == original
+                    and handoff['state'] == 'intent' and handoff['fence'] == attempt.fence
+                    and policy is not None
+                    and tuple(policy) == (self.action_key, self.manifest.machine_id, self.manifest.digest)
+                    and enrolled is not None
+                    and tuple(enrolled) == (self.action_key, self.manifest.machine_id, self.manifest.digest,
+                                            self.host_generation)
+                    and action is not None and action.machine_id == self.manifest.machine_id
+                    and action.environments == frozenset({'staging'}) and action.requires_execution_proof
+                    and self.queue._shared_policy_valid(self.action_key)
+                    and self.queue._target_verified(attempt.actor, self.action_key, 'staging', target))
+        except Exception:
+            return False
 
     def _prior_release(self):
         """Hub-signed release of the latest attempt whose queue job was released."""
