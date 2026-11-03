@@ -234,7 +234,10 @@ class SQLiteEventSource:
     After startup, a snapshot that fails with a verified SQLITE_BUSY/LOCKED
     primary code is retried with bounded, stop-interruptible backoff and the
     cursor unchanged, so the later successful snapshot catches up from it.
-    That bounded wait is the only timer. Exhausting the retry budget, and every
+    The budget counts from the start of the first blocked attempt and includes
+    time spent inside SQLite's busy handler: after startup, busy_timeout is
+    capped to the budget, and each retry to what is left of it. stop() also
+    interrupts SQL blocked in that handler. That bounded wait is the only timer. Exhausting the retry budget, and every
     other error, fails closed exactly as before. This hardens against lock
     contention generally; it does not assert any past outage was a lock.
     """
@@ -293,6 +296,10 @@ class SQLiteEventSource:
         self._transient_attempts = 0
         # Flush commands received during a retry wait run after it recovers.
         self._deferred_commands: list[tuple[str, threading.Event | None]] = []
+        # stop() interrupts SQL blocked in SQLite's busy handler; the lock keeps
+        # interrupt() and connection close from racing.
+        self._stop_requested = threading.Event()
+        self._connections_lock = threading.Lock()
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -387,7 +394,9 @@ class SQLiteEventSource:
                 self._commands.put(("stop", done), timeout=timeout)
             except queue.Full as exc:
                 raise TimeoutError("native SQLite lifecycle command queue is full") from exc
+            self._stop_requested.set()
             self._signal_control()
+            self._interrupt_sql()
             if not done.wait(timeout):
                 self.raise_if_failed()
                 raise TimeoutError("timed out stopping native SQLite event source")
@@ -490,6 +499,10 @@ class SQLiteEventSource:
             # The reader sentinel takes one head snapshot only after all watches exist.
             self._reconcile(reason="startup")
             self._set_stat("startup_catchups", 1)
+            # Startup keeps the full busy_timeout (start() has its own bound). After it,
+            # a single blocked attempt may not outlast the retry budget, so the budget
+            # covers time spent inside SQLite's busy handler too.
+            self._set_busy_timeout(self._steady_busy_timeout_ms())
             self._set_stat("healthy", True)
             self._ready.set()
             ready_signaled = True
@@ -698,19 +711,26 @@ class SQLiteEventSource:
 
     def _reconcile(self, *, reason: str) -> None:
         while True:
+            attempt_started = time.monotonic()
             try:
                 selected, next_cursor = self._snapshot()
                 break
             except sqlite3.OperationalError as exc:
+                if self._stop_requested.is_set():
+                    raise _StopRequested() from None  # stop() interrupted blocked SQL.
                 # Startup stays fail-closed: start() has its own bounded timeout.
                 code_name = None if reason == "startup" else _transient_sqlite_code(exc)
                 if code_name is None:
                     raise
+                if self._transient_started is None:
+                    # The budget counts from when the first blocked attempt began.
+                    self._transient_started = attempt_started
                 self._wait_transient(exc, code_name)
         if self._transient_started is not None:
             # A successful snapshot ends the episode and resets the budget.
             self._transient_started = None
             self._transient_attempts = 0
+            self._set_busy_timeout(self._steady_busy_timeout_ms())
             self._set_stat("transient_retrying", False)
             if self._deferred_commands:
                 self._signal_control()  # Wake the main loop for deferred flushes.
@@ -720,6 +740,26 @@ class SQLiteEventSource:
             self._stage = "publish_invalidation"
             self.deliver(selected, next_cursor)
             self._add_stat("deliveries")
+
+    def _steady_busy_timeout_ms(self) -> int:
+        if self.transient_retry_budget_ms == 0:
+            return self.busy_timeout_ms
+        return max(1, min(self.busy_timeout_ms, self.transient_retry_budget_ms))
+
+    def _set_busy_timeout(self, milliseconds: int) -> None:
+        for conn in (self._reader, self._barrier):
+            if conn is not None:
+                conn.execute(f"PRAGMA busy_timeout={int(milliseconds)}")
+
+    def _interrupt_sql(self) -> None:
+        """Abort SQL blocked in SQLite's busy handler so a stop is serviced promptly."""
+        with self._connections_lock:
+            for conn in (self._reader, self._barrier):
+                if conn is not None:
+                    try:
+                        conn.interrupt()
+                    except sqlite3.Error:
+                        pass
 
     def _wait_transient(self, exc: sqlite3.OperationalError, code_name: str) -> None:
         """Back off after a BUSY/LOCKED snapshot, interruptibly via the eventfd.
@@ -732,7 +772,7 @@ class SQLiteEventSource:
         """
         now = time.monotonic()
         if self._transient_started is None:
-            self._transient_started = now
+            self._transient_started = now  # Callers normally set it to the attempt's start.
         remaining_ms = self.transient_retry_budget_ms - (now - self._transient_started) * 1000
         if remaining_ms <= 0:
             raise exc
@@ -774,6 +814,11 @@ class SQLiteEventSource:
                     raise _StopRequested()
                 self._deferred_commands.append((command, done))
         self._stage = stage
+        left_ms = self.transient_retry_budget_ms - (time.monotonic() - self._transient_started) * 1000
+        if left_ms <= 0:
+            raise exc
+        # The next attempt may not block inside SQLite past the rest of the budget.
+        self._set_busy_timeout(max(1, min(self._steady_busy_timeout_ms(), int(left_ms))))
 
     def _fail(self, exc: BaseException) -> None:
         with self._condition:
@@ -797,13 +842,14 @@ class SQLiteEventSource:
                 pass
 
     def _cleanup(self) -> None:
-        for conn in (self._reader, self._barrier):
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-        self._reader = self._barrier = None
+        with self._connections_lock:
+            for conn in (self._reader, self._barrier):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+            self._reader = self._barrier = None
         if self._epoll is not None:
             try:
                 self._epoll.close()
