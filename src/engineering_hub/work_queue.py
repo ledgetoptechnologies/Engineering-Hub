@@ -382,6 +382,7 @@ class WorkQueue:
                     raise ValueError('invalid target')
                 staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
                 controller_owned = (row['action_key'].startswith(('modular.', 'staging-service.'))
+                    or row['request_id'].startswith('staging:')
                     or staging_table and db.execute(
                         "SELECT 1 FROM hub_staging_submissions WHERE id IN (?,?) OR json_extract(data,'$.job_id')=? OR (actor=? AND request_id=?) LIMIT 1",
                         (target.get('task_id'), target.get('submission_id'), job_id, actor,

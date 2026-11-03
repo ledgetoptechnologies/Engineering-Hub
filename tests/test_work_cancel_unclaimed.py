@@ -201,3 +201,19 @@ def test_corrupt_staging_record_denies_cancellation_with_fixed_error(setup_queue
     with pytest.raises(HubError,match='work_controller_cancel_required') as failure:
         queue.cancel_unclaimed(actor='codex',job_id=job['id'])
     assert failure.value.status==409 and queue.get_job(job['id'])['state']=='queued'
+
+
+def test_reserved_staging_request_denied_when_submission_table_missing(setup_queue):
+    queue, _, repo, _=setup_queue
+    job=submit(queue,'staging:orphaned-submission')
+    with repo._connection() as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone() is None
+    with pytest.raises(HubError,match='work_controller_cancel_required'):
+        queue.cancel_unclaimed(actor='codex',job_id=job['id'])
+    assert queue.get_job(job['id'])['state']=='queued'
+
+
+def test_non_reserved_prefix_still_cancellable(setup_queue):
+    queue, _, _, _=setup_queue
+    job=submit(queue,'staging-other')
+    assert queue.cancel_unclaimed(actor='codex',job_id=job['id'])['state']=='cancelled'
