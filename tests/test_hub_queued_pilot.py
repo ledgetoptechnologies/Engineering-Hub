@@ -138,12 +138,15 @@ async def test_private_worker_only_and_fence_cannot_be_forged(rig):
 
 
 @pytest.mark.asyncio
-async def test_changed_review_prevents_claim_and_any_host_submission(rig):
+async def test_open_job_freezes_reviewed_task_and_allows_its_pilot(rig):
     task, _ = submit(rig)
     current = rig.repo.get_task(task["id"])
-    rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
-    assert await rig.bridge.run_once() is None
-    assert rig.client.submissions == [] and rig.repo.list_runs() == []
+    with pytest.raises(HubError, match="task_in_progress"):
+        rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
+    result = await rig.bridge.run_once()
+    assert result["state"] == "succeeded"
+    assert len(rig.repo.list_runs()) == 1
+    assert len(rig.client.submissions) == len(ACTIONS[:2])
 
 
 @pytest.mark.asyncio
@@ -430,3 +433,14 @@ def test_missing_inprocess_bridge_never_treats_durable_marker_as_authority(rig):
         assert rig.repo.list_runs() == [] and rig.client.submissions == []
     finally:
         rig.repo._queued_pilot = rig.bridge
+
+@pytest.mark.asyncio
+async def test_one_open_job_per_task_does_not_deadlock_pilot(rig):
+    task, first = submit(rig)
+    assert rig.queue.submit(actor='codex', request_id='one', action_key=ACTION,
+        environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))['id'] == first['id']
+    with pytest.raises(HubError, match='work_task_already_queued'):
+        rig.queue.submit(actor='codex', request_id='duplicate-target', action_key=ACTION,
+            environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert machine_job(rig) is None

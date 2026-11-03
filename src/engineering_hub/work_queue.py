@@ -19,6 +19,7 @@ import inspect
 import math
 import os
 import re
+import sqlite3
 import time
 import uuid
 
@@ -313,6 +314,11 @@ class WorkQueue:
         self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
+        # Capture task state before the external target verifier; taskless
+        # trusted coordination actions retain their existing semantics.
+        with self.repo._connection() as db:
+            before = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            task_snapshot = before['data'] if before is not None else None
         if not self._target_verified(actor, action_key, environment, target):
             raise HubError('work_target_not_verified', 403)
         target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
@@ -325,6 +331,23 @@ class WorkQueue:
                 if old['fingerprint'] != fingerprint:
                     raise HubError('work_request_conflict', 409)
                 return self._public(old)
+            current = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            if (current['data'] if current is not None else None) != task_snapshot:
+                raise HubError('work_review_changed', 409)
+            if current is not None:
+                task = json.loads(current['data'])
+                review = task.get('review')
+                family = task.get('candidate_family', task.get('owner_family', task.get('owner')))
+                reviewer_family = review.get('family', review.get('actor')) if type(review) is dict else None
+                if not (task.get('owner') == actor and task.get('project') == action.project
+                        and task.get('status') == 'verified' and task.get('candidate_commit') == target.source_commit
+                        and type(review) is dict and review.get('verdict') == 'approve'
+                        and review.get('commit') == target.source_commit and review.get('actor') in AGENTS
+                        and review.get('actor') != actor and reviewer_family == review.get('actor')
+                        and type(family) is str and family == actor and reviewer_family != family):
+                    raise HubError('work_review_changed', 409)
+            if self.repo._open_work_job(db, target.task_id):
+                raise HubError('work_task_already_queued', 409)
             if db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] >= self.max_jobs:
                 raise HubError('work_queue_capacity', 503)
             job_id = str(uuid.uuid4())
@@ -333,6 +356,53 @@ class WorkQueue:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?)''',
                 (job_id, actor, request_id, fingerprint, action_key, environment, action.machine_id, action.project, approval_id, target_json, int(action.requires_execution_proof), self._now()))
             self._event(db, 'work.submitted', job_id, actor)
+            return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
+
+    def cancel_unclaimed(self, *, actor, job_id):
+        """Cancel an eligible never-claimed queue entry; controller resources are separate."""
+        if type(actor) is not str or actor not in AGENTS:
+            raise HubError('invalid_work_actor')
+        _key(job_id)
+        with self.repo._transaction() as db:
+            row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise HubError('work_job_not_found', 404)
+            if row['actor'] != actor:
+                raise HubError('forbidden', 403)
+            # Check the durable job project inside the cancellation transaction.
+            # Legacy agents may clear an archived project's unclaimed job;
+            # installation principals are not supported by this queue yet.
+            self.repo._project(row['project'], db, require_active=False)
+            # Modular source deposits and resource registration straddle queue
+            # insertion; only the controller can safely cancel that lifecycle.
+            # A durable submission precedes queue admission in both schemas.
+            try:
+                target = json.loads(row['target'])
+                if type(target) is not dict:
+                    raise ValueError('invalid target')
+                staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
+                controller_owned = (row['action_key'].startswith(('modular.', 'staging-service.'))
+                    or row['request_id'].startswith('staging:')
+                    or staging_table and db.execute(
+                        "SELECT 1 FROM hub_staging_submissions WHERE id IN (?,?) OR json_extract(data,'$.job_id')=? OR (actor=? AND request_id=?) LIMIT 1",
+                        (target.get('task_id'), target.get('submission_id'), job_id, actor,
+                         row['request_id'][len('staging:'):] if row['request_id'].startswith('staging:') else None)).fetchone())
+            except (ValueError, TypeError, sqlite3.DatabaseError):
+                raise HubError('work_controller_cancel_required', 409) from None
+            if controller_owned:
+                raise HubError('work_controller_cancel_required', 409)
+            if row['state'] == 'cancelled':
+                return self._public(row)
+            if (row['state'] != 'queued' or row['revision'] != 1
+                    or row['worker'] is not None or row['fence'] is not None
+                    or row['lease_until'] is not None
+                    or db.execute('SELECT 1 FROM hub_work_machines WHERE job_id=? LIMIT 1', (job_id,)).fetchone()
+                    or db.execute("SELECT 1 FROM hub_audit WHERE entity_id=? AND action='work.claimed' LIMIT 1", (job_id,)).fetchone()):
+                raise HubError('work_not_unclaimed', 409)
+            updated = db.execute("UPDATE hub_work_jobs SET state='cancelled' WHERE id=? AND state='queued' AND revision=1 AND worker IS NULL AND fence IS NULL AND lease_until IS NULL", (job_id,)).rowcount
+            if updated != 1:
+                raise HubError('work_not_unclaimed', 409)
+            self._event(db, 'work.cancelled', job_id, actor)
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
     def _admitted(self, worker, row):

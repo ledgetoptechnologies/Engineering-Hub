@@ -179,15 +179,25 @@ class HubRepository:
 
     def _assert_queued_pilot(self, operation, *, db=None, **context):
         if not self.queued_pilot_enrolled(db):
-            return
+            return None
         # The exact trusted local bridge is not a bearer identity, request flag
         # or callback supplied by a public caller. Its private scoped permit
         # rechecks the original job, live owner and physical reservation.
         from .queued_pilot import QueuedContainerPilot
         bridge = getattr(self, '_queued_pilot', None)
-        if (type(bridge) is not QueuedContainerPilot or bridge.repo is not self
-                or bridge.authorize(operation, db=db, **context) is not True):
+        if type(bridge) is not QueuedContainerPilot or bridge.repo is not self:
             raise HubError('queued_pilot_admission_required', 409)
+        authorization = bridge.authorize(operation, db=db, **context)
+        if operation == 'create_run':
+            # The private bridge returns the exact queued job it validated.
+            # That job owns this task already, so it must be exempt from the
+            # generic "another job is in progress" guard below.
+            if not isinstance(authorization, str):
+                raise HubError('queued_pilot_admission_required', 409)
+            return authorization
+        if authorization is not True:
+            raise HubError('queued_pilot_admission_required', 409)
+        return None
 
     @staticmethod
     def _actor(actor, human=False, agent=False):
@@ -393,6 +403,8 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
+            if self._open_work_job(db, identity):
+                raise HubError('task_in_progress', 409)
             if item['owner'] != actor or not session_context.continuation_allowed(item, actor):
                 raise HubError('forbidden', 403)
             if item['status'] == 'withdrawn':
@@ -410,6 +422,8 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
+            if self._open_work_job(db, identity):
+                raise HubError('task_in_progress', 409)
             if (item['owner'] == actor
                     or session_context.family(actor) == item.get('candidate_family', item.get('owner_family', item['owner']))):
                 raise HubError('independent_review_required', 403)
@@ -456,6 +470,8 @@ class HubRepository:
             else:
                 if item['status'] == 'withdrawn':
                     raise HubError('withdrawn', 409)
+                if self._open_work_job(db, identity):
+                    raise HubError('task_in_progress', 409)
                 # A queued manifest/review may already bind the task revision.
                 # Do not mutate that admission surface through this new API.
                 if self.queued_pilot_enrolled(db):
@@ -474,12 +490,18 @@ class HubRepository:
         return self._list('decision')
 
     @staticmethod
-    def _open_work_job(db, task_id):
+    def _open_work_job(db, task_id, *, excluding_job_id=None):
         """A queued, claimed or held work-queue job still owns this task; terminal ones don't."""
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_work_jobs'").fetchone():
             return False
-        return db.execute('''SELECT 1 FROM hub_work_jobs WHERE json_extract(target,'$.task_id')=?
-            AND state NOT IN ('succeeded','failed','cancelled') LIMIT 1''', (task_id,)).fetchone() is not None
+        query = '''SELECT 1 FROM hub_work_jobs WHERE json_extract(target,'$.task_id')=?
+            AND state NOT IN ('succeeded','failed','cancelled')'''
+        parameters = [task_id]
+        if excluding_job_id is not None:
+            query += ' AND id<>?'
+            parameters.append(excluding_job_id)
+        query += ' LIMIT 1'
+        return db.execute(query, parameters).fetchone() is not None
 
     @staticmethod
     def _creator(db, kind, identity):
@@ -582,7 +604,7 @@ class HubRepository:
         key = self._text(client_request_id, 128) if client_request_id is not None else None
         fingerprint = hashlib.sha256(_json([task_id, expected_revision, artifact_digest, target, execution_manifest_digest]).encode()).hexdigest()
         with self._transaction() as db:
-            self._assert_queued_pilot('create_run', db=db, actor=actor,
+            authorized_job_id = self._assert_queued_pilot('create_run', db=db, actor=actor,
                 task_id=task_id, expected_revision=expected_revision,
                 artifact_digest=artifact_digest, target=target,
                 execution_manifest_digest=execution_manifest_digest,
@@ -596,6 +618,8 @@ class HubRepository:
             task = self._get(db, task_id, 'task')
             self._project(task['project'], db)
             self._cas(task, expected_revision)
+            if self._open_work_job(db, task_id, excluding_job_id=authorized_job_id):
+                raise HubError('task_in_progress', 409)
             if self._paused(db):
                 raise HubError('paused', 409)
             if task['owner'] != actor:
