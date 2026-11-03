@@ -674,6 +674,93 @@ def test_second_process_cannot_take_over_while_first_effect_is_active(gate_path)
     b.close()
 
 
+_TRIES_TO_OPEN = r'''
+import fcntl, os, sys
+# The owner flock itself, independent of any SQLite lock the holder has.
+fd = os.open(sys.argv[2] + '.pilot-owner.lock', os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print('flock_free', end=' ')
+except BlockingIOError:
+    print('flock_held', end=' ')
+finally:
+    os.close(fd)  # Probe only: closing our own description releases only our probe.
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, os.path.join(sys.argv[1], 'src'))
+from hub_container_executor.supervisor_route import (DispatchCounterGate, DispatchGateConfig, RouteEpoch,
+                                                       SupervisorRouteError)
+try:
+    DispatchCounterGate(config=DispatchGateConfig(
+        enabled=True, journal_path=sys.argv[2], create_journal=False, executor_id='a' * 64,
+        launch_epoch=RouteEpoch(sys.argv[3], 5, sys.argv[4]), allow_ephemeral_test_storage=True))
+    print('opened')
+except SupervisorRouteError:
+    print('refused')
+'''
+
+
+def _second_process_opens(gate_path):
+    result = subprocess.run([sys.executable, "-c", _TRIES_TO_OPEN, str(Path(__file__).parents[1]),
+                             str(gate_path), LAUNCH, BOOT], capture_output=True, text=True, timeout=30)
+    return result.stdout.strip()
+
+
+@LINUX
+@pytest.mark.parametrize("inside", ["accept", "inspect"])
+def test_close_waits_for_store_mutex_holder_before_releasing_ownership(gate_path, monkeypatch, inside):
+    gate = DispatchCounterGate(config=gate_config(gate_path))
+    original = gate._latest
+    paused, resume, closed = threading.Event(), threading.Event(), threading.Event()
+    effects, outcome = Effects(), {}
+
+    def pause_in_transaction(db, table):
+        if not paused.is_set():  # First read inside the admission / inspection: mutex held.
+            paused.set()
+            assert resume.wait(10)
+        return original(db, table)
+    monkeypatch.setattr(gate, "_latest", pause_in_transaction)
+
+    def holder():
+        try:
+            outcome["value"] = run(gate, *signed_off(1), effects(1)) if inside == "accept" else gate.inspect()
+        except SupervisorRouteError as error:
+            outcome["error"] = type(error).__name__
+
+    def closer():
+        gate.close()
+        closed.set()
+    a = threading.Thread(target=holder)
+    a.start()
+    c = None
+    try:
+        assert paused.wait(10)
+        assert gate._mutex._is_owned() is False  # Held by thread A, not by us.
+        c = threading.Thread(target=closer)
+        c.start()
+        # While A holds the store mutex: ownership is NOT released, so another
+        # process still cannot open the store, and close() has not returned.
+        assert _second_process_opens(gate_path) == "flock_held refused"
+        assert not closed.is_set() and c.is_alive()
+    finally:
+        resume.set()
+        a.join(10)
+        if c is not None:
+            c.join(10)
+    assert closed.is_set()
+    if inside == "accept":
+        assert "error" in outcome and effects.done == []  # Closed before its effect: never acts.
+    else:
+        assert outcome == {"value": {"accepted": None, "started": None, "in_flight": None}}
+    for later in (gate.inspect, lambda: run(gate, *signed_off(2), effects(2))):
+        with pytest.raises(route_module.RouteJournalError):  # Fails closed; never reopens.
+            later()
+    assert effects.done == []
+    assert _second_process_opens(gate_path) == "flock_free opened"  # Ownership released only now.
+    reopened = DispatchCounterGate(config=gate_config(gate_path, create=False))
+    assert reopened.inspect()["accepted"] == (1 if inside == "accept" else None)
+    assert reopened.inspect()["started"] is None
+    reopened.close()
+
+
 @LINUX
 def test_route_to_gate_end_to_end(world, gate_path):
     gate = DispatchCounterGate(config=gate_config(gate_path))

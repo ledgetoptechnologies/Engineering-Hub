@@ -798,9 +798,17 @@ class _DurableStore:
                 raise RouteJournalError('route journal unavailable') from None
 
     def close(self):
-        self._closed = True
-        if self._owner is not None:
-            self._owner.close()
+        """Releases ownership only while holding the store mutex: waits for any
+        transaction or read in another thread (each bounded by the busy wait
+        and fsync) to finish, so the PilotOwner flock is never dropped mid-way.
+        Afterwards every transaction/read fails closed (``inactive``); a
+        closed store never reopens itself. Lock order everywhere is
+        [gate effect lock ->] store mutex; nothing that holds the store mutex
+        ever takes the effect lock."""
+        with self._mutex:
+            self._closed = True
+            if self._owner is not None:
+                self._owner.close()
 
 
 class RouteJournal(_DurableStore):
@@ -1129,7 +1137,10 @@ class DispatchCounterGate(_DurableStore):
     def close(self):
         """Refuses (SupervisorRouteInFlight) while an effect is running, so the
         inter-process owner lock is never released mid-effect. Retry after
-        the effect returns."""
+        the effect returns. Then, still holding the effect lock, waits for
+        the store mutex (fixed order: effect lock -> store mutex) so no
+        admission or inspection is mid-transaction when ownership is
+        released."""
         if not self._effect_lock.acquire(blocking=False):
             raise SupervisorRouteInFlight('dispatch effect')
         try:
