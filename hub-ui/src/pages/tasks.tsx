@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { link } from "../router";
-import { REVIEW_IS_NOT_A_RUN, relativeAge, waitingOn } from "../dashboardText";
+import { relativeAge, waitingOn } from "../dashboardText";
 import type { Hub } from "../hub";
 import type { Task } from "../types";
 import { actorAvatar, actorName } from "../actors";
@@ -16,8 +16,6 @@ export function stateAge(task: Task): string {
 }
 
 export const statusLabel = (task: Task) => task.status === "verified" ? "Review passed" : pretty(task.status);
-/** Hover text for the status badge: a passed review says nothing about running. */
-export const statusNote = (task: Task) => task.status === "verified" ? REVIEW_IS_NOT_A_RUN : undefined;
 export const statusTone = (task: Task) =>
   task.status === "verified" ? "forest" : task.status === "in_review" ? "amber" : "neutral";
 
@@ -39,7 +37,7 @@ export function TaskRow({ hub, task }: { hub: Hub; task: Task }) {
           <span className="mini-avatar">{actorAvatar(task.owner, task.owner_family).letter}</span>
           {task.owner ? actorName(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
         </span>
-        <Badge tone={statusTone(task)} title={statusNote(task)}>{statusLabel(task)}</Badge>
+        <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
       </summary>
       <div className="task-detail">
         <DetailsBlock entity={task} kind="task" load={expanded && !hub.demo} onUnauthorized={hub.clearPrivateWorkspace} />

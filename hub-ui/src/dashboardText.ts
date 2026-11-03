@@ -2,6 +2,11 @@
 import { actorFamily } from "./actors";
 import type { Task } from "./types";
 
+/** Visible count note on Home: says what a passed review is not, without claiming anything ran or may run. */
+export function reviewPassedNote(count: number): string {
+  return `${count} review passed · a review isn't a run`;
+}
+
 /** Review is a verdict on a commit, not permission to run it; whether anything ran or may run isn't known here. */
 export const REVIEW_IS_NOT_A_RUN = "A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show.";
 

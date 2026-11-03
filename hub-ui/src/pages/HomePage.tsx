@@ -5,7 +5,8 @@ import { ImageVersionsPanel } from "../ImageVersionsPanel";
 import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
-import { statusLabel, statusNote, statusTone } from "./tasks";
+import { reviewPassedNote } from "../dashboardText";
+import { statusLabel, statusTone } from "./tasks";
 import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
 
 function greeting(now = new Date()) {
@@ -33,7 +34,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
         <a className="kpi" href={link("/work")}>
           <span className="kpi-label"><Icon kind="work" size={16} /> Work in motion</span>
           <strong>{active.length}</strong>
-          <span className="kpi-note">{tasks.length - active.length} review passed</span>
+          <span className="kpi-note">{reviewPassedNote(tasks.length - active.length)}</span>
         </a>
         <a className="kpi" href={link("/agents")}>
           <span className="kpi-label"><Icon kind="agents" size={16} /> Agent streams observed</span>
@@ -102,7 +103,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                       {hub.projectName(task.project)} · {task.owner ? actorName(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
                     </span>
                   </a>
-                  <Badge tone={statusTone(task)} title={statusNote(task)}>{statusLabel(task)}</Badge>
+                  <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
                 </li>
               ))}
             </ul>
