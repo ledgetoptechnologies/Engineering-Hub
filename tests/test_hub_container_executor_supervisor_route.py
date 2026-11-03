@@ -890,3 +890,122 @@ def test_asyncio_cancellation_does_not_release_ownership_early(world):
     assert route.inspect(cmd.command_id).state == "completed"
     assert route.submit(other).state == "completed"
     route.close()
+
+
+@LINUX
+@pytest.mark.parametrize("fault", [OSError, KeyboardInterrupt])
+def test_fault_right_after_intent_commit_records_unknown_before_release(world, monkeypatch, fault):
+    route = world["make"]()
+    journal = route._journal
+    original_admit, original_mark = journal.admit, journal.mark_unknown
+    locked_while_marking = []
+
+    def admit_then_fault(*args, **kwargs):
+        result = original_admit(*args, **kwargs)  # Durable intent COMMITTED here.
+        raise fault()  # E.g. parent fsync failure / interrupt before any connect.
+
+    def mark(*args, **kwargs):
+        locked_while_marking.append(route._mutex.locked())
+        return original_mark(*args, **kwargs)
+    monkeypatch.setattr(journal, "admit", admit_then_fault)
+    monkeypatch.setattr(journal, "mark_unknown", mark)
+    cmd = command(world["epoch"])
+    with pytest.raises(SupervisorRouteRefused if fault is OSError else KeyboardInterrupt):
+        route.submit(cmd)
+    monkeypatch.undo()
+    assert locked_while_marking == [True]  # Recorded before the mutex was released.
+    assert intent_rows(world["path"]) == [(cmd.command_id, "unknown")]
+    assert route.inspect(cmd.command_id).state == "held"
+    assert route.submit(cmd).state == "held"  # Identical replay held; never forwarded.
+    assert world["backend"].calls == []
+    assert route.submit(command(world["epoch"])).state == "completed"
+    route.close()
+
+
+@LINUX
+def test_inspect_and_close_concurrent_with_in_flight_submit(world):
+    backend = _Blocking(world["pin"])
+    route = world["make"](backend=backend)
+    cmd = command(world["epoch"])
+    results = {}
+    worker = threading.Thread(target=lambda: results.setdefault("r", route.submit(cmd)))
+    worker.start()
+    try:
+        assert backend.entered.wait(10)
+        before = Path(world["path"]).read_bytes()
+        started = time.monotonic()
+        for _ in range(5):
+            assert route.inspect(cmd.command_id).state == "in_progress"
+            assert route.inspect(str(uuid4())) is None
+        with pytest.raises(route_module.SupervisorRouteInFlight) as refused:
+            route.close()
+        assert refused.value.command_id == cmd.command_id
+        assert time.monotonic() - started < 2
+        assert Path(world["path"]).read_bytes() == before  # inspect/close wrote nothing.
+        assert route._mutex.locked() and worker.is_alive()  # Ownership untouched.
+    finally:
+        backend.release.set()
+        worker.join(10)
+    assert results["r"].state == "completed"
+    route.close()
+
+
+@LINUX
+def test_provisional_in_progress_before_intent_does_not_stick(world):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def epochs():
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(10)
+            raise RuntimeError("epoch source failed before intent")
+        return world["epochs"]()
+    route = world["make"](epoch_source=epochs)
+    cmd = command(world["epoch"])
+    errors = []
+
+    def first():
+        try:
+            route.submit(cmd)
+        except SupervisorRouteRefused as error:
+            errors.append(error)
+    worker = threading.Thread(target=first)
+    worker.start()
+    try:
+        assert entered.wait(10)
+        provisional = route.submit(cmd)
+        assert provisional.state == "in_progress" and provisional.binding_digest is None
+        assert route.inspect(cmd.command_id) is None  # No durable intent yet.
+    finally:
+        release.set()
+        worker.join(10)
+    assert len(errors) == 1 and intent_rows(world["path"]) == [] and world["backend"].calls == []
+    later = route.submit(cmd)
+    assert later.state == "completed" and not later.replayed
+    assert len(world["backend"].calls) == 1
+    route.close()
+
+
+@LINUX
+def test_forked_child_close_refused_without_touching_mutex(world):
+    route = world["make"]()
+    assert route._mutex.acquire(blocking=False)  # Child inherits a LOCKED mutex.
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            route.close()
+        except route_module.SupervisorRouteInFlight:
+            code = 2  # Would mean it touched the inherited mutex.
+        except SupervisorRouteError as error:
+            code = 0 if "constructing process" in str(error) else 3
+        except BaseException:
+            code = 4
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    route._mutex.release()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert route.submit(command(world["epoch"])).state == "completed"  # Parent still usable.
+    route.close()

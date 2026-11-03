@@ -63,7 +63,11 @@ Explicit limits (this foundation grants no authority by itself):
   is retryable with the same command_id. Precedence while busy: an IDENTICAL
   replay of the in-flight command reports ``in_progress``; the same
   command_id with different content is rejected (``binding_conflict``); any
-  other command is ``busy``.
+  other command is ``busy``. A busy-path ``in_progress`` is PROVISIONAL: it
+  only says another submit of identical content owns the mutex. It is NOT
+  proof of admission, durable intent or any effect (the owner may still fail
+  before its intent commit, after which the same command can be submitted
+  again normally). Use ``inspect`` for the durable state.
 * Non-abandonable ownership: once admitted, the operation keeps the mutex until
   it reaches a recorded state (completed/rejected/refused/unknown). A
   BaseException (KeyboardInterrupt, CancelledError, SystemExit) raised in the
@@ -400,6 +404,8 @@ class RouteResult:
     Only completed (accepted) and rejected (definitive non-acceptance) carry a
     signed record. refused = verified never sent. held = uncertain. busy = not
     admitted, nothing journaled or sent (binding_digest is None); retryable.
+    in_progress with binding_digest None is provisional mutex ownership by an
+    identical submit only, not proof of admission, intent or effect.
     """
     state: str
     command_id: str
@@ -966,7 +972,18 @@ class SupervisorRoute:
             outcome, row = self._journal.admit(command.command_id, digest, binding, epoch)
         except SupervisorRouteRejected:
             raise
-        except Exception:
+        except BaseException as error:
+            # The intent may have committed even though admit raised (e.g. a
+            # parent fsync failure or an interrupt right after COMMIT). Nothing
+            # was forwarded; best effort turn our own committed intent into
+            # unknown before the mutex is released. If none exists this is a
+            # no-op; if it fails, a committed 'intent' row still reads held.
+            try:
+                self._journal.mark_unknown(command.command_id, digest, 'interrupted')
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
             raise SupervisorRouteRefused() from None
         if outcome == 'replay':
             return self._from_row(row, replayed=True)
@@ -1053,7 +1070,13 @@ class SupervisorRoute:
         return None if row is None else self._from_row(row, replayed=True)
 
     def close(self):
-        """Refuses (SupervisorRouteInFlight) while an operation is in flight."""
+        """Refuses (SupervisorRouteInFlight) while an operation is in flight.
+
+        A forked child (or any process other than the constructor's) is
+        refused BEFORE touching the inherited mutex or journal.
+        """
+        if os.getpid() != self._pid:
+            raise SupervisorRouteError('supervisor route is bound to its constructing process')
         if not self._mutex.acquire(blocking=False):
             with self._state:
                 active = self._active
