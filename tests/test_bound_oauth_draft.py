@@ -92,6 +92,9 @@ async def test_bound_oauth_router_signed_access_identity(monkeypatch, tmp_path):
         return jwt.encode({'iss':config.cloudflare_issuer,'aud':[config.cloudflare_audience], 'sub':subject,
             'email':'owner@example.com','type':'app','iat':now-1,'exp':now+120}, key, algorithm='RS256', headers={'kid':'fixture'})
     right, other = token('subject'), token('other')
+    now = int(time.time())
+    expired = jwt.encode({'iss':config.cloudflare_issuer,'aud':[config.cloudflare_audience], 'sub':'subject',
+        'email':'owner@example.com','type':'app','iat':now-120,'exp':now-60}, key, algorithm='RS256', headers={'kid':'fixture'})
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core), base_url=config.origin) as direct:
         assert (await direct.get('/api/hub/v1/auth/login', headers={'CF-Access-Jwt-Assertion':right})).status_code == 401
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=wrapped), base_url=config.origin, follow_redirects=False) as c:
@@ -103,6 +106,7 @@ async def test_bound_oauth_router_signed_access_identity(monkeypatch, tmp_path):
         assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 303
         assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':right})).json()['authenticated'] is True
         assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':other})).json()['authenticated'] is False
+        assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':expired})).status_code == 401
         assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 400
 
 @pytest.mark.asyncio

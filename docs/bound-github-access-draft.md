@@ -35,3 +35,10 @@ host validation, or permission to start an owned-pilot runtime.
 The tests use synthetic Access keys and a fake GitHub provider. Real OAuth app
 configuration, identity enrollment, client secret provisioning, Cloudflare
 policy, deployed frontend behavior, rollout and recovery remain separate work.
+
+For the separate standalone public gateway, `--bound-github-callback` is an
+independent, default-off routing flag. The private service must independently
+select bound mode; if either side does not opt in, the callback is denied. The
+flag does not validate Cloudflare, identify a backend, authorize a user, or
+establish executor peer binding. The private browser ingress verifies Access and
+the auth flow independently verifies the bound identity and GitHub account.

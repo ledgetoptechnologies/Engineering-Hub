@@ -650,3 +650,75 @@ async def test_private_queued_bound_signin_no_executor_effects(setup, monkeypatc
     finally:
         stop.set()
         await asyncio.wait_for(serving,8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('public_on,private_on,expected', [(False,False,403),(False,True,403),(True,False,403),(True,True,400)])
+async def test_callback_route_both_independent_optins_required(setup, public_on, private_on, expected):
+    from dataclasses import replace
+    from engineering_hub.repository import HubRepository
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    state=setup
+    if private_on:
+        with PilotOwner(state.settings.database,allow_ephemeral_test_storage=True) as owner:
+            repo=HubRepository(state.settings.database,pilot_owner=owner)
+            enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        state.settings=replace(state.settings,auth_config=replace(state.settings.auth_config,
+            human_auth_mode='github_cloudflare',github_client_id='fixture',github_client_secret='fixture',
+            beau_github_id=123,bound_access_subject='synthetic-human'))
+    stop,serving,_=await start(state)
+    try:
+        async with create_private_browser_client(state.endpoint) as private:
+            gateway=PublicBrowserGateway(private,allow_bound_oauth_callback=public_on)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(gateway),base_url=ORIGIN,
+                    follow_redirects=False,headers={'Cf-Access-Jwt-Assertion':state.assertion}) as browser:
+                assert (await browser.get(BASE+'/auth/callback')).status_code==expected
+                assert (await browser.get(BASE+'/auth/callback%2F')).status_code in {400,403}
+                assert (await browser.get(BASE+'/auth/callback',headers={'Cf-Access-Jwt-Assertion':'spoof'})).status_code in {401,403}
+        assert state.requests == []
+    finally:
+        stop.set(); await asyncio.wait_for(serving,8)
+
+
+@pytest.mark.asyncio
+async def test_actual_public_launcher_bound_callback_through_private_service(setup,monkeypatch):
+    from dataclasses import replace
+    from urllib.parse import parse_qs, urlsplit
+    from engineering_hub import public_browser, split_server
+    from engineering_hub.auth import GitHubIdentityProvider
+    from engineering_hub.repository import HubRepository
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    state=setup
+    with PilotOwner(state.settings.database,allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(state.settings.database,pilot_owner=owner)
+        enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+    state.settings=replace(state.settings,auth_config=replace(state.settings.auth_config,
+        human_auth_mode='github_cloudflare',github_client_id='fixture',github_client_secret='fixture',
+        beau_github_id=123,bound_access_subject='synthetic-human'))
+    async def exchange(self,code,verifier): return 123
+    monkeypatch.setattr(GitHubIdentityProvider,'exchange',exchange)
+    stop,serving,_=await start(state)
+    public_stop=asyncio.Event(); ready=asyncio.get_running_loop().create_future()
+    original=split_server.serve_public_browser
+    async def controlled(factory, *, browser_port, **options):
+        assert options.get('allow_bound_oauth_callback') is True
+        return await original(factory,browser_port=browser_port,stop_event=public_stop,install_signals=False,
+                              on_ready=lambda address:ready.set_result(address),**options)
+    monkeypatch.setattr(split_server,'serve_public_browser',controlled)
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1',0)); port=probe.getsockname()[1]
+    public=asyncio.create_task(public_browser.run(str(state.endpoint),port,allow_bound_oauth_callback=True))
+    try:
+        address=await asyncio.wait_for(ready,8)
+        async with httpx.AsyncClient(base_url='http://127.0.0.1:'+str(address[1]),trust_env=False,
+                follow_redirects=False,headers={'Host':'hub.example','CF-Access-Jwt-Assertion':state.assertion}) as browser:
+            login=await browser.get(BASE+'/auth/login'); assert login.status_code==302
+            oauth_state=parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            state_cookie=browser.cookies.get('hub_session_oauth')
+            callback=await browser.get(BASE+'/auth/callback',params={'state':oauth_state,'code':'fixture'},
+                                       headers={'Cookie':'hub_session_oauth='+state_cookie})
+            assert callback.status_code==303
+        assert state.requests==[]
+    finally:
+        public_stop.set(); await asyncio.wait_for(public,8)
+        stop.set(); await asyncio.wait_for(serving,8)
