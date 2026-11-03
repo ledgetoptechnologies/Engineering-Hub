@@ -57,7 +57,8 @@ def run_profile(profile, intent):
     home.mkdir(mode=0o700)
     if profile in {'python', 'all'}:
         subprocess.run(['/opt/validation-venv/bin/python', '-m', 'pytest', '-q', '-x',
-                        '--basetemp', '/tmp/pytest', '-o', 'cache_dir=/tmp/pytest-cache'], cwd=root, check=True)
+                        '--basetemp', '/tmp/pytest', '-o', 'cache_dir=/tmp/pytest-cache',
+                        '-o', 'tmp_path_retention_policy=failed'], cwd=root, check=True)
     if profile in {'ui', 'all'}:
         # This cache belongs to the reviewed image, not the source archive.
         # Preserve npm's relative .bin links so CLI module paths stay correct.
