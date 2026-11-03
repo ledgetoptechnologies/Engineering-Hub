@@ -20,6 +20,14 @@ ENVIRONMENT = ['PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin']
 _IMAGE = re.compile(r'(?:ghcr\.io/ledgetoptechnologies/)?engineering-hub-executor'
                     r'(?::build-[a-z0-9-]+|@sha256:[a-f0-9]{64})\Z')
 
+# Run against installed site-packages only; importing a module is inert.
+CORE_RESERVATION_PROBE = r'''
+drain = importlib.import_module('engineering_hub.unproved_drain')
+assert pathlib.Path(drain.__file__) == root / 'engineering_hub/unproved_drain.py', 'incompatible core'
+for name in ('acquire_reservation', 'validate_reservation', 'release_reservation', 'OwnedDrainHandoff'):
+    assert callable(getattr(drain, name, None)), 'incompatible core'
+'''
+
 # This is fixed code, not an operator-selected import/command loader. Imports
 # check packaging only: none calls a resource factory, parses installed config,
 # opens a daemon/issuer socket or constructs mutable executor state.
@@ -47,8 +55,9 @@ assert pathlib.Path(helper.__file__) == root / 'scripts/inspect_hub_image_identi
 assert hashlib.sha256(pathlib.Path(helper.__file__).read_bytes()).hexdigest() == record['source_files']['src/scripts/inspect_hub_image_identity.py']
 from engineering_hub.container_pilot_client import ContainerPilotClient
 assert callable(getattr(ContainerPilotClient, 'for_private_unix', None)), 'incompatible core'
+''' + CORE_RESERVATION_PROBE + r'''
 print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names),
-                  'private_unix_client': True, 'installed_artifact': 'passed'}))
+                  'private_unix_client': True, 'drain_reservation_api': True, 'installed_artifact': 'passed'}))
 '''
 
 
@@ -123,7 +132,8 @@ def smoke(image, commit):
                 or host.get('PublishAllPorts')
                 or report.get('source_commit') != commit
                 or report.get('installed_artifact') != 'passed'
-                or report.get('private_unix_client') is not True):
+                or report.get('private_unix_client') is not True
+                or report.get('drain_reservation_api') is not True):
             raise RuntimeError('Installed executor fixture did not pass')
         return {**report, 'image_id': image_id, 'network': 'none', 'host_mounts': 0,
                 'issuer_exchange': 'not_tested', 'staging_pilot': 'not_tested',
