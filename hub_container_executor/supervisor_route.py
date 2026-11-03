@@ -47,6 +47,33 @@ and durably, that the counter is still the latest accepted and newer than
 any effect ever started, so an accepted-but-delayed counter cannot act after
 a higher one (see the class docstring for dead-process behaviour).
 
+Two-phase path (the one the Hub MUST use, because the Hub commits its own
+command intent before a counter exists): ``reserve(command)`` sends NOTHING;
+in one journal transaction it checks the epoch high-water, consumes the next
+per-executor counter and records a ``reserved`` row holding a receipt signed
+(domain ``RESERVE_DOMAIN``) over {protocol, audience, key_id, command_id,
+body_sha256, method, path, pin, epoch, fence, counter, reserved_at_ms}. An
+identical repeat returns the same receipt bytes; a different binding under
+the command_id is refused. The Hub verifies it with its pinned
+``ReservationReceiptVerifier`` and commits it in its own transaction, then
+calls ``dispatch(receipt, command)`` once: the route re-verifies the receipt,
+requires the exact ``reserved`` row, marks it ``dispatched`` and records the
+intent in ONE transaction before any byte is sent, then sends with the
+reserved counter. Every failure, mismatch, repeat or uncertainty is ``held``
+and never retried under a new counter. ``abandon_reservation`` retires an
+unsent reservation; reserved, abandoned and never-dispatched counters stay
+consumed (gaps). Rows are trigger-protected: inserted once, only as
+``reserved``, with a counter above every earlier reservation for that
+executor; afterwards only the state changes, once, to dispatched/abandoned;
+never deleted. Reservation signing uses a separate, default-REFUSING
+``ReservationSigner``: with none configured, reserve/dispatch refuse.
+
+The one-step ``submit`` path is kept unchanged (the whole route is already
+disabled by default, and the existing evidence covers it) for direct
+operator/test use only. The two paths cannot be mixed for one command_id:
+``submit`` refuses a reserved command (``reserved_command``) and ``reserve``
+refuses an admitted one (``already_admitted``).
+
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
 against the pin immediately after connect and BEFORE any request byte is
 written; a mismatch closes the socket with zero bytes sent and durably records
@@ -145,6 +172,12 @@ Explicit limits (this foundation grants no authority by itself):
   ``release_unresolved_after_quiescence``, which relies entirely on the
   operator having established that the effect stopped: the gate cannot
   prove it.
+* No reservation signer exists here: an operator must supply one; key
+  storage, rotation and enrollment of its key_id/public key at the Hub are
+  NOT implemented. The signer is called inside the reservation transaction,
+  so a slow signer holds the journal lock. The Hub-side commit of the
+  receipt against its job/run/fence/reservation, and wiring
+  ``ReservationReceiptVerifier`` into a Hub client, are NOT implemented.
 * ROLLBACK IS NOT DETECTED. All of this is local SQLite state: a store
   restored from a backup, a copied older file or a snapshot rollback is
   indistinguishable from the real one. A rolled-back gate store can accept
@@ -198,6 +231,10 @@ AUDIENCE = 'engineering-hub.hub-supervisor-route'
 # record signed by the same enrolled key can never verify as either of those.
 SIGNATURE_DOMAIN = b'engineering-hub-supervisor-route-v1\x00'
 _NONCE_DOMAIN = b'engineering-hub-supervisor-route-observation-nonce-v1\x00'
+RESERVE_PROTOCOL = 'engineering-hub.supervisor-route-reservation.v1'
+RESERVE_AUDIENCE = 'engineering-hub.hub-supervisor-route-reservation'
+# Distinct from the route-record, launch-receipt and observation domains.
+RESERVE_DOMAIN = b'engineering-hub-supervisor-route-reserve-v1\x00'
 MAX_BODY_BYTES = 8192
 MAX_RESPONSE_BYTES = 16 * 1024
 MAX_RECORD_BYTES = 64 * 1024
@@ -214,6 +251,32 @@ _INTENT = ('CREATE TABLE supervisor_route_intent (command_id TEXT PRIMARY KEY, '
            'dispatch_counter INTEGER NOT NULL)')
 _EPOCH = ('CREATE TABLE supervisor_route_epoch (id INTEGER PRIMARY KEY CHECK(id=1), '
           'launch_counter INTEGER NOT NULL, launch_id TEXT NOT NULL, boot_id TEXT NOT NULL)')
+_RESERVATION = ('CREATE TABLE supervisor_route_reservation (command_id TEXT PRIMARY KEY, '
+                'executor_id TEXT NOT NULL, binding_digest TEXT NOT NULL, binding TEXT NOT NULL, '
+                "counter INTEGER NOT NULL CHECK(typeof(counter)='integer' AND counter > 0), "
+                "state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','abandoned')), "
+                'receipt TEXT NOT NULL, UNIQUE (executor_id, counter))')
+# Reserve once per command_id (also defeats INSERT OR REPLACE), only as
+# 'reserved', and only with a counter above every earlier reservation for
+# that executor; afterwards only state may change, once, reserved ->
+# dispatched | abandoned; never deleted.
+_RESERVATION_TRIGGERS = {
+    'supervisor_route_reservation_once': (
+        'CREATE TRIGGER supervisor_route_reservation_once BEFORE INSERT ON supervisor_route_reservation '
+        "WHEN NEW.state IS NOT 'reserved' OR EXISTS (SELECT 1 FROM supervisor_route_reservation "
+        'WHERE command_id = NEW.command_id OR (executor_id = NEW.executor_id AND counter >= NEW.counter)) '
+        "BEGIN SELECT RAISE(ABORT, 'reservation exists'); END"),
+    'supervisor_route_reservation_transition': (
+        'CREATE TRIGGER supervisor_route_reservation_transition BEFORE UPDATE ON supervisor_route_reservation '
+        "WHEN OLD.state IS NOT 'reserved' OR NEW.state NOT IN ('dispatched','abandoned') "
+        'OR NEW.command_id IS NOT OLD.command_id OR NEW.executor_id IS NOT OLD.executor_id '
+        'OR NEW.binding_digest IS NOT OLD.binding_digest OR NEW.binding IS NOT OLD.binding '
+        'OR NEW.counter IS NOT OLD.counter OR NEW.receipt IS NOT OLD.receipt '
+        "BEGIN SELECT RAISE(ABORT, 'reservation is final'); END"),
+    'supervisor_route_reservation_kept': (
+        'CREATE TRIGGER supervisor_route_reservation_kept BEFORE DELETE ON supervisor_route_reservation '
+        "BEGIN SELECT RAISE(ABORT, 'reservation is permanent'); END"),
+}
 _OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
 MAX_DISPATCH_COUNTER = 2**63 - 1
 DISPATCH_HEADER = 'X-Hub-Route-Dispatch'
@@ -321,6 +384,23 @@ class SupervisorRouteInFlight(SupervisorRouteError):
     def __init__(self, command_id):
         self.command_id = command_id
         super().__init__('supervisor route operation in flight: ' + str(command_id))
+
+
+class SupervisorRouteBusy(SupervisorRouteError):
+    """Another operation owns the route: nothing journaled or sent; retryable."""
+
+    def __init__(self):
+        super().__init__('supervisor route busy; nothing was journaled or sent')
+
+
+class ReservationUncertain(SupervisorRouteError):
+    """reserve() could not prove whether its reservation committed. Nothing
+    was sent. Repeating reserve with the IDENTICAL command is safe (it returns
+    the stored receipt if one exists); ``inspect_reservation`` reads it."""
+
+    def __init__(self):
+        super().__init__('reservation outcome unknown; nothing was sent; repeat reserve with the identical '
+                         'command or inspect the reservation')
 
 
 class DispatchRefused(SupervisorRouteRejected):
@@ -566,6 +646,111 @@ def parse_dispatch_header(value):
     except Exception:
         raise DispatchRefused('dispatch_invalid') from None
     return claim
+
+
+_RESERVATION_KEYS = frozenset({'protocol', 'audience', 'key_id', 'command_id', 'body_sha256', 'method', 'path',
+                               'pin', 'epoch', 'fence', 'counter', 'reserved_at_ms'})
+_EXPECTATION_KEYS = frozenset({'command_id', 'body_sha256', 'method', 'path', 'pin', 'epoch', 'fence'})
+
+
+def _reservation_fields(binding):
+    return {'command_id': binding['command_id'], 'body_sha256': binding['body_sha256'],
+            'method': binding['method'], 'path': binding['path'], 'pin': dict(binding['backend']),
+            'epoch': dict(binding['epoch']), 'fence': binding['queue_fence']}
+
+
+def reservation_expectation(command, pin):
+    """What a receipt must bind, from the Hub's own command bytes, epoch and
+    independently enrolled backend pin: command_id, body_sha256, method,
+    path, pin, epoch, fence."""
+    return _reservation_fields(binding_for(command, pin))
+
+
+def _verify_reservation(raw, *, public_key, key_id, expected):
+    error = SupervisorRouteError('reservation receipt unverified')
+    try:
+        _require(type(public_key) is bytes and len(public_key) == 32 and type(key_id) is str
+                 and _ID.fullmatch(key_id) and _shape(expected, _EXPECTATION_KEYS), error)
+        envelope = _strict_json(raw, MAX_RECORD_BYTES)
+        _require(_canonical(envelope) == raw and _shape(envelope, {'payload', 'signature'}), error)
+        payload, signature = envelope['payload'], envelope['signature']
+        _require(_shape(payload, _RESERVATION_KEYS) and type(signature) is str
+                 and _SIGNATURE.fullmatch(signature), error)
+        decoded = base64.urlsafe_b64decode(signature + '==')
+        _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b'=').decode() == signature,
+                 error)
+        Ed25519PublicKey.from_public_bytes(public_key).verify(decoded, RESERVE_DOMAIN + _canonical(payload))
+        binding = {'method': payload['method'], 'path': payload['path'], 'body_sha256': payload['body_sha256'],
+                   'command_id': payload['command_id'], 'queue_fence': payload['fence'],
+                   'epoch': payload['epoch'], 'backend': payload['pin']}
+        _require(payload['protocol'] == RESERVE_PROTOCOL and payload['audience'] == RESERVE_AUDIENCE
+                 and type(payload['key_id']) is str and payload['key_id'] == key_id and _valid_binding(binding)
+                 and _positive(payload['counter'], MAX_DISPATCH_COUNTER) and _positive(payload['reserved_at_ms'])
+                 and all(_canonical(payload[name]) == _canonical(value) for name, value in expected.items()),
+                 error)
+        return payload
+    except SupervisorRouteError:
+        raise
+    except Exception:
+        raise error from None
+
+
+class ReservationSigner:
+    """Reservation-receipt signer interface AND its default: this base class
+    REFUSES to sign. A configured signer (supplied by the operator; none is
+    provided, generated or discovered here) is any object exposing ``key_id``
+    (str), ``public_key`` (32 raw Ed25519 bytes) and ``sign(message) -> 64
+    bytes``, signing exactly ``RESERVE_DOMAIN + canonical(payload)``."""
+    key_id = None
+    public_key = None
+
+    def sign(self, message):
+        raise SupervisorRouteError('reservation signer not configured')
+
+
+def _signer_ready(signer):
+    return (type(signer) is not ReservationSigner and callable(getattr(signer, 'sign', None))
+            and type(getattr(signer, 'key_id', None)) is str and bool(_ID.fullmatch(signer.key_id))
+            and type(getattr(signer, 'public_key', None)) is bytes and len(signer.public_key) == 32)
+
+
+class ReservationReceiptVerifier:
+    """Hub-side reservation receipt verifier, DEFAULT REFUSING: constructed
+    without a pinned ``public_key`` (32 raw bytes) and ``key_id`` it refuses
+    every receipt. ``verify(raw, expected=reservation_expectation(...))``
+    enforces the exact canonical bytes and shape, the signature under the
+    pinned key and RESERVE_DOMAIN, protocol/audience/key_id, and that every
+    bound field equals ``expected``; returns the payload (with ``counter``
+    and ``reserved_at_ms``) or raises. Not yet wired into any Hub client.
+
+    Hub contract (NOT implemented here): commit the verified receipt in the
+    Hub's own DB transaction against the current job/run/fence and its own
+    reservation record, then call ``SupervisorRoute.dispatch`` exactly once
+    with those exact receipt bytes; never re-reserve under a new command_id
+    to "retry" a held dispatch.
+    """
+
+    def __init__(self, *, public_key=None, key_id=None):
+        self._public_key, self._key_id = public_key, key_id
+
+    def __repr__(self):
+        return 'ReservationReceiptVerifier(<pinned>)' if self._public_key is not None else \
+            'ReservationReceiptVerifier(<refusing>)'
+
+    def verify(self, raw, *, expected):
+        if self._public_key is None or self._key_id is None:
+            raise SupervisorRouteError('reservation receipt verifier not configured')
+        return _verify_reservation(raw, public_key=self._public_key, key_id=self._key_id, expected=expected)
+
+
+@dataclass(frozen=True)
+class RouteReservation:
+    """A durable reservation: ``receipt`` is the exact signed bytes to commit
+    and later pass to ``dispatch``; ``replayed`` for an identical repeat."""
+    command_id: str
+    counter: int
+    receipt: bytes
+    replayed: bool
 
 
 @dataclass(frozen=True)
@@ -831,15 +1016,17 @@ class RouteJournal(_DurableStore):
     Each inserted intent carries a per-attempt nonce; rows with a NULL nonce
     are never mutated by the failed-admit handler. Each inserted intent also
     consumes the next per-executor dispatch counter in the SAME transaction
-    (see ``admit``). A journal created with an earlier schema (no attempt or
-    dispatch_counter column, no dispatch table/triggers, user_version 1) fails
-    the exact schema check and is refused today (fail closed); adopting one
-    would require an offline migration/reconciliation step, which is NOT
-    implemented.
+    (see ``admit``); two-phase reservations draw from the same counter (see
+    ``reserve`` / ``dispatch_reserved``). A journal created with an earlier
+    schema (no attempt or dispatch_counter column, no dispatch or reservation
+    table/triggers, user_version below 3) fails the exact schema check and is
+    refused today (fail closed); adopting one would require an offline
+    migration/reconciliation step, which is NOT implemented.
     """
     _SCHEMA = {'supervisor_route_intent': _INTENT, 'supervisor_route_epoch': _EPOCH,
-               **_counter_schema('supervisor_route_dispatch')}
-    _VERSION = 2
+               **_counter_schema('supervisor_route_dispatch'),
+               'supervisor_route_reservation': _RESERVATION, **_RESERVATION_TRIGGERS}
+    _VERSION = 3
 
     @staticmethod
     def _row(db, command_id):
@@ -871,30 +1058,129 @@ class RouteJournal(_DurableStore):
                 if row[1] != digest or row[2] != _canonical(binding).decode():
                     raise SupervisorRouteRejected('binding_conflict')
                 return 'replay', row
-            high = db.execute('SELECT launch_counter,launch_id,boot_id FROM supervisor_route_epoch').fetchone()
-            if high is not None:
-                if epoch.launch_counter < high[0]:
-                    raise SupervisorRouteRejected('stale_epoch')
-                if epoch.launch_counter == high[0] and (epoch.launch_id, epoch.boot_id) != high[1:]:
-                    raise SupervisorRouteRejected('epoch_conflict')
-            if high is None or epoch.launch_counter > high[0]:
-                db.execute('INSERT OR REPLACE INTO supervisor_route_epoch VALUES (1,?,?,?)',
-                           (epoch.launch_counter, epoch.launch_id, epoch.boot_id))
-            executor = binding['backend']['container_id']
-            last = db.execute('SELECT counter FROM supervisor_route_dispatch WHERE executor_id=?',
-                              (executor,)).fetchone()
-            _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
-            counter = 1 if last is None else last[0] + 1
-            if counter > MAX_DISPATCH_COUNTER:
-                raise SupervisorRouteRejected('dispatch_counter_exhausted')
-            if last is None:
-                db.execute('INSERT INTO supervisor_route_dispatch VALUES (?,?)', (executor, counter))
-            else:
-                db.execute('UPDATE supervisor_route_dispatch SET counter=? WHERE executor_id=?',
-                           (counter, executor))
+            if self._reservation(db, command_id) is not None:
+                raise SupervisorRouteRejected('reserved_command')  # Only dispatch() may send it.
+            self._advance_epoch(db, epoch)
+            counter = self._next_counter(db, binding['backend']['container_id'])
             db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
                        (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt, counter))
             return 'new', counter
+
+    @staticmethod
+    def _advance_epoch(db, epoch):
+        """Durable epoch high-water check/advance (inside the caller's transaction)."""
+        high = db.execute('SELECT launch_counter,launch_id,boot_id FROM supervisor_route_epoch').fetchone()
+        if high is not None:
+            if epoch.launch_counter < high[0]:
+                raise SupervisorRouteRejected('stale_epoch')
+            if epoch.launch_counter == high[0] and (epoch.launch_id, epoch.boot_id) != high[1:]:
+                raise SupervisorRouteRejected('epoch_conflict')
+        if high is None or epoch.launch_counter > high[0]:
+            db.execute('INSERT OR REPLACE INTO supervisor_route_epoch VALUES (1,?,?,?)',
+                       (epoch.launch_counter, epoch.launch_id, epoch.boot_id))
+
+    @staticmethod
+    def _next_counter(db, executor):
+        """Consume previous + 1 for ``executor`` (inside the caller's transaction)."""
+        last = db.execute('SELECT counter FROM supervisor_route_dispatch WHERE executor_id=?',
+                          (executor,)).fetchone()
+        _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
+        counter = 1 if last is None else last[0] + 1
+        if counter > MAX_DISPATCH_COUNTER:
+            raise SupervisorRouteRejected('dispatch_counter_exhausted')
+        if last is None:
+            db.execute('INSERT INTO supervisor_route_dispatch VALUES (?,?)', (executor, counter))
+        else:
+            db.execute('UPDATE supervisor_route_dispatch SET counter=? WHERE executor_id=?', (counter, executor))
+        return counter
+
+    @staticmethod
+    def _reservation(db, command_id):
+        row = db.execute('SELECT command_id,executor_id,binding_digest,binding,counter,state,receipt '
+                         'FROM supervisor_route_reservation WHERE command_id=?', (command_id,)).fetchone()
+        if row is not None:
+            _require(_HEX.fullmatch(row[2]) and _positive(row[4], MAX_DISPATCH_COUNTER)
+                     and row[5] in ('reserved', 'dispatched', 'abandoned'), RouteJournalError('reservation'))
+        return row
+
+    def reserve(self, command_id, digest, binding, epoch, sign):
+        """ONE transaction, SENDS NOTHING: binding conflict check, epoch
+        high-water, next per-executor counter, and a 'reserved' row holding
+        the signed receipt ``sign(counter)`` returns (signed inside the
+        transaction, so a signing failure consumes nothing).
+
+        Returns ('new', receipt) or ('replay', receipt) - the SAME stored bytes
+        - for an identical binding. Raises Rejected for a different binding
+        under the command_id or a command_id already admitted one-step.
+        """
+        with self._transaction() as db:
+            row = self._reservation(db, command_id)
+            if row is not None:
+                if row[2] != digest or row[3] != _canonical(binding).decode():
+                    raise SupervisorRouteRejected('binding_conflict')
+                return 'replay', row[6].encode()
+            if self._row(db, command_id) is not None:
+                raise SupervisorRouteRejected('already_admitted')
+            self._advance_epoch(db, epoch)
+            executor = binding['backend']['container_id']
+            counter = self._next_counter(db, executor)
+            receipt = sign(counter)
+            _require(type(receipt) is bytes, RouteJournalError('receipt'))
+            db.execute("INSERT INTO supervisor_route_reservation VALUES (?,?,?,?,?,'reserved',?)",
+                       (command_id, executor, digest, _canonical(binding).decode(), counter, receipt.decode()))
+            return 'new', receipt
+
+    def dispatch_reserved(self, command_id, digest, binding, receipt, counter, epoch, attempt):
+        """ONE transaction, consume-once: the 'reserved' row must exist with
+        exactly this binding, these receipt bytes and this counter, and the
+        epoch high-water must still be the receipt's epoch. Marks it
+        'dispatched' and inserts the intent row (with the reserved counter)
+        BEFORE the caller may send. Raises Rejected(reason) otherwise:
+        reservation_missing / reservation_mismatch / already_dispatched /
+        reservation_abandoned / epoch_changed."""
+        _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
+        with self._transaction() as db:
+            row = self._reservation(db, command_id)
+            if row is None:
+                raise SupervisorRouteRejected('reservation_missing')
+            if (row[2] != digest or row[3] != _canonical(binding).decode() or row[6] != receipt.decode()
+                    or row[4] != counter):
+                raise SupervisorRouteRejected('reservation_mismatch')
+            if row[5] == 'dispatched':
+                raise SupervisorRouteRejected('already_dispatched')
+            if row[5] != 'reserved':
+                raise SupervisorRouteRejected('reservation_abandoned')
+            high = db.execute('SELECT launch_counter,launch_id,boot_id FROM supervisor_route_epoch').fetchone()
+            if high != (epoch.launch_counter, epoch.launch_id, epoch.boot_id):
+                raise SupervisorRouteRejected('epoch_changed')
+            if self._row(db, command_id) is not None:
+                raise SupervisorRouteRejected('already_dispatched')
+            db.execute("UPDATE supervisor_route_reservation SET state='dispatched' "
+                       "WHERE command_id=? AND state='reserved'", (command_id,))
+            db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
+                       (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt, counter))
+
+    def abandon_reservation(self, command_id):
+        """reserved -> abandoned (never sent; the counter stays consumed).
+        Returns True if this call abandoned it, False otherwise."""
+        with self._transaction() as db:
+            return db.execute("UPDATE supervisor_route_reservation SET state='abandoned' "
+                              "WHERE command_id=? AND state='reserved'", (command_id,)).rowcount == 1
+
+    def read_reservation(self, command_id):
+        """Read-only: (state, counter, receipt bytes) or None."""
+        _require(os.getpid() == self._pid, RouteJournalError('process'))
+        with self._mutex:
+            try:
+                self._active()
+                with self._connection(readonly=True) as db:
+                    self._schema(db)
+                    row = self._reservation(db, command_id)
+            except RouteJournalError:
+                raise
+            except Exception:
+                raise RouteJournalError('route journal unavailable') from None
+        return None if row is None else (row[5], row[4], row[6].encode())
 
     def abandon_attempt(self, command_id, digest, attempt):
         """Atomic compare-and-set: intent -> unknown ONLY for the row THIS
@@ -1388,7 +1674,7 @@ class SupervisorRoute:
     mutex; this is a foundation, not a server.
     """
 
-    def __init__(self, *, config, release, signing_key, epoch_source, backend):
+    def __init__(self, *, config, release, signing_key, epoch_source, backend, reservation_signer=None):
         if type(config) is not SupervisorRouteConfig or config.enabled is not True:
             raise SupervisorRouteDisabled('supervisor route is disabled')
         _require(type(release) is CurrentExecutorReleasePins and isinstance(signing_key, Ed25519PrivateKey)
@@ -1397,8 +1683,12 @@ class SupervisorRoute:
                  and callable(epoch_source) and callable(getattr(backend, 'forward', None))
                  and type(config.forward_timeout_ms) is int and 100 <= config.forward_timeout_ms <= 120000
                  and type(config.busy_wait_ms) is int and 0 <= config.busy_wait_ms <= 50
-                 and type(config.journal_path) is str, SupervisorRouteError('invalid supervisor route'))
+                 and type(config.journal_path) is str
+                 and (reservation_signer is None or _signer_ready(reservation_signer)),
+                 SupervisorRouteError('invalid supervisor route'))
         self._pid = os.getpid()
+        # Default refuses: reserve()/dispatch() exist only with an explicit signer.
+        self._reserver = ReservationSigner() if reservation_signer is None else reservation_signer
         self._mutex = threading.Lock()
         self._state = threading.Lock()  # Guards _active/_closed for busy reporting only.
         self._active = None  # The admitted RouteCommand currently owning the mutex.
@@ -1503,11 +1793,14 @@ class SupervisorRoute:
             return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
         if outcome == 'replay':
             return self._from_row(row, replayed=True)
-        # Durable intent AND its consumed dispatch counter exist from here:
-        # ownership is non-abandonable and the counter is never reused.
+        return self._send(command, request, binding, digest, epoch, pin, row)
+
+    def _send(self, command, request, binding, digest, epoch, pin, counter):
+        """Durable intent AND its consumed dispatch counter exist: ownership is
+        non-abandonable and the counter is never reused."""
         self._inflight.add(command.command_id)
         try:
-            return self._forward(command, request, binding, digest, epoch, pin, row)
+            return self._forward(command, request, binding, digest, epoch, pin, counter)
         except BaseException:
             # Cancellation/interrupt in this thread: record unknown before
             # the mutex is released, then re-raise. A no-op if an outcome
@@ -1578,6 +1871,156 @@ class SupervisorRoute:
             # Forwarded, but not durably recorded: NEVER report success.
             return self._hold(command, digest, 'outcome_unrecorded')
         return RouteResult(state, command.command_id, digest, False, None, record, reply.body)
+
+    def _exclusive(self, command):
+        """Route mutex for reserve/dispatch/abandon, same busy bound as submit."""
+        acquired = (self._mutex.acquire(timeout=self._busy_wait) if self._busy_wait
+                    else self._mutex.acquire(blocking=False))
+        if not acquired:
+            return False
+        try:
+            with self._state:
+                _require(not self._closed, SupervisorRouteError('supervisor route closed'))
+                self._active = command
+        except BaseException:
+            self._mutex.release()
+            raise
+        return True
+
+    def _release_exclusive(self):
+        with self._state:
+            self._active = None
+        self._mutex.release()
+
+    def _two_phase_ready(self, command):
+        _require(os.getpid() == self._pid, SupervisorRouteError('process'))
+        _require(type(command) is RouteCommand)
+        request = _submitted_request(command)
+        _require(_signer_ready(self._reserver), SupervisorRouteError('reservation signer not configured'))
+        return request
+
+    def reserve(self, command):
+        """PHASE 1 of the two-phase path. SENDS NOTHING to the executor.
+
+        Durably allocates the next per-executor dispatch counter for exactly
+        this command (method, path, body SHA-256, command_id, fence, launch
+        epoch, current backend pin) and records it 'reserved' with a receipt
+        signed by the configured reservation signer. An identical repeat
+        returns the SAME receipt bytes (``replayed``); a different binding
+        under the command_id, or one already sent one-step, is Rejected.
+        Raises SupervisorRouteBusy, SupervisorRouteRefused (epoch source
+        failed, nothing journaled) or ReservationUncertain (repeat reserve).
+        """
+        self._two_phase_ready(command)
+        if not self._exclusive(command):
+            raise SupervisorRouteBusy()
+        try:
+            try:
+                epoch, pin = self._current()
+            except Exception:
+                raise SupervisorRouteRefused() from None
+            if command.epoch != epoch:
+                raise SupervisorRouteRejected('stale_epoch' if command.epoch.launch_counter < epoch.launch_counter
+                                              else 'epoch_mismatch')
+            binding = binding_for(command, pin)
+            signer, reserved_at = self._reserver, _now_ms()
+
+            def sign(counter):
+                payload = {'protocol': RESERVE_PROTOCOL, 'audience': RESERVE_AUDIENCE, 'key_id': signer.key_id,
+                           **_reservation_fields(binding), 'counter': counter, 'reserved_at_ms': reserved_at}
+                message = RESERVE_DOMAIN + _canonical(payload)
+                signature = signer.sign(message)
+                _require(type(signature) is bytes and len(signature) == 64)
+                Ed25519PublicKey.from_public_bytes(signer.public_key).verify(signature, message)
+                receipt = _canonical({'payload': payload, 'signature': base64.urlsafe_b64encode(signature)
+                                      .rstrip(b'=').decode()})
+                _require(len(receipt) <= MAX_RECORD_BYTES)
+                return receipt
+            try:
+                outcome, receipt = self._journal.reserve(command.command_id, binding_digest(binding), binding,
+                                                         epoch, sign)
+            except SupervisorRouteRejected:
+                raise
+            except Exception:
+                raise ReservationUncertain() from None
+            return RouteReservation(command.command_id, json.loads(receipt)['payload']['counter'], receipt,
+                                    outcome == 'replay')
+        finally:
+            self._release_exclusive()
+
+    def dispatch(self, receipt, command):
+        """PHASE 2: explicit one-shot send of a reserved command.
+
+        Sends only if the receipt verifies under this route's reservation key
+        and binds exactly ``command`` with the current epoch and pin, AND the
+        matching 'reserved' journal row exists with these exact receipt bytes.
+        The row is marked 'dispatched' (consume-once) and the intent recorded
+        in ONE transaction BEFORE any byte is sent; the send then uses the
+        reserved counter and is classified exactly like ``submit``. Every
+        failure, mismatch, missing row, repeat or uncertain journal outcome
+        is reported ``held`` (or ``busy``, nothing touched): never retried and
+        never re-sent under a new counter. Use ``inspect`` for the outcome.
+        """
+        request = self._two_phase_ready(command)
+        _require(type(receipt) is bytes)
+        if not self._exclusive(command):
+            return RouteResult('busy', command.command_id, None, False)
+        try:
+            return self._dispatch(receipt, command, request)
+        finally:
+            self._release_exclusive()
+
+    def _dispatch(self, receipt, command, request):
+        try:
+            epoch, pin = self._current()
+        except Exception:
+            return RouteResult('held', command.command_id, None, False, 'epoch_unavailable')
+        binding = binding_for(command, pin)
+        digest = binding_digest(binding)
+        if command.epoch != epoch:
+            return RouteResult('held', command.command_id, digest, False, 'epoch_changed')
+        try:
+            payload = _verify_reservation(receipt, public_key=self._reserver.public_key,
+                                          key_id=self._reserver.key_id, expected=_reservation_fields(binding))
+        except Exception:
+            return RouteResult('held', command.command_id, digest, False, 'receipt_invalid')
+        attempt = secrets.token_hex(16)
+        try:
+            self._journal.dispatch_reserved(command.command_id, digest, binding, receipt, payload['counter'],
+                                            epoch, attempt)
+        except SupervisorRouteRejected as rejected:
+            return RouteResult('held', command.command_id, digest, False, rejected.reason)
+        except BaseException as error:
+            # The dispatched mark + intent may have committed: only the intent
+            # THIS attempt inserted is turned unknown; it is never re-sent.
+            try:
+                self._journal.abandon_attempt(command.command_id, digest, attempt)
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
+            return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
+        return self._send(command, request, binding, digest, epoch, pin, payload['counter'])
+
+    def abandon_reservation(self, command_id):
+        """reserved -> abandoned, never sent; the counter stays consumed. True
+        if this call abandoned it; False if missing, dispatched or abandoned."""
+        _require(os.getpid() == self._pid, SupervisorRouteError('process'))
+        _require(_uuid(command_id))
+        if not self._mutex.acquire(blocking=False):
+            raise SupervisorRouteBusy()
+        try:
+            with self._state:
+                _require(not self._closed, SupervisorRouteError('supervisor route closed'))
+            return self._journal.abandon_reservation(command_id)
+        finally:
+            self._mutex.release()
+
+    def inspect_reservation(self, command_id):
+        """Read-only: (state, counter, receipt) or None; never sends or writes."""
+        _require(os.getpid() == self._pid, SupervisorRouteError('process'))
+        _require(_uuid(command_id))
+        return self._journal.read_reservation(command_id)
 
     def inspect(self, command_id):
         """Read-only recorded state; never forwards, never writes."""
