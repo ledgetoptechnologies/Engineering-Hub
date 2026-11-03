@@ -761,6 +761,71 @@ def test_close_waits_for_store_mutex_holder_before_releasing_ownership(gate_path
     reopened.close()
 
 
+def _wait_child(pid, seconds=5):
+    """(exited, status): never blocks the parent on a deadlocked child."""
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return True, status
+        time.sleep(0.02)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return False, None
+
+
+@LINUX
+@pytest.mark.parametrize("held", ["store_mutex", "effect_lock"])
+def test_forked_child_close_touches_no_inherited_lock_and_keeps_parent_flock(gate_path, monkeypatch, held):
+    import warnings
+    gate = DispatchCounterGate(config=gate_config(gate_path))
+    paused, resume = threading.Event(), threading.Event()
+    outcome = {}
+    if held == "store_mutex":
+        original = gate._latest
+
+        def pause_in_read(db, table):
+            if not paused.is_set():
+                paused.set()
+                assert resume.wait(10)
+            return original(db, table)
+        monkeypatch.setattr(gate, "_latest", pause_in_read)
+        holder = threading.Thread(target=lambda: outcome.setdefault("value", gate.inspect()))
+    else:
+        def effect():
+            paused.set()
+            assert resume.wait(10)
+            return "done"
+        holder = threading.Thread(target=lambda: outcome.setdefault("value", run(gate, *signed_off(1), effect)))
+    holder.start()
+    try:
+        assert paused.wait(10)  # The parent thread now holds the lock across the fork.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork() with live threads is the point.
+            pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                gate.close()  # Must not wait on a lock held by a thread that does not exist here.
+                code = 0 if gate._closed else 2
+            except BaseException:
+                code = 3
+            os._exit(code)
+        exited, status = _wait_child(pid)
+        assert exited and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0  # Prompt, no deadlock.
+        # The child dropped only its own descriptors: the parent still owns the store.
+        assert _second_process_opens(gate_path) == "flock_held refused"
+    finally:
+        resume.set()
+        holder.join(10)
+    assert outcome["value"] == ({"accepted": None, "started": None, "in_flight": None}
+                                if held == "store_mutex" else "done")
+    assert gate.inspect()["in_flight"] is None  # Parent continues normally.
+    gate.close()
+    assert _second_process_opens(gate_path) == "flock_free opened"
+
+
 @LINUX
 def test_route_to_gate_end_to_end(world, gate_path):
     gate = DispatchCounterGate(config=gate_config(gate_path))

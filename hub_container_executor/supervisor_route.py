@@ -799,12 +799,25 @@ class _DurableStore:
 
     def close(self):
         """Releases ownership only while holding the store mutex: waits for any
-        transaction or read in another thread (each bounded by the busy wait
-        and fsync) to finish, so the PilotOwner flock is never dropped mid-way.
+        transaction or read in progress in another thread to finish, so the
+        PilotOwner flock is never dropped mid-way. That wait is NOT bounded:
+        only SQLite lock contention is limited (best effort, by the busy
+        timeout); fsync and other filesystem calls can block indefinitely.
         Afterwards every transaction/read fails closed (``inactive``); a
         closed store never reopens itself. Lock order everywhere is
         [gate effect lock ->] store mutex; nothing that holds the store mutex
-        ever takes the effect lock."""
+        ever takes the effect lock.
+
+        In any process other than the constructing one (a forked child) it
+        touches NEITHER lock, which may be held by a thread that does not
+        exist there: it only marks itself inactive and closes its inherited
+        descriptors (PilotOwner never unlocks, so the parent keeps the flock).
+        """
+        if os.getpid() != self._pid:
+            self._closed = True
+            if self._owner is not None:
+                self._owner.close()
+            return
         with self._mutex:
             self._closed = True
             if self._owner is not None:
@@ -1140,7 +1153,10 @@ class DispatchCounterGate(_DurableStore):
         the effect returns. Then, still holding the effect lock, waits for
         the store mutex (fixed order: effect lock -> store mutex) so no
         admission or inspection is mid-transaction when ownership is
-        released."""
+        released. In a forked child it touches neither lock (see
+        ``_DurableStore.close``)."""
+        if os.getpid() != self._pid:
+            return super().close()
         if not self._effect_lock.acquire(blocking=False):
             raise SupervisorRouteInFlight('dispatch effect')
         try:
