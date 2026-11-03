@@ -25,7 +25,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
-    INSPECTION_PATH, INSPECTION_SIGNATURE_DOMAIN, MAX_RESPONSE_BYTES, BackendPin, HeldAttemptSource,
+    INSPECTION_HELD_REASONS, INSPECTION_PATH, INSPECTION_SIGNATURE_DOMAIN, MAX_RESPONSE_BYTES, BackendPin,
+    HeldAttemptSource,
     InspectionAuthenticator,
     InspectionClientConfig, InspectionResolver, InspectionResolverConfig, InspectionResponderConfig,
     InspectionTokenAuthenticator, InspectionVerifier, PeerMismatch, PinnedKeyInspectionVerifier, RouteEpoch,
@@ -426,6 +427,7 @@ def test_held_restart_then_inspect(world, insp):
 def _assert_held(world, insp, resolver, cmd, counter, error, status=None):
     result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error, result.status) == ("held", error, status)
+    assert result.error in INSPECTION_HELD_REASONS
     assert result.observation is None and not result.applied
     assert ledger_state(insp, cmd.command_id) == ("held", None)
     return result
@@ -1507,3 +1509,89 @@ def test_verifier_requires_reservation_field_consistent_with_status(proof, rinsp
                 {k: v for k, v in payload.items() if k != "reservation"}):
         with pytest.raises(SupervisorRouteError):
             verifier.verify(sign(rinsp["key"], bad), request=request)
+
+
+# --- Held-reason contract, WAL switch around the snapshot, orphan challenges ---
+
+def test_held_reasons_are_a_closed_public_contract():
+    assert INSPECTION_HELD_REASONS == {
+        "no_held_attempt", "peer_mismatch", "transport_lost", "http_status", "unverified", "not_found",
+        "not_dispatched", "unknown", "observation_unrecorded", "replay_unverified", "hub_unavailable",
+        "hub_not_recorded"}
+
+
+def _switch_to_wal(path):
+    raw = sqlite3.connect(Path(path).as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=0)
+    try:
+        return raw.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    finally:
+        raw.close()
+
+
+@LINUX
+def test_wal_switch_before_the_snapshot_is_refused_unsigned(world, insp):
+    cmd, counter = launch(world, insp)
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    journal = insp["route"]._journal
+    schema = journal._schema
+
+    def switch_then_read(db):  # After open + the first mode check, before the snapshot's first read.
+        assert _switch_to_wal(world["path"]) == "wal"
+        return schema(db)
+    journal._schema = switch_then_read
+    try:
+        assert _ask(insp["responder"], body) == (503, b'{"error":{"code":"unavailable"}}')  # Nothing signed.
+    finally:
+        del journal._schema
+
+
+@LINUX
+def test_no_wal_switch_possible_while_the_snapshot_lock_is_held(world, insp, monkeypatch):
+    cmd, counter = launch(world, insp)
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    original, attempts = route_module._snapshot_mode, []
+
+    def switch_then_check(db):  # After the snapshot reads, before the re-check.
+        with pytest.raises(sqlite3.OperationalError):  # The SHARED lock blocks the switch.
+            _switch_to_wal(world["path"])
+        attempts.append(1)
+        return original(db)
+    monkeypatch.setattr(route_module, "_snapshot_mode", switch_then_check)
+    status, raw = _ask(insp["responder"], body)
+    assert attempts == [1] and status == 200 and json.loads(raw)["payload"]["status"] == "launched"
+    with sqlite3.connect(Path(world["path"]).as_uri() + "?mode=ro", uri=True) as db:
+        assert db.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+
+
+def _orphan_challenge(path, command_id, executor):
+    db = sqlite3.connect(Path(path).as_uri() + "?mode=rw", uri=True, isolation_level=None)
+    try:
+        db.execute("INSERT INTO supervisor_route_challenge VALUES (?,?,?,1,0,?,'outstanding',NULL,NULL)",
+                   (secrets.token_hex(16), command_id, executor, str(uuid4())))
+    finally:
+        db.close()
+
+
+@LINUX
+@pytest.mark.parametrize("with_intent", [False, True])
+def test_orphan_challenge_is_unknown_not_not_found(world, insp, with_intent):
+    if with_intent:  # One-step intent plus a challenge row that no reservation explains.
+        cmd, counter = launch(world, insp)
+    else:
+        cmd, counter = command(world["epoch"]), 1
+    _orphan_challenge(world["path"], cmd.command_id, world["pin"].container_id)
+    client = insp["client"]()
+    answer = client.inspect(client.request_for(cmd, world["pin"], counter))
+    assert answer.verified and (answer.status, answer.payload["reservation"]) == ("unknown", None)
+    resolver = insp["resolver"]()
+    resolver.hold(cmd, world["pin"], counter)
+    _assert_held(world, insp, resolver, cmd, counter, "unknown", "unknown")
+
+
+@LINUX
+def test_not_dispatched_is_a_defined_held_reason(proof, rinsp):
+    cmd, receipt, counter = two_phase(proof, rinsp, "reserved")
+    resolver = rinsp["resolver"]()
+    resolver.hold(cmd, proof["pin"], counter)
+    result = resolver.inspect(cmd, proof["pin"], counter)
+    assert (result.state, result.error) == ("held", "not_dispatched") and result.error in INSPECTION_HELD_REASONS
