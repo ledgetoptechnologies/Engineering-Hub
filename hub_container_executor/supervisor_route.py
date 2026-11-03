@@ -139,6 +139,38 @@ operator/test use only. The two paths cannot be mixed for one command_id:
 ``submit`` refuses a reserved command (``reserved_command``) and ``reserve``
 refuses an admitted one (``already_admitted``).
 
+Original-command inspection (read-only; also disabled by default, each part
+needs its own ``enabled=True`` config): the Hub asks the supervisor what
+happened to ONE held launch request. ``SupervisorInspectionClient`` verifies
+the supervisor peer (SO_PEERCRED pid/uid/gid + pidfd start ticks against an
+enrolled ``SupervisorPeerPin``) before writing any byte, then sends
+``POST /v1/supervisor-route/inspect`` with an inspection-scoped bearer
+(``ehri1.`` prefix; a launch bearer can never carry it and the inspection
+authenticator accepts nothing else) and a canonical request binding the full
+route binding (method, path, body SHA-256, command_id, fence, epoch incl.
+launch counter, pinned backend), the attempt's exact ``dispatch_claim``
+(executor, dispatch counter, method, path, body SHA-256, command_id, fence,
+launch epoch: the dispatch header's fields and canonical JSON, consistent with
+the binding), the expected supervisor key id and a fresh nonce. The reply
+is read with the same strict bounded framing and one total deadline.
+``SupervisorInspectionResponder`` answers only from the route journal row:
+``launched`` / ``refused`` / ``not_found`` / ``unknown``, Ed25519-signed
+under its own domain over an exact echo of the request. The Hub verifies
+through an ``InspectionVerifier`` (the base class refuses everything;
+``PinnedKeyInspectionVerifier`` checks one pinned key). ``InspectionResolver``
+records a verified signed terminal status matching the binding exactly as an
+OBSERVATION in ``InspectionLedger`` (``observed_launched`` /
+``observed_refused``); timeout, framing, HTTP denial, unsigned, bad
+signature, wrong key, any binding mismatch, ``unknown`` and signed
+``not_found`` record nothing and stay held. This module provides
+VERIFICATION and OBSERVATION STORAGE only and never decides: the
+authoritative step is ``HeldAttemptSource.record_observation_in_hub_transaction``,
+a callback the Hub executes inside ITS OWN DB transaction together with its
+owner/job checks (including the ``hold_version`` captured at hold),
+independently re-verifying the raw signed request/answer bytes; the default
+source refuses. Inspection never relaunches, resubmits or releases,
+and no result of it permits a resubmit or release.
+
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
 against the pin immediately after connect and BEFORE any request byte is
 written; a mismatch closes the socket with zero bytes sent and durably records
@@ -265,6 +297,42 @@ Explicit limits (this foundation grants no authority by itself):
   ``verify_route_record``) are NOT implemented.
 * Same-UID/root administrators remain trusted; the private-path guards do not
   sandbox hostile same-UID processes racing filesystem replacement.
+* Inspection limits: every local SQLite store here (route journal, dispatch
+  stores, ``InspectionLedger``) is UNANCHORED and cannot prove it was not
+  rolled back or restored from a backup. A restored or replaced route journal
+  is one more reason a missing row (signed ``not_found``) or ``unknown`` stays
+  held: absence never establishes "no effect". A signed ``launched`` /
+  ``refused`` attests only what the supervisor's journal recorded, under the
+  same trust limits as the route record. The responder has no listener or
+  HTTP server, the supervisor inspection key and the inspection credential are
+  not provisioned anywhere, and the Hub must supply the held attempt's
+  dispatch counter itself (``RouteResult`` does not carry it). Nothing
+  constructs the client, responder or resolver.
+* The inspection ledger is NOT the Hub job store and shares no transaction or
+  lock with it: its held row is caller-supplied and its observed rows are
+  only signed observations. This module provides verification + observation
+  storage; the HUB OWNS THE TRANSACTIONAL DECISION. Recording an outcome must
+  happen in the SAME Hub DB transaction as the authoritative owner/job checks
+  (including the hold version captured at hold time), via
+  ``HeldAttemptSource.record_observation_in_hub_transaction``; atomicity is
+  only as strong as that Hub transaction, and nothing in this module provides
+  it. The only source provided (the base class) refuses, so there is no
+  production use until one bound to the Hub job store exists. A replayed
+  observation is historical (signed ``answered_at_ms``, not fresh host/job
+  state), re-verified (exact request + signed answer, current pinned key and
+  binding), and again goes through the Hub transaction.
+* The responder reads the route journal row written by today's ``admit``
+  path; a later two-phase reserve/dispatch flow is not modelled here.
+* The responder's CONCURRENCY is bounded (separate non-blocking pre-auth and
+  post-auth slot pools) but its TIME is best-effort: contention is cut by
+  try-acquire and SQLite busy/progress timeouts, while filesystem calls,
+  connection open/close and a custom authenticator are not interruptible.
+  Its own deadline is checked as a best-effort RETURN-TIME check: a signed
+  answer is not returned after the deadline (an unsigned 503 is), although
+  the signer may already have produced the bytes. Limits are PER INSTANCE:
+  separate responder instances do not share slot pools. Work a departed
+  client no longer waits for can still complete (detached work), and
+  same-UID FD delegation and rollback anchoring remain open as above.
 """
 from __future__ import annotations
 
@@ -272,6 +340,7 @@ import base64
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import inspect
 import json
 import math
@@ -597,7 +666,9 @@ def _now_ms():
 
 
 def _bearer(value):
-    _require(type(value) is str and 0 < len(value) <= 4096 and all(33 <= ord(c) <= 126 for c in value),
+    # An inspection-scoped credential can never be used as the launch bearer.
+    _require(type(value) is str and 0 < len(value) <= 4096 and all(33 <= ord(c) <= 126 for c in value)
+             and not value.startswith(INSPECTION_TOKEN_PREFIX),
              SupervisorRouteError('executor bearer credential required'))
     return value
 
@@ -2810,3 +2881,883 @@ class SupervisorRoute:
             self._journal.close()
         finally:
             self._mutex.release()
+
+
+# --- Original-command inspection (Hub -> supervisor, read-only) -------------
+
+INSPECTION_REQUEST_PROTOCOL = 'engineering-hub.supervisor-route-inspection-request.v1'
+INSPECTION_ANSWER_PROTOCOL = 'engineering-hub.supervisor-route-inspection-answer.v1'
+INSPECTION_AUDIENCE = 'engineering-hub.hub-supervisor-route-inspection'
+INSPECTION_SCOPE = 'supervisor-route.inspect'
+# Distinct from the route-record, launch-receipt and observation domains.
+INSPECTION_SIGNATURE_DOMAIN = b'engineering-hub-supervisor-route-inspection-v1\x00'
+INSPECTION_PATH = '/v1/supervisor-route/inspect'
+# Scope marker of the inspection credential. ``_bearer`` refuses it as a
+# launch bearer and ``_inspection_bearer`` requires it, so neither credential
+# can stand in for the other.
+INSPECTION_TOKEN_PREFIX = 'ehri1.'
+MAX_INSPECTION_REQUEST_BYTES = 8192
+INSPECTION_STATUSES = frozenset({'launched', 'refused', 'not_found', 'unknown'})
+# Terminal inspection status -> route journal states it may stand for.
+_TERMINAL = {'launched': frozenset({'completed'}), 'refused': frozenset({'rejected', 'refused'})}
+_INSPECTION_REQUEST_KEYS = frozenset({'protocol', 'audience', 'scope', 'binding', 'binding_digest', 'dispatch',
+                                      'key_id', 'request_nonce'})
+_INSPECTION_ANSWER_KEYS = frozenset({'protocol', 'audience', 'key_id', 'request', 'request_sha256', 'status',
+                                     'route_state', 'answered_at_ms'})
+_REQUEST_NONCE = re.compile(r'[0-9a-f]{32}\Z')
+_INSPECTION_ERRORS = frozenset({'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status',
+                                'unverified', 'not_found', 'unknown', 'observation_unrecorded',
+                                'replay_unverified', 'hub_unavailable', 'hub_not_recorded'})
+
+
+def inspection_key_id(public_key):
+    """Key id of a raw Ed25519 public key: SHA-256 hex of its 32 raw bytes."""
+    _require(type(public_key) is bytes and len(public_key) == 32, SupervisorRouteError('inspection key'))
+    return hashlib.sha256(public_key).hexdigest()
+
+
+def _inspection_bearer(value):
+    _require(type(value) is str and value.startswith(INSPECTION_TOKEN_PREFIX)
+             and 32 <= len(value) - len(INSPECTION_TOKEN_PREFIX) and len(value) <= 4096
+             and all(33 <= ord(c) <= 126 for c in value),
+             SupervisorRouteError('inspection credential required'))
+    return value
+
+
+def inspection_request(command, pin, dispatch_counter, *, key_id, request_nonce):
+    """Canonical inspection request: the full route binding (incl. the pinned
+    backend), its digest, the exact ``dispatch_claim`` of the attempt
+    (executor, counter, method, path, body SHA-256, command_id, fence, launch
+    epoch; same fields and canonical JSON as the dispatch header), the
+    expected supervisor key id and a fresh per-inspection nonce."""
+    binding = binding_for(command, pin)
+    _require(type(key_id) is str and _HEX.fullmatch(key_id)
+             and type(request_nonce) is str and _REQUEST_NONCE.fullmatch(request_nonce))
+    return {'protocol': INSPECTION_REQUEST_PROTOCOL, 'audience': INSPECTION_AUDIENCE, 'scope': INSPECTION_SCOPE,
+            'binding': binding, 'binding_digest': binding_digest(binding),
+            'dispatch': dispatch_claim(binding, dispatch_counter), 'key_id': key_id, 'request_nonce': request_nonce}
+
+
+def _valid_inspection_request(request):
+    return (_shape(request, _INSPECTION_REQUEST_KEYS) and request['protocol'] == INSPECTION_REQUEST_PROTOCOL
+            and request['audience'] == INSPECTION_AUDIENCE and request['scope'] == INSPECTION_SCOPE
+            and _valid_binding(request['binding'])
+            and request['binding_digest'] == binding_digest(request['binding'])
+            and _valid_claim(request['dispatch'])
+            and _canonical(request['dispatch']) == _canonical(dispatch_claim(request['binding'],
+                                                                             request['dispatch']['counter']))
+            and type(request['key_id']) is str and _HEX.fullmatch(request['key_id']) is not None
+            and type(request['request_nonce']) is str and _REQUEST_NONCE.fullmatch(request['request_nonce'])
+            is not None)
+
+
+def _read_inspection_row(journal, command_id, budget_ms):
+    """Read-only (binding_digest, binding, state, dispatch_counter) or None
+    from the route journal under ONE time budget; never writes or forwards.
+
+    The journal mutex is only TRIED for the budget, the private read-only
+    connection's busy timeout is what remains of it, and a progress handler
+    aborts any statement (schema/quick_check included) once it is spent, so a
+    slow or locked journal makes this raise instead of pinning a worker.
+    """
+    _require(type(journal) is RouteJournal and os.getpid() == journal._pid
+             and type(budget_ms) is int and budget_ms > 0, RouteJournalError('process'))
+    deadline = time.monotonic() + budget_ms / 1000
+    if not journal._mutex.acquire(timeout=budget_ms / 1000):
+        raise RouteJournalError('route journal busy')
+    try:
+        journal._active()
+        remaining = deadline - time.monotonic()
+        _require(remaining > 0, RouteJournalError('route journal busy'))
+        db = sqlite3.connect(journal.path.as_uri() + '?mode=ro', uri=True, timeout=remaining,
+                             isolation_level=None)
+        try:
+            db.execute(f'PRAGMA busy_timeout={max(1, int(remaining * 1000))}')
+            db.execute('PRAGMA trusted_schema=OFF')
+            db.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+            journal._schema(db)
+            if journal._row(db, command_id) is None:
+                return None
+            row = db.execute('SELECT binding_digest,binding,state,dispatch_counter '
+                             'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
+            _require(row is not None and _positive(row[3], MAX_DISPATCH_COUNTER), RouteJournalError('row'))
+            _require(time.monotonic() <= deadline, RouteJournalError('route journal busy'))
+            return row
+        finally:
+            db.close()
+    except RouteJournalError:
+        raise
+    except Exception:
+        raise RouteJournalError('route journal unavailable') from None
+    finally:
+        journal._mutex.release()
+
+
+class InspectionAuthenticator:
+    """DEFAULT-REFUSING caller authenticator for the inspection responder.
+
+    The base class authenticates nobody. A subclass returns exactly
+    ``INSPECTION_SCOPE`` for an authorized inspection caller, else raises.
+    """
+
+    def authenticate(self, authorization):
+        raise SupervisorRouteError('inspection caller not authenticated')
+
+
+class InspectionTokenAuthenticator(InspectionAuthenticator):
+    """Accepts only the one enrolled inspection-scoped bearer (constant-time).
+
+    Only a SHA-256 of the token is kept. A launch/executor bearer cannot be
+    enrolled (no scope prefix) and cannot authenticate here.
+    """
+
+    def __init__(self, token):
+        self.__digest = hashlib.sha256(_inspection_bearer(token).encode('ascii')).digest()
+
+    def __repr__(self):
+        return 'InspectionTokenAuthenticator(<redacted>)'
+
+    def __reduce__(self):
+        raise TypeError('InspectionTokenAuthenticator is not serializable')
+
+    def authenticate(self, authorization):
+        denied = SupervisorRouteError('inspection caller not authenticated')
+        scheme, _, token = authorization.partition(' ') if type(authorization) is str else ('', '', '')
+        try:
+            _inspection_bearer(token)
+        except SupervisorRouteError:
+            raise denied from None
+        if scheme != 'Bearer' or not hmac.compare_digest(hashlib.sha256(token.encode('ascii')).digest(),
+                                                         self.__digest):
+            raise denied
+        return INSPECTION_SCOPE
+
+
+class InspectionVerifier:
+    """DEFAULT-REFUSING Hub-side verifier of signed inspection answers.
+
+    The base class verifies nothing: every answer is refused, so every
+    inspection through it stays held. ``verify(raw, request=)`` returns the
+    verified answer payload or raises.
+    """
+    key_id = None
+
+    def verify(self, raw, *, request):
+        raise SupervisorRouteError('inspection verifier not configured')
+
+
+class PinnedKeyInspectionVerifier(InspectionVerifier):
+    """Verifies against ONE independently pinned supervisor Ed25519 public key.
+
+    Enforces the exact envelope shape and canonical bytes, the signature under
+    the inspection domain, the pinned key id (equal to the request's), an
+    exact echo of the Hub's own request (every binding field, the dispatch
+    claim, key id, nonce), and the status/route_state pairing.
+    """
+
+    def __init__(self, public_key):
+        self.key_id = inspection_key_id(public_key)
+        self._key = Ed25519PublicKey.from_public_bytes(public_key)
+
+    def verify(self, raw, *, request):
+        error = SupervisorRouteError('supervisor inspection answer unverified')
+        try:
+            _require(_valid_inspection_request(request) and request['key_id'] == self.key_id, error)
+            envelope = _strict_json(raw, MAX_RESPONSE_BYTES)
+            _require(_canonical(envelope) == raw and _shape(envelope, {'payload', 'signature'}), error)
+            payload, signature = envelope['payload'], envelope['signature']
+            _require(_shape(payload, _INSPECTION_ANSWER_KEYS) and type(signature) is str
+                     and _SIGNATURE.fullmatch(signature), error)
+            decoded = base64.urlsafe_b64decode(signature + '==')
+            _require(len(decoded) == 64 and base64.urlsafe_b64encode(decoded).rstrip(b'=').decode() == signature,
+                     error)
+            self._key.verify(decoded, INSPECTION_SIGNATURE_DOMAIN + _canonical(payload))
+            status, route_state = payload['status'], payload['route_state']
+            _require(payload['protocol'] == INSPECTION_ANSWER_PROTOCOL
+                     and payload['audience'] == INSPECTION_AUDIENCE
+                     and type(payload['key_id']) is str and payload['key_id'] == self.key_id
+                     and _canonical(payload['request']) == _canonical(request)
+                     and payload['request_sha256'] == hashlib.sha256(_canonical(request)).hexdigest()
+                     and type(status) is str and status in INSPECTION_STATUSES
+                     and (route_state in _TERMINAL[status] if status in _TERMINAL else route_state is None)
+                     and _positive(payload['answered_at_ms']), error)
+            return payload
+        except SupervisorRouteError:
+            raise
+        except Exception:
+            raise error from None
+
+
+@dataclass(frozen=True)
+class SupervisorPeerPin:
+    """Independently enrolled identity of the supervisor's inspection listener."""
+    pid: int
+    uid: int
+    gid: int
+    start_ticks: int
+
+    def __post_init__(self):
+        _require(_positive(self.pid) and _positive(self.start_ticks) and _id32(self.uid) and _id32(self.gid))
+
+
+@dataclass(frozen=True)
+class InspectionResponderConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no responder exists.
+
+    ``max_authenticating`` (1..8) callers may be in the authenticator at once
+    and ``max_concurrent`` (1..8) authenticated answers may run at once; any
+    other caller gets an unsigned 503 ``busy`` immediately (never queued).
+    ``answer_budget_ms`` (20..2000, at least ``read_budget_ms``) is the
+    responder's own deadline per call, a return-time check on signed answers;
+    ``read_budget_ms`` (10..1000) caps each durable journal read.
+    Keep both well under the client's total deadline.
+    """
+    enabled: bool = False
+    max_concurrent: int = 2
+    read_budget_ms: int = 100
+    max_authenticating: int = 2
+    answer_budget_ms: int = 250
+
+
+class SupervisorInspectionResponder:
+    """DISABLED-BY-DEFAULT supervisor side: answers from the durable route journal.
+
+    ``answer(method=, path=, authorization=, body=)`` -> (http_status, bytes).
+    Authenticates the caller FIRST (inspection scope only), then parses the
+    exact canonical request, then reads ONLY the route journal row for the
+    command_id (read-only; never forwards, writes, relaunches or releases).
+    Status: ``launched`` (row completed), ``refused`` (row rejected or
+    refused), ``not_found`` (no row), ``unknown`` (intent/unknown, or ANY
+    difference between the row and the request's binding or dispatch
+    claim counter). Signed with the explicitly supplied supervisor key over the
+    full request echo; denials (401/400/404/503) are unsigned.
+
+    Bounds (independent of the client's deadline). CONCURRENCY is bounded:
+    two separate non-blocking slot pools, ``max_authenticating`` around the
+    authenticator callback and ``max_concurrent`` around the authenticated
+    work, so a slow or flooded authenticator can never occupy the slots of
+    already-authenticated answers (unauthenticated callers can still contend
+    for the pre-auth pool and make new callers ``busy``; that is the chosen
+    trade-off). TIME is best-effort, not a hard wall-clock bound: the journal
+    read tries its mutex for at most the remaining budget and SQLite busy /
+    progress timeouts stop contended statements, but filesystem calls,
+    connection open/close and a custom authenticator are not interruptible.
+    The responder's own deadline (``answer_budget_ms`` from entry) is a
+    best-effort RETURN-TIME check: whatever the status, a signed answer is
+    not returned after it; an unsigned 503 ``unavailable`` is returned
+    instead (the signer may already have produced the bytes, which are
+    dropped). Slot pools are PER INSTANCE: separate responder instances do
+    not share limits. Detached work is still possible (a client that gave
+    up is not noticed). No listener or HTTP server is provided and nothing
+    constructs this.
+    """
+
+    def __init__(self, *, config, route, authenticator, signing_key):
+        if type(config) is not InspectionResponderConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor inspection responder is disabled')
+        _require(type(route) is SupervisorRoute and isinstance(authenticator, InspectionAuthenticator)
+                 and isinstance(signing_key, Ed25519PrivateKey)
+                 and type(config.max_concurrent) is int and 1 <= config.max_concurrent <= 8
+                 and type(config.read_budget_ms) is int and 10 <= config.read_budget_ms <= 1000
+                 and type(config.max_authenticating) is int and 1 <= config.max_authenticating <= 8
+                 and type(config.answer_budget_ms) is int
+                 and max(20, config.read_budget_ms) <= config.answer_budget_ms <= 2000,
+                 SupervisorRouteError('invalid supervisor inspection responder'))
+        self._route, self._authenticator, self._signer = route, authenticator, signing_key
+        self._auth_slots = threading.BoundedSemaphore(config.max_authenticating)
+        self._slots = threading.BoundedSemaphore(config.max_concurrent)
+        self._read_budget_ms = config.read_budget_ms
+        self._answer_budget = config.answer_budget_ms / 1000
+        self.key_id = inspection_key_id(signing_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+
+    def __repr__(self):
+        return 'SupervisorInspectionResponder(<enabled>)'
+
+    @staticmethod
+    def _denied(status, code):
+        return status, _canonical({'error': {'code': code}})
+
+    def answer(self, *, method, path, authorization, body):
+        deadline = time.monotonic() + self._answer_budget
+        # Bounded concurrency: never queue; a saturated pool answers busy.
+        if not self._auth_slots.acquire(blocking=False):
+            return self._denied(503, 'busy')
+        try:
+            _require(self._authenticator.authenticate(authorization) == INSPECTION_SCOPE)
+        except Exception:
+            return self._denied(401, 'unauthorized')
+        finally:
+            self._auth_slots.release()
+        if not self._slots.acquire(blocking=False):
+            return self._denied(503, 'busy')
+        try:
+            status, raw = self._answer(method, path, body, deadline)
+        finally:
+            self._slots.release()
+        if status == 200 and not time.monotonic() <= deadline:
+            # Return-time check: a signed answer is not returned after the deadline.
+            return self._denied(503, 'unavailable')
+        return status, raw
+
+    def _answer(self, method, path, body, deadline):
+        if method != 'POST' or path != INSPECTION_PATH:
+            return self._denied(404, 'not_found')
+        try:
+            request = _strict_json(body, MAX_INSPECTION_REQUEST_BYTES)
+            _require(_canonical(request) == body and _valid_inspection_request(request))
+        except Exception:
+            return self._denied(400, 'invalid_payload')
+        if request['key_id'] != self.key_id:
+            return self._denied(400, 'wrong_key')
+        budget_ms = min(self._read_budget_ms, int((deadline - time.monotonic()) * 1000))
+        if budget_ms <= 0:
+            return self._denied(503, 'unavailable')
+        try:
+            row = _read_inspection_row(self._route._journal, request['binding']['command_id'], budget_ms)
+        except Exception:
+            return self._denied(503, 'unavailable')
+        status, route_state = 'unknown', None
+        if row is None:
+            # Absence is NOT proof of no effect (restored or replaced journal).
+            status = 'not_found'
+        elif (row[0] == request['binding_digest'] and row[1] == _canonical(request['binding']).decode()
+              and row[3] == request['dispatch']['counter']):
+            if row[2] == 'completed':
+                status, route_state = 'launched', 'completed'
+            elif row[2] in ('rejected', 'refused'):
+                status, route_state = 'refused', row[2]
+        try:
+            payload = {'protocol': INSPECTION_ANSWER_PROTOCOL, 'audience': INSPECTION_AUDIENCE,
+                       'key_id': self.key_id, 'request': request,
+                       'request_sha256': hashlib.sha256(_canonical(request)).hexdigest(),
+                       'status': status, 'route_state': route_state, 'answered_at_ms': _now_ms()}
+            signature = base64.urlsafe_b64encode(self._signer.sign(
+                INSPECTION_SIGNATURE_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+            raw = _canonical({'payload': payload, 'signature': signature})
+            _require(len(raw) <= MAX_RESPONSE_BYTES)
+        except Exception:
+            return self._denied(503, 'unavailable')
+        return 200, raw
+
+
+@dataclass(frozen=True)
+class InspectionClientConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no client exists."""
+    enabled: bool = False
+    socket_path: str | None = None
+    timeout_ms: int = 2000
+
+
+@dataclass(frozen=True)
+class InspectionAnswer:
+    """``verified`` is True only with a verifier-accepted payload; else ``error``."""
+    verified: bool
+    status: str | None = None
+    route_state: str | None = None
+    payload: dict | None = field(default=None, repr=False)
+    raw: bytes | None = field(default=None, repr=False)
+    error: str | None = None
+
+
+def _check_supervisor_peer(sock, expected):
+    """SO_PEERCRED pid/uid/gid + pidfd start ticks of the connected peer vs
+    the pin. Returns (pid, pidfd, start); PeerMismatch before any byte is sent."""
+    pid, uid, gid = struct.unpack('=iII', sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    if pid <= 0:
+        raise PeerMismatch()
+    pidfd = None
+    try:
+        before = _proc_start(pid)
+        pidfd = os.pidfd_open(pid, 0)
+        start = _proc_start(pid)
+    except Exception:
+        if pidfd is not None:
+            os.close(pidfd)
+        raise PeerMismatch() from None
+    if before != start or (pid, uid, gid, start) != (expected.pid, expected.uid, expected.gid, expected.start_ticks):
+        os.close(pidfd)
+        raise PeerMismatch()
+    return pid, pidfd, start
+
+
+class SupervisorInspectionClient:
+    """DISABLED-BY-DEFAULT Hub-side one-shot inspection over a Unix socket.
+
+    Connects to ``socket_path``, verifies the supervisor peer against the
+    enrolled ``SupervisorPeerPin`` BEFORE writing any byte (mismatch: zero
+    bytes sent), sends one ``POST INSPECTION_PATH`` with the inspection-scoped
+    bearer and the canonical request, reads the reply with the module's strict
+    bounded framing (``_read_response``) under ONE total deadline, rechecks
+    the peer, and hands the bytes to the ``InspectionVerifier``. Transport and
+    verification failures are returned as an unverified ``InspectionAnswer``,
+    never raised. No retries, reconnects or redirects.
+    """
+
+    def __init__(self, *, config, credential, supervisor_peer, verifier):
+        if type(config) is not InspectionClientConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor inspection client is disabled')
+        _require(sys.platform == 'linux' and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'),
+                 SupervisorRouteError('linux'))
+        _require(type(config.socket_path) is str and config.socket_path.startswith('/')
+                 and os.path.normpath(config.socket_path) == config.socket_path
+                 and type(config.timeout_ms) is int and 100 <= config.timeout_ms <= 120000
+                 and type(supervisor_peer) is SupervisorPeerPin and isinstance(verifier, InspectionVerifier)
+                 and type(verifier.key_id) is str and _HEX.fullmatch(verifier.key_id),
+                 SupervisorRouteError('invalid supervisor inspection client'))
+        self._path, self._timeout = config.socket_path, config.timeout_ms
+        self._peer, self._verifier = supervisor_peer, verifier
+        self.__authorization = 'Bearer ' + _inspection_bearer(credential)
+
+    def __repr__(self):
+        return 'SupervisorInspectionClient(<redacted>)'
+
+    __str__ = __repr__
+
+    def __reduce__(self):
+        raise TypeError('SupervisorInspectionClient is not serializable')
+
+    def request_for(self, command, pin, dispatch_counter):
+        return inspection_request(command, pin, dispatch_counter, key_id=self._verifier.key_id,
+                                  request_nonce=secrets.token_hex(16))
+
+    def inspect(self, request):
+        _require(_valid_inspection_request(request))  # Before connecting.
+        try:
+            status, raw = self._exchange(_canonical(request))
+        except PeerMismatch:
+            return InspectionAnswer(False, error='peer_mismatch')
+        except Exception:
+            return InspectionAnswer(False, error='transport_lost')
+        if status != 200:
+            return InspectionAnswer(False, error='http_status')
+        try:
+            payload = self._verifier.verify(raw, request=request)
+        except Exception:
+            return InspectionAnswer(False, error='unverified')
+        return InspectionAnswer(True, payload['status'], payload['route_state'], payload, raw)
+
+    def _exchange(self, body):
+        deadline = time.monotonic() + self._timeout / 1000
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if not value > 0:
+                raise TimeoutError
+            return value
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        pidfd = None
+        try:
+            peer.settimeout(remaining())
+            peer.connect(self._path)
+            pid, pidfd, start = _check_supervisor_peer(peer, self._peer)  # Nothing written yet.
+            request = ('\r\n'.join([f'POST {INSPECTION_PATH} HTTP/1.1', 'Host: supervisor-inspection',
+                                    'Accept-Encoding: identity', 'Connection: close',
+                                    'Content-Type: application/json', f'Content-Length: {len(body)}',
+                                    'Authorization: ' + self.__authorization]) + '\r\n\r\n').encode('ascii') + body
+            peer.settimeout(remaining())
+            peer.sendall(request)
+            del request
+            status, raw = _read_response(peer, remaining)
+            _require(not select.select([pidfd], [], [], 0)[0] and _proc_start(pid) == start,
+                     SupervisorRouteError('peer'))
+            return status, raw
+        except PeerMismatch:
+            raise PeerMismatch() from None
+        except Exception:
+            # Sanitized: no header, token or supervisor text in the chain.
+            raise SupervisorRouteError('inspection exchange unavailable') from None
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
+            peer.close()
+
+
+_OBSERVED = {'launched': 'observed_launched', 'refused': 'observed_refused'}
+_MAX_HOLD_VERSION = 256
+_OBSERVATION = ('CREATE TABLE supervisor_route_inspection (command_id TEXT PRIMARY KEY, '
+                'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, executor_id TEXT NOT NULL, '
+                "dispatch_counter INTEGER NOT NULL CHECK(typeof(dispatch_counter)='integer' "
+                'AND dispatch_counter > 0), hold_version TEXT NOT NULL, '
+                "state TEXT NOT NULL CHECK(state IN ('held','observed_launched','observed_refused')), "
+                'route_state TEXT, key_id TEXT, answer TEXT, request TEXT, '
+                "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL "
+                'AND request IS NULL) '
+                "OR (state='observed_launched' AND route_state='completed' AND key_id IS NOT NULL "
+                'AND answer IS NOT NULL AND request IS NOT NULL) '
+                "OR (state='observed_refused' AND route_state IN ('rejected','refused') AND key_id IS NOT NULL "
+                'AND answer IS NOT NULL AND request IS NOT NULL)))')
+_OBSERVATION_SCHEMA = {
+    'supervisor_route_inspection': _OBSERVATION,
+    'supervisor_route_inspection_insert_held': (
+        'CREATE TRIGGER supervisor_route_inspection_insert_held BEFORE INSERT ON supervisor_route_inspection '
+        "WHEN NEW.state IS NOT 'held' OR EXISTS (SELECT 1 FROM supervisor_route_inspection "
+        'WHERE command_id = NEW.command_id) '
+        "BEGIN SELECT RAISE(ABORT, 'inspection rows are inserted once, held'); END"),
+    'supervisor_route_inspection_observe_once': (
+        'CREATE TRIGGER supervisor_route_inspection_observe_once BEFORE UPDATE ON supervisor_route_inspection '
+        "WHEN OLD.state IS NOT 'held' OR NEW.state NOT IN ('observed_launched','observed_refused') "
+        'OR NEW.command_id IS NOT OLD.command_id OR NEW.binding_digest IS NOT OLD.binding_digest '
+        'OR NEW.binding IS NOT OLD.binding OR NEW.executor_id IS NOT OLD.executor_id '
+        'OR NEW.dispatch_counter IS NOT OLD.dispatch_counter OR NEW.hold_version IS NOT OLD.hold_version '
+        "BEGIN SELECT RAISE(ABORT, 'only a held inspection row records one observation'); END"),
+    'supervisor_route_inspection_no_delete': (
+        'CREATE TRIGGER supervisor_route_inspection_no_delete BEFORE DELETE ON supervisor_route_inspection '
+        "BEGIN SELECT RAISE(ABORT, 'inspection rows are permanent'); END"),
+}
+
+
+def _valid_hold_version(value):
+    return (type(value) is str and 0 < len(value) <= _MAX_HOLD_VERSION
+            and all(33 <= ord(c) <= 126 for c in value))
+
+
+class InspectionLedger(_DurableStore):
+    """Hub-side durable record of held attempts and the supervisor's signed
+    OBSERVATIONS of them. It is NOT the Hub job store and never resolves,
+    releases or authorizes anything.
+
+    Same durability as the route journal (single owner, BEGIN IMMEDIATE,
+    synchronous=FULL, parent fsync, exact schema incl. triggers). Triggers
+    make rows insert-once as ``held`` (with the source's opaque hold version,
+    if it gave one), movable once only from ``held`` to ``observed_launched``
+    / ``observed_refused`` with every binding column and the hold version
+    unchanged, and never deleted. An observed row means only "the supervisor
+    signed this status for this exact binding at its signed answered_at_ms";
+    it keeps the EXACT canonical request bytes and the EXACT signed answer
+    bytes (payload + signature) with its key id, as evidence re-verified on
+    every read and never trusted as stored. Like every local SQLite file it
+    is UNANCHORED: it cannot prove it was not rolled back, restored or edited
+    by a same-UID process.
+    """
+    _SCHEMA = _OBSERVATION_SCHEMA
+    _VERSION = 1
+    _COLUMNS = ('command_id,binding_digest,binding,executor_id,dispatch_counter,hold_version,state,route_state,'
+                'key_id,answer,request')
+
+    @staticmethod
+    def _key(request):
+        return (request['binding_digest'], _canonical(request['binding']).decode(),
+                request['dispatch']['executor_id'], request['dispatch']['counter'])
+
+    def _select(self, db, command_id):
+        return db.execute(f'SELECT {self._COLUMNS} FROM supervisor_route_inspection WHERE command_id=?',
+                          (command_id,)).fetchone()
+
+    def hold(self, request, hold_version):
+        """Record a held attempt with a VALID source hold version. An identical
+        repeat (same binding, same version) is a no-op; the same binding with
+        another version is refused (``hold_version_changed``) and a different
+        binding is refused (``binding_conflict``), changing nothing."""
+        _require(_valid_hold_version(hold_version), RouteJournalError('version'))
+        command_id = request['binding']['command_id']
+        with self._transaction() as db:
+            row = self._select(db, command_id)
+            if row is not None:
+                if row[1:5] != self._key(request):
+                    raise SupervisorRouteRejected('binding_conflict')
+                if row[5] != hold_version:
+                    raise SupervisorRouteRejected('hold_version_changed')
+                return
+            db.execute('INSERT INTO supervisor_route_inspection VALUES '
+                       "(?,?,?,?,?,?,'held',NULL,NULL,NULL,NULL)", (command_id, *self._key(request), hold_version))
+
+    def read(self, command_id):
+        _require(os.getpid() == self._pid, RouteJournalError('process'))
+        with self._mutex:
+            try:
+                self._active()
+                with self._connection(readonly=True) as db:
+                    self._schema(db)
+                    return self._select(db, command_id)
+            except RouteJournalError:
+                raise
+            except Exception:
+                raise RouteJournalError('inspection ledger unavailable') from None
+
+    def record_observation(self, request, status, route_state, key_id, answer):
+        """held -> observed_<status> for the EXACT binding.
+
+        Returns True only if THESE exact request and answer bytes are what is
+        persisted: either this call's UPDATE (rowcount 1, then read back
+        inside the same transaction) or an earlier write of byte-identical
+        request and answer. Returns False if another observation of the same
+        status, route_state and key (e.g. a concurrent inspection with another
+        nonce) is persisted instead; the caller must then use THAT persisted
+        observation, never these unpersisted bytes. A different status,
+        route_state or key raises (``observation_conflict``); nothing changes.
+        """
+        _require(status in _TERMINAL and route_state in _TERMINAL[status] and type(answer) is bytes,
+                 RouteJournalError('state'))
+        state, command_id = _OBSERVED[status], request['binding']['command_id']
+        ours = (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'))
+        with self._transaction() as db:
+            row = self._select(db, command_id)
+            _require(row is not None and row[1:5] == self._key(request), RouteJournalError('binding'))
+            if row[6] != 'held':
+                _require(row[6:9] == ours[:3], RouteJournalError('observation_conflict'))
+                return row[6:11] == ours  # Duplicate ONLY on exact byte match.
+            changed = db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, '
+                                 "answer=?, request=? WHERE command_id=? AND state='held'",
+                                 (*ours, command_id)).rowcount
+            _require(changed == 1 and self._select(db, command_id)[6:11] == ours, RouteJournalError('readback'))
+            return True
+
+
+@dataclass(frozen=True)
+class InspectionObservation:
+    """A verified signed supervisor statement about ONE exact binding.
+
+    It is evidence of what the supervisor's journal said at ``answered_at_ms``
+    (signed), not fresh host or Hub job state. ``historical`` is True when it
+    was replayed from the ledger rather than answered in this call.
+
+    ``request`` and ``answer`` are the RAW signed bytes (the exact canonical
+    request that the answer echoes, and the signed answer). Every other field
+    is a convenience HINT computed by this module and MUST NOT be trusted by
+    the Hub: inside its own transaction the Hub re-verifies the raw bytes
+    against its own pinned key (e.g. ``PinnedKeyInspectionVerifier.verify(
+    answer, request=json.loads(request))`` after a strict canonical parse),
+    derives the status, route_state, binding, dispatch claim and time from
+    the SIGNED payload, compares them with its own job record, and refuses
+    if any hint disagrees.
+    """
+    command_id: str
+    status: str
+    route_state: str
+    answered_at_ms: int
+    key_id: str
+    binding_digest: str
+    dispatch: dict
+    historical: bool
+    request: bytes = field(repr=False)
+    answer: bytes = field(repr=False)
+
+
+class HeldAttemptSource:
+    """DEFAULT-REFUSING interface to the AUTHORITATIVE Hub job store.
+
+    This module verifies and stores observations; it NEVER decides. Nothing
+    here can move, resolve or release a Hub job. The Hub owns that decision:
+
+    * ``hold_version(command, pin, dispatch_counter)`` -> an opaque version
+      string (printable ASCII, at most 256 chars) naming the exact held
+      attempt as the Hub job store has it now. ``InspectionResolver.hold``
+      records nothing unless it gets a valid one (a temporary failure can
+      simply be retried); a later hold of the same binding must return the
+      SAME version, else it is refused (``hold_version_changed``).
+    * ``record_observation_in_hub_transaction(version, observation)`` -> the
+      callback the Hub executes inside ITS OWN DB transaction. In that one
+      transaction it must INDEPENDENTLY: (1) strictly parse
+      ``observation.request`` (canonical JSON) and verify
+      ``observation.answer`` against it with its own pinned supervisor key;
+      (2) take the outcome (status, route_state), binding, dispatch claim and
+      time ONLY from those signed bytes, never from the module-computed
+      fields, refusing if any of them disagrees; (3) check that the signed
+      binding/claim is exactly its own held job and that ``version`` is that
+      job's current hold version, plus its owner checks; then (4) record the
+      outcome. It returns exactly True only if that transaction COMMITTED the
+      outcome. Anything else (False, any other value, an exception, a
+      rollback) means nothing was recorded.
+
+    Atomicity is ONLY as strong as that Hub transaction; this module provides
+    none (the inspection ledger shares no transaction or lock with the Hub
+    DB). The base class refuses both, so every attempt stays held until a
+    source bound to the Hub job store exists (none does today).
+    """
+
+    def hold_version(self, command, pin, dispatch_counter):
+        raise SupervisorRouteError('held attempt source not configured')
+
+    def record_observation_in_hub_transaction(self, version, observation):
+        raise SupervisorRouteError('held attempt source not configured')
+
+
+@dataclass(frozen=True)
+class InspectionResolverConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no resolver exists."""
+    enabled: bool = False
+    ledger_path: str | None = None
+    create_ledger: bool = False
+    allow_ephemeral_test_storage: bool = False
+
+
+@dataclass(frozen=True)
+class InspectionResolution:
+    """state: held | applied.
+
+    ``applied`` means only that the Hub's own DB transaction (the source
+    callback) committed the observation with its owner/job checks; ``held``
+    is everything else (including a verified observation the Hub refused or
+    that could not be offered). ``observation`` is the verified signed observation, if
+    any (``historical`` when replayed). Nothing here permits resubmitting,
+    redispatching or releasing.
+    """
+    state: str
+    command_id: str
+    observation: InspectionObservation | None = None
+    error: str | None = None
+    status: str | None = None
+
+    @property
+    def applied(self):
+        return self.state == 'applied'
+
+
+class InspectionResolver:
+    """DISABLED-BY-DEFAULT Hub-side inspection of HELD attempts.
+
+    ``hold(command, pin, dispatch_counter)`` durably records a held attempt
+    with the source's opaque ``hold_version``; without a valid version it
+    records nothing and raises, so it can be retried.
+    ``inspect(...)`` contacts the supervisor only for a row held with the
+    identical binding. A verified, signed ``launched``/``refused`` whose
+    echoed request equals the held binding and dispatch claim is recorded as
+    an OBSERVATION; everything else (no row, transport, framing, HTTP denial,
+    unsigned, bad signature, wrong key, any binding mismatch, ``unknown``,
+    signed ``not_found``) records nothing and returns ``held``.
+
+    The observation never moves the Hub job by itself and this class never
+    decides. The only authoritative step is
+    ``source.record_observation_in_hub_transaction(hold_version, obs)``, which
+    the Hub executes in its own DB transaction with its owner/job checks;
+    only its exact True yields ``applied``. A refusal or an exception ->
+    ``held`` (with the observation attached); the default source cannot
+    even hold (no hold version), so nothing is recorded. The Hub must re-verify
+    the raw signed bytes itself and not trust this module's hint fields.
+    Atomicity is only as strong as that Hub transaction.
+
+    Only PERSISTED bytes are ever offered: if a concurrent inspection of the
+    same attempt persisted its (byte-different, e.g. other nonce) observation
+    first, this call re-reads and re-verifies THAT row and offers it as
+    historical; its own unpersisted answer is dropped. Any write or readback
+    mismatch -> ``held``.
+
+    A recorded observation is replayed as HISTORICAL (signed answered_at_ms),
+    re-verified against the CURRENT pinned key and binding (key rotation,
+    another pin or binding, tampered or missing bytes -> ``held``), and again
+    goes through the Hub transaction with the hold version; replay never
+    moves anything on its own. Not wired into any Hub service.
+    """
+
+    def __init__(self, *, config, client, source):
+        if type(config) is not InspectionResolverConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('supervisor inspection resolver is disabled')
+        _require(type(client) is SupervisorInspectionClient and type(config.ledger_path) is str
+                 and isinstance(source, HeldAttemptSource),
+                 SupervisorRouteError('invalid supervisor inspection resolver'))
+        self._client, self._source = client, source
+        self._ledger = InspectionLedger(config.ledger_path, create=config.create_ledger,
+                                        allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
+
+    def __repr__(self):
+        return 'InspectionResolver(<enabled>)'
+
+    def hold(self, command, pin, dispatch_counter):
+        """Durably record a held attempt with the source's hold version.
+
+        Records NOTHING (``SupervisorRouteRejected('hold_version_unavailable')``)
+        unless the source returns a valid version, so a temporary source
+        failure never persists an unusable row; the caller may retry.
+        """
+        request = self._client.request_for(command, pin, dispatch_counter)
+        try:
+            version = self._source.hold_version(command, pin, dispatch_counter)
+        except Exception:
+            version = None
+        if not _valid_hold_version(version):
+            raise SupervisorRouteRejected('hold_version_unavailable')
+        self._ledger.hold(request, version)
+
+    def _replay(self, row, request):
+        """Re-verify a recorded observation; returns (payload, answer, request bytes) or None."""
+        try:
+            command_id, state, route_state, key_id, answer, sent = row[0], *row[6:11]
+            _require(type(sent) is str and type(answer) is str and key_id == request['key_id'])
+            raw = sent.encode('ascii')
+            stored = _strict_json(raw, MAX_INSPECTION_REQUEST_BYTES)
+            _require(_canonical(stored) == raw and _valid_inspection_request(stored)
+                     and _canonical({**stored, 'request_nonce': None})
+                     == _canonical({**request, 'request_nonce': None})
+                     and stored['binding']['command_id'] == command_id)
+            payload = self._client._verifier.verify(answer.encode('ascii'), request=stored)
+            status = payload['status']
+            _require(status in _TERMINAL and (_OBSERVED[status], payload['route_state'], payload['key_id'])
+                     == (state, route_state, key_id) and route_state in _TERMINAL[status])
+            return payload, answer.encode('ascii'), raw
+        except Exception:
+            return None
+
+    def _apply(self, row, observation):
+        """The ONLY path to ``applied``: the Hub's own DB transaction (source callback)."""
+        version = row[5]
+        if not _valid_hold_version(version):
+            return InspectionResolution('held', observation.command_id, observation, 'hub_unavailable',
+                                        observation.status)
+        try:
+            applied = self._source.record_observation_in_hub_transaction(version, observation) is True
+        except Exception:
+            applied = False
+        if not applied:
+            return InspectionResolution('held', observation.command_id, observation, 'hub_not_recorded',
+                                        observation.status)
+        return InspectionResolution('applied', observation.command_id, observation, None, observation.status)
+
+    @staticmethod
+    def _observation(request, payload, answer, historical, sent):
+        return InspectionObservation(request['binding']['command_id'], payload['status'], payload['route_state'],
+                                     payload['answered_at_ms'], payload['key_id'], request['binding_digest'],
+                                     json.loads(_canonical(request['dispatch'])), historical, sent, answer)
+
+    def inspect(self, command, pin, dispatch_counter):
+        request = self._client.request_for(command, pin, dispatch_counter)
+        command_id = command.command_id
+
+        def held(error, status=None, observation=None):
+            return InspectionResolution('held', command_id, observation, error, status)
+        try:
+            row = self._ledger.read(command_id)
+        except Exception:
+            return held('no_held_attempt')
+        if row is None or row[1:5] != InspectionLedger._key(request):
+            return held('no_held_attempt')  # Nothing sent.
+        if row[6] != 'held':
+            replayed = self._replay(row, request)
+            if replayed is None:
+                return held('replay_unverified')  # Never the stored observation unverified.
+            # Historical evidence only: an authoritative effect still needs the Hub transaction.
+            return self._apply(row, self._observation(request, replayed[0], replayed[1], True, replayed[2]))
+        answer = self._client.inspect(request)
+        if not answer.verified:
+            return held(answer.error if answer.error in _INSPECTION_ERRORS else 'unverified')
+        if answer.status in ('not_found', 'unknown'):
+            # Signed, but absence or ambiguity is never proof of no effect.
+            return held(answer.status, answer.status)
+        payload = answer.payload
+        if (answer.status not in _TERMINAL or answer.route_state not in _TERMINAL[answer.status]
+                or _canonical(payload['request']) != _canonical(request)
+                or payload['key_id'] != request['key_id']):
+            return held('unverified')
+        observation = self._observation(request, payload, answer.raw, False, _canonical(request))
+        try:
+            persisted = self._ledger.record_observation(request, answer.status, answer.route_state,
+                                                        payload['key_id'], answer.raw)
+        except Exception:
+            return held('observation_unrecorded', answer.status, observation)
+        if persisted is True:
+            return self._apply(row, observation)
+        # Another inspection's observation was persisted first: only THAT
+        # persisted, re-read and re-verified observation may be offered.
+        try:
+            stored = self._ledger.read(command_id)
+        except Exception:
+            return held('observation_unrecorded', answer.status)
+        if stored is None or stored[:6] != row[:6] or stored[6] == 'held':
+            return held('observation_unrecorded', answer.status)
+        replayed = self._replay(stored, request)
+        if replayed is None:
+            return held('replay_unverified', answer.status)
+        return self._apply(stored, self._observation(request, replayed[0], replayed[1], True, replayed[2]))
+
+    def close(self):
+        self._ledger.close()
