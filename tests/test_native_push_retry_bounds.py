@@ -120,3 +120,85 @@ def test_success_after_budget_is_not_delivered_as_recovery(tmp_path):
         release.join()
         locker.close()
         source.stop()
+
+
+def test_stop_during_multi_second_busy_wait_is_bounded_by_the_slice_not_interrupt(tmp_path, monkeypatch):
+    """With interrupt disabled, stop latency comes from the per-attempt SQL slice alone."""
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures = []
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4), lambda *_: None,
+                               on_error=failures.append, busy_timeout_ms=5_000,
+                               transient_retry_initial_ms=50, transient_retry_max_ms=200,
+                               transient_retry_budget_ms=60_000, transient_busy_slice_ms=100)
+    monkeypatch.setattr(source, "_interrupt_sql", lambda: None)
+    source.start()
+    locker, _ = hold_lock(repository)
+    try:
+        assert wait_until(lambda: source.stats["transient_retries"] >= 2, timeout=3)
+        began = time.monotonic()
+        source.stop(timeout=10)
+        took = time.monotonic() - began
+        assert took < 0.35, f"stop took {took:.2f}s with a 5 s busy_timeout"
+        assert failures == [] and source.failure is None
+    finally:
+        locker.close()
+
+
+def test_non_interrupt_error_during_stop_still_fails_closed(tmp_path):
+    """A real failure is reported even if a stop was requested at the same moment."""
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures = []
+    reader = MessageCursorReader(page_size=4)
+    holder = {}
+
+    def failing_reader(conn, cursor):
+        if cursor is not None and holder.get("armed"):
+            holder["source"]._stop_requested.set()  # The stop flag is set when the I/O error lands.
+            exc = sqlite3.OperationalError("disk I/O error")
+            exc.sqlite_errorcode = 10  # SQLITE_IOERR
+            raise exc
+        return reader(conn, cursor)
+
+    source = SQLiteEventSource(repository.path, failing_reader, lambda *_: None, on_error=failures.append,
+                               busy_timeout_ms=200, transient_busy_slice_ms=50)
+    holder["source"] = source
+    source.start()
+    try:
+        holder["armed"] = True
+        repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+        assert wait_until(lambda: failures, timeout=3)
+        assert len(failures) == 1 and failures[0].sqlite_errorcode == 10 and not source.healthy
+    finally:
+        source.stop()
+
+
+def test_late_success_is_bounded_to_one_slice_past_the_deadline(tmp_path):
+    """A snapshot that began before the deadline may finish after it, but by at most one slice."""
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    deliveries, failures = [], []
+    delivered_at = []
+    def deliver(recipients, cursor):
+        delivered_at.append(time.monotonic())
+        deliveries.append(tuple(recipients))
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4), deliver,
+                               on_error=failures.append, busy_timeout_ms=5_000,
+                               transient_retry_initial_ms=20, transient_retry_max_ms=50,
+                               transient_retry_budget_ms=400, transient_busy_slice_ms=100)
+    source.start()
+    locker, started = hold_lock(repository)
+    try:
+        time.sleep(0.35)  # Release close to the 400 ms deadline.
+        locker.execute("INSERT INTO messages (id,sender,recipient,message_type,body_json,created_at) "
+                       "VALUES ('edge','hermes','claude','event','{}','2026-01-01T00:00:00Z')")
+        locker.execute("INSERT INTO message_delivery_sequence (message_id) VALUES ('edge')")
+        locker.execute("COMMIT")
+        assert wait_until(lambda: deliveries or failures, timeout=3)
+        if deliveries:
+            assert delivered_at[0] - started <= 0.4 + 0.1 + SLACK_S
+            assert failures == [] and source.healthy
+        else:
+            assert len(failures) == 1 and not source.healthy  # Lost the race: failed closed, never both.
+            assert not deliveries
+    finally:
+        locker.close()
+        source.stop()

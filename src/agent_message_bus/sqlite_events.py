@@ -235,9 +235,13 @@ class SQLiteEventSource:
     primary code is retried with bounded, stop-interruptible backoff and the
     cursor unchanged, so the later successful snapshot catches up from it.
     The budget counts from the start of the first blocked attempt and includes
-    time spent inside SQLite's busy handler: after startup, busy_timeout is
-    capped to the budget, and each retry to what is left of it. stop() also
-    interrupts SQL blocked in that handler. That bounded wait is the only timer. Exhausting the retry budget, and every
+    time spent inside SQLite's busy handler: after startup each attempt blocks in
+    SQLite for at most transient_busy_slice_ms (and never past what is left of
+    the budget), and the stop flag is checked between attempts. A snapshot that
+    began before the deadline may complete up to one slice after it and is then
+    accepted. stop() also interrupts running SQL as a faster path; only
+    SQLITE_INTERRUPT after a stop is treated as a clean stop. Startup keeps the
+    full busy_timeout, bounded by start(). That bounded wait is the only timer. Exhausting the retry budget, and every
     other error, fails closed exactly as before. This hardens against lock
     contention generally; it does not assert any past outage was a lock.
     """
@@ -255,6 +259,7 @@ class SQLiteEventSource:
         transient_retry_initial_ms: int = 50,
         transient_retry_max_ms: int = 2_000,
         transient_retry_budget_ms: int = 30_000,
+        transient_busy_slice_ms: int = 100,
     ) -> None:
         if not sys_platform_linux():
             raise OSError("SQLiteEventSource requires Linux inotify, epoll, and eventfd")
@@ -264,6 +269,7 @@ class SQLiteEventSource:
             ("transient_retry_initial_ms", transient_retry_initial_ms, 1, 60_000),
             ("transient_retry_max_ms", transient_retry_max_ms, 1, 60_000),
             ("transient_retry_budget_ms", transient_retry_budget_ms, 0, 600_000),
+            ("transient_busy_slice_ms", transient_busy_slice_ms, 1, 60_000),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ValueError(f"{name} must be an integer between {low} and {high}")
@@ -292,6 +298,10 @@ class SQLiteEventSource:
         self.transient_retry_initial_ms = transient_retry_initial_ms
         self.transient_retry_max_ms = transient_retry_max_ms
         self.transient_retry_budget_ms = transient_retry_budget_ms
+        # After startup SQLite blocks at most one slice per attempt, so the stop flag
+        # and the budget are checked in Python between slices; interrupt() is only a
+        # faster path, not the bound.
+        self.transient_busy_slice_ms = transient_busy_slice_ms
         self._transient_started: float | None = None
         self._transient_attempts = 0
         # Flush commands received during a retry wait run after it recovers.
@@ -711,13 +721,16 @@ class SQLiteEventSource:
 
     def _reconcile(self, *, reason: str) -> None:
         while True:
+            if reason != "startup" and self._stop_requested.is_set():
+                raise _StopRequested()  # Checked between attempts; never mid-publication.
             attempt_started = time.monotonic()
             try:
                 selected, next_cursor = self._snapshot()
                 break
             except sqlite3.OperationalError as exc:
-                if self._stop_requested.is_set():
-                    raise _StopRequested() from None  # stop() interrupted blocked SQL.
+                code = _sqlite_error_details(exc).get('sqlite_errorcode')
+                if self._stop_requested.is_set() and type(code) is int and code & 0xFF == 9:
+                    raise _StopRequested() from None  # SQLITE_INTERRUPT from stop(); other errors stay fatal.
                 # Startup stays fail-closed: start() has its own bounded timeout.
                 code_name = None if reason == "startup" else _transient_sqlite_code(exc)
                 if code_name is None:
@@ -744,7 +757,7 @@ class SQLiteEventSource:
     def _steady_busy_timeout_ms(self) -> int:
         if self.transient_retry_budget_ms == 0:
             return self.busy_timeout_ms
-        return max(1, min(self.busy_timeout_ms, self.transient_retry_budget_ms))
+        return max(1, min(self.busy_timeout_ms, self.transient_retry_budget_ms, self.transient_busy_slice_ms))
 
     def _set_busy_timeout(self, milliseconds: int) -> None:
         for conn in (self._reader, self._barrier):
