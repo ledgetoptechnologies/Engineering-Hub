@@ -8,7 +8,9 @@ but may legitimately repeat), nobody else is notified, and the recipient reads t
 message back with the routing fields (``body.topic``, ``correlation_id``) that
 host-side wake filters depend on.
 
-It does NOT prove that a chat wakes: Claude's bus_wake listener, the Codex
+Every check holds only within the observed windows (SEND_BUDGET_SECONDS per
+message plus a final SETTLE_SECONDS quiet period); it is not an exactly-once
+guarantee. It does NOT prove that a chat wakes: Claude's bus_wake listener, the Codex
 native_push connector and the Hermes worker run on the agent hosts, outside this
 repository, and their routing (topic/correlation filters, restarts) is untested
 here. It is not a production probe and never polls anything recurring.
@@ -110,6 +112,7 @@ async def test_every_route_notifies_only_its_recipient_within_budget(tmp_path, t
                         if previous is not None:
                             prev_recipient, prev_count = previous
                             assert all(not late[name] for name in AGENTS if name != prev_recipient), (label, late)
+                            assert all(uri_of(event) == BASE_URI.format(prev_recipient) for event in late[prev_recipient]), label
                             assert prev_count + len(late[prev_recipient]) <= MAX_RECIPIENT_EVENTS, (label, late)
                         else:
                             assert all(not items for items in late.values()), (label, late)
@@ -132,6 +135,14 @@ async def test_every_route_notifies_only_its_recipient_within_budget(tmp_path, t
                         assert message["body"] == {"topic": topic, "from_role": sender}
                         assert message["correlation_id"] == topic
                         cursors[recipient] = page["next_cursor"]
+                    # Final bounded quiet check: after the last read-back, within SETTLE_SECONDS, only
+                    # late events for the last recipient (still within its bound) may arrive.
+                    await asyncio.sleep(SETTLE_SECONDS)
+                    late = take_leftovers(events)
+                    last_recipient, last_count = previous
+                    assert all(not late[name] for name in AGENTS if name != last_recipient), late
+                    assert all(uri_of(event) == BASE_URI.format(last_recipient) for event in late[last_recipient])
+                    assert last_count + len(late[last_recipient]) <= MAX_RECIPIENT_EVENTS
 
 
 def fake_event(recipient: str):
