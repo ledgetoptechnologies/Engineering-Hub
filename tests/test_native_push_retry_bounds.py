@@ -284,3 +284,84 @@ def test_budget_zero_lock_shorter_than_busy_timeout_is_absorbed_silently(tmp_pat
     finally:
         locker.close()
         source.stop()
+
+
+def _busy_source(tmp_path, code, on_attempt):
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures = []
+    inner = MessageCursorReader(page_size=4)
+    state = {"armed": False}
+
+    def reader(conn, cursor):
+        if cursor is not None and state["armed"]:
+            on_attempt()
+            exc = sqlite3.OperationalError("database is locked")
+            exc.sqlite_errorcode = code
+            raise exc
+        return inner(conn, cursor)
+
+    source = SQLiteEventSource(repository.path, reader, lambda *_: None, on_error=failures.append,
+                               busy_timeout_ms=200, transient_retry_initial_ms=20, transient_retry_max_ms=40,
+                               transient_retry_budget_ms=100, transient_busy_slice_ms=50)
+    return repository, source, failures, state
+
+
+@pytest.mark.parametrize("code", [5, 6, 517])
+def test_stop_arriving_with_a_lock_error_is_a_clean_stop(tmp_path, code):
+    """Precedence: an intentional stop wins over a BUSY/LOCKED error we would only retry."""
+    holder = {}
+    repository, source, failures, state = _busy_source(tmp_path, code, lambda: holder["source"]._stop_requested.set())
+    holder["source"] = source
+    source.start()
+    state["armed"] = True
+    repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+    assert wait_until(lambda: source._thread_done.is_set(), timeout=3)
+    source.stop(timeout=3)
+    assert failures == [] and source.failure is None
+
+
+def test_stop_arriving_during_the_last_backoff_before_exhaustion_is_a_clean_stop(tmp_path):
+    """The budget runs out right after a backoff in which a stop was requested: clean stop, not a failure."""
+    import threading
+    holder = {"timer": None}
+
+    def on_attempt():
+        if holder["timer"] is None:  # 95 ms after the first blocked attempt: inside the final backoff.
+            holder["timer"] = threading.Timer(0.095, holder["source"]._stop_requested.set)
+            holder["timer"].start()
+
+    repository, source, failures, state = _busy_source(tmp_path, 5, on_attempt)
+    holder["source"] = source
+    source.start()
+    state["armed"] = True
+    repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+    assert wait_until(lambda: source._thread_done.is_set(), timeout=3)
+    source.stop(timeout=3)
+    holder["timer"].join()
+    assert failures == [] and source.failure is None and source.stats["transient_retries"] >= 2
+
+
+def test_budget_exhaustion_without_stop_still_fails_closed(tmp_path):
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures = []
+    inner = MessageCursorReader(page_size=4)
+    armed = {"on": False}
+
+    def reader(conn, cursor):
+        if cursor is not None and armed["on"]:
+            exc = sqlite3.OperationalError("database is locked")
+            exc.sqlite_errorcode = 5
+            raise exc
+        return inner(conn, cursor)
+
+    source = SQLiteEventSource(repository.path, reader, lambda *_: None, on_error=failures.append,
+                               busy_timeout_ms=200, transient_retry_initial_ms=20, transient_retry_max_ms=40,
+                               transient_retry_budget_ms=100, transient_busy_slice_ms=50)
+    source.start()
+    try:
+        armed["on"] = True
+        repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+        assert wait_until(lambda: failures, timeout=3)
+        assert len(failures) == 1 and failures[0].sqlite_errorcode == 5 and not source.healthy
+    finally:
+        source.stop()

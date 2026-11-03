@@ -236,12 +236,19 @@ class SQLiteEventSource:
     unchanged, so a later successful snapshot catches up from it. That bounded
     wait is the only timer.
 
-    What is bounded: time spent waiting on SQLite locks. Each steady-state
-    attempt blocks in SQLite's busy handler for at most transient_busy_slice_ms
-    (never past what is left of the budget), backoff waits are interruptible,
-    and the stop flag is checked before every attempt. The budget counts from
-    the start of the first blocked attempt; once it is spent the source fails
-    closed. After a stop only SQLITE_INTERRUPT counts as a clean stop.
+    What is bounded: each SQLite lock wait. After startup every statement waits
+    in SQLite's busy handler for at most transient_busy_slice_ms (and not past
+    what was left of the budget when the attempt began), so an attempt with
+    several statements may wait up to one slice per statement. The budget
+    counts from the start of the first blocked attempt and is checked when an
+    attempt fails and again after each backoff; scheduling and one attempt may
+    run a little past it before the source fails closed. Backoff waits are
+    interruptible and the stop flag is checked before every attempt.
+
+    Stop precedence: once stop() is requested, SQLITE_INTERRUPT and a
+    BUSY/LOCKED wait (which would only be retried) end as a clean stop, also when
+    the budget runs out at that moment. Every other error still fails closed and
+    is reported.
 
     What is not bounded by the budget or by stop: a snapshot that is executing
     rather than waiting (paged reads, the cursor reader) runs to completion and
@@ -736,8 +743,11 @@ class SQLiteEventSource:
                 break
             except sqlite3.OperationalError as exc:
                 code = _sqlite_error_details(exc).get('sqlite_errorcode')
-                if self._stop_requested.is_set() and type(code) is int and code & 0xFF == 9:
-                    raise _StopRequested() from None  # SQLITE_INTERRUPT from stop(); other errors stay fatal.
+                if self._stop_requested.is_set() and type(code) is int and (
+                        code & 0xFF == 9 or _transient_sqlite_code(exc) is not None):
+                    # A requested stop wins over SQLITE_INTERRUPT and over a lock wait we would
+                    # only retry anyway; every other error still fails closed and is reported.
+                    raise _StopRequested() from None
                 # Startup stays fail-closed: start() has its own bounded timeout.
                 code_name = None if reason == "startup" else _transient_sqlite_code(exc)
                 if code_name is None:
@@ -795,6 +805,8 @@ class SQLiteEventSource:
             self._transient_started = now  # Callers normally set it to the attempt's start.
         remaining_ms = self.transient_retry_budget_ms - (now - self._transient_started) * 1000
         if remaining_ms <= 0:
+            if self._stop_requested.is_set():
+                raise _StopRequested() from None  # Stop requested as the budget ran out: clean stop.
             raise exc
         delay_ms = min(self.transient_retry_max_ms,
                        self.transient_retry_initial_ms * (2 ** min(self._transient_attempts, 16)),
@@ -836,6 +848,8 @@ class SQLiteEventSource:
         self._stage = stage
         left_ms = self.transient_retry_budget_ms - (time.monotonic() - self._transient_started) * 1000
         if left_ms <= 0:
+            if self._stop_requested.is_set():
+                raise _StopRequested() from None
             raise exc
         # The next attempt may not block inside SQLite past the rest of the budget.
         self._set_busy_timeout(max(1, min(self._steady_busy_timeout_ms(), int(left_ms))))
