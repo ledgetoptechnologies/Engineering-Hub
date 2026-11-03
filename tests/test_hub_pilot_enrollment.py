@@ -476,3 +476,59 @@ def test_owned_bound_schema_requires_explicit_offline_preparation(tmp_path):
         BoundOAuthDraftStore(store)
         with pytest.raises(ValueError, match='already present'):
             enroll_owned_bound_schema(repo, writers_stopped=True, backup_verified=True)
+
+
+def test_owned_bound_preparation_rolls_back_first_ddl_on_second_failure(tmp_path, monkeypatch):
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-fault'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        bad=dict(draft._SCHEMAS)
+        bad['auth_bound_oauth_sessions']='CREATE TABLE invalid SQL'
+        monkeypatch.setattr(draft,'_SCHEMAS',bad)
+        with pytest.raises(sqlite3.Error):
+            draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with repo._connection() as db:
+            assert db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'auth_bound_oauth_%'").fetchall() == []
+
+
+def test_bound_preparation_denies_competing_owner_and_installs_exact_schema(tmp_path):
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-contention'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        with pytest.raises(PilotOwnershipError):
+            PilotOwner(path, require_existing=True, allow_ephemeral_test_storage=True)
+        draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with repo._connection() as db:
+            draft._check_schema(db)
+            observed=dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name LIKE 'auth_bound_oauth_%'").fetchall())
+        assert observed == draft._SCHEMAS
+
+
+def test_bound_preparation_serializes_with_legacy_sqlite_writer(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from engineering_hub import bound_oauth_draft as draft
+    private=tmp_path/'owned-writer'; private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        entered=Event(); release=Event()
+        def legacy_writer():
+            with sqlite3.connect(path, timeout=5) as db:
+                db.execute('BEGIN IMMEDIATE')
+                entered.set()
+                assert release.wait(3)
+        def prepare():
+            return draft.enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer=pool.submit(legacy_writer)
+            assert entered.wait(2)
+            pending=pool.submit(prepare)
+            assert not pending.done()
+            release.set(); writer.result(timeout=3); pending.result(timeout=3)
+        with repo._connection() as db:
+            draft._check_schema(db)
