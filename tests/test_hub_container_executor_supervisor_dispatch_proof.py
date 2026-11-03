@@ -863,3 +863,51 @@ def test_no_writer_can_commit_proof_mode_or_resolve_the_intent_mid_send(proof):
     finally:
         db.close()
     legacy.close()
+
+
+# ---------------------------------------------------------------- rollback-journal mode only
+
+def _to_wal(path):
+    db = _raw(path)
+    assert db.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    return db
+
+
+@LINUX
+def test_wal_mode_journal_is_refused_on_open(proof, tmp_path):
+    from tests.test_hub_container_executor_supervisor_launch_counter import gate_config
+    route = route_for(proof)
+    route.close()
+    _to_wal(proof["path"]).close()  # Converted while the route was closed.
+    assert Path(proof["path"]).read_bytes()[18:20] == b"\x02\x02"
+    with pytest.raises(SupervisorRouteError):
+        route_for(proof, create=False)
+    assert Path(proof["path"]).read_bytes()[18:20] == b"\x02\x02"  # Refused, NOT silently converted back.
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir(mode=0o700)
+    gate_path = gate_dir / "gate.sqlite"
+    route_module.DispatchCounterGate(config=gate_config(gate_path)).close()
+    _to_wal(gate_path).close()
+    with pytest.raises(SupervisorRouteError):  # Same store base: the executor gate refuses too.
+        route_module.DispatchCounterGate(config=gate_config(gate_path, create=False))
+
+
+@LINUX
+def test_send_guard_refuses_a_journal_switched_to_wal_with_zero_bytes(proof, monkeypatch):
+    legacy = route_for(proof, dispatch_proof_verifier=None)
+    paused, resume = _paused_before_send(monkeypatch, legacy)
+    cmd = command(proof["epoch"])
+    worker, outcome = _submit_in_thread(legacy, cmd)
+    wal = None
+    try:
+        assert paused.wait(10)  # Admitted under rollback-journal mode, not yet sent.
+        wal = _to_wal(proof["path"])  # Kept open: WAL readers then open normally.
+    finally:
+        resume.set()
+        worker.join(10)
+    try:
+        result = outcome["result"]
+        assert (result.state, result.error) == ("held", "send_guard_failed") and sends(proof) == 0
+    finally:
+        wal.close()
+    legacy._journal.close()

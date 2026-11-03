@@ -114,7 +114,10 @@ one-step intent is unresolved (``legacy_in_flight``), and each one-step send
 holds a journal read transaction (SQLite SHARED lock) across exactly the
 backend exchange after re-checking the mode and its own intent, so no
 writer - even one ignoring the flock - can commit proof mode or resolve that
-intent mid-send; if the mode was entered after admit, the send is refused
+intent mid-send (this holds ONLY in rollback-journal mode, which the store
+enforces: a WAL-mode file is refused on open, on every write connection and
+inside the guard; direct file writes, restores and detached work remain
+outside it); if the mode was entered after admit, the send is refused
 (``proof_required``, intent held) with zero bytes. Cost: in legacy mode the
 journal accepts no commits while a one-step exchange is in progress (other
 writers fail after the busy timeout). Triggers make
@@ -1254,7 +1257,13 @@ class _DurableStore:
                 _require(not self.path.exists() and not self.path.is_symlink(), RouteJournalError('fresh'))
             else:
                 _private_file(self.path)
+                # Rollback-journal (DELETE) mode only: refuse a WAL file before
+                # SQLite opens it (header bytes 18/19 are 2 in WAL mode), and
+                # again by pragma. Never converted silently.
+                with open(self.path, 'rb') as header:
+                    _require(header.read(20)[18:20] == b'\x01\x01', RouteJournalError('mode'))
                 with self._connection(readonly=True) as db:
+                    _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',), RouteJournalError('mode'))
                     self._schema(db)
             self._owner = PilotOwner(self.path, allow_ephemeral_test_storage=allow_ephemeral_test_storage)
             _require(not create or self._owner.previous_epoch is None, RouteJournalError('fresh'))
@@ -1305,7 +1314,10 @@ class _DurableStore:
             db.execute('PRAGMA trusted_schema=OFF')
             if not readonly:
                 db.execute('PRAGMA synchronous=FULL')
-                _require(db.execute('PRAGMA journal_mode=DELETE').fetchone() == ('delete',),
+                # The file must ALREADY be in rollback-journal mode: a WAL file
+                # is refused, never converted back behind a reader's back.
+                _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',)
+                         and db.execute('PRAGMA journal_mode=DELETE').fetchone() == ('delete',),
                          RouteJournalError('mode'))
             yield db
         finally:
@@ -1496,8 +1508,11 @@ class RouteJournal(_DurableStore):
         until the exchange returns. While it is held no writer can COMMIT
         (rollback-journal mode needs EXCLUSIVE), so proof mode cannot be
         recorded, nor this intent resolved, mid-send even by a writer that
-        ignores the PilotOwner flock. Raises Rejected('proof_required' /
-        'intent_resolved') before anything is sent."""
+        ignores the PilotOwner flock - in rollback-journal (DELETE) mode,
+        which is asserted here (anything else raises RouteJournalError, so
+        the send is held ``send_guard_failed`` with zero bytes). Raises
+        Rejected('proof_required' / 'intent_resolved') before anything is
+        sent. Direct file writes, restores and detached work stay outside."""
         _require(os.getpid() == self._pid, RouteJournalError('process'))
         with self._mutex:
             self._active()
@@ -1505,6 +1520,11 @@ class RouteJournal(_DurableStore):
             db.execute('BEGIN')
             try:
                 self._schema(db)  # First read: SHARED lock from here until rollback.
+                # The SHARED lock blocks commits ONLY in rollback-journal mode
+                # (in WAL, writers commit alongside readers). Changing the mode
+                # needs an exclusive lock, so it is stable from here.
+                _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',),
+                         RouteJournalError('journal_mode'))
                 if self._proof_mode(db):
                     raise SupervisorRouteRejected('proof_required')
                 row = self._row(db, command_id)
