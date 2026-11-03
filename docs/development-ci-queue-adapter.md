@@ -126,6 +126,19 @@ What is enforced in source:
   mismatch, and a lease not beyond host time plus the skew bound (default 5 s).
   A delayed or replayed signed start is refused. Per-effect confirmation needs
   a host->Hub `claim_confirmer`; the default refuses, so runs stay held.
+- In-flight effects: each signed claim is recorded on the Hub ledger in the same
+  transaction that re-checks the live claim and pause state
+  (`hub_development_ci_effects`, bound to nonce, job, attempt and fence). A
+  ledger trigger refuses any job transition other than to `held` while a mark
+  is `in_flight`, so the job cannot be released or reassigned before the host
+  reports terminal (`receipt_committed` marks them `reported`). Pause, revoke
+  or lease loss only stop new signatures. There is no operator path to clear an
+  unreported mark; an attempt whose host never reports stays held.
+- Host nonces: at most `max_nonces` (default 64, 1..1024) live entries; expired
+  entries are pruned by `time.monotonic()`, a full store refuses new challenges
+  rather than evicting live ones, and each nonce is removed after one use
+  whether confirmation succeeds or fails. Clock values, skew and leases must be
+  finite (NaN and infinities refuse).
 - Hub: `receipt_committed` binds the authenticated host inspection to the
   original claim/attempt. The authenticated host ack is recorded with its
   credential (`host_acked`) and re-verified before release; a ledger trigger
@@ -147,7 +160,8 @@ What is enforced in source:
   a journal below the anchor. It also requires the same external anchor reader
   as admission (`stop(..., external_anchor=...)`); without one, including from
   the CLI today, every enrolled stop refuses. Unenrolled hosts keep the old
-  behaviour.
+  behaviour. Any emergency halt for an enrolled host is a separate design that
+  has not been reviewed and is not implemented here.
 
 What is NOT supplied (each default refuses, so attempts stay held):
 

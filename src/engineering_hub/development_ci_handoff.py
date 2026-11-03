@@ -46,6 +46,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -509,8 +510,8 @@ class CIHostHandoff:
     """
     def __init__(self, journal_path, anchor_path, engine_directory, *, manifest_digest,
                  runner, authenticator=None, external_anchor=None, terminal_verifier=None,
-                 claim_confirmer=None, clock=time.time, max_clock_skew=5.0, nonce_validity=30.0,
-                 enable_durable_handoff=False):
+                 claim_confirmer=None, clock=time.time, monotonic=time.monotonic, max_clock_skew=5.0,
+                 nonce_validity=30.0, max_nonces=64, enable_durable_handoff=False):
         if enable_durable_handoff is not True:
             raise HandoffRefused('handoff_disabled')
         if not isinstance(manifest_digest, str) or not _DIGEST.fullmatch(manifest_digest) or not callable(runner):
@@ -528,10 +529,15 @@ class CIHostHandoff:
                                             'handoff_terminal_verifier_required')
         self.claim_confirmer = _authority(claim_confirmer, RefusingClaimConfirmer, ('confirm',),
                                           'handoff_claim_confirmer_required')
-        if (not callable(clock) or type(max_clock_skew) not in (int, float) or not 0 <= max_clock_skew <= 60
-                or type(nonce_validity) not in (int, float) or not 0 < nonce_validity <= 120):
+        if (not callable(clock) or not callable(monotonic)
+                or type(max_clock_skew) not in (int, float) or not math.isfinite(max_clock_skew)
+                or not 0 <= max_clock_skew <= 60
+                or type(nonce_validity) not in (int, float) or not math.isfinite(nonce_validity)
+                or not 0 < nonce_validity <= 120
+                or type(max_nonces) is not int or not 1 <= max_nonces <= 1024):
             raise HandoffRefused('handoff_host_composition_required')
-        self.clock, self.max_clock_skew, self.nonce_validity = clock, max_clock_skew, nonce_validity
+        self.clock, self.monotonic = clock, monotonic
+        self.max_clock_skew, self.nonce_validity, self.max_nonces = max_clock_skew, nonce_validity, max_nonces
         # Process-local and single-use: a host restart forgets every nonce, so
         # an in-flight answer is refused rather than trusted.
         self._nonces = {}
@@ -603,9 +609,19 @@ class CIHostHandoff:
                 'source_commit': row['source_commit']}
 
     # -- fresh current-claim challenge -------------------------------------
+    @staticmethod
+    def _finite(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
     def _now(self):
         value = self.clock()
-        if type(value) not in (int, float) or value != value:
+        if not self._finite(value):
+            raise HandoffRefused('handoff_clock_unavailable')
+        return value
+
+    def _tick(self):
+        value = self.monotonic()
+        if not self._finite(value):
             raise HandoffRefused('handoff_clock_unavailable')
         return value
 
@@ -613,11 +629,19 @@ class CIHostHandoff:
         with self._db(write=False) as db:
             generation, _ = self._generation(db)
         nonce = secrets.token_hex(32)
-        challenge = {**binding, 'generation': generation, 'nonce': nonce,
-                     'expires_at': self._now() + self.nonce_validity}
+        challenge = {**binding, 'generation': generation, 'nonce': nonce}
         with self._nonce_lock:
-            self._nonces[nonce] = challenge
+            tick = self._tick()
+            for key in [key for key, (_, deadline) in self._nonces.items() if tick > deadline]:
+                del self._nonces[key]  # prune expired only; never evict a live nonce
+            if len(self._nonces) >= self.max_nonces:
+                raise HandoffRefused('handoff_nonce_store_full')
+            self._nonces[nonce] = (challenge, tick + self.nonce_validity)
         return self._signed('challenge_result', challenge)
+
+    def _discard(self, nonce):
+        with self._nonce_lock:
+            self._nonces.pop(nonce, None)
 
     def challenge(self, request, credential):
         """Issue a fresh single-use nonce for one (attempt, job, fence)."""
@@ -636,30 +660,38 @@ class CIHostHandoff:
                                                         claim.get('credential')):
             raise HandoffRefused('handoff_claim_unauthenticated')
         with self._nonce_lock:
-            issued = self._nonces.pop(statement.get('nonce'), None)  # single use, even on refusal
-        if issued is None:
+            entry = self._nonces.pop(statement.get('nonce'), None)  # single use, even on refusal
+        if entry is None:
             raise HandoffRefused('handoff_claim_nonce_unknown')
-        now = self._now()
-        if now > issued['expires_at']:
+        issued, deadline = entry
+        if self._tick() > deadline:
             raise HandoffRefused('handoff_claim_nonce_stale')
+        now = self._now()
         expected = {**binding, 'generation': generation}
         if (any(issued.get(key) != value for key, value in expected.items())
                 or any(statement.get(key) != value for key, value in expected.items())
                 or statement.get('state') != 'claim_current'):
             raise HandoffRefused('handoff_claim_mismatch')
         lease = statement.get('lease_until')
-        if type(lease) not in (int, float) or lease - self.max_clock_skew <= now:
+        if not self._finite(lease) or lease - self.max_clock_skew <= now:
             raise HandoffRefused('handoff_claim_lease_expired')
 
     def _confirm_current(self, binding, generation):
         challenge, credential = self._issue(binding)
         try:
-            answer = self.claim_confirmer.confirm(challenge, credential)
-        except Exception:
-            answer = None
-        if type(answer) is not tuple or len(answer) != 2:
-            raise HandoffRefused('handoff_claim_unconfirmed')
-        self._check_claim({'statement': _plain(answer[0]), 'credential': answer[1]}, binding, generation)
+            try:
+                answer = self.claim_confirmer.confirm(challenge, credential)
+            except Exception:
+                answer = None
+            if type(answer) is not tuple or len(answer) != 2:
+                raise HandoffRefused('handoff_claim_unconfirmed')
+            try:
+                statement = _plain(answer[0])
+            except Exception:
+                raise HandoffRefused('handoff_claim_unauthenticated') from None
+            self._check_claim({'statement': statement, 'credential': answer[1]}, binding, generation)
+        finally:
+            self._discard(challenge['nonce'])  # single use whether confirmed or not
 
     def start(self, request, credential):
         """Admit at most one new attempt; any doubt refuses before an effect."""
@@ -860,6 +892,27 @@ WHEN NEW.job_id IS NOT OLD.job_id OR NEW.attempt_id IS NOT OLD.attempt_id OR NEW
       AND NEW.host_ack IS OLD.host_ack
       AND (SELECT state FROM hub_work_jobs WHERE id=OLD.job_id) IS OLD.outcome))
 BEGIN SELECT RAISE(ABORT,'development_ci_handoff_transition'); END;
+CREATE TABLE IF NOT EXISTS hub_development_ci_effects (
+    nonce TEXT PRIMARY KEY, job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, fence INTEGER NOT NULL,
+    state TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_insert BEFORE INSERT ON hub_development_ci_effects
+WHEN NEW.state IS NOT 'in_flight'
+  OR NOT EXISTS(SELECT 1 FROM hub_development_ci_handoff WHERE job_id=NEW.job_id
+                AND attempt_id=NEW.attempt_id AND fence=NEW.fence AND state='intent')
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_insert'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_delete BEFORE DELETE ON hub_development_ci_effects
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_delete'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_transition BEFORE UPDATE ON hub_development_ci_effects
+WHEN NEW.nonce IS NOT OLD.nonce OR NEW.job_id IS NOT OLD.job_id OR NEW.attempt_id IS NOT OLD.attempt_id
+  OR NEW.fence IS NOT OLD.fence
+  OR NOT (OLD.state='in_flight' AND NEW.state='reported'
+          AND (SELECT state FROM hub_development_ci_handoff WHERE job_id=OLD.job_id) IN
+              ('receipt_committed','host_acked','finalized'))
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_transition'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_release_guard BEFORE UPDATE OF state ON hub_work_jobs
+WHEN NEW.state NOT IN ('claimed','held')
+  AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=NEW.id AND state='in_flight')
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_release_guard BEFORE UPDATE OF state ON hub_work_jobs
 WHEN NEW.state IN ('succeeded','failed')
   AND EXISTS(SELECT 1 FROM hub_development_ci_handoff WHERE job_id=NEW.id)
@@ -984,7 +1037,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         challenge = _plain(challenge)
         if (not _verified(self.authenticator, 'challenge_result', challenge, credential)
                 or type(challenge) is not dict
-                or set(challenge) != {'attempt_id', 'job_id', 'fence', 'generation', 'nonce', 'expires_at'}
+                or set(challenge) != {'attempt_id', 'job_id', 'fence', 'generation', 'nonce'}
                 or challenge['generation'] != self.host_generation):
             raise HubError('development_ci_handoff_challenge_invalid', 409)
         row = self._row(challenge['job_id'])
@@ -993,10 +1046,28 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         attempt = DevelopmentCIAttempt(**json.loads(row['attempt']))
         if row['state'] != 'intent' or attempt.epoch != self.epoch:
             raise HubError('development_ci_handoff_claim_not_current', 409)
-        job = self._bound(attempt)  # live_claim on the real queue, review, binding
+        self._bound(attempt)  # live_claim on the real queue, review, binding
+        # Same txn: re-check the live claim and pause, then durably mark this
+        # effect in flight. Until the host reports terminal (receipt_committed)
+        # the ledger refuses any release/reassignment of the job; a later
+        # pause/revoke only stops NEW signatures.
+        with self.repo._transaction() as db:
+            job = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (attempt.job_id,)).fetchone()
+            machine = db.execute('SELECT generation,job_id FROM hub_work_machines WHERE machine_id=?',
+                                 (self.manifest.machine_id,)).fetchone()
+            now = self.queue._now()
+            if (job is None or job['state'] != 'claimed' or job['worker'] != self.worker.encoded()
+                    or job['fence'] != attempt.fence or not job['lease_until'] > now
+                    or machine is None or tuple(machine) != (attempt.fence, attempt.job_id)
+                    or db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0]
+                    or self.repo._paused(db)):
+                raise HubError('development_ci_handoff_claim_not_current', 409)
+            db.execute("INSERT INTO hub_development_ci_effects VALUES(?,?,?,?,'in_flight')",
+                       (challenge['nonce'], attempt.job_id, attempt.attempt_id, attempt.fence))
+            lease_until = job['lease_until']
         statement = {'nonce': challenge['nonce'], 'attempt_id': attempt.attempt_id, 'job_id': attempt.job_id,
                      'fence': attempt.fence, 'generation': self.host_generation,
-                     'lease_until': job['lease_until'], 'state': 'claim_current'}
+                     'lease_until': lease_until, 'state': 'claim_current'}
         return statement, self._sign('claim', statement)
 
     def _prior_release(self):
@@ -1083,6 +1154,9 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                        "receipt_digest=?,terminal=?,outcome=?,hub_ack=? WHERE job_id=? AND state=?",
                        (trusted['receipt_id'], trusted['receipt_digest'], _canonical(terminal), outcome,
                         secrets.token_hex(32), job_id, row['state']))
+            # The host reported the terminal outcome of every effect.
+            db.execute("UPDATE hub_development_ci_effects SET state='reported' WHERE job_id=? AND state='in_flight'",
+                       (job_id,))
         return True
 
     def _finalize_request(self, row):

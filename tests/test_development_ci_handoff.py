@@ -170,13 +170,14 @@ RIG = object()
 
 
 def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=RIG, claim_confirmer=RIG,
-              enable=True):
+              enable=True, **extra):
     pick = lambda value, default: default if value is RIG else value
     return CIHostHandoff(rig.journal, rig.anchor, rig.engine, manifest_digest=rig.manifest.digest,
         runner=rig.runner, authenticator=pick(authenticator, rig.auth),
         external_anchor=pick(external_anchor, rig.external),
         terminal_verifier=pick(terminal_verifier, UnsafeTestOnlyTerminalVerifier()),
-        claim_confirmer=pick(claim_confirmer, RigClaimConfirmer(rig)), clock=lambda: rig.clock[0],
+        claim_confirmer=pick(claim_confirmer, RigClaimConfirmer(rig)),
+        **{'clock': lambda: rig.clock[0], 'monotonic': lambda: rig.clock[0], **extra},
         enable_durable_handoff=enable)
 
 
@@ -741,15 +742,18 @@ async def test_delayed_start_after_job_reassignment_is_refused(rig, monkeypatch)
     rig.clock[0] += 601
     operator = WorkQueue(rig.repo, dict(ACTIONS), reconciliation_verifier=lambda *args: True,
                          target_verifier=_verifier(rig.repo), clock=lambda: rig.clock[0])
-    operator.reconcile(job_id=first['id'], evidence_id='operator-inspected', outcome='cancelled')
+    # The signed admission is a durable in-flight effect: reassignment refused.
+    with pytest.raises(sqlite3.IntegrityError, match='development_ci_effect_in_flight'):
+        operator.reconcile(job_id=first['id'], evidence_id='operator-inspected', outcome='cancelled')
     second = submit(rig, 'second')
+    # ...and the delayed start itself is refused: never both.
     with pytest.raises(HandoffRefused, match='handoff_claim_nonce_stale'):
         rig.host.start(*delayed[0])
-    result = await rig.bridge.run_once()
-    assert result['id'] == second['id'] and result['state'] == 'succeeded'
+    assert (await rig.bridge.run_once())['id'] == first['id']
+    assert rig.queue.get_job(second['id'])['state'] == 'queued' and reservation(rig) == first['id']
     with pytest.raises(HandoffRefused, match='handoff_claim_nonce_unknown'):
         rig.host.start(*delayed[0])
-    assert [row['job_id'] for row in host_rows(rig)] == [second['id']] and len(rig.runner.calls) == 1
+    assert host_rows(rig) == [] and not rig.runner.calls
 
 
 def test_stale_nonce_expired_lease_and_mismatched_claim_are_refused(rig):
@@ -783,3 +787,102 @@ async def test_default_claim_confirmer_refuses_every_effect(rig):
     rig.host = make_host(rig, claim_confirmer=None)
     assert (await rig.bridge.run_once())['state'] == 'held'
     assert host_state(rig) == ['running'] and not rig.runner.calls and reservation(rig) == job['id']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('race', ['pause', 'revoke', 'reassign'])
+async def test_barrier_race_after_signature_never_both_release_and_effect(rig, race):
+    job = submit(rig)
+    outcomes = []
+    def after_signed_effect():
+        # The Hub has signed (and durably marked) the claim for the effect
+        # just admitted; now try to pause/revoke/reassign before the next one.
+        try:
+            if race == 'pause':
+                rig.queue.set_paused(True)
+            elif race == 'revoke':
+                with rig.repo._transaction() as hub:
+                    hub.execute("UPDATE hub_work_jobs SET state='cancelled' WHERE id=?", (job['id'],))
+            else:
+                rig.clock[0] += 601
+                operator = WorkQueue(rig.repo, dict(ACTIONS), reconciliation_verifier=lambda *args: True,
+                                     target_verifier=_verifier(rig.repo), clock=lambda: rig.clock[0])
+                operator.reconcile(job_id=job['id'], evidence_id='operator', outcome='cancelled')
+            outcomes.append('applied')
+        except sqlite3.IntegrityError as error:
+            assert 'development_ci_effect_in_flight' in str(error)
+            outcomes.append('release_refused')
+    rig.runner.during = after_signed_effect
+    result = await rig.bridge.run_once()
+    assert outcomes == (['applied'] if race == 'pause' else ['release_refused'])
+    if race == 'revoke':
+        # Release refused, so the still-current claim finishes normally once.
+        assert result['state'] == 'succeeded' and releases(rig, job['id']) == 1
+        assert host_state(rig) == ['finalized_reserved'] and len(rig.runner.calls) == 1
+        return
+    # Pause / lost lease stop NEW signatures: the next effect is refused and
+    # the job stays reserved with its in-flight marks.
+    assert host_state(rig) == ['running'] and len(rig.runner.calls) == 1
+    assert result['state'] in ('held', 'claimed') and reservation(rig) == job['id']
+    assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and releases(rig, job['id']) == 0
+    with rig.repo._connection() as db:
+        marks = db.execute('SELECT state FROM hub_development_ci_effects WHERE job_id=?', (job['id'],)).fetchall()
+    assert marks and all(row[0] == 'in_flight' for row in marks)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_marks_clear_only_when_host_reports_terminal(rig):
+    job = submit(rig)
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    with rig.repo._connection() as db:
+        marks = [row[0] for row in db.execute('SELECT state FROM hub_development_ci_effects WHERE job_id=?',
+                                              (job['id'],))]
+    assert marks == ['reported', 'reported']  # admission + one guarded effect
+
+
+def test_nonce_store_is_bounded_pruned_and_single_use(rig):
+    host = make_host(rig, max_nonces=2)
+    binding = {'attempt_id': 'a1', 'job_id': 'manual-job', 'fence': 1}
+    sign = lambda: rig.auth.sign('challenge', binding)
+    first, _ = host.challenge(binding, sign())
+    host.challenge(binding, sign())
+    with pytest.raises(HandoffRefused, match='handoff_nonce_store_full'):
+        host.challenge(binding, sign())  # never evicts a live nonce
+    assert first['nonce'] in host._nonces
+    rig.clock[0] += 31  # monotonic expiry
+    host.challenge(binding, sign())
+    assert first['nonce'] not in host._nonces and len(host._nonces) == 1
+    for bad in (0, 1025, True, 2.0):
+        with pytest.raises(HandoffRefused, match='composition_required'):
+            make_host(rig, max_nonces=bad)
+    # A failed per-effect confirmation still consumes its nonce.
+    refusing = make_host(rig, claim_confirmer=None)
+    with pytest.raises(HandoffRefused, match='handoff_claim_unconfirmed'):
+        refusing._confirm_current(binding, rig.generation)
+    assert refusing._nonces == {}
+
+
+@pytest.mark.parametrize('lease', [float('nan'), float('inf'), float('-inf')])
+def test_non_finite_lease_is_refused(rig, monkeypatch, lease):
+    binding = {'attempt_id': 'a1', 'job_id': 'manual-job', 'fence': 1}
+    challenge, _ = rig.host.challenge(binding, rig.auth.sign('challenge', binding))
+    statement = {'nonce': challenge['nonce'], **binding, 'generation': rig.generation,
+                 'lease_until': lease, 'state': 'claim_current'}
+    monkeypatch.setattr(rig.auth, 'verify', lambda *args: True)  # isolate the lease check
+    with pytest.raises(HandoffRefused, match='handoff_claim_lease_expired'):
+        rig.host._check_claim({'statement': statement, 'credential': 'x'}, binding, rig.generation)
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+@pytest.mark.parametrize('which', ['clock', 'monotonic'])
+def test_non_finite_clocks_are_refused(rig, value, which):
+    host = make_host(rig, **{which: lambda: value})
+    with pytest.raises(HandoffRefused, match='handoff_clock_unavailable'):
+        if which == 'monotonic':
+            start_request(rig, 1, host=host)
+        else:
+            host.start(*start_request(rig, 1, host=host))
+    assert host_rows(rig) == [] and not rig.runner.calls
+    for bad in (float('nan'), float('inf')):
+        with pytest.raises(HandoffRefused, match='composition_required'):
+            make_host(rig, max_clock_skew=bad)
