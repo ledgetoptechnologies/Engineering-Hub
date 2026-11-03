@@ -82,3 +82,60 @@ def test_queued_freezes_human_context_until_cancelled(setup_queue):
         repo.update_context('human:1234', 'task', task['id'], task['revision'], 'changed', [])
     queue.cancel_unclaimed(actor='codex', job_id=job['id'])
     assert repo.update_context('human:1234', 'task', task['id'], task['revision'], 'changed', [])['status'] == 'claimed'
+
+
+def test_same_task_single_open_idempotent_and_cancel_allows_new(setup_queue):
+    queue, _, repo, _ = setup_queue
+    task=reviewed_task(repo)
+    target=WorkTarget(task['id'], COMMIT, 'sha256:'+'b'*64)
+    first=submit(queue,'same',target=target)
+    assert submit(queue,'same',target=target)['id']==first['id']
+    with pytest.raises(HubError,match='work_task_already_queued'):
+        submit(queue,'second',target=target)
+    queue.cancel_unclaimed(actor='codex',job_id=first['id'])
+    second=submit(queue,'second',target=target)
+    assert second['id']!=first['id']
+    claim=queue.claim(worker=w('codex'))
+    with pytest.raises(HubError,match='work_task_already_queued'):
+        submit(queue,'third',target=target)
+    queue.complete(job_id=second['id'],worker=w('codex'),fence=claim['fence'],outcome='held')
+    with pytest.raises(HubError,match='work_task_already_queued'):
+        submit(queue,'fourth',target=target)
+
+
+def test_task_changes_during_preflight_never_freezes_stale_job(setup_queue):
+    queue, _, repo, _ = setup_queue
+    task=reviewed_task(repo)
+    target=WorkTarget(task['id'],COMMIT,'sha256:'+'b'*64)
+    def update(*args):
+        repo.set_candidate('codex',task['id'],task['revision'],'f'*40)
+        return True
+    queue.target_verifier=update
+    with pytest.raises(HubError,match='work_review_changed'):
+        submit(queue,'race',target=target)
+    assert queue.status()['jobs']==[]
+
+
+def test_tampered_family_denied_at_transaction(setup_queue):
+    import json
+    queue, _, repo, _=setup_queue
+    task=reviewed_task(repo)
+    task['review']['family']='codex'
+    with repo._transaction() as db:
+        db.execute('UPDATE hub_entities SET data=? WHERE id=?',(json.dumps(task),task['id']))
+    with pytest.raises(HubError,match='work_review_changed'):
+        submit(queue,'bad',target=WorkTarget(task['id'],COMMIT,'sha256:'+'b'*64))
+
+
+def test_concurrent_same_task_only_one_submission(setup_queue):
+    queue, _, repo, _=setup_queue
+    task=reviewed_task(repo)
+    target=WorkTarget(task['id'],COMMIT,'sha256:'+'b'*64)
+    barrier=threading.Barrier(2)
+    def run(key):
+        barrier.wait()
+        try: return submit(queue,key,target=target)['state']
+        except HubError as e: return e.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first,second=pool.submit(run,'a'),pool.submit(run,'b')
+        assert sorted([first.result(),second.result()]) == ['queued','work_task_already_queued']

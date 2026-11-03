@@ -465,3 +465,14 @@ async def test_corrupted_queued_extra_binding_is_not_claimed_or_dispatched(rig):
     assert await rig.bridge.run_once() is None
     assert rig.queue.get_job(job['id'])['state'] == 'queued'
     assert machine_job(rig) is None and rig.client.submissions == []
+
+@pytest.mark.asyncio
+async def test_one_open_job_per_task_does_not_deadlock_pilot(rig):
+    task, first = submit(rig)
+    assert rig.queue.submit(actor='codex', request_id='one', action_key=ACTION,
+        environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))['id'] == first['id']
+    with pytest.raises(HubError, match='work_task_already_queued'):
+        rig.queue.submit(actor='codex', request_id='duplicate-target', action_key=ACTION,
+            environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert machine_job(rig) is None
