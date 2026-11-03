@@ -44,7 +44,21 @@ Add `InstallationAuthority.verify(principal_row, *, checkpoint)` as a pure funct
 3. An execution grant exists that is not revoked, has not expired, and covers the project, the environment and the capability. A changed revision is accepted only if coverage still holds. This is an open question (§7).
 4. `submit_session_id` has `revoked_at IS NULL`. A session that merely expired is fine, because sessions last 15 minutes and jobs can run longer.
 
-**Lock order.** The bridge requires the session writer before the Hub writer (`session_hub_bridge.py:3`), but workers check inside `repo._transaction`. Option A: `verify` uses a read-only deferred session connection. A revoke that commits after that read may let one more effect through. Option B: effect checkpoints take the session writer first, then the Hub writer, so a revoke strictly wins. Recommend B for each host effect and A for status reads.
+**Process topology and journal mode (checked in source, not on a live host).**
+- The session bridge lives in the Hub app process (`app.py:522`) and holds an OS lock on `<sessions>.hub-bridge.lock` (`session_hub_bridge.py:105-114`), so no second process can run a bridge.
+- The pilot worker is built in a separate service process (`queued_pilot_service.py:141`, `unified_queued_pilot_service.py:162`, `serve_owned_queued_pilot` at `queued_pilot_service.py:49`). It cannot call the bridge and must read authority itself.
+- The Hub database sets WAL (`repository.py:64`). `agent_sessions.py` sets no journal mode (`_transaction`, `:141-152`), so the session database uses SQLite's default rollback journal unless something else changes it. Check the live file before implementation.
+- They are separate files. Reading one and writing the other gives no atomicity, and lock ordering alone does not make a revoke and an effect atomic. A host effect (an HTTP request to the worker) is outside every database transaction anyway.
+
+**Revocation fence (Hub-database tombstone).** Make revocation take effect inside the Hub database, the one the worker already writes effect intents to:
+1. When the owner revokes an installation, session or execution grant, or narrows a grant, the bridge writes the session-database change and then, in the same bridge critical section, a Hub-database row `hub_principal_fences(installation_id, session_id NULL, grant_id NULL, authority_epoch, revoked_at, reason)`. The owner API reports success only after both commits.
+2. Startup reconciliation in the Hub process copies any session-database revocation missing a fence row before the queue admits work. This covers a crash between the two commits.
+3. Every effect checkpoint checks fences inside the same Hub `BEGIN IMMEDIATE` transaction that records the effect intent (pilot command intent, CI attempt intent, staging submission). Fence row present or epoch mismatch: no intent and no effect.
+4. **Bounded race, stated plainly:** an intent that committed before the fence row may still be sent once, because sending happens after the commit. At most one such effect per job. It is recorded as `admitted_before_revocation`, never retried, and no later intent is admitted. Everything else is refused.
+
+The worker also reads the session database directly (`InstallationAuthority.verify`) as defence in depth, but the fence is the authority for ordering.
+
+**Grant edits.** Each execution grant carries an `authority_epoch` that increments only on a narrowing edit: revoke, an earlier expiry, or removing a project, environment or capability. A harmless edit (a label, a later expiry, an added unrelated project) changes `revision` but not `authority_epoch`. Jobs pin the epoch at submit. Admission requires the exact current revision; later checkpoints require the same epoch. A narrowing edit writes a fence row like a revoke.
 
 ## 3. Checkpoints and revocation
 
@@ -54,8 +68,10 @@ Add `InstallationAuthority.verify(principal_row, *, checkpoint)` as a pure funct
 | claim (`_eligible_target`) | `verify` | job not claimable, left `queued` and visible as `principal_revoked` |
 | before each effect (`live_claim`, pilot `authorize('command')`, CI `admission_guard`) | `verify` | raise; the existing path holds the job (`_hold`) |
 | `create_run` | `verify` plus family check against the principal row | `forbidden` |
-| completion (`complete`) | none for releasing the machine; terminal proof only | proof recorded; job tagged `admission_revoked`; nothing downstream admitted |
+| completion (`complete`) | none for releasing the machine; terminal proof only | true terminal outcome recorded with `authority='revoked_after_admission'`; an unknown effect stays `unknown`/held; the revoked principal advances nothing (no task status change, no promotion, no follow-on job) |
 | recovery and reconcile (`_bound(recovery=True)`, `recover`, `reconcile`) | **skip** `verify` | inspection and reconciliation stay available |
+
+**Session revocation.** Revoking a session stops new effects for every job that session submitted (fence row with `session_id`). Other sessions of the same active installation are unaffected. Read-only reconciliation and terminal evidence stay available.
 
 **Mid-run revocation.** No further effect is admitted, and an uncertain command is never redispatched. The existing guards (`staging_controller.py:631` "Never retry POST", `queued_pilot.py:404`, and the CI unique intent) already stop redispatch. The machine stays held until terminal proof (`work_queue.py:303-309, 630-653`).
 
@@ -95,14 +111,21 @@ Apply the same rule to the candidate. A legacy owner's `candidate_family` must e
 - `test_installation_review_family_checked_against_installation_record`: a tampered `review.family` or a missing provenance row is rejected.
 - `test_legacy_agents_flow_unchanged`: the existing end-to-end results are identical.
 - `test_execution_grant_cannot_name_production`: 422.
+- `test_fence_before_intent_sends_nothing`: fence committed, then a checkpoint; no intent row and no client call.
+- `test_intent_before_fence_sends_once_and_records_admitted_before_revocation`: commit an intent, write the fence, let dispatch run; exactly one client call, the outcome tagged `admitted_before_revocation`, and the next step refused.
+- `test_crash_between_session_revoke_and_fence_is_reconciled_before_admission`: session database revoked, no fence row, restart; startup writes the fence before `claim()` can return the job.
+- `test_harmless_grant_edit_keeps_job_narrowing_edit_stops_new_effects`: an added unrelated project leaves the epoch unchanged and the job continues; removing the project bumps the epoch, writes a fence and refuses the next effect.
+- `test_session_revoke_stops_only_that_sessions_jobs`.
+- `test_revoked_completion_records_truthful_outcome_without_advancing_task`: terminal success after revocation is recorded, the task status is unchanged, and no follow-on work is admitted.
+- `test_hub_database_is_wal_and_session_database_mode_is_asserted`: pins the journal modes this design relies on.
 
-## 7. Open questions
+## 7. Decisions (Codex, 2026-11-03) and open questions
 
-1. Session revocation: should it stop jobs that session already submitted (proposed), or should only installation and grant revocation stop them?
-2. Grant revision: is coverage-based rechecking acceptable, or must the revision match exactly, the way `_live` does (`session_hub_bridge.py:239`)? Exact match ends in-flight runs whenever the grant is edited.
-3. Lock strictness: should every effect take the session writer first, then the Hub writer (option B), and is that latency acceptable?
-4. Process topology: do the staging, pilot and CI workers run in the bridge process? The bridge's OS lock (`:105-114`) refuses a second process, so a separate worker process needs its own read-only authority.
-5. Should a job that completes after revocation record its outcome on the task, or only release the machine?
-6. Is a separate execution-grant table preferred, or should `session_hub_grants` be extended with environment and execution capabilities?
+Decided: revoking a session stops new effects for that session's jobs and keeps reconciliation and evidence. Execution grants are explicit and narrow. Admission pins the exact revision, and harmless edits are distinguished from narrowing ones (`authority_epoch`). Cross-database atomicity is not claimed; the Hub-database fence plus a stated one-effect bound replaces it. Terminal outcomes are recorded truthfully without granting revoked authority.
 
-**Not verified:** whether the session database runs in WAL mode; how `app.py` wires the queue and controller for installations; whether a remote staging cancel API exists; and whether a stored row with a forged legacy `review.family` exists today. No code was run.
+Open:
+1. Is the one-effect-per-job bound in §2 acceptable, or must dispatch itself re-check the fence after the intent commit (smaller window, but still not zero)?
+2. Should the fence write and the session revoke share a single code path in the bridge, so no owner route can revoke without fencing?
+3. Should a new `session_hub_execution_grants` table be used, or should `session_hub_grants` be extended?
+
+**Not verified:** the live session database's journal mode (the source sets none); how `app.py` would wire the queue and controller for installations; whether a remote staging cancel API exists; and whether a stored row with a forged legacy `review.family` exists today. No code was run.
