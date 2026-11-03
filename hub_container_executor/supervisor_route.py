@@ -160,9 +160,10 @@ DISPATCHED reservation's intent), ``not_dispatched`` (a reserved or
 abandoned/retired reservation, ONLY when the snapshot proves no challenge
 was consumed and no intent exists; otherwise ``unknown``), ``not_found``
 or ``unknown``, Ed25519-signed under its own domain over an exact echo of
-the request plus a ``reservation`` field binding the reservation receipt's
-SHA-256, its state and, when dispatched, the ONE consumed challenge's
-``challenge_sha256`` and proof hash. The Hub verifies
+the request plus a REQUIRED ``reservation`` field (so answers signed before
+it existed are intentionally incompatible and never verify) binding the
+reservation receipt's SHA-256, its state and, when dispatched, the ONE
+consumed challenge's ``challenge_sha256`` and proof hash. The Hub verifies
 through an ``InspectionVerifier`` (the base class refuses everything;
 ``PinnedKeyInspectionVerifier`` checks one pinned key). ``InspectionResolver``
 records a verified signed terminal status matching the binding exactly as an
@@ -2913,12 +2914,32 @@ _RESERVATION_INFO_KEYS = frozenset({'reservation_receipt_sha256', 'reservation_s
 _TERMINAL = {'launched': frozenset({'completed'}), 'refused': frozenset({'rejected', 'refused'})}
 _INSPECTION_REQUEST_KEYS = frozenset({'protocol', 'audience', 'scope', 'binding', 'binding_digest', 'dispatch',
                                       'key_id', 'request_nonce'})
+# The answer shape is versioned by its exact key set: the required
+# ``reservation`` key (added with two-phase reserve/dispatch) makes earlier
+# signed answers INTENTIONALLY unverifiable; there is no compatibility mode.
 _INSPECTION_ANSWER_KEYS = frozenset({'protocol', 'audience', 'key_id', 'request', 'request_sha256', 'status',
                                      'route_state', 'reservation', 'answered_at_ms'})
 _REQUEST_NONCE = re.compile(r'[0-9a-f]{32}\Z')
-_INSPECTION_ERRORS = frozenset({'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status',
-                                'unverified', 'not_found', 'unknown', 'observation_unrecorded',
-                                'replay_unverified', 'hub_unavailable', 'hub_not_recorded'})
+# PUBLIC CONTRACT: every ``InspectionResolution.error`` of a ``held`` result is
+# exactly one of these. None of them permits resubmitting, redispatching or
+# releasing anything.
+#   no_held_attempt        no held row with this exact binding (nothing sent)
+#   peer_mismatch          supervisor peer differs from its pin (zero bytes sent)
+#   transport_lost         connect/send/timeout/strict-framing failure
+#   http_status            supervisor answered other than 200 (unsigned denial)
+#   unverified             answer failed signature/key/shape/binding verification
+#   not_found              signed: neither reservation, intent nor challenge row
+#   not_dispatched         signed: reservation reserved/retired and provably unconsumed
+#   unknown                signed: anything else (incl. inconsistent rows)
+#   observation_unrecorded the verified observation could not be persisted
+#   replay_unverified      a persisted observation failed re-verification
+#   hub_unavailable        the held row has no usable hold version
+#   hub_not_recorded       the Hub's own transaction did not commit the outcome
+INSPECTION_HELD_REASONS = frozenset({
+    'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status', 'unverified', 'not_found',
+    'not_dispatched', 'unknown', 'observation_unrecorded', 'replay_unverified', 'hub_unavailable',
+    'hub_not_recorded'})
+_INSPECTION_ERRORS = INSPECTION_HELD_REASONS
 
 
 def inspection_key_id(public_key):
@@ -3000,7 +3021,10 @@ def _read_inspection_row(journal, command_id, budget_ms):
     remains of it, and a progress handler aborts any statement (schema/
     quick_check included) once it is spent, so a slow or locked journal makes
     this raise instead of pinning a worker. A journal not in rollback-journal
-    mode is refused, as everywhere else in this module.
+    mode is refused, as everywhere else in this module: checked before the
+    transaction AND re-checked after the snapshot reads while its SHARED lock
+    is still held, so a switch to WAL by a flock-ignoring writer before the
+    snapshot is caught (-> unsigned 503, nothing signed).
     """
     _require(type(journal) is RouteJournal and os.getpid() == journal._pid
              and type(budget_ms) is int and budget_ms > 0, RouteJournalError('process'))
@@ -3035,6 +3059,12 @@ def _read_inspection_row(journal, command_id, budget_ms):
                                         'WHERE command_id=? ORDER BY nonce', (command_id,)).fetchall()
                 _require(all(row[0] in ('outstanding', 'consumed', 'expired') for row in challenges),
                          RouteJournalError('challenge'))
+                # Re-checked AFTER the reads, while this transaction still holds
+                # the SHARED lock (as legacy_send_guard does): a writer that
+                # ignores the flock may have switched the file to WAL between
+                # the first check and BEGIN's first read; in rollback-journal
+                # mode no writer can switch it while the lock is held.
+                _snapshot_mode(db)
             finally:
                 db.execute('ROLLBACK')
             _require(time.monotonic() <= deadline, RouteJournalError('route journal busy'))
@@ -3049,11 +3079,16 @@ def _read_inspection_row(journal, command_id, budget_ms):
         journal._mutex.release()
 
 
+def _snapshot_mode(db):
+    _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',), RouteJournalError('mode'))
+
+
 def _inspection_status(request, snapshot):
     """(status, route_state, reservation) from ONE journal snapshot.
 
     One-step path (no reservation row): the intent's recorded outcome, else
-    ``unknown``; no row at all -> ``not_found``. Two-phase path: the
+    ``unknown``; no row at all -> ``not_found``; challenge rows without a
+    reservation (orphans) -> ``unknown``. Two-phase path: the
     reservation must carry exactly the request's binding, executor and
     counter, else ``unknown``. ``dispatched`` -> the dispatched intent's
     outcome (launched/refused) with the ONE consumed challenge's hash and
@@ -3075,6 +3110,9 @@ def _inspection_status(request, snapshot):
             return 'refused', row[2]
         return 'unknown', None
     if reservation is None:
+        if challenges:
+            # Challenge rows with no reservation are an inconsistent snapshot.
+            return 'unknown', None, None
         if intent is None:
             # Absence is NOT proof of no effect (restored or replaced journal).
             return 'not_found', None, None
@@ -3820,7 +3858,8 @@ class InspectionResolver:
         command_id = command.command_id
 
         def held(error, status=None, observation=None):
-            return InspectionResolution('held', command_id, observation, error, status)
+            return InspectionResolution('held', command_id, observation,
+                                        error if error in INSPECTION_HELD_REASONS else 'unverified', status)
         try:
             row = self._ledger.read(command_id)
         except Exception:
