@@ -19,6 +19,7 @@ import inspect
 import math
 import os
 import re
+import sqlite3
 import time
 import uuid
 
@@ -432,13 +433,19 @@ class WorkQueue:
             # Modular source deposits and resource registration straddle queue
             # insertion; only the controller can safely cancel that lifecycle.
             # A durable submission precedes queue admission in both schemas.
-            target = json.loads(row['target'])
-            staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
-            if (row['action_key'].startswith(('modular.', 'staging-service.'))
+            try:
+                target = json.loads(row['target'])
+                if type(target) is not dict:
+                    raise ValueError('invalid target')
+                staging_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone()
+                controller_owned = (row['action_key'].startswith(('modular.', 'staging-service.'))
                     or staging_table and db.execute(
                         "SELECT 1 FROM hub_staging_submissions WHERE id IN (?,?) OR json_extract(data,'$.job_id')=? OR (actor=? AND request_id=?) LIMIT 1",
                         (target.get('task_id'), target.get('submission_id'), job_id, actor,
-                         row['request_id'][len('staging:'):] if row['request_id'].startswith('staging:') else None)).fetchone()):
+                         row['request_id'][len('staging:'):] if row['request_id'].startswith('staging:') else None)).fetchone())
+            except (ValueError, TypeError, sqlite3.DatabaseError):
+                raise HubError('work_controller_cancel_required', 409) from None
+            if controller_owned:
                 raise HubError('work_controller_cancel_required', 409)
             if row['state'] == 'cancelled':
                 return self._public(row)
