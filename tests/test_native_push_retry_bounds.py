@@ -202,3 +202,85 @@ def test_late_success_is_bounded_to_one_slice_past_the_deadline(tmp_path):
     finally:
         locker.close()
         source.stop()
+
+
+def test_executing_snapshot_is_not_bounded_and_stop_waits_for_it(tmp_path):
+    """Documented limit: a snapshot that is executing (not waiting on a lock) runs to completion
+    and is published even past the budget; stop is serviced at the next check afterwards."""
+    import threading
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    deliveries, failures = [], []
+    inner = MessageCursorReader(page_size=4)
+    entered, release = threading.Event(), threading.Event()
+    slow = {"on": False}
+
+    def reader(conn, cursor):
+        result = inner(conn, cursor)
+        if cursor is not None and slow["on"]:
+            entered.set()
+            release.wait(5)  # Deterministic: hold the snapshot executing until the test releases it.
+        return result
+
+    source = SQLiteEventSource(repository.path, reader, lambda recipients, cursor: deliveries.append(tuple(recipients)),
+                               on_error=failures.append, busy_timeout_ms=2_000, transient_retry_budget_ms=100,
+                               transient_busy_slice_ms=50)
+    source.start()
+    try:
+        slow["on"] = True
+        repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+        assert entered.wait(3)
+        time.sleep(0.3)  # Well past the 100 ms budget while executing, not waiting.
+        stopper = threading.Thread(target=source.stop, kwargs={"timeout": 5})
+        stopper.start()
+        time.sleep(0.1)
+        assert stopper.is_alive()  # Stop cannot cut an executing snapshot short.
+        release.set()
+        stopper.join(5)
+        assert not stopper.is_alive()
+        assert deliveries == [("codex",)]  # The executing snapshot was published, not discarded.
+        assert failures == [] and source.failure is None
+    finally:
+        release.set()
+        source.stop()
+
+
+def test_budget_zero_keeps_full_busy_timeout_and_fails_closed_without_retry(tmp_path):
+    """transient_retry_budget_ms=0: no retries; a lock longer than busy_timeout fails closed after it."""
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures, failed_at = [], []
+    def on_error(exc):
+        failed_at.append(time.monotonic())
+        failures.append(exc)
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4), lambda *_: None,
+                               on_error=on_error, busy_timeout_ms=600, transient_retry_budget_ms=0)
+    source.start()
+    locker, started = hold_lock(repository)
+    try:
+        assert wait_until(lambda: failures, timeout=5)
+        elapsed = failed_at[0] - started
+        assert 0.5 <= elapsed <= 0.6 + SLACK_S, f"failed after {elapsed:.2f}s"  # Full busy_timeout, not a slice.
+        assert source.stats["transient_retries"] == 0 and len(failures) == 1 and not source.healthy
+    finally:
+        locker.close()
+        source.stop()
+
+
+def test_budget_zero_lock_shorter_than_busy_timeout_is_absorbed_silently(tmp_path):
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    deliveries, failures = [], []
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4),
+                               lambda recipients, cursor: deliveries.append(tuple(recipients)),
+                               on_error=failures.append, busy_timeout_ms=2_000, transient_retry_budget_ms=0)
+    source.start()
+    locker, _ = hold_lock(repository)
+    try:
+        time.sleep(0.4)
+        locker.execute("INSERT INTO messages (id,sender,recipient,message_type,body_json,created_at) "
+                       "VALUES ('z','hermes','claude','event','{}','2026-01-01T00:00:00Z')")
+        locker.execute("INSERT INTO message_delivery_sequence (message_id) VALUES ('z')")
+        locker.execute("COMMIT")
+        assert source.wait_for_cursor(repository.delivery_head(), timeout=5)
+        assert ("claude",) in deliveries and failures == [] and source.stats["transient_retries"] == 0
+    finally:
+        locker.close()
+        source.stop()

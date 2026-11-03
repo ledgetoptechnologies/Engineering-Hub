@@ -232,18 +232,25 @@ class SQLiteEventSource:
     query when the inotify/eventfd descriptors are idle.
 
     After startup, a snapshot that fails with a verified SQLITE_BUSY/LOCKED
-    primary code is retried with bounded, stop-interruptible backoff and the
-    cursor unchanged, so the later successful snapshot catches up from it.
-    The budget counts from the start of the first blocked attempt and includes
-    time spent inside SQLite's busy handler: after startup each attempt blocks in
-    SQLite for at most transient_busy_slice_ms (and never past what is left of
-    the budget), and the stop flag is checked between attempts. A snapshot that
-    began before the deadline may complete up to one slice after it and is then
-    accepted. stop() also interrupts running SQL as a faster path; only
-    SQLITE_INTERRUPT after a stop is treated as a clean stop. Startup keeps the
-    full busy_timeout, bounded by start(). That bounded wait is the only timer. Exhausting the retry budget, and every
-    other error, fails closed exactly as before. This hardens against lock
-    contention generally; it does not assert any past outage was a lock.
+    primary code is retried with stop-interruptible backoff and the cursor
+    unchanged, so a later successful snapshot catches up from it. That bounded
+    wait is the only timer.
+
+    What is bounded: time spent waiting on SQLite locks. Each steady-state
+    attempt blocks in SQLite's busy handler for at most transient_busy_slice_ms
+    (never past what is left of the budget), backoff waits are interruptible,
+    and the stop flag is checked before every attempt. The budget counts from
+    the start of the first blocked attempt; once it is spent the source fails
+    closed. After a stop only SQLITE_INTERRUPT counts as a clean stop.
+
+    What is not bounded by the budget or by stop: a snapshot that is executing
+    rather than waiting (paged reads, the cursor reader) runs to completion and
+    is published, even past the deadline; stop is then serviced at the next
+    check. Startup keeps the full busy_timeout, bounded only by start(). With
+    transient_retry_budget_ms=0 retries are off and every attempt keeps the
+    full busy_timeout, exactly as before this change. Every other error fails
+    closed exactly as before. This hardens against lock contention; it does not
+    assert any past outage was a lock.
     """
 
     def __init__(
