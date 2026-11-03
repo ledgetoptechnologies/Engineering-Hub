@@ -27,18 +27,25 @@ Dispatch counter: that same admission transaction also consumes the next
 durable per-executor dispatch counter (keyed by the pinned backend
 container_id; previous + 1, strictly increasing, never reused) and stores it
 on the intent row. The counter travels to the executor in the
-``X-Hub-Route-Dispatch`` header (``v1;executor=..;counter=..;body=<sha256>``)
-alongside the request; it is not part of the binding, the digest or the
-signed record. Triggers make the counter table append-only per executor (no
+``X-Hub-Route-Dispatch`` header: ``v1.`` + base64url of a canonical claim
+binding executor, counter, HTTP method, path, body SHA-256, command_id, queue
+fence and launch epoch (``dispatch_claim``), so it cannot be moved to another
+request. The claim is UNSIGNED today (protected only by the bearer and the
+peer check); its exact canonical bytes are what a later signature will cover.
+It is not part of the binding, the digest or the signed record. Triggers make the counter table append-only per executor (no
 lower/equal UPDATE, no DELETE, no second INSERT/REPLACE). A crash or failure
 after the admission COMMIT leaves the attempt ``intent``/``unknown`` (held)
 exactly as without the counter, and the consumed value is never sent again:
 an identical replay is held, a new command_id gets a higher value. The
 receiving side is ``DispatchCounterGate`` (also disabled by default, its own
-store): it refuses any counter not strictly greater than the last one it
-accepted for its executor (replays, duplicates and reorderings are refused,
-not deduplicated), allows gaps (consumed-but-unsent values), and commits the
-new value before the caller may act.
+store): it refuses a claim that does not match the actual request or any
+counter not strictly greater than the last one it accepted for its executor
+(replays, duplicates and reorderings are refused, not deduplicated), allows
+gaps (consumed-but-unsent values), and FENCES the effect itself: ``run``
+executes the caller's effect only after re-checking, under its effect lock
+and durably, that the counter is still the latest accepted and newer than
+any effect ever started, so an accepted-but-delayed counter cannot act after
+a higher one (see the class docstring for dead-process behaviour).
 
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
 against the pin immediately after connect and BEFORE any request byte is
@@ -126,10 +133,17 @@ Explicit limits (this foundation grants no authority by itself):
 * ``DispatchCounterGate`` is NOT wired into PilotASGI or any executor service:
   today nothing on the executor checks the dispatch header, so replay
   protection at the receiver exists only once an operator/test constructs the
-  gate and calls ``accept`` before acting. The header is unauthenticated
+  gate and runs the effect through ``run``. The header is unauthenticated
   beyond the bearer and peer check (no signer on either side); a party able
   to send with the bearer can choose any counter, and a large one would
   advance the gate. The gate's store must be private to the executor side.
+* ROLLBACK IS NOT DETECTED. All of this is local SQLite state: a store
+  restored from a backup, a copied older file or a snapshot rollback is
+  indistinguishable from the real one. A rolled-back gate store can accept
+  (and act on) an old counter again, and a rolled-back route journal can
+  reissue counters already sent. Proving non-rollback needs an external
+  monotonic anchor (e.g. a signed high-water mark held elsewhere), which is
+  NOT implemented.
 * The dispatch counter is keyed by container_id: a relaunch with a new
   container starts a new sequence at 1 (and needs a fresh gate store).
 * A custom backend object must honour the contract that ``PeerMismatch`` is
@@ -194,7 +208,11 @@ _EPOCH = ('CREATE TABLE supervisor_route_epoch (id INTEGER PRIMARY KEY CHECK(id=
 _OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
 MAX_DISPATCH_COUNTER = 2**63 - 1
 DISPATCH_HEADER = 'X-Hub-Route-Dispatch'
-_DISPATCH = re.compile(r'v1;executor=([0-9a-f]{64});counter=([1-9][0-9]{0,18});body=([0-9a-f]{64})\Z')
+DISPATCH_PROTOCOL = 'engineering-hub.supervisor-route-dispatch.v1'
+MAX_DISPATCH_HEADER = 2048
+_DISPATCH = re.compile(r'v1\.([A-Za-z0-9_-]{1,2045})\Z')
+_DISPATCH_KEYS = frozenset({'protocol', 'executor_id', 'counter', 'method', 'path', 'body_sha256',
+                            'command_id', 'queue_fence', 'epoch'})
 
 
 def _counter_schema(table):
@@ -218,6 +236,20 @@ def _counter_schema(table):
             f'CREATE TRIGGER {table}_no_delete BEFORE DELETE ON {table} '
             "BEGIN SELECT RAISE(ABORT, 'dispatch counter is permanent'); END"),
     }
+
+
+_GATE_IN_FLIGHT = ('CREATE TABLE supervisor_route_dispatch_in_flight (executor_id TEXT PRIMARY KEY, '
+                   "counter INTEGER NOT NULL CHECK(typeof(counter)='integer' AND counter > 0))")
+_GATE_OUTCOME = ('CREATE TABLE supervisor_route_dispatch_outcome (executor_id TEXT NOT NULL, '
+                 "counter INTEGER NOT NULL CHECK(typeof(counter)='integer' AND counter > 0), "
+                 "outcome TEXT NOT NULL CHECK(outcome IN ('completed','raised','released')), "
+                 'PRIMARY KEY (executor_id, counter))')
+_GATE_OUTCOME_FROZEN = ('CREATE TRIGGER supervisor_route_dispatch_outcome_frozen BEFORE UPDATE ON '
+                        'supervisor_route_dispatch_outcome '
+                        "BEGIN SELECT RAISE(ABORT, 'dispatch outcome is permanent'); END")
+_GATE_OUTCOME_KEPT = ('CREATE TRIGGER supervisor_route_dispatch_outcome_kept BEFORE DELETE ON '
+                      'supervisor_route_dispatch_outcome '
+                      "BEGIN SELECT RAISE(ABORT, 'dispatch outcome is permanent'); END")
 _STATES = frozenset({'intent', 'completed', 'rejected', 'refused', 'unknown'})
 _RECORDED = frozenset({'completed', 'rejected'})
 _ERRORS = frozenset({'transport_lost', 'malformed_response', 'backend_ambiguous', 'epoch_changed',
@@ -433,6 +465,13 @@ class RouteCommand:
                  and type(self.epoch) is RouteEpoch)
 
 
+def _pilot_request(body):
+    """Strict ContainerPilotRequest from the exact bytes; raises otherwise."""
+    value = _strict_json(body, MAX_BODY_BYTES)
+    _require(type(value) is dict and set(value) == set(ContainerPilotRequest.model_fields))
+    return ContainerPilotRequest.model_validate(value)
+
+
 def _submitted_request(command):
     """Parse the exact forwarded bytes per the executor submit contract.
 
@@ -441,9 +480,7 @@ def _submitted_request(command):
     if command.method != 'POST' or command.path != SUBMIT_PATH:
         raise SupervisorRouteRejected('unsupported_operation')
     try:
-        value = _strict_json(command.body, MAX_BODY_BYTES)
-        _require(type(value) is dict and set(value) == set(ContainerPilotRequest.model_fields))
-        request = ContainerPilotRequest.model_validate(value)
+        request = _pilot_request(command.body)
     except Exception:
         raise SupervisorRouteRejected('invalid_body') from None
     if request.command_id != command.command_id:
@@ -471,21 +508,52 @@ def observation_nonce(digest):
     return hashlib.sha256(_NONCE_DOMAIN + bytes.fromhex(digest)).hexdigest()
 
 
-def dispatch_header(executor_id, counter, body):
-    """Value of the ``X-Hub-Route-Dispatch`` header: the durably recorded
-    per-executor counter bound to the pinned executor and the exact body."""
-    _require(type(executor_id) is str and _HEX.fullmatch(executor_id)
-             and _positive(counter, MAX_DISPATCH_COUNTER) and type(body) is bytes)
-    return f'v1;executor={executor_id};counter={counter};body={hashlib.sha256(body).hexdigest()}'
+def dispatch_claim(binding, counter):
+    """The fields the dispatch header carries, all taken from the admitted
+    binding: executor (pinned container_id), counter, HTTP method, path, body
+    SHA-256, command_id, queue fence and launch epoch. A later signature can
+    cover exactly ``_canonical(claim)``; today the claim is UNSIGNED."""
+    _require(_valid_binding(binding) and _positive(counter, MAX_DISPATCH_COUNTER))
+    return {'protocol': DISPATCH_PROTOCOL, 'executor_id': binding['backend']['container_id'],
+            'counter': counter, 'method': binding['method'], 'path': binding['path'],
+            'body_sha256': binding['body_sha256'], 'command_id': binding['command_id'],
+            'queue_fence': binding['queue_fence'], 'epoch': dict(binding['epoch'])}
+
+
+def _valid_claim(claim):
+    return (_shape(claim, _DISPATCH_KEYS) and claim['protocol'] == DISPATCH_PROTOCOL
+            and type(claim['executor_id']) is str and _HEX.fullmatch(claim['executor_id'])
+            and _positive(claim['counter'], MAX_DISPATCH_COUNTER)
+            and claim['method'] in _METHODS and type(claim['path']) is str and _PATH.fullmatch(claim['path'])
+            and type(claim['body_sha256']) is str and _HEX.fullmatch(claim['body_sha256'])
+            and _uuid(claim['command_id']) and _positive(claim['queue_fence'])
+            and _shape(claim['epoch'], _EPOCH_KEYS) and _uuid(claim['epoch']['launch_id'], v4=True)
+            and _uuid(claim['epoch']['boot_id']) and _positive(claim['epoch']['launch_counter']))
+
+
+def dispatch_header(claim):
+    """``X-Hub-Route-Dispatch`` value: ``v1.`` + unpadded base64url of the
+    canonical claim JSON. Reserved for a later signed form: ``v2.<claim>.<sig>``
+    with the signature over a distinct domain + these exact claim bytes."""
+    _require(_valid_claim(claim))
+    value = 'v1.' + base64.urlsafe_b64encode(_canonical(claim)).rstrip(b'=').decode()
+    _require(len(value) <= MAX_DISPATCH_HEADER)
+    return value
 
 
 def parse_dispatch_header(value):
-    """Strict parse -> (executor_id, counter, body_sha256); DispatchRefused
-    for anything missing, non-canonical, non-integer or out of range."""
-    match = _DISPATCH.fullmatch(value) if type(value) is str else None
-    if match is None or not _positive(int(match[2]), MAX_DISPATCH_COUNTER):
-        raise DispatchRefused('dispatch_invalid')
-    return match[1], int(match[2]), match[3]
+    """Strict, non-malleable parse -> claim dict. DispatchRefused for anything
+    missing, non-canonical (base64 or JSON), wrongly typed or out of range."""
+    try:
+        match = _DISPATCH.fullmatch(value) if type(value) is str and len(value) <= MAX_DISPATCH_HEADER else None
+        _require(match is not None)
+        raw = base64.urlsafe_b64decode(match[1] + '=' * (-len(match[1]) % 4))
+        _require(base64.urlsafe_b64encode(raw).rstrip(b'=').decode() == match[1])
+        claim = _strict_json(raw, MAX_DISPATCH_HEADER)
+        _require(_valid_claim(claim) and _canonical(claim) == raw)
+    except Exception:
+        raise DispatchRefused('dispatch_invalid') from None
+    return claim
 
 
 @dataclass(frozen=True)
@@ -849,81 +917,193 @@ class RouteJournal(_DurableStore):
 
 @dataclass(frozen=True)
 class DispatchGateConfig:
-    """Explicit configuration. ``enabled`` defaults to False: no gate exists."""
+    """Explicit configuration. ``enabled`` defaults to False: no gate exists.
+
+    ``executor_id`` is this executor's pinned container_id and ``launch_epoch``
+    its enrolled RouteEpoch; claims for anything else are refused.
+    ``effect_wait_ms`` (0..50) bounds the wait for another run's effect."""
     enabled: bool = False
     journal_path: str | None = None
     create_journal: bool = False
     executor_id: str | None = None
+    launch_epoch: RouteEpoch | None = None
     allow_ephemeral_test_storage: bool = False
+    effect_wait_ms: int = 0
 
 
 class DispatchCounterGate(_DurableStore):
-    """DISABLED-BY-DEFAULT receiving-side check of the dispatch counter.
+    """DISABLED-BY-DEFAULT receiving-side dispatch counter gate AND effect fence.
 
-    For the executor that ``executor_id`` (its pinned container_id) names:
-    ``accept(header_value, body=...)`` refuses (DispatchRefused) a missing or
-    malformed header, another executor, a body whose SHA-256 differs from the
-    header's, and any counter NOT strictly greater than the last accepted one.
-    Replays, duplicates and reordered (lower) counters are refused, never
-    deduplicated. Gaps are ALLOWED: the sender consumes a counter at admission
-    even when the request is then never sent (peer mismatch, crash, failed
-    admit after COMMIT), so requiring +1 would wedge the executor on the first
-    unsent value. The new value is committed and fsynced BEFORE accept
-    returns; the caller acts only after a return. Any journal failure raises
-    RouteJournalError and the caller must not act (the counter may or may not
-    be consumed; the sender never resends it). Its own store, separate from
-    the route journal. NOT wired into PilotASGI or any service.
+    There is no public "accept, then act" call: the only entry point is
+    ``run(dispatch, method=, path=, body=, effect=)``, which runs the caller's
+    side effect itself, so a caller cannot skip the fence or forget a release:
+
+    1. Binding: the header claim must equal this executor, its launch epoch
+       and the actual request (method, path, body SHA-256, and the command_id
+       and fencing_generation parsed strictly from the body). Otherwise
+       DispatchRefused; nothing recorded.
+    2. Admission: one transaction refuses a counter not strictly greater than
+       the last ACCEPTED one (``dispatch_replay``) and records it. Replays,
+       duplicates and reorderings are refused, never deduplicated. Gaps are
+       ALLOWED: the sender consumes a counter at admission even when the
+       request is never sent, so requiring +1 would wedge on the first gap.
+    3. Fence: under the gate's effect lock (bounded wait, else
+       ``dispatch_busy``), one transaction re-checks that this counter is
+       STILL the latest accepted one and is greater than every counter whose
+       effect ever started (``dispatch_superseded``), and that no earlier
+       effect is unresolved (``dispatch_in_flight_unresolved``); it then
+       durably records "started" plus an in-flight marker. Only after that
+       COMMIT is ``effect()`` called. So an accepted-then-delayed counter can
+       never act after a higher one was accepted or acted.
+    4. Completion: the in-flight marker is replaced by a permanent outcome
+       (``completed``, or ``raised`` when effect raised, then re-raised)
+       before the lock is released.
+
+    A process that dies (or whose completion write fails) between steps 3 and
+    4 leaves the durable in-flight marker; its in-process lock dies with it.
+    The gate then FAILS CLOSED, loudly: every later ``run`` is refused with
+    ``dispatch_in_flight_unresolved`` (``inspect`` names the counter) until an
+    operator calls ``release_unresolved(counter)``, which records
+    ``released`` (effect outcome UNKNOWN). The released counter, and every
+    lower one, can never run again: "started" is monotonic. ``effect`` must
+    finish its side effect before returning; work it hands off and leaves
+    running is outside the fence. Any journal failure raises
+    RouteJournalError and nothing further is done. Its own store, separate
+    from the route journal. NOT wired into PilotASGI or any service.
     """
-    _SCHEMA = _counter_schema('supervisor_route_dispatch_accepted')
+    _SCHEMA = {**_counter_schema('supervisor_route_dispatch_accepted'),
+               **_counter_schema('supervisor_route_dispatch_started'),
+               'supervisor_route_dispatch_in_flight': _GATE_IN_FLIGHT,
+               'supervisor_route_dispatch_outcome': _GATE_OUTCOME,
+               'supervisor_route_dispatch_outcome_frozen': _GATE_OUTCOME_FROZEN,
+               'supervisor_route_dispatch_outcome_kept': _GATE_OUTCOME_KEPT}
     _VERSION = 1
 
     def __init__(self, *, config):
         if type(config) is not DispatchGateConfig or config.enabled is not True:
             raise SupervisorRouteDisabled('dispatch counter gate is disabled')
         _require(type(config.executor_id) is str and _HEX.fullmatch(config.executor_id)
-                 and type(config.journal_path) is str, SupervisorRouteError('invalid dispatch counter gate'))
-        self._executor = config.executor_id
+                 and type(config.launch_epoch) is RouteEpoch and type(config.journal_path) is str
+                 and type(config.effect_wait_ms) is int and 0 <= config.effect_wait_ms <= 50,
+                 SupervisorRouteError('invalid dispatch counter gate'))
+        self._executor, self._epoch = config.executor_id, config.launch_epoch.as_dict()
+        self._effect_wait = config.effect_wait_ms / 1000
+        self._effect_lock = threading.Lock()
         super().__init__(config.journal_path, create=config.create_journal,
                          allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
 
     def __repr__(self):
         return 'DispatchCounterGate(<enabled>)'
 
-    def accept(self, dispatch, *, body):
-        """Returns the accepted counter, durably recorded; raises otherwise."""
-        executor, counter, body_sha256 = parse_dispatch_header(dispatch)
-        if executor != self._executor:
-            raise DispatchRefused('dispatch_wrong_executor')
-        if type(body) is not bytes or hashlib.sha256(body).hexdigest() != body_sha256:
-            raise DispatchRefused('dispatch_body_mismatch')
-        with self._transaction() as db:
-            last = db.execute('SELECT counter FROM supervisor_route_dispatch_accepted WHERE executor_id=?',
-                              (executor,)).fetchone()
-            _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
-            if last is not None and not counter > last[0]:
-                raise DispatchRefused('dispatch_replay')
-            if last is None:
-                db.execute('INSERT INTO supervisor_route_dispatch_accepted VALUES (?,?)', (executor, counter))
-            else:
-                db.execute('UPDATE supervisor_route_dispatch_accepted SET counter=? WHERE executor_id=?',
-                           (counter, executor))
-        return counter
+    def run(self, dispatch, *, method, path, body, effect):
+        """Returns ``effect()``'s result after the fenced, recorded effect."""
+        _require(callable(effect), SupervisorRouteError('effect required'))
+        counter = self._bound(dispatch, method, path, body)
+        self._accept(counter)
+        return self._fenced(counter, effect)
 
-    def last_accepted(self):
-        """Read-only: the last accepted counter, or None."""
+    def _bound(self, dispatch, method, path, body):
+        claim = parse_dispatch_header(dispatch)
+        if claim['executor_id'] != self._executor:
+            raise DispatchRefused('dispatch_wrong_executor')
+        if claim['epoch'] != self._epoch:
+            raise DispatchRefused('dispatch_wrong_epoch')
+        try:
+            _require(type(method) is str and type(path) is str and type(body) is bytes
+                     and (claim['method'], claim['path']) == (method, path) == ('POST', SUBMIT_PATH)
+                     and claim['body_sha256'] == hashlib.sha256(body).hexdigest())
+            request = _pilot_request(body)
+            _require(request.command_id == claim['command_id']
+                     and request.fencing_generation == claim['queue_fence'])
+        except Exception:
+            raise DispatchRefused('dispatch_request_mismatch') from None
+        return claim['counter']
+
+    def _latest(self, db, table):
+        row = db.execute(f'SELECT counter FROM {table} WHERE executor_id=?', (self._executor,)).fetchone()
+        _require(row is None or _positive(row[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
+        return None if row is None else row[0]
+
+    def _advance(self, db, table, counter, previous):
+        if previous is None:
+            db.execute(f'INSERT INTO {table} VALUES (?,?)', (self._executor, counter))
+        else:
+            db.execute(f'UPDATE {table} SET counter=? WHERE executor_id=?', (counter, self._executor))
+
+    def _accept(self, counter):
+        with self._transaction() as db:
+            last = self._latest(db, 'supervisor_route_dispatch_accepted')
+            if last is not None and not counter > last:
+                raise DispatchRefused('dispatch_replay')
+            self._advance(db, 'supervisor_route_dispatch_accepted', counter, last)
+
+    def _fence(self, counter):
+        """Durable go/no-go for THIS counter's effect; called holding the lock."""
+        with self._transaction() as db:
+            if db.execute('SELECT 1 FROM supervisor_route_dispatch_in_flight').fetchone() is not None:
+                raise DispatchRefused('dispatch_in_flight_unresolved')
+            started = self._latest(db, 'supervisor_route_dispatch_started')
+            if (self._latest(db, 'supervisor_route_dispatch_accepted') != counter
+                    or (started is not None and not counter > started)):
+                raise DispatchRefused('dispatch_superseded')
+            self._advance(db, 'supervisor_route_dispatch_started', counter, started)
+            db.execute('INSERT INTO supervisor_route_dispatch_in_flight VALUES (?,?)', (self._executor, counter))
+
+    def _finish(self, counter, outcome):
+        with self._transaction() as db:
+            _require(db.execute('SELECT counter FROM supervisor_route_dispatch_in_flight WHERE executor_id=?',
+                                (self._executor,)).fetchone() == (counter,), RouteJournalError('in_flight'))
+            db.execute('DELETE FROM supervisor_route_dispatch_in_flight WHERE executor_id=?', (self._executor,))
+            db.execute('INSERT INTO supervisor_route_dispatch_outcome VALUES (?,?,?)',
+                       (self._executor, counter, outcome))
+
+    def _fenced(self, counter, effect):
+        acquired = (self._effect_lock.acquire(timeout=self._effect_wait) if self._effect_wait
+                    else self._effect_lock.acquire(blocking=False))
+        if not acquired:
+            raise DispatchRefused('dispatch_busy')  # Counter stays consumed; it never acts later.
+        try:
+            self._fence(counter)
+            # Durable in-flight from here: the outcome is recorded before release.
+            try:
+                result = effect()
+            except BaseException:
+                try:
+                    self._finish(counter, 'raised')
+                except BaseException:
+                    pass  # Marker stays: later runs are refused until released.
+                raise
+            self._finish(counter, 'completed')
+            return result
+        finally:
+            self._effect_lock.release()
+
+    def release_unresolved(self, counter):
+        """Explicit operator act after a dead/failed run: records ``released``
+        (effect outcome UNKNOWN) for exactly the in-flight ``counter``."""
+        _require(_positive(counter, MAX_DISPATCH_COUNTER), SupervisorRouteError('counter'))
+        if not self._effect_lock.acquire(blocking=False):
+            raise DispatchRefused('dispatch_busy')  # A live run owns it: not unresolved.
+        try:
+            self._finish(counter, 'released')
+        finally:
+            self._effect_lock.release()
+
+    def inspect(self):
+        """Read-only {'accepted', 'started', 'in_flight'} counters (or None)."""
         _require(os.getpid() == self._pid, RouteJournalError('process'))
         with self._mutex:
             try:
                 self._active()
                 with self._connection(readonly=True) as db:
                     self._schema(db)
-                    row = db.execute('SELECT counter FROM supervisor_route_dispatch_accepted '
-                                     'WHERE executor_id=?', (self._executor,)).fetchone()
+                    return {'accepted': self._latest(db, 'supervisor_route_dispatch_accepted'),
+                            'started': self._latest(db, 'supervisor_route_dispatch_started'),
+                            'in_flight': self._latest(db, 'supervisor_route_dispatch_in_flight')}
             except RouteJournalError:
                 raise
             except Exception:
                 raise RouteJournalError('dispatch gate unavailable') from None
-        return None if row is None else row[0]
 
 
 def _proc_start(pid):
@@ -1042,7 +1222,10 @@ class UnixSocketBackend:
             raise SupervisorRouteError('backend exchange unavailable') from None
 
     def _forward(self, method, path, body, timeout_ms, pin, dispatch):
-        parse_dispatch_header(dispatch)  # Before connect: nothing sent if refused.
+        claim = parse_dispatch_header(dispatch)  # Before connect: nothing sent if refused.
+        _require((claim['method'], claim['path'], claim['body_sha256'])
+                 == (method, path, hashlib.sha256(body).hexdigest()),
+                 DispatchRefused('dispatch_request_mismatch'))
         deadline = time.monotonic() + timeout_ms / 1000
 
         def remaining():
@@ -1273,7 +1456,7 @@ class SupervisorRoute:
     def _forward(self, command, request, binding, digest, epoch, pin, counter):
         extra = {}
         if getattr(self._backend, 'carries_dispatch', False) is True:
-            extra['dispatch'] = dispatch_header(pin.container_id, counter, command.body)
+            extra['dispatch'] = dispatch_header(dispatch_claim(binding, counter))
         try:
             reply = self._backend.forward(method=command.method, path=command.path, body=command.body,
                                           timeout_ms=self._timeout, pin=pin, **extra)
