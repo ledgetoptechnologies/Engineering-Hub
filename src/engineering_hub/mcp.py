@@ -5,7 +5,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from pydantic import ValidationError
-from pydantic import StrictInt
+from pydantic import StrictBool, StrictInt
 from agent_message_bus.knowledge import (KnowledgeConflict, KnowledgeError,
     KnowledgeIntegrityError, KnowledgeNotFound, KnowledgeRepository, KnowledgeProjectArchived)
 from .planning_api import PlanningWrite, Scope, Kind, Status
@@ -38,6 +38,10 @@ class HubMCPAuthMiddleware:
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+# Runs that still hold their task (repository's active-run set).
+OVERVIEW_ACTIVE_RUNS = frozenset({'pending', 'running', 'held', 'failed'})
 
 
 def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonomy_status=None,
@@ -148,11 +152,34 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
             raise ToolError('reachability_source_unavailable') from None
 
     @registration.tool()
-    async def hub_overview(ctx: Context) -> dict:
-        """Read shared tasks, decisions, runs and the emergency-pause state."""
+    async def hub_overview(ctx: Context, active_only: StrictBool = False, project: str | None = None) -> dict:
+        """Read shared tasks, decisions, runs and the emergency-pause state.
+
+        With no arguments, everything is returned. active_only keeps tasks that
+        aren't withdrawn, open decisions and runs that still hold their task
+        (pending, running, held or failed); project keeps one project's tasks,
+        decisions and runs. 'omitted' counts what a filter left out, so an agent
+        knows to ask again.
+
+        Presentation only, not access control: the caller can already read every
+        project, and paused, agents, autonomy and image_versions stay global.
+        """
         identity(ctx)
-        result = {"tasks": invoke(repo.list_task_views), "decisions": invoke(repo.list_decisions),
-                  "runs": invoke(repo.list_runs), "paused": invoke(repo.get_paused)}
+        if type(active_only) is not bool or (project is not None and (type(project) is not str or not project)):
+            raise ToolError('invalid_overview_filter')
+        tasks, decisions, runs = invoke(repo.list_task_views), invoke(repo.list_decisions), invoke(repo.list_runs)
+        result = {"tasks": tasks, "decisions": decisions, "runs": runs, "paused": invoke(repo.get_paused)}
+        if active_only or project is not None:
+            active = {"tasks": lambda item: item.get('status') != 'withdrawn',
+                      "decisions": lambda item: item.get('status') == 'open',
+                      "runs": lambda item: item.get('status') in OVERVIEW_ACTIVE_RUNS}
+            omitted = {}
+            for key, keep in active.items():
+                kept = [item for item in result[key]
+                        if (not active_only or keep(item)) and (project is None or item.get('project') == project)]
+                omitted[key] = len(result[key]) - len(kept)
+                result[key] = kept
+            result['omitted'] = omitted
         if autonomy_status is not None:
             result['autonomy'] = invoke(autonomy_status)
         if agent_status is not None:
