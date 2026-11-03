@@ -73,3 +73,18 @@ class BoundOAuthDraftStore:
         if token:
             with self.store._db() as db:
                 db.execute('DELETE FROM auth_bound_oauth_sessions WHERE token_hash=?', (_digest(token),))
+
+
+def require_enrolled_access(request, config, expected_subject):
+    """Read the ingress-only proof; user-supplied state/headers are not proof.
+
+    Draft helper, not wired into the OAuth router. A verified assertion at the
+    Cloudflare front door and independently enrolled subject are mandatory.
+    """
+    from .cloudflare_access import CloudflareAccessConfig, _verified_access
+    if type(config) is not CloudflareAccessConfig or type(expected_subject) is not str or not expected_subject:
+        raise ValueError('invalid access enrollment')
+    identity = _verified_access(request.scope, config)
+    if identity is None or not hmac.compare_digest(identity.subject.encode(), expected_subject.encode()):
+        raise PermissionError('enrolled Access identity required')
+    return identity
