@@ -1,4 +1,5 @@
 """Supervisor half of the one-use dispatch claim proof (docs/supervisor-dispatch-claim-proof.md)."""
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
@@ -155,6 +156,7 @@ def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consum
         "command_id": dict(command_id=str(uuid4())),
         "reservation_receipt_sha256": dict(reservation_receipt_sha256="0" * 64),
         "supervisor_boot_id": dict(supervisor_boot_id=str(uuid4())),
+        "run_id": dict(run_id=str(uuid4())),  # Must equal the run_id inside the exact request body.
     }
     for field, change in binding_cases.items():
         result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce, **change))
@@ -187,8 +189,8 @@ def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consum
     assert route.inspect_challenge(nonce)[0] == "outstanding"  # Nothing consumed by any failure.
     assert route.inspect_reservation(cmd.command_id)[0] == "reserved"
     assert route.inspect(cmd.command_id) is None
-    # Hub-side fields the supervisor cannot check are still bound by the signature.
-    accepted = hub_proof(proof, receipt, cmd, nonce, job_id="job-7", run_id="run-9", worker="w-3", lease_epoch=42)
+    # job_id, worker and lease_epoch exist in no supervisor state or body: bound only by the Hub signature.
+    accepted = hub_proof(proof, receipt, cmd, nonce, job_id="job-7", worker="w-3", lease_epoch=42)
     assert route.dispatch(receipt, cmd, accepted).state == "completed" and sends(proof) == 1
     assert route.inspect_challenge(nonce)[0] == "consumed"
     route.close()
@@ -232,16 +234,18 @@ def test_window_exceeded_is_held_then_expires_with_a_verifiable_statement(proof)
     payload = proof["statement_verifier"].verify(statement, nonce=nonce)
     assert payload == {"protocol": EXPIRED_PROTOCOL, "audience": EXPIRED_AUDIENCE, "key_id": "test-statement-key",
                        "nonce": nonce, "command_id": cmd.command_id, "counter": 1, "status": "expired_unconsumed",
-                       "boot_id": proof["clock"].boot_id}
+                       "reservation_status": "retired", "boot_id": proof["clock"].boot_id}
     for bad in (statement + b" ", forge(payload, signer=proof["statements"], domain=HUB_PROOF_DOMAIN)):
         with pytest.raises(SupervisorRouteError):
             proof["statement_verifier"].verify(bad, nonce=nonce)
     with pytest.raises(SupervisorRouteError):
         proof["statement_verifier"].verify(statement, nonce=unknown_nonce())
     assert route.expired_statement(nonce) == statement  # Repeatable, identical bytes (Ed25519).
-    assert route.dispatch(receipt, cmd, signed).error == "challenge_expired"  # Expired is final.
-    fresh = route.issue_dispatch_challenge(cmd.command_id).nonce  # The reservation itself is still usable.
-    assert route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, fresh)).state == "completed"
+    assert route.dispatch(receipt, cmd, signed).error == "reservation_abandoned"  # Retired: final.
+    assert route.inspect_reservation(cmd.command_id)[0] == "abandoned"
+    with pytest.raises(SupervisorRouteRejected):  # No new challenge for a retired reservation.
+        route.issue_dispatch_challenge(cmd.command_id)
+    assert sends(proof) == 0
     route.close()
 
 
@@ -310,9 +314,10 @@ def test_consumed_and_expired_are_mutually_exclusive(proof):
     assert raised.value.reason == "challenge_used" and proof["statements"].calls == 0
     dead_cmd, dead_receipt = reserved(proof, route)
     dead = route.issue_dispatch_challenge(dead_cmd.command_id).nonce
-    route.expired_statement(dead)  # Revoked while still inside the window.
+    route.expired_statement(dead)  # Revoked (reservation retired) while still inside the window.
     late = route.dispatch(dead_receipt, dead_cmd, hub_proof(proof, dead_receipt, dead_cmd, dead))
-    assert late.error == "challenge_expired" and sends(proof) == 1
+    assert late.error == "reservation_abandoned" and sends(proof) == 1
+    assert route.inspect_challenge(dead)[0] == "expired"
     t = "supervisor_route_challenge"
     db = _raw(proof["path"])
     try:
@@ -381,9 +386,133 @@ def test_dispatch_and_expiry_race_resolve_exactly_one_way(proof, monkeypatch, fi
         assert outcome == {"refused": "challenge_used"} and proof["statements"].calls == 0
         assert route.inspect_challenge(nonce)[0] == "consumed" and sends(proof) == 1
     else:
-        assert (outcome["value"].state, outcome["value"].error) == ("held", "challenge_expired")
+        assert (outcome["value"].state, outcome["value"].error) == ("held", "reservation_abandoned")
         assert route.inspect_challenge(nonce)[0] == "expired" and sends(proof) == 0
-        assert route.inspect_reservation(cmd.command_id)[0] == "reserved"
+        assert route.inspect_reservation(cmd.command_id)[0] == "abandoned"
+    route.close()
+
+
+@LINUX
+@pytest.mark.parametrize("first", ["statement", "dispatch"])
+def test_statement_for_one_nonce_retires_the_reservation_against_its_other_nonce(proof, monkeypatch, first):
+    route = route_for(proof)
+    cmd, receipt = reserved(proof, route)
+    stated = route.issue_dispatch_challenge(cmd.command_id).nonce
+    other = route.issue_dispatch_challenge(cmd.command_id).nonce  # A second live challenge, same reservation.
+    signed_other = hub_proof(proof, receipt, cmd, other)
+    journal = route._journal
+    paused, resume, outcome = threading.Event(), threading.Event(), {}
+    target = "dispatch_reserved" if first == "statement" else "revoke_unconsumed"
+    original = getattr(journal, target)
+
+    def paused_then_original(*args, **kwargs):
+        paused.set()
+        assert resume.wait(10)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(journal, target, paused_then_original)
+
+    def loser():
+        try:
+            outcome["value"] = (route.dispatch(receipt, cmd, signed_other) if first == "statement"
+                                else route.expired_statement(stated))
+        except SupervisorRouteRejected as error:
+            outcome["refused"] = error.reason
+    worker = threading.Thread(target=loser)
+    worker.start()
+    try:
+        assert paused.wait(10)
+        if first == "statement":
+            payload = proof["statement_verifier"].verify(route.expired_statement(stated), nonce=stated)
+            assert payload["reservation_status"] == "retired"
+        else:
+            assert route.dispatch(receipt, cmd, signed_other).state == "completed"
+    finally:
+        resume.set()
+        worker.join(10)
+    if first == "statement":
+        assert (outcome["value"].state, outcome["value"].error) == ("held", "reservation_abandoned")
+        assert [route.inspect_challenge(n)[0] for n in (stated, other)] == ["expired", "expired"]
+        assert route.inspect_reservation(cmd.command_id)[0] == "abandoned" and sends(proof) == 0
+    else:
+        assert outcome == {"refused": "challenge_used"} and proof["statements"].calls == 0
+        assert route.inspect_challenge(other)[0] == "consumed" and sends(proof) == 1
+    route.close()
+
+
+@LINUX
+def test_proof_mode_refuses_every_proofless_send_path_and_is_permanent(proof):
+    route = route_for(proof)
+    direct = command(proof["epoch"])
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        route.submit(direct)
+    assert raised.value.reason == "proof_required"
+    request = route_module._submitted_request(direct)
+    with pytest.raises(SupervisorRouteRejected) as raised:  # Even bypassing submit()'s own check.
+        route._admitted(direct, request)
+    assert raised.value.reason == "proof_required"
+    with pytest.raises(SupervisorRouteRejected) as raised:  # And at the journal itself.
+        binding = route_module.binding_for(direct, proof["pin"])
+        route._journal.admit(direct.command_id, route_module.binding_digest(binding), binding, proof["epoch"],
+                             "0" * 32)
+    assert raised.value.reason == "proof_required"
+    cmd, receipt = reserved(proof, route)
+    assert route.dispatch(receipt, cmd, b"").error == "proof_invalid"  # dispatch needs a real proof.
+    assert sends(proof) == 0 and route.inspect(direct.command_id) is None
+    route.close()
+    with pytest.raises(SupervisorRouteError):  # A later construction without a verifier is refused.
+        route_for(proof, create=False, dispatch_proof_verifier=None)
+    db = _raw(proof["path"])
+    try:
+        for sql in ("UPDATE supervisor_route_mode SET proof_required=1", "DELETE FROM supervisor_route_mode",
+                    "INSERT OR REPLACE INTO supervisor_route_mode VALUES (1, 1)"):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute(sql)
+    finally:
+        db.close()
+    reopened = route_for(proof, create=False)  # With a verifier it reopens, still in proof mode.
+    with pytest.raises(SupervisorRouteRejected):
+        reopened.submit(command(proof["epoch"]))
+    assert sends(proof) == 0
+    reopened.close()
+
+
+class _RewritingDb:
+    """Wraps one journal connection; rewrites only the challenge-consume UPDATE."""
+
+    def __init__(self, db, mode):
+        self._db, self._mode = db, mode
+
+    def execute(self, sql, params=()):
+        if sql.startswith("UPDATE supervisor_route_challenge SET state='consumed'"):
+            if self._mode == "no_row":
+                sql += " AND 0"  # Affects zero rows.
+            else:
+                params = ("f" * 64, params[1])  # Consumes with a different proof hash.
+        return self._db.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
+@LINUX
+@pytest.mark.parametrize("mode", ["no_row", "wrong_hash"])
+def test_consume_is_read_back_before_any_byte_is_sent(proof, monkeypatch, mode):
+    route = route_for(proof)
+    cmd, receipt = reserved(proof, route)
+    nonce = route.issue_dispatch_challenge(cmd.command_id).nonce
+    original = route._journal._connection
+
+    @contextmanager
+    def rewriting(*, readonly=False):
+        with original(readonly=readonly) as db:
+            yield _RewritingDb(db, mode)
+    monkeypatch.setattr(route._journal, "_connection", rewriting)
+    result = route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce))
+    monkeypatch.undo()
+    assert (result.state, result.error) == ("held", "challenge_consume_failed") and sends(proof) == 0
+    assert route.inspect_challenge(nonce)[0] == "outstanding"  # Rolled back: nothing consumed or marked.
+    assert route.inspect_reservation(cmd.command_id)[0] == "reserved" and route.inspect(cmd.command_id) is None
+    assert route.dispatch(receipt, cmd, hub_proof(proof, receipt, cmd, nonce)).state == "completed"
     route.close()
 
 

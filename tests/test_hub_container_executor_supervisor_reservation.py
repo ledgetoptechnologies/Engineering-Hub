@@ -84,7 +84,8 @@ def proof_payload(two, receipt, cmd, nonce, **changes):
     except Exception:
         counter, executor = 1, two["pin"].container_id
     return {"protocol": HUB_PROOF_PROTOCOL, "audience": HUB_PROOF_AUDIENCE, "hub_key_id": two["hub"].key_id,
-            "job_id": "job-1", "run_id": "run-1", "worker": "worker-1", "fence": cmd.queue_fence,
+            "job_id": "job-1", "run_id": json.loads(cmd.body)["run_id"], "worker": "worker-1",
+            "fence": cmd.queue_fence,
             "lease_epoch": 1, "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
             "command_id": cmd.command_id, "counter": counter, "executor": executor, "challenge_nonce": nonce,
             "supervisor_boot_id": two["clock"].boot_id, **changes}
@@ -184,18 +185,22 @@ def test_reserve_sends_zero_bytes_signs_binding_and_is_idempotent_across_restart
 
 @LINUX
 def test_conflicting_binding_and_mixed_paths_refused(two):
-    route = make(two)
+    # Before proof mode (no verifier) one-step submit still exists; the two
+    # paths still cannot be mixed for one command_id.
+    legacy = make(two, dispatch_proof_verifier=None)
     cmd = command(two["epoch"])
-    route.reserve(cmd)
+    legacy.reserve(cmd)
     for variant in (dict(fence=cmd.queue_fence + 1), dict(run_id=str(uuid4()))):
         with pytest.raises(SupervisorRouteRejected) as raised:
-            route.reserve(command(two["epoch"], command_id=cmd.command_id, **variant))
+            legacy.reserve(command(two["epoch"], command_id=cmd.command_id, **variant))
         assert raised.value.reason == "binding_conflict"
     with pytest.raises(SupervisorRouteRejected) as raised:
-        route.submit(cmd)  # One-step send of a reserved command.
+        legacy.submit(cmd)  # One-step send of a reserved command.
     assert raised.value.reason == "reserved_command"
     sent = command(two["epoch"])
-    assert route.submit(sent).state == "completed"
+    assert legacy.submit(sent).state == "completed"
+    legacy.close()
+    route = make(two, create=False)  # Proof mode switched ON (permanently) for this journal.
     with pytest.raises(SupervisorRouteRejected) as raised:
         route.reserve(sent)
     assert raised.value.reason == "already_admitted"
@@ -307,12 +312,14 @@ def test_older_reservation_superseded_after_newer_dispatch_with_zero_bytes(two):
 
 @LINUX
 def test_direct_submit_after_reserve_supersedes_the_earlier_reservation(two):
-    route = make(two)
+    legacy = make(two, dispatch_proof_verifier=None)  # Before proof mode: submit still exists.
     reserved = command(two["epoch"])
-    reserved_r = route.reserve(reserved)
+    reserved_r = legacy.reserve(reserved)
     direct = command(two["epoch"])
-    assert route.submit(direct).state == "completed"  # Allocates and sends counter 2.
+    assert legacy.submit(direct).state == "completed"  # Allocates and sends counter 2.
     assert parse_dispatch_header(two["sender"].dispatches[-1])["counter"] == 2
+    legacy.close()
+    route = make(two, create=False)  # Proof mode on: dispatch is now the only path.
     result = send(two, route, reserved_r.receipt, reserved)
     assert (result.state, result.error) == ("held", "reservation_superseded")
     assert len(two["sender"].calls) == 1 and route.inspect_reservation(reserved.command_id)[0] == "reserved"
@@ -397,7 +404,8 @@ def test_concurrent_dispatches_send_exactly_once(two):
                 route._journal.dispatch_reserved(other.command_id, binding_digest(binding), binding,
                                                  other_receipt, 2, two["epoch"], secrets.token_hex(16),
                                                  proof=claim, proof_sha256=hashlib.sha256(other_proof).hexdigest(),
-                                                 clock=two["clock"], window_ns=WINDOW_NS)
+                                                 clock=two["clock"], window_ns=WINDOW_NS,
+                                                 run_id=json.loads(other.body)["run_id"])
                 outcomes.append("consumed")
                 return
             except SupervisorRouteRejected as error:

@@ -87,9 +87,17 @@ supervisor requires the proof to bind exactly the receipt, reservation,
 command fence and current boot, and the nonce to be outstanding, from this
 boot and no older than ``proof_window_ms`` on its own clock, then consumes
 it. Any failure is ``held`` with zero bytes and nothing consumed.
-``expired_statement(nonce)`` revokes an unconsumed nonce whose reservation is
-not dispatched in ONE transaction and signs ``expired_unconsumed`` only after
-that commit; ``expire_challenges()`` retires dead ones in bulk. Triggers make
+``expired_statement(nonce)`` is reservation-wide: in ONE transaction it
+requires that no challenge for that reservation is consumed and that it is
+not dispatched, expires ALL its outstanding challenges and retires the
+reservation (abandoned, counter consumed), and signs ``expired_unconsumed`` /
+``reservation_status: retired`` only after that commit;
+``expire_challenges()`` retires dead nonces in bulk. Signed proof fields
+that also appear in the request body (command_id, run_id, fence) must equal
+it; job_id, worker and lease_epoch are bound only by the Hub's signature.
+Proof mode is durable: a route constructed with a proof verifier records it
+in the journal, after which ``submit`` (and the journal's one-step admit)
+refuse ``proof_required`` and a construction without a verifier is refused. Triggers make
 a nonce outstanding -> consumed | expired exactly once, never deleted.
 Defaults refuse: no ``HubDispatchProofVerifier`` -> no challenge, no
 dispatch; no ``ChallengeStatementSigner`` -> no statement.
@@ -351,6 +359,22 @@ _CHALLENGE_TRIGGERS = {
     'supervisor_route_challenge_kept': (
         'CREATE TRIGGER supervisor_route_challenge_kept BEFORE DELETE ON supervisor_route_challenge '
         "BEGIN SELECT RAISE(ABORT, 'challenge is permanent'); END"),
+}
+# Proof mode, once recorded, is permanent for the journal: the single row can
+# never be updated or deleted, so submit() can never be re-enabled.
+_MODE = ('CREATE TABLE supervisor_route_mode (id INTEGER PRIMARY KEY CHECK(id=1), '
+         "proof_required INTEGER NOT NULL CHECK(typeof(proof_required)='integer' AND proof_required=1))")
+_MODE_TRIGGERS = {
+    'supervisor_route_mode_once': (  # Also defeats INSERT OR REPLACE.
+        'CREATE TRIGGER supervisor_route_mode_once BEFORE INSERT ON supervisor_route_mode '
+        'WHEN EXISTS (SELECT 1 FROM supervisor_route_mode) '
+        "BEGIN SELECT RAISE(ABORT, 'proof mode is permanent'); END"),
+    'supervisor_route_mode_frozen': (
+        'CREATE TRIGGER supervisor_route_mode_frozen BEFORE UPDATE ON supervisor_route_mode '
+        "BEGIN SELECT RAISE(ABORT, 'proof mode is permanent'); END"),
+    'supervisor_route_mode_kept': (
+        'CREATE TRIGGER supervisor_route_mode_kept BEFORE DELETE ON supervisor_route_mode '
+        "BEGIN SELECT RAISE(ABORT, 'proof mode is permanent'); END"),
 }
 _OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
 MAX_DISPATCH_COUNTER = 2**63 - 1
@@ -824,7 +848,7 @@ _PROOF_KEYS = frozenset({'protocol', 'audience', 'hub_key_id', 'job_id', 'run_id
                          'lease_epoch', 'reservation_receipt_sha256', 'command_id', 'counter', 'executor',
                          'challenge_nonce', 'supervisor_boot_id'})
 _EXPIRED_KEYS = frozenset({'protocol', 'audience', 'key_id', 'nonce', 'command_id', 'counter', 'status',
-                           'boot_id'})
+                           'reservation_status', 'boot_id'})
 
 
 def _valid_nonce(value):
@@ -916,8 +940,10 @@ class ChallengeStatementSigner:
 class ExpiredStatementVerifier:
     """Hub-side verifier of a supervisor expired_unconsumed statement,
     DEFAULT REFUSING without a pinned key. ``verify(raw, nonce=)`` returns the
-    payload {protocol, audience, key_id, nonce, command_id, counter, status,
-    boot_id} or raises. Not wired into any Hub client."""
+    payload {protocol, audience, key_id, nonce, command_id, counter, status:
+    'expired_unconsumed', reservation_status: 'retired', boot_id} or raises.
+    It states that NO challenge for the reservation was or can be consumed
+    and the reservation was retired unsent. Not wired into any Hub client."""
 
     def __init__(self, *, public_key=None, key_id=None):
         self.configured = _pinned(public_key, key_id)
@@ -932,7 +958,8 @@ class ExpiredStatementVerifier:
             _require(payload['protocol'] == EXPIRED_PROTOCOL and payload['audience'] == EXPIRED_AUDIENCE
                      and payload['key_id'] == self._key_id and payload['nonce'] == nonce and _valid_nonce(nonce)
                      and _uuid(payload['command_id']) and _positive(payload['counter'], MAX_DISPATCH_COUNTER)
-                     and payload['status'] == 'expired_unconsumed' and _uuid(payload['boot_id']), error)
+                     and payload['status'] == 'expired_unconsumed' and payload['reservation_status'] == 'retired'
+                     and _uuid(payload['boot_id']), error)
             return payload
         except SupervisorRouteError:
             raise
@@ -1250,8 +1277,8 @@ class RouteJournal(_DurableStore):
     (see ``admit``); two-phase reservations draw from the same counter (see
     ``reserve`` / ``dispatch_reserved``). A journal created with an earlier
     schema (no attempt or dispatch_counter column, no dispatch, dispatched,
-    reservation or challenge table/triggers, user_version below 5) fails the
-    exact schema
+    reservation, challenge or mode table/triggers, user_version below 6) fails
+    the exact schema
     check and is refused today (fail closed); adopting one would require an
     offline migration/reconciliation step, which is NOT implemented.
 
@@ -1265,8 +1292,9 @@ class RouteJournal(_DurableStore):
                **_counter_schema('supervisor_route_dispatch'),
                **_counter_schema('supervisor_route_dispatched'),
                'supervisor_route_reservation': _RESERVATION, **_RESERVATION_TRIGGERS,
-               'supervisor_route_challenge': _CHALLENGE, **_CHALLENGE_TRIGGERS}
-    _VERSION = 5
+               'supervisor_route_challenge': _CHALLENGE, **_CHALLENGE_TRIGGERS,
+               'supervisor_route_mode': _MODE, **_MODE_TRIGGERS}
+    _VERSION = 6
 
     @staticmethod
     def _row(db, command_id):
@@ -1298,6 +1326,8 @@ class RouteJournal(_DurableStore):
                 if row[1] != digest or row[2] != _canonical(binding).decode():
                     raise SupervisorRouteRejected('binding_conflict')
                 return 'replay', row
+            if self._proof_mode(db):
+                raise SupervisorRouteRejected('proof_required')  # Durable: no proof-less send, ever.
             if self._reservation(db, command_id) is not None:
                 raise SupervisorRouteRejected('reserved_command')  # Only dispatch() may send it.
             self._advance_epoch(db, epoch)
@@ -1321,6 +1351,22 @@ class RouteJournal(_DurableStore):
             db.execute('INSERT INTO supervisor_route_dispatched VALUES (?,?)', (executor, counter))
         else:
             db.execute('UPDATE supervisor_route_dispatched SET counter=? WHERE executor_id=?', (counter, executor))
+
+    @staticmethod
+    def _proof_mode(db):
+        return db.execute('SELECT proof_required FROM supervisor_route_mode WHERE id=1').fetchone() == (1,)
+
+    def enter_mode(self, *, proof_required):
+        """ONE transaction at route construction: with ``proof_required`` the
+        permanent proof-mode row is recorded (idempotent); without it, a
+        journal already in proof mode is refused. Returns the durable mode."""
+        with self._transaction() as db:
+            recorded = self._proof_mode(db)
+            if recorded and not proof_required:
+                raise RouteJournalError('proof mode journal requires a dispatch proof verifier')
+            if proof_required and not recorded:
+                db.execute('INSERT INTO supervisor_route_mode VALUES (1, 1)')
+            return recorded or proof_required
 
     @staticmethod
     def _advance_epoch(db, epoch):
@@ -1392,7 +1438,7 @@ class RouteJournal(_DurableStore):
             return 'new', receipt
 
     def dispatch_reserved(self, command_id, digest, binding, receipt, counter, epoch, attempt, *, proof,
-                          proof_sha256, clock, window_ns):
+                          proof_sha256, clock, window_ns, run_id):
         """ONE transaction, consume-once: the 'reserved' row must exist with
         exactly this binding, these receipt bytes and this counter, and the
         epoch high-water must still be the receipt's epoch. Marks it
@@ -1411,7 +1457,7 @@ class RouteJournal(_DurableStore):
         reservation_missing / reservation_mismatch / already_dispatched /
         reservation_abandoned / epoch_changed / reservation_superseded /
         proof_mismatch / challenge_unknown / challenge_used /
-        challenge_expired."""
+        challenge_expired / challenge_consume_failed."""
         _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
         with self._transaction() as db:
             row = self._reservation(db, command_id)
@@ -1430,7 +1476,7 @@ class RouteJournal(_DurableStore):
             if self._row(db, command_id) is not None:
                 raise SupervisorRouteRejected('already_dispatched')
             self._mark_dispatched(db, row[1], counter)
-            self._consume_challenge(db, row, receipt, binding, proof, proof_sha256, clock, window_ns)
+            self._consume_challenge(db, row, receipt, binding, proof, proof_sha256, clock, window_ns, run_id)
             db.execute("UPDATE supervisor_route_reservation SET state='dispatched' "
                        "WHERE command_id=? AND state='reserved'", (command_id,))
             db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
@@ -1442,11 +1488,16 @@ class RouteJournal(_DurableStore):
         _require(_uuid(boot_id) and type(now) is int and now >= 0, RouteJournalError('clock'))
         return boot_id, now
 
-    def _consume_challenge(self, db, row, receipt, binding, proof, proof_sha256, clock, window_ns):
+    def _consume_challenge(self, db, row, receipt, binding, proof, proof_sha256, clock, window_ns, run_id):
+        # Signed fields also present in the exact request body (command_id,
+        # run_id, fencing_generation == queue_fence) must equal it. job_id,
+        # worker and lease_epoch are NOT in the body or any supervisor state:
+        # they are covered only by the Hub's signature and its barrier.
         boot_id, now = self._clock(clock)
         if (proof['reservation_receipt_sha256'] != hashlib.sha256(receipt).hexdigest()
                 or proof['command_id'] != row[0] or proof['counter'] != row[4] or proof['executor'] != row[1]
-                or proof['fence'] != binding['queue_fence'] or proof['supervisor_boot_id'] != boot_id):
+                or proof['fence'] != binding['queue_fence'] or proof['run_id'] != run_id
+                or proof['supervisor_boot_id'] != boot_id):
             raise SupervisorRouteRejected('proof_mismatch')
         challenge = db.execute('SELECT command_id,executor_id,counter,issued_boottime_ns,boot_id,state '
                                'FROM supervisor_route_challenge WHERE nonce=?',
@@ -1457,8 +1508,14 @@ class RouteJournal(_DurableStore):
             raise SupervisorRouteRejected('challenge_used')
         if challenge[5] != 'outstanding' or challenge[4] != boot_id or not 0 <= now - challenge[3] <= window_ns:
             raise SupervisorRouteRejected('challenge_expired')
-        db.execute("UPDATE supervisor_route_challenge SET state='consumed', proof_sha256=? "
-                   "WHERE nonce=? AND state='outstanding'", (proof_sha256, proof['challenge_nonce']))
+        consumed = db.execute("UPDATE supervisor_route_challenge SET state='consumed', proof_sha256=? "
+                              "WHERE nonce=? AND state='outstanding'", (proof_sha256, proof['challenge_nonce']))
+        # Read back before anything may be sent: exactly this nonce, consumed
+        # with exactly this proof hash; anything else rolls the dispatch back.
+        if consumed.rowcount != 1 or db.execute(
+                'SELECT state, proof_sha256 FROM supervisor_route_challenge WHERE nonce=?',
+                (proof['challenge_nonce'],)).fetchall() != [('consumed', proof_sha256)]:
+            raise SupervisorRouteRejected('challenge_consume_failed')
 
     def issue_challenge(self, command_id, nonce, clock, window_ns, cap):
         """ONE transaction: the reservation must be 'reserved' and not
@@ -1495,9 +1552,12 @@ class RouteJournal(_DurableStore):
                               (boot_id, now, window_ns)).rowcount
 
     def revoke_unconsumed(self, nonce):
-        """ONE transaction: the nonce must exist and not be consumed, and its
-        reservation must not be dispatched; an outstanding nonce is marked
-        expired (revoked) here. Returns (command_id, counter, boot_id).
+        """ONE transaction, RESERVATION-WIDE: the nonce must exist; NO challenge
+        for its reservation may be consumed and the reservation must not be
+        dispatched. Then EVERY outstanding challenge for that reservation is
+        marked expired and the reservation is retired (reserved -> abandoned;
+        its counter stays consumed), so no other nonce can still dispatch it.
+        Idempotent once retired. Returns (command_id, counter, boot_id).
         Raises Rejected: challenge_unknown / challenge_used /
         reservation_dispatched."""
         with self._transaction() as db:
@@ -1505,14 +1565,16 @@ class RouteJournal(_DurableStore):
                                    'WHERE nonce=?', (nonce,)).fetchone()
             if challenge is None:
                 raise SupervisorRouteRejected('challenge_unknown')
-            if challenge[3] == 'consumed':
+            if db.execute("SELECT 1 FROM supervisor_route_challenge WHERE command_id=? AND state='consumed'",
+                          (challenge[0],)).fetchone() is not None:
                 raise SupervisorRouteRejected('challenge_used')
             reservation = self._reservation(db, challenge[0])
             if reservation is None or reservation[5] == 'dispatched':
                 raise SupervisorRouteRejected('reservation_dispatched')
-            if challenge[3] == 'outstanding':
-                db.execute("UPDATE supervisor_route_challenge SET state='expired' "
-                           "WHERE nonce=? AND state='outstanding'", (nonce,))
+            db.execute("UPDATE supervisor_route_challenge SET state='expired' "
+                       "WHERE command_id=? AND state='outstanding'", (challenge[0],))
+            db.execute("UPDATE supervisor_route_reservation SET state='abandoned' "
+                       "WHERE command_id=? AND state='reserved'", (challenge[0],))
             return challenge[0], challenge[1], challenge[2]
 
     def read_challenge(self, nonce):
@@ -2086,6 +2148,13 @@ class SupervisorRoute:
         self._inflight = set()
         self._journal = RouteJournal(config.journal_path, create=config.create_journal,
                                      allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
+        try:
+            # Proof mode is recorded durably and can never be switched off for
+            # this journal: a later construction without a verifier refuses.
+            self._proof_mode = self._journal.enter_mode(proof_required=self._proof_verifier.configured)
+        except BaseException:
+            self._journal.close()
+            raise
 
     def __repr__(self):
         return 'SupervisorRoute(<enabled>)'
@@ -2112,6 +2181,10 @@ class SupervisorRoute:
         _require(type(command) is RouteCommand)
         # Contract check on the exact bytes BEFORE any journal access.
         request = _submitted_request(command)
+        if self._proof_mode:
+            # Proof mode: the only send path is dispatch(receipt, command, proof).
+            # admit() re-checks the durable mode inside its transaction.
+            raise SupervisorRouteRejected('proof_required')
         acquired = (self._mutex.acquire(timeout=self._busy_wait) if self._busy_wait
                     else self._mutex.acquire(blocking=False))
         if not acquired:
@@ -2392,7 +2465,7 @@ class SupervisorRoute:
             self._journal.dispatch_reserved(command.command_id, digest, binding, receipt, payload['counter'],
                                             epoch, attempt, proof=claim,
                                             proof_sha256=hashlib.sha256(proof).hexdigest(), clock=self._clock,
-                                            window_ns=self._window_ns)
+                                            window_ns=self._window_ns, run_id=request.run_id)
         except SupervisorRouteRejected as rejected:
             return RouteResult('held', command.command_id, digest, False, rejected.reason)
         except BaseException as error:
@@ -2435,11 +2508,13 @@ class SupervisorRoute:
 
     def expired_statement(self, nonce):
         """Signed {protocol, audience, key_id, nonce, command_id, counter,
-        status: 'expired_unconsumed', boot_id} for ``nonce``.
+        status: 'expired_unconsumed', reservation_status: 'retired', boot_id}.
 
-        ONE journal transaction first checks the nonce is not consumed and its
-        reservation not dispatched and marks it expired (revoking it if still
-        outstanding: a racing dispatch is then held). Only after that commit
+        RESERVATION-WIDE: ONE journal transaction checks that no challenge for
+        the nonce's reservation is consumed and the reservation is not
+        dispatched, marks EVERY outstanding challenge for it expired and
+        retires the reservation (abandoned; counter stays consumed), so any
+        racing dispatch with any of its nonces is held. Only after that commit
         is durable is anything signed; if the transaction fails or its outcome
         is uncertain nothing is signed (repeat later: an expired nonce stays
         expired). Refuses without a configured statement signer."""
@@ -2450,7 +2525,7 @@ class SupervisorRoute:
         command_id, counter, boot_id = self._journal.revoke_unconsumed(nonce)
         payload = {'protocol': EXPIRED_PROTOCOL, 'audience': EXPIRED_AUDIENCE, 'key_id': signer.key_id,
                    'nonce': nonce, 'command_id': command_id, 'counter': counter, 'status': 'expired_unconsumed',
-                   'boot_id': boot_id}
+                   'reservation_status': 'retired', 'boot_id': boot_id}
         message = EXPIRED_DOMAIN + _canonical(payload)
         signature = signer.sign(message)
         _require(type(signature) is bytes and len(signature) == 64, SupervisorRouteError('statement signing'))
