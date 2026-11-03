@@ -49,6 +49,12 @@ generated or discovered here.
 
 Explicit limits (this foundation grants no authority by itself):
 
+* Consumers must treat ``held`` after a journal failure as UNKNOWN, even if a
+  later ``inspect`` finds no row for the command_id: a commit may have landed
+  in a journal that is now unreadable or restored. Absence of a row is never
+  permission to resubmit under a new command_id; resolve through the original
+  command_id and operator reconciliation.
+
 * The total deadline bounds only the socket exchange with the backend
   (connect, peer check, send, header and body receive). It does NOT bound the
   whole submit: acquiring the route mutex, the caller-supplied epoch source and
