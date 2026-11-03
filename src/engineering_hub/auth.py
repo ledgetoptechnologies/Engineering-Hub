@@ -424,6 +424,11 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
     async def callback(request: Request):
         if config.human_auth_mode not in {"github", "github_cloudflare"}:
             raise HTTPException(404, "Not found")
+        if config.human_auth_mode == 'github_cloudflare':
+            # OAuth parameters are singleton fields. Reject ambiguity before
+            # consuming a state or exchanging an authorization code.
+            if any(len(request.query_params.getlist(name)) > 1 for name in ('state', 'code', 'error')):
+                raise HTTPException(400, "Sign-in verification failed")
         state = request.query_params.get("state", "")
         browser_state = request.cookies.get(state_cookie, "")
         if not state or not browser_state or not secrets.compare_digest(state.encode(), browser_state.encode()):

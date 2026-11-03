@@ -102,6 +102,10 @@ async def test_bound_oauth_router_signed_access_identity(monkeypatch, tmp_path):
         assert login.status_code == 302
         state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
         path = '/api/hub/v1/auth/callback'
+        for params in ([('state',state),('state',state),('code','code')],
+                       [('state',state),('code','code'),('code','other')],
+                       [('state',state),('code','code'),('error','a'),('error','b')]):
+            assert (await c.get(path, params=params, headers={'CF-Access-Jwt-Assertion':right})).status_code == 400
         assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':other})).status_code == 401
         assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 303
         assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':right})).json()['authenticated'] is True
