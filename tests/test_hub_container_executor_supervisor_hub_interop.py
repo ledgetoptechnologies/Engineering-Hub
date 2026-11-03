@@ -56,5 +56,5 @@ def test_hub_verifiers_accept_bytes_fetched_over_the_transport(env):
     cmd = command(env["proof"]["epoch"])
     reserved = hub.reserve(cmd)
     issued = hub.challenge(cmd.command_id)
-    assert not reserved.held and not issued.held
+    assert reserved.unverified is not None and issued.unverified is not None
     check(env["proof"], cmd, reserved.raw, issued.raw)

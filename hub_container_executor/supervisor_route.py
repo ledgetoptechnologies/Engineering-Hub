@@ -4461,10 +4461,12 @@ class TransportReply:
     """One exchange. ``raw`` = the exact 200 body or None; ``hint`` = the
     parsed UNSIGNED dispatch hint (dispatch only).
 
-    ``held`` is True unless this is a signed-route 200 whose bytes the Hub
-    must now verify with its own pinned verifier. A dispatch reply is ALWAYS
-    held: its hint never moves Hub state; only a verified inspection answer
-    recorded in the Hub's own transaction settles the attempt."""
+    ``held`` is ALWAYS True: no transport reply moves Hub state by itself, not
+    even a 200. ``unverified`` is the candidate signed body of a signed-route
+    200 (else None); the attempt stays held until the Hub's own pinned verifier
+    accepts those exact bytes inside its own transaction. A dispatch reply has
+    no candidate: its hint never moves Hub state; only a verified inspection
+    answer recorded in the Hub's own transaction settles the attempt."""
     raw: bytes | None = field(default=None, repr=False)
     status: int | None = None
     error: str | None = None
@@ -4472,7 +4474,11 @@ class TransportReply:
 
     @property
     def held(self):
-        return self.raw is None or self.hint is not None
+        return True
+
+    @property
+    def unverified(self):
+        return self.raw if self.hint is None else None
 
 
 class SupervisorTransportClient:

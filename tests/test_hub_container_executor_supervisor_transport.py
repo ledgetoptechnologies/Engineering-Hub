@@ -155,6 +155,8 @@ class StallingServer(SupervisorTransportServer):
         mode, self.mode = self.mode, None
         if mode is None:
             return super()._reply(peer, status, raw)
+        if type(mode) is bytes:  # Malicious supervisor: a 200 carrying arbitrary bytes.
+            return super()._reply(peer, 200, mode)
         try:
             self.entered.set()
             if mode == "drop":
@@ -262,11 +264,11 @@ def tls_clients(env, port, ids, *, client_id="hub", anchor=None, server_spki=Non
 def hub_reserve_and_prove(env, hub, cmd):
     proof = env["proof"]
     reserved = hub.reserve(cmd)
-    assert not reserved.held, reserved
+    assert reserved.held and reserved.unverified is not None, reserved
     receipt = reserved.raw
     proof["verifier"].verify(receipt, expected=reservation_expectation(cmd, proof["pin"]))  # Own pinned key.
     issued = hub.challenge(cmd.command_id)
-    assert not issued.held, issued
+    assert issued.held and issued.unverified is not None, issued
     proof["challenge_verifier"].verify(issued.raw, expected=challenge_expectation(receipt, proof["pin"],
                                                                                     proof["epoch"]))
     nonce = nonce_of(issued.raw)
@@ -280,7 +282,7 @@ def hub_inspect_and_apply(env, resolver, cmd, receipt):
     request = inspection_request(cmd, env["proof"]["pin"], counter, key_id=inspection_key_id(key),
                                  request_nonce=secrets.token_hex(16))
     answer = resolver.inspect(request)
-    assert not answer.held, answer
+    assert answer.held and answer.unverified is not None, answer
     payload = PinnedKeyInspectionVerifier(key).verify(answer.raw, request=request)
     previous = env["applied"].setdefault(cmd.command_id, payload["status"])
     assert previous == payload["status"]
@@ -483,6 +485,36 @@ def test_lost_dispatch_reply_is_held_and_resolved_by_inspection_once(env):
     assert again.held and again.hint["state"] == "held" and len(marker_lines(env)) == 1
 
 
+# ---------------------------------------------------------------- malicious 200
+
+@LINUX
+@pytest.mark.parametrize("body", [b'{"ok":true}', b"not json",
+                                  b'{"payload":{"protocol":"x"},"signature":"' + b"A" * 86 + b'"}'])
+def test_unsigned_or_invalid_200_stays_held_and_is_refused_by_the_hub_verifier(env, body):
+    listener, path = env["unix_server"]()
+    hub, resolver = unix_clients(env, path)
+    proof = env["proof"]
+    cmd = command(proof["epoch"])
+    listener.server.mode = body
+    reply = hub.reserve(cmd)
+    assert reply.status == 200 and reply.held and reply.unverified == body  # A 200 alone settles nothing.
+    with pytest.raises(SupervisorRouteError):
+        proof["verifier"].verify(reply.unverified, expected=reservation_expectation(cmd, proof["pin"]))
+    listener.server.mode = body
+    statement = resolver.expired_statement(nonce_of_unknown())
+    assert statement.held and statement.unverified == body
+    signer = proof["statements"]
+    with pytest.raises(SupervisorRouteError):
+        ExpiredStatementVerifier(public_key=signer.public_key, key_id=signer.key_id).verify(
+            statement.unverified, nonce=nonce_of_unknown.last)
+    assert cmd.command_id not in env["applied"] and marker_lines(env) == []
+
+
+def nonce_of_unknown():
+    nonce_of_unknown.last = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    return nonce_of_unknown.last
+
+
 # ---------------------------------------------------------------- 6. crash before dispatch
 
 @LINUX
@@ -492,7 +524,7 @@ def test_crash_before_dispatch_is_retired_by_expired_statement(env):
     cmd = command(env["proof"]["epoch"])
     receipt, nonce, signed = hub_reserve_and_prove(env, hub, cmd)  # Proof made; the Hub "crashes" here.
     statement = resolver.expired_statement(nonce)
-    assert not statement.held
+    assert statement.held and statement.unverified is not None
     signer = env["proof"]["statements"]
     payload = ExpiredStatementVerifier(public_key=signer.public_key, key_id=signer.key_id).verify(
         statement.raw, nonce=nonce)
@@ -602,7 +634,7 @@ def test_full_pools_answer_busy_at_once_and_groups_do_not_starve_each_other(env,
     finally:
         release.set()
         worker.join(GUARD_S)
-    assert not outcome["r"].held
+    assert outcome["r"].held and outcome["r"].unverified is not None
 
 
 @LINUX
