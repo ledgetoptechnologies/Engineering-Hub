@@ -82,3 +82,19 @@ async def test_separate_frontdoors_deny_browser_cancel_and_allow_agent(config, c
             response=await agent.post(path,headers=CODEX)
             assert response.status_code==200 and response.json()['state']=='cancelled'
 from tests.test_hub_frontends import config, checker
+
+
+def test_public_rest_reserves_staging_prefix(api_rig):
+    client, _, queue, _, _, submission, *_=api_rig
+    response=client.post(BASE+'/jobs',headers=bearer(),json=submission(request_id='staging:reserved'))
+    assert response.status_code==409 and response.json()['detail']['code']=='work_request_prefix_reserved'
+    assert queue.status()['jobs']==[]
+    accepted=client.post(BASE+'/jobs',headers=bearer(),json=submission(request_id='staging-other'))
+    assert accepted.status_code==201
+
+
+def test_public_mcp_reserves_staging_prefix(mcp_rig):
+    client, _, queue, _, _, payload=mcp_rig
+    error(call(client,'hub_work_submit',payload(request_id='staging:reserved')),'work_request_prefix_reserved')
+    assert queue.status()['jobs']==[]
+    assert call(client,'hub_work_submit',payload(request_id='staging-other'))['state']=='queued'
