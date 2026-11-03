@@ -314,3 +314,37 @@ Codex's review: signed responses do not defeat a *transparent* same-UID relay. S
 - `test_broker_refuses_expired_admission_at_docker_forward` (only if Docker mediation is adopted)
 
 **Unverified:** whether the supervisor can hold a pidfd (kernel 5.3 or later, plus a Python API); whether it can mediate the Docker API without changing the rootless engine setup; and the host's ptrace and dumpable policy.
+
+### 8.z Launch-plumbing feasibility (checked in source, not on the host)
+
+**How the executor starts.** The root supervisor creates and starts the executor as a Docker container through the private engine API (`hub_container_executor/launch_supervisor.py:871` create, `:880` start). The container has `NetworkMode: none`, `CapDrop: ALL`, a read-only root filesystem and `no-new-privileges` (`:769-781`). It receives host paths only through bind mounts, including `issuer_socket` and `engine_socket` (`:51-52`, `:669-673`, `:776`).
+
+**An inherited socketpair is not feasible with this launch.** The container's process is spawned by the engine's runtime (containerd-shim and runc), not forked from the supervisor. The Docker create/start API has no way to pass a file descriptor, so a socketpair created by the supervisor never reaches the executor. Getting real inheritance would mean launching the executor as a direct supervisor child instead of a container, which gives up the existing hardened container profile and its inspection checks (`_inspect`, `:785-841`).
+
+**A feasible alternative that reuses existing code: the executor dials the supervisor.** The supervisor already has the pattern needed:
+- It binds a root-owned socket through a pinned parent directory, `chown root:<consumer gid>`, mode `0660`, listen backlog 1 (`:745-763`). The socket is bind-mounted into the container as `issuer_socket`.
+- On every accept it requires `SO_PEERCRED == (consumer.pid, consumer_uid, consumer_gid)`, where `consumer.pid` is the container init pid read from engine inspect (`:882`, `:1012-1013`).
+- `_validate_live` re-checks against a held **pidfd** (`:184-188`, `:891-897`): the process is still alive, the init pid still equals the engine's `State.Pid`, it is in a distinct pid namespace, and its kernel profile and uid map match.
+
+Proposed route: the executor makes one outbound connection to a second supervisor-owned socket, `command_route`, mounted the same way. The supervisor verifies that connection with the same `SO_PEERCRED`, pidfd and inspect checks, then holds it as the only path for Hub commands. The Hub talks only to the supervisor's root-owned host-side endpoint. The executor listens on nothing.
+
+**What this gives:**
+- **No substitutable path.** The executor owns no listening socket. A same-UID process on the host can connect to the mounted `command_route` path, but its pid is not the pinned container init pid, so it is refused. Any other process inside the container has a different pid and is refused too.
+- **PID namespaces.** `SO_PEERCRED` reports the pid in the supervisor's (host) namespace, and the existing code already compares it with the engine's host-side `State.Pid` and holds a pidfd. It never trusts a pid the executor reports.
+- **Rootless engine user namespace.** The existing check compares the uid as seen from the host (`consumer_uid`) and checks `uid_map` (`:904-905`). The same check carries over.
+- **Disconnect and restart.** If the executor exits or drops the route, the pidfd becomes readable and the route closes, so the supervisor marks the launch ended and refuses Hub commands. A reconnect is accepted only from the same live init pid of the same launch. A new launch needs the full launch verification again. In-flight admissions are held, never redone.
+- **Relay.** A transparent relay would have to be the container init process itself, which is the executor.
+
+**Docker mediation, for host enforcement of the stall window.** Today `engine_socket` is bind-mounted straight from the private engine socket (`:673`). Bounding the stall would mean changing that mount's source to a supervisor proxy socket that forwards only allow-listed mutating calls and checks admission age on `CLOCK_BOOTTIME` at forward time. The mechanism is feasible because it is the same bind-mount pattern, but it changes the executor's engine access path. It needs its own review and must not be done as part of this change.
+
+**Not verified:**
+- Whether the executor image's init process can perform the outbound connect itself. The connecting process must be the init pid, or the supervisor must accept a documented single child with a pidfd check.
+- Behaviour under the real rootless engine on the staging host.
+- Whether a backlog of 1 with a single held connection suits the command rate.
+
+**Tests:**
+- `test_route_accepts_only_container_init_pid`, covering a host same-UID connector and a second in-container process.
+- `test_route_closed_when_init_exits_and_launch_marked_ended`.
+- `test_reconnect_from_same_live_init_accepted_other_refused`.
+- `test_executor_listens_on_no_socket`.
+- `test_hub_commands_refused_without_verified_route`.
