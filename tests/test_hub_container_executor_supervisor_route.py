@@ -280,10 +280,18 @@ def test_conflicting_replay_rejected_without_forward(world, change):
 @LINUX
 def test_journal_write_failure_before_forward_refuses(world, monkeypatch):
     route = world["make"]()
-    # Simulated disk/open failure on every journal connection.
-    monkeypatch.setattr(route._journal, "_connection", lambda **k: (_ for _ in ()).throw(OSError()))
-    with pytest.raises(SupervisorRouteRefused):
+    # Simulated disk/open failure on every WRITABLE journal connection: the
+    # failure is clearly before BEGIN and a read proves no row exists.
+    original = route._journal._connection
+
+    def writable_fails(*, readonly=False):
+        if not readonly:
+            raise OSError()
+        return original(readonly=True)
+    monkeypatch.setattr(route._journal, "_connection", writable_fails)
+    with pytest.raises(SupervisorRouteRefused) as refused:
         route.submit(command(world["epoch"]))
+    assert "new command" not in str(refused.value) and "inspect" in str(refused.value)
     monkeypatch.undo()
     # Real lock held by another writer beyond the bounded busy wait.
     blocker = sqlite3.connect(world["path"], isolation_level=None)
@@ -910,8 +918,12 @@ def test_fault_right_after_intent_commit_records_unknown_before_release(world, m
     monkeypatch.setattr(journal, "admit", admit_then_fault)
     monkeypatch.setattr(journal, "abandon_attempt", mark)
     cmd = command(world["epoch"])
-    with pytest.raises(SupervisorRouteRefused if fault is OSError else KeyboardInterrupt):
-        route.submit(cmd)
+    if fault is OSError:
+        uncertain = route.submit(cmd)  # COMMIT happened: inspect original, never 'refused'.
+        assert uncertain.state == "held" and uncertain.error == "admission_uncertain"
+    else:
+        with pytest.raises(KeyboardInterrupt):  # BaseException still propagates.
+            route.submit(cmd)
     monkeypatch.undo()
     assert locked_while_marking == [True]  # Recorded before the mutex was released.
     assert intent_rows(world["path"]) == [(cmd.command_id, "unknown")]
@@ -1042,8 +1054,8 @@ def test_failing_replay_never_mutates_pre_existing_intent(world, monkeypatch, fa
         _admit_raises(monkeypatch, route._journal)
     else:
         monkeypatch.setattr(route_module.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError()))
-    with pytest.raises(SupervisorRouteRefused):
-        route.submit(cmd)
+    uncertain = route.submit(cmd)  # Prior forwarded row exists: inspect original.
+    assert uncertain.state == "held" and uncertain.error == "admission_uncertain"
     monkeypatch.undo()
     assert full_rows(world["path"]) == before  # Byte-for-byte, same state.
     replay = route.submit(cmd)
@@ -1064,8 +1076,7 @@ def test_fresh_failed_admit_marks_only_its_own_row(world, monkeypatch):
     prior_row = full_rows(world["path"])[0]
     fresh = command(world["epoch"])
     _admit_raises(monkeypatch, route._journal)
-    with pytest.raises(SupervisorRouteRefused):
-        route.submit(fresh)
+    assert route.submit(fresh).state == "held"
     monkeypatch.undo()
     rows = {row[0]: row for row in full_rows(world["path"])}
     assert rows[prior.command_id] == prior_row
@@ -1086,8 +1097,7 @@ def test_recorded_and_mismatched_rows_untouched_by_failing_replay(world, monkeyp
     before = full_rows(world["path"])
     _admit_raises(monkeypatch, route._journal)
     for cmd in (completed, rejected):
-        with pytest.raises(SupervisorRouteRefused):
-            route.submit(cmd)
+        assert route.submit(cmd).state == "held"  # Not 'refused': a recorded row exists.
     with pytest.raises(SupervisorRouteRejected):  # Mismatched binding: conflict, no handler.
         route.submit(command(world["epoch"], command_id=completed.command_id, fence=8))
     monkeypatch.undo()
@@ -1100,4 +1110,37 @@ def test_recorded_and_mismatched_rows_untouched_by_failing_replay(world, monkeyp
         result = route.submit(cmd)
         assert attempt not in result.record.decode() and attempt not in repr(result)
         assert attempt not in json.dumps(json.loads(result.record))
+    route.close()
+
+
+@LINUX
+def test_failure_inside_rolled_back_transaction(world, monkeypatch):
+    route = world["make"]()
+    fresh = command(world["epoch"])
+    # Fails inside BEGIN IMMEDIATE before COMMIT (the epoch row read): rolled back.
+    original = route._journal._schema
+    calls = []
+
+    def failing_schema(db):
+        if route._journal.last_phase == "in_transaction" and not calls:
+            calls.append(1)  # Fail once inside the transaction; later reads work.
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(db)
+    monkeypatch.setattr(route._journal, "_schema", failing_schema)
+    with pytest.raises(SupervisorRouteRefused):
+        route.submit(fresh)  # Proved: rolled back and no row for this command_id.
+    monkeypatch.undo()
+    assert intent_rows(world["path"]) == [] and world["backend"].calls == []
+    # A prior forwarded, unknown row + the same rolled-back failure -> held.
+    prior = command(world["epoch"])
+    world["backend"].error = ConnectionResetError()
+    assert route.submit(prior).state == "held"
+    world["backend"].error = None
+    calls.clear()
+    monkeypatch.setattr(route._journal, "_schema", failing_schema)
+    replay = route.submit(prior)
+    assert replay.state == "held" and replay.error == "admission_uncertain"
+    monkeypatch.undo()
+    assert route.inspect(prior.command_id).error == "transport_lost"
+    assert len(world["backend"].calls) == 1
     route.close()

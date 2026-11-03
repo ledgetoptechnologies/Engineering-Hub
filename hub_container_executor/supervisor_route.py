@@ -194,10 +194,18 @@ class SupervisorRouteRejected(SupervisorRouteError):
 
 
 class SupervisorRouteRefused(SupervisorRouteError):
-    """Fail-closed: the durable intent could not be committed; NOT forwarded."""
+    """Fail-closed: THIS submit attempt journaled and forwarded nothing.
+
+    Raised only when that is proved (epoch source failed before any journal
+    access, or the journal failed before BEGIN / inside a rolled-back
+    transaction AND a read confirms no row exists for the command_id). It says
+    nothing about other attempts: ``inspect(command_id)`` reports any earlier
+    outcome. Uncertain admission is returned as ``held`` instead.
+    """
 
     def __init__(self):
-        super().__init__('supervisor route journal unavailable; command not forwarded')
+        super().__init__('supervisor route could not admit this submit attempt, which journaled and '
+                         'forwarded nothing; inspect the same command_id for any earlier outcome')
 
 
 class RouteJournalError(SupervisorRouteError):
@@ -510,7 +518,8 @@ class RouteJournal:
     Each inserted intent carries a per-attempt nonce; rows with a NULL nonce
     are never mutated by the failed-admit handler. A journal created with an
     earlier schema (no attempt column) fails the exact schema check and is
-    refused (fail closed); it is never migrated in place.
+    refused today (fail closed); adopting one would require an offline
+    migration/reconciliation step, which is NOT implemented.
     """
 
     def __init__(self, database_path, *, create, allow_ephemeral_test_storage=False):
@@ -597,17 +606,25 @@ class RouteJournal:
     def _transaction(self, *, initializing=False):
         _require(os.getpid() == self._pid, RouteJournalError('process'))
         with self._mutex:
+            # Phase of the most recent transaction, for the caller's proof of
+            # "nothing committed": before_begin / in_transaction (rolled back
+            # on error) / committing / committed.
+            self.last_phase = 'before_begin'
             try:
                 self._active()
                 with self._connection() as db:
                     db.execute('BEGIN IMMEDIATE')
+                    self.last_phase = 'in_transaction'
                     try:
                         _require(self._owner._read(db) == self._owner._row, RouteJournalError('owner'))
                         if not initializing:
                             self._schema(db)
                         yield db
                         _require(self._owner._read(db) == self._owner._row, RouteJournalError('owner'))
+                        # From here the outcome of COMMIT is not provably rolled back.
+                        self.last_phase = 'committing'
                         db.commit()
+                        self.last_phase = 'committed'
                         os.fsync(self._owner._parent_fd)
                     except BaseException:
                         db.rollback()
@@ -999,13 +1016,26 @@ class SupervisorRoute:
             # inserted into unknown before the mutex is released (compare-and-
             # set on the attempt nonce). A replayed pre-existing intent is never
             # touched and stays held; if this fails, our 'intent' reads held.
+            phase = getattr(self._journal, 'last_phase', None)
             try:
                 self._journal.abandon_attempt(command.command_id, digest, attempt)
             except BaseException:
                 pass
             if not isinstance(error, Exception):
                 raise
-            raise SupervisorRouteRefused() from None
+            # 'refused' only when proved: no COMMIT was attempted by this call
+            # AND a read confirms no row exists under this command_id at all.
+            if phase in ('before_begin', 'in_transaction'):
+                try:
+                    if self._journal.read(command.command_id) is None:
+                        raise SupervisorRouteRefused()
+                except SupervisorRouteRefused:
+                    raise SupervisorRouteRefused() from None
+                except Exception:
+                    pass
+            # Possibly committed, or a prior row (maybe already forwarded)
+            # exists: the original command_id's outcome must be inspected.
+            return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
         if outcome == 'replay':
             return self._from_row(row, replayed=True)
         # Durable intent exists from here: ownership is non-abandonable.
