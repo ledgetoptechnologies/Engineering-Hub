@@ -729,18 +729,20 @@ _BAD_RESPONSES = {
 
 
 class _BarrierServer(_ScriptedServer):
-    """Scripted peer with an explicit, test-owned barrier on its FIRST connection.
+    """Scripted peer whose LIFETIME on its first connection is owned by the test.
 
-    After reading the request it records ``entered_at`` and sets ``entered``,
-    sends any undelayed chunks, and at its first delay sets ``blocked`` and
-    waits on ``release``, which only the test sets (``_PEER_GUARD_S`` is a hang
-    guard). It never completes or closes that script on its own, so ``left``
-    (set only when the first connection's handler returns) stays clear until
-    the test releases it: any earlier end of the exchange was the route's."""
+    After reading the request it records ``entered_at``/``entered`` and sends
+    the undelayed chunks. At the first delayed chunk it either keeps TRICKLING
+    (a non-empty chunk: re-sent every <= ``_TRICKLE_GAP_S``, far below any
+    per-read timeout, timestamped in ``sends``) or STALLS (an empty chunk:
+    sends nothing). Either way it continues until the test sets ``release``
+    (``_PEER_GUARD_S`` is a last-resort guard) and never completes or closes on
+    its own - a send failing because the route already gave up (EPIPE) only
+    stops the sending; ``left`` is set only when that handler returns."""
 
     def __init__(self, path, scripts):
         self.entered, self.blocked, self.release, self.left = (threading.Event() for _ in range(4))
-        self.entered_at, self._first = None, True
+        self.entered_at, self.sends, self._first = None, [], True
         super().__init__(path, scripts)
 
     def _serve(self, peer, script):
@@ -761,7 +763,16 @@ class _BarrierServer(_ScriptedServer):
             for delay, chunk in script(body):
                 if delay and first:
                     self.blocked.set()
-                    self.release.wait(_PEER_GUARD_S)
+                    gap, broken = min(delay, _TRICKLE_GAP_S), False
+                    deadline = time.monotonic() + _PEER_GUARD_S
+                    while not self.release.wait(gap if chunk and not broken else _PEER_GUARD_S):
+                        if not chunk or broken or time.monotonic() > deadline:
+                            return  # Stall / route gone: only the guard ends it; or the guard itself.
+                        try:
+                            peer.sendall(chunk)  # Trickle: keep the route reading, chunk after chunk.
+                            self.sends.append(time.monotonic())
+                        except OSError:
+                            broken = True  # The route already gave up; the lifetime stays the test's.
                     return
                 time.sleep(delay)
                 peer.sendall(chunk)
@@ -777,10 +788,28 @@ class _BarrierServer(_ScriptedServer):
         super().close()
 
 
-# Cases only the route's total deadline can end (the peer is slow or silent, not malformed).
-_DEADLINE_ENDED = frozenset({"trickle_headers", "trickle_body", "stalled_headers", "stalled_body", "no_eof"})
+class _TimedBackend(UnixSocketBackend):
+    """Test spy: the backend exchange's own start/end and its REAL failure, which
+    the route deliberately reports only as a sanitized ``transport_lost``."""
+    started = ended = error = None
+
+    def _forward(self, *args):
+        self.started, self.error = time.monotonic(), None
+        try:
+            return super()._forward(*args)
+        except BaseException as error:
+            self.error = error
+            raise
+        finally:
+            self.ended = time.monotonic()
+
+
+# Cases only the route's TOTAL deadline can end (the peer is slow or silent, not malformed).
+_TRICKLING = frozenset({"trickle_headers", "trickle_body"})
+_DEADLINE_ENDED = _TRICKLING | {"stalled_headers", "stalled_body", "no_eof"}
+_TRICKLE_GAP_S = 0.05  # Peer chunk interval: well below the 0.6 s deadline / any per-read timeout.
 _HANG_GUARD_S = 10.0  # Generous upper bound on the exchange: catches a missing deadline, not load.
-_PEER_GUARD_S = 15.0  # The barrier server gives up only after this (hang guard of last resort).
+_PEER_GUARD_S = 15.0  # The barrier peer gives up only after this (hang guard of last resort).
 
 
 @LINUX
@@ -792,20 +821,29 @@ def test_bounded_strict_response_framing_is_held_and_releases_lock(world, case):
     try:
         deadline_s = 0.6
         world["epochs"].value = (world["epoch"], _own_pin())
-        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=int(deadline_s * 1000))
+        backend = _TimedBackend(path, bearer_token=TOKEN)
+        route = world["make"](backend=backend, timeout_ms=int(deadline_s * 1000))
         cmd = command(world["epoch"])
         result = route.submit(cmd)
-        returned_at = time.monotonic()
-        assert result.state == "held" and result.record is None, case
+        assert (result.state, result.record) == ("held", None), case
         assert server.entered.is_set(), case  # The exchange really reached the peer.
         if case in _DEADLINE_ENDED:
-            # The peer cannot finish or close on its own (test-owned barrier),
+            # The peer cannot finish or close on its own (test-owned lifetime),
             # so only the route's own deadline can have ended the exchange.
-            # Independent of EPIPE: the peer sends nothing while blocked.
             assert not server.left.is_set() and not server.release.is_set(), case
-            assert server.blocked.wait(_PEER_GUARD_S), case  # It did reach the barrier, not EOF.
-            elapsed = returned_at - server.entered_at  # From exchange entry, not before forwarding.
-            assert 0 <= elapsed < deadline_s + _HANG_GUARD_S, (case, elapsed)
+            assert result.error == "transport_lost", case
+            # ...and it was the DEADLINE, not a framing or connection error.
+            assert isinstance(backend.error, TimeoutError), (case, repr(backend.error))
+            # Timed against the deadline's own anchor (the exchange start, before
+            # connect) and spanning the peer's entry: never ended before it.
+            assert backend.started <= server.entered_at <= backend.ended, case
+            elapsed = backend.ended - backend.started
+            assert deadline_s - 0.005 <= elapsed < deadline_s + _HANG_GUARD_S, (case, elapsed)
+            assert server.blocked.wait(_PEER_GUARD_S), case
+            if case in _TRICKLING:
+                # Still trickling sub-timeout chunks within the exchange when the deadline hit.
+                trickled = sum(server.entered_at < at <= backend.ended for at in list(server.sends))
+                assert trickled >= 2, (case, trickled)
         server.release.set()
         assert server.left.wait(_PEER_GUARD_S), case
         assert route._mutex.acquire(blocking=False)
