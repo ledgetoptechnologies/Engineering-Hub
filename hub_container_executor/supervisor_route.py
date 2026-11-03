@@ -49,6 +49,18 @@ generated or discovered here.
 
 Explicit limits (this foundation grants no authority by itself):
 
+* The total deadline bounds only the socket exchange with the backend
+  (connect, peer check, send, header and body receive). It does NOT bound the
+  whole submit: acquiring the route mutex, the caller-supplied epoch source and
+  the durable journal (transaction, fsync) may block outside it. A timeout never
+  implies the command had no effect: once bytes may have been sent the outcome
+  is held. Bounding the entire submit would need busy admission that refuses
+  before any effect and durable handling that never abandons a started effect;
+  neither is implemented here.
+* Behaviour against the real executor's Unix-socket server close semantics
+  (Connection: close, EOF after the body) is exercised in tests with uvicorn but
+  must be re-verified on the actual deployment transport before integration.
+
 * SO_PEERCRED identifies the process that created/listened on the backend
   socket at connect time, not later holders of that socket or its FDs. The
   pin's container_id and Engine fields are NOT observable through the socket;
