@@ -148,6 +148,13 @@ What is enforced in source:
 - The signing transaction reads only through its own connection and runs no
   operator callback (those run in the precheck), so nothing can wait on the
   write lock it holds. It refuses if a shared execution policy is composed.
+- Target authorization at signing: the queue's configured target verifier is an
+  arbitrary callback and only runs in the precheck. Inside the signing
+  transaction an explicitly supplied `target_authorization.authorized_in_txn(db,
+  ...)` must decide from durable rows read through that same connection; its
+  author documents which rows constitute authorization. The default
+  (`RefusingTargetAuthorization`) refuses, so without one nothing is signed. The
+  test-only implementation reads the task row in `hub_entities`.
   Pre-existing: `WorkQueue` invokes target/claim callbacks inside its own
   transactions; a callback that tries to write there waits for the
   connection's busy timeout and then fails closed.
@@ -195,6 +202,7 @@ What is NOT supplied (each default refuses, so attempts stay held):
   anchor can be rolled back together with the journal and is only a hint; a
   coordinated local rollback is undetectable without the external anchor.
 - A host->Hub claim confirmation channel (`RefusingClaimConfirmer`).
+- A transactional target authorization (`RefusingTargetAuthorization`).
 - A terminal verifier that re-inspects the original container and pinned
   cgroup (`RefusingTerminalVerifier`). A runner's observation is not proof.
 - A host runner adapter around `scripts/local_development_ci.py`; that script

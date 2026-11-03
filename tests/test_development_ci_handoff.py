@@ -182,9 +182,23 @@ def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=
         enable_durable_handoff=enable)
 
 
-def make_bridge(rig, queue, owner, *, authenticator=RIG, enable=True):
+class TaskRowAuthorization:
+    """Test-only transactional authorization: the durable task row, read via
+    the signing connection. ``deny`` simulates a flipped decision."""
+    def __init__(self):
+        self.deny = False
+
+    def authorized_in_txn(self, db, actor, action_key, environment, target):
+        row = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+        task = json.loads(row[0])
+        return (not self.deny and task['owner'] == actor and task['status'] == 'verified'
+                and task['candidate_commit'] == target.source_commit)
+
+
+def make_bridge(rig, queue, owner, *, authenticator=RIG, target_authorization=RIG, enable=True):
     return DurableDevelopmentCIHandoff(queue, owner, rig.manifest, rig.channel, action_key=ACTION,
         host_generation=rig.generation, authenticator=rig.auth if authenticator is RIG else authenticator,
+        target_authorization=rig.authorization if target_authorization is RIG else target_authorization,
         enable_durable_handoff=enable, renew_interval=.01)
 
 
@@ -222,7 +236,7 @@ def rig(tmp_path):
     manifest = DevelopmentCIManifest(MACHINE, 'engine-one', IMAGE, 'sha256:' + 'e' * 64, ('sha256:' + 'a' * 64,) * 4)
     value = SimpleNamespace(tmp=tmp_path, path=path, owner=owner, repo=repo, clock=clock, manifest=manifest,
         engine=engine, journal=journal, anchor=anchor, generation=generation, auth=HmacAuth(),
-        external=MemoryExternalAnchor(), runner=Runner())
+        external=MemoryExternalAnchor(), runner=Runner(), authorization=TaskRowAuthorization())
     value.host = make_host(value)
     value.channel = Channel(value)
     value.queue = _queue(repo, clock)
@@ -1063,3 +1077,33 @@ async def test_signing_transaction_runs_no_callback_that_could_wait_on_its_lock(
     assert probes and not any(during for during, _, _ in probes)
     assert all(elapsed < 1.0 for _, _, elapsed in probes)  # bounded, never a deadlock
     assert clock.monotonic() - started < 15
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['flip', 'revoke', 'default'])
+async def test_target_authorization_change_after_precheck_records_no_mark(rig, monkeypatch, change):
+    task = reviewed_task(rig.repo, 'authz')
+    job = rig.queue.submit(actor='codex', request_id='authz', action_key=ACTION, environment='staging',
+                           target=WorkTarget(task['id'], task['candidate_commit'], rig.manifest.digest))
+    if change == 'default':
+        restart_hub(rig, target_authorization=None)
+    original, calls = rig.bridge._bound, []
+    def bound_then_change(attempt):
+        result = original(attempt)  # the queue's callback verifier said True here
+        calls.append(1)
+        if len(calls) == 2:  # answer_challenge precheck, just before BEGIN IMMEDIATE
+            if change == 'flip':
+                rig.authorization.deny = True
+            elif change == 'revoke':
+                with rig.repo._transaction() as db:  # durable authorization row revoked
+                    data = rig.repo._get(db, task['id'], 'task')
+                    data['owner'] = 'hermes'
+                    rig.repo._save(db, 'hermes', 'test.authorization-revoked', 'task', data)
+        return result
+    monkeypatch.setattr(rig.bridge, '_bound', bound_then_change)
+    await rig.bridge.run_once()
+    assert len(calls) >= 2
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+    assert not rig.channel.starts and not rig.runner.calls and host_rows(rig) == []
+    assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and reservation(rig) == job['id']

@@ -120,6 +120,19 @@ class RefusingTerminalVerifier:
         return False
 
 
+class RefusingTargetAuthorization:
+    """No transactionally verifiable target authorization is supplied.
+
+    The queue's configured target verifier is an arbitrary callback whose
+    answer can change after the precheck. Signing therefore also needs
+    ``authorized_in_txn(db, actor, action_key, environment, target)`` that
+    decides ONLY from rows read through the given signing connection ``db``
+    (durable authorization state), never via callbacks or other connections.
+    """
+    def authorized_in_txn(self, db, actor, action_key, environment, target):
+        return False
+
+
 class RefusingClaimConfirmer:
     """No host->Hub channel exists to confirm the CURRENT claim per effect.
 
@@ -990,7 +1003,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
     _handoff_mode = True
 
     def __init__(self, queue, owner, manifest, channel, *, action_key, host_generation,
-                 authenticator=None, enable_durable_handoff=False, renew_interval=120,
+                 authenticator=None, target_authorization=None, enable_durable_handoff=False,
+                 renew_interval=120,
                  monotonic=time.monotonic):
         if enable_durable_handoff is not True:
             raise HubError('development_ci_handoff_disabled', 409)
@@ -1003,6 +1017,12 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                                             'handoff_authenticator_required')
         except HandoffRefused:
             raise HubError('development_ci_handoff_composition_required', 409) from None
+        try:
+            self.target_authorization = _authority(target_authorization, RefusingTargetAuthorization,
+                                                   ('authorized_in_txn',), 'handoff_target_authorization_required')
+        except HandoffRefused:
+            raise HubError('development_ci_handoff_composition_required', 409) from None
+        self._target_authorization = self.target_authorization
         self.channel, self.host_generation = channel, host_generation
         super().__init__(queue, owner, manifest, _UnusedProvider(), action_key=action_key,
                          renew_interval=renew_interval, monotonic=monotonic)
@@ -1122,7 +1142,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         nothing can wait on the lock this transaction holds.
         """
         try:
-            if self._composition_changed() or not _schema_matches(db, _HUB_EXPECTED):
+            if (self._composition_changed() or self.target_authorization is not self._target_authorization
+                    or not _schema_matches(db, _HUB_EXPECTED)):
                 return False
             task = self.repo._get(db, attempt.task_id, 'task')
             review = task.get('review')
@@ -1159,7 +1180,9 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                     and action is not None and action.machine_id == self.manifest.machine_id
                     and action.environments == frozenset({'staging'}) and action.requires_execution_proof
                     and not self.queue._shared_policy_present()
-                    and self.repo.task_allows_environment(attempt.task_id, 'staging', db=db) is True)
+                    and self.repo.task_allows_environment(attempt.task_id, 'staging', db=db) is True
+                    and self.target_authorization.authorized_in_txn(
+                        db, attempt.actor, self.action_key, 'staging', target) is True)
         except Exception:
             return False
 
