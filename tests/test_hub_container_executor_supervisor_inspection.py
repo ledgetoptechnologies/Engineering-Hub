@@ -22,7 +22,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from hub_container_executor import supervisor_route as route_module
 from hub_container_executor.supervisor_route import (
-    INSPECTION_PATH, INSPECTION_SIGNATURE_DOMAIN, MAX_RESPONSE_BYTES, BackendPin, InspectionAuthenticator,
+    INSPECTION_PATH, INSPECTION_SIGNATURE_DOMAIN, MAX_RESPONSE_BYTES, BackendPin, HeldAttemptSource,
+    InspectionAuthenticator,
     InspectionClientConfig, InspectionResolver, InspectionResolverConfig, InspectionResponderConfig,
     InspectionTokenAuthenticator, InspectionVerifier, PeerMismatch, PinnedKeyInspectionVerifier, RouteEpoch,
     SupervisorInspectionClient, SupervisorInspectionResponder, SupervisorPeerPin, SupervisorRouteDisabled,
@@ -35,6 +36,17 @@ from tests.test_hub_container_executor_supervisor_route import (  # noqa: F401  
 
 INSPECT_TOKEN = "ehri1." + "Insp3ct" * 6  # Test-only inspection credential.
 REJECTION = b'{"error":{"code":"unauthorized"}}'
+
+
+class Vouching(HeldAttemptSource):
+    """Test-only stand-in for a Hub job store: vouches while ``allow`` is True."""
+
+    def __init__(self):
+        self.allow, self.calls = True, []
+
+    def vouch(self, command, pin, dispatch_counter):
+        self.calls.append((command.command_id, dispatch_counter))
+        return self.allow
 
 
 def raw_key(key):
@@ -134,10 +146,10 @@ def insp(world, tmp_path):
             credential=credential, supervisor_peer=peer or own_peer(),
             verifier=verifier or PinnedKeyInspectionVerifier(raw_key(key)))
 
-    def resolver(create=True, ledger=None, **kwargs):
+    def resolver(create=True, ledger=None, source=None, **kwargs):
         made = InspectionResolver(config=InspectionResolverConfig(
             enabled=True, ledger_path=ledger or state["ledger"], create_ledger=create,
-            allow_ephemeral_test_storage=True), client=client(**kwargs))
+            allow_ephemeral_test_storage=True), client=client(**kwargs), source=source or Vouching())
         state["resolvers"].append(made)
         return made
     state["client"], state["resolver"] = client, resolver
@@ -242,7 +254,7 @@ def test_inspection_disabled_by_default(world, tmp_path):
     ledger = tmp_path / "ledger.sqlite"
     for config in (InspectionResolverConfig(), InspectionResolverConfig(enabled=1, ledger_path=str(ledger)), None):
         with pytest.raises(SupervisorRouteDisabled):
-            InspectionResolver(config=config, client=None)
+            InspectionResolver(config=config, client=None, source=None)
     assert not ledger.exists()
     with pytest.raises(SupervisorRouteError):
         InspectionVerifier().verify(b"{}", request={})
@@ -651,10 +663,11 @@ def test_ledger_triggers_refuse_rewrites_and_schema_tamper(world, insp):
                 (f"UPDATE {table} SET state='launched', route_state='rejected', key_id='k', answer='a' "
                  "WHERE command_id=?", (held_cmd.command_id,)),
                 (f"DELETE FROM {table}", ()),
-                (f"INSERT OR REPLACE INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'held', NULL, NULL, NULL)",
+                (f"INSERT OR REPLACE INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'held', NULL, NULL, NULL, NULL)",
                  (cmd.command_id,)),
-                (f"INSERT INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'launched', 'completed', 'k', 'a')",
-                 (str(uuid4()),))):
+                (f"INSERT INTO {table} VALUES (?, 'd', 'b', 'e', 1, 'launched', 'completed', 'k', 'a', 'r')",
+                 (str(uuid4()),)),
+                (f"UPDATE {table} SET request=NULL WHERE command_id=?", (cmd.command_id,))):
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(sql, args)
         assert db.execute(f"SELECT command_id, state FROM {table} ORDER BY state").fetchall() == [
@@ -700,3 +713,248 @@ def test_request_reuses_dispatch_claim_and_refuses_inconsistent_claims(world, in
     for body in (canonical(request) + b" ", json.dumps(request).encode()):  # Non-canonical bytes.
         assert insp["responder"].answer(method="POST", path=INSPECTION_PATH,
                                         authorization="Bearer " + INSPECT_TOKEN, body=body)[0] == 400
+
+
+# --- Review fixes: replay re-verification, vouching source, bounded responder --
+
+def _resolved(world, insp):
+    resolver, cmd, counter = held_attempt(world, insp)
+    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    return resolver, cmd, counter
+
+
+def _reopen(insp, resolver, **kwargs):
+    resolver.close()
+    insp["resolvers"].remove(resolver)
+    return insp["resolver"](create=False, **kwargs)
+
+
+@LINUX
+def test_replay_after_key_rotation_is_held(world, insp):
+    resolver, cmd, counter = _resolved(world, insp)
+    rotated = PinnedKeyInspectionVerifier(raw_key(Ed25519PrivateKey.generate()))
+    reopened = _reopen(insp, resolver, verifier=rotated)
+    result = reopened.resolve(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "replay_unverified")  # Never the stored terminal.
+    assert ledger_state(insp, cmd.command_id) == ("launched", "completed")  # Evidence kept, not trusted.
+    back = _reopen(insp, reopened)  # Original pinned key: the same evidence verifies again.
+    assert back.resolve(cmd, world["pin"], counter).state == "launched"
+
+
+@LINUX
+def test_replay_after_restart_with_different_pin_is_held(world, insp):
+    resolver, cmd, counter = _resolved(world, insp)
+    reopened = _reopen(insp, resolver)
+    pin = world["pin"]
+    moved = BackendPin(pin.container_id, pin.host_pid + 1, pin.process_start_ticks, pin.uid, pin.gid,
+                       pin.engine_id, pin.engine_pid, pin.engine_start_ticks)
+    for args in ((cmd, moved, counter), (cmd, pin, counter + 1),
+                 (command(world["epoch"], command_id=cmd.command_id, fence=8), pin, counter)):
+        result = reopened.resolve(*args)
+        assert (result.state, result.error) == ("held", "no_held_attempt")
+    assert reopened.resolve(cmd, pin, counter).state == "launched"
+
+
+_TRIGGER = "supervisor_route_inspection_resolve_once"
+
+
+def _flip(text, index):
+    return text[:index] + ("B" if text[index] == "A" else "A") + text[index + 1:]
+
+
+def _tamper_answer_payload(row):
+    envelope = json.loads(row["answer"])
+    envelope["payload"]["answered_at_ms"] += 1
+    return {"answer": canonical(envelope).decode()}
+
+
+def _tamper_answer_signature(row):
+    envelope = json.loads(row["answer"])
+    envelope["signature"] = _flip(envelope["signature"], 20)
+    return {"answer": canonical(envelope).decode()}
+
+
+def _tamper_status(row):
+    return {"state": "refused", "route_state": "rejected"}
+
+
+def _tamper_request(row):
+    request = json.loads(row["request"])
+    request["request_nonce"] = "0" * 32  # Valid shape, but not what was signed.
+    return {"request": canonical(request).decode()}
+
+
+def _tamper_request_binding(row):
+    request = json.loads(row["request"])
+    request["binding"]["queue_fence"] = 8
+    return {"request": canonical(request).decode()}
+
+
+_TAMPER = {"answer_payload": _tamper_answer_payload, "answer_signature": _tamper_answer_signature,
+           "status": _tamper_status, "request_nonce": _tamper_request, "request_binding": _tamper_request_binding,
+           "missing_request": lambda row: {"request": ""}, "missing_answer": lambda row: {"answer": ""},
+           "key_id": lambda row: {"key_id": "f" * 64}}
+
+
+@LINUX
+@pytest.mark.parametrize("case", sorted(_TAMPER))
+def test_tampered_terminal_row_replays_held(world, insp, case):
+    resolver, cmd, counter = _resolved(world, insp)
+    db = sqlite3.connect(Path(insp["ledger"]).as_uri() + "?mode=rw", uri=True, isolation_level=None)
+    try:
+        db.row_factory = sqlite3.Row
+        row = dict(db.execute("SELECT * FROM supervisor_route_inspection WHERE command_id=?",
+                              (cmd.command_id,)).fetchone())
+        changes = _TAMPER[case](row)
+        sets = ", ".join(f"{k}=?" for k in changes)
+        with pytest.raises(sqlite3.IntegrityError):  # The trigger blocks rewriting a resolved row...
+            db.execute(f"UPDATE supervisor_route_inspection SET {sets} WHERE command_id=?",
+                       (*changes.values(), cmd.command_id))
+        # ...so a same-UID attacker drops it, rewrites, and restores the identical trigger SQL,
+        # which the exact schema check cannot notice. Only re-verification can.
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(f"DROP TRIGGER {_TRIGGER}")
+        db.execute(f"UPDATE supervisor_route_inspection SET {sets} WHERE command_id=?",
+                   (*changes.values(), cmd.command_id))
+        db.execute(route_module._RESOLUTION_SCHEMA[_TRIGGER])
+        db.execute("COMMIT")
+    finally:
+        db.close()
+    connections = len(insp["server"].received)
+    result = resolver.resolve(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "replay_unverified"), case
+    reopened = _reopen(insp, resolver)  # Exact schema still matches; replay still held after restart.
+    assert reopened.resolve(cmd, world["pin"], counter).state == "held"
+    assert len(insp["server"].received) == connections  # Replay never re-asks the supervisor.
+
+
+class _Refusing(HeldAttemptSource):
+    def __init__(self, value):
+        self.value = value
+
+    def vouch(self, command, pin, dispatch_counter):
+        if isinstance(self.value, BaseException):
+            raise self.value
+        return self.value
+
+
+@LINUX
+@pytest.mark.parametrize("source", ["default", "false", "truthy", "raises"])
+def test_held_attempt_source_refuses_by_default(world, insp, source):
+    chosen = {"default": HeldAttemptSource(), "false": _Refusing(False), "truthy": _Refusing(1),
+              "raises": _Refusing(OSError())}[source]
+    cmd, counter = launch(world, insp)
+    resolver = insp["resolver"](source=chosen)
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        resolver.hold(cmd, world["pin"], counter)
+    assert raised.value.reason == "unvouched"
+    assert ledger_state(insp, cmd.command_id) is None
+    result = resolver.resolve(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "unvouched")
+    assert insp["server"].received == []  # Never contacted.
+    with pytest.raises(SupervisorRouteError):
+        InspectionResolver(config=InspectionResolverConfig(enabled=True, ledger_path=insp["ledger"]),
+                           client=insp["client"](), source=None)
+
+
+@LINUX
+def test_source_must_vouch_on_every_resolve_and_replay(world, insp):
+    source = Vouching()
+    resolver, cmd, counter = held_attempt(world, insp, source=source)
+    source.allow = False
+    assert resolver.resolve(cmd, world["pin"], counter).error == "unvouched"
+    assert insp["server"].received == []
+    source.allow = True
+    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
+    source.allow = False
+    assert resolver.resolve(cmd, world["pin"], counter).error == "unvouched"  # Replay needs it too.
+    assert source.calls[-1] == (cmd.command_id, counter)
+
+
+def _responder(insp, **config):
+    return SupervisorInspectionResponder(
+        config=InspectionResponderConfig(enabled=True, **config), route=insp["route"],
+        authenticator=InspectionTokenAuthenticator(INSPECT_TOKEN), signing_key=insp["key"])
+
+
+def _ask(responder, body):
+    return responder.answer(method="POST", path=INSPECTION_PATH, authorization="Bearer " + INSPECT_TOKEN,
+                            body=body)
+
+
+@LINUX
+def test_responder_bounds_validated(world, insp):
+    for bad in ({"max_concurrent": 0}, {"max_concurrent": 9}, {"max_concurrent": True},
+                {"read_budget_ms": 9}, {"read_budget_ms": 1001}, {"read_budget_ms": 50.0}):
+        with pytest.raises(SupervisorRouteError):
+            _responder(insp, **bad)
+
+
+@LINUX
+def test_saturated_responder_answers_busy_without_queueing(world, insp, monkeypatch):
+    cmd, counter = launch(world, insp)
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    responder = _responder(insp, max_concurrent=2)
+    original, entered, release = route_module._read_inspection_row, threading.Semaphore(0), threading.Event()
+
+    def slow(*args):
+        entered.release()
+        assert release.wait(10)
+        return original(*args)
+    monkeypatch.setattr(route_module, "_read_inspection_row", slow)
+    results = []
+    workers = [threading.Thread(target=lambda: results.append(_ask(responder, body))) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    assert entered.acquire(timeout=5) and entered.acquire(timeout=5)
+    started = time.monotonic()
+    for _ in range(3):
+        assert _ask(responder, body) == (503, b'{"error":{"code":"busy"}}')  # Unsigned, immediate.
+    assert time.monotonic() - started < 0.2
+    assert responder.answer(method="POST", path=INSPECTION_PATH, authorization="Bearer " + TOKEN,
+                            body=body)[0] == 401  # Unauthenticated callers never take a slot.
+    release.set()
+    for worker in workers:
+        worker.join(10)
+    assert [status for status, _ in results] == [200, 200]
+    monkeypatch.undo()
+    assert _ask(responder, body)[0] == 200  # Slots released.
+
+
+@LINUX
+@pytest.mark.parametrize("lock", ["journal_mutex", "sqlite_exclusive"])
+def test_slow_journal_read_is_bounded_and_held(world, insp, lock):
+    resolver, cmd, counter = held_attempt(world, insp)
+    responder = _responder(insp, read_budget_ms=100)
+    insp["server"].responder = responder
+    body = canonical(insp["client"]().request_for(cmd, world["pin"], counter))
+    holder = None
+    if lock == "journal_mutex":
+        locked, done = threading.Event(), threading.Event()
+
+        def hold_mutex():
+            with insp["route"]._journal._mutex:
+                locked.set()
+                done.wait(10)
+        holder = threading.Thread(target=hold_mutex)
+        holder.start()
+        assert locked.wait(5)
+    else:
+        raw = sqlite3.connect(Path(world["path"]).as_uri() + "?mode=rw", uri=True, isolation_level=None)
+        raw.execute("BEGIN EXCLUSIVE")
+    try:
+        started = time.monotonic()
+        assert _ask(responder, body) == (503, b'{"error":{"code":"unavailable"}}')
+        assert time.monotonic() - started < 0.1 + 0.15  # Read budget plus small slack.
+        started = time.monotonic()
+        _assert_held(world, insp, resolver, cmd, counter, "http_status")
+        assert time.monotonic() - started < 0.6
+    finally:
+        if holder is not None:
+            done.set()
+            holder.join(10)
+        else:
+            raw.execute("ROLLBACK")
+            raw.close()
+    assert _ask(responder, body)[0] == 200
+    assert resolver.resolve(cmd, world["pin"], counter).state == "launched"
