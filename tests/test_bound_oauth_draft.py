@@ -104,3 +104,68 @@ async def test_bound_oauth_router_signed_access_identity(monkeypatch, tmp_path):
         assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':right})).json()['authenticated'] is True
         assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':other})).json()['authenticated'] is False
         assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 400
+
+@pytest.mark.asyncio
+async def test_full_hub_frontdoors_bound_signin_and_csrf(tmp_path):
+    import json, time
+    from urllib.parse import parse_qs, urlsplit
+    import httpx, jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from agent_message_bus.auth import AuthSettings
+    from engineering_hub.app import Settings, create_app
+    from engineering_hub.auth import AuthConfig
+    from engineering_hub.cloudflare_access import CloudflareAccessVerifier
+    from engineering_hub.frontends import HubFrontends
+    from tests.test_hub_frontends import Feed
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+    jwk.update(kid='fixture', alg='RS256', use='sig')
+    config = AuthConfig('https://hub.example', github_client_id='id', github_client_secret='secret', beau_github_id=123,
+        human_auth_mode='github_cloudflare', cloudflare_issuer='https://fixture.cloudflareaccess.com',
+        cloudflare_audience='aud', cloudflare_allowed_emails=('owner@example.com',), bound_access_subject='subject')
+    checker = CloudflareAccessVerifier(config.cloudflare_config, transport=httpx.MockTransport(lambda _: httpx.Response(200, json={'keys':[jwk]})))
+    class Provider:
+        async def exchange(self, code, verifier):
+            return 123
+    core = create_app(Settings(tmp_path/'hub.db', AuthSettings('h','c',claude_token='cl'), config), github_client=Provider(), event_feed=Feed())
+    pair = HubFrontends(core, access_verifier=checker)
+    now = int(time.time())
+    def token(subject):
+        return jwt.encode({'iss':config.cloudflare_issuer, 'aud':['aud'], 'sub':subject, 'email':'owner@example.com',
+                           'type':'app', 'iat':now-1, 'exp':now+120}, key, algorithm='RS256', headers={'kid':'fixture'})
+    good, bad = token('subject'), token('other')
+    async with pair.lifespan():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=pair.browser), base_url=config.origin, follow_redirects=False) as c:
+            headers = {'CF-Access-Jwt-Assertion':good}
+            login = await c.get('/api/hub/v1/auth/login', headers=headers)
+            assert login.status_code == 302
+            state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+            assert (await c.get('/api/hub/v1/auth/callback', params={'state':state,'code':'ok'}, headers=headers)).status_code == 303
+            me = (await c.get('/api/hub/v1/auth/me', headers=headers)).json()
+            assert me['authenticated'] and me['actor'].startswith('human:cf:') and me['github_id'] == 123
+            assert (await c.post('/api/hub/v1/auth/logout', headers=headers)).status_code == 403
+            assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':bad})).json()['authenticated'] is False
+            assert (await c.post('/api/hub/v1/auth/logout', headers={**headers,'Origin':config.origin,'X-Hub-CSRF':me['csrf_token']})).status_code == 200
+            assert not (await c.get('/api/hub/v1/auth/me', headers=headers)).json()['authenticated']
+
+
+def test_deployment_v3_explicit_and_incomplete_denied(tmp_path, monkeypatch):
+    import json
+    from engineering_hub.deployment_config import load_deployment_config
+    path = tmp_path/'settings.json'
+    document = {'schema_version':3,'base_url':'https://hub.example',
+        'cloudflare_access':{'issuer':'https://fixture.cloudflareaccess.com','audience':'aud','allowed_emails':['owner@example.com']},
+        'agent_allowed_hosts':['localhost'], 'agent_allowed_ips':['127.0.0.1'],
+        'human_auth':{'mode':'github_cloudflare','github_client_id':'id','github_id':123,'access_subject':'subject'}}
+    path.write_text(json.dumps(document))
+    monkeypatch.delenv('HUB_GITHUB_CLIENT_SECRET', raising=False)
+    with pytest.raises(ValueError):
+        load_deployment_config(path)
+    monkeypatch.setenv('HUB_GITHUB_CLIENT_SECRET', 'fixture-secret')
+    config = load_deployment_config(path)
+    assert config.auth_config.human_auth_mode == 'github_cloudflare'
+    assert config.auth_config.beau_github_id == 123
+    document['human_auth']['unexpected'] = 'reject'
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError):
+        load_deployment_config(path)

@@ -295,9 +295,9 @@ def _bound_access(request, config):
     return require_enrolled_access(request, config.cloudflare_config, config.bound_access_subject)
 
 
-def _bound_store(store):
+def _bound_store(store, *, initialize=False):
     from .bound_oauth_draft import BoundOAuthDraftStore
-    return BoundOAuthDraftStore(store)
+    return BoundOAuthDraftStore(store, initialize=initialize)
 
 
 def human_session(request: Request, config: AuthConfig, store: SessionStore):
@@ -306,8 +306,13 @@ def human_session(request: Request, config: AuthConfig, store: SessionStore):
     if config.human_auth_mode == 'github_cloudflare':
         try:
             identity = _bound_access(request, config)
-            return _bound_store(store).session_for(request.cookies.get(config.cookie_name),
+            session = _bound_store(store).session_for(request.cookies.get(config.cookie_name),
                 config.cloudflare_issuer, config.cloudflare_audience, identity.subject, config.beau_github_id)
+            # Preserve the verified existing Access principal, with GitHub as an
+            # independently verified additional login requirement.
+            if session is not None:
+                session['actor'] = identity.actor
+            return session
         except (ValueError, PermissionError):
             return None
     if config.human_auth_mode == "cloudflare_access":
@@ -363,6 +368,8 @@ class GitHubIdentityProvider:
 def build_auth_router(settings, auth_store: SessionStore, github_client=None):
     config = settings if isinstance(settings, AuthConfig) else settings.auth_config
     provider = github_client or GitHubIdentityProvider(config)
+    if config.human_auth_mode == "github_cloudflare":
+        _bound_store(auth_store, initialize=True)
     router = APIRouter(prefix="/api/hub/v1/auth", tags=["human-auth"])
     state_cookie = config.cookie_name + "_oauth"
     signed_out_cookie = config.cookie_name + "_signed_out"

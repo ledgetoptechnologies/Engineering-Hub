@@ -25,8 +25,10 @@ def _binding(issuer, audience, subject, github_id):
 
 class BoundOAuthDraftStore:
     """Use existing SessionStore transaction/owner; no separate database."""
-    def __init__(self, store):
+    def __init__(self, store, *, initialize=True):
         self.store = store
+        if not initialize:
+            return
         with store._db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS auth_bound_oauth_states (state_hash TEXT PRIMARY KEY, verifier TEXT NOT NULL, binding TEXT NOT NULL, expires REAL NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS auth_bound_oauth_sessions (token_hash TEXT PRIMARY KEY, binding TEXT NOT NULL, github_id INTEGER NOT NULL, csrf_token TEXT NOT NULL, expires REAL NOT NULL)')

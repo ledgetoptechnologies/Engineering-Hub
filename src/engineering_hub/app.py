@@ -86,7 +86,7 @@ class Settings:
         if self.ingress_mode not in {"combined", "agents", "browser"}:
             raise ValueError("Unknown Hub ingress mode")
         if self.ingress_mode == "browser" and (
-                self.auth_config.human_auth_mode != "cloudflare_access"
+                self.auth_config.human_auth_mode not in {"cloudflare_access", "github_cloudflare"}
                 or self.auth_config.cloudflare_config is None):
             raise ValueError("Browser ingress requires configured Cloudflare Access")
         # Operator templates must never become usable public bearer credentials.
@@ -235,7 +235,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         from .cloudflare_access import CloudflareAccessVerifier
         if (type(access_verifier) is not CloudflareAccessVerifier
                 or settings.auth_config is None
-                or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                 or access_verifier.config != settings.auth_config.cloudflare_config
                 or settings.ingress_mode != 'combined'):
             raise ValueError('explicit_access_verifier_binding_required')
@@ -297,7 +297,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     or connection_config.origin != settings.auth_config.origin
                     or (connection_config.environment == 'production'
                         and (not settings.auth_config.secure
-                             or settings.auth_config.human_auth_mode != 'cloudflare_access'
+                             or settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                              or not connection_config.owner.startswith('human:cf:')
                              or not settings.agent_auth.allowed_ips
                              or hub_state_root not in session_database.parents))

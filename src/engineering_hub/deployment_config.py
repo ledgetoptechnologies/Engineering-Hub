@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ipaddress
 import json
+import os
 from pathlib import Path
 
 from .auth import AuthConfig
@@ -99,6 +100,11 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
                   'agent_allowed_hosts', 'agent_allowed_ips')
         if version == 1:
             _keys(document, common)
+        elif version == 3:
+            _keys(document, (*common, 'human_auth'))
+            _keys(document['human_auth'], ('mode', 'github_client_id', 'github_id', 'access_subject'))
+            if document['human_auth']['mode'] != 'github_cloudflare':
+                raise ValueError(_ERROR)
         elif version == 2:
             _keys(document, (*common, 'storage'))
             _keys(document['storage'], ('layout',))
@@ -116,10 +122,20 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
             if type(value) is not str or not value:
                 raise ValueError(_ERROR)
         emails = _strings(access["allowed_emails"])
-        auth = AuthConfig(document["base_url"], human_auth_mode="cloudflare_access",
-                          cloudflare_issuer=access["issuer"],
-                          cloudflare_audience=access["audience"],
-                          cloudflare_allowed_emails=emails)
+        common_auth = dict(cloudflare_issuer=access['issuer'], cloudflare_audience=access['audience'],
+                           cloudflare_allowed_emails=emails)
+        if version == 3:
+            human = document['human_auth']
+            if (type(human['github_client_id']) is not str or not human['github_client_id']
+                    or type(human['github_id']) is not int or human['github_id'] <= 0
+                    or type(human['access_subject']) is not str or not human['access_subject']):
+                raise ValueError(_ERROR)
+            auth = AuthConfig(document['base_url'], human_auth_mode='github_cloudflare',
+                              github_client_id=human['github_client_id'],
+                              github_client_secret=os.environ.get('HUB_GITHUB_CLIENT_SECRET', ''),
+                              beau_github_id=human['github_id'], bound_access_subject=human['access_subject'], **common_auth)
+        else:
+            auth = AuthConfig(document['base_url'], human_auth_mode='cloudflare_access', **common_auth)
         if auth.cloudflare_config is None:
             raise ValueError(_ERROR)
         hosts = _strings(document["agent_allowed_hosts"])
