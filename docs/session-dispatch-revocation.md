@@ -89,8 +89,12 @@ DB, so the lock order is never inverted.
 
 - **No open gate covers the subject:** revoke immediately, exactly as today.
 - **An open gate covers the subject:** don't touch the frozen row. Insert an
-  immutable pending row `(scope, subject, actor, requested_at)` and audit
-  `X.revocation_pending`. The API reports `state: revocation_pending, reason:
+  immutable pending row
+  `session_dispatch_pending(revocation_id PRIMARY KEY, scope, subject,
+  subject_revision, actor, requested_at)`, with a fresh unique `revocation_id`
+  per revoke request, and audit `X.revocation_pending`. Several pending rows may
+  exist for the same subject over time (repeat revokes, revoke after a regrant);
+  "pending" means at least one row for the subject with no completion row. The API reports `state: revocation_pending, reason:
   dispatch_in_flight`. `_invalidate` still runs, so live transports drop.
 
 Scope rules:
@@ -121,18 +125,35 @@ observation, or the supervisor's signed `expired_unconsumed` statement), a
 resolver runs in session-then-Hub order:
 
 1. Session `BEGIN IMMEDIATE`.
-2. Hub read transaction: the barrier for (job_id, barrier_id) is terminal; its
-   evidence verifies against the pinned supervisor keys; the job, barrier,
-   challenge and recorded session/installation/grant revisions match the gate.
+2. Hub read transaction, opened after the session writer and **held until the
+   session commit returns**, so the Hub's terminal data can't change before
+   completion is recorded. Inside it:
+   - the barrier for (job_id, barrier_id) is terminal, and its terminal evidence
+     is permanent and immutable in the Hub (trigger-protected, never deleted or
+     replaced);
+   - the exact signed supervisor bytes (inspection observation, or
+     `expired_unconsumed` statement) are re-verified here against the
+     separately enrolled supervisor key and executor pin. A stored hash is only
+     a reference, never proof of authenticity;
+   - the signed barrier, challenge, counter, boot id, command and reservation
+     receipt match the barrier row and the gate, and the recorded
+     session/installation/grant revisions match the gate;
+   - an `expired_unconsumed` statement resolves only the gate whose barrier
+     references that exact retired reservation (command_id, counter, receipt
+     sha256) and challenge; it never resolves a different attempt.
 3. Mark the gate `resolved` with the evidence hash.
-4. For every pending row whose subject now has no open gate, apply the deferred
-   revocation in the same session transaction: set `revoked_at` (cascading to
-   sessions for an installation, or revoking the grant), bump revisions, audit
-   `X.revoked`, and record completion in an immutable
-   `session_dispatch_pending_completed(scope, subject, completed_at, gate
-   evidence)` table (pending rows stay immutable).
-5. End the Hub read; commit the session transaction; then run `_invalidate`
-   for any sessions revoked.
+4. For every uncompleted pending revocation whose subject no longer has any
+   open gate, apply the deferred revocation in the same session transaction:
+   set `revoked_at` (cascading to sessions for an installation, or revoking the
+   grant), bump revisions, audit `X.revoked`, and insert an immutable
+   completion row `session_dispatch_pending_completed(revocation_id PRIMARY KEY,
+   completed_at, resolving gate (job_id, barrier_id), evidence sha256)`.
+   Pending rows stay immutable.
+   - An installation revocation completes only when **every** open gate on any
+     session of that installation is resolved, not just the one being resolved
+     now.
+5. Commit the session transaction, then end the Hub read; then run
+   `_invalidate` for any sessions revoked.
 
 - **Idempotent:** an already-resolved gate or a completed pending row is a
   no-op, and crashes between steps are retried.
@@ -189,6 +210,18 @@ Neither halts work already sent; that is the executor effect fence's job.
   updates work.
 - Retry of the same job needs a new barrier_id; staging refuses it under a
   revoked or pending subject.
+- Simultaneous scopes: session, installation and grant revocations pending
+  together over several gates on several sessions; each completes only when all
+  of its own gates resolve; the installation cascade waits for every gate.
+- Repeat revokes and revoke-after-regrant: each gets its own revocation_id and
+  completes independently; a completed revocation never blocks a later grant
+  revision.
+- Resolution authenticity: a correct evidence hash with tampered or unsigned
+  bytes, a different supervisor key, a different pin, or a signed statement for
+  another reservation, challenge, counter or boot leaves the gate open.
+- The Hub's terminal barrier data changing between check and session commit is
+  impossible while the Hub read is held (deterministic test that a Hub writer
+  blocks until the session commit returns).
 - Lazy expiry of a frozen session refuses new use but keeps the gate open.
 - Trigger tests: gate insert once, single transition, no delete or replace;
   pending and completion rows immutable; freeze only while a gate is open.
