@@ -29,7 +29,7 @@ describe("routes", () => {
   });
   it.each([
     ["#decisions", "inbox"], ["#work", "work"], ["#notes", "notes"], ["#agents", "agents"],
-    ["#staging", "staging"], ["#software-queue", "staging"],
+    ["#staging", "staging"], ["#software-queue", "staging-queues"],
   ])("keeps old single-page anchor %s working", (hash, page) => {
     expect(parseRoute(hash).page).toBe(page);
   });
@@ -67,4 +67,43 @@ describe("orchestration routes", () => {
     expect(parseRoute(pathOf(route))).toEqual(route);
     expect(pathOf({ page: "orchestration" })).toBe("/orchestration");
   });
+});
+
+describe("section sub-page routes", () => {
+  it.each([
+    ["/agents/installations", { page: "agent-installations" }],
+    ["#/agents/installations", { page: "agent-installations" }],
+    ["/staging/queues", { page: "staging-queues" }],
+    ["#/staging/resources", { page: "staging-resources" }],
+  ])("parses %s", (value, route) => {
+    expect(parseRoute(value)).toEqual(route);
+  });
+  it("round-trips every sub-page", () => {
+    const routes: Route[] = [{ page: "agent-installations" }, { page: "staging-queues" }, { page: "staging-resources" }];
+    for (const route of routes) expect(parseRoute(pathOf(route))).toEqual(route);
+  });
+  // Every address that worked before the sidebar gained sub-pages still lands on the same place, or on the sub-page that now holds it.
+  it.each([
+    ["/agents", { page: "agents" }],
+    ["#/agents", { page: "agents" }],
+    ["/staging", { page: "staging" }],
+    ["#/staging", { page: "staging" }],
+    ["#software-queue", { page: "staging-queues" }],
+    ["/work", { page: "work" }],
+    ["/inbox", { page: "inbox" }],
+    ["/notes", { page: "notes" }],
+    ["/planning", { page: "planning" }],
+    ["/infrastructure", { page: "infrastructure" }],
+    ["/infrastructure/build-pc", { page: "device", id: "build-pc" }],
+    ["/orchestration", { page: "orchestration" }],
+    ["/projects/treedar/decisions", { page: "project", id: "treedar", tab: "decisions" }],
+    ["/projects/treedar/notes", { page: "project", id: "treedar", tab: "notes" }],
+    ["/projects/treedar/labeling", { page: "project", id: "treedar", tab: "labeling" }],
+  ])("keeps old address %s working", (value, route) => {
+    expect(parseRoute(value)).toEqual(route);
+  });
+  it.each(["/agents/unknown", "/agents/installations/x", "/staging/nope", "/staging/queues/x"])(
+    "falls back to the section overview for an unknown sub-page: %s", (value) => {
+      expect(["agents", "staging"]).toContain(parseRoute(value).page);
+    });
 });

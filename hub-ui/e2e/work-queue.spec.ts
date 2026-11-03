@@ -157,7 +157,7 @@ test("inbox does not present old queue details when workspace is stale", async (
 
 test("held queue is visible without implying executor readiness; explicit refresh only reads", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Not configured — claims are closed", { exact: false })).toBeVisible();
   await expect(panel.getByText("Reconciliation required — machine reservation remains held.", { exact: true })).toBeVisible();
@@ -223,7 +223,7 @@ test("reports pause without claiming an unpaused executor is running", async ({ 
 
 test("queue becoming unavailable clears old rows instead of showing an empty healthy queue", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Job " + jobId, { exact: false })).toBeVisible();
   state.queueStatus = 423;
@@ -236,7 +236,7 @@ test("queue becoming unavailable clears old rows instead of showing an empty hea
 
 test("queue authentication loss removes the entire private workspace", async ({ page }) => {
   const state = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Job " + jobId, { exact: false })).toBeVisible();
   state.queueStatus = 401;

@@ -18,7 +18,10 @@ export type Route =
   | { page: "notes" }
   | { page: "planning" }
   | { page: "agents" }
+  | { page: "agent-installations" }
   | { page: "staging" }
+  | { page: "staging-queues" }
+  | { page: "staging-resources" }
   | { page: "infrastructure" }
   | { page: "device"; id: string }
   // Demo-only until the orchestration backend exists; App gates it with orchestrationEnabled().
@@ -37,7 +40,8 @@ const legacy: Record<string, Route> = {
   planning: { page: "planning" },
   agents: { page: "agents" },
   staging: { page: "staging" },
-  "software-queue": { page: "staging" },
+  // The validation queue now lives on the staging queues sub-page.
+  "software-queue": { page: "staging-queues" },
 };
 
 // Guards belong to mounted editors only. Removing one (including on auth loss)
@@ -77,8 +81,12 @@ export function parseRoute(value: string): Route {
     case "work": return { page: "work" };
     case "notes": return { page: "notes" };
     case "planning": return { page: "planning" };
-    case "agents": return { page: "agents" };
-    case "staging": return { page: "staging" };
+    case "agents":
+      return parts.length === 2 && parts[1] === "installations" ? { page: "agent-installations" } : { page: "agents" };
+    case "staging":
+      if (parts.length === 2 && parts[1] === "queues") return { page: "staging-queues" };
+      if (parts.length === 2 && parts[1] === "resources") return { page: "staging-resources" };
+      return { page: "staging" };
     case "orchestration":
       if (parts.length === 1) return { page: "orchestration" };
       return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
@@ -108,6 +116,9 @@ export function pathOf(route: Route): string {
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
     case "orchestration-request": return `/orchestration/${route.id}`;
+    case "agent-installations": return "/agents/installations";
+    case "staging-queues": return "/staging/queues";
+    case "staging-resources": return "/staging/resources";
     default: return `/${route.page}`;
   }
 }

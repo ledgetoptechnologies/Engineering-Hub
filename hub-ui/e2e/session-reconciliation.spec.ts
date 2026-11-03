@@ -37,7 +37,7 @@ async function setup(page: Page, operator = true) {
 
 test("operator opens only the retained staging session without submitting a job", async ({ page }) => {
   const writes = await setup(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Staging session reconciliation" });
   await expect(panel.getByText("Synthetic browser test: operator must check actual host inventory.")).toBeVisible();
   await expect(panel.getByRole("button", { name: "Accept staging session only" })).toBeEnabled();
@@ -50,7 +50,7 @@ test("operator opens only the retained staging session without submitting a job"
 
 test("nonoperator denial keeps the human signed in and offers no acceptance", async ({ page }) => {
   const writes = await setup(page, false);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Staging session reconciliation" });
   await expect(panel.getByRole("alert")).toContainText("designated staging operator");
   await expect(panel.getByRole("button", { name: "Accept staging session only" })).toBeDisabled();
@@ -63,7 +63,7 @@ test("nonoperator denial keeps the human signed in and offers no acceptance", as
 test("phone review can decline without overflow or another acceptance", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const writes = await setup(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Staging session reconciliation" });
   await expect(panel.getByRole("button", { name: "Decline session" })).toBeEnabled();
   await panel.getByRole("button", { name: "Decline session" }).click();

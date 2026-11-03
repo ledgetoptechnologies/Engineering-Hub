@@ -59,7 +59,7 @@ const panel = (page: Page) => page.getByRole("region", { name: "Staging resource
 
 test("lists what staging keeps, with expiry, protection and unknown sizes stated plainly", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const rows = panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem");
   await expect(rows).toHaveCount(7);
   const rollback = rows.filter({ hasText: "Protected: rollback copy" });
@@ -74,7 +74,7 @@ test("lists what staging keeps, with expiry, protection and unknown sizes stated
 
 test("keep 7 more days and pin send CSRF, the seen revision and a required reason", async ({ page }) => {
   const { state } = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const rows = panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem");
   const workspace = rows.filter({ hasText: "Workspace" }).filter({ hasText: "1.2 GB" });
   await workspace.getByRole("button", { name: "Keep 7 more days" }).click();
@@ -95,7 +95,7 @@ test("keep 7 more days and pin send CSRF, the seen revision and a required reaso
 
 test("a conflicting change is explained and the list is re-read, not overwritten", async ({ page }) => {
   const { state } = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   state.conflictNext = true;
   const rows = panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem");
   await rows.filter({ hasText: "Test run" }).getByRole("button", { name: "Keep 7 more days" }).click();
@@ -105,7 +105,7 @@ test("a conflicting change is explained and the list is re-read, not overwritten
 
 test("cleanup shows its plan first, removes only what it listed and reports a skip honestly", async ({ page }) => {
   const { state } = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await panel(page).getByRole("button", { name: "Clean up staging…" }).click();
   const dialog = page.getByRole("dialog", { name: "Clean up staging" });
   await expect(dialog).toContainText("Will remove 1 preview and 1 workspace (1.2 GB).");
@@ -125,7 +125,7 @@ test("cleanup shows its plan first, removes only what it listed and reports a sk
 
 test("cancelling cleanup removes nothing", async ({ page }) => {
   const { state } = await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await panel(page).getByRole("button", { name: "Clean up staging…" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
   expect(state.posts.filter((post) => post.path.endsWith("/apply"))).toEqual([]);
@@ -134,14 +134,14 @@ test("cancelling cleanup removes nothing", async ({ page }) => {
 
 test("a Hub without staging resources says so and offers no cleanup", async ({ page }) => {
   await fixture(page, { unsupported: true });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await expect(panel(page)).toContainText("This Hub doesn't have staging resources yet.");
   await expect(panel(page).getByRole("button", { name: "Clean up staging…" })).toBeDisabled();
 });
 
 test("demo mode works without any staging API and says it's illustrative", async ({ page }) => {
   await page.route("**/api/hub/v1/staging/**", (route) => route.abort());
-  await page.goto("/?demo=1#/staging");
+  await page.goto("/?demo=1#/staging/resources");
   await expect(panel(page)).toContainText("Demo: illustrative items only.");
   await expect(panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem")).toHaveCount(7);
 });
@@ -149,14 +149,14 @@ test("demo mode works without any staging API and says it's illustrative", async
 test("fits a phone screen", async ({ page }) => {
   await fixture(page);
   await page.setViewportSize({ width: 375, height: 812 });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await expect(panel(page).getByRole("listitem")).toHaveCount(7);
   expect(blocking(await audit(page, "page", 375))).toEqual([]);
 });
 
 test("without a preview address, opening a preview says so and shows no frame", async ({ page }) => {
   await fixture(page);
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const preview = panel(page).getByRole("listitem").filter({ hasText: "Preview" }).filter({ hasText: "Engineering Hub" });
   await preview.getByRole("button", { name: "Open preview" }).click();
   await expect(panel(page).getByRole("alert")).toHaveText(/the separate preview address hasn't been set up/);
@@ -165,7 +165,7 @@ test("without a preview address, opening a preview says so and shows no frame", 
 
 test("a preview URL on the dashboard's own origin is refused", async ({ page }) => {
   await fixture(page, { previewUrl: "http://127.0.0.1:5174/preview/x/" });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await panel(page).getByRole("listitem").filter({ hasText: "Engineering Hub" }).getByRole("button", { name: "Open preview" }).first().click();
   await expect(panel(page).getByRole("alert")).toBeVisible();
   await expect(page.locator("iframe")).toHaveCount(0);
@@ -190,7 +190,7 @@ test("a preview runs in an opaque sandbox on its own origin: ES modules and JSON
     return route.fulfill({ headers, contentType: "text/html", body: `<!doctype html><p id="out">loading</p><script type="module" src="./app.js"></script>` });
   });
   await fixture(page, { previewUrl: `${previewOrigin}/t/ticket123/` });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await panel(page).getByRole("listitem").filter({ hasText: "Engineering Hub" }).getByRole("button", { name: "Open preview" }).first().click();
   const dialog = page.getByRole("dialog", { name: "Preview for Engineering Hub" });
   const frame = dialog.locator("iframe");
@@ -206,7 +206,7 @@ test("a preview runs in an opaque sandbox on its own origin: ES modules and JSON
 
 test("the service status line never claims readiness the server didn't report", async ({ page }) => {
   await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: { "engineering-hub": ["vite-build"] }, previews_configured: false } });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const line = panel(page).locator(".staging-status");
   await expect(line).toContainText("Staging PC reachable. 1 project has build or test recipes you can use.");
   await expect(line).toContainText("the separate preview address hasn't been set up");
@@ -214,7 +214,7 @@ test("the service status line never claims readiness the server didn't report", 
 
 test("an unset-up service says so, and a failed status read says unknown without hiding the list", async ({ page }) => {
   await fixture(page, { status: { configured: false, running: false, reachable: false, profiles: {}, state: "not_configured" } });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await expect(panel(page).locator(".staging-status")).toContainText("Service not ready");
   await expect(panel(page).locator(".staging-status")).toContainText("The staging service isn't set up yet.");
   await page.unrouteAll({ behavior: "ignoreErrors" });
@@ -228,7 +228,7 @@ test("a refusal to pin is explained and doesn't sign you out", async ({ page }) 
   await fixture(page);
   await page.route("**/api/hub/v1/staging/resources/*/keep", (route) =>
     route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: { code: "staging_admin_required" } }) }));
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const rows = panel(page).getByRole("list", { name: "Kept items" }).getByRole("listitem");
   await rows.filter({ hasText: "Test run" }).getByRole("button", { name: "Pin…" }).click();
   const dialog = page.getByRole("dialog", { name: "Pin this test run?" });
@@ -242,7 +242,7 @@ test("a Hub whose staging service isn't set up says so, not that the PC is down"
   await fixture(page, { status: { configured: false, running: false, reachable: false, previews_configured: false } });
   await page.route("**/api/hub/v1/staging/resources?*", (route) =>
     route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: { code: "staging_not_configured" } }) }));
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   await expect(panel(page)).toContainText("The staging service isn't set up yet, so nothing is being kept");
   await expect(panel(page).locator(".staging-status")).toContainText("The staging service isn't set up yet.");
   await expect(panel(page).getByRole("button", { name: "Clean up staging…" })).toBeDisabled();
@@ -257,7 +257,7 @@ test("the owner can recheck a held job: it's confirmed, says it won't re-run, an
     state.posts.push({ path: new URL(route.request().url()).pathname, body: route.request().postDataJSON(), csrf: route.request().headers()["x-hub-csrf"] });
     return route.fulfill({ contentType: "application/json", body: JSON.stringify({ job: { id: heldJob.id, state: "held" }, resource_ids: { workspace: "5ea9e000-0000-4000-8000-000000000003" }, phase: "held" }) });
   });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const held = panel(page).getByRole("group", { name: "Held staging jobs" });
   await expect(held).toContainText("1 staging job is on hold.");
   await held.getByRole("button", { name: "Recheck outcome…" }).click();
@@ -271,7 +271,7 @@ test("the owner can recheck a held job: it's confirmed, says it won't re-run, an
 
 test("someone who isn't the owner sees held jobs but no recheck control", async ({ page }) => {
   await fixture(page, { status: { configured: true, running: true, reachable: true, profiles: {}, can_reconcile: false, held_jobs: [heldJob] } });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/resources");
   const held = panel(page).getByRole("group", { name: "Held staging jobs" });
   await expect(held).toContainText("Only the Hub owner can recheck held jobs.");
   await expect(held.getByRole("button")).toHaveCount(0);
@@ -279,7 +279,7 @@ test("someone who isn't the owner sees held jobs but no recheck control", async 
 
 test("demo: rechecking the illustrative held job confirms it failed and the hold disappears", async ({ page }) => {
   await page.route("**/api/hub/v1/staging/**", (route) => route.abort());
-  await page.goto("/?demo=1#/staging");
+  await page.goto("/?demo=1#/staging/resources");
   const held = panel(page).getByRole("group", { name: "Held staging jobs" });
   await held.getByRole("button", { name: "Recheck outcome…" }).click();
   const dialog = page.getByRole("dialog");
