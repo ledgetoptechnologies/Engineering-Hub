@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -67,6 +68,31 @@ def _sqlite_error_details(exc: BaseException) -> dict[str, int | str]:
             and getattr(sqlite3, name) == code):
         result['sqlite_errorname'] = name
     return result
+
+
+# Primary result codes (low byte of an extended code) that only mean another
+# connection holds a lock right now. Extended codes such as SQLITE_BUSY_SNAPSHOT
+# (517) share the primary code. Everything else, including I/O, read-only,
+# corrupt, schema and code-less errors, remains fatal.
+_TRANSIENT_PRIMARY_CODES = {5: 'SQLITE_BUSY', 6: 'SQLITE_LOCKED'}
+
+
+def _transient_sqlite_code(exc: BaseException) -> str | None:
+    """Return the primary code name for a verified BUSY/LOCKED error, else None.
+
+    Classification uses only the integer ``sqlite_errorcode`` that sqlite3
+    attaches to the exception; message text is never inspected.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return None
+    code = _sqlite_error_details(exc).get('sqlite_errorcode')
+    if type(code) is not int:
+        return None
+    return _TRANSIENT_PRIMARY_CODES.get(code & 0xFF)
+
+
+class _StopRequested(BaseException):
+    """A stop command arrived while waiting out a transient SQLite lock."""
 
 
 class MessageCursorReader:
@@ -204,6 +230,13 @@ class SQLiteEventSource:
     from an ASGI lifespan. Startup installs every watch before taking one
     barrier-protected head snapshot. Normal operation has no timer or SQLite
     query when the inotify/eventfd descriptors are idle.
+
+    After startup, a snapshot that fails with a verified SQLITE_BUSY/LOCKED
+    primary code is retried with bounded, stop-interruptible backoff and the
+    cursor unchanged, so the later successful snapshot catches up from it.
+    That bounded wait is the only timer. Exhausting the retry budget, and every
+    other error, fails closed exactly as before. This hardens against lock
+    contention generally; it does not assert any past outage was a lock.
     """
 
     def __init__(
@@ -216,11 +249,23 @@ class SQLiteEventSource:
         read_buffer_bytes: int = 64 * 1024,
         max_flush_bytes: int = 8 * 1024 * 1024,
         on_error: Callable[[BaseException], None] | None = None,
+        transient_retry_initial_ms: int = 50,
+        transient_retry_max_ms: int = 2_000,
+        transient_retry_budget_ms: int = 30_000,
     ) -> None:
         if not sys_platform_linux():
             raise OSError("SQLiteEventSource requires Linux inotify, epoll, and eventfd")
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
+        for name, value, low, high in (
+            ("transient_retry_initial_ms", transient_retry_initial_ms, 1, 60_000),
+            ("transient_retry_max_ms", transient_retry_max_ms, 1, 60_000),
+            ("transient_retry_budget_ms", transient_retry_budget_ms, 0, 600_000),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"{name} must be an integer between {low} and {high}")
+        if transient_retry_max_ms < transient_retry_initial_ms:
+            raise ValueError("transient_retry_max_ms must be at least transient_retry_initial_ms")
         if read_buffer_bytes < _EVENT_HEADER.size:
             raise ValueError("read_buffer_bytes is too small for an inotify event")
         if max_flush_bytes < read_buffer_bytes:
@@ -239,6 +284,15 @@ class SQLiteEventSource:
         self.read_buffer_bytes = read_buffer_bytes
         self.max_flush_bytes = max_flush_bytes
         self.on_error = on_error
+        # Steady-state BUSY/LOCKED snapshots are retried with capped exponential
+        # backoff until the episode budget is spent; budget 0 disables retries.
+        self.transient_retry_initial_ms = transient_retry_initial_ms
+        self.transient_retry_max_ms = transient_retry_max_ms
+        self.transient_retry_budget_ms = transient_retry_budget_ms
+        self._transient_started: float | None = None
+        self._transient_attempts = 0
+        # Flush commands received during a retry wait run after it recovers.
+        self._deferred_commands: list[tuple[str, threading.Event | None]] = []
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -260,6 +314,9 @@ class SQLiteEventSource:
             "failure_stage": None,
             "sqlite_errorcode": None,
             "sqlite_errorname": None,
+            "transient_retries": 0,
+            "transient_retrying": False,
+            "last_transient_error": None,
         }
         self._stage = "created"
         self._failure: BaseException | None = None
@@ -455,14 +512,21 @@ class SQLiteEventSource:
                         should_stop = self._run_commands()
                 if should_stop or self.failure is not None:
                     break
+        except _StopRequested:
+            pass  # A clean stop during a transient retry wait is not a failure.
         except BaseException as exc:
             self._fail(exc)
         finally:
             if not ready_signaled:
                 self._ready.set()
             self._cleanup()
+            self._set_stat("transient_retrying", False)
             self._set_stat("watcher_stopped", True)
             self._thread_done.set()
+            deferred, self._deferred_commands = self._deferred_commands, []
+            for _kind, done in deferred:
+                if done is not None:
+                    done.set()
             while True:
                 try:
                     _kind, done = self._commands.get_nowait()
@@ -474,11 +538,14 @@ class SQLiteEventSource:
     def _run_commands(self) -> bool:
         self._stage = "control_command"
         stop = False
-        while True:
-            try:
-                command, done = self._commands.get_nowait()
-            except queue.Empty:
-                break
+        while not stop:
+            if self._deferred_commands:
+                command, done = self._deferred_commands.pop(0)
+            else:
+                try:
+                    command, done = self._commands.get_nowait()
+                except queue.Empty:
+                    break
             try:
                 if command == "flush":
                     self._flush_inotify_queue()
@@ -486,6 +553,8 @@ class SQLiteEventSource:
                     stop = True
                 else:
                     raise RuntimeError(f"unknown native SQLite command {command!r}")
+            except _StopRequested:
+                stop = True
             except BaseException as exc:
                 self._fail(exc)
                 stop = True
@@ -589,7 +658,12 @@ class SQLiteEventSource:
         if dirty:
             self._reconcile(reason="inotify")
 
-    def _reconcile(self, *, reason: str) -> None:
+    def _snapshot(self) -> tuple[tuple[str, ...], int]:
+        """Read and validate one barrier-protected snapshot without side effects.
+
+        Nothing is delivered and the cursor is not advanced here, so a failure
+        at any point leaves the durable cursor intact for the next attempt.
+        """
         assert self._barrier is not None and self._reader is not None
         began = False
         try:
@@ -613,12 +687,7 @@ class SQLiteEventSource:
             self._stage = "release_write_barrier"
             self._barrier.execute("ROLLBACK")
             began = False
-            self._cursor = next_cursor
-            self._set_stat("cursor", next_cursor)
-            if selected:
-                self._stage = "publish_invalidation"
-                self.deliver(selected, next_cursor)
-                self._add_stat("deliveries")
+            return selected, next_cursor
         except BaseException:
             if began:
                 try:
@@ -626,6 +695,85 @@ class SQLiteEventSource:
                 except sqlite3.Error:
                     pass
             raise
+
+    def _reconcile(self, *, reason: str) -> None:
+        while True:
+            try:
+                selected, next_cursor = self._snapshot()
+                break
+            except sqlite3.OperationalError as exc:
+                # Startup stays fail-closed: start() has its own bounded timeout.
+                code_name = None if reason == "startup" else _transient_sqlite_code(exc)
+                if code_name is None:
+                    raise
+                self._wait_transient(exc, code_name)
+        if self._transient_started is not None:
+            # A successful snapshot ends the episode and resets the budget.
+            self._transient_started = None
+            self._transient_attempts = 0
+            self._set_stat("transient_retrying", False)
+            if self._deferred_commands:
+                self._signal_control()  # Wake the main loop for deferred flushes.
+        self._cursor = next_cursor
+        self._set_stat("cursor", next_cursor)
+        if selected:
+            self._stage = "publish_invalidation"
+            self.deliver(selected, next_cursor)
+            self._add_stat("deliveries")
+
+    def _wait_transient(self, exc: sqlite3.OperationalError, code_name: str) -> None:
+        """Back off after a BUSY/LOCKED snapshot, interruptibly via the eventfd.
+
+        Re-raises ``exc`` once the episode budget is spent so the normal fatal
+        path records it. A stop command raises ``_StopRequested`` at once;
+        flush commands are deferred until the snapshot succeeds. Inotify events
+        stay queued in the kernel and are reconciled (or fail closed, e.g. on
+        overflow or replacement) by the main loop afterwards.
+        """
+        now = time.monotonic()
+        if self._transient_started is None:
+            self._transient_started = now
+        remaining_ms = self.transient_retry_budget_ms - (now - self._transient_started) * 1000
+        if remaining_ms <= 0:
+            raise exc
+        delay_ms = min(self.transient_retry_max_ms,
+                       self.transient_retry_initial_ms * (2 ** min(self._transient_attempts, 16)),
+                       remaining_ms)
+        self._transient_attempts += 1
+        with self._condition:
+            self._stats["transient_retries"] = int(self._stats["transient_retries"] or 0) + 1
+            self._stats["transient_retrying"] = True
+            self._stats["last_transient_error"] = code_name
+            self._condition.notify_all()
+        stage = self._stage
+        self._stage = "transient_retry_wait"
+        assert self._event_fd is not None
+        poller = select.poll()
+        poller.register(self._event_fd, select.POLLIN)
+        deadline = time.monotonic() + delay_ms / 1000
+        while True:
+            wait_ms = (deadline - time.monotonic()) * 1000
+            if wait_ms <= 0:
+                break
+            if not poller.poll(max(1, int(wait_ms + 0.999))):
+                continue
+            try:
+                os.eventfd_read(self._event_fd)
+            except BlockingIOError:
+                pass
+            if self.failure is not None:
+                raise _StopRequested()  # Already failed closed elsewhere; just exit.
+            while True:
+                try:
+                    command, done = self._commands.get_nowait()
+                except queue.Empty:
+                    break
+                if command == "stop":
+                    if done is not None:
+                        done.set()
+                    raise _StopRequested()
+                self._deferred_commands.append((command, done))
+        self._stage = stage
 
     def _fail(self, exc: BaseException) -> None:
         with self._condition:
