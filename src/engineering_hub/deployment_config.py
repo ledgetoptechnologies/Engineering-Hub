@@ -80,8 +80,8 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
     The configuration's parent retains settings and bus state. Version two
     explicitly selects the fixed, separately mounted existing private ledger;
     neither version creates or migrates that ledger. Version three is an
-    explicitly shared-root bound-auth configuration; it rejects a storage key.
-    Protected-ledger bound auth is not supported by this schema.
+    explicitly requires a storage layout, so changing auth cannot implicitly
+    change the selected ledger. Protected mode still requires an owned factory.
     """
     try:
         if not isinstance(path, (str, Path)):
@@ -103,10 +103,17 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
         if version == 1:
             _keys(document, common)
         elif version == 3:
-            _keys(document, (*common, 'human_auth'))
+            _keys(document, (*common, 'human_auth', 'storage'))
             _keys(document['human_auth'], ('mode', 'github_client_id', 'github_id', 'access_subject'))
-            if document['human_auth']['mode'] != 'github_cloudflare':
+            _keys(document['storage'], ('layout',))
+            if (document['human_auth']['mode'] != 'github_cloudflare'
+                    or document['storage']['layout'] not in ('shared-root-v1', 'protected-ledger-v1')):
                 raise ValueError(_ERROR)
+            if document['storage']['layout'] == 'protected-ledger-v1':
+                from .protected_layout import database_path
+                private_root = database_path().parent
+                if selected.parent == private_root or private_root in selected.parent.parents:
+                    raise ValueError(_ERROR)
         elif version == 2:
             _keys(document, (*common, 'storage'))
             _keys(document['storage'], ('layout',))
@@ -148,7 +155,8 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
                 raise ValueError(_ERROR)
         if len(set(ips)) != len(ips):
             raise ValueError(_ERROR)
-        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips), version == 2)
+        return DeploymentConfig(selected.parent, auth, hosts, frozenset(ips),
+                                version == 2 or (version == 3 and document['storage']['layout'] == 'protected-ledger-v1'))
     except (OSError, ValueError, TypeError, RecursionError):
         # Do not echo paths, parser fragments, rejected keys, or file contents.
         raise ValueError(_ERROR) from None

@@ -146,6 +146,7 @@ async def test_full_hub_frontdoors_bound_signin_and_csrf(tmp_path):
             expected_actor = 'human:cf:' + hashlib.sha256((config.cloudflare_issuer + '\0' + config.cloudflare_audience + '\0subject').encode()).hexdigest()
             assert me['authenticated'] and me['actor'] == expected_actor and me['github_id'] == 123
             assert (await c.post('/api/hub/v1/auth/logout', headers=headers)).status_code == 403
+            assert (await c.post('/api/hub/v1/auth/logout', headers={**headers,'Origin':'https://evil.example','X-Hub-CSRF':me['csrf_token']})).status_code == 403
             assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':bad})).json()['authenticated'] is False
             assert (await c.post('/api/hub/v1/auth/logout', headers={**headers,'Origin':config.origin,'X-Hub-CSRF':me['csrf_token']})).status_code == 200
             assert not (await c.get('/api/hub/v1/auth/me', headers=headers)).json()['authenticated']
@@ -161,7 +162,7 @@ def test_deployment_v3_explicit_and_incomplete_denied(tmp_path, monkeypatch):
     document = {'schema_version':3,'base_url':'https://hub.example',
         'cloudflare_access':{'issuer':'https://fixture.cloudflareaccess.com','audience':'aud','allowed_emails':['owner@example.com']},
         'agent_allowed_hosts':['localhost'], 'agent_allowed_ips':['127.0.0.1'],
-        'human_auth':{'mode':'github_cloudflare','github_client_id':'id','github_id':123,'access_subject':'subject'}}
+        'storage': {'layout':'shared-root-v1'}, 'human_auth':{'mode':'github_cloudflare','github_client_id':'id','github_id':123,'access_subject':'subject'}}
     path.write_text(json.dumps(document))
     monkeypatch.delenv('HUB_GITHUB_CLIENT_SECRET', raising=False)
     with pytest.raises(ValueError):
@@ -170,13 +171,61 @@ def test_deployment_v3_explicit_and_incomplete_denied(tmp_path, monkeypatch):
     config = load_deployment_config(path)
     assert config.auth_config.human_auth_mode == 'github_cloudflare'
     assert config.auth_config.beau_github_id == 123
-    assert config.protected_ledger is False  # v3 is explicitly shared-root only
+    assert config.protected_ledger is False
     document['storage'] = {'layout':'protected-ledger-v1'}
+    path.write_text(json.dumps(document))
+    assert load_deployment_config(path).protected_ledger is True
+    del document['storage']
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError):
         load_deployment_config(path)
-    del document['storage']
+    document['storage'] = {'layout':'shared-root-v1'}
     document['human_auth']['unexpected'] = 'reject'
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError):
         load_deployment_config(path)
+
+
+def test_bound_schema_missing_partial_or_trigger_fails_closed_without_repair(tmp_path):
+    from engineering_hub.auth import SessionStore
+    from engineering_hub.bound_oauth_draft import BoundOAuthDraftStore
+    store = SessionStore(tmp_path/'hub.db')
+    BoundOAuthDraftStore(store)
+    with store._db() as db:
+        db.execute('CREATE TRIGGER hostile BEFORE DELETE ON auth_bound_oauth_sessions BEGIN SELECT RAISE(IGNORE); END')
+    with pytest.raises(ValueError):
+        BoundOAuthDraftStore(store)
+    with pytest.raises(ValueError):
+        BoundOAuthDraftStore(store, initialize=False).session_for('fixture', 'issuer', 'aud', 'subject', 123)
+    with store._db() as db:
+        db.execute('DROP TRIGGER hostile')
+        db.execute('DROP TABLE auth_bound_oauth_states')
+    with pytest.raises(ValueError):
+        BoundOAuthDraftStore(store)
+    with store._read_db() as db:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='auth_bound_oauth_states'").fetchone() is None
+
+
+def test_concurrent_oauth_state_consumption_exactly_once(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    store = BoundOAuthDraftStore(SessionStore(tmp_path/'hub.db'))
+    state, _ = store.create_state('issuer','aud','subject',123)
+    def consume():
+        return store.consume_state(state,'issuer','aud','subject',123)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(consume), pool.submit(consume)]
+        results = [f.result() for f in futures]
+    assert len([v for v in results if v is not None]) == 1
+
+
+def test_bound_sessions_are_independent_until_revoked_or_expired(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    store = BoundOAuthDraftStore(SessionStore(tmp_path/'hub.db'))
+    def login():
+        return store.create_session('issuer','aud','subject',123,123)[0]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _:login(), range(2)))
+    assert first != second
+    store.delete_session(first)
+    assert store.session_for(first,'issuer','aud','subject',123) is None
+    assert store.session_for(second,'issuer','aud','subject',123) is not None
