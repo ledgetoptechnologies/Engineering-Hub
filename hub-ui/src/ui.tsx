@@ -43,9 +43,9 @@ export function Icon({ kind, size = 18 }: { kind: IconKind; size?: number }) {
   );
 }
 
-export function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: string }) {
+export function Badge({ children, tone = "neutral", title }: { children: ReactNode; tone?: string; title?: string }) {
   return (
-    <span className={`badge ${tone}`}>
+    <span className={`badge ${tone}`} title={title}>
       <span className="dot" />
       {children}
     </span>

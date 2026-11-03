@@ -125,7 +125,7 @@ describe("installation reviews and withdrawals (fixture v2 provenance)", () => {
   it("names the reviewer and withdrawer by installation and family", () => {
     const task = wire.installation_review as unknown as Task;
     const name = (id: string, family?: string | null) => actorName(id, { family });
-    expect(waitingOn(task, name)).toBe("Review passed by Claude on install 7a207d88. Running it is separate and needs its own authorization.");
+    expect(waitingOn(task, name)).toBe("Review passed by Claude on install 7a207d88. A passed review doesn't start or authorize a run. Running it needs separate authorization, which this page doesn't show.");
     const decision = wire.mcp_withdrawn_decision;
     expect(actorName(decision.withdrawn_by, { family: decision.withdrawn_family, viewer: "human:42" })).toBe("Codex on install 88736abd");
   });

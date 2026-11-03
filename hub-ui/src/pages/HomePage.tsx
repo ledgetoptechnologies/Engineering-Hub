@@ -5,7 +5,7 @@ import { ImageVersionsPanel } from "../ImageVersionsPanel";
 import type { Hub } from "../hub";
 import { Badge, Icon, PageHeader, names } from "../ui";
 import { answeredDecisions, openDecisions, RecentAnswers } from "./decisions";
-import { statusLabel, statusTone } from "./tasks";
+import { statusLabel, statusNote, statusTone } from "./tasks";
 import { DayBars, StageBar, StageLegend, dailyCounts } from "../charts";
 
 function greeting(now = new Date()) {
@@ -102,7 +102,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
                       {hub.projectName(task.project)} · {task.owner ? actorName(task.owner, { family: task.owner_family, viewer: hub.session?.actor }) : "Unclaimed"}
                     </span>
                   </a>
-                  <Badge tone={statusTone(task)}>{statusLabel(task)}</Badge>
+                  <Badge tone={statusTone(task)} title={statusNote(task)}>{statusLabel(task)}</Badge>
                 </li>
               ))}
             </ul>
