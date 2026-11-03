@@ -105,26 +105,47 @@ consolidated handoff is accepted. Do not bypass the GitHub publication blocker.
 
 `engineering_hub.development_ci_handoff` adds an opt-in protocol on top of the
 same owned `WorkQueue`, `PilotOwner` and attempts table. Nothing enables it:
-`DurableDevelopmentCIHandoff`, `CIHostHandoff` and `enroll_host` each refuse
-unless constructed with `enable_durable_handoff=True` by operator code.
+`DurableDevelopmentCIHandoff`, `CIHostHandoff`, `enroll_host` and
+`reconcile_restored_journal` each refuse without explicit operator objects.
 
-- Host journal (separate SQLite file) states: `intent -> running ->
-  terminal_held -> finalized_reserved`, guarded by triggers (no delete, no
-  identity change, `finalized_reserved` only from `terminal_held` with a
-  64-hex `hub_ack`). `finalized_reserved` is still reserved: the host admits
-  only a Hub start whose fence exceeds every recorded fence (journal, floor and
-  the separate anchor file) once every earlier attempt is finalized.
-- Hub: `receipt_committed` verifies an authenticated read-only host inspection
-  against the original claim/attempt and stores a random `hub_ack`; after an
-  authenticated host ack, one queue transaction (`complete`, or `reconcile` for
-  a held job) releases the machine and a ledger trigger marks the handoff
-  `finalized`. A ledger trigger refuses releasing a handoff job otherwise.
-- Enrollment writes `HANDOFF_ENROLLED.json` under the engine admission lock;
-  the standalone controller then refuses to run or clear holds, and the legacy
-  `QueuedDevelopmentCI` refuses to attach to a handoff-enrolled ledger.
-- A restored journal below the anchor refuses admission until an explicit
-  operator `reconcile_restored_journal(..., operator_confirmed=True)`.
+What is enforced in source:
 
-Not supplied: an authenticated transport or keys (the default authenticator
-refuses everything, so attempts stay held), a host runner adapter around
-`scripts/local_development_ci.py`, and any activation.
+- Host journal states `intent -> running -> terminal_held -> finalized_reserved`
+  with triggers (no delete, immutable identity, `finalized_reserved` only from
+  `terminal_held` with a 64-hex `hub_ack`). The exact schema/trigger SQL is
+  validated on every open; a dropped, altered or extra trigger refuses.
+- A start is admitted only with a fence above the journal, local hint and the
+  EXTERNAL anchor, every earlier attempt `finalized_reserved`, and a Hub-signed
+  release statement for exactly the host's latest attempt tuple (the Hub signs
+  it only after its queue released that job).
+- Hub: `receipt_committed` binds the authenticated host inspection to the
+  original claim/attempt. The authenticated host ack is recorded with its
+  credential (`host_acked`) and re-verified before release; a ledger trigger
+  refuses any `succeeded`/`failed` transition of a handoff job without that
+  record. This stops old queue writers and raw SQL that do not also forge the
+  record; normal WorkQueue APIs already need a context-local completion permit.
+  A writer with raw ledger access can still forge rows; the forged ack fails
+  credential re-verification, so the Hub itself never releases on it.
+- Enrollment, start, reconciliation and `scripts/staging_ci_engine.py stop` use
+  the same validated engine `admission.lock` (current-UID 0700 directory,
+  current-UID 0600 single-link inode, name still bound) as
+  `scripts/local_development_ci.py`. While enrolled, engine stop opens the
+  journal read-only and refuses unless every attempt is `finalized_reserved`,
+  and fails closed on a missing/corrupt/mismatched journal, marker or anchor or
+  a journal below the anchor. Unenrolled hosts keep the old behaviour.
+
+What is NOT supplied (each default refuses, so attempts stay held):
+
+- An authenticated Hub<->host channel and keys (`RefusingAuthenticator`).
+- An external non-rollback anchor (`RefusingExternalAnchor`). The local JSON
+  anchor can be rolled back together with the journal and is only a hint; a
+  coordinated local rollback is undetectable without the external anchor.
+- A terminal verifier that re-inspects the original container and pinned
+  cgroup (`RefusingTerminalVerifier`). A runner's observation is not proof.
+- A host runner adapter around `scripts/local_development_ci.py`; that script
+  refuses to run while enrolled, which also blocks the not-yet-wired adapter.
+- Writer exclusion for older installed controllers (for example the installed
+  f099 build or helpers copied from PR #147): they do not read
+  `HANDOFF_ENROLLED.json`. They are excluded only while they hold the shared
+  lock; they must be uninstalled or disabled before enrollment, which requires
+  an explicit `LegacyControllersRemoved` operator attestation (not verified).

@@ -1,32 +1,42 @@
 """Disabled-by-default durable CI handoff between the Hub queue and a CI host.
 
-Nothing here is activated by import, environment, MCP or REST. Both sides must
-be constructed with ``enable_durable_handoff=True`` by trusted operator code.
+Nothing here is activated by import, environment, MCP or REST. Every entry
+point refuses unless trusted operator code passes ``enable_durable_handoff=True``
+and every external authority below is explicitly supplied. All defaults refuse.
 
-Protocol (agreed design):
+Protocol:
 
-* Host per-attempt states: ``intent -> running -> terminal_held ->
+* Host per-attempt states ``intent -> running -> terminal_held ->
   finalized_reserved``. ``finalized_reserved`` is NOT free capacity; the host
-  never self-frees. The host admits a new attempt only on an authenticated Hub
-  start whose fence is strictly greater than every fence it durably recorded
-  (journal, reconciled floor and the separate non-rollback anchor) while every
-  earlier attempt is ``finalized_reserved``.
-* Hub: ``receipt_committed`` is one Hub transaction that checks the trusted,
-  authenticated host inspection against the ORIGINAL queue claim and attempt,
-  stores the receipt digest and a fresh random ``hub_ack``; the queue job stays
-  claimed/held and the machine reserved. After an authenticated host
-  ``finalized_reserved`` ack, ONE queue transaction completes the job (machine
-  release) and, through a ledger trigger, marks the handoff ``finalized``.
+  never self-frees. A new start is admitted only when (a) its fence exceeds every
+  fence known locally AND the fence confirmed by an external non-rollback anchor,
+  (b) every earlier attempt is ``finalized_reserved``, and (c) it carries a
+  Hub-signed *release* statement for exactly the host's latest attempt tuple,
+  which the Hub signs only after its queue released that job.
+* Hub: ``receipt_committed`` (one txn) binds the authenticated host inspection to
+  the ORIGINAL claim/attempt and stores a random ``hub_ack``. An authenticated
+  host ``finalized_reserved`` ack is then recorded and re-verifiable
+  (``host_acked``, with its credential). Only then can ONE queue transaction
+  release the machine; a ledger trigger marks the handoff ``finalized`` in it.
 
-No transport, key, endpoint or credential exists in this repository. Both sides
-take an explicit authenticator whose default refuses every message; until a real
-authenticated channel is enrolled every attempt stays held.
+Authorities NOT supplied by this repository (each defaults to refusing, so every
+attempt stays held until it exists): an authenticated Hub<->host channel and
+keys (``RefusingAuthenticator``), an external non-rollback fence anchor
+(``RefusingExternalAnchor``), a terminal verifier that re-inspects the original
+container and pinned cgroup (``RefusingTerminalVerifier``), and the operator
+attestation that legacy controllers are uninstalled (``enroll_host``).
+
+Writer exclusion is ONLY the shared validated engine admission flock. The
+``HANDOFF_ENROLLED.json`` marker is advisory to new code; older installed
+controllers do not read it and must be uninstalled before enrollment. Ledger
+triggers stop old queue writers and accidental SQL, not a writer with raw
+database access.
 """
 from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import inspect
 import json
@@ -35,6 +45,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -44,12 +55,12 @@ from .repository import HubError
 from .work_queue import SOFTWARE_VALIDATION_EXECUTOR, WorkTarget, WorkWorker
 
 HANDOFF_MARKER = 'HANDOFF_ENROLLED.json'
+ADMISSION_LOCK = 'admission.lock'
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}')
 _HEX64 = re.compile(r'[a-f0-9]{64}')
 _GENERATION = re.compile(r'[a-f0-9]{32}')
 _DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
 _COMMIT = re.compile(r'[a-f0-9]{40}')
-_HOST_STATES = ('intent', 'running', 'terminal_held', 'finalized_reserved')
 
 
 def receipt_digest(record):
@@ -63,13 +74,12 @@ class HandoffRefused(RuntimeError):
         self.code = code
 
 
-class RefusingAuthenticator:
-    """Default authenticator: no authenticated channel exists, so refuse.
+# --------------------------------------------------------------------------
+# External authorities: interfaces whose defaults refuse
+# --------------------------------------------------------------------------
 
-    A real implementation must bind the Hub and the enrolled host to keys that
-    are provisioned outside this repository. ``sign`` returning None means no
-    credential is available, and callers must not contact the peer.
-    """
+class RefusingAuthenticator:
+    """No authenticated channel exists: sign nothing, verify nothing."""
     def sign(self, operation, payload):
         return None
 
@@ -77,10 +87,58 @@ class RefusingAuthenticator:
         return False
 
 
-def _authenticator(value):
-    value = RefusingAuthenticator() if value is None else value
-    if not callable(getattr(value, 'sign', None)) or not callable(getattr(value, 'verify', None)):
-        raise HandoffRefused('handoff_authenticator_required')
+class RefusingExternalAnchor:
+    """No external non-rollback fence store exists.
+
+    The local JSON anchor lives beside the journal and can be rolled back with
+    it, so it is only a local hint. A real implementation must be outside the
+    host's restorable storage (e.g. a monotonic counter service).
+    ``highest_fence(generation)`` returns the authoritative int or None;
+    ``advance(generation, fence)`` returns True only once durably recorded.
+    """
+    def highest_fence(self, generation):
+        return None
+
+    def advance(self, generation, fence):
+        return False
+
+
+class RefusingTerminalVerifier:
+    """No trusted re-inspection of the original container/cgroup is wired.
+
+    ``verify(start_request, terminal)`` must independently re-inspect the exact
+    original container and pinned cgroup; a runner's report is not proof.
+    """
+    def verify(self, start_request, terminal):
+        return False
+
+
+@dataclass(frozen=True)
+class LegacyControllersRemoved:
+    """Operator attestation required by ``enroll_host``.
+
+    Installed controllers older than this change do not read the enrollment
+    marker. The operator must have uninstalled/disabled each of them; this
+    object records that statement, it does not verify it.
+    """
+    engine_directory: str
+    removed_controllers: tuple
+    attested_by: str
+
+
+@dataclass(frozen=True)
+class OperatorReconciliation:
+    """Explicit operator authorization bound to one journal and expected fence."""
+    journal_id: str
+    journal_device: int
+    journal_inode: int
+    expected_highest_fence: int
+
+
+def _authority(value, default, methods, code):
+    value = default() if value is None else value
+    if any(not callable(getattr(value, name, None)) for name in methods):
+        raise HandoffRefused(code)
     return value
 
 
@@ -89,6 +147,16 @@ def _verified(authenticator, operation, payload, credential):
         return credential is not None and authenticator.verify(operation, payload, credential) is True
     except Exception:
         return False
+
+
+def _external_fence(anchor, generation):
+    try:
+        value = anchor.highest_fence(generation)
+    except Exception:
+        value = None
+    if type(value) is not int or value < 0:
+        raise HandoffRefused('handoff_external_anchor_unavailable')
+    return value
 
 
 def _plain(value):
@@ -120,8 +188,22 @@ def _terminal(value):
     return _plain(value)
 
 
+_RELEASE_KEYS = {'attempt_id', 'generation', 'fence', 'receipt_digest', 'hub_ack', 'state'}
+
+
+def _release(value):
+    if (type(value) is not dict or set(value) != _RELEASE_KEYS or value['state'] != 'released'
+            or not isinstance(value['attempt_id'], str) or not _ID.fullmatch(value['attempt_id'])
+            or not isinstance(value['generation'], str) or not _GENERATION.fullmatch(value['generation'])
+            or not _int(value['fence'], 1)
+            or not isinstance(value['receipt_digest'], str) or not _DIGEST.fullmatch(value['receipt_digest'])
+            or not isinstance(value['hub_ack'], str) or not _HEX64.fullmatch(value['hub_ack'])):
+        raise HandoffRefused('handoff_request_invalid')
+    return value
+
+
 def _start_request(value):
-    keys = {'attempt_id', 'job_id', 'fence', 'generation', 'manifest_digest', 'source_commit'}
+    keys = {'attempt_id', 'job_id', 'fence', 'generation', 'manifest_digest', 'source_commit', 'prior_release'}
     if (type(value) is not dict or set(value) != keys
             or not isinstance(value['attempt_id'], str) or not _ID.fullmatch(value['attempt_id'])
             or not isinstance(value['job_id'], str) or not _ID.fullmatch(value['job_id'])
@@ -130,6 +212,11 @@ def _start_request(value):
             or not isinstance(value['manifest_digest'], str) or not _DIGEST.fullmatch(value['manifest_digest'])
             or not isinstance(value['source_commit'], str) or not _COMMIT.fullmatch(value['source_commit'])):
         raise HandoffRefused('handoff_request_invalid')
+    prior = value['prior_release']
+    if prior is not None:
+        if type(prior) is not dict or set(prior) != {'release', 'credential'}:
+            raise HandoffRefused('handoff_request_invalid')
+        _release(prior['release'])
     return _plain(value)
 
 
@@ -145,6 +232,84 @@ def _finalize_request(value):
     return _plain(value)
 
 
+def _statements(schema):
+    return [statement.strip() for statement in schema.split(';\n') if statement.strip()]
+
+
+def _reference_schema(schema, prelude=()):
+    """Exact (type, name, table, sql) rows SQLite records for our objects."""
+    db = sqlite3.connect(':memory:')
+    try:
+        for statement in prelude:
+            db.execute(statement)
+        before = {row[0] for row in db.execute('SELECT name FROM sqlite_master')}
+        for statement in _statements(schema):
+            db.execute(statement)
+        return {tuple(row) for row in db.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('table','trigger')")
+            if row[1] not in before}
+    finally:
+        db.close()
+
+
+def _schema_matches(db, expected):
+    names = {row[1] for row in expected}
+    tables = {row[1] for row in expected if row[0] == 'table'}
+    actual = {tuple(row) for row in db.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('table','trigger')")}
+    ours = {row for row in actual if row[1] in names}
+    # Any extra trigger on our own tables could rewrite guarded rows.
+    foreign = {row for row in actual if row[0] == 'trigger' and row[2] in tables and row[1] not in names}
+    return ours == expected and not foreign
+
+
+# --------------------------------------------------------------------------
+# Shared validated engine admission lock
+# --------------------------------------------------------------------------
+
+@contextmanager
+def engine_admission_lock(engine_directory):
+    """The SAME lock file and checks as scripts/local_development_ci.private_lock
+    and scripts/staging_ci_engine.admission_lock: private current-UID 0700
+    engine directory, regular current-UID 0600 single-link inode whose name
+    still resolves to the locked inode. Non-blocking; refusal on contention.
+    """
+    import fcntl  # Linux host only; there is deliberately no Windows fallback.
+    engine = Path(engine_directory)
+    parent = fd = None
+    try:
+        parent = os.open(engine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        directory = os.fstat(parent)
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+                or stat.S_IMODE(directory.st_mode) != 0o700):
+            raise HandoffRefused('handoff_admission_lock_invalid')
+        fd = os.open(ADMISSION_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                     dir_fd=parent)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise HandoffRefused('handoff_admission_lock_invalid')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise HandoffRefused('handoff_host_busy') from None
+        named = os.stat(ADMISSION_LOCK, dir_fd=parent, follow_symlinks=False)
+        current = engine.lstat()
+        if ((named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+                or (current.st_dev, current.st_ino) != (directory.st_dev, directory.st_ino)):
+            raise HandoffRefused('handoff_admission_lock_invalid')
+        yield
+    except HandoffRefused:
+        raise
+    except OSError:
+        raise HandoffRefused('handoff_admission_lock_invalid') from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent is not None:
+            os.close(parent)
+
+
 # --------------------------------------------------------------------------
 # Host side
 # --------------------------------------------------------------------------
@@ -155,7 +320,8 @@ CREATE TABLE handoff_meta (
 CREATE TABLE handoff_attempts (
     attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, fence INTEGER NOT NULL UNIQUE,
     generation TEXT NOT NULL, manifest_digest TEXT NOT NULL, source_commit TEXT NOT NULL,
-    state TEXT NOT NULL, receipt_id TEXT, receipt_digest TEXT, terminal TEXT, hub_ack TEXT);
+    state TEXT NOT NULL, receipt_id TEXT, receipt_digest TEXT, terminal TEXT, hub_ack TEXT,
+    hub_release TEXT);
 CREATE TRIGGER handoff_meta_guard BEFORE UPDATE ON handoff_meta
 WHEN NEW.generation IS NOT OLD.generation OR NEW.floor_fence < OLD.floor_fence
 BEGIN SELECT RAISE(ABORT,'handoff_meta_immutable'); END;
@@ -163,7 +329,7 @@ CREATE TRIGGER handoff_meta_delete BEFORE DELETE ON handoff_meta
 BEGIN SELECT RAISE(ABORT,'handoff_meta_immutable'); END;
 CREATE TRIGGER handoff_insert_guard BEFORE INSERT ON handoff_attempts
 WHEN NEW.state IS NOT 'intent' OR NEW.receipt_id IS NOT NULL OR NEW.receipt_digest IS NOT NULL
-  OR NEW.terminal IS NOT NULL OR NEW.hub_ack IS NOT NULL
+  OR NEW.terminal IS NOT NULL OR NEW.hub_ack IS NOT NULL OR NEW.hub_release IS NOT NULL
   OR NEW.generation IS NOT (SELECT generation FROM handoff_meta WHERE id=1)
 BEGIN SELECT RAISE(ABORT,'handoff_insert_refused'); END;
 CREATE TRIGGER handoff_delete_guard BEFORE DELETE ON handoff_attempts
@@ -174,15 +340,22 @@ WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.job_id IS NOT OLD.job_id
   OR NEW.manifest_digest IS NOT OLD.manifest_digest OR NEW.source_commit IS NOT OLD.source_commit
   OR NOT (
     (OLD.state='intent' AND NEW.state='running' AND NEW.receipt_id IS NULL
-      AND NEW.receipt_digest IS NULL AND NEW.terminal IS NULL AND NEW.hub_ack IS NULL)
+      AND NEW.receipt_digest IS NULL AND NEW.terminal IS NULL AND NEW.hub_ack IS NULL
+      AND NEW.hub_release IS NULL)
     OR (OLD.state='running' AND NEW.state='terminal_held' AND NEW.receipt_id IS NOT NULL
-      AND NEW.receipt_digest IS NOT NULL AND NEW.terminal IS NOT NULL AND NEW.hub_ack IS NULL)
+      AND NEW.receipt_digest IS NOT NULL AND NEW.terminal IS NOT NULL AND NEW.hub_ack IS NULL
+      AND NEW.hub_release IS NULL)
     OR (OLD.state='terminal_held' AND NEW.state='finalized_reserved'
       AND NEW.receipt_id IS OLD.receipt_id AND NEW.receipt_digest IS OLD.receipt_digest
-      AND NEW.terminal IS OLD.terminal AND NEW.hub_ack IS NOT NULL
-      AND length(NEW.hub_ack)=64 AND NEW.hub_ack NOT GLOB '*[^0-9a-f]*'))
+      AND NEW.terminal IS OLD.terminal AND NEW.hub_ack IS NOT NULL AND NEW.hub_release IS NULL
+      AND length(NEW.hub_ack)=64 AND NEW.hub_ack NOT GLOB '*[^0-9a-f]*')
+    OR (OLD.state='finalized_reserved' AND NEW.state='finalized_reserved'
+      AND NEW.receipt_id IS OLD.receipt_id AND NEW.receipt_digest IS OLD.receipt_digest
+      AND NEW.terminal IS OLD.terminal AND NEW.hub_ack IS OLD.hub_ack
+      AND OLD.hub_release IS NULL AND NEW.hub_release IS NOT NULL))
 BEGIN SELECT RAISE(ABORT,'handoff_transition_refused'); END;
 '''
+_HOST_EXPECTED = _reference_schema(_HOST_SCHEMA)
 
 
 def _fsync_directory(path):
@@ -196,22 +369,15 @@ def _fsync_directory(path):
 def _write_json_atomic(path, value, *, exclusive=False):
     path = Path(path)
     raw = json.dumps(value, sort_keys=True).encode()
-    if exclusive:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    else:
-        temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        try:
-            os.write(fd, raw)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(temporary, path)
+    target = path if exclusive else path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if not exclusive:
+        os.replace(target, path)
     _fsync_directory(path.parent)
 
 
@@ -219,46 +385,46 @@ def _read_json(path):
     path = Path(path)
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
         raise HandoffRefused('handoff_file_unavailable')
-    return json.loads(path.read_bytes())
+    value = json.loads(path.read_bytes())
+    if type(value) is not dict:
+        raise HandoffRefused('handoff_file_unavailable')
+    return value
 
 
-def _flock(path):
-    import fcntl  # Linux host only; there is deliberately no Windows fallback.
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0) | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BaseException:
-        os.close(fd)
-        raise HandoffRefused('handoff_host_busy') from None
-    return fd
-
-
-def enroll_host(journal_path, anchor_path, engine_directory, *, enable_durable_handoff=False):
+def enroll_host(journal_path, anchor_path, engine_directory, *, attestation=None,
+                enable_durable_handoff=False):
     """Explicit operator enrollment; never called by import or a Hub message.
 
-    Takes the same engine admission flock as the standalone controller, refuses
-    if that controller retained uncertain state, then writes the writer-exclusion
-    marker BEFORE creating the journal and its separate non-rollback anchor.
+    Requires an operator attestation that older controllers (which do not read
+    the marker) are uninstalled; takes the shared validated admission lock, so
+    a currently running controller makes enrollment refuse; refuses retained
+    HELD/STOPPING state.
     """
     if enable_durable_handoff is not True:
         raise HandoffRefused('handoff_disabled')
-    journal, anchor, engine = Path(journal_path), Path(anchor_path), Path(engine_directory)
-    if journal.resolve() == anchor.resolve() or os.path.lexists(journal) or os.path.lexists(anchor):
+    journal, anchor, engine = Path(journal_path).absolute(), Path(anchor_path).absolute(), Path(engine_directory)
+    if (type(attestation) is not LegacyControllersRemoved
+            or attestation.engine_directory != str(engine.absolute())
+            or type(attestation.removed_controllers) is not tuple or not attestation.removed_controllers
+            or not all(isinstance(item, str) and item for item in attestation.removed_controllers)
+            or not isinstance(attestation.attested_by, str) or not attestation.attested_by):
+        raise HandoffRefused('handoff_legacy_attestation_required')
+    if journal == anchor or os.path.lexists(journal) or os.path.lexists(anchor):
         raise HandoffRefused('handoff_already_enrolled')
-    lock = _flock(engine / 'admission.lock')
-    try:
+    with engine_admission_lock(engine):
         if any(os.path.lexists(engine / name) for name in ('HELD.json', 'STOPPING.json', HANDOFF_MARKER)):
             raise HandoffRefused('handoff_engine_not_quiescent')
         generation = secrets.token_hex(16)
         _write_json_atomic(engine / HANDOFF_MARKER, {'schema': 'engineering-hub.ci-handoff.v1',
-            'generation': generation, 'journal': str(journal)}, exclusive=True)
+            'generation': generation, 'journal_id': generation, 'journal': str(journal),
+            'anchor': str(anchor), 'legacy_controllers_removed': list(attestation.removed_controllers),
+            'attested_by': attestation.attested_by}, exclusive=True)
         db = sqlite3.connect(journal, isolation_level=None)
         try:
             db.execute('PRAGMA synchronous=FULL')
             db.execute('BEGIN IMMEDIATE')
-            for statement in _HOST_SCHEMA.split(';\n'):
-                if statement.strip():
-                    db.execute(statement)
+            for statement in _statements(_HOST_SCHEMA):
+                db.execute(statement)
             db.execute('INSERT INTO handoff_meta VALUES(1,?,0)', (generation,))
             db.execute('COMMIT')
         finally:
@@ -266,62 +432,86 @@ def enroll_host(journal_path, anchor_path, engine_directory, *, enable_durable_h
         _write_json_atomic(anchor, {'schema': 'engineering-hub.ci-handoff-anchor.v1',
                                     'generation': generation, 'highest_fence': 0}, exclusive=True)
         return generation
-    finally:
-        os.close(lock)
 
 
-def reconcile_restored_journal(journal_path, anchor_path, *, operator_confirmed=False):
+def reconcile_restored_journal(journal_path, anchor_path, engine_directory, confirmation, *,
+                               external_anchor=None):
     """Offline operator reconciliation after a journal restore. Never automatic.
 
-    The operator must already have inspected every host effect between the
-    restored journal and the anchor. This only raises the journal's floor to the
-    anchor fence so older/equal fences can never be admitted again.
+    Needs an ``OperatorReconciliation`` bound to this journal's id and inode and
+    to the fence the external anchor reports; runs under the admission lock.
+    It only raises the journal floor (and local hint) to that fence.
     """
-    if operator_confirmed is not True:
+    if type(confirmation) is not OperatorReconciliation or not _int(confirmation.expected_highest_fence):
         raise HandoffRefused('handoff_reconciliation_requires_operator')
-    anchor = _read_json(anchor_path)
-    db = sqlite3.connect(Path(journal_path).absolute().as_uri() + '?mode=rw', uri=True, isolation_level=None)
-    try:
-        db.execute('BEGIN IMMEDIATE')
-        generation, floor = db.execute('SELECT generation,floor_fence FROM handoff_meta WHERE id=1').fetchone()
-        if anchor.get('generation') != generation or not _int(anchor.get('highest_fence')):
-            db.execute('ROLLBACK')
-            raise HandoffRefused('handoff_anchor_mismatch')
-        db.execute('UPDATE handoff_meta SET floor_fence=? WHERE id=1', (max(floor, anchor['highest_fence']),))
-        db.execute('COMMIT')
-    finally:
-        db.close()
+    external = _authority(external_anchor, RefusingExternalAnchor, ('highest_fence', 'advance'),
+                          'handoff_external_anchor_unavailable')
+    journal = Path(journal_path)
+    with engine_admission_lock(engine_directory):
+        info = os.lstat(journal)
+        if (not stat.S_ISREG(info.st_mode)
+                or (info.st_dev, info.st_ino) != (confirmation.journal_device, confirmation.journal_inode)):
+            raise HandoffRefused('handoff_reconciliation_mismatch')
+        db = sqlite3.connect(journal.absolute().as_uri() + '?mode=rw', uri=True, isolation_level=None)
+        try:
+            if not _schema_matches(db, _HOST_EXPECTED):
+                raise HandoffRefused('handoff_journal_schema_invalid')
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                generation, floor = db.execute('SELECT generation,floor_fence FROM handoff_meta WHERE id=1').fetchone()
+                if (generation != confirmation.journal_id
+                        or _external_fence(external, generation) != confirmation.expected_highest_fence):
+                    raise HandoffRefused('handoff_reconciliation_mismatch')
+                fence = max(floor, confirmation.expected_highest_fence)
+                db.execute('UPDATE handoff_meta SET floor_fence=? WHERE id=1', (fence,))
+                _write_json_atomic(anchor_path, {'schema': 'engineering-hub.ci-handoff-anchor.v1',
+                                                 'generation': generation, 'highest_fence': fence})
+                db.execute('COMMIT')
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+        finally:
+            db.close()
 
 
 class CIHostHandoff:
     """Host-side journal and contract for start / inspect / finalize.
 
-    ``runner(start_request, guard)`` is the trusted host executor; it must call
-    ``guard()`` before each new effect and return the private terminal
-    observation for the ORIGINAL container and pinned cgroup. It is injected,
-    because the standalone controller has no handoff mode (see module report).
+    ``runner(start_request, guard)`` is the host executor; it must call
+    ``guard()`` before each new effect. Its returned observation is NOT proof:
+    the separately supplied ``terminal_verifier`` must confirm the original
+    container and pinned cgroup, or the attempt stays ``running`` (held).
     """
     def __init__(self, journal_path, anchor_path, engine_directory, *, manifest_digest,
-                 runner, authenticator=None, enable_durable_handoff=False):
+                 runner, authenticator=None, external_anchor=None, terminal_verifier=None,
+                 enable_durable_handoff=False):
         if enable_durable_handoff is not True:
             raise HandoffRefused('handoff_disabled')
         if not isinstance(manifest_digest, str) or not _DIGEST.fullmatch(manifest_digest) or not callable(runner):
             raise HandoffRefused('handoff_host_composition_required')
-        self.journal, self.anchor = Path(journal_path), Path(anchor_path)
+        self.journal, self.anchor = Path(journal_path).absolute(), Path(anchor_path).absolute()
         self.engine = Path(engine_directory)
-        if not self.journal.is_file() or self.journal.resolve() == self.anchor.resolve():
+        if not self.journal.is_file() or self.journal == self.anchor:
             raise HandoffRefused('handoff_not_enrolled')
         self.manifest_digest, self.runner = manifest_digest, runner
-        self.authenticator = _authenticator(authenticator)
+        self.authenticator = _authority(authenticator, RefusingAuthenticator, ('sign', 'verify'),
+                                        'handoff_authenticator_required')
+        self.external_anchor = _authority(external_anchor, RefusingExternalAnchor, ('highest_fence', 'advance'),
+                                          'handoff_external_anchor_unavailable')
+        self.terminal_verifier = _authority(terminal_verifier, RefusingTerminalVerifier, ('verify',),
+                                            'handoff_terminal_verifier_required')
         self._local = threading.Lock()
+        with self._db(write=False):
+            pass  # validates exact schema on open
 
     @contextmanager
     def _db(self, *, write):
-        mode = 'rw' if write else 'ro'
-        db = sqlite3.connect(self.journal.absolute().as_uri() + '?mode=' + mode, uri=True,
+        db = sqlite3.connect(self.journal.as_uri() + '?mode=' + ('rw' if write else 'ro'), uri=True,
                              isolation_level=None, timeout=10)
         db.row_factory = sqlite3.Row
         try:
+            if not _schema_matches(db, _HOST_EXPECTED):
+                raise HandoffRefused('handoff_journal_schema_invalid')
             if write:
                 db.execute('PRAGMA synchronous=FULL')
                 db.execute('BEGIN IMMEDIATE')
@@ -333,6 +523,8 @@ class CIHostHandoff:
                     raise
             else:
                 yield db
+        except sqlite3.DatabaseError:
+            raise HandoffRefused('handoff_journal_unavailable') from None
         finally:
             db.close()
 
@@ -342,15 +534,17 @@ class CIHostHandoff:
             raise HandoffRefused('handoff_not_enrolled')
         return row['generation'], row['floor_fence']
 
-    def _writer_excluded(self, generation):
+    def _enrolled(self, generation):
+        """Marker must name exactly this journal/anchor (advisory for new code)."""
         try:
             marker = _read_json(self.engine / HANDOFF_MARKER)
         except Exception:
-            raise HandoffRefused('handoff_writer_exclusion_missing') from None
-        if marker.get('generation') != generation:
-            raise HandoffRefused('handoff_writer_exclusion_missing')
+            raise HandoffRefused('handoff_enrollment_marker_invalid') from None
+        if (marker.get('generation') != generation or marker.get('journal_id') != generation
+                or marker.get('journal') != str(self.journal) or marker.get('anchor') != str(self.anchor)):
+            raise HandoffRefused('handoff_enrollment_marker_invalid')
 
-    def _anchor_fence(self, generation):
+    def _local_anchor(self, generation):
         try:
             anchor = _read_json(self.anchor)
         except Exception:
@@ -379,34 +573,64 @@ class CIHostHandoff:
         if not self._local.acquire(blocking=False):
             raise HandoffRefused('handoff_host_busy')
         try:
-            lock = _flock(str(self.journal) + '.lock')
-            try:
+            with engine_admission_lock(self.engine):
                 return self._start_locked(request)
-            finally:
-                os.close(lock)
         finally:
             self._local.release()
+
+    def _prior_released(self, db, rows, floor, prior):
+        """Host-verifiable evidence the Hub released the host's latest attempt."""
+        latest = max(rows, key=lambda row: row['fence'], default=None)
+        if latest is None and floor == 0:
+            if prior is not None:
+                raise HandoffRefused('handoff_prior_release_mismatch')
+            return
+        if prior is None or not _verified(self.authenticator, 'release', prior['release'], prior['credential']):
+            raise HandoffRefused('handoff_prior_release_required')
+        release = prior['release']
+        if latest is not None and latest['fence'] >= floor:
+            expected = {'attempt_id': latest['attempt_id'], 'generation': latest['generation'],
+                        'fence': latest['fence'], 'receipt_digest': latest['receipt_digest'],
+                        'hub_ack': latest['hub_ack'], 'state': 'released'}
+            if release != expected or latest['hub_release'] is not None:
+                raise HandoffRefused('handoff_prior_release_mismatch')
+            if any(row['hub_release'] is None for row in rows if row['attempt_id'] != latest['attempt_id']):
+                raise HandoffRefused('handoff_prior_release_mismatch')
+            db.execute('UPDATE handoff_attempts SET hub_release=? WHERE attempt_id=? '
+                       "AND state='finalized_reserved' AND hub_release IS NULL",
+                       (_canonical(prior), latest['attempt_id']))
+        elif release['fence'] != floor:
+            # After an operator floor reconcile only a release of that fence counts.
+            raise HandoffRefused('handoff_prior_release_mismatch')
 
     def _start_locked(self, request):
         with self._db(write=True) as db:
             generation, floor = self._generation(db)
-            self._writer_excluded(generation)
-            anchored = self._anchor_fence(generation)
-            rows = db.execute('SELECT attempt_id,fence,state FROM handoff_attempts').fetchall()
+            self._enrolled(generation)
+            local = self._local_anchor(generation)
+            external = _external_fence(self.external_anchor, generation)
+            rows = db.execute('SELECT * FROM handoff_attempts').fetchall()
             journal_high = max([row['fence'] for row in rows] + [floor])
-            if journal_high < anchored:
+            if journal_high < max(local, external):
                 raise HandoffRefused('handoff_journal_restored')
             if request['generation'] != generation or request['manifest_digest'] != self.manifest_digest:
                 raise HandoffRefused('handoff_binding_mismatch')
-            if request['fence'] <= max(journal_high, anchored):
+            if request['fence'] <= max(journal_high, local, external):
                 raise HandoffRefused('handoff_fence_stale')
             if any(row['state'] != 'finalized_reserved' for row in rows):
                 raise HandoffRefused('handoff_slot_held')
-            db.execute("INSERT INTO handoff_attempts VALUES(?,?,?,?,?,?,'intent',NULL,NULL,NULL,NULL)",
+            self._prior_released(db, rows, floor, request['prior_release'])
+            db.execute("INSERT INTO handoff_attempts VALUES(?,?,?,?,?,?,'intent',NULL,NULL,NULL,NULL,NULL)",
                        (request['attempt_id'], request['job_id'], request['fence'], generation,
                         request['manifest_digest'], request['source_commit']))
-        # Journal first, then anchor: a crash between leaves journal >= anchor
-        # (safe); a failed anchor write leaves this attempt held at intent.
+        # Journal first, then the external anchor and the local hint. A failed
+        # advance leaves this attempt at 'intent': held, never run or replayed.
+        try:
+            advanced = self.external_anchor.advance(generation, request['fence']) is True
+        except Exception:
+            advanced = False
+        if not advanced:
+            raise HandoffRefused('handoff_external_anchor_unavailable')
         _write_json_atomic(self.anchor, {'schema': 'engineering-hub.ci-handoff-anchor.v1',
                                          'generation': generation, 'highest_fence': request['fence']})
         with self._db(write=True) as db:
@@ -418,15 +642,18 @@ class CIHostHandoff:
             with self._db(write=False) as db:
                 row = db.execute('SELECT state FROM handoff_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()
                 current, _ = self._generation(db)
-            self._writer_excluded(current)
+            self._enrolled(current)
             if row is None or row['state'] != 'running' or current != generation:
                 raise HandoffRefused('handoff_admission_lost')
 
-        # Any runner failure or invalid observation leaves the row 'running':
-        # held, never replayed, never self-freed.
+        # Any runner failure or unverified observation leaves the row 'running'.
         terminal = _terminal(_plain(self.runner(dict(request), guard)))
-        if terminal is None:
-            raise HandoffRefused('handoff_terminal_unavailable')
+        try:
+            proven = terminal is not None and self.terminal_verifier.verify(dict(request), dict(terminal)) is True
+        except Exception:
+            proven = False
+        if not proven:
+            raise HandoffRefused('handoff_terminal_unproven')
         record = {**{key: request[key] for key in ('attempt_id', 'job_id', 'fence', 'manifest_digest',
                                                    'source_commit')},
                   'generation': generation, 'terminal': terminal}
@@ -460,14 +687,12 @@ class CIHostHandoff:
         """CAS terminal_held -> finalized_reserved for exactly this tuple.
 
         Identical repeat is idempotent; any mismatch refuses with no change.
-        finalized_reserved keeps the slot reserved: only a Hub start carrying a
-        strictly greater fence can admit the next attempt.
         """
         request = _finalize_request(request)
         self._verify('finalize', request, credential)
         with self._db(write=True) as db:
             generation, _ = self._generation(db)
-            self._writer_excluded(generation)
+            self._enrolled(generation)
             row = db.execute('SELECT * FROM handoff_attempts WHERE attempt_id=?', (request['attempt_id'],)).fetchone()
             if (row is None or request['generation'] != generation or row['generation'] != generation
                     or row['fence'] != request['fence'] or row['receipt_digest'] != request['receipt_digest']):
@@ -499,10 +724,15 @@ CREATE TABLE IF NOT EXISTS hub_development_ci_handoff (
     job_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE, attempt TEXT NOT NULL,
     fence INTEGER NOT NULL, epoch TEXT NOT NULL, host_generation TEXT NOT NULL,
     manifest_digest TEXT NOT NULL, state TEXT NOT NULL, observed TEXT, receipt_id TEXT,
-    receipt_digest TEXT, terminal TEXT, outcome TEXT, hub_ack TEXT);
+    receipt_digest TEXT, terminal TEXT, outcome TEXT, hub_ack TEXT, host_ack TEXT);
+CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_policy_guard BEFORE UPDATE ON hub_development_ci_handoff_policy
+BEGIN SELECT RAISE(ABORT,'development_ci_handoff_policy'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_policy_delete BEFORE DELETE ON hub_development_ci_handoff_policy
+BEGIN SELECT RAISE(ABORT,'development_ci_handoff_policy'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_insert BEFORE INSERT ON hub_development_ci_handoff
 WHEN NEW.state IS NOT 'intent' OR NEW.observed IS NOT NULL OR NEW.receipt_id IS NOT NULL
-  OR NEW.receipt_digest IS NOT NULL OR NEW.terminal IS NOT NULL OR NEW.outcome IS NOT NULL OR NEW.hub_ack IS NOT NULL
+  OR NEW.receipt_digest IS NOT NULL OR NEW.terminal IS NOT NULL OR NEW.outcome IS NOT NULL
+  OR NEW.hub_ack IS NOT NULL OR NEW.host_ack IS NOT NULL
 BEGIN SELECT RAISE(ABORT,'development_ci_handoff_insert'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_delete BEFORE DELETE ON hub_development_ci_handoff
 BEGIN SELECT RAISE(ABORT,'development_ci_handoff_delete'); END;
@@ -512,26 +742,33 @@ WHEN NEW.job_id IS NOT OLD.job_id OR NEW.attempt_id IS NOT OLD.attempt_id OR NEW
   OR NEW.manifest_digest IS NOT OLD.manifest_digest
   OR NOT (
     (OLD.state='intent' AND NEW.state='observed' AND NEW.observed IS NOT NULL AND NEW.receipt_id IS NULL
-      AND NEW.receipt_digest IS NULL AND NEW.terminal IS NULL AND NEW.outcome IS NULL AND NEW.hub_ack IS NULL)
+      AND NEW.receipt_digest IS NULL AND NEW.terminal IS NULL AND NEW.outcome IS NULL
+      AND NEW.hub_ack IS NULL AND NEW.host_ack IS NULL)
     OR (OLD.state IN ('intent','observed') AND NEW.state='receipt_committed' AND NEW.observed IS OLD.observed
       AND NEW.receipt_id IS NOT NULL AND NEW.receipt_digest IS NOT NULL AND NEW.terminal IS NOT NULL
-      AND NEW.outcome IN ('succeeded','failed') AND length(NEW.hub_ack)=64)
-    OR (OLD.state='receipt_committed' AND NEW.state='finalized' AND NEW.observed IS OLD.observed
+      AND NEW.outcome IN ('succeeded','failed') AND length(NEW.hub_ack)=64 AND NEW.host_ack IS NULL)
+    OR (OLD.state='receipt_committed' AND NEW.state='host_acked' AND NEW.observed IS OLD.observed
       AND NEW.receipt_id IS OLD.receipt_id AND NEW.receipt_digest IS OLD.receipt_digest
       AND NEW.terminal IS OLD.terminal AND NEW.outcome IS OLD.outcome AND NEW.hub_ack IS OLD.hub_ack
+      AND NEW.host_ack IS NOT NULL)
+    OR (OLD.state='host_acked' AND NEW.state='finalized' AND NEW.observed IS OLD.observed
+      AND NEW.receipt_id IS OLD.receipt_id AND NEW.receipt_digest IS OLD.receipt_digest
+      AND NEW.terminal IS OLD.terminal AND NEW.outcome IS OLD.outcome AND NEW.hub_ack IS OLD.hub_ack
+      AND NEW.host_ack IS OLD.host_ack
       AND (SELECT state FROM hub_work_jobs WHERE id=OLD.job_id) IS OLD.outcome))
 BEGIN SELECT RAISE(ABORT,'development_ci_handoff_transition'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_release_guard BEFORE UPDATE OF state ON hub_work_jobs
 WHEN NEW.state IN ('succeeded','failed')
   AND EXISTS(SELECT 1 FROM hub_development_ci_handoff WHERE job_id=NEW.id)
   AND NOT EXISTS(SELECT 1 FROM hub_development_ci_handoff WHERE job_id=NEW.id
-                 AND state='receipt_committed' AND outcome=NEW.state AND hub_ack IS NOT NULL)
+                 AND state='host_acked' AND outcome=NEW.state AND host_ack IS NOT NULL)
 BEGIN SELECT RAISE(ABORT,'development_ci_handoff_unfinalized'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_handoff_release_record AFTER UPDATE OF state ON hub_work_jobs
 WHEN NEW.state IN ('succeeded','failed')
 BEGIN UPDATE hub_development_ci_handoff SET state='finalized'
-      WHERE job_id=NEW.id AND state='receipt_committed' AND outcome=NEW.state; END;
+      WHERE job_id=NEW.id AND state='host_acked' AND outcome=NEW.state; END;
 '''
+_HUB_EXPECTED = _reference_schema(_HUB_SCHEMA, ('CREATE TABLE hub_work_jobs (id TEXT, state TEXT)',))
 
 
 class _UnusedProvider:
@@ -549,6 +786,9 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
     ``channel`` is an explicit transport with async ``start``, ``inspect`` and
     ``finalize`` methods taking ``(payload, credential)`` and returning
     ``(payload, credential)``. No such transport exists in this repository.
+    The Hub's only terminal proof is the authenticated host inspection of the
+    original attempt, which the host records only after its own terminal
+    verifier re-inspected the original container/cgroup.
     """
     _handoff_mode = True
 
@@ -562,28 +802,46 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                        for name in ('start', 'inspect', 'finalize'))):
             raise HubError('development_ci_handoff_composition_required', 409)
         try:
-            self.authenticator = _authenticator(authenticator)
+            self.authenticator = _authority(authenticator, RefusingAuthenticator, ('sign', 'verify'),
+                                            'handoff_authenticator_required')
         except HandoffRefused:
             raise HubError('development_ci_handoff_composition_required', 409) from None
         self.channel, self.host_generation = channel, host_generation
         super().__init__(queue, owner, manifest, _UnusedProvider(), action_key=action_key,
                          renew_interval=renew_interval, monotonic=monotonic)
-        with self.repo._transaction() as db:
-            for statement in _HUB_SCHEMA.split(';\n'):
-                if statement.strip():
-                    db.execute(statement)
-            expected = (action_key, manifest.machine_id, manifest.digest, host_generation)
-            old = db.execute('SELECT action_key,machine_id,manifest_digest,host_generation '
-                             'FROM hub_development_ci_handoff_policy WHERE id=1').fetchone()
-            if old is not None and tuple(old) != expected:
-                raise HubError('development_ci_handoff_enrollment_changed', 409)
-            db.execute('INSERT OR IGNORE INTO hub_development_ci_handoff_policy VALUES(1,?,?,?,?)', expected)
+        try:
+            with self.repo._transaction() as db:
+                enrolled = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                      "AND name='hub_development_ci_handoff_policy'").fetchone()
+                if enrolled is None:
+                    for statement in _statements(_HUB_SCHEMA):
+                        db.execute(statement)
+                # Never silently recreate a dropped/altered guard once enrolled.
+                if not _schema_matches(db, _HUB_EXPECTED):
+                    raise HubError('development_ci_handoff_schema_invalid', 409)
+                expected = (action_key, manifest.machine_id, manifest.digest, host_generation)
+                old = db.execute('SELECT action_key,machine_id,manifest_digest,host_generation '
+                                 'FROM hub_development_ci_handoff_policy WHERE id=1').fetchone()
+                if old is not None and tuple(old) != expected:
+                    raise HubError('development_ci_handoff_enrollment_changed', 409)
+                db.execute('INSERT OR IGNORE INTO hub_development_ci_handoff_policy VALUES(1,?,?,?,?)', expected)
+        except BaseException:
+            # Undo the parent's in-memory composition; nothing stays installed.
+            queue.target_verifier, queue.claim_verifier = self._target, self._claim
+            queue.completion_verifier = None
+            self.repo._development_ci = None
+            raise
         self._reconciliation = self.reconciliation_verifier
         queue.reconciliation_verifier = self._reconciliation
 
+    def _guard(self):
+        super()._guard()
+        with self.repo._connection() as db:
+            if not _schema_matches(db, _HUB_EXPECTED):
+                raise HubError('development_ci_handoff_schema_invalid', 409)
+
     # -- transport --------------------------------------------------------
-    async def _call(self, operation, payload):
-        payload = _plain(payload)
+    def _sign(self, operation, payload):
         try:
             credential = self.authenticator.sign(operation, payload)
         except Exception:
@@ -591,11 +849,16 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         if credential is None:
             # Missing authentication: never contact the host unauthenticated.
             raise HubError('development_ci_handoff_unauthenticated', 409)
+        return credential
+
+    async def _call(self, operation, payload):
+        payload = _plain(payload)
+        credential = self._sign(operation, payload)
         response, response_credential = await getattr(self.channel, operation)(payload, credential)
         response = _plain(response)
         if not _verified(self.authenticator, operation + '_result', response, response_credential):
             raise HubError('development_ci_handoff_unauthenticated', 409)
-        return response
+        return response, response_credential
 
     # -- Hub state helpers --------------------------------------------------
     def _row(self, job_id):
@@ -608,6 +871,18 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                              "WHERE h.state!='finalized' AND j.state IN ('claimed','held') "
                              "AND j.machine_id=? ORDER BY h.fence LIMIT 1", (self.manifest.machine_id,)).fetchone()
         return None if row is None else row['job_id']
+
+    def _prior_release(self):
+        """Hub-signed release of the latest attempt whose queue job was released."""
+        with self.repo._connection() as db:
+            row = db.execute("SELECT h.* FROM hub_development_ci_handoff h JOIN hub_work_jobs j ON j.id=h.job_id "
+                             "WHERE h.host_generation=? AND h.state='finalized' AND j.state=h.outcome "
+                             "ORDER BY h.fence DESC LIMIT 1", (self.host_generation,)).fetchone()
+        if row is None:
+            return None
+        release = {'attempt_id': row['attempt_id'], 'generation': row['host_generation'], 'fence': row['fence'],
+                   'receipt_digest': row['receipt_digest'], 'hub_ack': row['hub_ack'], 'state': 'released'}
+        return {'release': release, 'credential': self._sign('release', release)}
 
     def _original(self, db, row, attempt, *, states=('claimed', 'held')):
         """Bind to the ORIGINAL queue claim: job, fence, owner epoch, target."""
@@ -683,6 +958,20 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                         secrets.token_hex(32), job_id, row['state']))
         return True
 
+    def _finalize_request(self, row):
+        return {'attempt_id': row['attempt_id'], 'generation': row['host_generation'], 'fence': row['fence'],
+                'receipt_digest': row['receipt_digest'], 'hub_ack': row['hub_ack']}
+
+    def _host_ack_valid(self, row):
+        """Re-verify the RECORDED authenticated host ack for the exact tuple."""
+        try:
+            recorded = json.loads(row['host_ack'])
+            return (type(recorded) is dict and set(recorded) == {'ack', 'credential'}
+                    and recorded['ack'] == {**self._finalize_request(row), 'state': 'finalized_reserved'}
+                    and _verified(self.authenticator, 'finalize_result', recorded['ack'], recorded['credential']))
+        except Exception:
+            return False
+
     # -- queue verifiers ---------------------------------------------------
     def _handoff_verified(self, job, evidence_id, outcome):
         try:
@@ -695,7 +984,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                 attempt = DevelopmentCIAttempt(**json.loads(row['attempt']))
                 bound = self._original(db, row, attempt)
             return (bound and permit == (job['id'], row['fence'], evidence_id, outcome, row['hub_ack'])
-                    and row['state'] == 'receipt_committed' and row['receipt_id'] == evidence_id
+                    and row['state'] == 'host_acked' and self._host_ack_valid(row)
+                    and row['receipt_id'] == evidence_id
                     and row['outcome'] == outcome and job['fence'] == attempt.fence
                     and self._review_unchanged(attempt))
         except Exception:
@@ -705,7 +995,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         return self._handoff_verified(job, evidence_id, outcome)
 
     def reconciliation_verifier(self, job, evidence_id, outcome):
-        # Only the handoff's own held jobs, only with an acked host finalize.
+        # Only the handoff's own held jobs, only with a recorded verified host ack.
         return outcome in ('succeeded', 'failed') and self._handoff_verified(job, evidence_id, outcome)
 
     # -- run loop ------------------------------------------------------------
@@ -724,10 +1014,22 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
 
     async def _finalize(self, job_id):
         row = self._row(job_id)
-        request = {'attempt_id': row['attempt_id'], 'generation': row['host_generation'], 'fence': row['fence'],
-                   'receipt_digest': row['receipt_digest'], 'hub_ack': row['hub_ack']}
-        ack = await self._call('finalize', request)
-        if ack != {**request, 'state': 'finalized_reserved'}:
+        if row['state'] == 'receipt_committed':
+            request = self._finalize_request(row)
+            ack, credential = await self._call('finalize', request)
+            if ack != {**request, 'state': 'finalized_reserved'}:
+                raise HubError('development_ci_handoff_ack_mismatch', 409)
+            with self.repo._transaction() as db:
+                current = db.execute('SELECT * FROM hub_development_ci_handoff WHERE job_id=?', (job_id,)).fetchone()
+                attempt = DevelopmentCIAttempt(**json.loads(current['attempt']))
+                if (current['state'] != 'receipt_committed' or current['hub_ack'] != row['hub_ack']
+                        or not self._original(db, current, attempt)):
+                    raise HubError('development_ci_handoff_ack_mismatch', 409)
+                db.execute("UPDATE hub_development_ci_handoff SET state='host_acked',host_ack=? "
+                           "WHERE job_id=? AND state='receipt_committed'",
+                           (_canonical({'ack': ack, 'credential': credential}), job_id))
+            row = self._row(job_id)
+        if row['state'] != 'host_acked' or not self._host_ack_valid(row):
             raise HubError('development_ci_handoff_ack_mismatch', 409)
         token = self._permit.set((job_id, row['fence'], row['receipt_id'], row['outcome'], row['hub_ack']))
         try:
@@ -736,8 +1038,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                     and not job['requires_reconciliation']):
                 return self.queue.complete(job_id=job_id, worker=self.worker, fence=row['fence'],
                                            outcome=row['outcome'], evidence_id=row['receipt_id'])
-            # Held (or expired) original claim: same verified tuple, same txn
-            # semantics, via the queue's own reconciliation path.
+            # Held (or expired) original claim: same verified tuple through the
+            # queue's own reconciliation path.
             return self.queue.reconcile(job_id=job_id, evidence_id=row['receipt_id'], outcome=row['outcome'])
         finally:
             self._permit.reset(token)
@@ -747,11 +1049,11 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
         row = self._row(job_id)
         if row['state'] in ('intent', 'observed'):
             attempt = DevelopmentCIAttempt(**json.loads(row['attempt']))
-            inspection = await self._call('inspect', {'attempt_id': attempt.attempt_id})
+            inspection, _ = await self._call('inspect', {'attempt_id': attempt.attempt_id})
             if not self._commit_receipt(job_id, inspection):
                 raise HubError('development_ci_handoff_receipt_refused', 409)
             row = self._row(job_id)
-        if row['state'] == 'receipt_committed':
+        if row['state'] in ('receipt_committed', 'host_acked'):
             return await self._finalize(job_id)
         return self.queue.get_job(job_id)
 
@@ -786,7 +1088,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                             attempt.epoch, self.host_generation, attempt.manifest_digest))
             guard = lambda: self._bound(attempt)
             guard()
-            reported = await self._supervise(job, guard, self._call('start', self._start_payload(attempt)))
+            start = {**self._start_payload(attempt), 'prior_release': self._prior_release()}
+            reported, _ = await self._supervise(job, guard, self._call('start', start))
             observed = self._host_record(attempt, reported)
             if observed is None:
                 return self._hold(job)

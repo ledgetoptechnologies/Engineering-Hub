@@ -16,6 +16,7 @@ import pwd
 import fcntl
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -27,6 +28,9 @@ UNIT_OBJECT = '/org/freedesktop/systemd1/unit/eh_2ddevelopment_2dci_2dengine_2es
 MIB = 1024**2
 MEMORY = 2 * 1024**3
 ERROR = 'Development CI engine unavailable; preserve state for inspection'
+# Written by engineering_hub.development_ci_handoff.enroll_host. Absent marker:
+# stop behaves exactly as before (HELD.json/STOPPING.json checks only).
+HANDOFF_MARKER = 'HANDOFF_ENROLLED.json'
 _DEADLINE = None
 PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'InvocationID', 'MainPID',
     'ControlGroup', 'CPUQuotaPerSecUSec', 'MemoryMax', 'MemorySwapMax', 'TasksMax',
@@ -419,10 +423,75 @@ def _terminal(value, pid, started, invocation_id, control_group):
         and _cgroup_empty(control_group))
 
 
+def _bounded_json(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise EngineError()
+        raw = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    value = json.loads(raw)
+    if type(value) is not dict:
+        raise EngineError()
+    return value
+
+
+def _handoff_veto(value):
+    """Enrolled durable CI handoff: never stop under an unfinalized attempt.
+
+    Runs under the engine admission flock that the handoff host also holds for
+    admission and execution. Fails closed on a missing, corrupt, ambiguous or
+    restored (below-anchor) journal; reads only, never repairs.
+    """
+    marker = value.runtime / HANDOFF_MARKER
+    if not _present(marker):
+        return
+    try:
+        enrolled = _bounded_json(marker)
+        generation = enrolled.get('generation')
+        journal, anchor = enrolled.get('journal'), enrolled.get('anchor')
+        if (not isinstance(generation, str) or not re.fullmatch('[a-f0-9]{32}', generation)
+                or enrolled.get('journal_id') != generation
+                or not isinstance(journal, str) or not isinstance(anchor, str)
+                or not os.path.isabs(journal) or not os.path.isabs(anchor)
+                or os.path.normpath(journal) == os.path.normpath(anchor)):
+            raise EngineError()
+        anchored = _bounded_json(anchor)
+        fence = anchored.get('highest_fence')
+        if anchored.get('generation') != generation or type(fence) is not int or fence < 0:
+            raise EngineError()
+        before = os.lstat(journal)
+        if not stat.S_ISREG(before.st_mode):
+            raise EngineError()
+        db = sqlite3.connect(Path(journal).as_uri() + '?mode=ro', uri=True, timeout=5)
+        try:
+            meta = db.execute('SELECT generation,floor_fence FROM handoff_meta WHERE id=1').fetchone()
+            rows = db.execute('SELECT fence,state FROM handoff_attempts').fetchall()
+        finally:
+            db.close()
+        after = os.lstat(journal)
+        if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or meta is None or meta[0] != generation or type(meta[1]) is not int):
+            raise EngineError()
+        if any(type(row[0]) is not int for row in rows):
+            raise EngineError()
+        if max([row[0] for row in rows] + [meta[1]]) < fence:
+            raise EngineError()  # restored journal: offline reconciliation first
+        if any(row[1] != 'finalized_reserved' for row in rows):
+            raise EngineError()  # intent/running/terminal_held: preserve the engine
+    except EngineError:
+        raise
+    except Exception:
+        raise EngineError() from None
+
+
 def _stop_locked(value, parent, *, engine_id, invocation_id):
     global _DEADLINE
     if _present(value.runtime / 'STOPPING.json') or _present(value.runtime / 'HELD.json'):
         raise EngineError()
+    _handoff_veto(value)
     before = inspect(value)
     if before['engine_id'] != engine_id or before['invocation_id'] != invocation_id:
         raise EngineError()
