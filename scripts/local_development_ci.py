@@ -33,6 +33,10 @@ CID = re.compile(r'^[a-f0-9]{64}$')
 PROC_ROOT = Path('/proc')
 CGROUP_ROOT = Path('/sys/fs/cgroup')
 FD_ROOT = Path('/proc/self/fd')
+# Written by engineering_hub.development_ci_handoff.enroll_host under the same
+# engine admission flock. Once present the host journal owns every hold: this
+# standalone controller must neither run nor clear any retained intent.
+HANDOFF_MARKER = 'HANDOFF_ENROLLED.json'
 
 
 class CIError(RuntimeError):
@@ -285,7 +289,7 @@ def run(args, *, expected_commit=None, admission_guard=None, terminal_observer=N
     with ExitStack() as stack:
         engine_lock = private_lock(engine_directory / 'admission.lock')
         stack.callback(os.close, engine_lock)
-        if any(os.path.lexists(engine_directory / name) for name in ('STOPPING.json', 'HELD.json')):
+        if any(os.path.lexists(engine_directory / name) for name in ('STOPPING.json', 'HELD.json', HANDOFF_MARKER)):
             raise CIError('Engine is stopping or has retained CI intent; admission denied')
         lock = private_lock(output / 'runner.lock')
         stack.callback(os.close, lock)
@@ -467,7 +471,7 @@ def _run_admitted(args, checkout, output, engine_directory, *, expected_commit=N
                                   failure_code='private_observer_failed')
             result['terminal_verified'] = terminal
             (root / 'result.json').write_text(json.dumps(result, sort_keys=True) + '\n')
-            if terminal:
+            if terminal and not os.path.lexists(engine_directory / HANDOFF_MARKER):
                 clear_own_intent(held, intent)
                 clear_own_intent(engine_held, intent)
         finally:

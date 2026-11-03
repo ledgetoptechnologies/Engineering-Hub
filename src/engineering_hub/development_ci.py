@@ -104,6 +104,10 @@ class QueuedDevelopmentCI:
     verify_terminal must inspect that original attempt, not trust an agent's
     report. This module implements neither that host protocol nor reconciliation.
     """
+    # The durable handoff subclass (development_ci_handoff) sets this; once a
+    # ledger is handoff-enrolled the legacy composition refuses to attach.
+    _handoff_mode = False
+
     def __init__(self, queue, owner, manifest, provider, *, action_key,
                  renew_interval=120, monotonic=time.monotonic):
         if (type(queue) is not WorkQueue or type(owner) is not PilotOwner
@@ -140,6 +144,7 @@ class QueuedDevelopmentCI:
         self._approval=queue.approval_verifier
         self._readiness=queue.production_readiness_verifier
         self._permit=ContextVar('development-ci-completion',default=None)
+        self._reconciliation=None
         self._lock=asyncio.Lock()
         with self.repo._transaction() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS hub_development_ci_policy (
@@ -148,6 +153,9 @@ class QueuedDevelopmentCI:
             db.execute('''CREATE TABLE IF NOT EXISTS hub_development_ci_attempts (
                 job_id TEXT PRIMARY KEY, attempt TEXT NOT NULL, state TEXT NOT NULL,
                 receipt_id TEXT, proof TEXT)''')
+            if (not self._handoff_mode and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='hub_development_ci_handoff_policy'").fetchone() is not None):
+                raise HubError('development_ci_handoff_enrolled',409)
             expected=(action_key,manifest.machine_id,manifest.digest)
             old=db.execute('SELECT action_key,machine_id,manifest_digest FROM hub_development_ci_policy WHERE id=1').fetchone()
             if old is not None and tuple(old)!=expected:
@@ -168,7 +176,7 @@ class QueuedDevelopmentCI:
             or self.queue.actions!=self._registry or self.queue.target_verifier!=self.target_verifier
             or self.queue.claim_verifier!=self.claim_verifier
             or self.queue.completion_verifier!=self.completion_verifier
-            or self.queue.reconciliation_verifier is not None
+            or self.queue.reconciliation_verifier!=self._reconciliation
             or self.queue.approval_verifier is not self._approval
             or self.queue.production_readiness_verifier is not self._readiness):
             raise HubError('development_ci_ownership_changed',409)

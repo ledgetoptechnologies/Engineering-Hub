@@ -100,3 +100,31 @@ Live activation still requires a published/verified image, accepted private
 storage, reviewed operator configuration, enrolled host provider and a fresh
 bounded pilot. Keep the current Compose and live services unchanged until one
 consolidated handoff is accepted. Do not bypass the GitHub publication blocker.
+
+## Durable host handoff (disabled by default)
+
+`engineering_hub.development_ci_handoff` adds an opt-in protocol on top of the
+same owned `WorkQueue`, `PilotOwner` and attempts table. Nothing enables it:
+`DurableDevelopmentCIHandoff`, `CIHostHandoff` and `enroll_host` each refuse
+unless constructed with `enable_durable_handoff=True` by operator code.
+
+- Host journal (separate SQLite file) states: `intent -> running ->
+  terminal_held -> finalized_reserved`, guarded by triggers (no delete, no
+  identity change, `finalized_reserved` only from `terminal_held` with a
+  64-hex `hub_ack`). `finalized_reserved` is still reserved: the host admits
+  only a Hub start whose fence exceeds every recorded fence (journal, floor and
+  the separate anchor file) once every earlier attempt is finalized.
+- Hub: `receipt_committed` verifies an authenticated read-only host inspection
+  against the original claim/attempt and stores a random `hub_ack`; after an
+  authenticated host ack, one queue transaction (`complete`, or `reconcile` for
+  a held job) releases the machine and a ledger trigger marks the handoff
+  `finalized`. A ledger trigger refuses releasing a handoff job otherwise.
+- Enrollment writes `HANDOFF_ENROLLED.json` under the engine admission lock;
+  the standalone controller then refuses to run or clear holds, and the legacy
+  `QueuedDevelopmentCI` refuses to attach to a handoff-enrolled ledger.
+- A restored journal below the anchor refuses admission until an explicit
+  operator `reconcile_restored_journal(..., operator_confirmed=True)`.
+
+Not supplied: an authenticated transport or keys (the default authenticator
+refuses everything, so attempts stay held), a host runner adapter around
+`scripts/local_development_ci.py`, and any activation.
