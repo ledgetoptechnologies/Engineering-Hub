@@ -83,6 +83,15 @@ def outcomes(path):
                           "ORDER BY counter").fetchall()
 
 
+def evidence_rows(path):
+    with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT counter, evidence FROM supervisor_route_dispatch_outcome "
+                          "ORDER BY counter").fetchall()
+
+
+QUIESCED = "operator: executor pid 4242 confirmed exited; no engine jobs for command"
+
+
 def gate_config(path, create=True, **overrides):
     values = dict(enabled=True, journal_path=str(path), create_journal=create, executor_id=EXECUTOR,
                   launch_epoch=EPOCH, allow_ephemeral_test_storage=True)
@@ -460,17 +469,83 @@ def test_gate_concurrent_duplicates_act_exactly_once(gate):
 
 
 @LINUX
-def test_raising_effect_is_recorded_and_never_rerun(gate):
+@pytest.mark.parametrize("fault", [RuntimeError, KeyboardInterrupt])
+def test_raising_effect_keeps_marker_fail_closed_until_quiescence_release(gate, fault):
     one = signed_off(1)
 
     def boom():
-        raise RuntimeError("effect failed")
-    with pytest.raises(RuntimeError):
+        raise fault("effect failed part-way")  # May have partially happened.
+    with pytest.raises(fault):
         run(gate, *one, boom)
-    assert outcomes(gate.path) == [(1, "raised")] and gate.inspect()["in_flight"] is None
+    assert outcomes(gate.path) == [] and gate.inspect() == {"accepted": 1, "started": 1, "in_flight": 1}
+    for header, cmd in (one, signed_off(2)):
+        with pytest.raises(DispatchRefused):
+            run(gate, header, cmd, lambda: "ran")
+    gate.release_unresolved_after_quiescence(1, evidence=QUIESCED)
+    assert evidence_rows(gate.path) == [(1, QUIESCED)]
     with pytest.raises(DispatchRefused):
-        run(gate, *one, boom)
-    assert run(gate, *signed_off(2), lambda: "ok") == "ok"
+        run(gate, *one, lambda: "ran")  # Never rerun.
+    assert run(gate, *signed_off(3), lambda: "ok") == "ok"
+
+
+@LINUX
+def test_async_effects_refused_and_awaitable_result_keeps_marker(gate):
+    import asyncio
+    calls = []
+
+    async def coroutine_effect():
+        calls.append("ran")
+    with pytest.raises(SupervisorRouteError):
+        run(gate, *signed_off(1), coroutine_effect)  # Refused before anything is recorded.
+    assert gate.inspect() == {"accepted": None, "started": None, "in_flight": None}
+    with pytest.raises(DispatchRefused) as raised:
+        run(gate, *signed_off(2), lambda: coroutine_effect())  # Hidden behind a sync wrapper.
+    assert raised.value.reason == "dispatch_effect_async"
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(DispatchRefused) as raised:
+            run(gate, *signed_off(3), lambda: loop.create_future())  # A future may be live work.
+        assert raised.value.reason == "dispatch_in_flight_unresolved"  # 2's marker is kept.
+    finally:
+        loop.close()
+    assert calls == [] and gate.inspect()["in_flight"] == 2 and outcomes(gate.path) == []
+
+
+@LINUX
+def test_quiescence_release_requires_evidence_and_is_refused_mid_effect(gate):
+    entered, release = threading.Event(), threading.Event()
+    observed = {}
+
+    def slow():
+        entered.set()
+        assert release.wait(10)
+    worker = threading.Thread(target=lambda: run(gate, *signed_off(1), slow))
+    worker.start()
+    try:
+        assert entered.wait(10)
+        with pytest.raises(DispatchRefused) as raised:
+            gate.release_unresolved_after_quiescence(1, evidence=QUIESCED)  # Live effect: not quiescent.
+        observed["release"] = raised.value.reason
+        with pytest.raises(route_module.SupervisorRouteInFlight):
+            gate.close()  # Ownership is not released mid-effect.
+        assert gate.inspect()["in_flight"] == 1  # Store still owned and open.
+    finally:
+        release.set()
+        worker.join(10)
+    assert observed == {"release": "dispatch_busy"} and outcomes(gate.path) == [(1, "completed")]
+
+    def boom():
+        raise RuntimeError()
+    with pytest.raises(RuntimeError):
+        run(gate, *signed_off(2), boom)
+    for bad in (None, "", " " * 0, "x" * 1025, "caf\u00e9", "line\nbreak", b"bytes"):
+        with pytest.raises(SupervisorRouteError):
+            gate.release_unresolved_after_quiescence(2, evidence=bad)
+    with pytest.raises(TypeError):
+        gate.release_unresolved_after_quiescence(2)  # Evidence is a required argument.
+    assert gate.inspect()["in_flight"] == 2
+    gate.release_unresolved_after_quiescence(2, evidence=QUIESCED)
+    assert outcomes(gate.path) == [(1, "completed"), (2, "released")]
 
 
 @LINUX
@@ -488,8 +563,8 @@ def test_unrecorded_completion_fails_closed_until_operator_release(gate, monkeyp
         run(gate, *signed_off(2), effects(2))
     assert raised.value.reason == "dispatch_in_flight_unresolved" and effects.done == [1]
     with pytest.raises(route_module.RouteJournalError):
-        gate.release_unresolved(7)  # Only the exact in-flight counter can be released.
-    gate.release_unresolved(1)
+        gate.release_unresolved_after_quiescence(7, evidence=QUIESCED)  # Only the exact in-flight one.
+    gate.release_unresolved_after_quiescence(1, evidence=QUIESCED)
     assert outcomes(gate.path) == [(1, "released")]
     with pytest.raises(DispatchRefused):  # 2 was consumed while unresolved; never acts.
         run(gate, *signed_off(2), effects(2))
@@ -528,12 +603,75 @@ def test_process_dead_mid_effect_fails_closed_and_stale_never_runs(gate_path):
         run(gate, *signed_off(2), effects(2))
     assert raised.value.reason == "dispatch_in_flight_unresolved"  # Loud, not silent.
     assert effects.done == []
-    gate.release_unresolved(1)  # Explicit operator act: effect of 1 is UNKNOWN.
+    gate.release_unresolved_after_quiescence(1, evidence=QUIESCED)  # Operator: process is gone.
     with pytest.raises(DispatchRefused):
         run(gate, header, cmd, effects("stale"))  # The dead run's counter never runs again.
     assert run(gate, *signed_off(3), effects(3)) == 3 and effects.done == [3]
     assert outcomes(gate_path) == [(1, "released"), (3, "completed")]
     gate.close()
+
+
+_HOLDS_EFFECT = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, os.path.join(sys.argv[1], 'src'))
+from hub_container_executor.supervisor_route import (DispatchCounterGate, DispatchGateConfig, RouteEpoch,
+                                                       SUBMIT_PATH, SupervisorRouteInFlight)
+gate = DispatchCounterGate(config=DispatchGateConfig(
+    enabled=True, journal_path=sys.argv[2], create_journal=False, executor_id='a' * 64,
+    launch_epoch=RouteEpoch(sys.argv[3], 5, sys.argv[4]), allow_ephemeral_test_storage=True))
+def effect():
+    print('started', flush=True)
+    try:
+        gate.close()  # Attempt to drop the inter-process owner lock mid-effect.
+        print('close_ok', flush=True)
+    except SupervisorRouteInFlight:
+        print('close_refused', flush=True)
+    sys.stdin.readline()  # Barrier: the effect stays active until the parent says so.
+    return 'done'
+try:
+    print('result', gate.run(sys.argv[5], method='POST', path=SUBMIT_PATH, body=sys.argv[6].encode(),
+                             effect=effect), flush=True)
+except Exception as error:
+    print('error', type(error).__name__, flush=True)
+gate.close()
+print('closed', flush=True)
+'''
+
+
+@LINUX
+def test_second_process_cannot_take_over_while_first_effect_is_active(gate_path):
+    DispatchCounterGate(config=gate_config(gate_path)).close()
+    header, cmd = signed_off(1)
+    a = subprocess.Popen([sys.executable, "-c", _HOLDS_EFFECT, str(Path(__file__).parents[1]), str(gate_path),
+                          LAUNCH, BOOT, header, cmd.body.decode()],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    b_ran = []
+    try:
+        assert a.stdout.readline().strip() == "started"
+        close_attempt = a.stdout.readline().strip()
+        # Process B, while A's effect is active: open + operator release + higher counter.
+        try:
+            b = DispatchCounterGate(config=gate_config(gate_path, create=False))
+        except SupervisorRouteError:
+            b = None
+        if b is not None:
+            try:
+                b.release_unresolved_after_quiescence(1, evidence=QUIESCED)
+                run(b, *signed_off(2), lambda: b_ran.append(2))
+            finally:
+                b.close()
+        assert close_attempt == "close_refused"
+        assert b is None and b_ran == []  # B could not even open the store.
+    finally:
+        a.stdin.write("\n")
+        a.stdin.flush()
+        out, err = a.communicate(timeout=30)
+    assert out.split() == ["result", "done", "closed"], err
+    b = DispatchCounterGate(config=gate_config(gate_path, create=False))  # Only now, after A drained.
+    assert b.inspect() == {"accepted": 1, "started": 1, "in_flight": None}
+    assert outcomes(gate_path) == [(1, "completed")]
+    assert run(b, *signed_off(2), lambda: "two") == "two"
+    b.close()
 
 
 @LINUX

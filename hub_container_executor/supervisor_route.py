@@ -137,6 +137,14 @@ Explicit limits (this foundation grants no authority by itself):
   beyond the bearer and peer check (no signer on either side); a party able
   to send with the bearer can choose any counter, and a large one would
   advance the gate. The gate's store must be private to the executor side.
+* The gate's effect fence covers only a SYNCHRONOUS effect that finishes its
+  side effect before returning. Detached work (threads, processes, engine
+  jobs it starts and leaves running) is not fenced or detected; an
+  enforceable drain contract for it is NOT implemented. An effect that
+  raises or returns an awaitable keeps the gate fail-closed until
+  ``release_unresolved_after_quiescence``, which relies entirely on the
+  operator having established that the effect stopped: the gate cannot
+  prove it.
 * ROLLBACK IS NOT DETECTED. All of this is local SQLite state: a store
   restored from a backup, a copied older file or a snapshot rollback is
   indistinguishable from the real one. A rolled-back gate store can accept
@@ -161,6 +169,7 @@ import base64
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -242,8 +251,11 @@ _GATE_IN_FLIGHT = ('CREATE TABLE supervisor_route_dispatch_in_flight (executor_i
                    "counter INTEGER NOT NULL CHECK(typeof(counter)='integer' AND counter > 0))")
 _GATE_OUTCOME = ('CREATE TABLE supervisor_route_dispatch_outcome (executor_id TEXT NOT NULL, '
                  "counter INTEGER NOT NULL CHECK(typeof(counter)='integer' AND counter > 0), "
-                 "outcome TEXT NOT NULL CHECK(outcome IN ('completed','raised','released')), "
+                 "outcome TEXT NOT NULL CHECK(outcome IN ('completed','released')), evidence TEXT, "
+                 "CHECK((outcome='completed' AND evidence IS NULL) OR (outcome='released' "
+                 "AND typeof(evidence)='text' AND length(evidence) BETWEEN 1 AND 1024)), "
                  'PRIMARY KEY (executor_id, counter))')
+_EVIDENCE = re.compile(r'[\x20-\x7e]{1,1024}\Z')
 _GATE_OUTCOME_FROZEN = ('CREATE TRIGGER supervisor_route_dispatch_outcome_frozen BEFORE UPDATE ON '
                         'supervisor_route_dispatch_outcome '
                         "BEGIN SELECT RAISE(ABORT, 'dispatch outcome is permanent'); END")
@@ -955,21 +967,36 @@ class DispatchCounterGate(_DurableStore):
        durably records "started" plus an in-flight marker. Only after that
        COMMIT is ``effect()`` called. So an accepted-then-delayed counter can
        never act after a higher one was accepted or acted.
-    4. Completion: the in-flight marker is replaced by a permanent outcome
-       (``completed``, or ``raised`` when effect raised, then re-raised)
-       before the lock is released.
+    4. Completion: ONLY a normal, synchronous return of ``effect()`` replaces
+       the in-flight marker with the permanent outcome ``completed``, before
+       the lock is released. If effect raises (any BaseException), or
+       returns an awaitable (``dispatch_effect_async``: a coroutine, task or
+       future may be running or half-done), the marker is KEPT: the effect
+       may have partially happened or left detached work, so its outcome is
+       unknown and the gate stays fail-closed.
 
-    A process that dies (or whose completion write fails) between steps 3 and
-    4 leaves the durable in-flight marker; its in-process lock dies with it.
-    The gate then FAILS CLOSED, loudly: every later ``run`` is refused with
-    ``dispatch_in_flight_unresolved`` (``inspect`` names the counter) until an
-    operator calls ``release_unresolved(counter)``, which records
-    ``released`` (effect outcome UNKNOWN). The released counter, and every
-    lower one, can never run again: "started" is monotonic. ``effect`` must
-    finish its side effect before returning; work it hands off and leaves
-    running is outside the fence. Any journal failure raises
-    RouteJournalError and nothing further is done. Its own store, separate
-    from the route journal. NOT wired into PilotASGI or any service.
+    Ownership is never released mid-effect: ``close()`` refuses
+    (SupervisorRouteInFlight) while an effect runs, so this process keeps the
+    PilotOwner flock, and no other process can open the store, until the
+    effect has returned and its outcome is recorded. A process that dies
+    mid-effect releases the flock only by dying, and leaves the marker.
+
+    With a kept marker (dead process, raised or async effect, or a failed
+    completion write) the gate FAILS CLOSED, loudly: every later ``run`` is
+    refused with ``dispatch_in_flight_unresolved`` (``inspect`` names the
+    counter) until an operator calls
+    ``release_unresolved_after_quiescence(counter, evidence=...)``. That
+    records ``released`` (effect outcome UNKNOWN) with the operator's
+    evidence. The released counter, and every lower one, can never run
+    again: "started" is monotonic.
+
+    ``effect`` MUST be synchronous and finish its side effect before
+    returning. OPEN GAP: work it hands to another thread/process/engine and
+    leaves running is outside the fence and is not detectable here; an
+    explicit, enforceable drain contract for detached work is NOT
+    implemented. Any journal failure raises RouteJournalError and nothing
+    further is done. Its own store, separate from the route journal. NOT
+    wired into PilotASGI or any service.
     """
     _SCHEMA = {**_counter_schema('supervisor_route_dispatch_accepted'),
                **_counter_schema('supervisor_route_dispatch_started'),
@@ -997,7 +1024,8 @@ class DispatchCounterGate(_DurableStore):
 
     def run(self, dispatch, *, method, path, body, effect):
         """Returns ``effect()``'s result after the fenced, recorded effect."""
-        _require(callable(effect), SupervisorRouteError('effect required'))
+        _require(callable(effect) and not inspect.iscoroutinefunction(effect),
+                 SupervisorRouteError('synchronous effect required'))
         counter = self._bound(dispatch, method, path, body)
         self._accept(counter)
         return self._fenced(counter, effect)
@@ -1049,13 +1077,13 @@ class DispatchCounterGate(_DurableStore):
             self._advance(db, 'supervisor_route_dispatch_started', counter, started)
             db.execute('INSERT INTO supervisor_route_dispatch_in_flight VALUES (?,?)', (self._executor, counter))
 
-    def _finish(self, counter, outcome):
+    def _finish(self, counter, outcome, evidence=None):
         with self._transaction() as db:
             _require(db.execute('SELECT counter FROM supervisor_route_dispatch_in_flight WHERE executor_id=?',
                                 (self._executor,)).fetchone() == (counter,), RouteJournalError('in_flight'))
             db.execute('DELETE FROM supervisor_route_dispatch_in_flight WHERE executor_id=?', (self._executor,))
-            db.execute('INSERT INTO supervisor_route_dispatch_outcome VALUES (?,?,?)',
-                       (self._executor, counter, outcome))
+            db.execute('INSERT INTO supervisor_route_dispatch_outcome VALUES (?,?,?,?)',
+                       (self._executor, counter, outcome, evidence))
 
     def _fenced(self, counter, effect):
         acquired = (self._effect_lock.acquire(timeout=self._effect_wait) if self._effect_wait
@@ -1064,28 +1092,48 @@ class DispatchCounterGate(_DurableStore):
             raise DispatchRefused('dispatch_busy')  # Counter stays consumed; it never acts later.
         try:
             self._fence(counter)
-            # Durable in-flight from here: the outcome is recorded before release.
-            try:
-                result = effect()
-            except BaseException:
-                try:
-                    self._finish(counter, 'raised')
-                except BaseException:
-                    pass  # Marker stays: later runs are refused until released.
-                raise
+            # Durable in-flight from here. Any exception propagates with the
+            # marker KEPT (outcome unknown); only a normal return completes.
+            result = effect()
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()  # Never started by us; a task/future may be live.
+                raise DispatchRefused('dispatch_effect_async')  # Marker kept.
             self._finish(counter, 'completed')
             return result
         finally:
             self._effect_lock.release()
 
-    def release_unresolved(self, counter):
-        """Explicit operator act after a dead/failed run: records ``released``
-        (effect outcome UNKNOWN) for exactly the in-flight ``counter``."""
+    def release_unresolved_after_quiescence(self, counter, *, evidence):
+        """OPERATOR ACT. Clears the kept in-flight marker of exactly ``counter``
+        and durably records ``released`` (effect outcome UNKNOWN) with
+        ``evidence`` (1..1024 printable ASCII: who established, and how, that
+        the effect has STOPPED: process gone, detached work drained or killed).
+
+        The gate CANNOT prove quiescence. It only refuses while an effect runs
+        in THIS process, and other processes cannot open the store while this
+        one owns it; it cannot see detached work. Releasing while the effect
+        (or work it handed off) is still active lets a higher counter act
+        concurrently with it. The released counter never runs again.
+        """
         _require(_positive(counter, MAX_DISPATCH_COUNTER), SupervisorRouteError('counter'))
+        _require(type(evidence) is str and _EVIDENCE.fullmatch(evidence),
+                 SupervisorRouteError('operator quiescence evidence required'))
         if not self._effect_lock.acquire(blocking=False):
-            raise DispatchRefused('dispatch_busy')  # A live run owns it: not unresolved.
+            raise DispatchRefused('dispatch_busy')  # A live run owns it: not quiescent.
         try:
-            self._finish(counter, 'released')
+            self._finish(counter, 'released', evidence)
+        finally:
+            self._effect_lock.release()
+
+    def close(self):
+        """Refuses (SupervisorRouteInFlight) while an effect is running, so the
+        inter-process owner lock is never released mid-effect. Retry after
+        the effect returns."""
+        if not self._effect_lock.acquire(blocking=False):
+            raise SupervisorRouteInFlight('dispatch effect')
+        try:
+            super().close()
         finally:
             self._effect_lock.release()
 
