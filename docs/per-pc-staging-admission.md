@@ -71,7 +71,20 @@ Add `InstallationAuthority.verify(principal_row, *, checkpoint)` as a pure funct
 | Worker process with no bridge running at all | Unaffected: it reads fences from the Hub database it already writes. |
 | Natural expiry, with no revoke write | Jobs pin the installation and grant `expires_at` in their principal row. Every checkpoint compares the Hub clock to the pinned expiry inside its transaction. An earlier-expiry edit is a narrowing edit and goes through `revoke_with_fence`. |
 
-**The residual window is not yet bounded.** It lies between the dispatch re-check and the request reaching the executor. It is at most one send per job only if the executor refuses a second command for the same intent, and nothing in this design proves that today. A search of `hub_container_executor` found no command-id deduplication. Until the executor enforces single use of a command ID, or an authority lease (see open questions), no numeric bound is claimed. The required executor test is `test_executor_refuses_second_command_for_same_intent_id`.
+**The residual window is not yet closed.** It lies between the dispatch re-check and the effect on the staging host. Carrying an epoch in each command does not close it, because an executor that has not learned of the newest fence cannot tell that the command is stale. Deduplication does not close it either: refusing a repeated command says nothing about revocation. Closing it needs enforcement at the executor. Two options:
+
+| | A. Online admission at effect time | B. Short-lived signed lease |
+|---|---|---|
+| Mechanism | Just before the host effect, the executor calls an authenticated Hub endpoint `admit(intent_id, command_id)`. In one Hub transaction the Hub checks fences, pinned expiry and the principal, then marks the intent `consumed`. | At dispatch the Hub signs `(intent_id, command_id, installation_id, authority_epoch, not_after = now + T)` with an enrolled Hub key. The executor verifies the signature and `not_after` against its own clock, and records `command_id` as used before the effect. |
+| Revocation guarantee | No effect whose admission check commits after the fence. The remaining exposure is the effect's own duration after a successful check. | Exposure after a fence is at most T plus the clock skew S between the Hub and the executor. |
+| Replay | The intent is single-use in the Hub; a second `admit` is refused. | A durable used-ID store on the executor, written before the effect, plus `not_after`. |
+| Disconnect | Hub unreachable: the executor refuses. Fail closed, at an availability cost. | The executor works offline until `not_after`; with no new lease it refuses. |
+| Crash | Executor crashes after `admit` and before the effect: the intent is consumed and recovery inspects. It never redoes the step without a new intent. | Executor crashes after recording the ID: the ID stays used. A crash before recording sends no effect. |
+| Assumptions | An authenticated executor-to-Hub channel, which does not exist today. | Bounded clock skew S, monitored; the executor refuses when unsynchronised. Key enrollment and rotation. |
+
+Recommendation: A for the staging pilot. It is low volume on the same private network, the availability cost is acceptable, and it gives a revocation point backed by a recorded Hub decision. Use B only if the executor cannot reach the Hub, and state T + S as the exposure. Neither option is claimed until its executor-side tests pass. Until then, the design claims only that no new intent is admitted after a fence.
+
+**Pending-fence reconciliation.** Runs at startup (before queue admission) and on every owner retry or on-demand request. It never runs silently in the background. A fence that cannot be completed stays `pending`, is shown to the owner with its error, and keeps blocking execution.
 
 **Grant edits.** Each execution grant carries an `authority_epoch` that increments only on a narrowing edit: revoke, an earlier expiry, or removing a project, environment or capability. A harmless edit (a label, a later expiry, an added unrelated project) changes `revision` but not `authority_epoch`. Jobs pin the epoch at submit. Admission requires the exact current revision; later checkpoints require the same epoch. A narrowing edit goes through `revoke_with_fence` like a revoke.
 
@@ -133,7 +146,11 @@ Apply the same rule to the candidate. A legacy owner's `candidate_family` must e
 - `test_every_revoke_route_goes_through_revoke_with_fence`: enumerate app routes and owner API methods that revoke or narrow; each one writes a fence first. A direct `revoke_session` call without `fence_id` raises.
 - `test_worker_honours_fence_with_bridge_process_dead`: the worker runs with no bridge object and refuses on a fence row.
 - `test_pinned_expiry_stops_new_effects_without_any_write`.
-- `test_executor_refuses_second_command_for_same_intent_id`: an executor-side test. The residual-window bound is claimed only once this passes.
+Acceptance tests for executor enforcement (option A unless noted):
+- **Race:** `test_fence_commits_between_dispatch_and_admit_refuses_effect` (the executor calls `admit` after the fence; refused, no effect) and `test_admit_commits_before_fence_effect_runs_and_is_recorded`.
+- **Replay:** `test_second_admit_for_same_intent_refused`, `test_replayed_command_after_restart_refused`; for B, `test_expired_or_reused_lease_refused`.
+- **Disconnect:** `test_hub_unreachable_executor_refuses_and_reports`; for B, `test_lease_valid_offline_until_not_after_then_refused`.
+- **Crash:** `test_executor_crash_after_admit_before_effect_not_redone`, `test_hub_crash_during_admit_transaction_leaves_intent_unconsumed`, `test_pending_fence_reconciled_on_startup_and_retry_and_visible_on_failure`.
 - `test_harmless_grant_edit_keeps_job_narrowing_edit_stops_new_effects`: an added unrelated project leaves the epoch unchanged and the job continues; removing the project bumps the epoch, writes a fence and refuses the next effect.
 - `test_session_revoke_stops_only_that_sessions_jobs`.
 - `test_revoked_completion_records_truthful_outcome_without_advancing_task`: terminal success after revocation is recorded, the task status is unchanged, and no follow-on work is admitted.
@@ -146,7 +163,7 @@ Decided: revoking a session stops new effects for that session's jobs and keeps 
 Decided (second round): use a dedicated execution grant, one fail-closed revoke path that writes the fence first, a dispatch-side re-check, and recovery kept available.
 
 Open:
-1. To close the residual window at the executor: either command-ID single use plus an epoch carried in each command (the executor refuses a command older than the newest fence it has seen), or a short Hub-signed authority lease per command. The executor has no Hub feed today.
-2. Reconciler cadence for `pending` fences: startup plus a periodic sweep, or on demand only?
+1. Executor enforcement: option A (online admission; recommended) or option B (signed lease)? Either needs executor work and a new channel or key that does not exist today.
+2. For option B, the values of T and the accepted skew S.
 
 **Not verified:** the live session database's journal mode (the source sets none); how `app.py` would wire the queue and controller for installations; whether a remote staging cancel API exists; and whether a stored row with a forged legacy `review.family` exists today. No code was run.
