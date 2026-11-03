@@ -138,12 +138,15 @@ async def test_private_worker_only_and_fence_cannot_be_forged(rig):
 
 
 @pytest.mark.asyncio
-async def test_changed_review_prevents_claim_and_any_host_submission(rig):
+async def test_open_job_freezes_reviewed_task_and_allows_its_pilot(rig):
     task, _ = submit(rig)
     current = rig.repo.get_task(task["id"])
-    rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
-    assert await rig.bridge.run_once() is None
-    assert rig.client.submissions == [] and rig.repo.list_runs() == []
+    with pytest.raises(HubError, match="task_in_progress"):
+        rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
+    result = await rig.bridge.run_once()
+    assert result["state"] == "succeeded"
+    assert len(rig.repo.list_runs()) == 1
+    assert len(rig.client.submissions) == len(ACTIONS[:2])
 
 
 @pytest.mark.asyncio

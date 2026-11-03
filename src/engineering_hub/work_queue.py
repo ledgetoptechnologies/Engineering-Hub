@@ -335,6 +335,35 @@ class WorkQueue:
             self._event(db, 'work.submitted', job_id, actor)
             return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
 
+    def cancel_unclaimed(self, *, actor, job_id):
+        """Cancel the caller's provably never-claimed queue entry; no host effect."""
+        if type(actor) is not str or actor not in AGENTS:
+            raise HubError('invalid_work_actor')
+        _key(job_id)
+        with self.repo._transaction() as db:
+            row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise HubError('work_job_not_found', 404)
+            if row['actor'] != actor:
+                raise HubError('forbidden', 403)
+            # Check the durable job project inside the cancellation transaction.
+            # Legacy agents may clear an archived project's unclaimed job;
+            # installation principals are not supported by this queue yet.
+            self.repo._project(row['project'], db, require_active=False)
+            if row['state'] == 'cancelled':
+                return self._public(row)
+            if (row['state'] != 'queued' or row['revision'] != 1
+                    or row['worker'] is not None or row['fence'] is not None
+                    or row['lease_until'] is not None
+                    or db.execute('SELECT 1 FROM hub_work_machines WHERE job_id=? LIMIT 1', (job_id,)).fetchone()
+                    or db.execute("SELECT 1 FROM hub_audit WHERE entity_id=? AND action='work.claimed' LIMIT 1", (job_id,)).fetchone()):
+                raise HubError('work_not_unclaimed', 409)
+            updated = db.execute("UPDATE hub_work_jobs SET state='cancelled' WHERE id=? AND state='queued' AND revision=1 AND worker IS NULL AND fence IS NULL AND lease_until IS NULL", (job_id,)).rowcount
+            if updated != 1:
+                raise HubError('work_not_unclaimed', 409)
+            self._event(db, 'work.cancelled', job_id, actor)
+            return self._public(db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone())
+
     def _admitted(self, worker, row):
         if not self._shared_policy_valid(row['action_key']):
             return False

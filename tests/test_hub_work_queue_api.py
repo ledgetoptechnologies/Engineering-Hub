@@ -177,7 +177,7 @@ def test_submit_binds_owned_reviewed_task_and_registered_project(rig, case):
     assert client.get(BASE + '/jobs', headers=bearer()).json()['items'] == []
 
 
-def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
+def test_production_priority_is_not_approval_and_active_review_is_frozen(rig):
     client, repo, _, _, _, submission, *_ = rig
     prod = submission(environment='production', approval_id='not-real-approval')
     assert client.post(BASE + '/jobs', headers=bearer(), json=prod).status_code == 201
@@ -185,8 +185,11 @@ def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
     staging = submission()
     assert client.post(BASE + '/jobs', headers=bearer(), json=staging).status_code == 201
     current = repo.get_task(staging['target']['task_id'])
-    repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
-    assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
+    with pytest.raises(HubError, match='task_in_progress'):
+        repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+    assert repo.get_task(current['id'])['candidate_commit'] == COMMIT
+    claimed = client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job']
+    assert claimed['target']['task_id'] == staging['target']['task_id']
 
 
 @pytest.mark.parametrize('evidence', [None, 'untrusted-evidence'])

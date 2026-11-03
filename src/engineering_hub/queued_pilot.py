@@ -427,7 +427,10 @@ class QueuedContainerPilot:
         if self.async_admission_required and operation in {'create_run', 'command'}:
             # Local binding/ledger reads can consume the proof window too.
             self._active_admission(kinds={'claim'} if operation == 'create_run' else {'command'})
-        return True
+        # Return the exact owning queue job for create_run so the repository
+        # can distinguish this admitted job from a competing open job on the
+        # same task. All other authorized operations retain the boolean result.
+        return job_id if operation == 'create_run' else True
 
     def _intent(self, job):
         self._guard(admission=True)

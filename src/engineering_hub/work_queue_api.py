@@ -165,6 +165,11 @@ def attach_work_queue_routes(app, *, repo, queue, actor, agent, human):
         principal = identity(request, agent)
         return submit_reviewed_work(repo, configured(), principal, payload)
 
+    @app.post('/api/hub/v1/work/jobs/{job_id}/cancel')
+    def cancel_unclaimed(job_id: JobID, request: Request):
+        principal = identity(request, agent)
+        return configured().cancel_unclaimed(actor=principal, job_id=job_id)
+
     @app.post('/api/hub/v1/work/claim')
     def claim(payload: WorkClaim, request: Request):
         principal = identity(request, agent)
