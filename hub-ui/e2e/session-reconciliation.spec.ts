@@ -54,7 +54,7 @@ test("nonoperator denial keeps the human signed in and offers no acceptance", as
   const panel = page.getByRole("region", { name: "Staging session reconciliation" });
   await expect(panel.getByRole("alert")).toContainText("designated staging operator");
   await expect(panel.getByRole("button", { name: "Accept staging session only" })).toBeDisabled();
-  await expect(page.getByRole("heading", { name: "Staging.", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Queues & sessions.", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign out", exact: true })).toBeVisible();
   await expect(page.getByText("Sign in to Engineering Hub.", { exact: true })).toHaveCount(0);
   expect(writes).toEqual([]);

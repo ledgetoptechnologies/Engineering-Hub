@@ -675,7 +675,7 @@ test("live task creation uses browser session, same-origin request and CSRF with
       body: JSON.stringify({ detail: { code: "work_queue_not_configured" } }) });
   });
   try {
-    await page.goto("/#/staging");
+    await page.goto("/#/staging/queues");
     await expect
       .poll(() =>
         mock.requests.map(
