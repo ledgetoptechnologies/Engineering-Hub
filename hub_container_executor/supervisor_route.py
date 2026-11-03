@@ -199,6 +199,18 @@ Explicit limits (this foundation grants no authority by itself):
   not provisioned anywhere, and the Hub must supply the held attempt's
   dispatch counter itself (``RouteResult`` does not carry it). Nothing
   constructs the client, responder or resolver.
+* The resolver's held row is caller-supplied and does NOT prove it is the
+  original authoritative Hub job: ``InspectionResolver`` requires a
+  ``HeldAttemptSource`` to vouch for each attempt, and the only one provided
+  (the base class) refuses everything, so there is no production use until a
+  source bound to the Hub job store exists. Recorded terminal rows are
+  re-verified (exact request + signed answer, current pinned key and
+  binding) on every replay, else held.
+* The responder bounds its own work (``max_concurrent`` non-blocking slots,
+  ``read_budget_ms`` per journal read) independently of the client deadline,
+  but work a departed client no longer waits for still completes inside that
+  budget (detached work), and same-UID FD delegation and rollback anchoring
+  remain open as above.
 """
 from __future__ import annotations
 
@@ -1657,7 +1669,8 @@ _INSPECTION_ANSWER_KEYS = frozenset({'protocol', 'audience', 'key_id', 'request'
                                      'route_state', 'answered_at_ms'})
 _REQUEST_NONCE = re.compile(r'[0-9a-f]{32}\Z')
 _INSPECTION_ERRORS = frozenset({'no_held_attempt', 'peer_mismatch', 'transport_lost', 'http_status',
-                                'unverified', 'not_found', 'unknown', 'resolution_unrecorded'})
+                                'unverified', 'not_found', 'unknown', 'resolution_unrecorded', 'unvouched',
+                                'replay_unverified'})
 
 
 def inspection_key_id(public_key):
@@ -1701,25 +1714,46 @@ def _valid_inspection_request(request):
             is not None)
 
 
-def _read_inspection_row(journal, command_id):
+def _read_inspection_row(journal, command_id, budget_ms):
     """Read-only (binding_digest, binding, state, dispatch_counter) or None
-    from the route journal; never writes or forwards."""
-    _require(type(journal) is RouteJournal and os.getpid() == journal._pid, RouteJournalError('process'))
-    with journal._mutex:
+    from the route journal under ONE time budget; never writes or forwards.
+
+    The journal mutex is only TRIED for the budget, the private read-only
+    connection's busy timeout is what remains of it, and a progress handler
+    aborts any statement (schema/quick_check included) once it is spent, so a
+    slow or locked journal makes this raise instead of pinning a worker.
+    """
+    _require(type(journal) is RouteJournal and os.getpid() == journal._pid
+             and type(budget_ms) is int and budget_ms > 0, RouteJournalError('process'))
+    deadline = time.monotonic() + budget_ms / 1000
+    if not journal._mutex.acquire(timeout=budget_ms / 1000):
+        raise RouteJournalError('route journal busy')
+    try:
+        journal._active()
+        remaining = deadline - time.monotonic()
+        _require(remaining > 0, RouteJournalError('route journal busy'))
+        db = sqlite3.connect(journal.path.as_uri() + '?mode=ro', uri=True, timeout=remaining,
+                             isolation_level=None)
         try:
-            journal._active()
-            with journal._connection(readonly=True) as db:
-                journal._schema(db)
-                if journal._row(db, command_id) is None:
-                    return None
-                row = db.execute('SELECT binding_digest,binding,state,dispatch_counter '
-                                 'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
-                _require(row is not None and _positive(row[3], MAX_DISPATCH_COUNTER), RouteJournalError('row'))
-                return row
-        except RouteJournalError:
-            raise
-        except Exception:
-            raise RouteJournalError('route journal unavailable') from None
+            db.execute(f'PRAGMA busy_timeout={max(1, int(remaining * 1000))}')
+            db.execute('PRAGMA trusted_schema=OFF')
+            db.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+            journal._schema(db)
+            if journal._row(db, command_id) is None:
+                return None
+            row = db.execute('SELECT binding_digest,binding,state,dispatch_counter '
+                             'FROM supervisor_route_intent WHERE command_id=?', (command_id,)).fetchone()
+            _require(row is not None and _positive(row[3], MAX_DISPATCH_COUNTER), RouteJournalError('row'))
+            _require(time.monotonic() <= deadline, RouteJournalError('route journal busy'))
+            return row
+        finally:
+            db.close()
+    except RouteJournalError:
+        raise
+    except Exception:
+        raise RouteJournalError('route journal unavailable') from None
+    finally:
+        journal._mutex.release()
 
 
 class InspectionAuthenticator:
@@ -1831,8 +1865,16 @@ class SupervisorPeerPin:
 
 @dataclass(frozen=True)
 class InspectionResponderConfig:
-    """Explicit configuration. ``enabled`` defaults to False: no responder exists."""
+    """Explicit configuration. ``enabled`` defaults to False: no responder exists.
+
+    ``max_concurrent`` (1..8) answers may run at once; another caller gets an
+    unsigned 503 ``busy`` immediately (never queued). ``read_budget_ms``
+    (10..1000) bounds each durable journal read; keep it well under the
+    client's total deadline.
+    """
     enabled: bool = False
+    max_concurrent: int = 2
+    read_budget_ms: int = 100
 
 
 class SupervisorInspectionResponder:
@@ -1846,17 +1888,26 @@ class SupervisorInspectionResponder:
     refused), ``not_found`` (no row), ``unknown`` (intent/unknown, or ANY
     difference between the row and the request's binding or dispatch
     claim counter). Signed with the explicitly supplied supervisor key over the
-    full request echo; denials (401/400/404/503) are unsigned. No listener or
-    HTTP server is provided and nothing constructs this.
+    full request echo; denials (401/400/404/503) are unsigned. Work is
+    bounded independently of the client's deadline: at most
+    ``max_concurrent`` answers at once (non-blocking: ``busy`` otherwise) and
+    each journal read within ``read_budget_ms`` (``unavailable`` otherwise).
+    Detached work is still possible inside the budget (a client that gave up
+    is not noticed). No listener or HTTP server is provided and nothing
+    constructs this.
     """
 
     def __init__(self, *, config, route, authenticator, signing_key):
         if type(config) is not InspectionResponderConfig or config.enabled is not True:
             raise SupervisorRouteDisabled('supervisor inspection responder is disabled')
         _require(type(route) is SupervisorRoute and isinstance(authenticator, InspectionAuthenticator)
-                 and isinstance(signing_key, Ed25519PrivateKey),
+                 and isinstance(signing_key, Ed25519PrivateKey)
+                 and type(config.max_concurrent) is int and 1 <= config.max_concurrent <= 8
+                 and type(config.read_budget_ms) is int and 10 <= config.read_budget_ms <= 1000,
                  SupervisorRouteError('invalid supervisor inspection responder'))
         self._route, self._authenticator, self._signer = route, authenticator, signing_key
+        self._slots = threading.BoundedSemaphore(config.max_concurrent)
+        self._read_budget_ms = config.read_budget_ms
         self.key_id = inspection_key_id(signing_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw))
 
@@ -1872,6 +1923,15 @@ class SupervisorInspectionResponder:
             _require(self._authenticator.authenticate(authorization) == INSPECTION_SCOPE)
         except Exception:
             return self._denied(401, 'unauthorized')
+        # Bounded concurrency: never queue; a saturated responder answers busy.
+        if not self._slots.acquire(blocking=False):
+            return self._denied(503, 'busy')
+        try:
+            return self._answer(method, path, body)
+        finally:
+            self._slots.release()
+
+    def _answer(self, method, path, body):
         if method != 'POST' or path != INSPECTION_PATH:
             return self._denied(404, 'not_found')
         try:
@@ -1882,7 +1942,8 @@ class SupervisorInspectionResponder:
         if request['key_id'] != self.key_id:
             return self._denied(400, 'wrong_key')
         try:
-            row = _read_inspection_row(self._route._journal, request['binding']['command_id'])
+            row = _read_inspection_row(self._route._journal, request['binding']['command_id'],
+                                       self._read_budget_ms)
         except Exception:
             return self._denied(503, 'unavailable')
         status, route_state = 'unknown', None
@@ -2046,11 +2107,13 @@ _RESOLUTION = ('CREATE TABLE supervisor_route_inspection (command_id TEXT PRIMAR
                "dispatch_counter INTEGER NOT NULL CHECK(typeof(dispatch_counter)='integer' "
                'AND dispatch_counter > 0), '
                "state TEXT NOT NULL CHECK(state IN ('held','launched','refused')), route_state TEXT, "
-               'key_id TEXT, answer TEXT, '
-               "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL) "
-               "OR (state='launched' AND route_state='completed' AND key_id IS NOT NULL AND answer IS NOT NULL) "
+               'key_id TEXT, answer TEXT, request TEXT, '
+               "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL "
+               'AND request IS NULL) '
+               "OR (state='launched' AND route_state='completed' AND key_id IS NOT NULL AND answer IS NOT NULL "
+               'AND request IS NOT NULL) '
                "OR (state='refused' AND route_state IN ('rejected','refused') AND key_id IS NOT NULL "
-               'AND answer IS NOT NULL)))')
+               'AND answer IS NOT NULL AND request IS NOT NULL)))')
 _RESOLUTION_SCHEMA = {
     'supervisor_route_inspection': _RESOLUTION,
     'supervisor_route_inspection_insert_held': (
@@ -2078,12 +2141,16 @@ class InspectionLedger(_DurableStore):
     synchronous=FULL, parent fsync, exact schema incl. triggers). Triggers
     make rows insert-once as ``held``, movable once only from ``held`` to
     ``launched``/``refused`` with every binding column unchanged, and never
-    deleted. Like every local SQLite file it is UNANCHORED: it cannot prove it
-    was not rolled back or restored.
+    deleted. A terminal row keeps the EXACT canonical request bytes that were
+    sent and the EXACT signed answer bytes (payload + signature) with its key
+    id; they are evidence to re-verify on every read, never trusted as stored.
+    Like every local SQLite file it is UNANCHORED: it cannot prove it was not
+    rolled back, restored or edited by a same-UID process.
     """
     _SCHEMA = _RESOLUTION_SCHEMA
     _VERSION = 1
-    _COLUMNS = 'command_id,binding_digest,binding,executor_id,dispatch_counter,state,route_state,key_id,answer'
+    _COLUMNS = ('command_id,binding_digest,binding,executor_id,dispatch_counter,state,route_state,key_id,answer,'
+                'request')
 
     @staticmethod
     def _key(request):
@@ -2103,7 +2170,7 @@ class InspectionLedger(_DurableStore):
                 if row[1:5] != self._key(request):
                     raise SupervisorRouteRejected('binding_conflict')
                 return
-            db.execute("INSERT INTO supervisor_route_inspection VALUES (?,?,?,?,?,'held',NULL,NULL,NULL)",
+            db.execute("INSERT INTO supervisor_route_inspection VALUES (?,?,?,?,?,'held',NULL,NULL,NULL,NULL)",
                        (command_id, *self._key(request)))
 
     def read(self, command_id):
@@ -2131,9 +2198,27 @@ class InspectionLedger(_DurableStore):
             if row[5] != 'held':
                 _require(row[5:8] == (state, route_state, key_id), RouteJournalError('resolution_conflict'))
                 return
-            db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, answer=? '
-                       "WHERE command_id=? AND state='held'", (state, route_state, key_id, answer.decode(),
-                                                                command_id))
+            db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, answer=?, '
+                       "request=? WHERE command_id=? AND state='held'",
+                       (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'),
+                        command_id))
+
+
+class HeldAttemptSource:
+    """DEFAULT-REFUSING authority that a held attempt is the ORIGINAL,
+    authoritative Hub job (its command_id, exact command bytes, fence, epoch,
+    backend pin and dispatch counter).
+
+    The resolver's own ledger row is caller-supplied and proves nothing about
+    which Hub job it stands for. ``vouch(command, pin, dispatch_counter)``
+    must return exactly True, and only an implementation bound to the Hub's
+    durable job store may do so. The base class refuses everything, so the
+    resolver cannot hold or resolve anything until such a source exists
+    (none does today).
+    """
+
+    def vouch(self, command, pin, dispatch_counter):
+        raise SupervisorRouteError('held attempt source not configured')
 
 
 @dataclass(frozen=True)
@@ -2172,22 +2257,60 @@ class InspectionResolver:
     framing, HTTP denial, unsigned, bad signature, wrong key, any binding
     mismatch, ``unknown``, signed ``not_found``, failure to record) returns
     ``held`` and changes nothing. Not wired into any Hub service.
+
+    IMPORTANT: the ledger row alone does NOT prove that the held attempt is
+    the original authoritative Hub job; a caller could hold any binding.
+    Every ``hold`` and ``resolve`` therefore first requires the
+    ``HeldAttemptSource`` to vouch for the exact attempt (default: refuses,
+    so nothing can be held or resolved in production until a source bound to
+    the Hub job store exists). A recorded terminal row is NOT returned as
+    stored: its exact request and signed answer are re-verified against the
+    CURRENT pinned key and the CURRENT binding on every replay; key rotation,
+    a different pin or binding, a tampered or missing byte returns ``held``.
     """
 
-    def __init__(self, *, config, client):
+    def __init__(self, *, config, client, source):
         if type(config) is not InspectionResolverConfig or config.enabled is not True:
             raise SupervisorRouteDisabled('supervisor inspection resolver is disabled')
-        _require(type(client) is SupervisorInspectionClient and type(config.ledger_path) is str,
+        _require(type(client) is SupervisorInspectionClient and type(config.ledger_path) is str
+                 and isinstance(source, HeldAttemptSource),
                  SupervisorRouteError('invalid supervisor inspection resolver'))
-        self._client = client
+        self._client, self._source = client, source
         self._ledger = InspectionLedger(config.ledger_path, create=config.create_ledger,
                                         allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
 
     def __repr__(self):
         return 'InspectionResolver(<enabled>)'
 
+    def _vouched(self, command, pin, dispatch_counter):
+        try:
+            return self._source.vouch(command, pin, dispatch_counter) is True
+        except Exception:
+            return False
+
     def hold(self, command, pin, dispatch_counter):
-        self._ledger.hold(self._client.request_for(command, pin, dispatch_counter))
+        request = self._client.request_for(command, pin, dispatch_counter)
+        if not self._vouched(command, pin, dispatch_counter):
+            raise SupervisorRouteRejected('unvouched')
+        self._ledger.hold(request)
+
+    def _replay(self, row, request):
+        """Re-verify a recorded terminal row; returns its state or None."""
+        try:
+            command_id, state, route_state, key_id, answer, sent = row[0], *row[5:10]
+            _require(type(sent) is str and type(answer) is str and key_id == request['key_id'])
+            raw = sent.encode('ascii')
+            stored = _strict_json(raw, MAX_INSPECTION_REQUEST_BYTES)
+            _require(_canonical(stored) == raw and _valid_inspection_request(stored)
+                     and _canonical({**stored, 'request_nonce': None})
+                     == _canonical({**request, 'request_nonce': None})
+                     and stored['binding']['command_id'] == command_id)
+            payload = self._client._verifier.verify(answer.encode('ascii'), request=stored)
+            _require(state in _TERMINAL and (payload['status'], payload['route_state'], payload['key_id'])
+                     == (state, route_state, key_id) and route_state in _TERMINAL[state])
+            return state, route_state
+        except Exception:
+            return None
 
     def resolve(self, command, pin, dispatch_counter):
         request = self._client.request_for(command, pin, dispatch_counter)
@@ -2195,6 +2318,8 @@ class InspectionResolver:
 
         def held(error, status=None):
             return InspectionResolution('held', command_id, status, None, error)
+        if not self._vouched(command, pin, dispatch_counter):
+            return held('unvouched')  # Nothing read or sent.
         try:
             row = self._ledger.read(command_id)
         except Exception:
@@ -2202,7 +2327,10 @@ class InspectionResolver:
         if row is None or row[1:5] != InspectionLedger._key(request):
             return held('no_held_attempt')  # Nothing sent.
         if row[5] != 'held':
-            return InspectionResolution(row[5], command_id, row[5], row[6], None, True)
+            replayed = self._replay(row, request)
+            if replayed is None:
+                return held('replay_unverified')  # Never the stored terminal unverified.
+            return InspectionResolution(replayed[0], command_id, replayed[0], replayed[1], None, True)
         answer = self._client.inspect(request)
         if not answer.verified:
             return held(answer.error if answer.error in _INSPECTION_ERRORS else 'unverified')
