@@ -168,7 +168,12 @@ class QueuedDevelopmentCI:
 
     def _guard(self):
         self.owner.assert_active(self.repo.path)
-        if (self.owner.epoch!=self.epoch or self.repo.pilot_owner is not self.owner
+        if self._composition_changed():
+            raise HubError('development_ci_ownership_changed',409)
+
+    def _composition_changed(self):
+        """In-memory composition identity only: no I/O, no callbacks."""
+        return (self.owner.epoch!=self.epoch or self.repo.pilot_owner is not self.owner
             or self.repo.execution_principal!=SOFTWARE_VALIDATION_EXECUTOR
             or self.manifest is not self._manifest or self.provider is not self._provider
             or self.provider.invoke!=self._invoke or self.provider.verify_terminal!=self._verify
@@ -178,8 +183,7 @@ class QueuedDevelopmentCI:
             or self.queue.completion_verifier!=self.completion_verifier
             or self.queue.reconciliation_verifier!=self._reconciliation
             or self.queue.approval_verifier is not self._approval
-            or self.queue.production_readiness_verifier is not self._readiness):
-            raise HubError('development_ci_ownership_changed',409)
+            or self.queue.production_readiness_verifier is not self._readiness)
 
     def _review(self, actor, target):
         task=self.repo.get_task(target.task_id)

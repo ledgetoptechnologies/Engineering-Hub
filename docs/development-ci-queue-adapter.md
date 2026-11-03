@@ -141,9 +141,21 @@ What is enforced in source:
   (task revision, review, candidate commit, manifest, both policy rows, attempt
   rows, registry and target verification) under `BEGIN IMMEDIATE`; any drift
   records no mark and signs nothing.
-- Triggers bind cooperative writers only. A writer that drops or bypasses
-  triggers (any direct SQLite access to the ledger or journal) is outside every
-  guarantee here; the exclusive-writer boundary must be enforced externally.
+  BEFORE INSERT triggers on both tables also refuse `INSERT OR REPLACE`,
+  `REPLACE` (which with the default `recursive_triggers=OFF` would delete the
+  conflicting row without DELETE triggers) and upserts that collide with an
+  in-flight job (by id, sequence or actor/request id) or its machine row.
+- The signing transaction reads only through its own connection and runs no
+  operator callback (those run in the precheck), so nothing can wait on the
+  write lock it holds. It refuses if a shared execution policy is composed.
+  Pre-existing: `WorkQueue` invokes target/claim callbacks inside its own
+  transactions; a callback that tries to write there waits for the
+  connection's busy timeout and then fails closed.
+- None of this fences a writer who can drop or bypass triggers (any direct
+  SQLite access to the ledger or journal) or who can drive the Engine
+  directly (Docker socket, systemd unit). Those are outside every guarantee
+  here; the exclusive-writer and engine-access boundaries must be enforced
+  externally.
 - Host nonces: at most `max_nonces` (default 64, 1..1024) live entries; expired
   entries are pruned by `time.monotonic()`, a full store refuses new challenges
   rather than evicting live ones, and each nonce is removed after one use

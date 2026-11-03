@@ -937,6 +937,15 @@ CREATE TRIGGER IF NOT EXISTS hub_ci_effect_machine_update BEFORE UPDATE ON hub_w
 WHEN OLD.job_id IS NOT NULL AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.job_id AND state='in_flight')
   AND (NEW.job_id IS NOT OLD.job_id OR NEW.generation IS NOT OLD.generation OR NEW.machine_id IS NOT OLD.machine_id)
 BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_machine_insert BEFORE INSERT ON hub_work_machines
+WHEN EXISTS(SELECT 1 FROM hub_work_machines m JOIN hub_development_ci_effects e ON e.job_id=m.job_id
+            WHERE m.machine_id=NEW.machine_id AND e.state='in_flight')
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
+CREATE TRIGGER IF NOT EXISTS hub_ci_effect_job_insert BEFORE INSERT ON hub_work_jobs
+WHEN EXISTS(SELECT 1 FROM hub_work_jobs j JOIN hub_development_ci_effects e ON e.job_id=j.id
+            WHERE e.state='in_flight' AND (j.id=NEW.id OR j.sequence=NEW.sequence
+                  OR (j.actor=NEW.actor AND j.request_id=NEW.request_id)))
+BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
 CREATE TRIGGER IF NOT EXISTS hub_ci_effect_machine_delete BEFORE DELETE ON hub_work_machines
 WHEN OLD.job_id IS NOT NULL AND EXISTS(SELECT 1 FROM hub_development_ci_effects WHERE job_id=OLD.job_id AND state='in_flight')
 BEGIN SELECT RAISE(ABORT,'development_ci_effect_in_flight'); END;
@@ -1108,10 +1117,13 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
 
         BEGIN IMMEDIATE holds the write lock, so the committed task, review,
         policy and attempt rows read here cannot change before the mark and
-        signature are recorded.
+        signature are recorded. Every read uses THIS connection and no
+        operator callback runs here (callbacks run in the _bound precheck), so
+        nothing can wait on the lock this transaction holds.
         """
         try:
-            self._guard()  # composition, manifest/provider identity, registry, schema
+            if self._composition_changed() or not _schema_matches(db, _HUB_EXPECTED):
+                return False
             task = self.repo._get(db, attempt.task_id, 'task')
             review = task.get('review')
             target = WorkTarget(**json.loads(job['target']))
@@ -1146,8 +1158,8 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                                             self.host_generation)
                     and action is not None and action.machine_id == self.manifest.machine_id
                     and action.environments == frozenset({'staging'}) and action.requires_execution_proof
-                    and self.queue._shared_policy_valid(self.action_key)
-                    and self.queue._target_verified(attempt.actor, self.action_key, 'staging', target))
+                    and not self.queue._shared_policy_present()
+                    and self.repo.task_allows_environment(attempt.task_id, 'staging', db=db) is True)
         except Exception:
             return False
 

@@ -4,6 +4,7 @@ The host runner, channel, HMAC authenticator, in-memory external anchor and
 terminal verifier below are TEST-ONLY doubles (key generated per test). No real
 transport, credential, external anchor or Docker engine is used.
 """
+import asyncio
 import hmac
 import importlib.util
 import json
@@ -952,3 +953,113 @@ async def test_binding_drift_before_signing_txn_records_no_mark_and_no_effect(ri
         assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
     assert not rig.channel.starts and not rig.runner.calls and host_rows(rig) == []
     assert reservation(rig) == job['id'] and releases(rig, job['id']) == 0
+
+
+JOB_COLUMNS = ('sequence,id,actor,request_id,fingerprint,action_key,environment,machine_id,project,'
+               'approval_id,target,requires_execution_proof,state,revision,worker,fence,lease_until,created_at')
+
+
+def _raw(rig):
+    db = sqlite3.connect(rig.path, timeout=1, isolation_level=None)
+    db.execute('PRAGMA recursive_triggers=OFF')
+    return db
+
+
+def _attempt(db, statement, values=()):
+    """Run one raw statement in its own rolled-back transaction."""
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute(statement, values)
+        return 'applied'
+    except sqlite3.IntegrityError as error:
+        return 'in_flight' if 'development_ci_effect_in_flight' in str(error) else 'other'
+    finally:
+        db.execute('ROLLBACK')
+
+
+def _replace_statements(job_id, other_id):
+    copy = lambda changes: ('SELECT ' + ','.join(changes.get(c, c) for c in JOB_COLUMNS.split(','))
+                            + ' FROM hub_work_jobs WHERE id=?')
+    return (
+        ('INSERT OR REPLACE INTO hub_work_machines VALUES(?,99,NULL)', (MACHINE,)),
+        ('REPLACE INTO hub_work_machines VALUES(?,99,?)', (MACHINE, other_id)),
+        ('INSERT INTO hub_work_machines VALUES(?,0,NULL) ON CONFLICT(machine_id) DO UPDATE SET job_id=NULL',
+         (MACHINE,)),
+        ('INSERT OR REPLACE INTO hub_work_jobs(' + JOB_COLUMNS + ') ' + copy({}), (job_id,)),
+        ('REPLACE INTO hub_work_jobs(' + JOB_COLUMNS + ') ' + copy({'fence': 'fence+1'}), (job_id,)),
+        ('INSERT OR REPLACE INTO hub_work_jobs(' + JOB_COLUMNS + ') '
+         + copy({'sequence': 'NULL', 'id': "'replacement-job'"}), (job_id,)),  # via UNIQUE(actor,request_id)
+        ('INSERT INTO hub_work_jobs(' + JOB_COLUMNS + ') ' + copy({}) + ' ON CONFLICT(id) DO UPDATE SET '
+         "fence=excluded.fence+1, machine_id='elsewhere'", (job_id,)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_and_upsert_cannot_bypass_in_flight_guards(rig):
+    job = submit(rig)
+    other = submit(rig, 'other')
+    outcomes, unrelated = [], []
+    def raw_writer():
+        db = _raw(rig)
+        try:
+            outcomes.extend(_attempt(db, statement, values) for statement, values in
+                            _replace_statements(job['id'], other['id']))
+            unrelated.append(_attempt(db, "INSERT INTO hub_work_machines VALUES('unrelated-machine',0,NULL)"))
+            unrelated.append(_attempt(db, 'INSERT INTO hub_work_jobs(' + JOB_COLUMNS + ') SELECT NULL,'
+                "'unrelated-job',actor,'unrelated-request',fingerprint,action_key,environment,machine_id,"
+                'project,approval_id,target,requires_execution_proof,state,revision,worker,fence,lease_until,'
+                'created_at FROM hub_work_jobs WHERE id=?', (other['id'],)))
+        finally:
+            db.close()
+    rig.runner.during = raw_writer
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert outcomes == ['in_flight'] * len(outcomes) and len(outcomes) == 7
+    assert unrelated == ['applied', 'applied']
+    assert releases(rig, job['id']) == 1 and len(rig.runner.calls) == 1
+    # After the normal path closes the marks, the same operations apply again.
+    db = _raw(rig)
+    try:
+        after = [_attempt(db, statement, values) for statement, values in
+                 _replace_statements(job['id'], other['id'])]
+    finally:
+        db.close()
+    assert 'in_flight' not in after and after[0] == 'applied' and after[3] == 'applied'
+
+
+@pytest.mark.asyncio
+async def test_signing_transaction_runs_no_callback_that_could_wait_on_its_lock(rig):
+    import time as clock
+    job = submit(rig)
+    original_target, original_binding = rig.bridge._target, rig.bridge._binding_in_txn
+    signing, probes = [], []
+    def binding(*args):
+        signing.append(True)
+        try:
+            return original_binding(*args)
+        finally:
+            signing.pop()
+    def writing_callback(*args):
+        # An operator callback that opens a SECOND connection and wants the
+        # write lock. WorkQueue already invokes target callbacks inside its own
+        # transactions (pre-existing), so the write must fail fast there; it
+        # must never be invoked inside the handoff signing transaction.
+        started = clock.monotonic()
+        db = sqlite3.connect(rig.path, timeout=0.2, isolation_level=None)
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('ROLLBACK')
+            state = 'free'
+        except sqlite3.OperationalError:
+            state = 'locked'
+        finally:
+            db.close()
+        probes.append((bool(signing), state, clock.monotonic() - started))
+        return original_target(*args)
+    rig.bridge._binding_in_txn = binding
+    rig.bridge._target = writing_callback
+    started = clock.monotonic()
+    result = await asyncio.wait_for(rig.bridge.run_once(), timeout=20)
+    assert result['id'] == job['id'] and result['state'] == 'succeeded'
+    assert probes and not any(during for during, _, _ in probes)
+    assert all(elapsed < 1.0 for _, _, elapsed in probes)  # bounded, never a deadlock
+    assert clock.monotonic() - started < 15
