@@ -118,6 +118,43 @@ def write_intent(path, value):
         os.close(directory)
 
 
+def prepare_input_directory(path):
+    """Allow the mapped container user to traverse this bind, under private parents."""
+    path.mkdir(mode=0o700)
+    path.chmod(0o755)  # mkdir is filtered by the caller's umask.
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o755):
+        raise CIError('CI input directory is not traversable')
+
+
+def publish_admission(inputs, intent):
+    """Expose a complete read-only gate atomically, never replacing a prior gate."""
+    directory = os.open(inputs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    temporary = '.admit-' + uuid4().hex
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=directory)
+        with os.fdopen(fd, 'wb', closefd=False) as stream:
+            stream.write(json.dumps({'intent': intent}).encode())
+            stream.flush()
+        os.fchmod(fd, 0o444)
+        os.fsync(fd)
+        os.link(temporary, 'admit.json', src_dir_fd=directory, dst_dir_fd=directory,
+                follow_symlinks=False)
+        os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
 def clear_own_intent(path, intent):
     """Clear only our original marker after authoritative terminal inspection."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -347,7 +384,7 @@ def _run_admitted(args, checkout, output, engine_directory, *, expected_commit=N
             raise CIError('Committed snapshot exceeds 64 MiB bound')
         result['phase'] = 'snapshot_creation'
         inputs = root / 'input'
-        inputs.mkdir(mode=0o755)
+        prepare_input_directory(inputs)
         archive = inputs / 'source.tar'
         subprocess.run(['/usr/bin/git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
                         'archive', '--format=tar', '--output', str(archive), commit],
@@ -389,8 +426,7 @@ def _run_admitted(args, checkout, output, engine_directory, *, expected_commit=N
         result['phase'] = 'source_admission'
         if admission_guard is not None:
             admission_guard()
-        (inputs / 'admit.json').write_text(json.dumps({'intent': intent}))
-        (inputs / 'admit.json').chmod(0o444)
+        publish_admission(inputs, intent)
         result['phase'] = 'source_execution'
         try:
             docker('container', 'wait', cid, timeout=args.timeout)
