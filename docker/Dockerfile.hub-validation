@@ -8,6 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/validation-venv/bin:${PATH}"
 
 WORKDIR /validation
+# Source-compatibility tests exercise real Git repositories, including offline CI.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install --no-cache-dir uv==0.11.17
 COPY pyproject.toml uv.lock README.md .env.example ./
 COPY src ./src

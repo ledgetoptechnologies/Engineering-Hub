@@ -49,6 +49,12 @@ or live configuration was changed. No warning was suppressed or force-GC used.
 
 `docker/Dockerfile.hub-validation` is a separate test image, not the deployed bus
 or Hub image. It installs locked test dependencies and copies required test inputs.
+It also installs Git for tests that create local repositories; test execution can
+remain network-isolated. The Python base tag and Debian package repositories are
+not immutable pins, so rebuilding this Dockerfile at a later date can select a
+different base or Git version. Record the resolved base and completed image IDs
+and Git version for each review; use the verified image ID for subsequent runs.
+These records identify what ran but do not by themselves establish build provenance.
 Its Dockerfile-specific ignore file admits only the tracked public `.env.example`
 template while continuing to exclude real environment files and runtime data.
 The normal default command uses `-W default` without global tracemalloc.
