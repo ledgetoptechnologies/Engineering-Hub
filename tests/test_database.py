@@ -162,7 +162,37 @@ def test_claim_ack_and_duplicate_claim_are_atomic(tmp_path):
     with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "hermes")
     done = repo.acknowledge(msg.id, "codex")
     assert done.status == "acknowledged" and done.acknowledged_at
+    # A retried ack (lost response, restart) returns the committed result, unchanged, marked as a replay.
+    assert repo.acknowledge_with_outcome(msg.id, "codex") == (done, True)
+    with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "hermes")
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "late")
+
+
+def test_retried_reject_is_idempotent_only_for_the_same_reason(tmp_path):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    repo.claim(msg.id, "codex")
+    done = repo.reject(msg.id, "codex", "out of scope")
+    assert repo.reject(msg.id, "codex", "out of scope") == done
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "another reason")
     with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "codex")
+
+
+def test_unclaimed_message_still_cannot_be_finished(tmp_path):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    with pytest.raises(InvalidTransition): repo.acknowledge(msg.id, "codex")
+    with pytest.raises(InvalidTransition): repo.reject(msg.id, "codex", "x")
+    assert repo.get(msg.id).status == "pending"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_json_numbers_are_refused_at_send_and_never_stored(tmp_path, value):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    with pytest.raises(MessageError, match="not valid JSON"):
+        repo.insert(sender="hermes", recipient="codex", message_type="x", body={"n": value})
+    with repo.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
 
 
 def test_expired_claim_can_be_retried(tmp_path):
@@ -191,3 +221,54 @@ def test_retention_preserves_pending_and_claimed(tmp_path):
     assert result == {"acknowledged_deleted": 1, "rejected_deleted": 1}
     assert repo.get(pending.id).status == "pending"
     assert repo.get(claimed.id).status == "claimed"
+
+
+def test_first_finish_reports_new_transition(tmp_path):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    repo.claim(msg.id, "codex")
+    message, replayed = repo.acknowledge_with_outcome(msg.id, "codex")
+    assert message.status == "acknowledged" and replayed is False
+
+
+def test_concurrent_ack_retries_make_exactly_one_transition(tmp_path):
+    import threading
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    repo.claim(msg.id, "codex")
+    barrier, results = threading.Barrier(8), []
+    def ack():
+        barrier.wait(); results.append(repo.acknowledge_with_outcome(msg.id, "codex"))
+    threads = [threading.Thread(target=ack) for _ in range(8)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert sorted(replayed for _, replayed in results) == [False] + [True] * 7
+    assert len({message.acknowledged_at for message, _ in results}) == 1
+
+
+def test_concurrent_rejects_with_different_reasons_one_wins(tmp_path):
+    import threading
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    msg = repo.insert(sender="hermes", recipient="codex", message_type="x", body={})
+    repo.claim(msg.id, "codex")
+    barrier, outcomes = threading.Barrier(2), {}
+    def reject(reason):
+        barrier.wait()
+        try: outcomes[reason] = repo.reject_with_outcome(msg.id, "codex", reason)[1]
+        except InvalidTransition: outcomes[reason] = "refused"
+    threads = [threading.Thread(target=reject, args=(reason,)) for reason in ("one", "two")]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert sorted(map(str, outcomes.values())) == ["False", "refused"]
+    winner = next(reason for reason, value in outcomes.items() if value is False)
+    assert repo.get(msg.id).rejection_reason == winner
+
+
+@pytest.mark.parametrize("body", [{"a": [{"b": float("nan")}]}, [1, {"x": float("inf")}], float("-inf")])
+@pytest.mark.parametrize("key", [None, "retry-key-1"])
+def test_nested_and_keyed_non_json_numbers_are_refused(tmp_path, body, key):
+    repo = MessageRepository(tmp_path / "m.sqlite3")
+    with pytest.raises(MessageError):
+        repo.insert(sender="hermes", recipient="codex", message_type="x", body=body, client_request_id=key)
+    with repo.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
