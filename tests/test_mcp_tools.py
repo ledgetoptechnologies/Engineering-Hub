@@ -52,3 +52,29 @@ def test_mcp_send_message_accepts_correlated_reply(tmp_path):
     reply = send(recipient="hermes", message_type="reply", body={}, in_reply_to=parent["id"], ctx=context("c"))
     assert reply["in_reply_to"] == parent["id"]
     assert reply["hop_count"] == 1
+
+
+def test_mcp_ack_and_reject_retries_are_audited_as_replays(tmp_path):
+    import json
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    service = Service(MessageRepository(tmp_path / "m.sqlite3"), audit, AuthSettings("h", "c"), RetentionPolicy())
+    tools = {tool.name: tool.fn for tool in build_mcp(service)._tool_manager.list_tools()}
+
+    def context(token):
+        request = Request({
+            "type": "http", "method": "POST", "scheme": "http", "server": ("test", 80),
+            "client": ("127.0.0.1", 1234), "root_path": "", "path": "/mcp", "raw_path": b"/mcp",
+            "query_string": b"", "headers": [(b"authorization", f"Bearer {token}".encode())], "state": {},
+        })
+        return SimpleNamespace(request_context=SimpleNamespace(request=request))
+
+    first = tools["send_message"](recipient="codex", message_type="x", body={}, ctx=context("h"))
+    second = tools["send_message"](recipient="codex", message_type="x", body={}, ctx=context("h"))
+    for message in (first, second):
+        tools["claim_message"](message_id=message["id"], ctx=context("c"))
+    assert tools["ack_message"](message_id=first["id"], ctx=context("c")) == tools["ack_message"](message_id=first["id"], ctx=context("c"))
+    tools["reject_message"](message_id=second["id"], reason="no", ctx=context("c"))
+    tools["reject_message"](message_id=second["id"], reason="no", ctx=context("c"))
+    rows = [json.loads(line) for line in audit.path.read_text().splitlines()]
+    finishes = [(row["operation"], row["result"]) for row in rows if row["operation"] in {"acknowledge", "reject"}]
+    assert finishes == [("acknowledge", "ok"), ("acknowledge", "replayed"), ("reject", "ok"), ("reject", "replayed")]

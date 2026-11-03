@@ -483,13 +483,20 @@ class MessageRepository:
             conn.commit(); return self.get(message_id, conn=conn)
 
     def acknowledge(self, message_id: str, agent: str) -> Message:
+        return self.acknowledge_with_outcome(message_id, agent)[0]
+
+    def acknowledge_with_outcome(self, message_id: str, agent: str) -> tuple[Message, bool]:
+        """Return (message, replayed); replayed means an earlier identical ack had already committed."""
         return self._finish(message_id, agent, "acknowledged", None)
 
     def reject(self, message_id: str, agent: str, reason: str) -> Message:
+        return self.reject_with_outcome(message_id, agent, reason)[0]
+
+    def reject_with_outcome(self, message_id: str, agent: str, reason: str) -> tuple[Message, bool]:
         if not reason: raise MessageError("rejection reason is required")
         return self._finish(message_id, agent, "rejected", reason)
 
-    def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> Message:
+    def _finish(self, message_id: str, agent: str, status: str, reason: str | None) -> tuple[Message, bool]:
         self._validate_agent(agent); timestamp = iso(now_utc())
         with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -498,14 +505,14 @@ class MessageRepository:
             if (row["recipient"] == agent and row["claimed_by"] == agent and row["status"] == status
                     and (status == "acknowledged" or row["rejection_reason"] == reason)):
                 # A retry of a finish that already committed (e.g. lost response or restart) returns the result.
-                conn.rollback(); return self._from_row(row)
+                conn.rollback(); return self._from_row(row), True
             if row["recipient"] != agent or row["status"] != "claimed" or row["claimed_by"] != agent:
                 conn.rollback(); raise InvalidTransition("message is not claimed by this agent")
             if status == "acknowledged":
                 conn.execute("UPDATE messages SET status=?,acknowledged_at=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, message_id))
             else:
                 conn.execute("UPDATE messages SET status=?,rejected_at=?,rejection_reason=?,claim_expires_at=NULL WHERE id=?", (status, timestamp, reason, message_id))
-            conn.commit(); return self.get(message_id, conn=conn)
+            conn.commit(); return self.get(message_id, conn=conn), False
 
     def cleanup(self, *, acknowledged_days: int = 30, rejected_days: int = 90) -> dict[str, int]:
         acknowledged_days = max(1, int(acknowledged_days)); rejected_days = max(1, int(rejected_days)); current = now_utc()
