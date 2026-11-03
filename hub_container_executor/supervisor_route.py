@@ -23,6 +23,23 @@ mark and command_id uniqueness BEFORE anything is forwarded. Identical replay
 returns the recorded outcome, ``in_progress`` or ``held``; a different binding
 under a known command_id is a conflict and is never forwarded.
 
+Dispatch counter: that same admission transaction also consumes the next
+durable per-executor dispatch counter (keyed by the pinned backend
+container_id; previous + 1, strictly increasing, never reused) and stores it
+on the intent row. The counter travels to the executor in the
+``X-Hub-Route-Dispatch`` header (``v1;executor=..;counter=..;body=<sha256>``)
+alongside the request; it is not part of the binding, the digest or the
+signed record. Triggers make the counter table append-only per executor (no
+lower/equal UPDATE, no DELETE, no second INSERT/REPLACE). A crash or failure
+after the admission COMMIT leaves the attempt ``intent``/``unknown`` (held)
+exactly as without the counter, and the consumed value is never sent again:
+an identical replay is held, a new command_id gets a higher value. The
+receiving side is ``DispatchCounterGate`` (also disabled by default, its own
+store): it refuses any counter not strictly greater than the last one it
+accepted for its executor (replays, duplicates and reorderings are refused,
+not deduplicated), allows gaps (consumed-but-unsent values), and commits the
+new value before the caller may act.
+
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
 against the pin immediately after connect and BEFORE any request byte is
 written; a mismatch closes the socket with zero bytes sent and durably records
@@ -106,6 +123,15 @@ Explicit limits (this foundation grants no authority by itself):
   reply authenticity rests only on the SO_PEERCRED/pidfd peer check and the
   bearer; the signed record attests what the supervisor forwarded and
   received, not independent proof of Docker effects or health.
+* ``DispatchCounterGate`` is NOT wired into PilotASGI or any executor service:
+  today nothing on the executor checks the dispatch header, so replay
+  protection at the receiver exists only once an operator/test constructs the
+  gate and calls ``accept`` before acting. The header is unauthenticated
+  beyond the bearer and peer check (no signer on either side); a party able
+  to send with the bearer can choose any counter, and a large one would
+  advance the gate. The gate's store must be private to the executor side.
+* The dispatch counter is keyed by container_id: a relaunch with a new
+  container starts a new sequence at 1 (and needs a fresh gate store).
 * A custom backend object must honour the contract that ``PeerMismatch`` is
   raised only before any byte is written; ``UnixSocketBackend`` does.
 * The actual supervisor/engine wiring (who constructs this, which socket the
@@ -161,10 +187,37 @@ _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z')
 _SIGNATURE = re.compile(r'[A-Za-z0-9_-]{86}\Z')
 _INTENT = ('CREATE TABLE supervisor_route_intent (command_id TEXT PRIMARY KEY, '
            'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, state TEXT NOT NULL, '
-           'owner_epoch TEXT NOT NULL, error TEXT, record TEXT, response BLOB, attempt TEXT)')
+           'owner_epoch TEXT NOT NULL, error TEXT, record TEXT, response BLOB, attempt TEXT, '
+           'dispatch_counter INTEGER NOT NULL)')
 _EPOCH = ('CREATE TABLE supervisor_route_epoch (id INTEGER PRIMARY KEY CHECK(id=1), '
           'launch_counter INTEGER NOT NULL, launch_id TEXT NOT NULL, boot_id TEXT NOT NULL)')
-_TABLES = {'hub_pilot_owner', 'hub_pilot_owner_epochs', 'supervisor_route_intent', 'supervisor_route_epoch'}
+_OWNER_TABLES = frozenset({'hub_pilot_owner', 'hub_pilot_owner_epochs'})
+MAX_DISPATCH_COUNTER = 2**63 - 1
+DISPATCH_HEADER = 'X-Hub-Route-Dispatch'
+_DISPATCH = re.compile(r'v1;executor=([0-9a-f]{64});counter=([1-9][0-9]{0,18});body=([0-9a-f]{64})\Z')
+
+
+def _counter_schema(table):
+    """Per-executor monotonic counter table plus triggers that make it
+    append-only per executor: one INSERT per executor_id (which also defeats
+    INSERT OR REPLACE), UPDATE only to a strictly greater value, no DELETE.
+    The exact SQL is part of the schema check, so a dropped or altered
+    trigger makes the store refuse to open or transact."""
+    return {
+        table: (f'CREATE TABLE {table} (executor_id TEXT PRIMARY KEY, counter INTEGER NOT NULL '
+                f"CHECK(typeof(counter)='integer' AND counter > 0))"),
+        table + '_insert_once': (
+            f'CREATE TRIGGER {table}_insert_once BEFORE INSERT ON {table} '
+            f'WHEN EXISTS (SELECT 1 FROM {table} WHERE executor_id = NEW.executor_id) '
+            "BEGIN SELECT RAISE(ABORT, 'dispatch counter exists'); END"),
+        table + '_increase_only': (
+            f'CREATE TRIGGER {table}_increase_only BEFORE UPDATE ON {table} '
+            'WHEN NEW.executor_id IS NOT OLD.executor_id OR NEW.counter <= OLD.counter '
+            "BEGIN SELECT RAISE(ABORT, 'dispatch counter must increase'); END"),
+        table + '_no_delete': (
+            f'CREATE TRIGGER {table}_no_delete BEFORE DELETE ON {table} '
+            "BEGIN SELECT RAISE(ABORT, 'dispatch counter is permanent'); END"),
+    }
 _STATES = frozenset({'intent', 'completed', 'rejected', 'refused', 'unknown'})
 _RECORDED = frozenset({'completed', 'rejected'})
 _ERRORS = frozenset({'transport_lost', 'malformed_response', 'backend_ambiguous', 'epoch_changed',
@@ -224,6 +277,12 @@ class SupervisorRouteInFlight(SupervisorRouteError):
     def __init__(self, command_id):
         self.command_id = command_id
         super().__init__('supervisor route operation in flight: ' + str(command_id))
+
+
+class DispatchRefused(SupervisorRouteRejected):
+    """Receiving side: the dispatch counter was missing, malformed, for another
+    executor or body, or not strictly greater than the last accepted one.
+    Nothing was recorded and the request must not be acted on."""
 
 
 class PeerMismatch(Exception):
@@ -412,6 +471,23 @@ def observation_nonce(digest):
     return hashlib.sha256(_NONCE_DOMAIN + bytes.fromhex(digest)).hexdigest()
 
 
+def dispatch_header(executor_id, counter, body):
+    """Value of the ``X-Hub-Route-Dispatch`` header: the durably recorded
+    per-executor counter bound to the pinned executor and the exact body."""
+    _require(type(executor_id) is str and _HEX.fullmatch(executor_id)
+             and _positive(counter, MAX_DISPATCH_COUNTER) and type(body) is bytes)
+    return f'v1;executor={executor_id};counter={counter};body={hashlib.sha256(body).hexdigest()}'
+
+
+def parse_dispatch_header(value):
+    """Strict parse -> (executor_id, counter, body_sha256); DispatchRefused
+    for anything missing, non-canonical, non-integer or out of range."""
+    match = _DISPATCH.fullmatch(value) if type(value) is str else None
+    if match is None or not _positive(int(match[2]), MAX_DISPATCH_COUNTER):
+        raise DispatchRefused('dispatch_invalid')
+    return match[1], int(match[2]), match[3]
+
+
 @dataclass(frozen=True)
 class RouteResult:
     """state: completed | rejected | refused | in_progress | held | busy.
@@ -513,20 +589,19 @@ def verify_route_record(raw, *, public_key, issuer_id, expected_binding, receive
         raise error from None
 
 
-class RouteJournal:
-    """Dedicated durable route intent/outcome journal (Linux, single owner).
+class _DurableStore:
+    """Single-owner durable SQLite store (Linux), shared by the route journal
+    and the receiving-side dispatch gate.
 
     Mirrors ``operation_journal.SQLiteOperationJournal`` durability: PilotOwner
     flock/enrollment, BEGIN IMMEDIATE, synchronous=FULL, rollback journal,
     parent fsync after commit, 250ms busy bound per wait. Any failure raises
-    RouteJournalError and the transaction is rolled back. No credential is
-    ever passed to or stored by the journal.
-    Each inserted intent carries a per-attempt nonce; rows with a NULL nonce
-    are never mutated by the failed-admit handler. A journal created with an
-    earlier schema (no attempt column) fails the exact schema check and is
-    refused today (fail closed); adopting one would require an offline
-    migration/reconciliation step, which is NOT implemented.
+    RouteJournalError and the transaction is rolled back. The exact schema
+    (tables AND triggers) and user_version are checked on open and inside
+    every transaction.
     """
+    _SCHEMA = {}
+    _VERSION = 0
 
     def __init__(self, database_path, *, create, allow_ephemeral_test_storage=False):
         from engineering_hub.pilot_ownership import PilotOwner
@@ -552,9 +627,9 @@ class RouteJournal:
             self._closed = False
             if create:
                 with self._transaction(initializing=True) as db:
-                    db.execute(_INTENT)
-                    db.execute(_EPOCH)
-                    db.execute('PRAGMA user_version=1')
+                    for sql in self._SCHEMA.values():
+                        db.execute(sql)
+                    db.execute(f'PRAGMA user_version={self._VERSION}')
             with self._transaction() as db:
                 pass
         except BaseException as error:
@@ -569,14 +644,15 @@ class RouteJournal:
     def owner_epoch(self):
         return self._owner.epoch
 
-    @staticmethod
-    def _schema(db):
+    def _schema(self, db):
         rows = db.execute("SELECT name, type, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").fetchall()
-        _require({name for name, kind, _ in rows if kind == 'table'} == _TABLES
-                 and all(kind == 'table' for _, kind, _ in rows), RouteJournalError('schema'))
+        _require(len(rows) == len({name for name, _, _ in rows})
+                 and {name for name, _, _ in rows} == set(self._SCHEMA) | _OWNER_TABLES
+                 and all(kind == 'table' for name, kind, _ in rows if name in _OWNER_TABLES),
+                 RouteJournalError('schema'))
         sql = {name: text for name, _, text in rows}
-        _require(sql['supervisor_route_intent'] == _INTENT and sql['supervisor_route_epoch'] == _EPOCH
-                 and db.execute('PRAGMA user_version').fetchone() == (1,)
+        _require(all(sql[name] == text for name, text in self._SCHEMA.items())
+                 and db.execute('PRAGMA user_version').fetchone() == (self._VERSION,)
                  and db.execute('PRAGMA quick_check').fetchall() == [('ok',)], RouteJournalError('schema'))
 
     def _sidecars(self, private_file):
@@ -641,6 +717,29 @@ class RouteJournal:
             except Exception:
                 raise RouteJournalError('route journal unavailable') from None
 
+    def close(self):
+        self._closed = True
+        if self._owner is not None:
+            self._owner.close()
+
+
+class RouteJournal(_DurableStore):
+    """Dedicated durable route intent/outcome journal (Linux, single owner).
+
+    No credential is ever passed to or stored by the journal.
+    Each inserted intent carries a per-attempt nonce; rows with a NULL nonce
+    are never mutated by the failed-admit handler. Each inserted intent also
+    consumes the next per-executor dispatch counter in the SAME transaction
+    (see ``admit``). A journal created with an earlier schema (no attempt or
+    dispatch_counter column, no dispatch table/triggers, user_version 1) fails
+    the exact schema check and is refused today (fail closed); adopting one
+    would require an offline migration/reconciliation step, which is NOT
+    implemented.
+    """
+    _SCHEMA = {'supervisor_route_intent': _INTENT, 'supervisor_route_epoch': _EPOCH,
+               **_counter_schema('supervisor_route_dispatch')}
+    _VERSION = 2
+
     @staticmethod
     def _row(db, command_id):
         row = db.execute('SELECT command_id,binding_digest,binding,state,owner_epoch,error,record,response '
@@ -651,12 +750,18 @@ class RouteJournal:
         return row
 
     def admit(self, command_id, digest, binding, epoch, attempt):
-        """ONE transaction: replay/conflict check, epoch high-water, intent row.
+        """ONE transaction: replay/conflict check, epoch high-water, dispatch
+        counter, intent row.
 
-        Returns ('new', None) when the caller may forward exactly once, or
+        Returns ('new', counter) when the caller may forward exactly once, or
         ('replay', row) for an identical binding. Raises Rejected otherwise.
         ``attempt`` is a fresh per-invocation nonce stored ONLY on a row this
         call inserts; it is journal-internal and never in results or records.
+        ``counter`` is the pinned executor's (backend container_id) previous
+        counter + 1, committed with the intent BEFORE any byte can be sent:
+        once committed it is consumed whatever happens next (refused, held,
+        crash), so a counter value is never sent twice. A rolled-back admit
+        consumed nothing and sent nothing. Exhaustion is rejected unforwarded.
         """
         _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
         with self._transaction() as db:
@@ -674,9 +779,21 @@ class RouteJournal:
             if high is None or epoch.launch_counter > high[0]:
                 db.execute('INSERT OR REPLACE INTO supervisor_route_epoch VALUES (1,?,?,?)',
                            (epoch.launch_counter, epoch.launch_id, epoch.boot_id))
-            db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?)",
-                       (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt))
-            return 'new', None
+            executor = binding['backend']['container_id']
+            last = db.execute('SELECT counter FROM supervisor_route_dispatch WHERE executor_id=?',
+                              (executor,)).fetchone()
+            _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
+            counter = 1 if last is None else last[0] + 1
+            if counter > MAX_DISPATCH_COUNTER:
+                raise SupervisorRouteRejected('dispatch_counter_exhausted')
+            if last is None:
+                db.execute('INSERT INTO supervisor_route_dispatch VALUES (?,?)', (executor, counter))
+            else:
+                db.execute('UPDATE supervisor_route_dispatch SET counter=? WHERE executor_id=?',
+                           (counter, executor))
+            db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?,?)",
+                       (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt, counter))
+            return 'new', counter
 
     def abandon_attempt(self, command_id, digest, attempt):
         """Atomic compare-and-set: intent -> unknown ONLY for the row THIS
@@ -728,10 +845,85 @@ class RouteJournal:
             except Exception:
                 raise RouteJournalError('route journal unavailable') from None
 
-    def close(self):
-        self._closed = True
-        if self._owner is not None:
-            self._owner.close()
+
+
+@dataclass(frozen=True)
+class DispatchGateConfig:
+    """Explicit configuration. ``enabled`` defaults to False: no gate exists."""
+    enabled: bool = False
+    journal_path: str | None = None
+    create_journal: bool = False
+    executor_id: str | None = None
+    allow_ephemeral_test_storage: bool = False
+
+
+class DispatchCounterGate(_DurableStore):
+    """DISABLED-BY-DEFAULT receiving-side check of the dispatch counter.
+
+    For the executor that ``executor_id`` (its pinned container_id) names:
+    ``accept(header_value, body=...)`` refuses (DispatchRefused) a missing or
+    malformed header, another executor, a body whose SHA-256 differs from the
+    header's, and any counter NOT strictly greater than the last accepted one.
+    Replays, duplicates and reordered (lower) counters are refused, never
+    deduplicated. Gaps are ALLOWED: the sender consumes a counter at admission
+    even when the request is then never sent (peer mismatch, crash, failed
+    admit after COMMIT), so requiring +1 would wedge the executor on the first
+    unsent value. The new value is committed and fsynced BEFORE accept
+    returns; the caller acts only after a return. Any journal failure raises
+    RouteJournalError and the caller must not act (the counter may or may not
+    be consumed; the sender never resends it). Its own store, separate from
+    the route journal. NOT wired into PilotASGI or any service.
+    """
+    _SCHEMA = _counter_schema('supervisor_route_dispatch_accepted')
+    _VERSION = 1
+
+    def __init__(self, *, config):
+        if type(config) is not DispatchGateConfig or config.enabled is not True:
+            raise SupervisorRouteDisabled('dispatch counter gate is disabled')
+        _require(type(config.executor_id) is str and _HEX.fullmatch(config.executor_id)
+                 and type(config.journal_path) is str, SupervisorRouteError('invalid dispatch counter gate'))
+        self._executor = config.executor_id
+        super().__init__(config.journal_path, create=config.create_journal,
+                         allow_ephemeral_test_storage=config.allow_ephemeral_test_storage)
+
+    def __repr__(self):
+        return 'DispatchCounterGate(<enabled>)'
+
+    def accept(self, dispatch, *, body):
+        """Returns the accepted counter, durably recorded; raises otherwise."""
+        executor, counter, body_sha256 = parse_dispatch_header(dispatch)
+        if executor != self._executor:
+            raise DispatchRefused('dispatch_wrong_executor')
+        if type(body) is not bytes or hashlib.sha256(body).hexdigest() != body_sha256:
+            raise DispatchRefused('dispatch_body_mismatch')
+        with self._transaction() as db:
+            last = db.execute('SELECT counter FROM supervisor_route_dispatch_accepted WHERE executor_id=?',
+                              (executor,)).fetchone()
+            _require(last is None or _positive(last[0], MAX_DISPATCH_COUNTER), RouteJournalError('counter'))
+            if last is not None and not counter > last[0]:
+                raise DispatchRefused('dispatch_replay')
+            if last is None:
+                db.execute('INSERT INTO supervisor_route_dispatch_accepted VALUES (?,?)', (executor, counter))
+            else:
+                db.execute('UPDATE supervisor_route_dispatch_accepted SET counter=? WHERE executor_id=?',
+                           (counter, executor))
+        return counter
+
+    def last_accepted(self):
+        """Read-only: the last accepted counter, or None."""
+        _require(os.getpid() == self._pid, RouteJournalError('process'))
+        with self._mutex:
+            try:
+                self._active()
+                with self._connection(readonly=True) as db:
+                    self._schema(db)
+                    row = db.execute('SELECT counter FROM supervisor_route_dispatch_accepted '
+                                     'WHERE executor_id=?', (self._executor,)).fetchone()
+            except RouteJournalError:
+                raise
+            except Exception:
+                raise RouteJournalError('dispatch gate unavailable') from None
+        return None if row is None else row[0]
 
 
 def _proc_start(pid):
@@ -818,7 +1010,11 @@ class UnixSocketBackend:
     PeerMismatch (zero bytes sent). The peer is rechecked after the reply.
     Sends the caller-supplied executor bearer; never stores it elsewhere,
     never includes it in repr or exceptions. No retries/reconnects/redirects.
+    Carries the route's ``dispatch`` value (see ``dispatch_header``) as the
+    ``X-Hub-Route-Dispatch`` header; a missing or malformed value is refused
+    before connecting.
     """
+    carries_dispatch = True
 
     def __init__(self, socket_path, *, bearer_token):
         _require(sys.platform == 'linux' and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'),
@@ -836,16 +1032,17 @@ class UnixSocketBackend:
     def __reduce__(self):
         raise TypeError('UnixSocketBackend is not serializable')
 
-    def forward(self, *, method, path, body, timeout_ms, pin):
+    def forward(self, *, method, path, body, timeout_ms, pin, dispatch=None):
         try:
-            return self._forward(method, path, body, timeout_ms, pin)
+            return self._forward(method, path, body, timeout_ms, pin, dispatch)
         except PeerMismatch:
             raise PeerMismatch() from None
         except Exception:
             # Sanitized: no header, token or backend text in the exception chain.
             raise SupervisorRouteError('backend exchange unavailable') from None
 
-    def _forward(self, method, path, body, timeout_ms, pin):
+    def _forward(self, method, path, body, timeout_ms, pin, dispatch):
+        parse_dispatch_header(dispatch)  # Before connect: nothing sent if refused.
         deadline = time.monotonic() + timeout_ms / 1000
 
         def remaining():
@@ -871,7 +1068,8 @@ class UnixSocketBackend:
             if before != start or not observed.matches(pin):
                 raise PeerMismatch()  # Socket closed in finally; nothing was written.
             lines = [f'{method} {path} HTTP/1.1', 'Host: supervisor-route', 'Accept-Encoding: identity',
-                     'Connection: close', 'Authorization: ' + self.__authorization]
+                     'Connection: close', f'{DISPATCH_HEADER}: {dispatch}',
+                     'Authorization: ' + self.__authorization]
             if method == 'POST':
                 lines += ['Content-Type: application/json', f'Content-Length: {len(body)}']
             request = ('\r\n'.join(lines) + '\r\n\r\n').encode('ascii') + (body if method == 'POST' else b'')
@@ -922,7 +1120,10 @@ class SupervisorRoute:
     ``epoch_source()`` must return the supervisor's CURRENT (RouteEpoch,
     BackendPin); it is consulted before admission and again after forwarding.
     ``backend.forward(method=, path=, body=, timeout_ms=, pin=)`` returns a
-    BackendReply, raises PeerMismatch before sending, or raises otherwise.
+    BackendReply, raises PeerMismatch before sending, or raises otherwise. A
+    backend whose ``carries_dispatch`` is True also receives ``dispatch=``, the
+    durably recorded dispatch counter header value; any other backend does not
+    carry it, and a wired receiving-side gate would refuse its requests.
     ``signing_key`` is the already-enrolled issuer Ed25519 key and must match
     ``release.public_key``; none is created here. Any executor bearer belongs
     to the backend object, never to this route. Commands are serialized by one
@@ -1044,10 +1245,11 @@ class SupervisorRoute:
             return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
         if outcome == 'replay':
             return self._from_row(row, replayed=True)
-        # Durable intent exists from here: ownership is non-abandonable.
+        # Durable intent AND its consumed dispatch counter exist from here:
+        # ownership is non-abandonable and the counter is never reused.
         self._inflight.add(command.command_id)
         try:
-            return self._forward(command, request, binding, digest, epoch, pin)
+            return self._forward(command, request, binding, digest, epoch, pin, row)
         except BaseException:
             # Cancellation/interrupt in this thread: record unknown before
             # the mutex is released, then re-raise. A no-op if an outcome
@@ -1068,10 +1270,13 @@ class SupervisorRoute:
             pass
         return RouteResult('held', command.command_id, digest, False, error)
 
-    def _forward(self, command, request, binding, digest, epoch, pin):
+    def _forward(self, command, request, binding, digest, epoch, pin, counter):
+        extra = {}
+        if getattr(self._backend, 'carries_dispatch', False) is True:
+            extra['dispatch'] = dispatch_header(pin.container_id, counter, command.body)
         try:
             reply = self._backend.forward(method=command.method, path=command.path, body=command.body,
-                                          timeout_ms=self._timeout, pin=pin)
+                                          timeout_ms=self._timeout, pin=pin, **extra)
         except PeerMismatch:
             try:
                 self._journal.mark_refused(command.command_id, digest, 'backend_identity_mismatch')
