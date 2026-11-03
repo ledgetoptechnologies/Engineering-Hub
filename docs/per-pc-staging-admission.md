@@ -244,3 +244,44 @@ Also: `test_observation_nonce_must_equal_request_digest`, `test_replayed_observa
 - Staging effect steps after `core.py:849`.
 - Uncommitted files not named above.
 - No code was run.
+
+### 8.x Channel binding and the age bound (revision after Codex review)
+
+**Gap.** The HTTPS observer identity is not bound to the separate command Unix socket peer. A shared bearer plus a nonce-signed observation proves that *a* supervisor-launched executor answered *an* observation request. It does not prove that the process behind the command socket, or the one sending an admission, is that same executor. A relay can also forward between them. No `SO_PEERCRED` check exists in the executor or `container_pilot_client.py` today.
+
+**Binding: a supervisor-attested channel key.**
+1. At each launch the executor generates an ephemeral Ed25519 key pair in memory, never written to disk.
+2. The root launch supervisor, which already holds the enrolled key and starts the executor, signs an attestation over the following:
+   - the executor's public key;
+   - its pid and process start time (from `/proc/<pid>/stat`), plus the host `boot_id`;
+   - the command socket's `(st_dev, st_ino)` and owner, as created by the supervisor;
+   - a supervisor launch counter, monotonic and persisted;
+   - the existing release and launch pins.
+3. The executor signs with that key every message that matters: command responses and receipts, observation responses and admission requests. The signature covers the request digest and the Hub's nonce or the command ID.
+4. The Hub verifies the chain (enrolled supervisor key → attestation → message signature). It accepts only the attestation with the highest launch counter it has seen for that machine.
+5. Where the Hub-side client and the socket share a host, the client also checks `SO_PEERCRED` on the command socket: the peer pid must equal the attested pid, with the same start time and socket inode. Where they don't share a host, the signed responses carry the binding on their own.
+
+**What this defeats:**
+- **Same-UID socket substitution.** A different process at the socket path has a different pid, start time or inode, and has no attested key, so its responses fail verification.
+- **Relay.** A relay can forward messages but cannot alter one or produce a signature. A relayed command reaching a different executor produces a response signed by the wrong key, or none, and is refused. Relaying the real executor's own admission request changes nothing: the decision belongs to that executor's intent.
+- **Reconnect or restart.** A new launch means a new key and a higher counter. Messages under the old key are refused once the new attestation has been seen.
+
+It does not defend against root on the staging host, as before.
+
+**Age bound: what can and cannot be asserted.** The executor uses `time.monotonic()` for deadlines (`adapter.py:182,274`, `asgi.py:137-184`). On Linux that is `CLOCK_MONOTONIC`, which **does not advance during system suspend**. Measured that way, an admission's age would undercount a suspend. Requirements:
+- **Clock.** Measure the admit-to-effect age with `CLOCK_BOOTTIME` (`time.clock_gettime(time.CLOCK_BOOTTIME)`), which counts suspend. Start it before the admission request is sent, so network delay counts too. The Hub's clock and wall-clock jumps play no part in the executor's check. Wall clock is used only for audit, with the existing `CLOCK_SKEW_MS=5000` noted.
+- **Restart.** Admissions live in memory and are tied to the launch counter and `boot_id`. After a restart, any admitted-but-not-effected operation is treated as expired and the command is `held`, as with the existing never-repeat intent. It is never redone without a new intent.
+- **Process suspension (SIGSTOP, scheduler stall) between the final age check and the Docker request.** User space cannot prevent this, so the bound cannot be asserted across it. Mitigations: do the check immediately before the Docker call; record the `CLOCK_BOOTTIME` at effect start in the signed receipt; have the Hub flag any receipt whose effect started later than the bound after its admission as `bound_exceeded`, visible to the owner. The design therefore claims only "exposure ≤ age bound + one operation timeout, **except** an undetected stall between the final check and the Docker call, which is detected after the fact from the signed receipt".
+
+**Threat and acceptance tests:**
+- `test_same_uid_socket_substitution_refused`: a fake server at the socket path with a different pid and inode; the Hub refuses its responses and records no effect.
+- `test_relay_cannot_alter_or_redirect`: a relay that alters the payload fails the signature check; a relay to a second executor fails the attested-key check.
+- `test_reconnect_after_executor_restart_requires_new_attestation`: old-key messages are refused after a higher counter; a lower counter is never accepted.
+- `test_peer_pid_mismatch_on_shared_host_refused`.
+- `test_admission_age_counts_suspend`: a fake `CLOCK_BOOTTIME` advanced past the bound while `CLOCK_MONOTONIC` is frozen; the effect is refused.
+- `test_admission_age_includes_network_delay`: admit response delayed past the bound; refused.
+- `test_restart_with_admitted_unapplied_operation_holds_without_redo`.
+- `test_wall_clock_jump_does_not_change_admission_age`.
+- `test_stall_after_final_check_flagged_bound_exceeded_from_receipt`.
+
+**Still unverified:** that the installed supervisor can sign arbitrary attestation fields and nonces; whether the Hub-side client shares a host with the command socket in the pilot layout; staging-host reachability to the Hub.
