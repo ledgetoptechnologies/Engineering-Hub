@@ -106,3 +106,38 @@ async def test_unified_factory_bound_login_and_session_machine_endpoint(tmp_path
             response=await agent.post('/mcp',json=init,headers={'Authorization':'Bearer '+token,'Accept':'application/json, text/event-stream'})
             assert response.status_code==200 and 'mcp-session-id' in response.headers
 
+
+@pytest.mark.asyncio
+async def test_bound_signin_with_real_owned_repository(tmp_path):
+    from engineering_hub.pilot_ownership import PilotOwner
+    from engineering_hub.repository import HubRepository
+    from engineering_hub.auth import SessionStore
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    private = tmp_path/'private'
+    private.mkdir(mode=0o700)
+    path=private/'hub.db'
+    origin, issuer, audience, subject = 'https://hub.example', 'https://fixture.cloudflareaccess.com', 'aud', 'subject'
+    owner_actor='human:cf:'+hashlib.sha256((issuer+'\0'+audience+'\0'+subject).encode()).hexdigest()
+    auth=AuthSettings('test-hermes','test-codex',claude_token='test-claude')
+    config=AuthConfig(origin,github_client_id='fixture',github_client_secret='fixture',beau_github_id=123,
+        human_auth_mode='github_cloudflare',cloudflare_issuer=issuer,cloudflare_audience=audience,
+        cloudflare_allowed_emails=('owner@example.com',),bound_access_subject=subject)
+    key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+    jwk=json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()));jwk.update(kid='fixture',alg='RS256',use='sig')
+    checker=CloudflareAccessVerifier(config.cloudflare_config,transport=httpx.MockTransport(lambda _:httpx.Response(200,json={'keys':[jwk]})))
+    class Github:
+        async def exchange(self, code, verifier): return 123
+    now=int(time.time()); assertion=jwt.encode({'iss':issuer,'aud':[audience],'sub':subject,'email':'owner@example.com','type':'app','iat':now-1,'exp':now+120},key,algorithm='RS256',headers={'kid':'fixture'})
+    with PilotOwner(path,allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(path,pilot_owner=owner)
+        SessionStore(path,repository=repo)
+        enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+        core=create_app(Settings(path,auth,config),repository=repo,github_client=Github(),event_feed=Feed())
+        pair=HubFrontends(core,access_verifier=checker)
+        async with pair.lifespan():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=pair.browser),base_url=origin,follow_redirects=False) as c:
+                headers={'CF-Access-Jwt-Assertion':assertion}
+                login=await c.get('/api/hub/v1/auth/login',headers=headers)
+                state=parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+                assert (await c.get('/api/hub/v1/auth/callback',params={'state':state,'code':'ok'},headers=headers)).status_code==303
+                assert (await c.get('/api/hub/v1/auth/me',headers=headers)).json()['actor']==owner_actor

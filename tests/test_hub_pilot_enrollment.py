@@ -458,3 +458,21 @@ def test_bound_oauth_tables_are_exact_atomic_group_for_offline_scan(ledger):
         db.execute('DROP TABLE auth_bound_oauth_sessions')
     with pytest.raises(enrollment.EnrollmentError):
         snapshot(path)
+
+
+def test_owned_bound_schema_requires_explicit_offline_preparation(tmp_path):
+    from engineering_hub.bound_oauth_draft import BoundOAuthDraftStore, enroll_owned_bound_schema
+    private = tmp_path/'owned'
+    private.mkdir(mode=0o700)
+    path = private/'hub.db'
+    with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+        repo = HubRepository(path, pilot_owner=owner)
+        store = SessionStore(path, repository=repo)
+        with pytest.raises(ValueError, match='offline enrollment'):
+            BoundOAuthDraftStore(store)
+        with pytest.raises(ValueError, match='offline'):
+            enroll_owned_bound_schema(repo, writers_stopped=False, backup_verified=True)
+        enroll_owned_bound_schema(repo, writers_stopped=True, backup_verified=True)
+        BoundOAuthDraftStore(store)
+        with pytest.raises(ValueError, match='already present'):
+            enroll_owned_bound_schema(repo, writers_stopped=True, backup_verified=True)

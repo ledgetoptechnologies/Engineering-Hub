@@ -23,10 +23,13 @@ The standalone core has no verified browser ingress capability and cannot
 establish or use a bound human session. Its fixed application shell may still
 be served without a human session under existing combined-mode behavior.
 
-The protected-ledger and owned-pilot entrypoints deliberately reject this mode.
-A version 3 protected storage selection sets `protected_ledger` but is not
-sufficient to make those entrypoints accept the new mode. Do not treat settings
-validation as a protected deployment or an automatic storage migration.
+The owned inactive entrypoint accepts this mode only after explicit offline
+preparation of the bound-auth schema under the existing PilotOwner. Caller
+attestations that writers stopped and a backup exists are not independent proof
+of either condition. This operation is not called by the server and does not
+repair partially present tables. The owned-pilot entrypoints deliberately reject
+this mode. A version 3 protected selection is not automatic migration, a completed
+host validation, or permission to start an owned-pilot runtime.
 
 The tests use synthetic Access keys and a fake GitHub provider. Real OAuth app
 configuration, identity enrollment, client secret provisioning, Cloudflare

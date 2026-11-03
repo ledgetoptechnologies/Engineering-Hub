@@ -46,6 +46,10 @@ class BoundOAuthDraftStore:
         with store._db() as db:
             present = db.execute("SELECT name FROM sqlite_master WHERE name IN (?,?)", tuple(_SCHEMAS)).fetchall()
             if not present:
+                # Owner-enrolled databases may only adopt this group via the
+                # explicit offline preparation operation below.
+                if store.repository is not None and store.repository.pilot_owner is not None:
+                    raise ValueError('bound OAuth offline enrollment required')
                 for statement in _SCHEMAS.values():
                     db.execute(statement)
             _check_schema(db)
@@ -98,6 +102,28 @@ class BoundOAuthDraftStore:
             with self.store._db() as db:
                 _check_schema(db)
                 db.execute('DELETE FROM auth_bound_oauth_sessions WHERE token_hash=?', (_digest(token),))
+
+
+def enroll_owned_bound_schema(repo, *, writers_stopped, backup_verified):
+    """Explicit offline preparation; never invoke from a server or agent route.
+
+    Caller attestations are not proof that legacy writers stopped or a backup
+    exists. An already-held PilotOwner is required; failure never repairs data.
+    """
+    from .repository import HubRepository
+    from .pilot_ownership import PilotOwner
+    if (type(repo) is not HubRepository or type(repo.pilot_owner) is not PilotOwner
+            or writers_stopped is not True or backup_verified is not True):
+        raise ValueError('explicit offline bound OAuth enrollment required')
+    repo.pilot_owner.assert_active(repo.path)
+    with repo._transaction() as db:
+        present = db.execute("SELECT name FROM sqlite_master WHERE name IN (?,?)", tuple(_SCHEMAS)).fetchall()
+        if present:
+            raise ValueError('bound OAuth schema already present or partial')
+        for statement in _SCHEMAS.values():
+            db.execute(statement)
+        _check_schema(db)
+
 
 
 def require_enrolled_access(request, config, expected_subject):
