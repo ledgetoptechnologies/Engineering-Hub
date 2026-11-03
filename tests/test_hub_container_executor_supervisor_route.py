@@ -102,9 +102,9 @@ def world(tmp_path):
     state = {"key": key, "release": release, "pin": pin, "epoch": epoch, "backend": backend,
              "epochs": epochs, "path": str(private / "route.sqlite")}
 
-    def make(create=True, **overrides):
+    def make(create=True, timeout_ms=2000, **overrides):
         config = SupervisorRouteConfig(enabled=True, journal_path=state["path"], create_journal=create,
-                                       allow_ephemeral_test_storage=True, forward_timeout_ms=2000)
+                                       allow_ephemeral_test_storage=True, forward_timeout_ms=timeout_ms)
         args = dict(config=config, release=release, signing_key=key, epoch_source=epochs, backend=backend)
         args.update(overrides)
         return SupervisorRoute(**args)
@@ -604,4 +604,164 @@ def test_real_pilot_asgi_bearer_classification_and_token_never_recorded(world, c
         thread.join(10)
         if os.path.exists(path):
             os.unlink(path)
+        os.rmdir(directory)
+
+
+class _ScriptedServer:
+    """In-process (pinnable PID) raw HTTP peer; one script per connection."""
+
+    def __init__(self, path, scripts):
+        self.scripts, self.threads = list(scripts), []
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(path)
+        self.listener.listen(4)
+        self.acceptor = threading.Thread(target=self._accept, daemon=True)
+        self.acceptor.start()
+
+    def _accept(self):
+        while self.scripts:
+            try:
+                peer, _ = self.listener.accept()
+            except OSError:
+                return
+            thread = threading.Thread(target=self._serve, args=(peer, self.scripts.pop(0)), daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    @staticmethod
+    def _serve(peer, script):
+        try:
+            peer.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += peer.recv(65536)
+            head, body = data.split(b"\r\n\r\n", 1)
+            length = int([l for l in head.split(b"\r\n") if l.lower().startswith(b"content-length:")][0]
+                         .split(b":")[1])
+            while len(body) < length:
+                body += peer.recv(65536)
+            for delay, chunk in script(body):
+                time.sleep(delay)
+                peer.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            peer.close()
+
+    def close(self):
+        self.listener.close()
+        for thread in self.threads:
+            thread.join(10)
+
+
+def _good(body):
+    raw = canonical(echo(json.loads(body)))
+    return [(0, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(raw) + raw)]
+
+
+def _framed(headers, payload=None):
+    def script(body):
+        raw = canonical(echo(json.loads(body))) if payload is None else payload
+        head = b"HTTP/1.1 200 OK\r\n" + b"".join(h.replace(b"{n}", b"%d" % len(raw)) + b"\r\n" for h in headers)
+        return [(0, head + b"\r\n" + raw)]
+    return script
+
+
+def _trickle_headers(body):
+    return [(0, b"HTTP/1.1 200 OK\r\nX-Slow: ")] + [(0.05, b"a")] * 60
+
+
+def _trickle_body(body):
+    raw = canonical(echo(json.loads(body)))
+    return ([(0, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(raw))]
+            + [(0.05, raw[i:i + 1]) for i in range(len(raw))])
+
+
+def _stall_headers(body):
+    return [(0, b"HTTP/1.1 200 OK\r\nContent-Le"), (3, b"")]
+
+
+def _stall_body(body):
+    raw = canonical(echo(json.loads(body)))
+    return [(0, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(raw) + raw[:5]), (3, b"")]
+
+
+def _short(body):
+    raw = canonical(echo(json.loads(body)))
+    return [(0, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % (len(raw) + 10) + raw)]
+
+
+def _long(body):
+    raw = canonical(echo(json.loads(body)))
+    return [(0, b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(raw) + raw + b"   ")]
+
+
+def _open_after(body):
+    return _good(body)[:1] + [(3, b"")]  # Never closes: no EOF within the deadline.
+
+
+_BAD_RESPONSES = {
+    "trickle_headers": _trickle_headers,
+    "trickle_body": _trickle_body,
+    "stalled_headers": _stall_headers,
+    "stalled_body": _stall_body,
+    "duplicate_content_length": _framed([b"Content-Length: {n}", b"Content-Length: {n}"]),
+    "non_numeric_content_length": _framed([b"Content-Length: abc"]),
+    "negative_content_length": _framed([b"Content-Length: -1"]),
+    "oversized_content_length": _framed([b"Content-Length: %d" % (route_module.MAX_RESPONSE_BYTES + 1)]),
+    "missing_content_length": _framed([]),
+    "transfer_encoding": _framed([b"Content-Length: {n}", b"Transfer-Encoding: chunked"]),
+    "body_shorter": _short,
+    "body_longer": _long,
+    "no_eof": _open_after,
+    "header_count": _framed([b"Content-Length: {n}"] + [b"X-H%d: v" % i for i in range(40)]),
+    "header_bytes": _framed([b"Content-Length: {n}", b"X-Big: " + b"v" * 9000]),
+    "rejection_wrong_body": _framed([b"Content-Length: {n}"], b'{"error":{"code":"other"}}'),
+}
+
+
+@LINUX
+@pytest.mark.parametrize("case", sorted(_BAD_RESPONSES))
+def test_bounded_strict_response_framing_is_held_and_releases_lock(world, case):
+    directory = tempfile.mkdtemp(dir="/tmp")
+    path = os.path.join(directory, "s.sock")
+    server = _ScriptedServer(path, [_BAD_RESPONSES[case], _good])
+    try:
+        world["epochs"].value = (world["epoch"], _own_pin())
+        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=600)
+        cmd = command(world["epoch"])
+        started = time.monotonic()
+        result = route.submit(cmd)
+        elapsed = time.monotonic() - started
+        assert result.state == "held" and result.record is None, case
+        assert elapsed < 0.6 + 0.4, (case, elapsed)  # Total deadline plus small slack.
+        assert route._mutex.acquire(blocking=False)
+        route._mutex.release()
+        assert route.submit(cmd).state == "held"  # Never redispatched.
+        second = route.submit(command(world["epoch"]))
+        assert second.state == "completed"  # Lock released; next command proceeds.
+        route.close()
+    finally:
+        server.close()
+        os.unlink(path)
+        os.rmdir(directory)
+
+
+@LINUX
+def test_strict_reader_accepts_exact_framing_and_exact_rejection(world):
+    directory = tempfile.mkdtemp(dir="/tmp")
+    path = os.path.join(directory, "s.sock")
+    rejection = b'{"error":{"code":"unauthorized"}}'
+    server = _ScriptedServer(path, [_good, lambda body: [(0, b"HTTP/1.1 401 Unauthorized\r\n"
+                                    b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                                    % len(rejection) + rejection)]])
+    try:
+        world["epochs"].value = (world["epoch"], _own_pin())
+        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=600)
+        assert route.submit(command(world["epoch"])).state == "completed"
+        assert route.submit(command(world["epoch"])).state == "rejected"
+        route.close()
+    finally:
+        server.close()
+        os.unlink(path)
         os.rmdir(directory)

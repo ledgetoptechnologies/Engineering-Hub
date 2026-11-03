@@ -81,7 +81,6 @@ import base64
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
-import http.client
 import json
 import math
 import os
@@ -656,6 +655,73 @@ def _proc_start(pid):
     return ticks
 
 
+MAX_HEADER_BYTES = 8192
+MAX_HEADERS = 32
+_STATUS_LINE = re.compile(rb'HTTP/1\.[01] ([1-5][0-9]{2})(?: [\x20-\x7e]*)?\Z')
+_HEADER_LINE = re.compile(rb"([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?)?[ \t]*\Z")
+_LENGTH = re.compile(rb'[0-9]{1,6}\Z')
+
+
+def _framing():
+    return SupervisorRouteError('backend framing')
+
+
+def _read_response(peer, remaining):
+    """Strict bounded HTTP/1.1 response reader under ONE total deadline.
+
+    ``remaining()`` is recomputed before every recv and set as the socket
+    timeout, so trickling or stalled peers cannot extend the exchange. Exactly
+    one decimal Content-Length within MAX_RESPONSE_BYTES, no Transfer-Encoding,
+    at most MAX_HEADERS headers / MAX_HEADER_BYTES header bytes, exactly
+    Content-Length body bytes, then EOF (Connection: close). Any violation
+    raises; the caller treats it as held, never as success or rejection.
+    """
+    def receive(size):
+        peer.settimeout(remaining())
+        part = peer.recv(size)
+        if not part:
+            raise _framing()
+        return part
+    buffer = bytearray()
+    while True:
+        end = buffer.find(b'\r\n\r\n')
+        if end >= 0:
+            break
+        if len(buffer) > MAX_HEADER_BYTES:
+            raise _framing()
+        buffer += receive(MAX_HEADER_BYTES + 4 - len(buffer) if len(buffer) < MAX_HEADER_BYTES else 4)
+    if end > MAX_HEADER_BYTES:
+        raise _framing()
+    head, body = bytes(buffer[:end]), bytearray(buffer[end + 4:])
+    lines = head.split(b'\r\n')
+    match = _STATUS_LINE.fullmatch(lines[0])
+    if match is None or len(lines) - 1 > MAX_HEADERS:
+        raise _framing()
+    lengths = []
+    for line in lines[1:]:
+        header = _HEADER_LINE.fullmatch(line)
+        if header is None:
+            raise _framing()
+        name = header[1].lower()
+        if name == b'transfer-encoding':
+            raise _framing()
+        if name == b'content-length':
+            lengths.append(header[2] or b'')
+    if len(lengths) != 1 or not _LENGTH.fullmatch(lengths[0]):
+        raise _framing()
+    length = int(lengths[0])
+    if length > MAX_RESPONSE_BYTES or len(body) > length:
+        raise _framing()
+    while len(body) < length:
+        body += receive(length - len(body))
+    # Connection: close was requested: exactly EOF must follow, within deadline.
+    peer.settimeout(remaining())
+    if peer.recv(1) != b'':
+        raise _framing()
+    remaining()
+    return int(match[1]), bytes(body)
+
+
 class UnixSocketBackend:
     """One-shot HTTP/1.1 over an explicit Unix socket to the executor ASGI.
 
@@ -716,25 +782,20 @@ class UnixSocketBackend:
             observed = ObservedPeer(pid, uid, gid, start)
             if before != start or not observed.matches(pin):
                 raise PeerMismatch()  # Socket closed in finally; nothing was written.
-            connection = http.client.HTTPConnection('supervisor-route', timeout=remaining())
-            connection.sock = peer
-            headers = {'Host': 'supervisor-route', 'Accept-Encoding': 'identity', 'Connection': 'close',
-                       'Authorization': self.__authorization}
+            lines = [f'{method} {path} HTTP/1.1', 'Host: supervisor-route', 'Accept-Encoding: identity',
+                     'Connection: close', 'Authorization: ' + self.__authorization]
             if method == 'POST':
-                headers['Content-Type'] = 'application/json'
-            connection.request(method, path, body=body if method == 'POST' else None, headers=headers)
-            del headers
+                lines += ['Content-Type: application/json', f'Content-Length: {len(body)}']
+            request = ('\r\n'.join(lines) + '\r\n\r\n').encode('ascii') + (body if method == 'POST' else b'')
+            del lines
+            # Python 3.5+: the socket timeout bounds the WHOLE sendall.
             peer.settimeout(remaining())
-            response = connection.getresponse()
-            _require(response.getheader('Transfer-Encoding') is None
-                     and len([k for k, _ in response.getheaders() if k.lower() == 'content-length']) == 1,
-                     SupervisorRouteError('framing'))
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            _require(len(raw) <= MAX_RESPONSE_BYTES, SupervisorRouteError('size'))
-            remaining()
+            peer.sendall(request)
+            del request
+            status, raw = _read_response(peer, remaining)
             _require(not select.select([pidfd], [], [], 0)[0] and _proc_start(pid) == start,
                      SupervisorRouteError('peer'))
-            return BackendReply(response.status, raw, observed)
+            return BackendReply(status, raw, observed)
         finally:
             if pidfd is not None:
                 os.close(pidfd)
