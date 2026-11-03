@@ -1230,8 +1230,10 @@ async def test_slow_authorizer_over_budget_is_refused(rig):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('advance_to', [1600, 1599.5])  # expired, or inside the 1 s margin
-async def test_lease_expiring_during_decide_records_no_mark_and_strands_nothing(rig, advance_to):
+@pytest.mark.parametrize('advance_to, margin', [(1600, 1.0), (1599.5, 1.0), (1600, 0), (1600.5, 0)])
+async def test_lease_expiring_during_decide_records_no_mark_and_strands_nothing(rig, advance_to, margin):
+    # Expired, inside the 1 s margin, exactly at expiry with no margin, and past it with no margin.
+    rig.bridge.lease_margin = margin
     job = submit(rig)
     rig.authorization.action = lambda snapshot: rig.clock.__setitem__(0, advance_to)
     result = await rig.bridge.run_once()

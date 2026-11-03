@@ -1179,7 +1179,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
             if (job is None or job['state'] != 'claimed' or job['worker'] != self.worker.encoded()
                     or job['fence'] != attempt.fence or type(fresh) not in (int, float)
                     or not math.isfinite(fresh) or type(lease) not in (int, float) or not math.isfinite(lease)
-                    or lease - fresh < self.lease_margin):
+                    or lease <= fresh or lease - fresh < self.lease_margin):  # live even at margin 0
                 raise HubError('development_ci_handoff_claim_not_current', 409)
             db.execute("INSERT INTO hub_development_ci_effects VALUES(?,?,?,?,'in_flight')",
                        (challenge['nonce'], attempt.job_id, attempt.attempt_id, attempt.fence))
