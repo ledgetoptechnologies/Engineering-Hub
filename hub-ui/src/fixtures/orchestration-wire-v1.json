@@ -50,7 +50,7 @@
         { "role": "business-docs", "lease_holder": null, "lease_expires_at": null }
       ],
       "projects": [
-        { "id": "ledge-top-ops", "name": "Ledge Top Ops", "created_by": "human:1", "origin_request_id": null }
+        { "id": "ledge-top-ops", "name": "Ledge Top Ops", "created_by": { "kind": "human", "id": "beau" }, "origin_request_id": null }
       ],
       "dispatches": [
         {
@@ -65,7 +65,7 @@
             "task_id": "task-demo-ui",
             "title": "Rebuild the landing page layout",
             "project": "ledge-top-ops",
-            "created_by": "human:1",
+            "created_by": { "kind": "human", "id": "beau" },
             "origin_request_id": "req-demo-viewer-refresh",
             "checklist": [
               { "text": "Sketch the new layout", "done": true },
@@ -94,7 +94,7 @@
             "task_id": "task-demo-review",
             "title": "Review the summary endpoint change",
             "project": "ledge-top-ops",
-            "created_by": "human:1",
+            "created_by": { "kind": "human", "id": "beau" },
             "origin_request_id": "req-demo-viewer-refresh",
             "checklist": [
               { "text": "Read the diff", "done": true },
@@ -120,7 +120,7 @@
             "task_id": "task-demo-integration",
             "title": "Wire the new page into the viewer shell",
             "project": "ledge-top-ops",
-            "created_by": "human:1",
+            "created_by": { "kind": "human", "id": "beau" },
             "origin_request_id": "req-demo-viewer-refresh",
             "checklist": [
               { "text": "Add the route", "done": true },
@@ -147,7 +147,7 @@
             "task_id": "task-demo-ops",
             "title": "Plan the staging rollout",
             "project": "ledge-top-ops",
-            "created_by": "human:1",
+            "created_by": { "kind": "human", "id": "beau" },
             "origin_request_id": "req-demo-viewer-refresh",
             "checklist": [],
             "eta_seconds": null,
@@ -170,7 +170,7 @@
             "task_id": "task-demo-docs",
             "title": "Draft the release note",
             "project": "ledge-top-ops",
-            "created_by": "human:1",
+            "created_by": { "kind": "human", "id": "beau" },
             "origin_request_id": "req-demo-viewer-refresh",
             "checklist": [
               { "text": "Draft", "done": true },
@@ -201,7 +201,7 @@
         { "role": "ops", "lease_holder": "session-demo-ops-05", "lease_expires_at": "2026-11-03T09:00:00Z" }
       ],
       "projects": [
-        { "id": "billing-export", "name": "Billing export", "created_by": "orchestrator", "origin_request_id": "req-demo-billing-export" }
+        { "id": "billing-export", "name": "Billing export", "created_by": { "kind": "agent", "id": "orchestrator" }, "origin_request_id": "req-demo-billing-export" }
       ],
       "dispatches": [
         {
@@ -216,7 +216,7 @@
             "task_id": "task-demo-export-ui",
             "title": "Add an Export button to the billing page",
             "project": "billing-export",
-            "created_by": "orchestrator",
+            "created_by": { "kind": "agent", "id": "orchestrator" },
             "origin_request_id": "req-demo-billing-export",
             "checklist": [
               { "text": "Button and file name", "done": true },
@@ -243,7 +243,7 @@
             "task_id": "task-demo-export-review",
             "title": "Review the export query",
             "project": "billing-export",
-            "created_by": "codex",
+            "created_by": { "kind": "agent", "id": "codex" },
             "origin_request_id": "req-demo-billing-export",
             "checklist": [
               { "text": "Read the query", "done": true },
@@ -269,7 +269,7 @@
             "task_id": "task-demo-export-ops",
             "title": "Schedule the monthly export job",
             "project": "billing-export",
-            "created_by": "orchestrator",
+            "created_by": { "kind": "agent", "id": "orchestrator" },
             "origin_request_id": "req-demo-billing-export",
             "checklist": [
               { "text": "Write the schedule", "done": true },

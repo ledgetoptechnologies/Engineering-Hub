@@ -25,8 +25,10 @@ export interface RequestSummary {
 }
 export interface RequestList { items: RequestSummary[]; truncated: boolean }
 export interface ChecklistItem { text: string; done: boolean }
+/** The authenticated actor the server recorded; kind is server-derived, never inferred from the id. */
+export interface Actor { kind: "human" | "agent"; id: string }
 export interface ProgressTask {
-  task_id: string; title: string; project: string; created_by: string; origin_request_id: string | null;
+  task_id: string; title: string; project: string; created_by: Actor; origin_request_id: string | null;
   checklist: ChecklistItem[];
   /** Server-computed from the observed checklist rate; null when there is not enough history. */
   eta_seconds: number | null;
@@ -40,7 +42,7 @@ export interface Dispatch {
 }
 export interface PendingDecision { decision_id: string; question: string; asked_by_role: string; asked_at: string }
 export interface RoleLease { role: string; lease_holder: string | null; lease_expires_at: string | null }
-export interface OrchestrationProject { id: string; name: string; created_by: string; origin_request_id: string | null }
+export interface OrchestrationProject { id: string; name: string; created_by: Actor; origin_request_id: string | null }
 export interface RequestDetail {
   request: { request_id: string; title: string; asked_at: string; updated_at: string };
   /** Only decisions still waiting on Beau; pinned at the top of the request. */
@@ -97,6 +99,12 @@ function unique(values: string[]) {
   if (new Set(values).size !== values.length) invalid();
 }
 
+function actor(value: unknown): Actor {
+  const row = exact(value, ["kind", "id"]);
+  if (row.kind !== "human" && row.kind !== "agent") return invalid();
+  return { kind: row.kind, id: text(row.id, 128) };
+}
+
 function parseSummary(value: unknown): RequestSummary {
   const row = exact(value, ["request_id", "title", "asked_at", "updated_at", "dispatch_count", "done_count",
     "waiting_decision_count", "stale_count"]);
@@ -125,7 +133,7 @@ function parseTask(value: unknown): ProgressTask {
     return { text: text(entry.text, 300), done: entry.done };
   });
   return { task_id: id(row.task_id), title: text(row.title, 200), project: id(row.project, PROJECT),
-    created_by: text(row.created_by, 128), origin_request_id: nullable(row.origin_request_id, v => id(v)), checklist,
+    created_by: actor(row.created_by), origin_request_id: nullable(row.origin_request_id, v => id(v)), checklist,
     eta_seconds: seconds(row.eta_seconds), agent_eta_guess_seconds: seconds(row.agent_eta_guess_seconds),
     status_line: text(row.status_line, 500, true), blocked_on: nullable(row.blocked_on, v => text(v, 300)),
     updated_at: time(row.updated_at), stale: row.stale };
@@ -164,7 +172,7 @@ export function parseRequestDetail(value: unknown, expectedId: string): RequestD
   });
   const projects = list(row.projects, MAX_DISPATCHES).map(item => {
     const entry = exact(item, ["id", "name", "created_by", "origin_request_id"]);
-    return { id: id(entry.id, PROJECT), name: text(entry.name, 120), created_by: text(entry.created_by, 128),
+    return { id: id(entry.id, PROJECT), name: text(entry.name, 120), created_by: actor(entry.created_by),
       origin_request_id: nullable(entry.origin_request_id, v => id(v)) };
   });
   unique(decisions.map(item => item.decision_id));
@@ -198,9 +206,9 @@ export function formatEta(value: number | null): string {
   return `about ${Math.round(value / 86400)} days`;
 }
 
-/** Human actors are recorded as "human:..."; anything else (an agent or the orchestrator) is agent-created. */
-export function isAgentCreated(createdBy: string): boolean {
-  return !createdBy.startsWith("human:");
+/** Uses the server's authenticated actor kind; display ids are never parsed for identity. */
+export function isAgentCreated(createdBy: Actor): boolean {
+  return createdBy.kind === "agent";
 }
 
 /** True when the dispatch is stale by state or its task's progress is flagged stale. */
@@ -209,12 +217,12 @@ export function isStale(dispatch: Dispatch): boolean {
 }
 
 /*
- * PROVISIONAL endpoints. Codex owns the backend and has not built or reviewed these paths, so the
- * shape and prefix may change (other Hub routes live under /api/hub/v1). Nothing calls these while
- * orchestrationEnabled() is false for live mode.
+ * PROVISIONAL endpoints (prefix agreed with Codex; backend not built yet). The server filters every
+ * list and detail to projects the caller may read, so counts here cover only authorized dispatches.
+ * Nothing calls these while orchestrationEnabled() is false for live mode.
  */
-export const PROVISIONAL_LIST_PATH = "/api/orchestration/requests";
-export const provisionalDetailPath = (requestId: string) => `/api/orchestration/requests/${id(requestId)}`;
+export const PROVISIONAL_LIST_PATH = "/api/hub/v1/orchestration/requests";
+export const provisionalDetailPath = (requestId: string) => `/api/hub/v1/orchestration/requests/${id(requestId)}`;
 
 async function readJson(path: string, signal: AbortSignal, fetchImpl: typeof fetch): Promise<unknown> {
   const response = await fetchImpl.call(globalThis, path, { method: "GET", credentials: "same-origin", redirect: "error",

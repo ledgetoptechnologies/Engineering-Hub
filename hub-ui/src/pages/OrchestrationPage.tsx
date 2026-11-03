@@ -102,7 +102,7 @@ export function DispatchRow({ dispatch, lease, now = Date.now() }: { dispatch: D
       {task.status_line && <p className="orchestration-status">{task.status_line}</p>}
       {task.blocked_on && <p className="orchestration-blocked">Blocked on: {task.blocked_on}</p>}
       <p className="machine-footnote">
-        Updated {relativeAge(task.updated_at, now) ?? "at an unknown time"} · created by {task.created_by}
+        Updated {relativeAge(task.updated_at, now) ?? "at an unknown time"} · created by {task.created_by.id}
       </p>
     </li>
   );
