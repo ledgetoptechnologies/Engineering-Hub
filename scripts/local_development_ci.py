@@ -146,13 +146,20 @@ def publish_admission(inputs, intent):
         os.unlink(temporary, dir_fd=directory)
         os.fsync(directory)
     finally:
-        if fd is not None:
-            os.close(fd)
+        primary_error = sys.exc_info()[0] is not None
         try:
-            os.unlink(temporary, dir_fd=directory)
-        except FileNotFoundError:
-            pass
-        os.close(directory)
+            if fd is not None:
+                os.close(fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if not primary_error:
+                    raise
+            finally:
+                os.close(directory)
 
 
 def clear_own_intent(path, intent):

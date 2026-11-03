@@ -66,6 +66,36 @@ def test_admission_is_complete_and_read_only_before_name_is_visible(tmp_path, mo
     assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory descriptor semantics')
+def test_admission_cleanup_closes_directory_and_preserves_primary_error(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_open = os.open
+    opened_directories = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == inputs:
+            opened_directories.append(fd)
+        return fd
+
+    def fail_link(*args, **kwargs):
+        raise RuntimeError('primary publication failure')
+
+    def fail_unlink(*args, **kwargs):
+        raise PermissionError('cleanup failure')
+
+    monkeypatch.setattr(runner.os, 'open', track_open)
+    monkeypatch.setattr(runner.os, 'link', fail_link)
+    monkeypatch.setattr(runner.os, 'unlink', fail_unlink)
+    with pytest.raises(RuntimeError, match='primary publication failure'):
+        runner.publish_admission(inputs, 'a' * 32)
+    assert len(opened_directories) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_directories[0])
+    assert not (inputs / 'admit.json').exists()
+
+
 @pytest.mark.parametrize('value', [1, 300, 900])
 def test_ci_wait_accepts_only_positive_bounded_seconds(value):
     assert runner.validate_timeout(value) == value
