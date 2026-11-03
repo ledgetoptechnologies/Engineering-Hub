@@ -313,6 +313,11 @@ class WorkQueue:
         self.repo._project(action.project)
         if type(target) is not WorkTarget:
             raise HubError('invalid_work_target')
+        # Capture task state before the external target verifier; taskless
+        # trusted coordination actions retain their existing semantics.
+        with self.repo._connection() as db:
+            before = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            task_snapshot = before['data'] if before is not None else None
         if not self._target_verified(actor, action_key, environment, target):
             raise HubError('work_target_not_verified', 403)
         target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
@@ -325,6 +330,23 @@ class WorkQueue:
                 if old['fingerprint'] != fingerprint:
                     raise HubError('work_request_conflict', 409)
                 return self._public(old)
+            current = db.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'", (target.task_id,)).fetchone()
+            if (current['data'] if current is not None else None) != task_snapshot:
+                raise HubError('work_review_changed', 409)
+            if current is not None:
+                task = json.loads(current['data'])
+                review = task.get('review')
+                family = task.get('candidate_family', task.get('owner_family', task.get('owner')))
+                reviewer_family = review.get('family', review.get('actor')) if type(review) is dict else None
+                if not (task.get('owner') == actor and task.get('project') == action.project
+                        and task.get('status') == 'verified' and task.get('candidate_commit') == target.source_commit
+                        and type(review) is dict and review.get('verdict') == 'approve'
+                        and review.get('commit') == target.source_commit and review.get('actor') in AGENTS
+                        and review.get('actor') != actor and reviewer_family == review.get('actor')
+                        and type(family) is str and family == actor and reviewer_family != family):
+                    raise HubError('work_review_changed', 409)
+            if self.repo._open_work_job(db, target.task_id):
+                raise HubError('work_task_already_queued', 409)
             if db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] >= self.max_jobs:
                 raise HubError('work_queue_capacity', 503)
             job_id = str(uuid.uuid4())

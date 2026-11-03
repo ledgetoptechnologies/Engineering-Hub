@@ -433,3 +433,14 @@ def test_missing_inprocess_bridge_never_treats_durable_marker_as_authority(rig):
         assert rig.repo.list_runs() == [] and rig.client.submissions == []
     finally:
         rig.repo._queued_pilot = rig.bridge
+
+@pytest.mark.asyncio
+async def test_one_open_job_per_task_does_not_deadlock_pilot(rig):
+    task, first = submit(rig)
+    assert rig.queue.submit(actor='codex', request_id='one', action_key=ACTION,
+        environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))['id'] == first['id']
+    with pytest.raises(HubError, match='work_task_already_queued'):
+        rig.queue.submit(actor='codex', request_id='duplicate-target', action_key=ACTION,
+            environment='staging', target=WorkTarget(task['id'], COMMIT, IMAGE))
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert machine_job(rig) is None
