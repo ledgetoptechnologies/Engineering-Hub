@@ -755,3 +755,111 @@ def test_challenge_hash_is_bound_once_and_required_for_consumption(proof):
     finally:
         db.close()
     route.close()
+
+
+# ---------------------------------------------------------------- legacy -> proof mode race
+
+def _paused_before_send(monkeypatch, route):
+    """Pause a one-step submit after its admit commit, before its send guard."""
+    paused, resume = threading.Event(), threading.Event()
+    original = route._journal.legacy_send_guard
+
+    def wait_then_guard(*args, **kwargs):
+        paused.set()
+        assert resume.wait(10)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(route._journal, "legacy_send_guard", wait_then_guard)
+    return paused, resume
+
+
+def _submit_in_thread(route, cmd):
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("result", route.submit(cmd)))
+    worker.start()
+    return worker, outcome
+
+
+@LINUX
+def test_proof_mode_entry_refused_while_a_legacy_send_is_in_flight(proof, monkeypatch):
+    legacy = route_for(proof, dispatch_proof_verifier=None)
+    paused, resume = _paused_before_send(monkeypatch, legacy)
+    cmd = command(proof["epoch"])
+    worker, outcome = _submit_in_thread(legacy, cmd)
+    try:
+        assert paused.wait(10)  # Admitted (durable intent), not yet sent.
+        with pytest.raises(SupervisorRouteError):  # The flock: no second instance on this journal.
+            route_for(proof, create=False)
+        with pytest.raises(SupervisorRouteRejected) as raised:  # Mode entry itself, flock aside.
+            legacy._journal.enter_mode(proof_required=True)
+        assert raised.value.reason == "legacy_in_flight" and sends(proof) == 0
+    finally:
+        resume.set()
+        worker.join(10)
+    assert outcome["result"].state == "completed" and sends(proof) == 1
+    assert legacy._journal.enter_mode(proof_required=True) is True  # Resolved: now allowed.
+    with pytest.raises(SupervisorRouteRejected):
+        legacy.submit(command(proof["epoch"]))  # admit() sees the durable mode.
+    legacy.close()
+
+
+@LINUX
+@pytest.mark.parametrize("entered_by", ["journal_after_marking_held", "flock_ignoring_writer"])
+def test_paused_legacy_send_is_refused_once_proof_mode_is_entered(proof, monkeypatch, entered_by):
+    legacy = route_for(proof, dispatch_proof_verifier=None)
+    paused, resume = _paused_before_send(monkeypatch, legacy)
+    cmd = command(proof["epoch"])
+    worker, outcome = _submit_in_thread(legacy, cmd)
+    try:
+        assert paused.wait(10)
+        if entered_by == "journal_after_marking_held":
+            digest = route_module.binding_digest(route_module.binding_for(cmd, proof["pin"]))
+            legacy._journal.mark_unknown(cmd.command_id, digest, "interrupted")  # Operator: held.
+            assert legacy._journal.enter_mode(proof_required=True) is True
+        else:
+            db = _raw(proof["path"])  # An old/direct writer: ignores the flock and legacy_in_flight.
+            try:
+                db.execute("INSERT INTO supervisor_route_mode VALUES (1, 1)")
+            finally:
+                db.close()
+    finally:
+        resume.set()
+        worker.join(10)
+    result = outcome["result"]
+    assert (result.state, result.error) == ("held", "proof_required") and sends(proof) == 0  # Never sent.
+    assert legacy.inspect(cmd.command_id).state == "held"
+    legacy.close()
+
+
+@LINUX
+def test_no_writer_can_commit_proof_mode_or_resolve_the_intent_mid_send(proof):
+    entered, release = threading.Event(), threading.Event()
+
+    class Blocking(type(proof["sender"])):
+        def forward(self, **kwargs):
+            entered.set()
+            assert release.wait(10)
+            return super().forward(**kwargs)
+    legacy = route_for(proof, dispatch_proof_verifier=None, backend=Blocking(proof["pin"]))
+    cmd = command(proof["epoch"])
+    worker, outcome = _submit_in_thread(legacy, cmd)
+    try:
+        assert entered.wait(10)  # Inside the backend exchange, send guard held.
+        db = sqlite3.connect(Path(proof["path"]).as_uri() + "?mode=rw", uri=True, isolation_level=None,
+                             timeout=0.2)
+        try:
+            for sql in ("INSERT INTO supervisor_route_mode VALUES (1, 1)",
+                        "UPDATE supervisor_route_intent SET state='unknown', error='interrupted'"):
+                with pytest.raises(sqlite3.OperationalError):  # database is locked: cannot COMMIT.
+                    db.execute(sql)
+        finally:
+            db.close()
+    finally:
+        release.set()
+        worker.join(10)
+    assert outcome["result"].state == "completed"
+    db = _raw(proof["path"])
+    try:
+        db.execute("INSERT INTO supervisor_route_mode VALUES (1, 1)")  # After the exchange: commits.
+    finally:
+        db.close()
+    legacy.close()

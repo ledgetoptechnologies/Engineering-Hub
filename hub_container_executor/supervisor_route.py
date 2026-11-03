@@ -105,7 +105,19 @@ that also appear in the request body (command_id, run_id, fence) must equal
 it; job_id, worker and lease_epoch are bound only by the Hub's signature.
 Proof mode is durable: a route constructed with a proof verifier records it
 in the journal, after which ``submit`` (and the journal's one-step admit)
-refuse ``proof_required`` and a construction without a verifier is refused. Triggers make
+refuse ``proof_required`` and a construction without a verifier is refused.
+What serializes route instances: the PilotOwner flock admits ONE open
+journal per file (a second instance in the same or another process is
+refused until the first closes), and ``close()`` refuses while a submit is in
+flight. Independently of that, entering proof mode is refused while any
+one-step intent is unresolved (``legacy_in_flight``), and each one-step send
+holds a journal read transaction (SQLite SHARED lock) across exactly the
+backend exchange after re-checking the mode and its own intent, so no
+writer - even one ignoring the flock - can commit proof mode or resolve that
+intent mid-send; if the mode was entered after admit, the send is refused
+(``proof_required``, intent held) with zero bytes. Cost: in legacy mode the
+journal accepts no commits while a one-step exchange is in progress (other
+writers fail after the busy timeout). Triggers make
 a nonce outstanding -> consumed | expired exactly once, never deleted.
 Defaults refuse: no ``HubDispatchProofVerifier`` -> no challenge, no
 dispatch; no ``ChallengeStatementSigner`` -> no statement.
@@ -446,7 +458,8 @@ _GATE_OUTCOME_KEPT = ('CREATE TRIGGER supervisor_route_dispatch_outcome_kept BEF
 _STATES = frozenset({'intent', 'completed', 'rejected', 'refused', 'unknown'})
 _RECORDED = frozenset({'completed', 'rejected'})
 _ERRORS = frozenset({'transport_lost', 'malformed_response', 'backend_ambiguous', 'epoch_changed',
-                     'backend_identity_mismatch', 'outcome_unrecorded', 'interrupted', 'signing_failed'})
+                     'backend_identity_mismatch', 'outcome_unrecorded', 'interrupted', 'signing_failed',
+                     'proof_required', 'intent_resolved', 'send_guard_failed'})
 # PilotASGI error codes emitted BEFORE its adapter is invoked, keyed by status.
 # 403 is reserved for an explicit forbidden answer from a fronting executor.
 _DEFINITIVE_REJECTIONS = {400: 'invalid_payload', 401: 'unauthorized', 403: 'forbidden',
@@ -1457,14 +1470,49 @@ class RouteJournal(_DurableStore):
     def enter_mode(self, *, proof_required):
         """ONE transaction at route construction: with ``proof_required`` the
         permanent proof-mode row is recorded (idempotent); without it, a
-        journal already in proof mode is refused. Returns the durable mode."""
+        journal already in proof mode is refused. Returns the durable mode.
+
+        Entering proof mode is refused (``legacy_in_flight``) while ANY
+        one-step intent row is still unresolved ('intent'): its send could
+        still be in progress. Resolve it first (an outcome, or marked
+        unknown, which reads held) - a crashed legacy owner's 'intent' row
+        needs that operator reconciliation before proof mode can begin."""
         with self._transaction() as db:
             recorded = self._proof_mode(db)
             if recorded and not proof_required:
                 raise RouteJournalError('proof mode journal requires a dispatch proof verifier')
             if proof_required and not recorded:
+                if db.execute("SELECT 1 FROM supervisor_route_intent WHERE state='intent'").fetchone() is not None:
+                    raise SupervisorRouteRejected('legacy_in_flight')
                 db.execute('INSERT INTO supervisor_route_mode VALUES (1, 1)')
             return recorded or proof_required
+
+    @contextmanager
+    def legacy_send_guard(self, command_id, digest):
+        """Held around EXACTLY the one-step backend exchange (no journal write
+        happens inside it). Opens a read transaction that takes SQLite's
+        SHARED lock, re-checks that the journal is NOT in proof mode and that
+        this command's own intent row is still unresolved, and keeps the lock
+        until the exchange returns. While it is held no writer can COMMIT
+        (rollback-journal mode needs EXCLUSIVE), so proof mode cannot be
+        recorded, nor this intent resolved, mid-send even by a writer that
+        ignores the PilotOwner flock. Raises Rejected('proof_required' /
+        'intent_resolved') before anything is sent."""
+        _require(os.getpid() == self._pid, RouteJournalError('process'))
+        with self._mutex:
+            self._active()
+        with self._connection(readonly=True) as db:
+            db.execute('BEGIN')
+            try:
+                self._schema(db)  # First read: SHARED lock from here until rollback.
+                if self._proof_mode(db):
+                    raise SupervisorRouteRejected('proof_required')
+                row = self._row(db, command_id)
+                if row is None or row[1] != digest or row[3] != 'intent':
+                    raise SupervisorRouteRejected('intent_resolved')
+                yield
+            finally:
+                db.rollback()
 
     @staticmethod
     def _advance_epoch(db, epoch):
@@ -2370,14 +2418,14 @@ class SupervisorRoute:
             return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
         if outcome == 'replay':
             return self._from_row(row, replayed=True)
-        return self._send(command, request, binding, digest, epoch, pin, row)
+        return self._send(command, request, binding, digest, epoch, pin, row, legacy=True)
 
-    def _send(self, command, request, binding, digest, epoch, pin, counter):
+    def _send(self, command, request, binding, digest, epoch, pin, counter, *, legacy):
         """Durable intent AND its consumed dispatch counter exist: ownership is
         non-abandonable and the counter is never reused."""
         self._inflight.add(command.command_id)
         try:
-            return self._forward(command, request, binding, digest, epoch, pin, counter)
+            return self._forward(command, request, binding, digest, epoch, pin, counter, legacy)
         except BaseException:
             # Cancellation/interrupt in this thread: record unknown before
             # the mutex is released, then re-raise. A no-op if an outcome
@@ -2398,13 +2446,28 @@ class SupervisorRoute:
             pass
         return RouteResult('held', command.command_id, digest, False, error)
 
-    def _forward(self, command, request, binding, digest, epoch, pin, counter):
+    def _forward(self, command, request, binding, digest, epoch, pin, counter, legacy):
         extra = {}
         if getattr(self._backend, 'carries_dispatch', False) is True:
             extra['dispatch'] = dispatch_header(dispatch_claim(binding, counter))
+        guard = None
+        if legacy:
+            # One-step path: re-check, in a journal read transaction held for
+            # the whole exchange, that proof mode was not entered after admit.
+            guard = self._journal.legacy_send_guard(command.command_id, digest)
+            try:
+                guard.__enter__()
+            except SupervisorRouteRejected as refused:
+                return self._hold(command, digest, refused.reason)  # Zero bytes; intent reads held.
+            except Exception:
+                return self._hold(command, digest, 'send_guard_failed')
         try:
-            reply = self._backend.forward(method=command.method, path=command.path, body=command.body,
-                                          timeout_ms=self._timeout, pin=pin, **extra)
+            try:
+                reply = self._backend.forward(method=command.method, path=command.path, body=command.body,
+                                              timeout_ms=self._timeout, pin=pin, **extra)
+            finally:
+                if guard is not None:
+                    guard.__exit__(None, None, None)  # Released before ANY journal write below.
         except PeerMismatch:
             try:
                 self._journal.mark_refused(command.command_id, digest, 'backend_identity_mismatch')
@@ -2596,7 +2659,7 @@ class SupervisorRoute:
             if not isinstance(error, Exception):
                 raise
             return RouteResult('held', command.command_id, digest, False, 'admission_uncertain')
-        return self._send(command, request, binding, digest, epoch, pin, payload['counter'])
+        return self._send(command, request, binding, digest, epoch, pin, payload['counter'], legacy=False)
 
     def _journal_op(self):
         _require(os.getpid() == self._pid, SupervisorRouteError('process'))
