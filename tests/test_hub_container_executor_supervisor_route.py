@@ -728,21 +728,73 @@ _BAD_RESPONSES = {
 }
 
 
+class _StretchedServer(_ScriptedServer):
+    """Scripted peer whose delays are stretched and interruptible on close.
+
+    Each connection's script finishing is recorded, so a test can show that the
+    ROUTE's own deadline ended an exchange while the peer was still mid-script,
+    instead of racing wall-clock time against a tight bound."""
+    STRETCH = 5  # 3 s stalls / 60 x 0.05 s trickles become >= 15 s.
+
+    def __init__(self, path, scripts):
+        self.stop, self.finished = threading.Event(), []
+        super().__init__(path, scripts)
+
+    def _serve(self, peer, script):
+        done = threading.Event()
+        self.finished.append(done)
+        try:
+            peer.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += peer.recv(65536)
+            head, body = data.split(b"\r\n\r\n", 1)
+            length = int([l for l in head.split(b"\r\n") if l.lower().startswith(b"content-length:")][0]
+                         .split(b":")[1])
+            while len(body) < length:
+                body += peer.recv(65536)
+            for delay, chunk in script(body):
+                if self.stop.wait(delay * self.STRETCH):
+                    return
+                peer.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            peer.close()
+            done.set()
+
+    def close(self):
+        self.stop.set()
+        super().close()
+
+
+# Cases only the route's total deadline can end (the peer is slow or silent, not malformed).
+_DEADLINE_ENDED = frozenset({"trickle_headers", "trickle_body", "stalled_headers", "stalled_body", "no_eof"})
+_HANG_GUARD_S = 5.0  # Generous: catches a missing deadline (peer needs >= 15 s), not scheduling noise.
+
+
 @LINUX
 @pytest.mark.parametrize("case", sorted(_BAD_RESPONSES))
 def test_bounded_strict_response_framing_is_held_and_releases_lock(world, case):
     directory = tempfile.mkdtemp(dir="/tmp")
     path = os.path.join(directory, "s.sock")
-    server = _ScriptedServer(path, [_BAD_RESPONSES[case], _good])
+    server = _StretchedServer(path, [_BAD_RESPONSES[case], _good])
     try:
+        deadline_s = 0.6
         world["epochs"].value = (world["epoch"], _own_pin())
-        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=600)
+        route = world["make"](backend=UnixSocketBackend(path, bearer_token=TOKEN), timeout_ms=int(deadline_s * 1000))
         cmd = command(world["epoch"])
         started = time.monotonic()
         result = route.submit(cmd)
         elapsed = time.monotonic() - started
         assert result.state == "held" and result.record is None, case
-        assert elapsed < 0.6 + 0.4, (case, elapsed)  # Total deadline plus small slack.
+        if case in _DEADLINE_ENDED:
+            # Ended by the configured deadline: never before it, and while the
+            # peer was still mid-script (it needs >= 15 s to finish or close).
+            # Load can only make the route later, never the peer earlier.
+            assert elapsed >= deadline_s - 0.05, (case, elapsed)
+            assert not server.finished[0].is_set(), case
+        assert elapsed < deadline_s + _HANG_GUARD_S, (case, elapsed)
         assert route._mutex.acquire(blocking=False)
         route._mutex.release()
         assert route.submit(cmd).state == "held"  # Never redispatched.
