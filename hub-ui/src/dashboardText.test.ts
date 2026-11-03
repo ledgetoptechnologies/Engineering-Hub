@@ -48,7 +48,7 @@ describe("dashboard wording", () => {
 describe("review is not a run", () => {
   it("says so in visible text, not hover text", async () => {
     const { reviewPassedNote, REVIEW_IS_NOT_A_RUN } = await import("./dashboardText");
-    expect(reviewPassedNote(3)).toBe("3 review passed · a review isn't a run");
+    expect(reviewPassedNote(3)).toBe("3 review passed · a review doesn't authorize a run");
     expect(REVIEW_IS_NOT_A_RUN).toContain("doesn't start or authorize a run");
     expect(REVIEW_IS_NOT_A_RUN).not.toMatch(/has (not )?run|never ran|was run/i);
   });

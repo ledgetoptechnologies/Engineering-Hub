@@ -4,7 +4,7 @@ import type { Task } from "./types";
 
 /** Visible count note on Home: says what a passed review is not, without claiming anything ran or may run. */
 export function reviewPassedNote(count: number): string {
-  return `${count} review passed · a review isn't a run`;
+  return `${count} review passed · a review doesn't authorize a run`;
 }
 
 /** Review is a verdict on a commit, not permission to run it; whether anything ran or may run isn't known here. */
