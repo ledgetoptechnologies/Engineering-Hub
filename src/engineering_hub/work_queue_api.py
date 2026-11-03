@@ -105,6 +105,8 @@ def submit_reviewed_work(repo, queue, principal, payload: WorkSubmission):
     """Shared REST/MCP submission guard; identity is authenticated, never input."""
     if queue is None:
         raise HubError('work_queue_not_configured', 423)
+    if payload.request_id.startswith('staging:'):
+        raise HubError('work_request_prefix_reserved', 409)
     task = repo.get_task(payload.target.task_id)
     review = task.get('review')
     if task.get('owner') != principal:
