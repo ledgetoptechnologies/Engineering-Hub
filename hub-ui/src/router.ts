@@ -20,10 +20,14 @@ export type Route =
   | { page: "agents" }
   | { page: "staging" }
   | { page: "infrastructure" }
-  | { page: "device"; id: string };
+  | { page: "device"; id: string }
+  // Demo-only until the orchestration backend exists; App gates it with orchestrationEnabled().
+  | { page: "orchestration" }
+  | { page: "orchestration-request"; id: string };
 
 const projectId = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const setId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const requestId = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const reviewId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // Section anchors from the single-page dashboard keep working as links.
 const legacy: Record<string, Route> = {
@@ -75,6 +79,9 @@ export function parseRoute(value: string): Route {
     case "planning": return { page: "planning" };
     case "agents": return { page: "agents" };
     case "staging": return { page: "staging" };
+    case "orchestration":
+      if (parts.length === 1) return { page: "orchestration" };
+      return parts.length === 2 && requestId.test(parts[1]) ? { page: "orchestration-request", id: parts[1] } : { page: "orchestration" };
     case "infrastructure":
       if (parts.length === 1) return { page: "infrastructure" };
       return parts.length === 2 && projectId.test(parts[1]) ? { page: "device", id: parts[1] } : { page: "infrastructure" };
@@ -100,6 +107,7 @@ export function pathOf(route: Route): string {
     case "labels": return `/projects/${route.project}/labels/${route.set}`;
     case "review": return `/projects/${route.project}/reviews/${route.id}`;
     case "device": return `/infrastructure/${route.id}`;
+    case "orchestration-request": return `/orchestration/${route.id}`;
     default: return `/${route.page}`;
   }
 }

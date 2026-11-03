@@ -20,6 +20,10 @@ describe("routes", () => {
     ["/projects/treedar/plans", { page: "project", id: "treedar", tab: "plans" }],
     ["/agents", { page: "agents" }],
     ["/staging", { page: "staging" }],
+    ["/orchestration", { page: "orchestration" }],
+    ["#/orchestration/req-demo-viewer-refresh", { page: "orchestration-request", id: "req-demo-viewer-refresh" }],
+    ["/orchestration/<script>", { page: "orchestration" }],
+    ["/orchestration/a/b", { page: "orchestration" }],
   ])("parses %s", (value, route) => {
     expect(parseRoute(value)).toEqual(route);
   });
@@ -53,5 +57,14 @@ describe("path routing detection", () => {
       expect(await detectPathRouting(vi.fn<typeof fetch>().mockResolvedValue(response))).toBe(false);
     }
     expect(await detectPathRouting(vi.fn<typeof fetch>().mockRejectedValue(new Error("offline")))).toBe(false);
+  });
+});
+
+describe("orchestration routes", () => {
+  it("round-trips a request route", () => {
+    const route: Route = { page: "orchestration-request", id: "req-demo-billing-export" };
+    expect(pathOf(route)).toBe("/orchestration/req-demo-billing-export");
+    expect(parseRoute(pathOf(route))).toEqual(route);
+    expect(pathOf({ page: "orchestration" })).toBe("/orchestration");
   });
 });
