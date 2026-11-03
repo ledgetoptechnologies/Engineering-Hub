@@ -897,6 +897,36 @@ class _Blocking(Backend):
         return super().forward(**kwargs)
 
 
+# Hang guard for calls made WHILE an in-flight submit is held by a test-owned
+# event (_Blocking.release). Below _Blocking's own 10 s self-release, so a call
+# that waited behind the in-flight operation cannot finish in time: the order
+# (returned while the in-flight op was still blocked) is asserted, not latency.
+_CONCURRENT_GUARD_S = 5.0
+
+
+def _while_in_flight(backend, route, worker, call):
+    """Runs ``call`` in a helper thread while ``backend``'s first send is held.
+
+    Returns ``call``'s outcome plus, captured the moment it returned, whether
+    the in-flight submit was still blocked (release unset, mutex held, worker
+    alive). Fails if ``call`` did not return within the guard."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = call()
+        except BaseException as error:
+            outcome["error"] = error
+        outcome["in_flight_still_blocked"] = (not backend.release.is_set() and route._mutex.locked()
+                                              and worker.is_alive())
+    helper = threading.Thread(target=run, daemon=True)
+    helper.start()
+    helper.join(_CONCURRENT_GUARD_S)
+    assert not helper.is_alive(), "call waited behind the in-flight operation"
+    assert outcome["in_flight_still_blocked"], outcome
+    return outcome
+
+
 def test_busy_wait_is_validated(world):
     for value in (-1, 51, True, 1.0):
         config = SupervisorRouteConfig(enabled=True, journal_path=world["path"], create_journal=True,
@@ -927,9 +957,9 @@ def test_busy_admission_refuses_fast_without_effect_and_close_refuses_in_flight(
     try:
         assert backend.entered.wait(10)
         calls_before = len(epoch_calls)
-        started = time.monotonic()
-        busy = route.submit(other)
-        assert time.monotonic() - started < busy_wait_ms / 1000 + 0.2
+        # Refused while the first submit is provably still blocked (test-owned
+        # release), i.e. without waiting for it - not a wall-clock race.
+        busy = _while_in_flight(backend, route, worker, lambda: route.submit(other))["value"]
         assert busy.state == "busy" and busy.binding_digest is None and busy.record is None
         assert len(epoch_calls) == calls_before  # Not even the epoch source was consulted.
         assert intent_rows(world["path"]) == [(first.command_id, "intent")]  # No intent for `other`.
@@ -939,9 +969,9 @@ def test_busy_admission_refuses_fast_without_effect_and_close_refuses_in_flight(
         with pytest.raises(SupervisorRouteRejected) as raised:
             route.submit(command(world["epoch"], command_id=first.command_id, fence=8))
         assert raised.value.reason == "binding_conflict"
-        with pytest.raises(route_module.SupervisorRouteInFlight) as refused:
-            route.close()
-        assert refused.value.command_id == first.command_id
+        closing = _while_in_flight(backend, route, worker, route.close)
+        assert type(closing.get("error")) is route_module.SupervisorRouteInFlight, closing
+        assert closing["error"].command_id == first.command_id
     finally:
         backend.release.set()
         worker.join(10)
@@ -1048,14 +1078,19 @@ def test_inspect_and_close_concurrent_with_in_flight_submit(world):
     try:
         assert backend.entered.wait(10)
         before = Path(world["path"]).read_bytes()
-        started = time.monotonic()
-        for _ in range(5):
-            assert route.inspect(cmd.command_id).state == "in_progress"
-            assert route.inspect(str(uuid4())) is None
-        with pytest.raises(route_module.SupervisorRouteInFlight) as refused:
-            route.close()
-        assert refused.value.command_id == cmd.command_id
-        assert time.monotonic() - started < 2
+
+        def inspect_then_close():
+            states = [(route.inspect(cmd.command_id).state, route.inspect(str(uuid4()))) for _ in range(5)]
+            try:
+                route.close()
+            except route_module.SupervisorRouteInFlight as refused:
+                return states, refused
+            return states, None
+        # All of it happens while the submit is provably still blocked: inspect
+        # and close never wait for (or disturb) the in-flight operation.
+        states, refused = _while_in_flight(backend, route, worker, inspect_then_close)["value"]
+        assert states == [("in_progress", None)] * 5
+        assert refused is not None and refused.command_id == cmd.command_id
         assert Path(world["path"]).read_bytes() == before  # inspect/close wrote nothing.
         assert route._mutex.locked() and worker.is_alive()  # Ownership untouched.
     finally:
