@@ -348,3 +348,39 @@ Proposed route: the executor makes one outbound connection to a second superviso
 - `test_reconnect_from_same_live_init_accepted_other_refused`.
 - `test_executor_listens_on_no_socket`.
 - `test_hub_commands_refused_without_verified_route`.
+
+### 8.w No-delegation and coordinator ingress (third review)
+
+**Problem.** `SO_PEERCRED` records the credentials of the process that called `connect()`. It does not identify who later reads or writes the socket. A connected socket can reach another process in two ways: inheritance across `fork` (and across `exec` unless `FD_CLOEXEC` is set), or `SCM_RIGHTS` over another Unix socket. The verified route therefore holds only while no other process can come to hold that descriptor.
+
+**Constraints found in source:**
+- Executor code starts no processes. `hub_container_executor/*.py`, excluding the supervisor, has no `subprocess`, `fork`, `multiprocessing` or `exec`. That is a code-review fact, not an enforcement.
+- The container is `NetworkMode: none`, `ReadonlyRootfs`, `CapDrop: ALL` and `no-new-privileges`, with tmpfs `/tmp` mounted `noexec` (`launch_supervisor.py:769-781`). `PidsLimit` is 16 to 128 (`:254`), and threads count against it, so it cannot be set to 1.
+- `SecurityOpt` is only `no-new-privileges:true` (`launch_supervisor.py:770`, `daemon_backend.py:956,1210`), so the engine's default seccomp profile applies. That profile allows `fork`, `clone` and `execve`.
+- The only Unix sockets reachable from inside the container are the supervisor's (`issuer_socket` and the proposed `command_route`, both with a root peer) and `engine_socket`, whose peer is dockerd. Docker's HTTP API ignores passed descriptors.
+
+**Enforcement proposal: no new processes in the executor container.**
+1. A custom seccomp profile passed via `SecurityOpt: seccomp=<pinned profile>`. It denies `fork`, `vfork`, `execve` and `execveat`, denies `clone` unless `CLONE_THREAD` is set (seccomp can inspect clone flags), and returns `ENOSYS` for `clone3` so that libc falls back to `clone`. Threads still work. No second process can exist in the container.
+2. With no second process, an `SCM_RIGHTS` transfer has no attacker-controlled recipient. The remaining peers are root-owned (the supervisor) or ignore descriptors (dockerd).
+3. The executor opens the route `SOCK_CLOEXEC`, as defence in depth.
+4. **A check the supervisor can enforce now, independently of seccomp.** The supervisor is root in the host namespace, so it can list `/proc/<pid>/fd/*` for every pid in the container's pid namespace (pids found through `/proc/<init>/task` and the cgroup's `cgroup.procs`). It confirms that the route socket's inode (`socket:[ino]`) appears only in the init process's descriptor table. It does this at accept and before forwarding each Hub command. A hit anywhere else is treated as launch compromise: the route closes, the launch is held, and nothing is redone.
+5. **Residual risk.** Without the seccomp profile, a transfer and its use between two scans cannot be prevented, only detected at the next scan. With the profile, the window has no recipient process. Root on the host stays out of scope.
+
+The launch inspection must verify the seccomp profile. It should compare `HostConfig.SecurityOpt` and `/proc/<pid>/status` `Seccomp: 2` with the pinned profile digest, alongside the existing `_kernel_profile` check (`:904`). The daemon backend's equality check at `daemon_backend.py:1210` would need the same update.
+
+**Coordinator ingress.** The Hub, or coordinator, reaches the supervisor's host-side endpoint, and that hop needs its own identity:
+- **Transport.** mTLS with a pinned Hub client certificate, enrolled in the supervisor's existing root-owned enrollment file alongside the supervisor key. A private Unix socket is an option only if the Hub process runs on the staging host, in which case `SO_PEERCRED` plus pidfd apply the same way.
+- **Per-command authorisation.** The Hub signs `(command_id, operation, digest, Hub nonce, admission decision id)` with an enrolled Hub key. The supervisor journals each `command_id` once and refuses replays. **Gap:** the Hub has no signing key today. Its enrollment, custody and rotation need their own design and Beau's approval, since this is a new credential.
+- **Delegation on the Hub side.** The Hub process is trusted at host level. The same no-delegation reasoning applies only if the supervisor endpoint is a local Unix socket.
+
+**Tests:**
+- `test_fork_child_holding_route_fd_detected_by_fd_scan`: init forks and the child keeps the descriptor. The scan finds the inode outside init, and the launch is held.
+- `test_scm_rights_to_sibling_detected_by_fd_scan`: an in-container socketpair passes the route descriptor to a sibling and is detected.
+- `test_seccomp_profile_denies_fork_exec_and_nonthread_clone`: `os.fork`, `subprocess` and `clone3` all fail; `threading` works.
+- `test_route_opened_cloexec`.
+- `test_launch_refused_without_pinned_seccomp_profile`.
+- `test_coordinator_without_enrolled_client_cert_refused`.
+- `test_replayed_hub_command_signature_refused`.
+- `test_fd_scan_runs_before_every_forwarded_command`.
+
+**Not verified:** whether the rootless engine applies a custom seccomp profile as written; Python's `clone3` fallback behaviour on the host's glibc; whether the executor needs any subprocess at runtime (source says no); and the Hub's deployment location relative to the staging host.
