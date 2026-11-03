@@ -98,20 +98,64 @@ def test_errors_do_not_reflect_peer_input(hub):
     assert "not_found" in str(response)
 
 
+
+def _seed_run(repo, project, status):
+    """A stored run row for presentation filtering; runs are otherwise created only by a reviewed pilot."""
+    import json, uuid
+    run = {"id": str(uuid.uuid4()), "project": project, "status": status, "revision": 1}
+    with repo._transaction() as db:
+        db.execute("INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)", (run["id"], "run", json.dumps(run)))
+    return run
+
+
 def test_overview_filters_keep_active_items_and_count_the_rest(hub):
     client, repo = hub
-    kept = repo.create_task("human:123", "3d-viewer", "Active fixture", "request-active")
-    gone = repo.create_task("human:123", "3d-viewer", "Withdrawn fixture", "request-gone")
-    repo.withdraw("human:123", "task", gone["id"], gone["revision"], "fixture")
-    other = repo.create_task("human:123", "treedar", "Other project", "request-other")
+    tasks = {
+        "viewer_open": repo.create_task("human:123", "3d-viewer", "Open", "t1"),
+        "viewer_gone": repo.create_task("human:123", "3d-viewer", "Withdrawn", "t2"),
+        "treedar_open": repo.create_task("human:123", "treedar", "Other project", "t3"),
+    }
+    repo.withdraw("human:123", "task", tasks["viewer_gone"]["id"], tasks["viewer_gone"]["revision"], "fixture")
+    decisions = {
+        "viewer_open": repo.create_decision("human:123", "3d-viewer", "Open choice", ["A", "B"]),
+        "viewer_gone": repo.create_decision("human:123", "3d-viewer", "Withdrawn choice", ["A", "B"]),
+        "treedar_open": repo.create_decision("human:123", "treedar", "Other choice", ["A", "B"]),
+    }
+    gone = decisions["viewer_gone"]
+    repo.withdraw("human:123", "decision", gone["id"], gone["revision"], "fixture")
+    runs = {"viewer_held": _seed_run(repo, "3d-viewer", "held"),
+            "viewer_done": _seed_run(repo, "3d-viewer", "succeeded"),
+            "treedar_running": _seed_run(repo, "treedar", "running")}
+
+    def ids(result, key):
+        return {item["id"] for item in result[key]}
+
     full = call(client, "hub_overview")["structuredContent"]
-    assert "omitted" not in full and {item["id"] for item in full["tasks"]} >= {kept["id"], other["id"]}
+    assert "omitted" not in full
+    assert (len(full["tasks"]), len(full["decisions"]), len(full["runs"])) == (3, 3, 3)
+
     scoped = call(client, "hub_overview", {"project": "3d-viewer"})["structuredContent"]
-    assert other["id"] not in {item["id"] for item in scoped["tasks"]}
-    assert scoped["omitted"]["tasks"] >= 1
+    assert ids(scoped, "tasks") == {tasks["viewer_open"]["id"], tasks["viewer_gone"]["id"]}
+    assert ids(scoped, "decisions") == {decisions["viewer_open"]["id"], gone["id"]}
+    assert ids(scoped, "runs") == {runs["viewer_held"]["id"], runs["viewer_done"]["id"]}
+    assert scoped["omitted"] == {"tasks": 1, "decisions": 1, "runs": 1}
+
     active = call(client, "hub_overview", {"active_only": True})["structuredContent"]
-    assert all(item["status"] != "withdrawn" for item in active["tasks"])
-    assert all(item["status"] == "open" for item in active["decisions"])
-    assert set(active["omitted"]) == {"tasks", "decisions", "runs"}
-    for bad in ({"active_only": "yes"}, {"project": ""}):
+    assert ids(active, "tasks") == {tasks["viewer_open"]["id"], tasks["treedar_open"]["id"]}
+    assert ids(active, "decisions") == {decisions["viewer_open"]["id"], decisions["treedar_open"]["id"]}
+    assert ids(active, "runs") == {runs["viewer_held"]["id"], runs["treedar_running"]["id"]}
+    assert active["omitted"] == {"tasks": 1, "decisions": 1, "runs": 1}
+
+    both = call(client, "hub_overview", {"active_only": True, "project": "3d-viewer"})["structuredContent"]
+    assert ids(both, "tasks") == {tasks["viewer_open"]["id"]}
+    assert ids(both, "decisions") == {decisions["viewer_open"]["id"]}
+    assert ids(both, "runs") == {runs["viewer_held"]["id"]}
+    assert both["omitted"] == {"tasks": 2, "decisions": 2, "runs": 2}
+    # Presentation only: global sections are unchanged by the project filter.
+    assert both["paused"] == full["paused"]
+
+    nothing = call(client, "hub_overview", {"project": "no-such-project"})["structuredContent"]
+    assert (nothing["tasks"], nothing["decisions"], nothing["runs"]) == ([], [], [])
+    assert nothing["omitted"] == {"tasks": 3, "decisions": 3, "runs": 3}
+    for bad in ({"active_only": "yes"}, {"active_only": 1}, {"project": ""}, {"project": 5}):
         assert call(client, "hub_overview", bad)["isError"] is True
