@@ -54,9 +54,27 @@ Explicit limits (this foundation grants no authority by itself):
   whole submit: acquiring the route mutex, the caller-supplied epoch source and
   the durable journal (transaction, fsync) may block outside it. A timeout never
   implies the command had no effect: once bytes may have been sent the outcome
-  is held. Bounding the entire submit would need busy admission that refuses
-  before any effect and durable handling that never abandons a started effect;
-  neither is implemented here.
+  is held. There is NO hard end-to-end deadline: only ADMISSION is bounded
+  (busy refusal below); once admitted, the epoch source and the journal
+  (transaction, fsync) can still block outside the socket deadline.
+* Busy admission: one operation at a time. A submit that cannot take the route
+  mutex within ``busy_wait_ms`` (0..50, default 0 = non-blocking) returns
+  ``busy`` before any effect: no epoch call, no journal intent, no bytes. It
+  is retryable with the same command_id. Precedence while busy: an IDENTICAL
+  replay of the in-flight command reports ``in_progress``; the same
+  command_id with different content is rejected (``binding_conflict``); any
+  other command is ``busy``.
+* Non-abandonable ownership: once admitted, the operation keeps the mutex until
+  it reaches a recorded state (completed/rejected/refused/unknown). A
+  BaseException (KeyboardInterrupt, CancelledError, SystemExit) raised in the
+  submitting thread after durable intent first records ``unknown``
+  (``interrupted``), then re-raises; if even that write fails, the committed
+  ``intent`` row reads as held. asyncio cancellation of a ``to_thread`` caller
+  does not stop the thread, which still records the outcome and only then
+  releases the mutex. ``unknown`` is always reported ``held``.
+* ``close()`` REFUSES while an operation is in flight: it raises
+  ``SupervisorRouteInFlight`` naming the in-flight command_id and leaves the
+  route open; it never returns as if idle. Retry close after the outcome.
 * Behaviour against the real executor's Unix-socket server close semantics
   (Connection: close, EOF after the body) is exercised in tests with uvicorn but
   must be re-verified on the actual deployment transport before integration.
@@ -179,6 +197,14 @@ class SupervisorRouteRefused(SupervisorRouteError):
 
 class RouteJournalError(SupervisorRouteError):
     pass
+
+
+class SupervisorRouteInFlight(SupervisorRouteError):
+    """close() refused: an admitted operation has not reached a recorded state."""
+
+    def __init__(self, command_id):
+        self.command_id = command_id
+        super().__init__('supervisor route operation in flight: ' + str(command_id))
 
 
 class PeerMismatch(Exception):
@@ -369,14 +395,15 @@ def observation_nonce(digest):
 
 @dataclass(frozen=True)
 class RouteResult:
-    """state: completed | rejected | refused | in_progress | held.
+    """state: completed | rejected | refused | in_progress | held | busy.
 
     Only completed (accepted) and rejected (definitive non-acceptance) carry a
-    signed record. refused = verified never sent. held = uncertain.
+    signed record. refused = verified never sent. held = uncertain. busy = not
+    admitted, nothing journaled or sent (binding_digest is None); retryable.
     """
     state: str
     command_id: str
-    binding_digest: str
+    binding_digest: str | None
     replayed: bool
     error: str | None = None
     record: bytes | None = None
@@ -391,6 +418,7 @@ class SupervisorRouteConfig:
     create_journal: bool = False
     forward_timeout_ms: int = 5000
     allow_ephemeral_test_storage: bool = False
+    busy_wait_ms: int = 0
 
 
 def _shape(value, keys):
@@ -861,9 +889,14 @@ class SupervisorRoute:
                      serialization.PublicFormat.Raw) == release.public_key
                  and callable(epoch_source) and callable(getattr(backend, 'forward', None))
                  and type(config.forward_timeout_ms) is int and 100 <= config.forward_timeout_ms <= 120000
+                 and type(config.busy_wait_ms) is int and 0 <= config.busy_wait_ms <= 50
                  and type(config.journal_path) is str, SupervisorRouteError('invalid supervisor route'))
         self._pid = os.getpid()
         self._mutex = threading.Lock()
+        self._state = threading.Lock()  # Guards _active/_closed for busy reporting only.
+        self._active = None  # The admitted RouteCommand currently owning the mutex.
+        self._closed = False
+        self._busy_wait = config.busy_wait_ms / 1000
         self._release, self._signer = release, signing_key
         self._epoch_source, self._backend = epoch_source, backend
         self._timeout = config.forward_timeout_ms
@@ -896,31 +929,62 @@ class SupervisorRoute:
         _require(type(command) is RouteCommand)
         # Contract check on the exact bytes BEFORE any journal access.
         request = _submitted_request(command)
-        with self._mutex:
+        acquired = (self._mutex.acquire(timeout=self._busy_wait) if self._busy_wait
+                    else self._mutex.acquire(blocking=False))
+        if not acquired:
+            with self._state:
+                active = self._active
+            if active is not None and active.command_id == command.command_id:
+                if active == command:
+                    return RouteResult('in_progress', command.command_id, None, True)
+                raise SupervisorRouteRejected('binding_conflict')
+            return RouteResult('busy', command.command_id, None, False)
+        try:
+            with self._state:
+                _require(not self._closed, SupervisorRouteError('supervisor route closed'))
+                self._active = command
+            return self._admitted(command, request)
+        finally:
+            with self._state:
+                self._active = None
+            self._mutex.release()
+
+    def _admitted(self, command, request):
+        """Runs holding the mutex; returns only at a recorded (or held) state."""
+        try:
+            epoch, pin = self._current()
+        except Exception:
+            raise SupervisorRouteRefused() from None
+        if command.epoch != epoch:
+            # Never journaled, never forwarded. Older counters are also
+            # rejected by the durable high-water check inside admit().
+            raise SupervisorRouteRejected('stale_epoch' if command.epoch.launch_counter < epoch.launch_counter
+                                          else 'epoch_mismatch')
+        binding = binding_for(command, pin)
+        digest = binding_digest(binding)
+        try:
+            outcome, row = self._journal.admit(command.command_id, digest, binding, epoch)
+        except SupervisorRouteRejected:
+            raise
+        except Exception:
+            raise SupervisorRouteRefused() from None
+        if outcome == 'replay':
+            return self._from_row(row, replayed=True)
+        # Durable intent exists from here: ownership is non-abandonable.
+        self._inflight.add(command.command_id)
+        try:
+            return self._forward(command, request, binding, digest, epoch, pin)
+        except BaseException:
+            # Cancellation/interrupt in this thread: record unknown before
+            # the mutex is released, then re-raise. A no-op if an outcome
+            # was already recorded; if this write fails, 'intent' = held.
             try:
-                epoch, pin = self._current()
-            except Exception:
-                raise SupervisorRouteRefused() from None
-            if command.epoch != epoch:
-                # Never journaled, never forwarded. Older counters are also
-                # rejected by the durable high-water check inside admit().
-                raise SupervisorRouteRejected('stale_epoch' if command.epoch.launch_counter < epoch.launch_counter
-                                              else 'epoch_mismatch')
-            binding = binding_for(command, pin)
-            digest = binding_digest(binding)
-            try:
-                outcome, row = self._journal.admit(command.command_id, digest, binding, epoch)
-            except SupervisorRouteRejected:
-                raise
-            except Exception:
-                raise SupervisorRouteRefused() from None
-            if outcome == 'replay':
-                return self._from_row(row, replayed=True)
-            self._inflight.add(command.command_id)
-            try:
-                return self._forward(command, request, binding, digest, epoch, pin)
-            finally:
-                self._inflight.discard(command.command_id)
+                self._journal.mark_unknown(command.command_id, digest, 'interrupted')
+            except BaseException:
+                pass
+            raise
+        finally:
+            self._inflight.discard(command.command_id)
 
     def _hold(self, command, digest, error):
         try:
@@ -989,5 +1053,15 @@ class SupervisorRoute:
         return None if row is None else self._from_row(row, replayed=True)
 
     def close(self):
-        self._signer = None
-        self._journal.close()
+        """Refuses (SupervisorRouteInFlight) while an operation is in flight."""
+        if not self._mutex.acquire(blocking=False):
+            with self._state:
+                active = self._active
+            raise SupervisorRouteInFlight(None if active is None else active.command_id)
+        try:
+            with self._state:
+                self._closed = True
+            self._signer = None
+            self._journal.close()
+        finally:
+            self._mutex.release()

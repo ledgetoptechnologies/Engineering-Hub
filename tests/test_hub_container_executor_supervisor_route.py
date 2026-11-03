@@ -765,3 +765,128 @@ def test_strict_reader_accepts_exact_framing_and_exact_rejection(world):
         server.close()
         os.unlink(path)
         os.rmdir(directory)
+
+
+class _Blocking(Backend):
+    """Fake backend that blocks mid-send until released; counts calls."""
+
+    def __init__(self, pin):
+        super().__init__(pin)
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.interrupt = None
+
+    def forward(self, **kwargs):
+        if not self.calls:
+            self.calls.append((kwargs["method"], kwargs["path"], kwargs["body"]))
+            self.entered.set()
+            assert self.release.wait(10)
+            if self.interrupt is not None:
+                raise self.interrupt
+            self.calls.pop()
+        return super().forward(**kwargs)
+
+
+def test_busy_wait_is_validated(world):
+    for value in (-1, 51, True, 1.0):
+        config = SupervisorRouteConfig(enabled=True, journal_path=world["path"], create_journal=True,
+                                       allow_ephemeral_test_storage=True, busy_wait_ms=value)
+        with pytest.raises(SupervisorRouteError):
+            SupervisorRoute(config=config, release=world["release"], signing_key=world["key"],
+                            epoch_source=world["epochs"], backend=world["backend"])
+    assert not Path(world["path"]).exists()
+
+
+@LINUX
+@pytest.mark.parametrize("busy_wait_ms", [0, 20])
+def test_busy_admission_refuses_fast_without_effect_and_close_refuses_in_flight(world, busy_wait_ms):
+    backend = _Blocking(world["pin"])
+    config = SupervisorRouteConfig(enabled=True, journal_path=world["path"], create_journal=True,
+                                   allow_ephemeral_test_storage=True, busy_wait_ms=busy_wait_ms)
+    epoch_calls = []
+
+    def epochs():
+        epoch_calls.append(1)
+        return world["epochs"]()
+    route = SupervisorRoute(config=config, release=world["release"], signing_key=world["key"],
+                            epoch_source=epochs, backend=backend)
+    first, other = command(world["epoch"]), command(world["epoch"])
+    results = {}
+    worker = threading.Thread(target=lambda: results.setdefault("first", route.submit(first)))
+    worker.start()
+    try:
+        assert backend.entered.wait(10)
+        calls_before = len(epoch_calls)
+        started = time.monotonic()
+        busy = route.submit(other)
+        assert time.monotonic() - started < busy_wait_ms / 1000 + 0.2
+        assert busy.state == "busy" and busy.binding_digest is None and busy.record is None
+        assert len(epoch_calls) == calls_before  # Not even the epoch source was consulted.
+        assert intent_rows(world["path"]) == [(first.command_id, "intent")]  # No intent for `other`.
+        assert len(backend.calls) == 1  # Zero bytes for the refused command.
+        replay = route.submit(first)
+        assert replay.state == "in_progress"  # Identical replay of the in-flight command.
+        with pytest.raises(SupervisorRouteRejected) as raised:
+            route.submit(command(world["epoch"], command_id=first.command_id, fence=8))
+        assert raised.value.reason == "binding_conflict"
+        with pytest.raises(route_module.SupervisorRouteInFlight) as refused:
+            route.close()
+        assert refused.value.command_id == first.command_id
+    finally:
+        backend.release.set()
+        worker.join(10)
+    assert results["first"].state == "completed"
+    retried = route.submit(other)  # Same command_id, now admitted normally.
+    assert retried.state == "completed" and not retried.replayed
+    assert route.submit(other).state == "completed" and len(backend.calls) == 2
+    route.close()
+    with pytest.raises(SupervisorRouteError):
+        route.submit(command(world["epoch"]))
+
+
+@LINUX
+def test_interrupt_of_submitting_thread_records_unknown_before_release(world):
+    backend = _Blocking(world["pin"])
+    backend.interrupt = KeyboardInterrupt()
+    backend.release.set()
+    route = world["make"](backend=backend)
+    cmd = command(world["epoch"])
+    with pytest.raises(KeyboardInterrupt):
+        route.submit(cmd)
+    assert intent_rows(world["path"]) == [(cmd.command_id, "unknown")]
+    held = route.inspect(cmd.command_id)
+    assert held.state == "held" and held.error == "interrupted"
+    assert route.submit(cmd).state == "held"  # Unknown stays held; never re-forwarded.
+    assert len(backend.calls) == 1
+    assert route.submit(command(world["epoch"])).state == "completed"  # Mutex released afterwards.
+    route.close()
+
+
+@LINUX
+def test_asyncio_cancellation_does_not_release_ownership_early(world):
+    import asyncio
+    backend = _Blocking(world["pin"])
+    route = world["make"](backend=backend)
+    cmd, other = command(world["epoch"]), command(world["epoch"])
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.to_thread(route.submit, cmd))
+        assert await asyncio.to_thread(backend.entered.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Caller gave up, but the admitted operation still owns the route.
+        assert route.submit(other).state == "busy"
+        assert route.submit(cmd).state == "in_progress"
+        with pytest.raises(route_module.SupervisorRouteInFlight):
+            route.close()
+        assert route.inspect(cmd.command_id).state == "in_progress"
+        # Release before asyncio.run joins its default executor thread.
+        backend.release.set()
+    started = time.monotonic()
+    asyncio.run(scenario())
+    assert time.monotonic() - started < 8
+    assert route._mutex.acquire(timeout=10)  # Released only after the outcome is recorded.
+    route._mutex.release()
+    assert route.inspect(cmd.command_id).state == "completed"
+    assert route.submit(other).state == "completed"
+    route.close()
