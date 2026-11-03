@@ -39,11 +39,14 @@ REJECTION = b'{"error":{"code":"unauthorized"}}'
 
 
 class JobStore(HeldAttemptSource):
-    """Test-only authoritative Hub job store with an atomic, idempotent
-    compare-and-set under its own lock (what a real source must provide)."""
+    """Test-only authoritative Hub job store. ``record_observation_in_hub_transaction``
+    stands in for the Hub's own DB transaction: under one lock it re-verifies
+    the signed observation, checks the job (hold version) and records the
+    outcome, idempotently (what a real source must provide)."""
 
-    def __init__(self):
-        self.lock, self.versions, self.applied, self.cas_calls = threading.Lock(), {}, {}, []
+    def __init__(self, verifier=None):
+        self.lock, self.versions, self.applied, self.hub_calls = threading.Lock(), {}, {}, []
+        self.verifier = verifier
 
     def hold_version(self, command, pin, dispatch_counter):
         with self.lock:
@@ -53,11 +56,16 @@ class JobStore(HeldAttemptSource):
         with self.lock:
             self.versions[command_id] += "+"
 
-    def apply_observation_if_unchanged(self, version, observation):
+    def record_observation_in_hub_transaction(self, version, observation):
         with self.lock:
-            self.cas_calls.append((version, observation))
+            self.hub_calls.append((version, observation))
             if self.versions.get(observation.command_id) != version:
                 return False
+            if self.verifier is not None:  # The Hub re-verifies inside its own transaction.
+                try:
+                    self.verifier.verify(observation.answer, request=json.loads(observation.request))
+                except SupervisorRouteError:
+                    return False
             previous = self.applied.setdefault(observation.command_id, observation.status)
             return previous == observation.status
 
@@ -152,7 +160,7 @@ def insp(world, tmp_path):
     server = _Supervisor(path, responder)
     state = {"key": key, "route": route, "responder": responder, "server": server, "socket": path,
              "ledger": str(hub / "inspection.sqlite"), "resolvers": [],
-             "store": JobStore()}  # The authoritative job store outlives any resolver.
+             "store": JobStore(PinnedKeyInspectionVerifier(raw_key(key)))}  # The authoritative job store outlives any resolver.
 
     def client(peer=None, verifier=None, credential=INSPECT_TOKEN, timeout_ms=600, socket_path=path):
         return SupervisorInspectionClient(
@@ -322,7 +330,7 @@ def test_launch_bearer_never_authorizes_inspection_and_vice_versa(world, insp):
 # --- Positive cases ----------------------------------------------------------
 
 @LINUX
-def test_signed_launched_observed_and_applied_only_via_cas_across_restart(world, insp):
+def test_signed_launched_observed_and_applied_only_via_hub_transaction_across_restart(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
     before, calls = route_rows(world), list(world["backend"].calls)
     result = resolver.inspect(cmd, world["pin"], counter)
@@ -348,7 +356,7 @@ def test_signed_launched_observed_and_applied_only_via_cas_across_restart(world,
 
 @LINUX
 @pytest.mark.parametrize("outcome", ["rejected", "refused"])
-def test_signed_refused_observed_and_applied_only_via_cas(world, insp, outcome):
+def test_signed_refused_observed_and_applied_only_via_hub_transaction(world, insp, outcome):
     resolver, cmd, counter = held_attempt(world, insp, outcome)
     result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.status, result.observation.route_state) == ("applied", "refused", outcome)
@@ -734,7 +742,7 @@ def test_request_reuses_dispatch_claim_and_refuses_inconsistent_claims(world, in
                                         authorization="Bearer " + INSPECT_TOKEN, body=body)[0] == 400
 
 
-# --- Replay re-verification, held-attempt source CAS, bounded responder -------
+# --- Replay re-verification, Hub-transaction source, bounded responder -------
 
 def _resolved(world, insp):
     resolver, cmd, counter = held_attempt(world, insp)
@@ -848,7 +856,7 @@ def test_tampered_terminal_row_replays_held(world, insp, case):
 
 
 class _Source(HeldAttemptSource):
-    """Versions like JobStore but with a scripted CAS result."""
+    """Versions like JobStore but with a scripted Hub-transaction result."""
 
     def __init__(self, result, version="v1"):
         self.result, self.version, self.calls = result, version, []
@@ -856,7 +864,7 @@ class _Source(HeldAttemptSource):
     def hold_version(self, command, pin, dispatch_counter):
         return self.version
 
-    def apply_observation_if_unchanged(self, version, observation):
+    def record_observation_in_hub_transaction(self, version, observation):
         self.calls.append(version)
         if isinstance(self.result, BaseException):
             raise self.result
@@ -865,11 +873,11 @@ class _Source(HeldAttemptSource):
 
 @LINUX
 @pytest.mark.parametrize("source,error", [
-    ("default", "cas_unavailable"), ("bad_version", "cas_unavailable"), ("cas_false", "cas_not_applied"),
-    ("cas_truthy", "cas_not_applied"), ("cas_raises", "cas_not_applied")])
-def test_observation_recorded_but_held_without_source_cas(world, insp, source, error):
+    ("default", "hub_unavailable"), ("bad_version", "hub_unavailable"), ("hub_false", "hub_not_recorded"),
+    ("hub_truthy", "hub_not_recorded"), ("hub_raises", "hub_not_recorded")])
+def test_observation_recorded_but_held_without_hub_transaction(world, insp, source, error):
     chosen = {"default": HeldAttemptSource(), "bad_version": _Source(True, version="has space"),
-              "cas_false": _Source(False), "cas_truthy": _Source(1), "cas_raises": _Source(OSError())}[source]
+              "hub_false": _Source(False), "hub_truthy": _Source(1), "hub_raises": _Source(OSError())}[source]
     resolver, cmd, counter = held_attempt(world, insp, source=chosen)
     result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error, result.status, result.applied) == ("held", error, "launched", False)
@@ -886,7 +894,7 @@ def test_observation_recorded_but_held_without_source_cas(world, insp, source, e
 
 @LINUX
 @pytest.mark.parametrize("when", ["before_inspection", "while_answer_in_flight"])
-def test_source_change_refuses_cas_and_stays_held(world, insp, when):
+def test_source_change_refused_by_hub_transaction_and_stays_held(world, insp, when):
     store = JobStore()
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     held_version = store.versions[cmd.command_id]
@@ -894,22 +902,22 @@ def test_source_change_refuses_cas_and_stays_held(world, insp, when):
         store.change(cmd.command_id)
     else:
         def in_flight(body, responder):
-            store.change(cmd.command_id)  # The job changes after hold_version, before the CAS.
+            store.change(cmd.command_id)  # The job changes after hold_version, before the Hub transaction.
             return [(0, _http(200, genuine(body, responder)))]
         insp["server"].script = in_flight
     result = resolver.inspect(cmd, world["pin"], counter)
-    assert (result.state, result.error, result.status) == ("held", "cas_not_applied", "launched")
-    assert store.applied == {} and store.cas_calls[-1][0] == held_version  # CAS used the HOLD version.
+    assert (result.state, result.error, result.status) == ("held", "hub_not_recorded", "launched")
+    assert store.applied == {} and store.hub_calls[-1][0] == held_version  # The Hub got the HOLD version.
     assert ledger_state(insp, cmd.command_id) == ("observed_launched", "completed")  # Observed, not released.
 
 
 @LINUX
-def test_cas_receives_exact_signed_observation(world, insp):
+def test_hub_transaction_receives_exact_reverifiable_observation(world, insp):
     store = JobStore()
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     result = resolver.inspect(cmd, world["pin"], counter)
     assert result.applied
-    version, observation = store.cas_calls[-1]
+    version, observation = store.hub_calls[-1]
     binding = binding_for(cmd, world["pin"])
     assert version == "v1." + cmd.command_id
     assert (observation.command_id, observation.binding_digest, observation.dispatch) == (
@@ -917,22 +925,34 @@ def test_cas_receives_exact_signed_observation(world, insp):
     assert observation.key_id == inspection_key_id(raw_key(insp["key"]))
     signed = json.loads(observation.answer)["payload"]
     assert observation.answered_at_ms == signed["answered_at_ms"] and signed["status"] == "launched"
+    assert signed["request"] == json.loads(observation.request)  # Exactly what was signed: re-verifiable.
+    other = PinnedKeyInspectionVerifier(raw_key(Ed25519PrivateKey.generate()))
+    with pytest.raises(SupervisorRouteError):
+        other.verify(observation.answer, request=json.loads(observation.request))
 
 
 @LINUX
-def test_replay_is_historical_and_needs_a_fresh_cas(world, insp):
+def test_hub_reverification_failure_inside_transaction_keeps_held(world, insp):
+    store = JobStore(PinnedKeyInspectionVerifier(raw_key(Ed25519PrivateKey.generate())))  # Hub pins another key.
+    resolver, cmd, counter = held_attempt(world, insp, source=store)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "hub_not_recorded") and store.applied == {}
+
+
+@LINUX
+def test_replay_is_historical_and_needs_the_hub_transaction(world, insp):
     store = JobStore()
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     first = resolver.inspect(cmd, world["pin"], counter)
     assert first.applied and not first.observation.historical
-    calls = len(store.cas_calls)
+    calls = len(store.hub_calls)
     replay = resolver.inspect(cmd, world["pin"], counter)
-    assert replay.applied and replay.observation.historical  # Idempotent CAS accepted it again...
+    assert replay.applied and replay.observation.historical  # The idempotent Hub transaction accepted it again...
     assert replay.observation.answered_at_ms == first.observation.answered_at_ms  # ...as the OLD signed fact.
-    assert len(store.cas_calls) == calls + 1  # Replay went through the CAS.
+    assert len(store.hub_calls) == calls + 1  # Replay went through the Hub transaction.
     store.change(cmd.command_id)
     stale = resolver.inspect(cmd, world["pin"], counter)
-    assert (stale.state, stale.error, stale.observation.historical) == ("held", "cas_not_applied", True)
+    assert (stale.state, stale.error, stale.observation.historical) == ("held", "hub_not_recorded", True)
     assert len(insp["server"].received) == 1  # Replays never re-ask the supervisor.
 
 
