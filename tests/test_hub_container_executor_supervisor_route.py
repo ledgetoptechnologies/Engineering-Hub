@@ -897,7 +897,7 @@ def test_asyncio_cancellation_does_not_release_ownership_early(world):
 def test_fault_right_after_intent_commit_records_unknown_before_release(world, monkeypatch, fault):
     route = world["make"]()
     journal = route._journal
-    original_admit, original_mark = journal.admit, journal.mark_unknown
+    original_admit, original_mark = journal.admit, journal.abandon_attempt
     locked_while_marking = []
 
     def admit_then_fault(*args, **kwargs):
@@ -908,7 +908,7 @@ def test_fault_right_after_intent_commit_records_unknown_before_release(world, m
         locked_while_marking.append(route._mutex.locked())
         return original_mark(*args, **kwargs)
     monkeypatch.setattr(journal, "admit", admit_then_fault)
-    monkeypatch.setattr(journal, "mark_unknown", mark)
+    monkeypatch.setattr(journal, "abandon_attempt", mark)
     cmd = command(world["epoch"])
     with pytest.raises(SupervisorRouteRefused if fault is OSError else KeyboardInterrupt):
         route.submit(cmd)
@@ -1008,4 +1008,96 @@ def test_forked_child_close_refused_without_touching_mutex(world):
     route._mutex.release()
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     assert route.submit(command(world["epoch"])).state == "completed"  # Parent still usable.
+    route.close()
+
+
+def full_rows(path):
+    with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT * FROM supervisor_route_intent ORDER BY command_id").fetchall()
+
+
+def _admit_raises(monkeypatch, journal, fault=OSError):
+    original = journal.admit
+
+    def admit_then_fault(*args, **kwargs):
+        original(*args, **kwargs)
+        raise fault()
+    monkeypatch.setattr(journal, "admit", admit_then_fault)
+
+
+@LINUX
+@pytest.mark.parametrize("failure", ["admit_raises", "fsync_raises"])
+def test_failing_replay_never_mutates_pre_existing_intent(world, monkeypatch, failure):
+    route = world["make"]()
+    cmd = command(world["epoch"])
+    # Leave a genuine ambiguous 'intent' row: forward lost, unknown not recordable.
+    world["backend"].error = ConnectionResetError()
+    monkeypatch.setattr(route._journal, "mark_unknown", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    assert route.submit(cmd).state == "held"
+    monkeypatch.undo()
+    world["backend"].error = None
+    before = full_rows(world["path"])
+    assert [r[3] for r in before] == ["intent"] and before[0][8] is not None
+    if failure == "admit_raises":
+        _admit_raises(monkeypatch, route._journal)
+    else:
+        monkeypatch.setattr(route_module.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(SupervisorRouteRefused):
+        route.submit(cmd)
+    monkeypatch.undo()
+    assert full_rows(world["path"]) == before  # Byte-for-byte, same state.
+    replay = route.submit(cmd)
+    assert replay.state == "held" and full_rows(world["path"]) == before
+    assert len(world["backend"].calls) == 1
+    route.close()
+
+
+@LINUX
+def test_fresh_failed_admit_marks_only_its_own_row(world, monkeypatch):
+    route = world["make"]()
+    prior = command(world["epoch"])
+    world["backend"].error = ConnectionResetError()
+    monkeypatch.setattr(route._journal, "mark_unknown", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    assert route.submit(prior).state == "held"  # Prior row left in 'intent'.
+    monkeypatch.undo()
+    world["backend"].error = None
+    prior_row = full_rows(world["path"])[0]
+    fresh = command(world["epoch"])
+    _admit_raises(monkeypatch, route._journal)
+    with pytest.raises(SupervisorRouteRefused):
+        route.submit(fresh)
+    monkeypatch.undo()
+    rows = {row[0]: row for row in full_rows(world["path"])}
+    assert rows[prior.command_id] == prior_row
+    assert rows[fresh.command_id][3:6] == ("unknown", rows[fresh.command_id][4], "interrupted")
+    assert len(world["backend"].calls) == 1
+    route.close()
+
+
+@LINUX
+def test_recorded_and_mismatched_rows_untouched_by_failing_replay(world, monkeypatch):
+    route = world["make"]()
+    completed = command(world["epoch"])
+    assert route.submit(completed).state == "completed"
+    world["backend"].status, world["backend"].body = 401, b'{"error":{"code":"unauthorized"}}'
+    rejected = command(world["epoch"])
+    assert route.submit(rejected).state == "rejected"
+    world["backend"].status, world["backend"].body = 200, None
+    before = full_rows(world["path"])
+    _admit_raises(monkeypatch, route._journal)
+    for cmd in (completed, rejected):
+        with pytest.raises(SupervisorRouteRefused):
+            route.submit(cmd)
+    with pytest.raises(SupervisorRouteRejected):  # Mismatched binding: conflict, no handler.
+        route.submit(command(world["epoch"], command_id=completed.command_id, fence=8))
+    monkeypatch.undo()
+    assert full_rows(world["path"]) == before
+    assert len(world["backend"].calls) == 2
+    # The nonce is journal-internal: never in signed records or results.
+    for row, cmd in zip(sorted(before), sorted((completed, rejected), key=lambda c: c.command_id)):
+        attempt = row[8]
+        assert attempt and len(attempt) == 32
+        result = route.submit(cmd)
+        assert attempt not in result.record.decode() and attempt not in repr(result)
+        assert attempt not in json.dumps(json.loads(result.record))
     route.close()

@@ -120,6 +120,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import socket
 import sqlite3
@@ -154,7 +155,7 @@ _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z')
 _SIGNATURE = re.compile(r'[A-Za-z0-9_-]{86}\Z')
 _INTENT = ('CREATE TABLE supervisor_route_intent (command_id TEXT PRIMARY KEY, '
            'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, state TEXT NOT NULL, '
-           'owner_epoch TEXT NOT NULL, error TEXT, record TEXT, response BLOB)')
+           'owner_epoch TEXT NOT NULL, error TEXT, record TEXT, response BLOB, attempt TEXT)')
 _EPOCH = ('CREATE TABLE supervisor_route_epoch (id INTEGER PRIMARY KEY CHECK(id=1), '
           'launch_counter INTEGER NOT NULL, launch_id TEXT NOT NULL, boot_id TEXT NOT NULL)')
 _TABLES = {'hub_pilot_owner', 'hub_pilot_owner_epochs', 'supervisor_route_intent', 'supervisor_route_epoch'}
@@ -506,6 +507,10 @@ class RouteJournal:
     parent fsync after commit, 250ms busy bound per wait. Any failure raises
     RouteJournalError and the transaction is rolled back. No credential is
     ever passed to or stored by the journal.
+    Each inserted intent carries a per-attempt nonce; rows with a NULL nonce
+    are never mutated by the failed-admit handler. A journal created with an
+    earlier schema (no attempt column) fails the exact schema check and is
+    refused (fail closed); it is never migrated in place.
     """
 
     def __init__(self, database_path, *, create, allow_ephemeral_test_storage=False):
@@ -622,12 +627,15 @@ class RouteJournal:
                      and (row[3] in _RECORDED) == (row[6] is not None), RouteJournalError('row'))
         return row
 
-    def admit(self, command_id, digest, binding, epoch):
+    def admit(self, command_id, digest, binding, epoch, attempt):
         """ONE transaction: replay/conflict check, epoch high-water, intent row.
 
         Returns ('new', None) when the caller may forward exactly once, or
         ('replay', row) for an identical binding. Raises Rejected otherwise.
+        ``attempt`` is a fresh per-invocation nonce stored ONLY on a row this
+        call inserts; it is journal-internal and never in results or records.
         """
+        _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
         with self._transaction() as db:
             row = self._row(db, command_id)
             if row is not None:
@@ -643,9 +651,20 @@ class RouteJournal:
             if high is None or epoch.launch_counter > high[0]:
                 db.execute('INSERT OR REPLACE INTO supervisor_route_epoch VALUES (1,?,?,?)',
                            (epoch.launch_counter, epoch.launch_id, epoch.boot_id))
-            db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL)",
-                       (command_id, digest, _canonical(binding).decode(), self._owner.epoch))
+            db.execute("INSERT INTO supervisor_route_intent VALUES (?,?,?,'intent',?,NULL,NULL,NULL,?)",
+                       (command_id, digest, _canonical(binding).decode(), self._owner.epoch, attempt))
             return 'new', None
+
+    def abandon_attempt(self, command_id, digest, attempt):
+        """Atomic compare-and-set: intent -> unknown ONLY for the row THIS
+        attempt inserted. A pre-existing (replayed) intent, any recorded row,
+        or a row without an attempt nonce is never matched or mutated."""
+        _require(type(attempt) is str and re.fullmatch(r'[0-9a-f]{32}', attempt), RouteJournalError('attempt'))
+        with self._transaction() as db:
+            return db.execute("UPDATE supervisor_route_intent SET state='unknown', error='interrupted' "
+                              "WHERE command_id=? AND binding_digest=? AND state='intent' "
+                              "AND attempt IS NOT NULL AND attempt=?",
+                              (command_id, digest, attempt)).rowcount
 
     def record_outcome(self, command_id, digest, state, record, response):
         _require(state in _RECORDED, RouteJournalError('state'))
@@ -968,18 +987,20 @@ class SupervisorRoute:
                                           else 'epoch_mismatch')
         binding = binding_for(command, pin)
         digest = binding_digest(binding)
+        attempt = secrets.token_hex(16)
         try:
-            outcome, row = self._journal.admit(command.command_id, digest, binding, epoch)
+            outcome, row = self._journal.admit(command.command_id, digest, binding, epoch, attempt)
         except SupervisorRouteRejected:
             raise
         except BaseException as error:
             # The intent may have committed even though admit raised (e.g. a
             # parent fsync failure or an interrupt right after COMMIT). Nothing
-            # was forwarded; best effort turn our own committed intent into
-            # unknown before the mutex is released. If none exists this is a
-            # no-op; if it fails, a committed 'intent' row still reads held.
+            # was forwarded; best effort turn ONLY the intent THIS attempt
+            # inserted into unknown before the mutex is released (compare-and-
+            # set on the attempt nonce). A replayed pre-existing intent is never
+            # touched and stays held; if this fails, our 'intent' reads held.
             try:
-                self._journal.mark_unknown(command.command_id, digest, 'interrupted')
+                self._journal.abandon_attempt(command.command_id, digest, attempt)
             except BaseException:
                 pass
             if not isinstance(error, Exception):
