@@ -183,20 +183,21 @@ def make_host(rig, *, authenticator=RIG, external_anchor=RIG, terminal_verifier=
 
 
 class TaskRowAuthorization:
-    """Test-only transactional authorization reproducing ``_verifier``: the
-    durable task row plus an absent revocation row, read via the view.
-    ``deny`` simulates a flipped decision; ``action`` a hostile authorizer."""
+    """Test-only decision reproducing ``_verifier`` from the Hub-read snapshot:
+    the task entity plus an absent revocation row. ``deny`` simulates a
+    flipped decision; ``action`` runs arbitrary code with the snapshot."""
+    authorization_entity_ids = ('ci-authorization-revoked',)
+
     def __init__(self):
         self.deny = False
         self.action = None
         self.equivalent_target_verifier = None
 
-    def authorized_in_txn(self, view, actor, action_key, environment, target):
+    def decide(self, snapshot, actor, action_key, environment, target):
         if self.action is not None:
-            self.action(view)
-        task = json.loads(view.execute("SELECT data FROM hub_entities WHERE id=? AND kind='task'",
-                                       (target.task_id,))[0][0])
-        revoked = view.execute("SELECT 1 FROM hub_entities WHERE id='ci-authorization-revoked'")
+            self.action(snapshot)
+        task = json.loads(snapshot.task.data)
+        revoked = any(row.data is not None for row in snapshot.entities)
         return (not self.deny and not revoked and task['owner'] == actor and task['status'] == 'verified'
                 and task['candidate_commit'] == target.source_commit)
 
@@ -1121,47 +1122,70 @@ async def test_target_authorization_change_after_precheck_records_no_mark(rig, m
     assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and reservation(rig) == job['id']
 
 
-def _hostile(kind):
-    def act(view):
-        raw = view._connection
-        try:
-            if kind == 'commit':
-                view.execute('COMMIT')
-            elif kind == 'raw_commit':
-                raw.commit()
-            elif kind == 'rollback':
-                raw.execute('ROLLBACK')
-            elif kind == 'insert':
-                raw.execute("INSERT INTO hub_entities VALUES('hostile','policy','{}')")
-            elif kind == 'update':
-                raw.execute("UPDATE hub_work_policy SET revision=revision+1")
-            elif kind == 'delete':
-                raw.execute("DELETE FROM hub_entities WHERE id='pause'")
-            elif kind == 'attach':
-                raw.execute("ATTACH DATABASE ':memory:' AS other")
-            elif kind == 'unhook_write':
-                raw.set_authorizer(None)
-                raw.execute("INSERT INTO hub_entities VALUES('hostile','policy','{}')")
-        except Exception:
-            pass  # swallowing the denial must not help
-    return act
+def _leaves(value):
+    if isinstance(value, tuple):
+        for item in value:
+            yield from _leaves(item)
+    elif hasattr(value, '__dataclass_fields__'):
+        for name in value.__dataclass_fields__:
+            yield from _leaves(getattr(value, name))
+    else:
+        yield value
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['commit', 'raw_commit', 'rollback', 'insert', 'update', 'delete', 'attach',
-                                  'unhook_write'])
-async def test_hostile_authorizer_is_refused_and_txn_aborted_cleanly(rig, kind):
+async def test_decision_receives_only_immutable_values_and_no_connection(rig):
     job = submit(rig)
-    with rig.repo._connection() as db:
-        before = db.execute('SELECT revision FROM hub_work_policy WHERE id=1').fetchone()[0]
-    rig.authorization.action = _hostile(kind)
+    seen = []
+    def inspect_snapshot(snapshot):
+        seen.append(snapshot)
+        with pytest.raises(Exception):
+            snapshot.task.data = 'mutated'  # frozen
+    rig.authorization.action = inspect_snapshot
+    assert (await rig.bridge.run_once())['state'] == 'succeeded'
+    assert seen and all(type(leaf) in (str, int, float, type(None)) for leaf in _leaves(seen[0]))
+    assert not any(isinstance(leaf, sqlite3.Connection) for leaf in _leaves(seen[0]))
+    assert not hasattr(seen[0], '_connection') and releases(rig, job['id']) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['reach_connection', 'raises', 'non_true'])
+async def test_decision_failure_refuses_without_mark_or_signature(rig, kind):
+    job = submit(rig)
+    def act(snapshot):
+        if kind == 'reach_connection':
+            snapshot._connection.execute('COMMIT')  # no such attribute exists
+        raise RuntimeError('decision failed')
+    if kind == 'non_true':
+        rig.authorization.decide = lambda *args: 1  # truthy but not True
+    else:
+        rig.authorization.action = act
     await rig.bridge.run_once()
     with rig.repo._connection() as db:
         assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM hub_entities WHERE id='hostile'").fetchone()[0] == 0
-        assert db.execute('SELECT revision FROM hub_work_policy WHERE id=1').fetchone()[0] == before
-    assert not rig.channel.starts and not rig.runner.calls
-    assert rig.queue.get_job(job['id'])['state'] in ('held', 'claimed') and reservation(rig) == job['id']
+    assert not rig.channel.starts and not rig.runner.calls and reservation(rig) == job['id']
+
+
+def test_sqlite_authorizer_is_not_a_boundary_for_in_process_code(tmp_path):
+    """Why the old raw-connection view was replaced: in a disposable DB, code
+    holding the connection can drop the authorizer, write AND commit; a later
+    savepoint/total_changes check can refuse a signature but cannot undo it."""
+    db = sqlite3.connect(tmp_path / 'disposable.sqlite3', isolation_level=None)
+    db.execute('CREATE TABLE t (v TEXT)')
+    db.execute('BEGIN IMMEDIATE')
+    db.execute('SAVEPOINT guard')
+    db.set_authorizer(lambda *args: sqlite3.SQLITE_DENY if args[0] == sqlite3.SQLITE_INSERT else sqlite3.SQLITE_OK)
+    with pytest.raises(sqlite3.DatabaseError):
+        db.execute("INSERT INTO t VALUES('denied')")
+    db.set_authorizer(None)  # hostile unhook
+    db.execute("INSERT INTO t VALUES('escaped')")
+    db.execute('COMMIT')     # commits the outer transaction, savepoint gone
+    with pytest.raises(sqlite3.OperationalError):
+        db.execute('RELEASE guard')  # detection is possible...
+    other = sqlite3.connect(tmp_path / 'disposable.sqlite3')
+    assert other.execute('SELECT v FROM t').fetchall() == [('escaped',)]  # ...undo is not
+    other.close()
+    db.close()
 
 
 @pytest.mark.asyncio

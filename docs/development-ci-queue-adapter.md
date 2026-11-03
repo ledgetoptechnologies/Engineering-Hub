@@ -146,30 +146,33 @@ What is enforced in source:
   conflicting row without DELETE triggers) and upserts that collide with an
   in-flight job (by id, sequence or actor/request id) or its machine row.
 - The signing transaction reads only through its own connection. The queue's
-  own operator callbacks run only in the precheck. The ONE callback inside the
-  transaction is the target authorizer below, which is restricted, read-only
-  and time-bounded. Signing refuses if a shared execution policy is composed.
-- Target authorization at signing: the queue's configured target verifier is an
-  arbitrary callback and only runs in the precheck. Inside the signing
-  transaction an explicitly supplied `target_authorization.authorized_in_txn(view,
-  ...)` must decide as a PURE function of rows read through
-  `ReadOnlyAuthorizationView.execute(select, params)`: no blocking or external
-  I/O, no mutable process state. For the call an sqlite3 authorizer allows only
-  SELECT, functions and reads of `hub_entities`, `hub_work_jobs`,
-  `hub_work_machines` and `hub_work_policy`; transaction control, writes,
-  ATTACH and PRAGMA are denied. Any denial (even if swallowed), any change in
-  `total_changes`, a lost savepoint/transaction or a call longer than
-  `authorization_budget` (default 0.25 s, measured after the fact; a blocking
-  call cannot be pre-empted) aborts the whole transaction: no mark, no
-  signature. The object must declare `equivalent_target_verifier` as the exact
-  queue target verifier it reproduces; any other value refuses composition.
-  That equivalence is declared, not proven, and must be concretely reviewed
-  before enabling. The default (`RefusingTargetAuthorization`) declares none, so
-  composition refuses. The test-only implementation reads the task row and a
-  revocation row in `hub_entities`.
+  own operator callbacks run only in the precheck. The one call into supplied
+  code inside the transaction is the trusted, reviewed target decision below,
+  which receives only immutable values. Signing refuses if a shared execution
+  policy is composed.
   Pre-existing: `WorkQueue` invokes target/claim callbacks inside its own
   transactions; a callback that tries to write there waits for the
   connection's busy timeout and then fails closed.
+- Target authorization at signing: the queue's configured target verifier is an
+  arbitrary callback and only runs in the precheck. Inside the signing
+  transaction the Hub itself reads the documented authorization rows on its own
+  connection (the task entity, the `hub_entities` rows named by
+  `authorization_entity_ids`, and the job row) into an immutable
+  `AuthorizationSnapshot` of plain values, then calls
+  `target_authorization.decide(snapshot, ...)`. No connection, cursor or
+  callback is passed. The decision must be a pure function of the snapshot.
+  This API is a correctness aid against accidental writes and stale reads, NOT
+  a security boundary: same-process Python cannot be sandboxed (an SQLite
+  authorizer can be removed by code holding the connection, which can then
+  write and commit; a later check can refuse a signature but cannot undo it).
+  Any implementation must be code-reviewed, trusted and shipped with the Hub,
+  never loaded from configuration or supplied by agents. The 0.25 s
+  `authorization_budget` is checked after the call returns; it cannot interrupt
+  a hang. The object must declare `equivalent_target_verifier` as the exact
+  queue target verifier it reproduces; any other value refuses composition.
+  Equivalence is declared, not proven, and must be concretely reviewed before
+  enabling. The default (`RefusingTargetAuthorization`) declares none, so
+  composition refuses.
 - None of this fences a writer who can drop or bypass triggers (any direct
   SQLite access to the ledger or journal) or who can drive the Engine
   directly (Docker socket, systemd unit). Those are outside every guarantee
