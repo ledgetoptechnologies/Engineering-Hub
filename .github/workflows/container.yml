@@ -9,40 +9,15 @@ permissions:
 
 jobs:
   verify:
-    name: Test and build container
-    # Development branches and PRs are validated locally on staging.
+    name: Validate Compose and build container
+    # Development branches and PRs are validated locally on staging. The full
+    # Python suite runs once per main commit in hub-control.yml; running it here
+    # too only spent hosted minutes on an identical result.
     if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.17"
-          enable-cache: true
-
-      - name: Install locked dependencies
-        run: uv sync --locked --all-groups
-
-      - name: Run tests
-        run: uv run pytest -q
-        env:
-          EH_RESPONSIVENESS_ARTIFACT_DIR: ${{ runner.temp }}/eh-responsiveness
-      - name: Preserve responsiveness evidence on success and failure
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: companion-responsiveness-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/eh-responsiveness/*.json
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Validate Compose files
         run: |
