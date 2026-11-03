@@ -585,16 +585,25 @@ async def test_failed_background_still_closes_private_client(env):
     assert closed == [True]
 
 
+@pytest.mark.parametrize('worker_blocked', [False, True], ids=['completes', 'timeout-holds'])
 @pytest.mark.asyncio
-async def test_actual_client_contract_through_registered_worker_core(env, tmp_path):
+async def test_actual_client_contract_through_registered_worker_core(env, tmp_path, worker_blocked):
     import httpx
+    import threading
     from engineering_hub.staging_client import StagingClient, StagingConnectionConfig
     from hub_staging_service.core import Service
     profile = {'image_id': 'sha256:' + 'a' * 64, 'build_argv': ['builder'], 'test_argv': ['tests'],
                'timeout_seconds': 30, 'memory_mb': 128, 'cpus': 1, 'pids': 32,
                'output_bytes': 1048576, 'log_bytes': 65536}
+    release_worker = threading.Event()
+    entered_worker = threading.Event()
+    backend_calls = []
     class Backend:
         def run(self, paths, profile, command_id):
+            backend_calls.append(command_id)
+            entered_worker.set()
+            if worker_blocked and not release_worker.wait(5):
+                raise RuntimeError('test worker release timed out')
             for kind in ('build', 'preview'):
                 (paths[kind] / 'index.html').write_bytes(b'<html>real-contract</html>')
             return {'preview_ready': True, 'stages': {stage: {'exit_code': 0, 'log_bytes': 0} for stage in ('build', 'test')}}
@@ -605,6 +614,8 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
             import json
             body = json.loads(request.content)
             result = service.put_source(body) if path[-1] == 'sources' else service.submit(body)
+            if worker_blocked and path[-1] == 'jobs':
+                assert entered_worker.wait(2), 'worker did not enter backend before polling'
             return httpx.Response(202 if path[-1] == 'jobs' else 200, json=result)
         if path[2] == 'jobs':
             return httpx.Response(200, json=service.status(path[3]))
@@ -619,11 +630,27 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
                            projects={'engineering-hub': {'recipes': ['static']}}), test_transport=httpx.MockTransport(transport))
     controller = env[0]
     controller.client = client
+    # The shared fixture's 100ms window tests fast fakes; the actual worker
+    # has a thread and filesystem work that may be delayed under a CPU limit.
+    controller.max_poll_seconds = 0.1 if worker_blocked else 5
     try:
         submitted = await controller.submit('codex', payload())
         finished = await controller.run_once()
-        assert finished['job']['state'] == 'succeeded'
-        assert await controller.preview_file(submitted['resource_ids']['preview'], 'index.html') == (b'<html>real-contract</html>', 'text/html')
+        receipt = service.status(submitted['job']['id'])
+        expected = 'held' if worker_blocked else 'succeeded'
+        assert finished['job']['state'] == expected, {'controller': finished, 'worker_receipt': receipt}
+        if worker_blocked:
+            assert entered_worker.is_set()
+            assert receipt['state'] == 'running', receipt
+            release_worker.set()
+            service.wait()
+            assert service.status(submitted['job']['id'])['state'] == 'succeeded'
+            assert len(backend_calls) == 1
+        else:
+            assert await controller.preview_file(submitted['resource_ids']['preview'], 'index.html') == (b'<html>real-contract</html>', 'text/html')
     finally:
-        await client.aclose()
-        service.close()
+        release_worker.set()
+        try:
+            await client.aclose()
+        finally:
+            service.close()
