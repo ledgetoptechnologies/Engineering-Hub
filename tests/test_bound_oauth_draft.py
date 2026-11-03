@@ -60,3 +60,47 @@ async def test_real_frontdoor_capability_rejects_direct_and_wrong_subject(monkey
         assert (await browser.get('/identity')).status_code == 401
         assert (await browser.get('/identity', headers={'CF-Access-Jwt-Assertion':'wrong'})).status_code == 403
         assert (await browser.get('/identity', headers={'CF-Access-Jwt-Assertion':'right'})).status_code == 200
+
+@pytest.mark.asyncio
+async def test_bound_oauth_router_signed_access_identity(monkeypatch, tmp_path):
+    import json, time
+    from urllib.parse import parse_qs, urlsplit
+    import httpx, jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from fastapi import FastAPI
+    from agent_message_bus.auth import AuthSettings
+    from engineering_hub.auth import AuthConfig, SessionStore, build_auth_router
+    from engineering_hub.cloudflare_access import CloudflareAccessVerifier
+    from engineering_hub.ingress import HubIngressMiddleware
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+    jwk.update(kid='fixture', alg='RS256', use='sig')
+    config = AuthConfig('https://hub.example', github_client_id='id', github_client_secret='secret',
+        beau_github_id=123, human_auth_mode='github_cloudflare', cloudflare_issuer='https://fixture.cloudflareaccess.com',
+        cloudflare_audience='aud', cloudflare_allowed_emails=('owner@example.com',), bound_access_subject='subject')
+    checker = CloudflareAccessVerifier(config.cloudflare_config, transport=httpx.MockTransport(lambda _: httpx.Response(200, json={'keys':[jwk]})))
+    monkeypatch.setattr('engineering_hub.ingress.CloudflareAccessVerifier', lambda _: checker)
+    class Provider:
+        async def exchange(self, code, verifier):
+            assert code == 'code' and verifier
+            return 123
+    core = FastAPI()
+    core.include_router(build_auth_router(config, SessionStore(tmp_path/'hub.db'), Provider()))
+    wrapped = HubIngressMiddleware(core, mode='browser', agent_auth=AuthSettings('h','c',claude_token='cl'), cloudflare_config=config.cloudflare_config)
+    def token(subject):
+        now = int(time.time())
+        return jwt.encode({'iss':config.cloudflare_issuer,'aud':[config.cloudflare_audience], 'sub':subject,
+            'email':'owner@example.com','type':'app','iat':now-1,'exp':now+120}, key, algorithm='RS256', headers={'kid':'fixture'})
+    right, other = token('subject'), token('other')
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=core), base_url=config.origin) as direct:
+        assert (await direct.get('/api/hub/v1/auth/login', headers={'CF-Access-Jwt-Assertion':right})).status_code == 401
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=wrapped), base_url=config.origin, follow_redirects=False) as c:
+        login = await c.get('/api/hub/v1/auth/login', headers={'CF-Access-Jwt-Assertion':right})
+        assert login.status_code == 302
+        state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+        path = '/api/hub/v1/auth/callback'
+        assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':other})).status_code == 401
+        assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 303
+        assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':right})).json()['authenticated'] is True
+        assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':other})).json()['authenticated'] is False
+        assert (await c.get(path, params={'state':state, 'code':'code'}, headers={'CF-Access-Jwt-Assertion':right})).status_code == 400

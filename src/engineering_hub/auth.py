@@ -36,6 +36,7 @@ class AuthConfig:
     cloudflare_audience: str = ""
     cloudflare_allowed_emails: tuple[str, ...] = ()
     alternate_origins: tuple[str, ...] = ()
+    bound_access_subject: str = ""
 
     def __post_init__(self):
         url = urlsplit(self.base_url)
@@ -46,11 +47,17 @@ class AuthConfig:
             raise ValueError("Hub base URL requires HTTPS except on loopback")
         if self.beau_github_id is not None and (type(self.beau_github_id) is not int or self.beau_github_id <= 0):
             raise ValueError("Allowlisted GitHub identity must be a positive numeric ID")
-        if self.human_auth_mode not in {"github", "cloudflare_access"}:
+        if self.human_auth_mode not in {"github", "cloudflare_access", "github_cloudflare"}:
             raise ValueError("Unknown human authentication mode")
         if self.human_auth_mode == "cloudflare_access" and not self.secure:
             raise ValueError("Cloudflare Access requires HTTPS")
         _ = self.cloudflare_config  # Validate complete configuration before serving.
+        if self.human_auth_mode == 'github_cloudflare':
+            if (not self.secure or self.cloudflare_config is None or not self.github_client_id
+                    or not self.github_client_secret or self.beau_github_id is None
+                    or type(self.bound_access_subject) is not str or not self.bound_access_subject
+                    or len(self.bound_access_subject) > 2048):
+                raise ValueError('Complete bound human authentication enrollment required')
         if type(self.alternate_origins) is not tuple or len(self.alternate_origins) > 4:
             raise ValueError("At most four explicit alternate HTTPS origins are allowed")
         for alternate in self.alternate_origins:
@@ -281,9 +288,28 @@ class SessionStore:
                     db.execute("DELETE FROM auth_access_sessions WHERE token_hash = ?", (_hash(token),))
 
 
+def _bound_access(request, config):
+    from .bound_oauth_draft import require_enrolled_access
+    if request.headers.get('authorization'):
+        raise PermissionError('human access required')
+    return require_enrolled_access(request, config.cloudflare_config, config.bound_access_subject)
+
+
+def _bound_store(store):
+    from .bound_oauth_draft import BoundOAuthDraftStore
+    return BoundOAuthDraftStore(store)
+
+
 def human_session(request: Request, config: AuthConfig, store: SessionStore):
     if request.headers.get("authorization"):
         return None  # Agent/service bearers never become human sessions.
+    if config.human_auth_mode == 'github_cloudflare':
+        try:
+            identity = _bound_access(request, config)
+            return _bound_store(store).session_for(request.cookies.get(config.cookie_name),
+                config.cloudflare_issuer, config.cloudflare_audience, identity.subject, config.beau_github_id)
+        except (ValueError, PermissionError):
+            return None
     if config.human_auth_mode == "cloudflare_access":
         return store.cloudflare_session_for(request.cookies.get(config.cookie_name), config,
                                             getattr(request.state, "cloudflare_identity", None))
@@ -369,7 +395,16 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
             return response
         if not config.github_client_id or not config.github_client_secret or config.beau_github_id is None:
             raise HTTPException(503, "Human sign-in is not configured")
-        pending = auth_store.create_state()
+        if config.human_auth_mode == 'github_cloudflare':
+            try:
+                identity = _bound_access(request, config)
+            except (ValueError, PermissionError):
+                raise HTTPException(401, 'Human sign-in required') from None
+            state, challenge = _bound_store(auth_store).create_state(config.cloudflare_issuer,
+                config.cloudflare_audience, identity.subject, config.beau_github_id)
+            pending = {'state': state, 'challenge': challenge}
+        else:
+            pending = auth_store.create_state()
         response = RedirectResponse("https://github.com/login/oauth/authorize?" + urlencode({
             "client_id": config.github_client_id, "redirect_uri": config.origin + "/api/hub/v1/auth/callback",
             "state": pending["state"], "code_challenge": pending["challenge"], "code_challenge_method": "S256",
@@ -380,13 +415,21 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
 
     @router.get("/callback")
     async def callback(request: Request):
-        if config.human_auth_mode != "github":
+        if config.human_auth_mode not in {"github", "github_cloudflare"}:
             raise HTTPException(404, "Not found")
         state = request.query_params.get("state", "")
         browser_state = request.cookies.get(state_cookie, "")
         if not state or not browser_state or not secrets.compare_digest(state.encode(), browser_state.encode()):
             raise HTTPException(400, "Sign-in verification failed")
-        verifier = auth_store.consume_state(state)
+        if config.human_auth_mode == 'github_cloudflare':
+            try:
+                identity = _bound_access(request, config)
+            except (ValueError, PermissionError):
+                raise HTTPException(401, 'Human sign-in required') from None
+            verifier = _bound_store(auth_store).consume_state(state, config.cloudflare_issuer,
+                config.cloudflare_audience, identity.subject, config.beau_github_id)
+        else:
+            verifier = auth_store.consume_state(state)
         code = request.query_params.get("code", "")
         if not verifier or not code or request.query_params.get("error"):
             raise HTTPException(400, "Sign-in verification failed")
@@ -398,8 +441,15 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
             raise HTTPException(502, "Identity provider request failed") from None
         if type(github_id) is not int or github_id != config.beau_github_id:
             raise HTTPException(403, "Human identity is not authorized")
-        auth_store.delete_session(request.cookies.get(config.cookie_name))
-        session = auth_store.create_session(github_id)
+        if config.human_auth_mode == 'github_cloudflare':
+            bound = _bound_store(auth_store)
+            bound.delete_session(request.cookies.get(config.cookie_name))
+            token, csrf = bound.create_session(config.cloudflare_issuer, config.cloudflare_audience,
+                identity.subject, config.beau_github_id, github_id)
+            session = {'cookie_token': token, 'csrf_token': csrf}
+        else:
+            auth_store.delete_session(request.cookies.get(config.cookie_name))
+            session = auth_store.create_session(github_id)
         response = RedirectResponse("/", status_code=303)
         response.set_cookie(config.cookie_name, session["cookie_token"], max_age=auth_store.session_ttl, **cookie_options)
         response.delete_cookie(state_cookie, **cookie_options)
@@ -444,7 +494,9 @@ def build_auth_router(settings, auth_store: SessionStore, github_client=None):
     @router.post("/logout")
     async def logout(request: Request):
         require_human(request, config, auth_store, mutation=True)
-        if config.human_auth_mode == "cloudflare_access":
+        if config.human_auth_mode == 'github_cloudflare':
+            _bound_store(auth_store).delete_session(request.cookies.get(config.cookie_name))
+        elif config.human_auth_mode == "cloudflare_access":
             auth_store.delete_cloudflare_session(request.cookies.get(config.cookie_name))
         else:
             auth_store.delete_session(request.cookies.get(config.cookie_name))
