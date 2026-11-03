@@ -159,6 +159,13 @@ resolver runs in session-then-Hub order:
   no-op, and crashes between steps are retried.
 - **Ambiguous evidence:** missing, unverifiable or mismatched evidence leaves
   the gate open and the revocation pending.
+- **What resolution means:** a signed "launched" observation proves only that
+  the dispatch was accepted, not that the work it started has terminated.
+  Resolution settles the dispatch outcome; stopping running work is the
+  executor effect fence's job. Until the Hub has an authoritative,
+  reservation-wide terminal-evidence record, an owner-bound Hub transaction
+  API and an enrolled supervisor statement key, the resolver stays disabled
+  and every deferred revocation simply stays pending.
 - **No automatic deletion, re-dispatch or release on ambiguity.**
 
 A subject whose pending row has completed is revoked like any other; a later
