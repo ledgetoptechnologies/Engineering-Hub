@@ -40,7 +40,11 @@ creates a credential or changes billing. Each of those needs Beau.
    (production work keeps precedence), asks GitHub for a single-use
    just-in-time runner configuration, and starts one ephemeral runner inside
    the existing capped CI engine. The runner takes exactly one job and exits;
-   the Hub records the outcome on the task. This is what "dynamic" means here:
+   the Hub records the outcome on the task. Standing policy keeps GitHub
+   Actions jobs main-only, so these runners take only the existing main
+   workflows; pre-merge checks of feature and task commits stay with the
+   local runner and Hub queue in option 2 unless Beau approves an exception.
+   This is what "dynamic" means here:
    nothing runs or listens between jobs, and the same workflow YAML runs on a
    hosted runner by changing one label.
    - Needs Beau: a GitHub App (or fine-grained token) limited to this
@@ -68,7 +72,8 @@ creates a credential or changes billing. Each of those needs Beau.
 3. Codex finishes the `QueuedDevelopmentCI` host provider, which both option
    1 and option 2 need: admission, lease renewal and terminal verification on
    the staging CI engine.
-4. Beau decides between options 1 and 2 through a Hub decision, including the
+4. Beau decides whether to add option 1 (main workflows only) on top of option 2
+   (pre-merge checks) through a Hub decision, including the
    credential and host approvals above.
 5. Move `hub-control.yml` verify to the chosen path. Keep publication on
    hosted runners until a trusted build record binds source commit to image
