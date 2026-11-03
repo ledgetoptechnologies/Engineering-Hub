@@ -80,6 +80,9 @@ describe("strict parsing", () => {
     ["unknown decision field", (v: Record<string, any>) => { v.decisions[0].approve_url = "https://example.test"; }],
     ["decision from an unknown role", (v: Record<string, any>) => { v.decisions[0].asked_by_role = "finance"; }],
     ["uppercase role", (v: Record<string, any>) => { v.dispatches[0].role = "UI"; }],
+    ["prefix-style creator string", (v: Record<string, any>) => { v.dispatches[0].task.created_by = "human:1"; }],
+    ["unknown creator kind", (v: Record<string, any>) => { v.dispatches[0].task.created_by.kind = "installation"; }],
+    ["extra creator field", (v: Record<string, any>) => { v.projects[0].created_by.admin = true; }],
   ])("refuses a detail with %s", (_name, change) => {
     const value = detail();
     change(value);
@@ -113,9 +116,10 @@ describe("ETA wording", () => {
 
 describe("flags", () => {
   it("treats only human actors as human-created", () => {
-    expect(isAgentCreated("human:1")).toBe(false);
-    expect(isAgentCreated("orchestrator")).toBe(true);
-    expect(isAgentCreated("codex")).toBe(true);
+    expect(isAgentCreated({ kind: "human", id: "beau" })).toBe(false);
+    expect(isAgentCreated({ kind: "agent", id: "orchestrator" })).toBe(true);
+    // Identity comes from the server-recorded kind, never from a display-id prefix.
+    expect(isAgentCreated({ kind: "human", id: "agent:lookalike" })).toBe(false);
   });
   it("marks stale by state or by the progress flag", () => {
     const detail = parseRequestDetail(clone(billing), billing.request.request_id);
@@ -130,7 +134,7 @@ describe("provisional reads", () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(json(fixture.list)).mockResolvedValueOnce(json(viewer));
     await listOrchestrationRequests(signal(), fetchImpl);
     await readOrchestrationRequest(viewerId, signal(), fetchImpl);
-    expect(fetchImpl.mock.calls.map(call => call[0])).toEqual(["/api/orchestration/requests", `/api/orchestration/requests/${viewerId}`]);
+    expect(fetchImpl.mock.calls.map(call => call[0])).toEqual(["/api/hub/v1/orchestration/requests", `/api/hub/v1/orchestration/requests/${viewerId}`]);
     expect(fetchImpl.mock.calls[0][1]).toMatchObject({ method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store" });
   });
   it("refuses a malformed id without a request and maps a missing route to unsupported", async () => {
