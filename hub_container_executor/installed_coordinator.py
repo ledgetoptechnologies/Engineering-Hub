@@ -213,10 +213,24 @@ def target_allowed(config, actor, action_key, environment, target):
         and target.artifact_digest == config.manifest.candidate.image_config_id)
 
 
-async def run_installed_coordinator(config, *, session_profile_path=None,
+
+
+async def run_installed_coordinator(*args, _drain_handoff=None, **kwargs):
+    from engineering_hub.unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    owned = _drain_handoff is None
+    handoff = acquire_reservation() if owned else _drain_handoff
+    if not owned:
+        validate_reservation(handoff)
+    try:
+        return await _reserved_run_installed_coordinator(*args, _drain_handoff=handoff, **kwargs)
+    finally:
+        if owned:
+            release_reservation(handoff)
+
+async def _reserved_run_installed_coordinator(config, *, session_profile_path=None,
                                      session_enrollment_path=None,
                                      reconciliation_factory=None,
-                                     session_acceptance_factory=None):
+                                     session_acceptance_factory=None, _drain_handoff=None):
     composition = None
     session_credential = None
     session_actors = None
@@ -306,7 +320,7 @@ async def run_installed_coordinator(config, *, session_profile_path=None,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port)
+            agent_host='127.0.0.1', agent_port=config.port, _drain_handoff=_drain_handoff)
     except Exception:
         raise InstalledCoordinatorError() from None
     finally:

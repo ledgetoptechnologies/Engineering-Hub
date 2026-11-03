@@ -225,12 +225,56 @@ class TopicPreflight(Input):
     guidance: DeliveryGuidance
 
 
-def create_app(settings: Settings | None = None, *, repository=None, github_client=None,
+def create_app(*args, **kwargs):
+    """Reserve generic shared-staging compositions before construction."""
+    from .unproved_drain import acquire_reservation, validate_reservation, release_reservation
+    if kwargs.get('shared_staging') is None:
+        return _reserved_create_app(*args, **kwargs)
+    handoff = kwargs.get('drain_handoff')
+    owned = handoff is None
+    handoff = acquire_reservation() if owned else handoff
+    if not owned:
+        validate_reservation(handoff)
+    kwargs['drain_handoff'] = handoff
+    try:
+        app = _reserved_create_app(*args, **kwargs)
+    except BaseException:
+        if owned:
+            release_reservation(handoff)
+        raise
+    if owned:
+        import threading
+        original = app.router.lifespan_context
+        entry_lock, entered = threading.Lock(), False
+        @asynccontextmanager
+        async def reserved_lifespan(application):
+            nonlocal entered
+            with entry_lock:
+                if entered:
+                    from .unproved_drain import UnprovedDrainError
+                    raise UnprovedDrainError()
+                entered = True
+            try:
+                async with original(application):
+                    yield
+            finally:
+                release_reservation(handoff)
+        app.router.lifespan_context = reserved_lifespan
+    return app
+
+
+def _reserved_create_app(settings: Settings | None = None, *, repository=None, github_client=None,
                fixture_workflow=None, reachability_provider=None, event_feed=None,
                staging_dispatcher=None, container_pilot_workflow=None, registry_bridge=None,
                owned_pilot_service=None, work_queue=None, archive_reader=None,
-               queued_pilot_runtime=None, bus_app=None, shared_staging=None, access_verifier=None):
+               queued_pilot_runtime=None, bus_app=None, shared_staging=None, access_verifier=None,
+               drain_handoff=None):
     settings = settings or Settings.from_env()
+    from .unproved_drain import OwnedDrainHandoff
+    if drain_handoff is not None and type(drain_handoff) is not OwnedDrainHandoff:
+        raise ValueError('owned_drain_handoff_required')
+    if shared_staging is not None and drain_handoff is None:
+        drain_handoff = OwnedDrainHandoff()
     if access_verifier is not None:
         from .cloudflare_access import CloudflareAccessVerifier
         if (type(access_verifier) is not CloudflareAccessVerifier
@@ -576,12 +620,22 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
             cleanup_started = True
             from .lifecycle import finish_owned
             async def stop_all():
-                try:
-                    if shared_staging is not None:
+                shared_error = None
+                if shared_staging is not None:
+                    try:
                         await shared_staging.close()
-                    elif staging_module.controller is not None:
+                    except BaseException as error:
+                        shared_error = error
+                    if shared_staging.is_drained is not True:
+                        # Stay inside the MCP/bus lifespan. No transport, feed,
+                        # owner or observer may be closed under uncertain work.
+                        await drain_handoff.retain_unproved(app, shared_staging, bus_app, feed,
+                            queued_pilot_runtime, staging_module, staging_observer,
+                            interactive_service, runtime, session_bridge, infrastructure)
+                try:
+                    if shared_staging is None and staging_module.controller is not None:
                         await staging_module.controller.close()
-                    elif staging_module.client is not None:
+                    elif shared_staging is None and staging_module.client is not None:
                         await staging_module.client.aclose()
                 finally:
                     try:
@@ -598,6 +652,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                                     session_bridge.close()
                                 clear_metrics_transport()
                                 infrastructure.close()
+                if shared_error is not None:
+                    raise shared_error
             await finish_owned(stop_all())
 
         async def stop_existing_components():
@@ -645,7 +701,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                         await staging_module.controller.start()
                     yield
                 finally:
-                    if bus_app is not None:
+                    if bus_app is not None or shared_staging is not None:
                         # Retain bus identity/publisher/native source while accepted
                         # Hub work drains; never close its transport underneath it.
                         await stop_components()
@@ -671,6 +727,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.staging_runtime = runtime
     app.state.queued_pilot_runtime = queued_pilot_runtime
     app.state.shared_staging = shared_staging
+    app.state.drain_handoff = drain_handoff
     if queued_pilot_runtime is not None:
         # One-use application ownership, not transfer of its owner/client.
         queued_pilot_runtime._application = app
