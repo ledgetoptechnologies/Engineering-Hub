@@ -142,11 +142,16 @@ async def test_full_hub_frontdoors_bound_signin_and_csrf(tmp_path):
             state = parse_qs(urlsplit(login.headers['location']).query)['state'][0]
             assert (await c.get('/api/hub/v1/auth/callback', params={'state':state,'code':'ok'}, headers=headers)).status_code == 303
             me = (await c.get('/api/hub/v1/auth/me', headers=headers)).json()
-            assert me['authenticated'] and me['actor'].startswith('human:cf:') and me['github_id'] == 123
+            import hashlib
+            expected_actor = 'human:cf:' + hashlib.sha256((config.cloudflare_issuer + '\0' + config.cloudflare_audience + '\0subject').encode()).hexdigest()
+            assert me['authenticated'] and me['actor'] == expected_actor and me['github_id'] == 123
             assert (await c.post('/api/hub/v1/auth/logout', headers=headers)).status_code == 403
             assert (await c.get('/api/hub/v1/auth/me', headers={'CF-Access-Jwt-Assertion':bad})).json()['authenticated'] is False
             assert (await c.post('/api/hub/v1/auth/logout', headers={**headers,'Origin':config.origin,'X-Hub-CSRF':me['csrf_token']})).status_code == 200
             assert not (await c.get('/api/hub/v1/auth/me', headers=headers)).json()['authenticated']
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=pair.agents), base_url=config.origin) as agent:
+            assert (await agent.get('/api/hub/v1/auth/me', headers={'Authorization':'Bearer c'})).status_code == 403
+            assert (await agent.get('/api/hub/v1/tasks', headers={'Authorization':'Bearer c'})).status_code == 200
 
 
 def test_deployment_v3_explicit_and_incomplete_denied(tmp_path, monkeypatch):
