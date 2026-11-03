@@ -637,8 +637,12 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
                'timeout_seconds': 30, 'memory_mb': 128, 'cpus': 1, 'pids': 32,
                'output_bytes': 1048576, 'log_bytes': 65536}
     release_worker = threading.Event()
+    entered_worker = threading.Event()
+    backend_calls = []
     class Backend:
         def run(self, paths, profile, command_id):
+            backend_calls.append(command_id)
+            entered_worker.set()
             if worker_blocked and not release_worker.wait(5):
                 raise RuntimeError('test worker release timed out')
             for kind in ('build', 'preview'):
@@ -651,6 +655,8 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
             import json
             body = json.loads(request.content)
             result = service.put_source(body) if path[-1] == 'sources' else service.submit(body)
+            if worker_blocked and path[-1] == 'jobs':
+                assert entered_worker.wait(2), 'worker did not enter backend before polling'
             return httpx.Response(202 if path[-1] == 'jobs' else 200, json=result)
         if path[2] == 'jobs':
             return httpx.Response(200, json=service.status(path[3]))
@@ -674,12 +680,21 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
         receipt = service.status(submitted['job']['id'])
         expected = 'held' if worker_blocked else 'succeeded'
         assert finished['job']['state'] == expected, {'controller': finished, 'worker_receipt': receipt}
-        if not worker_blocked:
+        if worker_blocked:
+            assert entered_worker.is_set()
+            assert receipt['state'] == 'running', receipt
+            release_worker.set()
+            service.wait()
+            assert service.status(submitted['job']['id'])['state'] == 'succeeded'
+            assert len(backend_calls) == 1
+        else:
             assert await controller.preview_file(submitted['resource_ids']['preview'], 'index.html') == (b'<html>real-contract</html>', 'text/html')
     finally:
         release_worker.set()
-        await client.aclose()
-        service.close()
+        try:
+            await client.aclose()
+        finally:
+            service.close()
 
 @pytest.mark.asyncio
 async def test_cancel_during_submit_resource_registration_never_abandons_deposit(env):
