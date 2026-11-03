@@ -2274,21 +2274,32 @@ class InspectionLedger(_DurableStore):
                 raise RouteJournalError('inspection ledger unavailable') from None
 
     def record_observation(self, request, status, route_state, key_id, answer):
-        """held -> observed_<status> for the EXACT binding; an identical
-        repeat is a no-op, anything else raises and changes nothing."""
+        """held -> observed_<status> for the EXACT binding.
+
+        Returns True only if THESE exact request and answer bytes are what is
+        persisted: either this call's UPDATE (rowcount 1, then read back
+        inside the same transaction) or an earlier write of byte-identical
+        request and answer. Returns False if another observation of the same
+        status, route_state and key (e.g. a concurrent inspection with another
+        nonce) is persisted instead; the caller must then use THAT persisted
+        observation, never these unpersisted bytes. A different status,
+        route_state or key raises (``observation_conflict``); nothing changes.
+        """
         _require(status in _TERMINAL and route_state in _TERMINAL[status] and type(answer) is bytes,
                  RouteJournalError('state'))
         state, command_id = _OBSERVED[status], request['binding']['command_id']
+        ours = (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'))
         with self._transaction() as db:
             row = self._select(db, command_id)
             _require(row is not None and row[1:5] == self._key(request), RouteJournalError('binding'))
             if row[6] != 'held':
-                _require(row[6:9] == (state, route_state, key_id), RouteJournalError('observation_conflict'))
-                return
-            db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, answer=?, '
-                       "request=? WHERE command_id=? AND state='held'",
-                       (state, route_state, key_id, answer.decode('ascii'), _canonical(request).decode('ascii'),
-                        command_id))
+                _require(row[6:9] == ours[:3], RouteJournalError('observation_conflict'))
+                return row[6:11] == ours  # Duplicate ONLY on exact byte match.
+            changed = db.execute('UPDATE supervisor_route_inspection SET state=?, route_state=?, key_id=?, '
+                                 "answer=?, request=? WHERE command_id=? AND state='held'",
+                                 (*ours, command_id)).rowcount
+            _require(changed == 1 and self._select(db, command_id)[6:11] == ours, RouteJournalError('readback'))
+            return True
 
 
 @dataclass(frozen=True)
@@ -2414,6 +2425,12 @@ class InspectionResolver:
     the raw signed bytes itself and not trust this module's hint fields.
     Atomicity is only as strong as that Hub transaction.
 
+    Only PERSISTED bytes are ever offered: if a concurrent inspection of the
+    same attempt persisted its (byte-different, e.g. other nonce) observation
+    first, this call re-reads and re-verifies THAT row and offers it as
+    historical; its own unpersisted answer is dropped. Any write or readback
+    mismatch -> ``held``.
+
     A recorded observation is replayed as HISTORICAL (signed answered_at_ms),
     re-verified against the CURRENT pinned key and binding (key rotation,
     another pin or binding, tampered or missing bytes -> ``held``), and again
@@ -2521,11 +2538,24 @@ class InspectionResolver:
             return held('unverified')
         observation = self._observation(request, payload, answer.raw, False, _canonical(request))
         try:
-            self._ledger.record_observation(request, answer.status, answer.route_state, payload['key_id'],
-                                            answer.raw)
+            persisted = self._ledger.record_observation(request, answer.status, answer.route_state,
+                                                        payload['key_id'], answer.raw)
         except Exception:
             return held('observation_unrecorded', answer.status, observation)
-        return self._apply(row, observation)
+        if persisted is True:
+            return self._apply(row, observation)
+        # Another inspection's observation was persisted first: only THAT
+        # persisted, re-read and re-verified observation may be offered.
+        try:
+            stored = self._ledger.read(command_id)
+        except Exception:
+            return held('observation_unrecorded', answer.status)
+        if stored is None or stored[:6] != row[:6] or stored[6] == 'held':
+            return held('observation_unrecorded', answer.status)
+        replayed = self._replay(stored, request)
+        if replayed is None:
+            return held('replay_unverified', answer.status)
+        return self._apply(stored, self._observation(request, replayed[0], replayed[1], True, replayed[2]))
 
     def close(self):
         self._ledger.close()

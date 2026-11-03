@@ -1238,3 +1238,74 @@ def test_hub_refuses_observation_whose_hints_disagree_with_signed_bytes(world, i
     assert store.applied == {} and store.hub_calls  # The Hub was asked and refused.
     monkeypatch.undo()
     assert resolver.inspect(cmd, world["pin"], counter).state == "applied"  # Untampered hints: accepted.
+
+
+# --- Concurrent inspections: only persisted bytes reach the Hub ---------------
+
+@LINUX
+def test_concurrent_inspections_offer_only_the_persisted_observation(world, insp, monkeypatch):
+    store = insp["store"]
+    resolver, cmd, counter = held_attempt(world, insp)
+    in_flight = threading.Barrier(2, timeout=10)
+
+    def both_in_flight(body, responder):
+        raw = genuine(body, responder)
+        in_flight.wait()  # Both signed answers exist before either is returned.
+        return [(0, _http(200, raw))]
+    insp["server"].script = both_in_flight
+    received, a_recorded = {}, threading.Event()
+    client_inspect, record = resolver._client.inspect, resolver._ledger.record_observation
+
+    def capture(request):
+        answer = client_inspect(request)
+        received[threading.current_thread().name] = answer.raw
+        return answer
+
+    def ordered(*args, **kwargs):
+        if threading.current_thread().name == "B":
+            assert a_recorded.wait(10)  # Deterministic: A commits first.
+            return record(*args, **kwargs)
+        try:
+            return record(*args, **kwargs)
+        finally:
+            a_recorded.set()
+    monkeypatch.setattr(resolver._client, "inspect", capture)
+    monkeypatch.setattr(resolver._ledger, "record_observation", ordered)
+    results = {}
+    threads = [threading.Thread(name=name, target=lambda n=name: results.update(
+        {n: resolver.inspect(cmd, world["pin"], counter)})) for name in ("A", "B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(15)
+    assert received["A"] != received["B"]  # Distinct nonces: two different valid signed answers.
+    with sqlite3.connect(Path(insp["ledger"]).as_uri() + "?mode=ro", uri=True) as db:
+        persisted = db.execute("SELECT answer, request FROM supervisor_route_inspection WHERE command_id=?",
+                               (cmd.command_id,)).fetchone()
+    assert persisted[0].encode() == received["A"]  # A's bytes are what the ledger holds.
+    offered = [observation.answer for _, observation in store.hub_calls]
+    assert offered and all(answer == received["A"] for answer in offered)  # Never B's unpersisted bytes.
+    assert all(observation.request == persisted[1].encode() for _, observation in store.hub_calls)
+    assert results["A"].applied and not results["A"].observation.historical
+    # B re-read and re-verified A's persisted row and offered THAT (idempotent Hub accepts it).
+    assert results["B"].applied and results["B"].observation.historical
+    assert results["B"].observation.answer == received["A"] and len(store.hub_calls) == 2
+
+
+@LINUX
+def test_readback_mismatch_after_write_rolls_back_and_stays_held(world, insp, monkeypatch):
+    resolver, cmd, counter = held_attempt(world, insp)
+    ledger, select, calls = resolver._ledger, resolver._ledger._select, []
+
+    def lying_select(db, command_id):
+        row = select(db, command_id)
+        calls.append(row)
+        if row is not None and row[6] != "held":  # Only the read-back of the just-written row.
+            return (*row[:9], row[9] + " ", row[10])
+        return row
+    monkeypatch.setattr(ledger, "_select", lying_select)
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "observation_unrecorded")
+    monkeypatch.undo()
+    assert ledger_state(insp, cmd.command_id) == ("held", None)  # Rolled back: nothing persisted.
+    assert insp["store"].hub_calls == [] and len(calls) == 3  # Read, check, read-back; nothing offered.
