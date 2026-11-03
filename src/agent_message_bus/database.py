@@ -78,6 +78,14 @@ def _validate_client_request_id(client_request_id: str) -> None:
         raise MessageError("invalid client request id")
 
 
+def _body_json(body: Any) -> str:
+    """Stored bodies must parse as strict JSON for every reader; NaN and Infinity are refused."""
+    try:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        raise MessageError("message body is not valid JSON data") from None
+
+
 def _send_fingerprint(*, recipient: str, message_type: str, body: Any, priority: str,
                       correlation_id: str | None, in_reply_to: str | None,
                       requires_user_approval: bool) -> str:
@@ -339,7 +347,7 @@ class MessageRepository:
                     (id,sender,recipient,message_type,priority,body_json,correlation_id,in_reply_to,hop_count,
                      requires_user_approval,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (message_id, sender, recipient, message_type, priority,
-                    json.dumps(body, separators=(",", ":"), ensure_ascii=False), correlation_id, in_reply_to,
+                    _body_json(body), correlation_id, in_reply_to,
                     hop_count, int(requires_user_approval), created))
                 conn.execute(
                     "INSERT INTO message_delivery_sequence (message_id) VALUES (?)", (message_id,)
@@ -487,6 +495,10 @@ class MessageRepository:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
             if row is None: conn.rollback(); raise NotFound("message not found")
+            if (row["recipient"] == agent and row["claimed_by"] == agent and row["status"] == status
+                    and (status == "acknowledged" or row["rejection_reason"] == reason)):
+                # A retry of a finish that already committed (e.g. lost response or restart) returns the result.
+                conn.rollback(); return self._from_row(row)
             if row["recipient"] != agent or row["status"] != "claimed" or row["claimed_by"] != agent:
                 conn.rollback(); raise InvalidTransition("message is not claimed by this agent")
             if status == "acknowledged":
