@@ -114,6 +114,32 @@ def test_admission_directory_sync_failure_can_follow_visible_gate(tmp_path, monk
     assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
 
 
+def test_failed_retention_releases_passed_tmpdir_during_run_and_keeps_call_failure(tmp_path):
+    suite = tmp_path / 'synthetic_suite.py'
+    suite.write_text('''
+def test_pass(tmp_path):
+    (tmp_path / "payload").write_bytes(b"x" * 1024)
+    (tmp_path.parent / "passed-path").write_text(str(tmp_path))
+
+def test_next_sees_passed_directory_removed(tmp_path):
+    from pathlib import Path
+    assert not Path((tmp_path.parent / "passed-path").read_text()).exists()
+
+def test_call_failure(tmp_path):
+    (tmp_path / "failure-evidence").write_text("inspect me")
+    assert False
+''')
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    base = tmp_path / 'child-basetemp'
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', str(suite),
+                             '--basetemp', str(base), '-o', 'tmp_path_retention_policy=failed'],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=30)
+    assert result.returncode == 1, result.stdout
+    evidence = [p for p in base.glob('test_call_failure*/failure-evidence') if not p.parent.is_symlink()]
+    assert len(evidence) == 1, result.stdout
+
+
 @pytest.mark.parametrize('value', [1, 300, 900])
 def test_ci_wait_accepts_only_positive_bounded_seconds(value):
     assert runner.validate_timeout(value) == value
@@ -266,6 +292,8 @@ def test_image_owned_cached_profiles_are_fixed_and_preserve_npm_links(cached_pro
     bootstrap.run_profile(profile, intent)
     assert len(commands) == count
     assert all(options['check'] is True for _, options in commands)
+    if profile in {'python', 'all'}:
+        assert 'tmp_path_retention_policy=failed' in commands[0][0]
     if profile in {'ui', 'all'}:
         assert commands[-2][0] == ['npm', 'test']
         assert commands[-1][0] == ['npm', 'run', 'build']
