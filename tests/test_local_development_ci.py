@@ -27,6 +27,75 @@ bootstrap = module('local_ci_container')
 IMAGE = 'sha256:' + 'a' * 64
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX mode and umask semantics')
+def test_input_directory_ignores_restrictive_umask_but_parent_stays_private(tmp_path):
+    parent = tmp_path / 'private'
+    parent.mkdir(mode=0o700)
+    previous = os.umask(0o077)
+    try:
+        runner.prepare_input_directory(parent / 'input')
+    finally:
+        os.umask(previous)
+    assert (parent.stat().st_mode & 0o777) == 0o700
+    assert ((parent / 'input').stat().st_mode & 0o777) == 0o755
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX atomic link and mode semantics')
+def test_admission_is_complete_and_read_only_before_name_is_visible(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_link = os.link
+    observed = []
+    def inspect_before_publish(src, dst, **kwargs):
+        assert not (inputs / 'admit.json').exists()
+        candidate = inputs / src
+        observed.append(((candidate.stat().st_mode & 0o777), json.loads(candidate.read_text())))
+        return original_link(src, dst, **kwargs)
+    monkeypatch.setattr(runner.os, 'link', inspect_before_publish)
+    previous = os.umask(0o077)
+    try:
+        runner.publish_admission(inputs, 'a' * 32)
+    finally:
+        os.umask(previous)
+    assert observed == [(0o444, {'intent': 'a' * 32})]
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'a' * 32}
+    monkeypatch.setattr(runner.os, 'link', original_link)
+    with pytest.raises(FileExistsError):
+        runner.publish_admission(inputs, 'b' * 32)
+    assert json.loads((inputs / 'admit.json').read_text()) == {'intent': 'a' * 32}
+    assert sorted(p.name for p in inputs.iterdir()) == ['admit.json']
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory descriptor semantics')
+def test_admission_cleanup_closes_directory_and_preserves_primary_error(tmp_path, monkeypatch):
+    inputs = tmp_path / 'input'
+    runner.prepare_input_directory(inputs)
+    original_open = os.open
+    opened_directories = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == inputs:
+            opened_directories.append(fd)
+        return fd
+
+    def fail_link(*args, **kwargs):
+        raise RuntimeError('primary publication failure')
+
+    def fail_unlink(*args, **kwargs):
+        raise PermissionError('cleanup failure')
+
+    monkeypatch.setattr(runner.os, 'open', track_open)
+    monkeypatch.setattr(runner.os, 'link', fail_link)
+    monkeypatch.setattr(runner.os, 'unlink', fail_unlink)
+    with pytest.raises(RuntimeError, match='primary publication failure'):
+        runner.publish_admission(inputs, 'a' * 32)
+    assert len(opened_directories) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_directories[0])
+    assert not (inputs / 'admit.json').exists()
+
+
 @pytest.mark.parametrize('value', [1, 300, 900])
 def test_ci_wait_accepts_only_positive_bounded_seconds(value):
     assert runner.validate_timeout(value) == value
