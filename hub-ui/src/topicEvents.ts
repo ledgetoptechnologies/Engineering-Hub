@@ -1,4 +1,3 @@
-import { topicPath } from "./api";
 import type { TopicSnapshot } from "./types";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -91,7 +90,7 @@ export function watchTopicRegistry(options: {
     let next: EventSource;
     try {
       next = (options.source ?? ((url) => new EventSource(url, { withCredentials: true })))(
-        `/api/hub/v1${topicPath(options.topic)}/events${query}`,
+        `/api/hub/v1/topics/${encodeURIComponent(options.topic)}/events${query}`,
       );
     } catch (error) { fail(error); return; }
     stream = next;
@@ -129,10 +128,7 @@ export function watchTopicRegistry(options: {
     }
     next.onerror = () => { if (current()) fail(); };
   }
-  // Use the backend topic contract; topicPath rejects anything outside it.
-  let validTopic = true;
-  try { topicPath(options.topic); } catch { validTopic = false; }
-  if (!uuid.test(epoch) || !validTopic) fail();
+  if (!uuid.test(epoch) || !/^[a-z0-9][a-z0-9_-]{0,127}$/.test(options.topic)) fail();
   else connect();
   return () => { alive = false; close(); };
 }
