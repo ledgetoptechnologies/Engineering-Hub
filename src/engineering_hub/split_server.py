@@ -166,7 +166,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
             pair = pair_factory()
             if (type(pair) is not HubFrontends or pair.state != 'new'
                     or pair.settings.ingress_mode != 'combined'
-                    or pair.settings.auth_config.human_auth_mode != 'cloudflare_access'
+                    or pair.settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                     or pair.settings.auth_config.cloudflare_config is None):
                 raise SplitServerError()
             if (getattr(pair.core.state, 'staging_runtime', None) is not None

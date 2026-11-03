@@ -58,6 +58,7 @@ class BoundOAuthDraftStore:
             raise ValueError('identity not enrolled')
         token, csrf = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
         with self.store._db() as db:
+            db.execute('DELETE FROM auth_bound_oauth_sessions WHERE expires<=?', (self.store.clock(),))
             db.execute('INSERT INTO auth_bound_oauth_sessions VALUES (?,?,?,?,?)', (_digest(token), binding, verified_github_id, csrf, self.store.clock() + self.store.session_ttl))
         return token, csrf
 

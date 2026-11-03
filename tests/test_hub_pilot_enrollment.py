@@ -447,3 +447,14 @@ e.apply_plan(plan, e.plan_digest(plan), writers_stopped=True, backup_verified=Tr
         owner.assert_active(path)
         repo = HubRepository(path, pilot_owner=owner)
         assert len(repo.list_tasks()) == len(repo.list_decisions()) == 1
+
+
+def test_bound_oauth_tables_are_exact_atomic_group_for_offline_scan(ledger):
+    from engineering_hub.bound_oauth_draft import BoundOAuthDraftStore
+    path, repo, store, _ = ledger
+    BoundOAuthDraftStore(store)
+    snapshot(path)
+    with repo._transaction() as db:
+        db.execute('DROP TABLE auth_bound_oauth_sessions')
+    with pytest.raises(enrollment.EnrollmentError):
+        snapshot(path)

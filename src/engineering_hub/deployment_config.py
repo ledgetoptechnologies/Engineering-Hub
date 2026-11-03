@@ -79,7 +79,9 @@ def load_deployment_config(path: str | Path) -> DeploymentConfig:
     Configuration cannot contain credentials, executable flags or arbitrary paths.
     The configuration's parent retains settings and bus state. Version two
     explicitly selects the fixed, separately mounted existing private ledger;
-    neither version creates or migrates that ledger.
+    neither version creates or migrates that ledger. Version three is an
+    explicitly shared-root bound-auth configuration; it rejects a storage key.
+    Protected-ledger bound auth is not supported by this schema.
     """
     try:
         if not isinstance(path, (str, Path)):

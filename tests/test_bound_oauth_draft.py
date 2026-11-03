@@ -170,6 +170,12 @@ def test_deployment_v3_explicit_and_incomplete_denied(tmp_path, monkeypatch):
     config = load_deployment_config(path)
     assert config.auth_config.human_auth_mode == 'github_cloudflare'
     assert config.auth_config.beau_github_id == 123
+    assert config.protected_ledger is False  # v3 is explicitly shared-root only
+    document['storage'] = {'layout':'protected-ledger-v1'}
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError):
+        load_deployment_config(path)
+    del document['storage']
     document['human_auth']['unexpected'] = 'reject'
     path.write_text(json.dumps(document))
     with pytest.raises(ValueError):
