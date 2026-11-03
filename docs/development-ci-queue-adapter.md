@@ -186,6 +186,11 @@ What is enforced in source:
   protection: nonce expiry uses the host's monotonic clock, but comparing the
   Hub's lease expiry with host wall-clock time still ASSUMES the two clocks
   differ by no more than `max_clock_skew`; nothing here measures or enforces it.
+  On the Hub, the queue clock is re-sampled after the target decision returns,
+  and the mark and signature are recorded only if the same claim's lease is
+  still finite and at least `lease_margin` (default 1 s) in the future. These
+  lease checks assume the queue clock never moves backwards; a wall-clock
+  rollback is not detected.
 - Hub: `receipt_committed` binds the authenticated host inspection to the
   original claim/attempt. The authenticated host ack is recorded with its
   credential (`host_acked`) and re-verified before release; a ledger trigger

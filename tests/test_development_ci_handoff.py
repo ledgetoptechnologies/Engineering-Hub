@@ -1227,3 +1227,22 @@ async def test_slow_authorizer_over_budget_is_refused(rig):
     with rig.repo._connection() as db:
         assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
     assert not rig.channel.starts and not rig.runner.calls and reservation(rig) == job['id']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('advance_to', [1600, 1599.5])  # expired, or inside the 1 s margin
+async def test_lease_expiring_during_decide_records_no_mark_and_strands_nothing(rig, advance_to):
+    job = submit(rig)
+    rig.authorization.action = lambda snapshot: rig.clock.__setitem__(0, advance_to)
+    result = await rig.bridge.run_once()
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_development_ci_effects').fetchone()[0] == 0
+    assert not rig.channel.starts and not rig.runner.calls and host_rows(rig) == []
+    assert result['state'] in ('claimed', 'held') and reservation(rig) == job['id']
+    # Normal expiry/recovery proceeds: no in-flight mark blocks it.
+    rig.authorization.action = None
+    rig.clock[0] = 1601
+    operator = WorkQueue(rig.repo, dict(ACTIONS), reconciliation_verifier=lambda *args: True,
+                         target_verifier=_verifier(rig.repo), clock=lambda: rig.clock[0])
+    assert operator.reconcile(job_id=job['id'], evidence_id='operator', outcome='cancelled')['state'] == 'cancelled'
+    assert reservation(rig) is None

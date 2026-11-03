@@ -1032,7 +1032,7 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
     _handoff_mode = True
 
     def __init__(self, queue, owner, manifest, channel, *, action_key, host_generation,
-                 authenticator=None, target_authorization=None, authorization_budget=0.25,
+                 authenticator=None, target_authorization=None, authorization_budget=0.25, lease_margin=1.0,
                  enable_durable_handoff=False, renew_interval=120,
                  monotonic=time.monotonic):
         if enable_durable_handoff is not True:
@@ -1061,6 +1061,10 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                 or not 0 < authorization_budget <= 2):
             raise HubError('development_ci_handoff_composition_required', 409)
         self.authorization_budget = authorization_budget
+        if (type(lease_margin) not in (int, float) or not math.isfinite(lease_margin)
+                or not 0 <= lease_margin <= 60):
+            raise HubError('development_ci_handoff_composition_required', 409)
+        self.lease_margin = lease_margin
         self.channel, self.host_generation = channel, host_generation
         super().__init__(queue, owner, manifest, _UnusedProvider(), action_key=action_key,
                          renew_interval=renew_interval, monotonic=monotonic)
@@ -1165,6 +1169,17 @@ class DurableDevelopmentCIHandoff(QueuedDevelopmentCI):
                     or db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0]
                     or self.repo._paused(db)
                     or not self._binding_in_txn(db, attempt, job)):
+                raise HubError('development_ci_handoff_claim_not_current', 409)
+            # decide() may take up to the authorization budget: re-sample the
+            # queue clock AFTER it and recheck the same claim and a live lease
+            # with margin, so no mark/signature is recorded for an expired lease.
+            fresh = self.queue._now()  # finite-checked by WorkQueue
+            job = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (attempt.job_id,)).fetchone()
+            lease = None if job is None else job['lease_until']
+            if (job is None or job['state'] != 'claimed' or job['worker'] != self.worker.encoded()
+                    or job['fence'] != attempt.fence or type(fresh) not in (int, float)
+                    or not math.isfinite(fresh) or type(lease) not in (int, float) or not math.isfinite(lease)
+                    or lease - fresh < self.lease_margin):
                 raise HubError('development_ci_handoff_claim_not_current', 409)
             db.execute("INSERT INTO hub_development_ci_effects VALUES(?,?,?,?,'in_flight')",
                        (challenge['nonce'], attempt.job_id, attempt.attempt_id, attempt.fence))
