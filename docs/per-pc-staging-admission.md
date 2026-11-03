@@ -167,3 +167,80 @@ Open:
 2. For option B, the values of T and the accepted skew S.
 
 **Not verified:** the live session database's journal mode (the source sets none); how `app.py` would wire the queue and controller for installations; whether a remote staging cancel API exists; and whether a stored row with a forged legacy `review.family` exists today. No code was run.
+
+## 8. Online admission interface (option A)
+
+Paths are relative to Codex's `agent-bootstrap-download` worktree, uncommitted changes included. The executor package is the top-level `hub_container_executor/`.
+
+### 8.1 Existing protocols
+
+| Item | Today |
+|---|---|
+| Direction | **The Hub always initiates.** `ContainerPilotClient` uses POST/GET `/v1/container-pilot/commands[/{id}[/reconcile]]` and POST `/current-observation` (`asgi.py:22-23, 58-133`). `StagingClient` uses `/v1/jobs`, `/v1/operations`, … (`staging_client.py:309-358`). Neither the executor nor the staging service contains a Hub client; the only outbound HTTP is to Docker (`daemon_backend.py:21`). **No executor→Hub channel exists.** |
+| Hub→executor authentication | A single static bearer, compared with `hmac.compare_digest` (`asgi.py:65-68`; staging `__main__.py:80-84`, plus a socket-peer allowlist). Transport: an HTTPS CA pinned by the caller, or a private UDS (`container_pilot_client.py:143-206`). |
+| Executor identity proof | Fresh observations signed with Ed25519 by the root launch supervisor, bound to a Hub nonce, the enrolled `issuer_id`/`public_key`, release and launch pins, and `CLOCK_SKEW_MS=5000` (`current_executor_observation.py:26-48, 107-133, 243-312`; `launch_transport.py:171-237`). Commit 3d558fd ("bounded executor readiness before receipt handshake") only bounds cold start. The Hub consumes one observation per command in `prepare_admission`/`admission_scope` (`startup_reconciliation.py:305-390`, `queued_pilot.py:671-680`, `container_pilot.py:323-372`). |
+| Command IDs | Pilot: `uuid5(run_id, 'container_pilot_v1:'+action)` (`container_pilot.py:279-284`). Executor operation: `uuid5(command_id, kind)` (`ledger.py:430`). Staging: `uuid4`, persisted at submission (`staging_controller.py:413`). |
+| Hub persistence | `hub_container_pilot_commands` row `state='unknown'` before the POST (`container_pilot.py:298-306, 343-346`). The response is stored afterwards. An existing row is never re-POSTed. Staging persists `phase='dispatching'` before the POST: "Never retry POST" (`staging_controller.py:631-632`). |
+| Executor persistence | `ledger.admit` writes `commands`/`runs`/`targets`/`phases` and checks the fence generation (`ledger.py:309-384`). Per effect, `begin_operation` inserts an `operations` row `'intent'` with UNIQUE(command_id, kind) and checks pause and fence (`:413-440`). Then comes the callback, then `complete_operation` with a MAC receipt (`adapter.py:405-435`, `ledger.py:448`). On restart, `running` commands become `held` (`ledger.py:296-308`). Staging: `operations` `'accepted'`, then a thread, then `'running'` (`core.py:784-795, 831-836`). |
+| Release evidence | `protocol_verified` and `journal_verified` are read-only echo and state checks (`pilot_release_evidence.py:65-77`, uncommitted). |
+
+### 8.2 Minimal interface
+
+**Granularity.** Admission happens per executor operation, not per command: one `deploy_container` performs state_copy, create and start (`adapter.py:220-232, 457-486`). Admitting per operation bounds the exposure to one operation. The staging service admits once, before `_execute_operation` (`core.py:831`).
+
+**Endpoint.** `POST /v1/executor/admissions` on a new private Hub listener that writes the Hub database (WAL, `repository.py:64`).
+- Request: `{intent_ref:{run_id,action}|{job_id}, command_id, operation_id, kind, request_digest, observation}`.
+  - `request_digest` is sha256 of the canonical first four fields.
+  - `observation` is a launch-supervisor observation whose `nonce == request_digest`.
+- Response: `{decision: admitted|refused, reason, admission_id, decided_at_ms, max_effect_age_ms, replayed}`.
+
+**Authentication (gap named).**
+- **Executor to Hub.** Reuse the enrolled Ed25519 issuer key: the signed observation binds this exact request to the pinned live launch. The current verifier generates its own nonce (`:254`), so it needs a variant that accepts a supplied nonce. Its other checks are unchanged. Add a **new, distinct** admission bearer, so a stolen Hub→executor token cannot admit.
+- **Hub to executor.** The executor needs a pinned-CA TLS client to the Hub, modelled on `for_verified_https`. None exists.
+- The Hub has no signing key, so decisions are authenticated only by TLS.
+
+**Hub transaction.** One `BEGIN IMMEDIATE`, in this order:
+1. If a row already exists in `hub_execution_admissions(operation_id PK, command_id, intent_ref, request_digest, decision, reason, observation_id UNIQUE, decided_at_ms)`: with an equal digest, return it with `replayed=true`; with a different digest, refuse with `identity_conflict`.
+2. Check that `command_id` equals the uuid5 rederived from the stored intent, and that `operation_id = uuid5(command_id, kind)`. Check that the intent is `unknown`, the job is claimed and the `hub_work_machines` fence matches, and nothing is paused.
+3. Refuse if any `hub_principal_fences` row exists for the principal. Refuse if the pinned expiry is earlier than Hub now. Refuse if `authority_epoch` has changed.
+4. Insert the decision. **Refusals are sticky.**
+
+States:
+- Hub: intent `unknown` → admission `admitted` (consumed) or `refused`.
+- Executor `operations.status`: `admit_requested` → `admitted` | `refused` | `admission_expired` → `completed` | `terminal_failed`.
+
+**Executor state machine** inside `_effect`, after `begin_operation`:
+1. Persist `admit_requested`.
+2. Call the Hub. The anchor `t0` is the monotonic time of the first send.
+3. Persist the decision.
+4. Immediately before the callback, require `monotonic() - t0 ≤ A`, with A = 10 s and no later than the observation expiry. Otherwise persist `admission_expired` and hold.
+5. Run the effect.
+6. Write the receipt.
+
+**Retries and timeouts.** A retry resends the identical request; the Hub returns the stored answer and never consumes a second time. Each call has a 2 s deadline, all attempts must fit within A, and there is no retry after A. If the Hub is unreachable, the executor holds with `admission_unavailable` and fails closed.
+
+### 8.3 Scenarios and acceptance tests (`tests/test_executor_online_admission.py`)
+
+| Scenario | Outcome | Test and assertion |
+|---|---|---|
+| a. Stall after `admitted`, then a fence | If the stall comes before the age check, more than A means no effect. If it comes after the check (inside the syscall or effect), it cannot be stopped. **Exposure ≤ A + operation timeout** (`create_ms`/`start_ms`/`total_command_ms`). | `test_admitted_stall_beyond_max_age_refuses_effect`: backend call count 0, op `admission_expired`, command `held`. `test_fence_after_admit_is_audited`: effect runs, evidence `revoked_after_admission`. |
+| b. Revocation before admit | Refused. No effect. | `test_fence_before_admit_refuses`: decision `refused`, callback never invoked, run held. |
+| c. Revocation after admit | Already-admitted operation proceeds. The next operation is refused. | `test_fence_between_operations_stops_next_op`: create runs, start is refused, the container start count is 0. |
+| d1. Crash before admit | `admit_requested` proves no effect. Held. | `test_crash_admit_requested_is_no_effect`: reconcile reports no effect and never calls admit. |
+| d2. Crash after `admitted`, before effect | Indistinguishable from mid-effect, so `inspect_required`. Never re-admitted. | `test_crash_after_admitted_holds_without_readmit`: a restart issues 0 admit calls and inspects by operation_id only. |
+| d3. Crash after effect, before receipt | The existing `inspect_operation` path. | `test_crash_after_effect_reconciles_by_operation_id`. |
+| e. Hub crash mid-admit | Rolled back: no row, and the retry is re-evaluated. Crash after commit: same as f. | `test_hub_crash_before_commit_reevaluates_with_new_fence`: a retry after a fence is refused. |
+| f. Response lost | The retry gets the identical stored decision. If the age already exceeds A, there is no effect. | `test_lost_response_retry_same_decision_single_consumption`: one row, `replayed=true`. `test_late_replay_beyond_age_refuses`. `test_digest_mismatch_identity_conflict`. |
+| g. Recovery and inspection | GET, `/reconcile` (`adapter.py:526-600`), `inspect` (`container_pilot.py:468`), `recover` (`queued_pilot.py:682`) and staging terminal evidence never call admit. | `test_recovery_paths_work_with_admission_down_and_fenced`: the admit mock raises if called, and every path returns its evidence. |
+
+Also: `test_observation_nonce_must_equal_request_digest`, `test_replayed_observation_id_rejected`, `test_hub_bearer_cannot_call_admission`.
+
+### 8.4 Not verified
+
+- Whether the staging host can reach the Hub, and which Hub process would host the listener.
+- Whether the installed supervisor serves observations for arbitrary nonces.
+- Executor clock synchronisation.
+- `hub_work_principals` and `hub_principal_fences` are only proposals.
+- Staging effect steps after `core.py:849`.
+- Uncommitted files not named above.
+- No code was run.
