@@ -50,15 +50,30 @@ Add `InstallationAuthority.verify(principal_row, *, checkpoint)` as a pure funct
 - The Hub database sets WAL (`repository.py:64`). `agent_sessions.py` sets no journal mode (`_transaction`, `:141-152`), so the session database uses SQLite's default rollback journal unless something else changes it. Check the live file before implementation.
 - They are separate files. Reading one and writing the other gives no atomicity, and lock ordering alone does not make a revoke and an effect atomic. A host effect (an HTTP request to the worker) is outside every database transaction anyway.
 
-**Revocation fence (Hub-database tombstone).** Make revocation take effect inside the Hub database, the one the worker already writes effect intents to:
-1. When the owner revokes an installation, session or execution grant, or narrows a grant, the bridge writes the session-database change and then, in the same bridge critical section, a Hub-database row `hub_principal_fences(installation_id, session_id NULL, grant_id NULL, authority_epoch, revoked_at, reason)`. The owner API reports success only after both commits.
-2. Startup reconciliation in the Hub process copies any session-database revocation missing a fence row before the queue admits work. This covers a crash between the two commits.
-3. Every effect checkpoint checks fences inside the same Hub `BEGIN IMMEDIATE` transaction that records the effect intent (pilot command intent, CI attempt intent, staging submission). Fence row present or epoch mismatch: no intent and no effect.
-4. **Bounded race, stated plainly:** an intent that committed before the fence row may still be sent once, because sending happens after the commit. At most one such effect per job. It is recorded as `admitted_before_revocation`, never retried, and no later intent is admitted. Everything else is refused.
+**Revocation fence: fence first, then revoke.** Revocation must fail closed across processes, including when the bridge dies part-way. Writing the session database first and the Hub fence second leaves a window in which a separately running worker can still dispatch, and startup reconciliation does not close it. So the order is reversed:
 
-The worker also reads the session database directly (`InstallationAuthority.verify`) as defence in depth, but the fence is the authority for ordering.
+1. **One revoke path.** `revoke_with_fence(kind, id, expected_revision, reason)` in the Hub process is the only way to revoke an installation, session or execution grant, or to narrow a grant. Today there are three routes: `agent_sessions_api.py:200` (installation) and `:208` (session), which call the session repository directly, and the bridge's `grant_revoke` (`session_hub_bridge.py:212`, route `:465`). All three are rerouted through `revoke_with_fence`. The session repository's `revoke_installation` (`agent_sessions.py:328`) and `revoke_session` (`:379`) take a required `fence_id` and refuse without one, so a new route cannot bypass the fence by accident.
+2. **Fence first.** In one Hub `BEGIN IMMEDIATE` transaction, insert `hub_principal_fences(id, installation_id, session_id NULL, grant_id NULL, authority_epoch, state='pending', reason, created_at)`. Commit.
+3. **Then revoke.** Revoke in the session database, passing `fence_id`. Then mark the fence `state='complete'`.
+4. **Owner result.** The API reports success only when the fence is `complete`. A `pending` fence is shown to the owner as "revocation not finished: retry". Retrying is idempotent: it reuses the pending fence and finishes the session-database step.
+5. **Workers honour any fence row, pending or complete.** A fence that exists blocks execution whether or not the session-database step happened.
 
-**Grant edits.** Each execution grant carries an `authority_epoch` that increments only on a narrowing edit: revoke, an earlier expiry, or removing a project, environment or capability. A harmless edit (a label, a later expiry, an added unrelated project) changes `revision` but not `authority_epoch`. Jobs pin the epoch at submit. Admission requires the exact current revision; later checkpoints require the same epoch. A narrowing edit writes a fence row like a revoke.
+**Interleavings and crashes:**
+
+| Case | Result |
+|---|---|
+| Bridge or Hub dies before the fence commits | Nothing revoked, nothing fenced. The owner sees failure and retries. Workers continue under the old authority, which is correct. |
+| Dies after the fence commits, before the session revoke | Execution is blocked at once. The installation keeps MCP tool access until retry or the periodic reconciler completes the revoke: over-revocation of execution, never under. |
+| Dies after the session revoke, before `complete` | Execution blocked by the fence, tools blocked by the session revoke. The reconciler marks it complete. |
+| Fence committed before a worker's intent transaction | The intent transaction sees the fence and refuses. No intent, no effect. |
+| Intent committed, then fence, then dispatch | Dispatch re-reads the fence immediately before sending and refuses. The intent is recorded as `never_sent`. |
+| Intent committed, dispatch re-check passed, then fence, then send | **The residual window.** The one already-checked send proceeds. |
+| Worker process with no bridge running at all | Unaffected: it reads fences from the Hub database it already writes. |
+| Natural expiry, with no revoke write | Jobs pin the installation and grant `expires_at` in their principal row. Every checkpoint compares the Hub clock to the pinned expiry inside its transaction. An earlier-expiry edit is a narrowing edit and goes through `revoke_with_fence`. |
+
+**The residual window is not yet bounded.** It lies between the dispatch re-check and the request reaching the executor. It is at most one send per job only if the executor refuses a second command for the same intent, and nothing in this design proves that today. A search of `hub_container_executor` found no command-id deduplication. Until the executor enforces single use of a command ID, or an authority lease (see open questions), no numeric bound is claimed. The required executor test is `test_executor_refuses_second_command_for_same_intent_id`.
+
+**Grant edits.** Each execution grant carries an `authority_epoch` that increments only on a narrowing edit: revoke, an earlier expiry, or removing a project, environment or capability. A harmless edit (a label, a later expiry, an added unrelated project) changes `revision` but not `authority_epoch`. Jobs pin the epoch at submit. Admission requires the exact current revision; later checkpoints require the same epoch. A narrowing edit goes through `revoke_with_fence` like a revoke.
 
 ## 3. Checkpoints and revocation
 
@@ -111,9 +126,14 @@ Apply the same rule to the candidate. A legacy owner's `candidate_family` must e
 - `test_installation_review_family_checked_against_installation_record`: a tampered `review.family` or a missing provenance row is rejected.
 - `test_legacy_agents_flow_unchanged`: the existing end-to-end results are identical.
 - `test_execution_grant_cannot_name_production`: 422.
-- `test_fence_before_intent_sends_nothing`: fence committed, then a checkpoint; no intent row and no client call.
-- `test_intent_before_fence_sends_once_and_records_admitted_before_revocation`: commit an intent, write the fence, let dispatch run; exactly one client call, the outcome tagged `admitted_before_revocation`, and the next step refused.
-- `test_crash_between_session_revoke_and_fence_is_reconciled_before_admission`: session database revoked, no fence row, restart; startup writes the fence before `claim()` can return the job.
+- `test_fence_before_intent_sends_nothing`: the fence is committed, then a checkpoint runs; no intent row and no client call.
+- `test_fence_between_intent_and_dispatch_recheck_records_never_sent`: no client call, intent marked `never_sent`.
+- `test_pending_fence_blocks_execution_before_session_revoke`: crash injected after the fence commits; worker refuses; session tools still work; retry completes the revoke.
+- `test_crash_after_session_revoke_before_complete_is_reconciled`: the fence stays `pending`, execution is blocked, and the reconciler marks it `complete`.
+- `test_every_revoke_route_goes_through_revoke_with_fence`: enumerate app routes and owner API methods that revoke or narrow; each one writes a fence first. A direct `revoke_session` call without `fence_id` raises.
+- `test_worker_honours_fence_with_bridge_process_dead`: the worker runs with no bridge object and refuses on a fence row.
+- `test_pinned_expiry_stops_new_effects_without_any_write`.
+- `test_executor_refuses_second_command_for_same_intent_id`: an executor-side test. The residual-window bound is claimed only once this passes.
 - `test_harmless_grant_edit_keeps_job_narrowing_edit_stops_new_effects`: an added unrelated project leaves the epoch unchanged and the job continues; removing the project bumps the epoch, writes a fence and refuses the next effect.
 - `test_session_revoke_stops_only_that_sessions_jobs`.
 - `test_revoked_completion_records_truthful_outcome_without_advancing_task`: terminal success after revocation is recorded, the task status is unchanged, and no follow-on work is admitted.
@@ -123,9 +143,10 @@ Apply the same rule to the candidate. A legacy owner's `candidate_family` must e
 
 Decided: revoking a session stops new effects for that session's jobs and keeps reconciliation and evidence. Execution grants are explicit and narrow. Admission pins the exact revision, and harmless edits are distinguished from narrowing ones (`authority_epoch`). Cross-database atomicity is not claimed; the Hub-database fence plus a stated one-effect bound replaces it. Terminal outcomes are recorded truthfully without granting revoked authority.
 
+Decided (second round): use a dedicated execution grant, one fail-closed revoke path that writes the fence first, a dispatch-side re-check, and recovery kept available.
+
 Open:
-1. Is the one-effect-per-job bound in §2 acceptable, or must dispatch itself re-check the fence after the intent commit (smaller window, but still not zero)?
-2. Should the fence write and the session revoke share a single code path in the bridge, so no owner route can revoke without fencing?
-3. Should a new `session_hub_execution_grants` table be used, or should `session_hub_grants` be extended?
+1. To close the residual window at the executor: either command-ID single use plus an epoch carried in each command (the executor refuses a command older than the newest fence it has seen), or a short Hub-signed authority lease per command. The executor has no Hub feed today.
+2. Reconciler cadence for `pending` fences: startup plus a periodic sweep, or on demand only?
 
 **Not verified:** the live session database's journal mode (the source sets none); how `app.py` would wire the queue and controller for installations; whether a remote staging cancel API exists; and whether a stored row with a forged legacy `review.family` exists today. No code was run.
