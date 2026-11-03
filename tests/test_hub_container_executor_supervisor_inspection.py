@@ -1,5 +1,6 @@
 """Hub -> supervisor original-command inspection: authenticated, bounded, read-only."""
 import base64
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -39,17 +40,28 @@ REJECTION = b'{"error":{"code":"unauthorized"}}'
 
 
 class JobStore(HeldAttemptSource):
-    """Test-only authoritative Hub job store. ``record_observation_in_hub_transaction``
-    stands in for the Hub's own DB transaction: under one lock it re-verifies
-    the signed observation, checks the job (hold version) and records the
-    outcome, idempotently (what a real source must provide)."""
+    """Test-only authoritative Hub job store, doing what the contract demands.
 
-    def __init__(self, verifier=None):
-        self.lock, self.versions, self.applied, self.hub_calls = threading.Lock(), {}, {}, []
-        self.verifier = verifier
+    ``hold_version`` records the Hub's OWN job record (binding, dispatch claim,
+    version). ``record_observation_in_hub_transaction`` stands in for the
+    Hub's own DB transaction: under one lock it strictly parses the raw signed
+    request, verifies the raw signed answer with its own pinned key, takes the
+    outcome/binding/claim/time ONLY from those signed bytes, refuses if any
+    module-computed hint disagrees, checks its job record and the hold
+    version, then records the outcome (idempotently).
+    """
+
+    def __init__(self, verifier):
+        self.lock, self.versions, self.jobs, self.applied, self.hub_calls = threading.Lock(), {}, {}, {}, []
+        self.verifier, self.fail_next_hold = verifier, False
 
     def hold_version(self, command, pin, dispatch_counter):
         with self.lock:
+            if self.fail_next_hold:
+                self.fail_next_hold = False
+                raise OSError("job store temporarily unavailable")
+            binding = binding_for(command, pin)
+            self.jobs.setdefault(command.command_id, (binding, dispatch_claim(binding, dispatch_counter)))
             return self.versions.setdefault(command.command_id, "v1." + command.command_id)
 
     def change(self, command_id):  # The job moved on (re-queued, cancelled, re-pinned...).
@@ -59,15 +71,26 @@ class JobStore(HeldAttemptSource):
     def record_observation_in_hub_transaction(self, version, observation):
         with self.lock:
             self.hub_calls.append((version, observation))
-            if self.versions.get(observation.command_id) != version:
-                return False
-            if self.verifier is not None:  # The Hub re-verifies inside its own transaction.
-                try:
-                    self.verifier.verify(observation.answer, request=json.loads(observation.request))
-                except SupervisorRouteError:
+            try:
+                raw = observation.request
+                request = json.loads(raw)
+                if type(raw) is not bytes or canonical(request) != raw:
                     return False
-            previous = self.applied.setdefault(observation.command_id, observation.status)
-            return previous == observation.status
+                payload = self.verifier.verify(observation.answer, request=request)  # Own pinned key.
+                command_id = request["binding"]["command_id"]
+                signed = (command_id, payload["status"], payload["route_state"], request["binding_digest"],
+                          request["dispatch"], payload["answered_at_ms"], payload["key_id"])
+                hints = (observation.command_id, observation.status, observation.route_state,
+                         observation.binding_digest, observation.dispatch, observation.answered_at_ms,
+                         observation.key_id)
+                if hints != signed or (request["binding"], request["dispatch"]) != self.jobs[command_id]:
+                    return False
+                if self.versions[command_id] != version:
+                    return False
+            except Exception:
+                return False
+            previous = self.applied.setdefault(command_id, payload["status"])
+            return previous == payload["status"]
 
 
 def raw_key(key):
@@ -160,7 +183,8 @@ def insp(world, tmp_path):
     server = _Supervisor(path, responder)
     state = {"key": key, "route": route, "responder": responder, "server": server, "socket": path,
              "ledger": str(hub / "inspection.sqlite"), "resolvers": [],
-             "store": JobStore(PinnedKeyInspectionVerifier(raw_key(key)))}  # The authoritative job store outlives any resolver.
+             # The authoritative job store outlives any resolver.
+             "store": JobStore(PinnedKeyInspectionVerifier(raw_key(key)))}
 
     def client(peer=None, verifier=None, credential=INSPECT_TOKEN, timeout_ms=600, socket_path=path):
         return SupervisorInspectionClient(
@@ -873,11 +897,9 @@ class _Source(HeldAttemptSource):
 
 @LINUX
 @pytest.mark.parametrize("source,error", [
-    ("default", "hub_unavailable"), ("bad_version", "hub_unavailable"), ("hub_false", "hub_not_recorded"),
-    ("hub_truthy", "hub_not_recorded"), ("hub_raises", "hub_not_recorded")])
+    ("hub_false", "hub_not_recorded"), ("hub_truthy", "hub_not_recorded"), ("hub_raises", "hub_not_recorded")])
 def test_observation_recorded_but_held_without_hub_transaction(world, insp, source, error):
-    chosen = {"default": HeldAttemptSource(), "bad_version": _Source(True, version="has space"),
-              "hub_false": _Source(False), "hub_truthy": _Source(1), "hub_raises": _Source(OSError())}[source]
+    chosen = {"hub_false": _Source(False), "hub_truthy": _Source(1), "hub_raises": _Source(OSError())}[source]
     resolver, cmd, counter = held_attempt(world, insp, source=chosen)
     result = resolver.inspect(cmd, world["pin"], counter)
     assert (result.state, result.error, result.status, result.applied) == ("held", error, "launched", False)
@@ -895,7 +917,7 @@ def test_observation_recorded_but_held_without_hub_transaction(world, insp, sour
 @LINUX
 @pytest.mark.parametrize("when", ["before_inspection", "while_answer_in_flight"])
 def test_source_change_refused_by_hub_transaction_and_stays_held(world, insp, when):
-    store = JobStore()
+    store = JobStore(PinnedKeyInspectionVerifier(raw_key(insp["key"])))
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     held_version = store.versions[cmd.command_id]
     if when == "before_inspection":
@@ -913,7 +935,7 @@ def test_source_change_refused_by_hub_transaction_and_stays_held(world, insp, wh
 
 @LINUX
 def test_hub_transaction_receives_exact_reverifiable_observation(world, insp):
-    store = JobStore()
+    store = JobStore(PinnedKeyInspectionVerifier(raw_key(insp["key"])))
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     result = resolver.inspect(cmd, world["pin"], counter)
     assert result.applied
@@ -941,7 +963,7 @@ def test_hub_reverification_failure_inside_transaction_keeps_held(world, insp):
 
 @LINUX
 def test_replay_is_historical_and_needs_the_hub_transaction(world, insp):
-    store = JobStore()
+    store = JobStore(PinnedKeyInspectionVerifier(raw_key(insp["key"])))
     resolver, cmd, counter = held_attempt(world, insp, source=store)
     first = resolver.inspect(cmd, world["pin"], counter)
     assert first.applied and not first.observation.historical
@@ -1127,3 +1149,92 @@ def test_slow_authenticator_is_bounded_and_cannot_take_authenticated_slots(world
     assert results["s"][0] == 401
     monkeypatch.undo()
     assert _ask(responder, body)[0] == 200  # Both pools released.
+
+
+# --- Hold version must be valid; the Hub re-verifies the raw signed bytes ------
+
+def _hold_version_of(insp, command_id):
+    with sqlite3.connect(Path(insp["ledger"]).as_uri() + "?mode=ro", uri=True) as db:
+        return db.execute("SELECT hold_version FROM supervisor_route_inspection WHERE command_id=?",
+                          (command_id,)).fetchall()
+
+
+@LINUX
+@pytest.mark.parametrize("version", ["default", None, "", "has space", "x" * 257, 7, "v\u00e9"])
+def test_hold_without_valid_version_records_nothing(world, insp, version):
+    source = HeldAttemptSource() if version == "default" else _Source(True, version=version)
+    cmd, counter = launch(world, insp)
+    resolver = insp["resolver"](source=source)
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        resolver.hold(cmd, world["pin"], counter)
+    assert raised.value.reason == "hold_version_unavailable"
+    assert ledger_state(insp, cmd.command_id) is None  # Nothing recorded, nothing wedged.
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "no_held_attempt") and insp["server"].received == []
+
+
+@LINUX
+def test_temporary_source_failure_then_hold_succeeds(world, insp):
+    store = insp["store"]
+    store.fail_next_hold = True
+    cmd, counter = launch(world, insp)
+    resolver = insp["resolver"]()
+    with pytest.raises(SupervisorRouteRejected):
+        resolver.hold(cmd, world["pin"], counter)
+    assert ledger_state(insp, cmd.command_id) is None
+    resolver.hold(cmd, world["pin"], counter)  # Retry works: no immutable empty version was persisted.
+    assert _hold_version_of(insp, cmd.command_id) == [("v1." + cmd.command_id,)]
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"
+
+
+@LINUX
+def test_repeat_hold_same_version_idempotent_changed_version_refused(world, insp):
+    store = insp["store"]
+    cmd, counter = launch(world, insp)
+    resolver = insp["resolver"]()
+    resolver.hold(cmd, world["pin"], counter)
+    resolver.hold(cmd, world["pin"], counter)  # Same binding, same version: no-op.
+    assert _hold_version_of(insp, cmd.command_id) == [("v1." + cmd.command_id,)]
+    store.change(cmd.command_id)
+    with pytest.raises(SupervisorRouteRejected) as raised:
+        resolver.hold(cmd, world["pin"], counter)
+    assert raised.value.reason == "hold_version_changed"
+    assert _hold_version_of(insp, cmd.command_id) == [("v1." + cmd.command_id,)]  # Nothing changed.
+    assert ledger_state(insp, cmd.command_id) == ("held", None)
+
+
+def _tamper_hint(field):
+    def tamper(observation):
+        if field == "request":
+            request = json.loads(observation.request)
+            request["request_nonce"] = "0" * 32
+            return dataclasses.replace(observation, request=canonical(request))
+        values = {"status": "refused", "route_state": "rejected", "binding_digest": "0" * 64,
+                  "command_id": str(uuid4()), "answered_at_ms": observation.answered_at_ms + 1,
+                  "key_id": "f" * 64, "dispatch": {**observation.dispatch, "counter": 99}}
+        return dataclasses.replace(observation, **{field: values[field]})
+    return tamper
+
+
+@LINUX
+@pytest.mark.parametrize("field", ["status", "route_state", "binding_digest", "command_id", "answered_at_ms",
+                                   "key_id", "dispatch", "request"])
+@pytest.mark.parametrize("historical", [False, True])
+def test_hub_refuses_observation_whose_hints_disagree_with_signed_bytes(world, insp, monkeypatch, field,
+                                                                        historical):
+    store = JobStore(PinnedKeyInspectionVerifier(raw_key(insp["key"])))
+    resolver, cmd, counter = held_attempt(world, insp, source=store)
+    if historical:
+        resolver._source = _Source(False, version="v1." + cmd.command_id)  # Record the observation only.
+        assert resolver.inspect(cmd, world["pin"], counter).error == "hub_not_recorded"
+        store.hold_version(cmd, world["pin"], counter)
+        resolver._source = store
+    original = InspectionResolver._observation
+    tamper = _tamper_hint(field)
+    monkeypatch.setattr(InspectionResolver, "_observation",
+                        staticmethod(lambda *args: tamper(original(*args))))
+    result = resolver.inspect(cmd, world["pin"], counter)
+    assert (result.state, result.error) == ("held", "hub_not_recorded"), field
+    assert store.applied == {} and store.hub_calls  # The Hub was asked and refused.
+    monkeypatch.undo()
+    assert resolver.inspect(cmd, world["pin"], counter).state == "applied"  # Untampered hints: accepted.

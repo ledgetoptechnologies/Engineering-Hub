@@ -74,8 +74,9 @@ signature, wrong key, any binding mismatch, ``unknown`` and signed
 VERIFICATION and OBSERVATION STORAGE only and never decides: the
 authoritative step is ``HeldAttemptSource.record_observation_in_hub_transaction``,
 a callback the Hub executes inside ITS OWN DB transaction together with its
-owner/job checks (including the ``hold_version`` captured at hold); the
-default source refuses. Inspection never relaunches, resubmits or releases,
+owner/job checks (including the ``hold_version`` captured at hold),
+independently re-verifying the raw signed request/answer bytes; the default
+source refuses. Inspection never relaunches, resubmits or releases,
 and no result of it permits a resubmit or release.
 
 The backend peer (SO_PEERCRED pid/uid/gid + pidfd start ticks) is verified
@@ -1905,7 +1906,8 @@ class InspectionResponderConfig:
     and ``max_concurrent`` (1..8) authenticated answers may run at once; any
     other caller gets an unsigned 503 ``busy`` immediately (never queued).
     ``answer_budget_ms`` (20..2000, at least ``read_budget_ms``) is the
-    responder's own deadline per call, a return-time check on signed answers; ``read_budget_ms`` (10..1000) caps each durable journal read.
+    responder's own deadline per call, a return-time check on signed answers;
+    ``read_budget_ms`` (10..1000) caps each durable journal read.
     Keep both well under the client's total deadline.
     """
     enabled: bool = False
@@ -2174,7 +2176,7 @@ _MAX_HOLD_VERSION = 256
 _OBSERVATION = ('CREATE TABLE supervisor_route_inspection (command_id TEXT PRIMARY KEY, '
                 'binding_digest TEXT NOT NULL, binding TEXT NOT NULL, executor_id TEXT NOT NULL, '
                 "dispatch_counter INTEGER NOT NULL CHECK(typeof(dispatch_counter)='integer' "
-                'AND dispatch_counter > 0), hold_version TEXT, '
+                'AND dispatch_counter > 0), hold_version TEXT NOT NULL, '
                 "state TEXT NOT NULL CHECK(state IN ('held','observed_launched','observed_refused')), "
                 'route_state TEXT, key_id TEXT, answer TEXT, request TEXT, '
                 "CHECK((state='held' AND route_state IS NULL AND key_id IS NULL AND answer IS NULL "
@@ -2241,15 +2243,19 @@ class InspectionLedger(_DurableStore):
                           (command_id,)).fetchone()
 
     def hold(self, request, hold_version):
-        """Record a held attempt; idempotent for the identical binding (the
-        first hold version recorded is kept)."""
-        _require(hold_version is None or _valid_hold_version(hold_version), RouteJournalError('version'))
+        """Record a held attempt with a VALID source hold version. An identical
+        repeat (same binding, same version) is a no-op; the same binding with
+        another version is refused (``hold_version_changed``) and a different
+        binding is refused (``binding_conflict``), changing nothing."""
+        _require(_valid_hold_version(hold_version), RouteJournalError('version'))
         command_id = request['binding']['command_id']
         with self._transaction() as db:
             row = self._select(db, command_id)
             if row is not None:
                 if row[1:5] != self._key(request):
                     raise SupervisorRouteRejected('binding_conflict')
+                if row[5] != hold_version:
+                    raise SupervisorRouteRejected('hold_version_changed')
                 return
             db.execute('INSERT INTO supervisor_route_inspection VALUES '
                        "(?,?,?,?,?,?,'held',NULL,NULL,NULL,NULL)", (command_id, *self._key(request), hold_version))
@@ -2291,10 +2297,17 @@ class InspectionObservation:
 
     It is evidence of what the supervisor's journal said at ``answered_at_ms``
     (signed), not fresh host or Hub job state. ``historical`` is True when it
-    was replayed from the ledger rather than answered in this call. ``request``
-    and ``answer`` are the exact canonical request bytes and signed answer
-    bytes, so the Hub can re-verify (``PinnedKeyInspectionVerifier.verify(
-    answer, request=json.loads(request))``) inside its own transaction.
+    was replayed from the ledger rather than answered in this call.
+
+    ``request`` and ``answer`` are the RAW signed bytes (the exact canonical
+    request that the answer echoes, and the signed answer). Every other field
+    is a convenience HINT computed by this module and MUST NOT be trusted by
+    the Hub: inside its own transaction the Hub re-verifies the raw bytes
+    against its own pinned key (e.g. ``PinnedKeyInspectionVerifier.verify(
+    answer, request=json.loads(request))`` after a strict canonical parse),
+    derives the status, route_state, binding, dispatch claim and time from
+    the SIGNED payload, compares them with its own job record, and refuses
+    if any hint disagrees.
     """
     command_id: str
     status: str
@@ -2316,14 +2329,23 @@ class HeldAttemptSource:
 
     * ``hold_version(command, pin, dispatch_counter)`` -> an opaque version
       string (printable ASCII, at most 256 chars) naming the exact held
-      attempt as the Hub job store has it now; captured when it is held.
+      attempt as the Hub job store has it now. ``InspectionResolver.hold``
+      records nothing unless it gets a valid one (a temporary failure can
+      simply be retried); a later hold of the same binding must return the
+      SAME version, else it is refused (``hold_version_changed``).
     * ``record_observation_in_hub_transaction(version, observation)`` -> the
-      callback the Hub executes inside ITS OWN DB transaction: in that one
-      transaction it performs its authoritative owner/job checks (the job is
-      still this held attempt with ``version``, the caller still owns it, ...)
-      and records the outcome, and it returns exactly True only if that
-      transaction COMMITTED the outcome. Anything else (False, any other
-      value, an exception, a rollback) means nothing was recorded.
+      callback the Hub executes inside ITS OWN DB transaction. In that one
+      transaction it must INDEPENDENTLY: (1) strictly parse
+      ``observation.request`` (canonical JSON) and verify
+      ``observation.answer`` against it with its own pinned supervisor key;
+      (2) take the outcome (status, route_state), binding, dispatch claim and
+      time ONLY from those signed bytes, never from the module-computed
+      fields, refusing if any of them disagrees; (3) check that the signed
+      binding/claim is exactly its own held job and that ``version`` is that
+      job's current hold version, plus its owner checks; then (4) record the
+      outcome. It returns exactly True only if that transaction COMMITTED the
+      outcome. Anything else (False, any other value, an exception, a
+      rollback) means nothing was recorded.
 
     Atomicity is ONLY as strong as that Hub transaction; this module provides
     none (the inspection ledger shares no transaction or lock with the Hub
@@ -2373,7 +2395,8 @@ class InspectionResolver:
     """DISABLED-BY-DEFAULT Hub-side inspection of HELD attempts.
 
     ``hold(command, pin, dispatch_counter)`` durably records a held attempt
-    with the source's opaque ``hold_version`` (none if the source refuses).
+    with the source's opaque ``hold_version``; without a valid version it
+    records nothing and raises, so it can be retried.
     ``inspect(...)`` contacts the supervisor only for a row held with the
     identical binding. A verified, signed ``launched``/``refused`` whose
     echoed request equals the held binding and dispatch claim is recorded as
@@ -2385,9 +2408,11 @@ class InspectionResolver:
     decides. The only authoritative step is
     ``source.record_observation_in_hub_transaction(hold_version, obs)``, which
     the Hub executes in its own DB transaction with its owner/job checks;
-    only its exact True yields ``applied``. No hold version, a refusal, an
-    exception or the default source -> ``held`` (with the observation
-    attached). Atomicity is only as strong as that Hub transaction.
+    only its exact True yields ``applied``. A refusal or an exception ->
+    ``held`` (with the observation attached); the default source cannot
+    even hold (no hold version), so nothing is recorded. The Hub must re-verify
+    the raw signed bytes itself and not trust this module's hint fields.
+    Atomicity is only as strong as that Hub transaction.
 
     A recorded observation is replayed as HISTORICAL (signed answered_at_ms),
     re-verified against the CURRENT pinned key and binding (key rotation,
@@ -2410,12 +2435,20 @@ class InspectionResolver:
         return 'InspectionResolver(<enabled>)'
 
     def hold(self, command, pin, dispatch_counter):
+        """Durably record a held attempt with the source's hold version.
+
+        Records NOTHING (``SupervisorRouteRejected('hold_version_unavailable')``)
+        unless the source returns a valid version, so a temporary source
+        failure never persists an unusable row; the caller may retry.
+        """
         request = self._client.request_for(command, pin, dispatch_counter)
         try:
             version = self._source.hold_version(command, pin, dispatch_counter)
         except Exception:
             version = None
-        self._ledger.hold(request, version if _valid_hold_version(version) else None)
+        if not _valid_hold_version(version):
+            raise SupervisorRouteRejected('hold_version_unavailable')
+        self._ledger.hold(request, version)
 
     def _replay(self, row, request):
         """Re-verify a recorded observation; returns (payload, answer, request bytes) or None."""
