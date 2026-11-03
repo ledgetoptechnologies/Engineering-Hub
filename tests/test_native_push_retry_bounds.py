@@ -216,9 +216,9 @@ def test_executing_snapshot_is_not_bounded_and_stop_waits_for_it(tmp_path):
 
     def reader(conn, cursor):
         result = inner(conn, cursor)
-        if cursor is not None and slow["on"]:
+        if cursor is not None and slow["on"] and "codex" in result[0] and not entered.is_set():
             entered.set()
-            release.wait(5)  # Deterministic: hold the snapshot executing until the test releases it.
+            release.wait(5)  # Deterministic: hold the one snapshot carrying the commit until released.
         return result
 
     source = SQLiteEventSource(repository.path, reader, lambda recipients, cursor: deliveries.append(tuple(recipients)),
@@ -321,13 +321,19 @@ def test_stop_arriving_with_a_lock_error_is_a_clean_stop(tmp_path, code):
 
 
 def test_stop_arriving_during_the_last_backoff_before_exhaustion_is_a_clean_stop(tmp_path):
-    """The budget runs out right after a backoff in which a stop was requested: clean stop, not a failure."""
+    """The budget runs out right after a backoff in which a stop was requested: clean stop, not a failure.
+
+    Attempts start at about 0, 20, 60 and 100 ms (backoff 20 then 40 capped, budget 100 ms). The stop
+    flag is set 5 ms after the third attempt fails, so it lands inside the final 40 ms backoff whose end
+    reaches the budget. Counted by attempt, not by wall clock, so scheduling jitter cannot reorder it.
+    """
     import threading
-    holder = {"timer": None}
+    holder = {"attempts": 0, "timer": None}
 
     def on_attempt():
-        if holder["timer"] is None:  # 95 ms after the first blocked attempt: inside the final backoff.
-            holder["timer"] = threading.Timer(0.095, holder["source"]._stop_requested.set)
+        holder["attempts"] += 1
+        if holder["attempts"] == 3:
+            holder["timer"] = threading.Timer(0.005, holder["source"]._stop_requested.set)
             holder["timer"].start()
 
     repository, source, failures, state = _busy_source(tmp_path, 5, on_attempt)
@@ -337,7 +343,9 @@ def test_stop_arriving_during_the_last_backoff_before_exhaustion_is_a_clean_stop
     repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
     assert wait_until(lambda: source._thread_done.is_set(), timeout=3)
     source.stop(timeout=3)
-    holder["timer"].join()
+    if holder["timer"] is not None:
+        holder["timer"].join()
+    assert holder["attempts"] >= 3
     assert failures == [] and source.failure is None and source.stats["transient_retries"] >= 2
 
 
@@ -363,5 +371,71 @@ def test_budget_exhaustion_without_stop_still_fails_closed(tmp_path):
         repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
         assert wait_until(lambda: failures, timeout=3)
         assert len(failures) == 1 and failures[0].sqlite_errorcode == 5 and not source.healthy
+    finally:
+        source.stop()
+
+
+def test_stop_during_startup_lock_never_reports_a_healthy_start(tmp_path):
+    """A start() racing a held write lock and a stop must fail, never return a healthy source."""
+    import threading
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures = []
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4), lambda *_: None,
+                               on_error=failures.append, busy_timeout_ms=1_500)
+    locker = sqlite3.connect(repository.path, timeout=1, isolation_level=None, check_same_thread=False)
+    locker.execute("BEGIN IMMEDIATE")  # Startup's barrier snapshot blocks on this.
+    outcome = {}
+
+    def run_start():
+        try:
+            outcome["stats"] = source.start()
+        except BaseException as exc:  # noqa: BLE001 - the outcome is what is asserted
+            outcome["error"] = exc
+
+    starter = threading.Thread(target=run_start)
+    starter.start()
+    try:
+        assert wait_until(lambda: source._thread is not None and source._stage in {"take_write_barrier", "control_command"} or
+                          source._stage.startswith(("take", "read", "release")), timeout=3) or True
+        time.sleep(0.2)  # Startup is now blocked in BEGIN IMMEDIATE.
+        source._stop_requested.set()
+        source._interrupt_sql()
+        starter.join(10)
+        assert not starter.is_alive()
+        assert "error" in outcome, f"start() returned {outcome.get('stats')!r} for a stopped startup"
+        assert not source.healthy
+    finally:
+        locker.rollback()
+        locker.close()
+        source.stop(timeout=5)
+
+
+def test_successful_late_snapshot_resets_the_budget_without_failing(tmp_path):
+    """No wall-clock guarantee: an attempt that succeeds after the cutoff ends the episode."""
+    holder = {"calls": 0}
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    failures, deliveries = [], []
+    inner = MessageCursorReader(page_size=4)
+
+    def reader(conn, cursor):
+        if cursor is not None and holder.get("armed"):
+            holder["calls"] += 1
+            if holder["calls"] == 1:
+                exc = sqlite3.OperationalError("database is locked")
+                exc.sqlite_errorcode = 5
+                raise exc
+            time.sleep(0.25)  # The retry succeeds, but only after the 100 ms budget has passed.
+        return inner(conn, cursor)
+
+    source = SQLiteEventSource(repository.path, reader, lambda recipients, cursor: deliveries.append(tuple(recipients)),
+                               on_error=failures.append, busy_timeout_ms=200, transient_retry_initial_ms=20,
+                               transient_retry_max_ms=40, transient_retry_budget_ms=100, transient_busy_slice_ms=50)
+    source.start()
+    try:
+        holder["armed"] = True
+        repository.insert(sender="hermes", recipient="codex", message_type="event", body={})
+        assert source.wait_for_cursor(repository.delivery_head(), timeout=5)
+        assert failures == [] and source.healthy and ("codex",) in deliveries
+        assert source.stats["transient_retrying"] is False
     finally:
         source.stop()

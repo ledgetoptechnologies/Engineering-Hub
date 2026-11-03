@@ -240,15 +240,18 @@ class SQLiteEventSource:
     in SQLite's busy handler for at most transient_busy_slice_ms (and not past
     what was left of the budget when the attempt began), so an attempt with
     several statements may wait up to one slice per statement. The budget
-    counts from the start of the first blocked attempt and is checked when an
-    attempt fails and again after each backoff; scheduling and one attempt may
-    run a little past it before the source fails closed. Backoff waits are
+    counts from the start of the first blocked attempt and is checked only when
+    a BUSY/LOCKED attempt fails and again after each backoff. There is no
+    wall-clock guarantee: the source fails closed on the first BUSY/LOCKED
+    failure observed after the cutoff, while an attempt that succeeds, even
+    late, ends the episode and resets the budget. Backoff waits are
     interruptible and the stop flag is checked before every attempt.
 
-    Stop precedence: once stop() is requested, SQLITE_INTERRUPT and a
-    BUSY/LOCKED wait (which would only be retried) end as a clean stop, also when
-    the budget runs out at that moment. Every other error still fails closed and
-    is reported.
+    Stop precedence (after startup only): once stop() is requested,
+    SQLITE_INTERRUPT and a BUSY/LOCKED wait (which would only be retried) end as
+    a clean stop, also when the budget runs out at that moment. Every other
+    error still fails closed and is reported. During startup every error stays
+    fatal, and start() raises unless startup completed healthy.
 
     What is not bounded by the budget or by stop: a snapshot that is executing
     rather than waiting (paged reads, the cursor reader) runs to completion and
@@ -391,6 +394,9 @@ class SQLiteEventSource:
         if not self._ready.wait(self.busy_timeout_ms / 1000 + 10):
             raise TimeoutError("timed out starting native SQLite event source")
         self.raise_if_failed()
+        if not self.stats["healthy"]:
+            # Ready was signalled without a completed startup (e.g. stopped during it).
+            raise WatcherFailed("native SQLite event source did not complete startup")
         return self.stats
 
     def raise_if_failed(self) -> None:
@@ -743,7 +749,7 @@ class SQLiteEventSource:
                 break
             except sqlite3.OperationalError as exc:
                 code = _sqlite_error_details(exc).get('sqlite_errorcode')
-                if self._stop_requested.is_set() and type(code) is int and (
+                if reason != "startup" and self._stop_requested.is_set() and type(code) is int and (
                         code & 0xFF == 9 or _transient_sqlite_code(exc) is not None):
                     # A requested stop wins over SQLITE_INTERRUPT and over a lock wait we would
                     # only retry anyway; every other error still fails closed and is reported.
