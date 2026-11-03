@@ -27,8 +27,9 @@ The owned inactive entrypoint accepts this mode only after explicit offline
 preparation of the bound-auth schema under the existing PilotOwner. Caller
 attestations that writers stopped and a backup exists are not independent proof
 of either condition. This operation is not called by the server and does not
-repair partially present tables. The owned-pilot entrypoints deliberately reject
-this mode. A version 3 protected selection is not automatic migration, a completed
+repair partially present tables. Owned-pilot draft factories accept the mode;
+the private browser gateway also needs an explicit callback opt-in on its public
+side. A version 3 protected selection is not automatic migration, a completed
 host validation, or permission to start an owned-pilot runtime.
 
 The tests use synthetic Access keys and a fake GitHub provider. Real OAuth app

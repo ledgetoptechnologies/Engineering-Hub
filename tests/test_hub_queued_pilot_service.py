@@ -615,3 +615,38 @@ async def test_existing_legacy_dispatch_records_are_not_adopted_or_deleted(setup
         assert db.execute("SELECT name FROM sqlite_master WHERE name='hub_queued_pilot_policy'").fetchall() == []
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_private_queued_bound_signin_no_executor_effects(setup, monkeypatch):
+    from dataclasses import replace
+    from urllib.parse import parse_qs, urlsplit
+    from engineering_hub.auth import GitHubIdentityProvider
+    from engineering_hub.repository import HubRepository
+    from engineering_hub.bound_oauth_draft import enroll_owned_bound_schema
+    state=setup
+    with PilotOwner(state.settings.database,allow_ephemeral_test_storage=True) as owner:
+        repo=HubRepository(state.settings.database,pilot_owner=owner)
+        enroll_owned_bound_schema(repo,writers_stopped=True,backup_verified=True)
+    state.settings=replace(state.settings,auth_config=replace(state.settings.auth_config,
+        human_auth_mode='github_cloudflare',github_client_id='fixture',github_client_secret='fixture',
+        beau_github_id=123,bound_access_subject='synthetic-human'))
+    async def exchange(self, code, verifier): return 123
+    monkeypatch.setattr(GitHubIdentityProvider,'exchange',exchange)
+    stop,serving,_=await start(state)
+    try:
+        async with create_private_browser_client(state.endpoint) as private:
+            gateway=PublicBrowserGateway(private,allow_bound_oauth_callback=True)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(gateway),base_url=ORIGIN,
+                    follow_redirects=False,headers={'Cf-Access-Jwt-Assertion':state.assertion}) as browser:
+                login=await browser.get(BASE+'/auth/login')
+                assert login.status_code==302
+                oauth_state=parse_qs(urlsplit(login.headers['location']).query)['state'][0]
+                response=await browser.get(BASE+'/auth/callback',params={'state':oauth_state,'code':'fixture'})
+                assert response.status_code==303
+                me=await browser.get(BASE+'/auth/me')
+                assert me.status_code==200 and me.json()['authenticated'] and me.json()['actor'].startswith('human:cf:')
+        assert state.requests==[]
+    finally:
+        stop.set()
+        await asyncio.wait_for(serving,8)
