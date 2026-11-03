@@ -184,10 +184,10 @@ def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consum
         forge({**good, "audience": "other"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "hub_key_id": "other-key"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "issued_at": 1730000000}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),  # No wall clock.
-        forge({k: v for k, v in good.items() if k != "lease_epoch"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
+        forge({k: v for k, v in good.items() if k != "owner_epoch"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "fence": True}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "fence": str(cmd.queue_fence)}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
-        forge({**good, "lease_epoch": 0}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
+        forge({**good, "owner_epoch": "not-a-uuid"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "counter": 1.0}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "job_id": "job 1"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
         forge({**good, "challenge_nonce": nonce + "A"}, signer=proof["hub"], domain=HUB_PROOF_DOMAIN),
@@ -203,8 +203,10 @@ def test_every_proof_binding_mismatch_is_held_with_zero_bytes_and_nothing_consum
     assert route.inspect_challenge(nonce)[0] == "outstanding"  # Nothing consumed by any failure.
     assert route.inspect_reservation(cmd.command_id)[0] == "reserved"
     assert route.inspect(cmd.command_id) is None
-    # job_id, worker and lease_epoch exist in no supervisor state or body: bound only by the Hub signature.
-    accepted = hub_proof(proof, receipt, cmd, nonce, job_id="job-7", worker="w-3", lease_epoch=42)
+    # job_id, worker, machine_id and owner_epoch exist in no supervisor state or body: bound only by the
+    # Hub signature (the Hub barrier must enforce them).
+    accepted = hub_proof(proof, receipt, cmd, nonce, job_id="job-7", worker="w-3", machine_id="m-9",
+                         owner_epoch=str(uuid4()))
     assert route.dispatch(receipt, cmd, accepted).state == "completed" and sends(proof) == 1
     assert route.inspect_challenge(nonce)[0] == "consumed"
     route.close()
@@ -911,3 +913,36 @@ def test_send_guard_refuses_a_journal_switched_to_wal_with_zero_bytes(proof, mon
     finally:
         wal.close()
     legacy._journal.close()
+
+
+@LINUX
+def test_proof_contract_is_exactly_the_machine_and_owner_epoch_field_set(proof):
+    route = route_for(proof)
+    cmd, receipt = reserved(proof, route)
+    nonce = nonce_of(route.issue_dispatch_challenge(cmd.command_id))
+    good = proof_payload(proof, receipt, cmd, nonce)
+    assert set(good) == {"protocol", "audience", "hub_key_id", "job_id", "run_id", "worker", "machine_id", "fence",
+                         "owner_epoch", "reservation_receipt_sha256", "command_id", "counter", "executor",
+                         "challenge_nonce", "challenge_sha256", "supervisor_boot_id"}
+    old = {k: v for k, v in good.items() if k not in ("machine_id", "owner_epoch")}
+    refused = {
+        "old contract (lease_epoch)": {**old, "lease_epoch": 1},
+        "old contract plus new fields": {**good, "lease_epoch": 1},
+        "machine_id missing": {k: v for k, v in good.items() if k != "machine_id"},
+        "owner_epoch missing": {k: v for k, v in good.items() if k != "owner_epoch"},
+        "extra field": {**good, "machine_generation": 3},
+        "machine_id int": {**good, "machine_id": 7},
+        "machine_id pattern": {**good, "machine_id": "machine 1"},
+        "machine_id empty": {**good, "machine_id": ""},
+        "machine_id too long": {**good, "machine_id": "m" * 129},
+        "owner_epoch int": {**good, "owner_epoch": 1},
+        "owner_epoch not uuid": {**good, "owner_epoch": "epoch-1"},
+        "owner_epoch uppercase": {**good, "owner_epoch": good["owner_epoch"].upper()},
+    }
+    for label, payload in refused.items():
+        result = route.dispatch(receipt, cmd, forge(payload, signer=proof["hub"], domain=HUB_PROOF_DOMAIN))
+        assert (result.state, result.error) == ("held", "proof_invalid"), label
+    assert sends(proof) == 0 and route.inspect_challenge(nonce)[0] == "outstanding"
+    result = route.dispatch(receipt, cmd, forge(good, signer=proof["hub"], domain=HUB_PROOF_DOMAIN))
+    assert result.state == "completed" and sends(proof) == 1
+    route.close()

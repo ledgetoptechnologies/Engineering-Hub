@@ -54,6 +54,7 @@ class FakeBootClock:
 
 
 WINDOW_NS = 5000 * 10**6  # SupervisorRouteConfig().proof_window_ms default.
+OWNER_EPOCH = "3b0b8b1e-5c1a-4c8e-9f2a-6d4e2b7a9c01"  # The Hub barrier's owner epoch in test proofs.
 
 
 @pytest.fixture
@@ -99,8 +100,8 @@ def proof_payload(two, receipt, cmd, nonce, **changes):
         counter, executor = 1, two["pin"].container_id
     return {"protocol": HUB_PROOF_PROTOCOL, "audience": HUB_PROOF_AUDIENCE, "hub_key_id": two["hub"].key_id,
             "job_id": "job-1", "run_id": json.loads(cmd.body)["run_id"], "worker": "worker-1",
-            "fence": cmd.queue_fence,
-            "lease_epoch": 1, "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+            "machine_id": "machine-1", "fence": cmd.queue_fence, "owner_epoch": OWNER_EPOCH,
+            "reservation_receipt_sha256": hashlib.sha256(receipt).hexdigest(),
             "command_id": cmd.command_id, "counter": counter, "executor": executor, "challenge_nonce": nonce,
             "challenge_sha256": CHALLENGE_HASHES.get(nonce, "0" * 64),
             "supervisor_boot_id": two["clock"].boot_id, **changes}

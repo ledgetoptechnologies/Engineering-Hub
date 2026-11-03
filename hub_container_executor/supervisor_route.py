@@ -86,10 +86,10 @@ those exact bytes to the row before returning them. The Hub verifies the
 challenge with its pinned ``DispatchChallengeVerifier`` against
 ``challenge_expectation(receipt, pin, epoch)`` and signs, under its pinned
 dispatch key and ``HUB_PROOF_DOMAIN``, {protocol, audience, hub_key_id,
-job_id, run_id, worker, fence, lease_epoch, reservation_receipt_sha256,
-command_id, counter, executor, challenge_nonce, challenge_sha256,
-supervisor_boot_id} (no wall-clock field); ``challenge_sha256`` must equal
-the hash bound to the challenge row. In the
+job_id, run_id, worker, machine_id, fence, owner_epoch,
+reservation_receipt_sha256, command_id, counter, executor, challenge_nonce,
+challenge_sha256, supervisor_boot_id} (no wall-clock field);
+``challenge_sha256`` must equal the hash bound to the challenge row. In the
 SAME transaction that marks the reservation dispatched, before any byte, the
 supervisor requires the proof to bind exactly the receipt, reservation,
 command fence and current boot, and the nonce to be outstanding, from this
@@ -101,8 +101,13 @@ not dispatched, expires ALL its outstanding challenges and retires the
 reservation (abandoned, counter consumed), and signs ``expired_unconsumed`` /
 ``reservation_status: retired`` only after that commit;
 ``expire_challenges()`` retires dead nonces in bulk. Signed proof fields
-that also appear in the request body (command_id, run_id, fence) must equal
-it; job_id, worker and lease_epoch are bound only by the Hub's signature.
+that also appear in the request body or journal (command_id, run_id,
+fence, counter, executor, challenge) must equal it. job_id, worker,
+machine_id and owner_epoch are bound ONLY by the Hub's signature: the Hub
+must enforce, inside its barrier transaction, a monotonic per-machine
+generation (fence), the current job/worker/fence and owner epoch, with
+old-writer and restore exclusions, and no proof may be released until that
+is enforced and reviewed.
 Proof mode is durable: a route constructed with a proof verifier records it
 in the journal, after which ``submit`` (and the journal's one-step admit)
 refuse ``proof_required`` and a construction without a verifier is refused.
@@ -880,7 +885,8 @@ class ReservationReceiptVerifier:
 
 _NONCE_B64 = re.compile(r'[A-Za-z0-9_-]{43}\Z')
 _PROOF_KEYS = frozenset({'protocol', 'audience', 'hub_key_id', 'job_id', 'run_id', 'worker', 'fence',
-                         'lease_epoch', 'reservation_receipt_sha256', 'command_id', 'counter', 'executor',
+                         'machine_id', 'owner_epoch', 'reservation_receipt_sha256', 'command_id', 'counter',
+                         'executor',
                          'challenge_nonce', 'challenge_sha256', 'supervisor_boot_id'})
 _CHALLENGE_KEYS = frozenset({'protocol', 'audience', 'key_id', 'nonce', 'command_id', 'counter',
                              'reservation_receipt_sha256', 'executor', 'pin', 'epoch', 'supervisor_boot_id',
@@ -926,9 +932,11 @@ class HubDispatchProofVerifier:
 
     ``verify(raw)`` enforces the exact canonical envelope, the signature under
     the pinned key and HUB_PROOF_DOMAIN, and the exact payload
-    {protocol, audience, hub_key_id, job_id, run_id, worker, fence,
-    lease_epoch, reservation_receipt_sha256, command_id, counter, executor,
-    challenge_nonce, challenge_sha256, supervisor_boot_id} with strict types
+    {protocol, audience, hub_key_id, job_id, run_id, worker, machine_id,
+    fence, owner_epoch, reservation_receipt_sha256, command_id, counter,
+    executor, challenge_nonce, challenge_sha256, supervisor_boot_id} with
+    strict types (job_id/run_id/worker/machine_id: identifier pattern;
+    owner_epoch: UUID; fence: positive int)
     (``challenge_sha256`` = SHA-256 of the exact signed challenge bytes the
     Hub verified with DispatchChallengeVerifier). There is NO
     wall-clock field: freshness comes only from the supervisor's own
@@ -952,8 +960,8 @@ class HubDispatchProofVerifier:
             _require(payload['protocol'] == HUB_PROOF_PROTOCOL and payload['audience'] == HUB_PROOF_AUDIENCE
                      and type(payload['hub_key_id']) is str and payload['hub_key_id'] == self._key_id
                      and all(type(payload[k]) is str and _ID.fullmatch(payload[k])
-                             for k in ('job_id', 'run_id', 'worker'))
-                     and _positive(payload['fence']) and _positive(payload['lease_epoch'])
+                             for k in ('job_id', 'run_id', 'worker', 'machine_id'))
+                     and _positive(payload['fence']) and _uuid(payload['owner_epoch'])
                      and type(payload['reservation_receipt_sha256']) is str
                      and _HEX.fullmatch(payload['reservation_receipt_sha256'])
                      and _uuid(payload['command_id']) and _positive(payload['counter'], MAX_DISPATCH_COUNTER)
@@ -1657,8 +1665,9 @@ class RouteJournal(_DurableStore):
     def _consume_challenge(self, db, row, receipt, binding, proof, proof_sha256, clock, window_ns, run_id):
         # Signed fields also present in the exact request body (command_id,
         # run_id, fencing_generation == queue_fence) must equal it. job_id,
-        # worker and lease_epoch are NOT in the body or any supervisor state:
-        # they are covered only by the Hub's signature and its barrier.
+        # worker, machine_id and owner_epoch are NOT in the body or any
+        # supervisor state: they are covered only by the Hub's signature and
+        # its barrier (which must enforce them before releasing any proof).
         boot_id, now = self._clock(clock)
         if (proof['reservation_receipt_sha256'] != hashlib.sha256(receipt).hexdigest()
                 or proof['command_id'] != row[0] or proof['counter'] != row[4] or proof['executor'] != row[1]

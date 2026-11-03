@@ -61,9 +61,13 @@ challenge_nonce, issued_at, state)`, guarded by triggers:
    the CI handoff's fresh-claim challenge.
 2. **Proof.** Inside the barrier transaction (A) the Hub signs, with its pinned
    Hub dispatch key under its own Ed25519 domain, canonical
-   `{protocol, audience, hub_key_id, job_id, run_id, worker, fence, lease_epoch,
-   reservation_receipt_sha256, command_id, counter, executor, challenge_nonce,
-   supervisor_boot_id}`. It deliberately carries **no wall-clock lease time**.
+   `{protocol, audience, hub_key_id, job_id, run_id, worker, machine_id, fence,
+   owner_epoch, reservation_receipt_sha256, command_id, counter, executor,
+   challenge_nonce, challenge_sha256, supervisor_boot_id}`. It deliberately carries
+   **no wall-clock lease time**. The claim identity is the Hub's
+   `(job_id, worker, machine_id, fence, owner_epoch)`, which only the Hub's
+   barrier transaction can enforce; the supervisor binds only fence, run_id,
+   command_id, counter, executor and the challenge.
 3. **Dispatch.** The Hub sends `dispatch(receipt, command, proof)`. In one journal
    transaction, before any byte goes out, the supervisor:
    - verifies the proof against the pinned Hub key and that every field matches
