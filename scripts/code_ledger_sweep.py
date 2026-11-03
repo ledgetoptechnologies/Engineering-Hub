@@ -52,10 +52,10 @@ def read_refs(repo, base, namespace, strip, reviewing):
 
 
 def read_branches(repo, base, prs):
-    """Remote refs win; local-only branches matter too, since most clutter never gets pushed."""
+    """Local refs win: unpushed commits on a branch whose remote head merged have not landed."""
     reviewing = {pr.branch for pr in prs if pr.state == 'OPEN'}
-    local = read_refs(repo, base, 'refs/heads', 2, reviewing)
-    return list({**local, **read_refs(repo, base, 'refs/remotes/origin', 3, reviewing)}.values())
+    remote = read_refs(repo, base, 'refs/remotes/origin', 3, reviewing)
+    return list({**remote, **read_refs(repo, base, 'refs/heads', 2, reviewing)}.values())
 
 
 def read_prs(repo):
