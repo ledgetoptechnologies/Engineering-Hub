@@ -1,15 +1,15 @@
 /**
  * Small dependency-free charts for the home overview. Stage is ordinal, so it uses one
- * blue ramp light→dark; counts are always shown as text too (legend, labels, sr table).
+ * blue ramp, quiet to strong in either theme (tokens in styles.css); counts are always shown as text too (legend, labels, sr table).
  */
 import { useState } from "react";
 import type { Task } from "./types";
 
 export const STAGES: { key: Task["status"]; label: string; color: string }[] = [
-  { key: "assigned", label: "Assigned", color: "#bcd4f5" },
-  { key: "claimed", label: "In progress", color: "#6fa3e8" },
-  { key: "in_review", label: "In review", color: "#2f6fd1" },
-  { key: "verified", label: "Review passed", color: "#173d86" },
+  { key: "assigned", label: "Assigned", color: "var(--chart-stage-1)" },
+  { key: "claimed", label: "In progress", color: "var(--chart-stage-2)" },
+  { key: "in_review", label: "In review", color: "var(--chart-stage-3)" },
+  { key: "verified", label: "Review passed", color: "var(--chart-stage-4)" },
 ];
 
 export function stageCounts(tasks: Task[]): Record<Task["status"], number> {
