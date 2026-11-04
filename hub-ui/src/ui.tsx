@@ -13,7 +13,7 @@ export const pretty = (value: string) =>
 
 export type IconKind =
   | "grid" | "inbox" | "work" | "folder" | "notes" | "agents" | "staging" | "network"
-  | "arrow" | "plus" | "refresh" | "search" | "chevron" | "check" | "pause" | "menu";
+  | "arrow" | "plus" | "refresh" | "search" | "chevron" | "check" | "pause" | "menu" | "theme";
 
 const paths: Record<IconKind, string> = {
   grid: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
@@ -32,6 +32,7 @@ const paths: Record<IconKind, string> = {
   check: "M5 12l5 5L20 7",
   pause: "M9 5v14 M15 5v14",
   menu: "M4 6h16 M4 12h16 M4 18h16",
+  theme: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18 M12 3v18",
 };
 
 export function Icon({ kind, size = 18 }: { kind: IconKind; size?: number }) {
