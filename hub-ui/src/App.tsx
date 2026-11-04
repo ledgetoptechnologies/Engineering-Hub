@@ -11,6 +11,7 @@ import { useRoute, type Route } from "./router";
 import { workspaceNav } from "./navModel";
 import { ProjectNav, WorkspaceNav } from "./SideNav";
 import { Badge, Icon, Modal, PageHeader, pretty } from "./ui";
+import { ThemeControl } from "./ThemeControl";
 import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
@@ -703,6 +704,7 @@ export function HubApp() {
             <span className="date">
               {new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/Chicago" }).format(new Date())}
             </span>
+            <ThemeControl />
             <Badge tone={demo ? "amber" : "forest"}>{demo ? "DEMO" : "PRIVATE"}</Badge>
             {session?.authenticated && !demo && (
               <button className="text-button" onClick={() => { agentReader.current?.pause(); void mutate(() => client.logout(session.csrf_token!), "Signed out."); }}>
