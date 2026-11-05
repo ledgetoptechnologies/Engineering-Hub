@@ -48,7 +48,6 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
   return <section className="panel software-queue" id="software-queue" aria-label="Software validation queue">
     <div className="panel-title"><h2>Software validation queue</h2>
       <span className="panel-action"><button className="secondary" type="button" disabled={mode === "demo" || state === "loading"} onClick={() => setRevision(value => value + 1)}>Check queue</button></span></div>
-    <p className="panel-description">Read-only coordination, separate from agent presence. No deployment, approval or execution controls.</p>
     {stale && <p role="status">Workspace events are stale. Queue information is not continuously verified.</p>}
     {state !== "loaded" && <p role={state === "unknown" ? "alert" : "status"}>{messages[state]}</p>}
     {snapshot && <>

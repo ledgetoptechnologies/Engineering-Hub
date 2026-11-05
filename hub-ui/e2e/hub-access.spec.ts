@@ -318,16 +318,3 @@ test("the hand-over confirmation shows exact ids, and changing the target asks f
   await expect(dialog.getByLabel("To session id")).toHaveText(second);
   await expect(dialog.getByLabel("I understand the review is cleared")).not.toBeChecked();
 });
-
-test("with Hub access available, the staging note says tasks and reviews need a grant", async ({ page }) => {
-  await fixture(page);
-  await page.goto("/#/agents/installations");
-  await expect(panel(page)).toContainText("only where you grant them under Hub access");
-  await expect(panel(page)).not.toContainText("can't use Hub tasks or reviews");
-});
-
-test("without Hub access, the staging note keeps the foundation-only wording", async ({ page }) => {
-  await fixture(page, { catalog: false });
-  await page.goto("/#/agents/installations");
-  await expect(panel(page)).toContainText("can't use Hub tasks or reviews");
-});

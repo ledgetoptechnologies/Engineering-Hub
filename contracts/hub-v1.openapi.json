@@ -1869,6 +1869,24 @@
         }
       }
     },
+    "/api/hub/v1/agents/activity": {
+      "get": {
+        "summary": "Agent Activity",
+        "operationId": "agent_activity_api_hub_v1_agents_activity_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentActivityDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/staging/status": {
       "get": {
         "summary": "Status",
@@ -3920,6 +3938,103 @@
   },
   "components": {
     "schemas": {
+      "AgentActivityDTO": {
+        "properties": {
+          "observed_at": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Observed At"
+          },
+          "window_hours": {
+            "type": "integer",
+            "title": "Window Hours"
+          },
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentActivityItem"
+            },
+            "type": "array",
+            "maxItems": 3,
+            "title": "Agents"
+          },
+          "topics": {
+            "items": {
+              "$ref": "#/components/schemas/TopicActivityItem"
+            },
+            "type": "array",
+            "maxItems": 201,
+            "title": "Topics"
+          },
+          "open": {
+            "items": {
+              "$ref": "#/components/schemas/OpenMessageItem"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Open"
+          },
+          "open_total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Open Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "observed_at",
+          "window_hours",
+          "agents",
+          "topics",
+          "open",
+          "open_total"
+        ],
+        "title": "AgentActivityDTO"
+      },
+      "AgentActivityItem": {
+        "properties": {
+          "agent": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Agent"
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Pending"
+          },
+          "claimed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Claimed"
+          },
+          "oldest_pending_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "agent",
+          "pending",
+          "claimed",
+          "oldest_pending_at"
+        ],
+        "title": "AgentActivityItem"
+      },
       "AgentConnectionDTO": {
         "properties": {
           "state": {
@@ -5509,6 +5624,86 @@
           "expected_version"
         ],
         "title": "NoteWrite"
+      },
+      "OpenMessageItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Id"
+          },
+          "sender": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Sender"
+          },
+          "recipient": {
+            "type": "string",
+            "enum": [
+              "hermes",
+              "codex",
+              "claude"
+            ],
+            "title": "Recipient"
+          },
+          "message_type": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Message Type"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "low",
+              "normal",
+              "high",
+              "urgent"
+            ],
+            "title": "Priority"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "claimed"
+            ],
+            "title": "Status"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "created_at": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "sender",
+          "recipient",
+          "message_type",
+          "priority",
+          "status",
+          "topic",
+          "created_at"
+        ],
+        "title": "OpenMessageItem"
       },
       "OverviewDTO": {
         "properties": {
@@ -7202,6 +7397,116 @@
           "items"
         ],
         "title": "TaskListDTO"
+      },
+      "TopicActivityItem": {
+        "properties": {
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "agents": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "hermes",
+                "codex",
+                "claude"
+              ]
+            },
+            "type": "array",
+            "maxItems": 3,
+            "title": "Agents"
+          },
+          "messages": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Messages"
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Pending"
+          },
+          "claimed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Claimed"
+          },
+          "pending_by_agent": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "hermes",
+                "codex",
+                "claude"
+              ]
+            },
+            "type": "object",
+            "title": "Pending By Agent"
+          },
+          "claimed_by_agent": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "hermes",
+                "codex",
+                "claude"
+              ]
+            },
+            "type": "object",
+            "title": "Claimed By Agent"
+          },
+          "oldest_pending_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Pending At"
+          },
+          "last_activity_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Activity At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "topic",
+          "agents",
+          "messages",
+          "pending",
+          "claimed",
+          "pending_by_agent",
+          "claimed_by_agent",
+          "oldest_pending_at",
+          "last_activity_at"
+        ],
+        "title": "TopicActivityItem"
       },
       "TopicCatalogDTO": {
         "properties": {

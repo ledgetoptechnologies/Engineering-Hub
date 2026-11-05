@@ -125,7 +125,6 @@ export function MachineHealth({ hub, deviceId }: { hub: Hub; deviceId?: string }
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={() => setAttempt(value => value + 1)}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
-    <p className="panel-description">Read from Prometheus when you open this page or press Refresh. Values are what the exporters last reported.</p>
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
     {notice && <p className="notice" role="status">{notice}</p>}

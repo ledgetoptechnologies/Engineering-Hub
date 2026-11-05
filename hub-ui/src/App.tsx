@@ -16,6 +16,7 @@ import { HomePage } from "./pages/HomePage";
 import { InboxPage, WorkPage } from "./pages/WorkPages";
 import { ProjectPage, ProjectsPage } from "./pages/ProjectPages";
 import { AgentsPage, StagingPage } from "./pages/SystemPages";
+import { AgentMapPage } from "./pages/AgentMapPage";
 import { InfrastructurePage } from "./pages/InfrastructurePage";
 import { OrchestrationPage } from "./pages/OrchestrationPage";
 import { orchestrationEnabled } from "./orchestrationApi";
@@ -616,6 +617,7 @@ export function HubApp() {
   });
   const subTitles: Partial<Record<Route["page"], string>> = {
     "agent-installations": "Agents / Installations",
+    "agent-map": "Agents / Map",
     "staging-queues": "Staging / Queues & sessions",
     "staging-resources": "Staging / Kept resources",
     "orchestration-request": "Orchestration",
@@ -728,8 +730,7 @@ export function HubApp() {
         )}
         {!hub ? (
           <>
-            <PageHeader eyebrow="DEVELOPMENT / STAGING" title="Engineering, in view"
-              subtitle="Your projects, your agents, and a clear next step.">{actions}</PageHeader>
+            <PageHeader eyebrow="DEVELOPMENT / STAGING" title="Engineering, in view">{actions}</PageHeader>
             <section className="login-panel">
               <span className="login-symbol">H</span>
               <p className="eyebrow">YOUR PRIVATE CONTROL PLANE</p>
@@ -764,8 +765,7 @@ export function HubApp() {
             {route.page === "project" && <ProjectPage hub={hub} id={route.id} tab={route.tab} actions={actions} notesProps={notesProps} />}
             {route.page === "notes" && (
               <>
-                <PageHeader eyebrow="NOTES" title="Shared notes"
-                  subtitle="Durable notes shared with the agents. Context only, never approvals.">{actions}</PageHeader>
+                <PageHeader eyebrow="NOTES" title="Shared notes">{actions}</PageHeader>
                 <NotesPanel {...notesProps} selectedProject="all" />
               </>
             )}
@@ -773,10 +773,10 @@ export function HubApp() {
             {route.page === "review" && <ReviewPage hub={hub} project={route.project} id={route.id} actions={actions} />}
             {route.page === "agents" && <AgentsPage hub={hub} actions={actions} />}
             {route.page === "agent-installations" && <AgentsPage hub={hub} actions={actions} view="installations" />}
+            {route.page === "agent-map" && <AgentMapPage hub={hub} actions={actions} />}
             {route.page === "planning" && (
               <>
-                <PageHeader eyebrow="PLANNING" title="Plans & ideas"
-                  subtitle="Plans and ideas across projects, plus the Engineering Hub improvement backlog. Never execution approval.">{actions}</PageHeader>
+                <PageHeader eyebrow="PLANNING" title="Plans & ideas">{actions}</PageHeader>
                 <PlanningPanel {...notesProps} selectedProject="all" topic={topic} />
               </>
             )}

@@ -231,14 +231,7 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
   return (
     <section className="panel installations" aria-label="Installations">
       {header}
-      <p className="panel-description">Each agent installation has its own connection, so one computer can have separate Codex and Claude
-        installations. Ending a session stops just that session. Disconnecting an installation ends all of its sessions and needs a fresh,
-        approved pairing to use again; other installations, even on the same computer, keep working. No passwords or tokens are shown here.</p>
       <PairingGuide open={load === "loaded" && items.length === 0} environment={environment} />
-      {catalog ? <p className="notice">A {environmentLabel} connection approved here can send and receive its own messages. It can use Hub tasks,
-        reviews and other project operations only where you grant them under Hub access. Running work and waking an agent's chat stay separate.</p>
-        : <p className="notice">This is the {environmentLabel} identity and messaging foundation. A connection approved here can send and receive its own
-        messages, but it can't use Hub tasks or reviews, and it doesn't wake an agent's chat automatically.</p>}
       {demo && <p className="notice">Demo: these installations are examples. Nothing can be approved or revoked.</p>}
       {failure && <p role="alert" className="notice error">{failure}</p>}
       {notice && !dialog && <p role={notice.error ? "alert" : "status"} className={notice.error ? "notice error" : "notice"}>{notice.text}</p>}
@@ -321,9 +314,6 @@ export function AgentConnectionsPanel({ hub, client: given }: { hub: Hub; client
           })}
         </ol>}
       </details>
-      <p className="panel-footnote">"Last used" is when a session last called the Hub. It's a transport observation: it doesn't prove the agent is
-        listening, ready, or doing work. Ending a session or disconnecting an installation stops the Hub accepting it; it can't stop a program
-        already running on that computer.</p>
 
       {dialog?.kind === "approve" && <ApproveDialog item={dialog.item} now={now} busy={busy === `approve:${dialog.item.id}`} canChange={canChange}
         error={notice?.error && notice.for === `approve:${dialog.item.id}` ? notice.text : ""}
