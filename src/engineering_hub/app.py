@@ -42,7 +42,7 @@ from .registry_client import (
 from .dto import (
     AgentListDTO, AutonomyDTO, DecisionDTO, DecisionListDTO, EventStatusDTO,
     HealthDTO, OverviewDTO, PauseDTO, ProjectListDTO, RunDTO, RunListDTO, RecoveryDTO,
-    TaskDTO, TaskListDTO,
+    PilotReleaseEvidenceDTO, TaskDTO, TaskListDTO,
 )
 
 @dataclass(frozen=True)
@@ -1154,6 +1154,20 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     def list_runs(request: Request):
         actor(request)
         return {"items": repo.list_runs()}
+
+    @app.get("/api/hub/v1/container-pilot/runs/{run_id}/release-evidence",
+             response_model=PilotReleaseEvidenceDTO)
+    def container_pilot_release_evidence(run_id: str, request: Request):
+        human(request)
+        workflow = container_pilot_workflow
+        if workflow is None and owned_pilot_service is not None:
+            workflow = owned_pilot_service.workflow
+        if workflow is None and queued_pilot_runtime is not None:
+            workflow = queued_pilot_runtime.bridge.workflow
+        if workflow is None:
+            raise HTTPException(423, detail={'code': 'container_pilot_not_enabled'})
+        from .pilot_release_evidence import pilot_release_evidence
+        return pilot_release_evidence(repo, workflow, run_id)
 
     @app.post("/api/hub/v1/runs", status_code=201, response_model=RunDTO)
     def create_run(payload: NewRun, request: Request):

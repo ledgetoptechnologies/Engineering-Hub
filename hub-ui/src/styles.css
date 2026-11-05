@@ -4690,3 +4690,18 @@ button.primary.danger:disabled {
   .agent-map svg { min-width: 720px; }
   .map-foot { align-items: flex-start; flex-direction: column; }
 }
+/* Human-readable, read-only evidence for one container-pilot run. */
+.release-evidence { display: grid; gap: 12px; margin-top: 12px; min-width: 0; }
+.release-evidence-basis { border-left: 3px solid #b68222; border-radius: 4px; padding: 10px 12px; background: var(--surface-2); }
+.release-evidence-basis p { margin: 6px 0 0; color: var(--ink-2); font-size: 13px; }
+.release-evidence-facts { display: grid; grid-template-columns: minmax(120px, .7fr) minmax(0, 2fr); gap: 7px 12px; margin: 0; }
+.release-evidence-facts dt { color: var(--muted); font-size: 13px; font-weight: 600; }
+.release-evidence-facts dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.release-evidence-steps { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 13px; }
+.release-evidence-steps th, .release-evidence-steps td { padding: 8px; border-top: 1px solid var(--line); text-align: left; vertical-align: top; }
+.release-evidence-steps th { font-weight: 600; }
+.release-evidence-steps small { display: block; color: var(--muted); }
+@media (max-width: 700px) {
+  .release-evidence-facts { grid-template-columns: 1fr; gap: 3px; }
+  .release-evidence-facts dd { margin-bottom: 7px; }
+}

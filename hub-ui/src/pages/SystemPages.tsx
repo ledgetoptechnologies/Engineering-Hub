@@ -10,6 +10,7 @@ import type { AgentSummary } from "../types";
 import { Badge, Icon, PageHeader, PanelTitle, names, pretty } from "../ui";
 import { WorkQueuePanel } from "../WorkQueuePanel";
 import { StagingRuntimePanel } from "../StagingRuntimePanel";
+import { RunReleaseEvidence } from "../ReleaseEvidencePanel";
 import { StagingResourcesPanel } from "../StagingResourcesPanel";
 import { SessionReconciliationPanel } from "../SessionReconciliationPanel";
 import { SharedStagingPanel } from "../SharedStagingPanel";
@@ -266,6 +267,9 @@ export function StagingPage({ hub, actions, view = "overview" }: {
                   )}
                   <code>{run.artifact_digest}</code>
                   <p className="small-text">Fence {run.fencing_generation} · {run.events.length} recorded events</p>
+                  {!hub.demo && hub.session?.authenticated && (
+                    <RunReleaseEvidence runId={run.id} onUnauthorized={hub.clearPrivateWorkspace} />
+                  )}
                 </details>
               ))}
             </div>
