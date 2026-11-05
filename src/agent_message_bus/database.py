@@ -414,23 +414,27 @@ class MessageRepository:
             rows = conn.execute(sql + " ORDER BY created_at LIMIT ?", (*params, limit)).fetchall()
             return [self._from_row(row) for row in rows]
 
-    def routing_activity(self, *, since: str, open_limit: int = 100) -> dict[str, Any]:
+    def routing_activity(self, *, since: str, open_limit: int = 100, scan_limit: int = 5000) -> dict[str, Any]:
         """Message routing metadata for a human overview. Only body.topic is read from a body."""
         topic = ("CASE WHEN json_valid(body_json) AND json_type(body_json, '$.topic') = 'text' "
                  "THEN json_extract(body_json, '$.topic') END")
         with self._connection() as conn:
             open_counts = conn.execute(
                 f"SELECT recipient, {topic} AS topic, status, COUNT(*) AS total, MIN(created_at) AS oldest "
-                "FROM messages WHERE status IN ('pending', 'claimed') GROUP BY recipient, topic, status").fetchall()
+                "FROM (SELECT recipient, status, created_at, body_json FROM messages "
+                "WHERE status IN ('pending', 'claimed') ORDER BY created_at LIMIT ?) "
+                "GROUP BY recipient, topic, status", (scan_limit,)).fetchall()
+            open_total = conn.execute("SELECT COUNT(*) FROM messages WHERE status IN ('pending', 'claimed')").fetchone()[0]
             links = conn.execute(
                 f"SELECT sender, recipient, {topic} AS topic, COUNT(*) AS total, MAX(created_at) AS latest "
-                "FROM messages WHERE created_at >= ? GROUP BY sender, recipient, topic", (since,)).fetchall()
+                "FROM (SELECT sender, recipient, created_at, body_json FROM messages WHERE created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?) GROUP BY sender, recipient, topic", (since, scan_limit)).fetchall()
             waiting = conn.execute(
                 f"SELECT id, sender, recipient, message_type, priority, status, created_at, {topic} AS topic "
                 "FROM messages WHERE status IN ('pending', 'claimed') ORDER BY created_at LIMIT ?",
                 (min(max(1, int(open_limit)), 100),)).fetchall()
         return {"open_counts": [dict(row) for row in open_counts], "links": [dict(row) for row in links],
-                "open": [dict(row) for row in waiting]}
+                "open": [dict(row) for row in waiting], "open_total": open_total}
 
     @staticmethod
     def _delivery_head(conn: sqlite3.Connection) -> int:

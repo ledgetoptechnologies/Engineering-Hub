@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { demoActivity, parseActivity, type TopicActivity } from "./agentActivityApi";
+import { OWNER_REQUIRED, demoActivity, parseActivity, readActivity, type TopicActivity } from "./agentActivityApi";
 import type { Installation, Session } from "./agentConnectionsApi";
 import { MAX_TOPICS_SHOWN, agentKey, agentLoad, buildAgents, buildSessions, connectedTo, fit, layoutMap, rankTopics, sessionKey, topicKey } from "./agentMap";
 import type { Task } from "./types";
@@ -112,6 +112,18 @@ describe("activity parsing", () => {
     const snapshot = JSON.parse(JSON.stringify(demoActivity(NOW)));
     expect(() => parseActivity({ ...snapshot, open_total: -1 })).toThrow();
     expect(() => parseActivity({ ...snapshot, agents: [{ ...snapshot.agents[0], agent: "other" }] })).toThrow();
+  });
+});
+
+describe("reading activity", () => {
+  const reply = (status: number, code: string) => (async () => new Response(JSON.stringify({ detail: { code } }),
+    { status, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  it("tells a non-owner refusal apart from a lost session", async () => {
+    await expect(readActivity(new AbortController().signal, reply(403, OWNER_REQUIRED))).rejects.toMatchObject({ code: OWNER_REQUIRED });
+    await expect(readActivity(new AbortController().signal, reply(403, "forbidden"))).rejects.toMatchObject({ code: "agent_activity_failed" });
+  });
+  it("treats a missing route as an older Hub", async () => {
+    await expect(readActivity(new AbortController().signal, reply(404, "not_found"))).resolves.toBeNull();
   });
 });
 

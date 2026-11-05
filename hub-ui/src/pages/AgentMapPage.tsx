@@ -1,6 +1,6 @@
 /** Agents map: live sessions, the agents behind them, the topics they talk on, and what nobody has picked up. */
 import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
-import { demoActivity, readActivity, type ActivitySnapshot, type OpenMessage } from "../agentActivityApi";
+import { OWNER_REQUIRED, demoActivity, readActivity, type ActivitySnapshot, type OpenMessage } from "../agentActivityApi";
 import { demoAgentConnections, httpAgentConnections, type Installation, type Session } from "../agentConnectionsApi";
 import { COLUMNS, MAP_WIDTH, agentKey, buildAgents, buildSessions, connectedTo, fit, layoutMap, sessionKey, topicKey,
   type AgentLoad, type MapLine, type SessionLoad } from "../agentMap";
@@ -22,7 +22,7 @@ interface Directory { installations: Installation[]; sessions: Record<string, Se
 
 function useActivity(hub: Hub) {
   const [activity, setActivity] = useState<ActivitySnapshot | null>(null);
-  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "failed">("loading");
+  const [state, setState] = useState<"loading" | "loaded" | "unsupported" | "failed" | "not_owner">("loading");
   useEffect(() => {
     if (hub.demo) { setActivity(demoActivity()); setState("loaded"); return; }
     let controller = new AbortController();
@@ -37,7 +37,8 @@ function useActivity(hub: Hub) {
         setState(value ? "loaded" : "unsupported");
       }).catch(error => {
         if (signal.aborted) return;
-        if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
+        if (error instanceof HubApiError && error.code === OWNER_REQUIRED) setState("not_owner");
+        else if (error instanceof HubApiError && [401, 403].includes(error.status)) hub.clearPrivateWorkspace();
         else setState("failed");
       });
     };
@@ -49,7 +50,7 @@ function useActivity(hub: Hub) {
   return { activity, state };
 }
 
-/** Sessions are owner-only. Anyone else still gets the agents and topics, so a refusal is not an error. */
+/** Sessions are read separately, so a failure here leaves the agents and topics showing. */
 function useDirectory(hub: Hub) {
   const [directory, setDirectory] = useState<Directory | null>(null);
   useEffect(() => {
@@ -152,6 +153,7 @@ export function AgentMapPage({ hub, actions }: { hub: Hub; actions: ReactNode })
       {hub.demo && <p className="notice">Demo: these sessions and messages are examples.</p>}
       {state === "loading" && <p role="status">Reading activity…</p>}
       {state === "unsupported" && <p className="notice">This Hub needs an update before it can show the map.</p>}
+      {state === "not_owner" && <p className="notice">Only the Hub owner can see the map.</p>}
       {state === "failed" && <p role="alert" className="notice error">{activity ? "Couldn't refresh. Showing the last reading." : "Activity couldn't be read."}</p>}
       {activity && layout && <>
         <dl className="map-stats">
