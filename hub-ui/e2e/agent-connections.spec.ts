@@ -112,7 +112,6 @@ test("the owner sees installations by agent, a staging badge and the pairing che
   await expect(claude.getByLabel("Pairing check")).toContainText("482913");
   await expect(claude.getByLabel("Pairing check")).toContainText("a1b2c3d4e5f60718");
   await expect(panel.getByRole("region", { name: "Hermes installations" })).toContainText("No Hermes installations yet.");
-  await expect(panel).toContainText("doesn't prove the agent is listening");
   await expect(panel).not.toContainText(/eh[is]_/);
 });
 

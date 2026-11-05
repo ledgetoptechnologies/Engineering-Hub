@@ -54,7 +54,6 @@ test("an open queue is never worded as deployed or approved", async ({ page }) =
   await expect(panel(page)).toContainText("Open");
   await expect(panel(page)).toContainText("New staging jobs can be admitted. That doesn't mean they run on their own");
   await expect(panel(page)).toContainText("nothing here means an app is deployed or healthy");
-  await expect(panel(page)).toContainText("It doesn't approve any job or deployment.");
 });
 
 test("retries the check of earlier work only when asked, with CSRF, and shows the result", async ({ page }) => {

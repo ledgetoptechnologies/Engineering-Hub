@@ -196,8 +196,7 @@ function OrchestrationLoader({ requestId, reader }: { requestId: string | null; 
 export function OrchestrationPage({ hub, actions, requestId = null }: { hub: Hub; actions: ReactNode; requestId?: string | null }) {
   return (
     <>
-      <PageHeader eyebrow="ORCHESTRATION · DEMO" title="Requests in flight"
-        subtitle="Each request, split into one dispatch per role. Read-only; sample data until the backend exists.">{actions}</PageHeader>
+      <PageHeader eyebrow="ORCHESTRATION · DEMO" title="Requests in flight">{actions}</PageHeader>
       <OrchestrationView mode={hub.demo ? "demo" : "live"} requestId={requestId} />
     </>
   );

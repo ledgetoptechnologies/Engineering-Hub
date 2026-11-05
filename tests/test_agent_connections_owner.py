@@ -39,6 +39,19 @@ def owner_app(tmp_path):
         yield client, app, bus.state.agent_sessions, headers
 
 
+def test_agent_activity_is_wired_for_the_owner_only(owner_app):
+    client, app, repository, _ = owner_app
+    app.state.embedded_bus.state.service.repository.insert(
+        sender='codex', recipient='claude', message_type='request', body={'topic': 'live topic', 'text': 'never returned'})
+    path = '/api/hub/v1/agents/activity'
+    response = client.get(path)
+    assert response.status_code == 200 and 'never returned' not in response.text
+    assert response.json()['topics'][0]['pending_by_agent'] == {'claude': 1}
+    assert client.get(path, headers={'Authorization': 'Bearer synthetic-codex'}).status_code == 403
+    repository.owner = 'human:someone-else'
+    assert client.get(path).json()['detail']['code'] == 'agent_activity_owner_required'
+
+
 def pending(repository):
     secret = 'ehi_' + 'A' * 43
     record = repository.request_enrollment('codex', 'Synthetic processing PC', 'fixture',

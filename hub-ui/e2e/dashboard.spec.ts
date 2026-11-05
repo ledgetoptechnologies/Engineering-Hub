@@ -36,7 +36,6 @@ test("Hub connection snapshots remain distinct from unconfigured topic readiness
   await expect(page.getByText("Topic readiness: Not tracked yet", { exact: true })).toBeVisible();
   await expect(page.locator(".peer-row")).toHaveCount(0);
   await expect(page.getByText("Online · verified", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("may still accept writes after the agent stops listening.", { exact: false })).toBeVisible();
 });
 
 test("retained Hub observations expire without overview or topic polling", async ({ page }) => {

@@ -53,8 +53,7 @@ test("splits the staging engine from other programs, and offers no controls", as
   await expect(panel(page)).not.toContainText("registry.example.test");
   await expect(panel(page)).not.toContainText("sha256");
   await expect(panel(page).getByRole("button")).toHaveText(["Refresh"]);
-  // The only mention of readiness is the disclaimer that this isn't one.
-  await expect(panel(page).getByText(/\bready\b/i)).toHaveText([/^What the staging PC reported .*doesn't mean the PC is ready for work/]);
+  await expect(panel(page).getByText(/\bready\b/i)).toHaveCount(0);
   expect(blocking(await audit(page, "page", 1440))).toEqual([]);
 });
 

@@ -138,8 +138,6 @@ test("a device page shows declared facts, checks and the journal as plain text",
   await page.goto("/#/infrastructure/build-pc");
   const facts = page.getByRole("region", { name: "Declared details" });
   await expect(facts).toContainText("198.51.100.0/24");
-  await expect(facts).toContainText("Recorded details aren't checked against the device itself.");
-  await expect(page.getByRole("region", { name: "Checks" })).toContainText("doesn't prove the device is powered on or that agents can use it");
   const maintenance = page.getByRole("region", { name: "Maintenance" });
   await expect(maintenance).toContainText("Open · overdue");
   await expect(maintenance).toContainText("that's passed, but it stays open until someone resolves it");

@@ -21,7 +21,7 @@ describe("workspace sections", () => {
   it("has a sub-item key for every route that belongs to one", () => {
     const all = ids(workspaceNav({ ...base, infrastructure: true, orchestration: true, deviceId: "x" }));
     const routes: Route[] = [{ page: "home" }, { page: "inbox" }, { page: "work" }, { page: "orchestration" },
-      { page: "orchestration-request", id: "r" }, { page: "agents" }, { page: "agent-installations" }, { page: "staging" },
+      { page: "orchestration-request", id: "r" }, { page: "agents" }, { page: "agent-installations" }, { page: "agent-map" }, { page: "staging" },
       { page: "staging-queues" }, { page: "staging-resources" }, { page: "infrastructure" }, { page: "device", id: "x" }];
     for (const route of routes) expect(all).toContain(navKey(route));
   });

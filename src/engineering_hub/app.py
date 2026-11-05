@@ -802,6 +802,9 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     app.state.project_registry = project_registry
     from .topic_catalog_api import attach_topic_catalog_route
     attach_topic_catalog_route(app, bridge=registry_bridge, human=human)
+    from .agent_activity_api import attach_agent_activity_route
+    attach_agent_activity_route(app, bus_service=getattr(getattr(bus_app, 'state', None), 'service', None),
+                                sessions=connection_service, human=human)
 
     if archive_reader is not None:
         from .archive_api import attach_archive_routes
