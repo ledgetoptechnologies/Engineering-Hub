@@ -66,12 +66,22 @@ export function parseActivity(value: unknown): ActivitySnapshot {
   };
 }
 
+export const OWNER_REQUIRED = "agent_activity_owner_required";
+
+async function ownerRequired(response: Response): Promise<boolean> {
+  try {
+    const body: unknown = await response.clone().json();
+    return (body as { detail?: { code?: unknown } })?.detail?.code === OWNER_REQUIRED;
+  } catch { return false; }
+}
+
 /** null means this Hub is too old to have the route; other failures are thrown. */
 export async function readActivity(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<ActivitySnapshot | null> {
   const response = await fetchImpl.call(globalThis, "/api/hub/v1/agents/activity", {
     method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal,
   });
   if (await isMissingRoute(response)) return null;
+  if (response.status === 403 && await ownerRequired(response)) throw new HubApiError(403, OWNER_REQUIRED);
   if (!response.ok) throw new HubApiError(response.status, "agent_activity_failed");
   return parseActivity(await response.json());
 }

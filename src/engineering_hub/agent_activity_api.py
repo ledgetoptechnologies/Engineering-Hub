@@ -104,15 +104,17 @@ def project_activity(raw, *, observed_at, window_hours=WINDOW_HOURS):
                 open=[{**row, 'topic': _topic(row['topic']),
                        'message_type': row['message_type'] if _TYPE.fullmatch(row['message_type']) else 'other'}
                       for row in raw['open']],
-                open_total=sum(row['total'] for row in raw['open_counts']))
+                open_total=raw['open_total'])
 
 
-def attach_agent_activity_route(app, *, bus_service, human):
+def attach_agent_activity_route(app, *, bus_service, sessions, human):
     @app.get('/api/hub/v1/agents/activity', response_model=AgentActivityDTO)
     def agent_activity(request: Request, response: Response):
-        human(request)
-        if bus_service is None:
+        actor = human(request)
+        if bus_service is None or sessions is None:
             raise HubError('agent_activity_unavailable', 503)
+        if actor != sessions.owner:
+            raise HubError('agent_activity_owner_required', 403)
         now = datetime.now(timezone.utc)
         since = (now - timedelta(hours=WINDOW_HOURS)).isoformat().replace('+00:00', 'Z')
         response.headers['Cache-Control'] = 'no-store'

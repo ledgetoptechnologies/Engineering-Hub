@@ -1,15 +1,19 @@
 """Agents map data: routing counts for humans, with no message content."""
 import json
+from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 import pytest
 
 from agent_message_bus.auth import AuthSettings
 from agent_message_bus.database import MessageRepository
-from engineering_hub.agent_activity_api import project_activity
+from engineering_hub.agent_activity_api import attach_agent_activity_route, project_activity
 from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.private_gateway import browser_route_allowed
+from engineering_hub.repository import HubError
 
 SECRET = 'body text that must never appear'
 PATH = '/api/hub/v1/agents/activity'
@@ -99,11 +103,20 @@ def test_open_list_is_capped_but_the_total_is_not(repo):
     assert len(result['open']) == 2 and result['open_total'] == 3
 
 
+def test_scans_are_bounded_but_the_total_stays_true(repo):
+    for _ in range(3):
+        send(repo, 'codex', 'claude', {'topic': 'busy'})
+    raw = repo.routing_activity(since='2000-01-01T00:00:00Z', scan_limit=2)
+    assert sum(row['total'] for row in raw['open_counts']) == 2
+    assert sum(row['total'] for row in raw['links']) == 2
+    assert raw['open_total'] == 3
+
+
 def test_busy_topics_survive_the_topic_cap():
     links = [dict(sender='codex', recipient='claude', topic=f'quiet-{index:03}', total=1, latest='t')
              for index in range(250)]
     counts = [dict(recipient='claude', topic='zz-busy', status='pending', total=1, oldest='t')]
-    result = project_activity(dict(open_counts=counts, links=links, open=[]), observed_at='now')
+    result = project_activity(dict(open_counts=counts, links=links, open=[], open_total=1), observed_at='now')
     assert len(result['topics']) == 200 and result['topics'][0]['topic'] == 'zz-busy'
 
 
@@ -118,6 +131,35 @@ def test_route_is_human_only_and_needs_the_bus(tmp_path):
         session = app.state.sessions.create_session(42)
         client.cookies.set(settings.auth_config.cookie_name, session['cookie_token'])
         assert client.get(PATH).status_code == 503
+
+
+def activity_client(repo, owner='human:42', actor='human:42'):
+    app = FastAPI()
+
+    @app.exception_handler(HubError)
+    async def refused(request, error):
+        return JSONResponse({'detail': {'code': error.code}}, status_code=error.status)
+
+    attach_agent_activity_route(app, bus_service=SimpleNamespace(repository=repo),
+                                sessions=owner and SimpleNamespace(owner=owner), human=lambda request: actor)
+    return TestClient(app)
+
+
+def test_owner_gets_counts_and_no_body(repo):
+    send(repo, 'codex', 'claude', {'topic': 'live topic', 'text': SECRET})
+    response = activity_client(repo).get(PATH)
+    assert response.status_code == 200 and response.headers['cache-control'] == 'no-store'
+    assert SECRET not in response.text
+    assert response.json()['topics'][0]['pending_by_agent'] == {'claude': 1}
+
+
+def test_another_human_is_refused(repo):
+    refused = activity_client(repo, actor='human:7').get(PATH)
+    assert refused.status_code == 403 and refused.json()['detail']['code'] == 'agent_activity_owner_required'
+
+
+def test_no_owner_record_means_unavailable_not_open(repo):
+    assert activity_client(repo, owner=None).get(PATH).status_code == 503
 
 
 def test_gateway_exposes_only_the_read():
