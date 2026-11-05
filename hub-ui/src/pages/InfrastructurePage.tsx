@@ -89,8 +89,7 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
     kind === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now)).length;
   const canEdit = Boolean(list?.capabilities.device_write) && hub.writable && !hub.stale && !hub.demo;
   return <>
-    <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure"
-      subtitle="The devices the Hub knows about, what its checks last saw, and any maintenance in progress. Nothing here powers or changes a device.">
+    <PageHeader eyebrow="INFRASTRUCTURE" title="Infrastructure">
       {actions}
     </PageHeader>
     <section className="panel infra" aria-label="Devices">
@@ -168,7 +167,6 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
           {detail.capabilities.device_write && writable && !editing && <button type="button" className="secondary" onClick={() => setEditing(true)}>Edit</button>}
           <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>Refresh</button>
         </PanelTitle>
-        <p className="panel-description">What's been recorded about this device. Recorded details aren't checked against the device itself.</p>
         {device.retired && <p className="notice" role="status">This device is retired. Its history is kept.</p>}
         {editing ? <DeviceEditor client={client} csrf={csrf} device={device} onDone={saved => { setEditing(false); if (saved) refresh(); }} />
           : <dl className="infra-facts">
@@ -184,7 +182,6 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
       </section>
       <section className="panel" aria-label="Checks">
         <PanelTitle title="Checks" />
-        <p className="panel-description">A passed check means only that the check succeeded. It doesn't prove the device is powered on or that agents can use it.</p>
         {device.observations.length === 0 ? <p className="infra-empty">No checks are set up for this device, so its state is unknown.</p>
           : <ul className="infra-checks">{device.observations.map(item => { const view = observationView(item, now);
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
@@ -216,7 +213,6 @@ function MaintenanceSection({ client, csrf, detail, now, self, canWrite, onChang
   const open = detail.device.open_maintenance;
   return <section className="panel" aria-label="Maintenance">
     <PanelTitle title="Maintenance" />
-    <p className="panel-description">Notes on planned or ongoing work, so an outage has a reason attached. A note records intent; it isn't proof the work happened.</p>
     {open ? <OpenMaintenance client={client} csrf={csrf} entry={open} now={now} self={self} canWrite={canWrite} onChanged={onChanged} />
       : canWrite ? <MaintenanceForm client={client} csrf={csrf} deviceId={detail.device.id} onChanged={onChanged} />
         : <p className="infra-empty">No maintenance is open.</p>}

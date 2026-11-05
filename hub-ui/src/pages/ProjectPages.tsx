@@ -243,7 +243,6 @@ function ActivityFeed({ hub, project, fallback }: { hub: Hub; project: string; f
   if (!items.length) return <EmptyState title="No activity yet." />;
   return (
     <>
-      <p className="panel-description">Every recorded change, newest first. Titles are shown as they are now.</p>
       <ol className="timeline" aria-label="Activity history">
         {items.map((item) => (
           <li key={item.sequence}>

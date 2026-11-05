@@ -22,8 +22,7 @@ export function HomePage({ hub, actions }: { hub: Hub; actions: React.ReactNode 
   const targets = projects.filter((item) => item.executor_enabled).length;
   return (
     <>
-      <PageHeader eyebrow="DEVELOPMENT / STAGING" title={greeting()}
-        subtitle="What needs you, what's moving, and who's around.">{actions}</PageHeader>
+      <PageHeader eyebrow="DEVELOPMENT / STAGING" title={greeting()}>{actions}</PageHeader>
       <div className="kpi-grid">
         <a className={`kpi ${waiting.length ? "attention" : ""}`} href={link("/inbox")}>
           <span className="kpi-label"><Icon kind="inbox" size={16} /> Needs you</span>

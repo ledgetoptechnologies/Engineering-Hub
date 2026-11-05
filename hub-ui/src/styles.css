@@ -4635,3 +4635,58 @@ button.primary.danger:disabled {
   color: var(--ink-2);
   font-size: 12px;
 }
+
+/* Agents map */
+.map-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.map-stats > div {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.map-stats dt { color: var(--ink-3); font-size: 12px; }
+.map-stats dd { color: var(--ink); font-size: 24px; font-weight: 600; margin: 2px 0 0; }
+.map-stats dd small { color: var(--ink-3); font-size: 13px; font-weight: 400; }
+.map-stats .attention { background: var(--warn-bg); border-color: var(--warn-line); }
+.map-stats .attention dd, .map-stats .attention dt { color: var(--warn-text); }
+.agent-map { margin-bottom: 16px; }
+.agent-map svg { display: block; height: auto; width: 100%; }
+.map-node { cursor: pointer; outline: none; transition: opacity 120ms ease; }
+.map-node rect { fill: var(--surface-2); stroke: var(--line-strong); stroke-width: 1; }
+.map-node:hover rect { fill: var(--surface-3); }
+.map-node:focus-visible rect, .map-node.selected rect { stroke: var(--accent-text); stroke-width: 2; }
+.map-title { fill: var(--ink); font-size: 13px; font-weight: 600; }
+.map-sub { fill: var(--ink-3); font-size: 11px; }
+.map-dot { fill: var(--line-strong); }
+.map-dot.working, .map-dot.active { fill: var(--ok); }
+.map-dot.waiting { fill: var(--warn); }
+.map-line { transition: opacity 120ms ease; }
+.map-line path { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
+.map-line.handling path { stroke: var(--ok); }
+.map-line.waiting path { stroke: var(--warn); stroke-width: 2; }
+.map-count circle { fill: var(--warn); }
+.map-count text { fill: var(--surface); font-size: 11px; font-weight: 700; }
+.map-node.dim, .map-line.dim { opacity: 0.18; }
+.map-foot {
+  align-items: center;
+  color: var(--ink-3);
+  display: flex;
+  font-size: 12px;
+  gap: 12px;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+.map-table { overflow-x: auto; }
+.map-messages .badge { margin-left: 6px; }
+.map-messages td:last-child .badge { margin-left: 0; }
+@media (max-width: 720px) {
+  .map-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .agent-map { overflow-x: auto; }
+  .agent-map svg { min-width: 720px; }
+  .map-foot { align-items: flex-start; flex-direction: column; }
+}

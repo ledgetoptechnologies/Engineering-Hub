@@ -47,8 +47,7 @@ function HubConnectionRow({ agent, stale }: { agent: AgentSummary; stale: boolea
 function AgentInstallationsPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   return (
     <>
-      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations"
-        subtitle="Each agent installation, its sessions and its Hub access. No passwords or tokens are shown here.">
+      <PageHeader eyebrow="AGENTS / INSTALLATIONS" title="Installations">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
@@ -86,11 +85,9 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
   const topics: TopicEntry[] = serverTopics ?? remembered.map((topic) => ({ topic, last_activity_at: null, peer_count: null, source: "device" }));
   if (!topics.some((entry) => entry.topic === hub.topic))
     topics.unshift({ topic: hub.topic, last_activity_at: null, peer_count: null, source: "device" });
-  const connected = hub.agents.filter((agent) => connectionView(agent, !demo && stale).connected).length;
   return (
     <>
-      <PageHeader eyebrow="AGENTS" title="Agents"
-        subtitle="Recent Hub stream observations and reachability on a specific conversation topic. These are checked separately.">
+      <PageHeader eyebrow="AGENTS" title="Agents">
         {actions}
       </PageHeader>
       <div id="agents" className="agents-page">
@@ -98,15 +95,6 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
       <section className="agent-cards" aria-label="Hub stream observations">
         {hub.agents.map((agent) => <HubConnectionRow key={agent.id} agent={agent} stale={!demo && stale} />)}
       </section>
-      <p className="panel-footnote">
-        {connected} of {hub.agents.length} with a Hub stream observed. Stream observed means the Hub recently wrote to a
-        retained stream. An upstream connection may still accept writes after the agent stops listening. This does not prove
-        client receipt, listening, or work. Stale means recent stream activity is missing; it doesn't prove the agent is
-        offline. Topic readiness is checked separately.
-      </p>
-      <p className="panel-footnote">
-        Agent installations, their sessions and Hub access are under <a className="text-link" href={link("/agents/installations")}>Installations</a>.
-      </p>
       <section className="panel agents-panel" id="topics">
         <PanelTitle title="Topics" count={topics.length} />
         <div className="topics-layout">
@@ -171,17 +159,7 @@ function AgentsOverview({ hub, actions }: { hub: Hub; actions: React.ReactNode }
                 );
               })}
             </div>
-            <div className="advisory">
-              <span>↳</span>
-              <p>
-                This is a best guess. Messages are kept even when an agent is offline, and being
-                reachable doesn't mean a message was read or acted on.
-              </p>
-            </div>
-            <p className="panel-footnote">
-              {demo ? "All agent states above are illustrative fixtures."
-                : "An agent shows as unknown until the Hub can confirm its live session for this topic."}
-            </p>
+            {demo && <p className="panel-footnote">All agent states above are illustrative fixtures.</p>}
           </div>
         </div>
       </section>
@@ -203,8 +181,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   const { data } = hub;
   if (view === "queues") return (
     <>
-      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions"
-        subtitle="The shared staging queue, staging session review and the software validation queue. Software only.">
+      <PageHeader eyebrow="STAGING / QUEUES & SESSIONS" title="Queues & sessions">
         {actions}
       </PageHeader>
       <div className="staging-layout single">
@@ -224,8 +201,7 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   );
   if (view === "resources") return (
     <>
-      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources"
-        subtitle="What is kept on staging, held jobs and clean-up. Software only.">
+      <PageHeader eyebrow="STAGING / KEPT RESOURCES" title="Kept resources">
         {actions}
       </PageHeader>
       <div className="staging-layout single">
@@ -238,14 +214,12 @@ export function StagingPage({ hub, actions, view = "overview" }: {
   );
   return (
     <>
-      <PageHeader eyebrow="STAGING" title="Staging"
-        subtitle="Staging targets, the emergency pause, execution evidence and what is running on the staging PC. Software only.">
+      <PageHeader eyebrow="STAGING" title="Staging">
         {actions}
       </PageHeader>
       <div className="staging-layout">
         <section className="panel" id="staging">
           <PanelTitle title="Staging overview"><Badge tone="neutral">SOFTWARE ONLY</Badge></PanelTitle>
-          <p className="panel-description">Independent projects. Explicit activation. No production shortcuts.</p>
           <div className="staging-control">
             <div>
               <span className={`status-orb ${data.paused ? "paused" : ""}`} />
