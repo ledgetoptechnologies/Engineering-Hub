@@ -15,7 +15,8 @@ import {
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
 import { Badge, PageHeader, PanelTitle } from "../ui";
-import { MachineHealth } from "./MachineHealth";
+import { MachineHealth, MachineStrip, machinesByDevice, useMachineMetrics } from "./MachineHealth";
+import type { MachineGroup } from "../infrastructureMetrics";
 
 type Load<T> = { state: "loading" } | { state: "loaded"; value: T } | { state: "failed"; message: string } | { state: "unavailable" };
 type Filter = "all" | "attention" | "maintenance";
@@ -73,12 +74,14 @@ function Unavailable({ actions, children }: { actions: React.ReactNode; children
 function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const client = useClient(hub);
   const now = useNow();
+  const reading = useMachineMetrics(hub);
+  const machines = machinesByDevice(reading);
   const [retired, setRetired] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [creating, setCreating] = useState(false);
   const [load, refresh] = useRead<DeviceList>(hub, signal => client.list(signal, retired), [client, retired, hub.data]);
   // Machine health has its own admission: someone refused the device list may still read metrics, and it hides itself otherwise.
-  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} /></Unavailable>;
+  if (load.state === "unavailable") return <Unavailable actions={actions}><MachineHealth hub={hub} reading={reading} /></Unavailable>;
   const list = load.state === "loaded" ? load.value : null;
   const shown = (list?.items ?? []).filter(device => filter === "all" ? true
     : filter === "maintenance" ? device.open_maintenance !== null : needsAttention(device, now));
@@ -113,14 +116,14 @@ function DeviceListPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }
       {list && list.items.length === 0 && <p className="infra-empty">No devices are recorded yet.</p>}
       {list && list.items.length > 0 && shown.length === 0 && <p className="infra-empty">No devices match this filter.</p>}
       {shown.length > 0 && <ul className="infra-list">
-        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} />)}
+        {shown.map(device => <DeviceRow key={device.id} device={device} now={now} self={hub.session?.actor ?? null} machine={machines.get(device.id)} />)}
       </ul>}
     </section>
-    <MachineHealth hub={hub} />
+    <MachineHealth hub={hub} reading={reading} shownDevices={new Set((list?.items ?? []).map(device => device.id))} />
   </>;
 }
 
-function DeviceRow({ device, now, self }: { device: Device; now: Date; self: string | null }) {
+function DeviceRow({ device, now, self, machine }: { device: Device; now: Date; self: string | null; machine?: MachineGroup }) {
   const maintenance = device.open_maintenance ? maintenanceView(device.open_maintenance, now, self) : null;
   return <li className={device.retired ? "infra-row retired" : "infra-row"}>
     <a className="infra-row-main" href={href({ page: "device", id: device.id })}>
@@ -137,12 +140,14 @@ function DeviceRow({ device, now, self }: { device: Device; now: Date; self: str
         return <Badge key={item.probe_id} tone={view.tone}>{view.label}: {view.line}</Badge>; })}
       {maintenance && <span className={maintenance.overdue ? "infra-maintenance overdue" : "infra-maintenance"}>Maintenance: {maintenance.line}</span>}
     </div>
+    {machine && <MachineStrip group={machine} deviceId={device.id} now={now} />}
   </li>;
 }
 
 function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; id: string }) {
   const client = useClient(hub);
   const now = useNow();
+  const reading = useMachineMetrics(hub);
   const self = hub.session?.actor ?? null;
   const [editing, setEditing] = useState(false);
   const [load, refresh] = useRead<DeviceDetail>(hub, signal => client.detail(id, signal), [client, id, hub.data]);
@@ -184,7 +189,7 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
               <Badge tone={view.tone}>{view.line}</Badge></li>; })}</ul>}
       </section>
-      <MachineHealth hub={hub} deviceId={device.id} />
+      <MachineHealth hub={hub} deviceId={device.id} reading={reading} />
       <MaintenanceSection client={client} csrf={csrf} detail={detail} now={now} self={self}
         canWrite={detail.capabilities.maintenance_write && writable && !device.retired} onChanged={refresh} />
     </div>}

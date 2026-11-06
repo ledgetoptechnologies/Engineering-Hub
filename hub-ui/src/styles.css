@@ -4236,3 +4236,46 @@ button.text-button.danger { color: #a3402f; }
 .work-owner-text { display: grid; gap: 3px; min-width: 0; }
 .work-owner-text strong { font-size: 14px; overflow-wrap: anywhere; }
 .work-owner-text small { font-size: 12px; color: var(--muted); }
+
+/* Machine stats under each device, and history charts. */
+:root { --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #c98500; }
+:root[data-theme="dark"] { --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; }
+.machine-strip { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding-top: 10px;
+  border-top: 1px solid var(--line); color: inherit; text-decoration: none; }
+.machine-strip:hover .machine-stat-label { color: var(--ink-2); }
+.machine-strip.quiet { display: flex; }
+.machine-stat { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 3px; align-items: baseline; min-width: 0; }
+.machine-stat-label { font-size: 12px; color: var(--muted); }
+.machine-stat strong { font-size: 15px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.machine-stat small { grid-column: 1 / -1; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.machine-stat .machine-meter-track { grid-column: 1 / -1; display: block; height: 4px; }
+.machine-history-toggle { justify-self: start; }
+.history { display: grid; gap: 12px; margin-top: 14px; min-width: 0; }
+.machine-card .history { grid-column: 1 / -1; margin-top: 0; }
+.history-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.history-ranges { display: flex; gap: 6px; }
+.history-grid-layout { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
+.history-chart { margin: 0; min-width: 0; display: grid; gap: 6px; }
+.history-chart figcaption { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.history-chart figcaption span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.history-plot { position: relative; min-width: 0; }
+.history-plot svg { display: block; touch-action: pan-y; border-radius: 4px; }
+.history-plot svg:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.history-grid { stroke: var(--line); stroke-width: 1; }
+.history-axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.history-line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.history-dot { fill: var(--series); }
+.history-cross { stroke: var(--muted); stroke-width: 1; }
+.history-mark { fill: var(--series); stroke: var(--surface); stroke-width: 2; }
+.history-series-1 { --series: var(--series-1); }
+.history-series-2 { --series: var(--series-2); }
+.history-series-3 { --series: var(--series-3); }
+.history-series-4 { --series: var(--series-4); }
+.history-tip { position: absolute; top: 4px; margin-left: 10px; display: grid; gap: 2px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); font-size: 12px; white-space: nowrap; pointer-events: none; color: var(--ink-2); z-index: 1; }
+.history-tip.left { transform: translateX(calc(-100% - 20px)); }
+.history-tip small { color: var(--muted); }
+.history-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
+.history-legend li { display: flex; align-items: center; gap: 6px; }
+.history-swatch { width: 12px; height: 3px; border-radius: 2px; background: var(--series); }
+@media (max-width: 640px) { .machine-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

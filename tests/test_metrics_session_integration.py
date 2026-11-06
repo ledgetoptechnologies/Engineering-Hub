@@ -35,7 +35,7 @@ def test_owner_bulk_classification_and_mcp_read_isolation(unified):
     assert client.put(path, headers=csrf, json=body).status_code == 200
     for call in (first_call, second_call):
         result = data(call('hub_infrastructure_metrics', {}))
-        assert result['schema_version'] == 2
+        assert result['schema_version'] == 3
         assert result['source']['status'] == 'not_configured' and result['devices'] == []
     scope = '/api/hub/v1/agent-connections/installations/' + first + '/scope'
     assert client.put(scope, headers=csrf, json={'kind': 'project_only', 'expected_revision': 1}).status_code == 200
