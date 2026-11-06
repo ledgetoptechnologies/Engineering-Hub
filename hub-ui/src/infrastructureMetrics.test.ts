@@ -1,3 +1,4 @@
+import { HISTORY_RANGES, formatRate, parseHistory, quickStats, readHistory } from "./infrastructureMetrics";
 import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/infrastructure-metrics-v1.json";
 import discovered from "./fixtures/infrastructure-metrics-v2.json";
@@ -19,7 +20,7 @@ describe("machine metrics", () => {
   });
   it.each([
     ["an extra top-level key", (v: any) => { v.extra = 1; }],
-    ["another schema version", (v: any) => { v.schema_version = 3; }],
+    ["another schema version", (v: any) => { v.schema_version = 4; }],
     ["schema 2 with schema 1 rows", (v: any) => { v.schema_version = 2; }],
     ["an unknown label", (v: any) => { v.devices[0].labels.secret = "x"; }],
     ["a non-finite-looking ratio", (v: any) => { v.devices[0].cpu_busy_ratio = 1.5; }],
@@ -130,5 +131,52 @@ describe("text limits count Unicode characters, as the backend does", () => {
   it("still rejects 65 characters and control characters", () => {
     expect(() => parseMetrics(withLabel(tree.repeat(65)))).toThrow();
     expect(() => parseMetrics(withLabel("a\u0000b"))).toThrow();
+  });
+});
+
+describe("network rates and history", () => {
+  const hostKey = `host:${"a".repeat(64)}`;
+  const history = (over: Record<string, unknown> = {}) => ({ schema_version: 1, generated_at: "2026-11-06T12:00:00Z", host_key: hostKey, range: "1h", step_seconds: 30,
+    source: { status: "ok" }, series: [{ key: "cpu", label: null, unit: "ratio", points: [[100, 0.5], [130, null]] }], ...over });
+  const row = (over: Record<string, unknown> = {}) => ({ host_key: hostKey, host_label: "nas", association: "matched", device_id: "nas", probe_id: null, job: "node", instance: "nas:9100",
+    exporter: "node", labels: {}, up: true, last_scrape: "2026-11-06T12:00:00Z", state: "fresh", cpu_busy_ratio: 0.2, mem_total_bytes: 1000, mem_available_bytes: 250, uptime_seconds: 1,
+    disks: [{ mount: "/", size_bytes: 100, free_bytes: 90 }, { mount: "/data", size_bytes: 100, free_bytes: 10 }], gpus: [], top_processes: [],
+    net_rx_bytes_per_second: 2048, net_tx_bytes_per_second: null, ...over });
+  const metrics = (rows: unknown[], version = 3) => ({ schema_version: version, generated_at: "2026-11-06T12:00:00Z",
+    source: { status: "ok", truncated: false, omitted_count: 0, warnings: [] }, devices: rows });
+
+  it("reads schema 3 rates, keeps a missing one null, and requires both fields", () => {
+    const [target] = parseMetrics(metrics([row()])).targets;
+    expect(target.net_rx_bytes_per_second).toBe(2048);
+    expect(target.net_tx_bytes_per_second).toBeNull();
+    const { net_rx_bytes_per_second: _rx, ...short } = row();
+    expect(() => parseMetrics(metrics([short]))).toThrow();
+    expect(() => parseMetrics(metrics([row()], 2))).toThrow();
+  });
+  it("sums up a machine: the fullest disk, memory in use, and whether it's reporting", () => {
+    const stats = quickStats(groupMachines(parseMetrics(metrics([row()])).targets)[0]);
+    expect(stats).toMatchObject({ cpu: 0.2, memory: 0.75, diskRatio: 0.9, down: 2048, up: null, reporting: true });
+    expect(stats.disk?.mount).toBe("/data");
+    const stale = quickStats(groupMachines(parseMetrics(metrics([row({ state: "stale" })])).targets)[0]);
+    expect(stale.reporting).toBe(false);
+  });
+  it("keeps gaps in history and rejects anything outside the contract", () => {
+    expect(parseHistory(history()).series[0].points[1]).toEqual([130, null]);
+    expect(() => parseHistory(history({ range: "30d" }))).toThrow();
+    expect(() => parseHistory(history({ extra: 1 }))).toThrow();
+    expect(() => parseHistory(history({ series: [{ key: "cpu", label: null, unit: "ratio", points: [[100, 1.5]] }] }))).toThrow();
+    expect(() => parseHistory(history({ series: [{ key: "gpu", label: null, unit: "ratio", points: [[100, 0.5]] }] }))).toThrow();
+  });
+  it("asks for one fixed route and hides on refusal", async () => {
+    const fetchImpl = vi.fn(async () => json(history()));
+    await readHistory(hostKey, "1h", new AbortController().signal, fetchImpl as unknown as typeof fetch);
+    expect(String((fetchImpl.mock.calls[0] as unknown[])[0])).toBe(`/api/hub/v1/infrastructure/metrics/history?host=${encodeURIComponent(hostKey)}&range=1h`);
+    const refused = vi.fn(async () => new Response("{}", { status: 403 }));
+    await expect(readHistory(hostKey, "1h", new AbortController().signal, refused as unknown as typeof fetch)).resolves.toBeNull();
+  });
+  it("offers only the ranges the Hub serves, and formats a missing rate as not reported", () => {
+    expect(HISTORY_RANGES).toEqual(["1h", "6h", "24h", "7d"]);
+    expect(formatRate(null)).toBe("not reported");
+    expect(formatRate(2048)).toBe("2.0 KB/s");
   });
 });

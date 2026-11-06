@@ -294,15 +294,17 @@ const discovered = (name: keyof typeof discoveredFixture.cases, change: (value: 
 };
 
 test("discovered machines show without mappings, flag unregistered and ambiguous ones, and link matched devices", async ({ page }) => {
-  await fixture(page, { metrics: [discovered("discovered", value => { value.devices[0].device_id = value.devices[1].device_id = "build-pc"; })] });
+  await fixture(page, { metrics: [discovered("discovered", value => { value.devices[0].device_id = value.devices[1].device_id = "build-pc";
+    Object.assign(value.devices[0], { up: true, state: "fresh", last_scrape: new Date().toISOString(), cpu_busy_ratio: 0.25 }); })] });
   await page.goto("/#/infrastructure");
   const panel = healthPanel(page);
   const cards = panel.getByRole("listitem");
-  await expect(cards).toHaveCount(3);
-  const workstation = cards.filter({ hasText: "demo-workstation" });
-  await expect(workstation).toContainText("Windows");
-  await expect(workstation).toContainText("GPUs");
-  await expect(workstation.getByRole("link", { name: "demo-workstation" })).toHaveAttribute("href", "/infrastructure/build-pc");
+  await expect(cards).toHaveCount(2);
+  await expect(panel).not.toContainText("demo-workstation");
+  const strip = devicesPanel(page).getByRole("link", { name: "Machine stats" });
+  await expect(strip).toHaveAttribute("href", "/infrastructure/build-pc");
+  await expect(strip).toContainText("25%");
+  await expect(strip).toContainText("Memory");
   await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not in devices");
   await expect(cards.filter({ hasText: "192.0.2.11:9000" })).toContainText("Not a recognized exporter");
   await expect(cards.filter({ hasText: "duplicate-demo" })).toContainText("Matches more than one device");
@@ -354,6 +356,42 @@ test("machine health stays hidden without metrics access or when not set up", as
     await expect(devicesPanel(page)).toContainText("Build PC");
     await expect(healthPanel(page)).toHaveCount(0);
   }
+});
+
+test("a device page charts history, keeps gaps, and changes range on request", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
+  const ranges: string[] = [];
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => {
+    const url = new URL(route.request().url());
+    ranges.push(url.searchParams.get("range") ?? "");
+    const points = [[1000, 0.2], [1030, null], [1060, 0.6], [1090, 0.4]];
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ schema_version: 1, generated_at: "2026-11-06T12:00:00Z",
+      host_key: url.searchParams.get("host"), range: url.searchParams.get("range"), step_seconds: 30, source: { status: "ok" },
+      series: [{ key: "cpu", label: null, unit: "ratio", points }, { key: "network_rx", label: null, unit: "bytes_per_second", points: [[1000, 2048], [1030, 4096]] },
+        { key: "network_tx", label: null, unit: "bytes_per_second", points: [[1000, 1024], [1030, 512]] }] }) });
+  });
+  await page.goto("/#/infrastructure/build-pc");
+  const cpu = page.getByRole("img", { name: /^CPU:/ });
+  await expect(cpu).toHaveAttribute("aria-label", "CPU: now 40%, peak 60%");
+  await expect(page.getByRole("img", { name: /^Network:/ })).toBeVisible();
+  await expect(page.getByRole("img", { name: /^Memory:/ })).toHaveCount(0);
+  await cpu.focus();
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await expect(page.locator(".history-tip")).toContainText("No data");
+  await page.getByRole("button", { name: "7 days" }).click();
+  await expect.poll(() => ranges.at(-1)).toBe("7d");
+  expect(ranges[0]).toBe("24h");
+  await page.setViewportSize({ width: 375, height: 812 });
+  expect(blocking(await audit(page, "page", 375))).toEqual([]);
+});
+
+test("history that can't be read says so and offers a retry", async ({ page }) => {
+  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => route.fulfill({ status: 500, contentType: "application/json", body: "{}" }));
+  await page.goto("/#/infrastructure/build-pc");
+  await expect(page.getByRole("alert")).toContainText("History couldn't be read");
+  await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
 });
 
 test("a device page shows only that device's machine health", async ({ page }) => {
