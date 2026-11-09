@@ -376,7 +376,7 @@ def test_budget_exhaustion_without_stop_still_fails_closed(tmp_path):
 
 
 def test_stop_during_startup_lock_never_reports_a_healthy_start(tmp_path):
-    """A start() racing a held write lock and a stop must fail, never return a healthy source."""
+    """A stop interrupts the verified startup lock wait without a false healthy result."""
     import threading
     repository = MessageRepository(tmp_path / "messages.sqlite3")
     failures = []
@@ -385,6 +385,11 @@ def test_stop_during_startup_lock_never_reports_a_healthy_start(tmp_path):
     locker = sqlite3.connect(repository.path, timeout=1, isolation_level=None, check_same_thread=False)
     locker.execute("BEGIN IMMEDIATE")  # Startup's barrier snapshot blocks on this.
     outcome = {}
+    # Fill the bounded command queue before startup so stop() must avoid holding
+    # the readiness condition while it waits for command space.
+    queued_flushes = [threading.Event(), threading.Event()]
+    for done in queued_flushes:
+        source._commands.put_nowait(("flush", done))
 
     def run_start():
         try:
@@ -395,19 +400,87 @@ def test_stop_during_startup_lock_never_reports_a_healthy_start(tmp_path):
     starter = threading.Thread(target=run_start)
     starter.start()
     try:
-        assert wait_until(lambda: source._thread is not None and source._stage in {"take_write_barrier", "control_command"} or
-                          source._stage.startswith(("take", "read", "release")), timeout=3) or True
-        time.sleep(0.2)  # Startup is now blocked in BEGIN IMMEDIATE.
-        source._stop_requested.set()
-        source._interrupt_sql()
+        assert wait_until(lambda: source._stage == "acquire_write_barrier", timeout=3), \
+            f"startup never reached the barrier; stage={source._stage!r}"
+        stopped = {}
+
+        def run_stop():
+            try:
+                stopped["stats"] = source.stop(timeout=5)
+            except BaseException as exc:  # noqa: BLE001 - assert lifecycle result below
+                stopped["error"] = exc
+
+        stopper = threading.Thread(target=run_stop)
+        stopper.start()
+        stopper.join(7)
         starter.join(10)
+        assert not stopper.is_alive()
         assert not starter.is_alive()
+        assert "error" not in stopped, stopped.get("error")
         assert "error" in outcome, f"start() returned {outcome.get('stats')!r} for a stopped startup"
         assert not source.healthy
+        assert source.failure is None
+        assert all(done.is_set() for done in queued_flushes)
     finally:
         locker.rollback()
         locker.close()
         source.stop(timeout=5)
+
+
+def test_successful_startup_snapshot_after_stop_request_does_not_report_healthy(tmp_path, monkeypatch):
+    """A snapshot that succeeds after stop() wins must still leave startup unready."""
+    import threading
+    repository = MessageRepository(tmp_path / "messages.sqlite3")
+    source = SQLiteEventSource(repository.path, MessageCursorReader(page_size=4), lambda *_: None,
+                               busy_timeout_ms=1_500)
+    locker = sqlite3.connect(repository.path, timeout=1, isolation_level=None, check_same_thread=False)
+    locker.execute("BEGIN IMMEDIATE")
+    starter_outcome = {}
+    stopper_outcome = {}
+
+    def run_start():
+        try:
+            starter_outcome["stats"] = source.start()
+        except BaseException as exc:  # noqa: BLE001 - assert lifecycle result below
+            starter_outcome["error"] = exc
+
+    def run_stop():
+        try:
+            stopper_outcome["stats"] = source.stop(timeout=5)
+        except BaseException as exc:  # noqa: BLE001 - assert lifecycle result below
+            stopper_outcome["error"] = exc
+
+    # Let SQLite complete the in-flight statement after stop is requested, so this
+    # exercises the successful-snapshot race rather than relying on interrupt().
+    monkeypatch.setattr(source, "_interrupt_sql", lambda: None)
+    starter = threading.Thread(target=run_start)
+    starter.start()
+    stopper = None
+    try:
+        assert wait_until(lambda: source._stage == "acquire_write_barrier", timeout=3), \
+            f"startup never reached the barrier; stage={source._stage!r}"
+        stopper = threading.Thread(target=run_stop)
+        stopper.start()
+        assert wait_until(lambda: source._stop_requested.is_set(), timeout=3), \
+            "stop() did not publish its request"
+        locker.execute("ROLLBACK")
+        stopper.join(7)
+        starter.join(10)
+        assert not stopper.is_alive()
+        assert not starter.is_alive()
+        assert "error" not in stopper_outcome, stopper_outcome.get("error")
+        assert "error" in starter_outcome, \
+            f"start() returned {starter_outcome.get('stats')!r} for a stopped startup"
+        assert not source.healthy
+        assert source.failure is None
+    finally:
+        if locker.in_transaction:
+            locker.rollback()
+        locker.close()
+        if stopper is not None and stopper.is_alive():
+            stopper.join(7)
+        if source.running:
+            source.stop(timeout=5)
 
 
 def test_successful_late_snapshot_resets_the_budget_without_failing(tmp_path):

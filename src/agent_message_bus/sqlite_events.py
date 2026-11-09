@@ -327,6 +327,7 @@ class SQLiteEventSource:
         # interrupt() and connection close from racing.
         self._stop_requested = threading.Event()
         self._connections_lock = threading.Lock()
+        self._control_lock = threading.Lock()
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -419,15 +420,23 @@ class SQLiteEventSource:
         if self._thread is None:
             return self.stats
         if not self._thread_done.is_set():
-            done = threading.Event()
-            try:
-                self._commands.put(("stop", done), timeout=timeout)
-            except queue.Full as exc:
-                raise TimeoutError("native SQLite lifecycle command queue is full") from exc
-            self._stop_requested.set()
-            self._signal_control()
+            # Publish stop under the same lock used by startup readiness. The
+            # eventfd wakes the running loop, whose command handler checks this
+            # flag before draining the bounded lifecycle queue.
+            with self._condition:
+                self._stop_requested.set()
+                self._condition.notify_all()
+            # During setup the eventfd may not exist yet. Startup checks the stop
+            # flag after setup and before it can publish readiness.
+            if self._event_fd is not None:
+                try:
+                    self._signal_control()
+                except (OSError, RuntimeError):
+                    # Cleanup may have closed the descriptor as the worker exits.
+                    if self._event_fd is not None and not self._thread_done.is_set():
+                        raise
             self._interrupt_sql()
-            if not done.wait(timeout):
+            if not self._thread_done.wait(timeout):
                 self.raise_if_failed()
                 raise TimeoutError("timed out stopping native SQLite event source")
         self._thread.join(timeout=timeout)
@@ -454,15 +463,16 @@ class SQLiteEventSource:
         return self.stats
 
     def _signal_control(self) -> None:
-        fd = self._event_fd
-        if fd is None:
-            raise RuntimeError("native SQLite eventfd is not ready")
-        while True:
-            try:
-                os.eventfd_write(fd, 1)
-                return
-            except InterruptedError:
-                continue
+        with self._control_lock:
+            fd = self._event_fd
+            if fd is None:
+                raise RuntimeError("native SQLite eventfd is not ready")
+            while True:
+                try:
+                    os.eventfd_write(fd, 1)
+                    return
+                except InterruptedError:
+                    continue
 
     def _set_stat(self, key: str, value: int | bool | str | None) -> None:
         with self._condition:
@@ -533,9 +543,15 @@ class SQLiteEventSource:
             # a single blocked attempt may not outlast the retry budget, so the budget
             # covers time spent inside SQLite's busy handler too.
             self._set_busy_timeout(self._steady_busy_timeout_ms())
-            self._set_stat("healthy", True)
-            self._ready.set()
-            ready_signaled = True
+            # Readiness and stop share the condition lock so start() cannot report
+            # a healthy source after a concurrent stop has already won the race.
+            with self._condition:
+                if self._stop_requested.is_set():
+                    raise _StopRequested()
+                self._stats["healthy"] = True
+                self._condition.notify_all()
+                self._ready.set()
+                ready_signaled = True
             assert self._epoll is not None and self._inotify_fd is not None and self._event_fd is not None
             while True:
                 self._stage = "wait_native_event"
@@ -580,7 +596,7 @@ class SQLiteEventSource:
 
     def _run_commands(self) -> bool:
         self._stage = "control_command"
-        stop = False
+        stop = self._stop_requested.is_set()
         while not stop:
             if self._deferred_commands:
                 command, done = self._deferred_commands.pop(0)
@@ -741,18 +757,22 @@ class SQLiteEventSource:
 
     def _reconcile(self, *, reason: str) -> None:
         while True:
-            if reason != "startup" and self._stop_requested.is_set():
+            if self._stop_requested.is_set():
                 raise _StopRequested()  # Checked between attempts; never mid-publication.
             attempt_started = time.monotonic()
             try:
                 selected, next_cursor = self._snapshot()
+                if reason == "startup" and self._stop_requested.is_set():
+                    # Do not publish a startup snapshot or mark ready if stop won
+                    # while its SQLite operation was completing successfully.
+                    raise _StopRequested()
                 break
             except sqlite3.OperationalError as exc:
                 code = _sqlite_error_details(exc).get('sqlite_errorcode')
-                if reason != "startup" and self._stop_requested.is_set() and type(code) is int and (
+                if self._stop_requested.is_set() and type(code) is int and (
                         code & 0xFF == 9 or _transient_sqlite_code(exc) is not None):
-                    # A requested stop wins over SQLITE_INTERRUPT and over a lock wait we would
-                    # only retry anyway; every other error still fails closed and is reported.
+                    # A requested stop wins over SQLITE_INTERRUPT and a lock wait
+                    # it would only retry anyway; other errors still fail closed.
                     raise _StopRequested() from None
                 # Startup stays fail-closed: start() has its own bounded timeout.
                 code_name = None if reason == "startup" else _transient_sqlite_code(exc)
@@ -830,6 +850,8 @@ class SQLiteEventSource:
         poller.register(self._event_fd, select.POLLIN)
         deadline = time.monotonic() + delay_ms / 1000
         while True:
+            if self._stop_requested.is_set():
+                raise _StopRequested() from None
             wait_ms = (deadline - time.monotonic()) * 1000
             if wait_ms <= 0:
                 break
@@ -841,6 +863,8 @@ class SQLiteEventSource:
                 pass
             if self.failure is not None:
                 raise _StopRequested()  # Already failed closed elsewhere; just exit.
+            if self._stop_requested.is_set():
+                raise _StopRequested() from None
             while True:
                 try:
                     command, done = self._commands.get_nowait()
@@ -896,7 +920,7 @@ class SQLiteEventSource:
             except OSError:
                 pass
             self._epoll = None
-        for fd_name in ("_inotify_fd", "_event_fd"):
+        for fd_name in ("_inotify_fd",):
             fd = getattr(self, fd_name)
             if fd is not None:
                 try:
@@ -904,6 +928,14 @@ class SQLiteEventSource:
                 except OSError:
                     pass
                 setattr(self, fd_name, None)
+        with self._control_lock:
+            fd = self._event_fd
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self._event_fd = None
         self._watch_kinds.clear()
 
 
