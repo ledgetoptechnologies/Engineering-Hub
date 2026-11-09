@@ -101,7 +101,7 @@ def pilot_release_evidence(repo, workflow, run_id):
         raise HubError('container_pilot_not_enabled', 423)
     workflow._assert_pilot_owner()
     run = repo.get_run(run_id)
-    target = workflow._target(run, pin=False)
+    target = workflow._historical_target(run)
     details = {action: _command_evidence(repo, workflow, run, target, action)
                for action in _ACTIONS}
     return PilotReleaseEvidenceDTO(
