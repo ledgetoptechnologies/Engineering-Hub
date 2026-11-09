@@ -1103,7 +1103,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     @app.get("/api/hub/v1/container-pilot/runs/{run_id}/release-evidence",
              response_model=PilotReleaseEvidenceDTO)
     def container_pilot_release_evidence(run_id: str, request: Request):
-        human(request)
+        principal = human(request)
+        from .pilot_release_evidence import release_evidence_owner_allowed
+        owner_actor = connection_config.owner if connection_config is not None else None
+        if not release_evidence_owner_allowed(principal, settings.auth_config, owner_actor):
+            raise HTTPException(403, detail={'code': 'release_evidence_owner_required'})
         workflow = container_pilot_workflow
         if workflow is None and owned_pilot_service is not None:
             workflow = owned_pilot_service.workflow
