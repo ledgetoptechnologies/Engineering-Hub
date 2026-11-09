@@ -718,8 +718,14 @@ dirty and a verified SQLite BUSY prevents reconciliation.
         assert self._barrier is not None and self._reader is not None
         began = False
         try:
-            attempt_timeout_ms = (self.busy_timeout_ms if reason == "startup" else
-                                  min(self.busy_timeout_ms, self.busy_retry_interval_ms))
+            if reason == "startup":
+                attempt_timeout_ms = self.busy_timeout_ms
+            else:
+                assert self._dirty_since is not None
+                retry_deadline = self._dirty_since + self.busy_retry_deadline_ms / 1000
+                remaining_ms = max(0, int((retry_deadline - time.monotonic()) * 1000))
+                attempt_timeout_ms = min(
+                    self.busy_timeout_ms, self.busy_retry_interval_ms, remaining_ms)
             self._barrier.execute(f"PRAGMA busy_timeout={attempt_timeout_ms}")
             self._stage = "acquire_write_barrier"
             self._barrier.execute("BEGIN IMMEDIATE")
