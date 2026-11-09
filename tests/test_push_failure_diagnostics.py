@@ -199,6 +199,35 @@ def test_startup_busy_writer_expires_fail_closed_without_becoming_ready(tmp_path
         source.stop()
 
 
+def test_retry_busy_timeout_never_exceeds_remaining_deadline(monkeypatch):
+    source = object.__new__(SQLiteEventSource)
+    source._barrier = None
+    source._reader = object()
+    source._dirty_since = 1.0
+    source.busy_retry_deadline_ms = 100
+    source.busy_timeout_ms = 10_000
+    source.busy_retry_interval_ms = 250
+    source._stage = None
+    configured = []
+    failure = sqlite3.OperationalError('database is locked')
+    failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    failure.sqlite_errorname = 'SQLITE_BUSY'
+
+    class Barrier:
+        def execute(self, statement):
+            if statement.startswith('PRAGMA busy_timeout='):
+                configured.append(int(statement.partition('=')[2]))
+            elif statement == 'BEGIN IMMEDIATE':
+                raise failure
+
+    source._barrier = Barrier()
+    monkeypatch.setattr('agent_message_bus.sqlite_events.time.monotonic', lambda: 1.075)
+    with pytest.raises(sqlite3.OperationalError):
+        source._reconcile(reason='busy_retry')
+    assert len(configured) == 1
+    assert 0 < configured[0] <= 25
+
+
 def _capture_start_result(source, results, errors):
     try:
         results.append(source.start())
