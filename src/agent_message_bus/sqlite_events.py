@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -200,10 +201,11 @@ _FIONREAD = getattr(termios, "FIONREAD", None) if termios is not None else None
 class SQLiteEventSource:
     """Persistent native eventsource for message delivery-sequence changes.
 
-    Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
-    from an ASGI lifespan. Startup installs every watch before taking one
-    barrier-protected head snapshot. Normal operation has no timer or SQLite
-    query when the inotify/eventfd descriptors are idle.
+Lifecycle methods are blocking and must be called via ``asyncio.to_thread``
+from an ASGI lifespan. Startup installs every watch before taking one
+barrier-protected head snapshot. Normal operation has no timer or SQLite
+query when idle; a bounded retry timer exists only while an invalidation is
+dirty and a verified SQLite BUSY prevents reconciliation.
     """
 
     def __init__(
@@ -213,6 +215,8 @@ class SQLiteEventSource:
         deliver: Callable[[Sequence[str], int], None],
         *,
         busy_timeout_ms: int = 10_000,
+        busy_retry_deadline_ms: int = 60_000,
+        busy_retry_interval_ms: int = 250,
         read_buffer_bytes: int = 64 * 1024,
         max_flush_bytes: int = 8 * 1024 * 1024,
         on_error: Callable[[BaseException], None] | None = None,
@@ -221,6 +225,8 @@ class SQLiteEventSource:
             raise OSError("SQLiteEventSource requires Linux inotify, epoll, and eventfd")
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be positive")
+        if busy_retry_deadline_ms <= 0 or busy_retry_interval_ms <= 0:
+            raise ValueError("SQLite busy retry bounds must be positive")
         if read_buffer_bytes < _EVENT_HEADER.size:
             raise ValueError("read_buffer_bytes is too small for an inotify event")
         if max_flush_bytes < read_buffer_bytes:
@@ -236,6 +242,8 @@ class SQLiteEventSource:
         self.read_after = read_after
         self.deliver = deliver
         self.busy_timeout_ms = busy_timeout_ms
+        self.busy_retry_deadline_ms = busy_retry_deadline_ms
+        self.busy_retry_interval_ms = busy_retry_interval_ms
         self.read_buffer_bytes = read_buffer_bytes
         self.max_flush_bytes = max_flush_bytes
         self.on_error = on_error
@@ -260,6 +268,8 @@ class SQLiteEventSource:
             "failure_stage": None,
             "sqlite_errorcode": None,
             "sqlite_errorname": None,
+            "degraded": False,
+            "busy_retry_count": 0,
         }
         self._stage = "created"
         self._failure: BaseException | None = None
@@ -267,6 +277,7 @@ class SQLiteEventSource:
         self._event_fd: int | None = None
         self._epoll: select.epoll | None = None
         self._watch_kinds: dict[int, str] = {}
+        self._watch_identities: dict[str, tuple[int, int]] = {}
         self._directory_wd: int | None = None
         self._db_wd: int | None = None
         self._wal_wd: int | None = None
@@ -275,6 +286,10 @@ class SQLiteEventSource:
         self._cursor: int | None = None
         self._db_name = self.db_path.name
         self._wal_name = self.db_path.name + "-wal"
+        self._dirty = False
+        self._dirty_since: float | None = None
+        self._retry_at: float | None = None
+        self._last_busy_error: sqlite3.OperationalError | None = None
 
     @property
     def stats(self) -> dict[str, int | bool | str | None]:
@@ -300,7 +315,8 @@ class SQLiteEventSource:
             raise RuntimeError("SQLite event source can only be started once")
         self._thread = threading.Thread(target=self._run, name=f"sqlite-inotify:{self.db_path.name}", daemon=False)
         self._thread.start()
-        if not self._ready.wait(self.busy_timeout_ms / 1000 + 10):
+        startup_wait = (self.busy_timeout_ms + self.busy_retry_deadline_ms) / 1000 + 10
+        if not self._ready.wait(startup_wait):
             raise TimeoutError("timed out starting native SQLite event source")
         self.raise_if_failed()
         return self.stats
@@ -391,6 +407,7 @@ class SQLiteEventSource:
 
     def _add_watch(self, path: Path, mask: int, kind: str) -> int:
         assert self._inotify_fd is not None
+        before = path.stat(follow_symlinks=False)
         libc = ctypes.CDLL(None, use_errno=True)
         add_watch = libc.inotify_add_watch
         add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
@@ -399,7 +416,12 @@ class SQLiteEventSource:
         if wd < 0:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(path))
+        after = path.stat(follow_symlinks=False)
+        identity = (before.st_dev, before.st_ino)
+        if identity != (after.st_dev, after.st_ino):
+            raise WatcherFailed(f"{kind} path changed while installing its inotify watch")
         self._watch_kinds[wd] = kind
+        self._watch_identities[kind] = identity
         return wd
 
     def _setup(self) -> None:
@@ -428,18 +450,39 @@ class SQLiteEventSource:
 
     def _run(self) -> None:
         ready_signaled = False
-        try:
-            self._setup()
-            # The reader sentinel takes one head snapshot only after all watches exist.
-            self._reconcile(reason="startup")
+
+        def signal_startup_ready() -> None:
+            nonlocal ready_signaled
             self._set_stat("startup_catchups", 1)
             self._set_stat("healthy", True)
             self._ready.set()
             ready_signaled = True
+
+        try:
+            self._setup()
+            # The reader sentinel takes one head snapshot only after all watches
+            # exist. A busy writer may delay this initial snapshot, but the
+            # source must not become ready or healthy until it succeeds.
+            self._dirty = True
+            self._dirty_since = time.monotonic()
+            self._attempt_reconcile(reason="startup")
+            if self._retry_at is None and not self._dirty:
+                signal_startup_ready()
             assert self._epoll is not None and self._inotify_fd is not None and self._event_fd is not None
             while True:
                 self._stage = "wait_native_event"
-                ready = self._epoll.poll(-1)
+                timeout = -1 if self._retry_at is None else max(0, self._retry_at - time.monotonic())
+                ready = self._epoll.poll(timeout)
+                if not ready and self._retry_at is not None:
+                    # The timer exists only while a filesystem invalidation is
+                    # dirty. Drain queued events first so overflow, inode
+                    # replacement, and WAL recreation remain fail-closed.
+                    self._drain_pending_events_before_publish()
+                    if self._dirty and self._retry_at is not None and time.monotonic() >= self._retry_at:
+                        self._attempt_reconcile(reason="busy_retry")
+                        if not ready_signaled and self._retry_at is None and not self._dirty:
+                            signal_startup_ready()
+                    continue
                 should_stop = False
                 for fd, _mask in ready:
                     if fd == self._inotify_fd:
@@ -453,6 +496,14 @@ class SQLiteEventSource:
                         except BlockingIOError:
                             pass
                         should_stop = self._run_commands()
+                if (not should_stop and self._dirty and self._retry_at is not None
+                        and time.monotonic() >= self._retry_at):
+                    self._drain_pending_events_before_publish()
+                    self._attempt_reconcile(reason="busy_retry")
+                    if not ready_signaled and self._retry_at is None and not self._dirty:
+                        signal_startup_ready()
+                if should_stop and not ready_signaled:
+                    raise WatcherFailed("native SQLite event source stopped before its startup cursor snapshot")
                 if should_stop or self.failure is not None:
                     break
         except BaseException as exc:
@@ -529,7 +580,7 @@ class SQLiteEventSource:
             if data:
                 self._process_data(data)
 
-    def _process_data(self, data: bytes) -> None:
+    def _process_data(self, data: bytes, *, reconcile: bool = True) -> None:
         self._stage = "process_native_events"
         dirty = False
         relevant = 0
@@ -587,15 +638,93 @@ class SQLiteEventSource:
             self._add_stat("inotify_batches")
             self._add_stat("relevant_events", relevant)
         if dirty:
-            self._reconcile(reason="inotify")
+            self._dirty = True
+            if self._dirty_since is None:
+                self._dirty_since = time.monotonic()
+            if reconcile and self._retry_at is None:
+                self._attempt_reconcile(reason="inotify")
+
+    def _drain_pending_events_before_publish(self) -> None:
+        """Drain a bounded native-event snapshot before releasing the barrier."""
+        assert self._inotify_fd is not None
+        if fcntl is None or _FIONREAD is None:
+            raise RuntimeError("pre-publish inotify validation requires Linux fcntl support")
+        self._stage = "validate_pending_native_events"
+        started = time.monotonic()
+        total = 0
+        while True:
+            available = struct.unpack(
+                "I", fcntl.ioctl(self._inotify_fd, _FIONREAD, struct.pack("I", 0))
+            )[0]
+            if available == 0:
+                return
+            if total + available > self.max_flush_bytes:
+                raise WatcherFailed("queued inotify events exceed the pre-publish bound")
+            try:
+                chunk = os.read(self._inotify_fd, min(self.read_buffer_bytes, available))
+            except InterruptedError:
+                continue
+            if not chunk:
+                continue
+            total += len(chunk)
+            self._process_data(chunk, reconcile=False)
+            if time.monotonic() - started > 1.0:
+                raise WatcherFailed("pre-publish inotify validation exceeded its time bound")
+
+    def _verify_watched_paths(self) -> None:
+        paths = {"directory": self.db_path.parent, "database": self.db_path}
+        if self._wal_wd is not None:
+            paths["wal"] = Path(str(self.db_path) + "-wal")
+        for kind, path in paths.items():
+            try:
+                info = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WatcherFailed(f"watched {kind} path is unavailable") from exc
+            if self._watch_identities.get(kind) != (info.st_dev, info.st_ino):
+                raise WatcherFailed(f"watched {kind} path was replaced")
+
+    def _attempt_reconcile(self, *, reason: str) -> None:
+        if (self._retry_at is not None and self._dirty_since is not None
+                and time.monotonic() >= self._dirty_since + self.busy_retry_deadline_ms / 1000):
+            assert self._last_busy_error is not None
+            self._stage = "acquire_write_barrier"
+            raise self._last_busy_error
+        try:
+            self._reconcile(reason=reason)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if (self._stage != "acquire_write_barrier" or not isinstance(code, int)
+                    or code & 0xFF != sqlite3.SQLITE_BUSY):
+                raise
+            now = time.monotonic()
+            assert self._dirty_since is not None
+            if now - self._dirty_since >= self.busy_retry_deadline_ms / 1000:
+                raise
+            self._last_busy_error = exc
+            self._retry_at = min(
+                now + self.busy_retry_interval_ms / 1000,
+                self._dirty_since + self.busy_retry_deadline_ms / 1000,
+            )
+            self._set_stat("degraded", True)
+            self._add_stat("busy_retry_count")
+            return
+        self._dirty = False
+        self._dirty_since = None
+        self._retry_at = None
+        self._last_busy_error = None
+        self._set_stat("degraded", False)
 
     def _reconcile(self, *, reason: str) -> None:
         assert self._barrier is not None and self._reader is not None
         began = False
         try:
+            attempt_timeout_ms = (self.busy_timeout_ms if reason == "startup" else
+                                  min(self.busy_timeout_ms, self.busy_retry_interval_ms))
+            self._barrier.execute(f"PRAGMA busy_timeout={attempt_timeout_ms}")
             self._stage = "acquire_write_barrier"
             self._barrier.execute("BEGIN IMMEDIATE")
             began = True
+            self._assert_retry_deadline()
             self._stage = "read_committed_cursor"
             recipients, next_cursor = self.read_after(self._reader, self._cursor)
             self._stage = "validate_cursor"
@@ -610,9 +739,14 @@ class SQLiteEventSource:
             elif selected and next_cursor <= self._cursor:
                 raise WatcherFailed("recipient rows did not advance the message cursor")
             self._add_stat("snapshot_reads")
+            self._drain_pending_events_before_publish()
+            self._verify_watched_paths()
+            self._assert_retry_deadline()
             self._stage = "release_write_barrier"
             self._barrier.execute("ROLLBACK")
             began = False
+            self._dirty = False
+            self._dirty_since = None
             self._cursor = next_cursor
             self._set_stat("cursor", next_cursor)
             if selected:
@@ -627,12 +761,20 @@ class SQLiteEventSource:
                     pass
             raise
 
+    def _assert_retry_deadline(self) -> None:
+        if (self._retry_at is not None and self._dirty_since is not None
+                and time.monotonic() >= self._dirty_since + self.busy_retry_deadline_ms / 1000):
+            assert self._last_busy_error is not None
+            self._stage = "acquire_write_barrier"
+            raise self._last_busy_error
+
     def _fail(self, exc: BaseException) -> None:
         with self._condition:
             first_failure = self._failure is None
             if first_failure:
                 self._failure = exc
                 self._stats["healthy"] = False
+                self._stats["degraded"] = False
                 self._stats["failure"] = f"{type(exc).__name__}: {exc}"
                 self._stats["failure_stage"] = self._stage
                 self._stats.update(_sqlite_error_details(exc))
