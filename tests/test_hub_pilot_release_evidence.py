@@ -1,5 +1,7 @@
 """Human review DTOs expose only journaled pilot evidence."""
+import json
 import sys
+from dataclasses import asdict
 
 import pytest
 import httpx
@@ -9,8 +11,10 @@ from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.pilot_release_evidence import pilot_release_evidence
 from engineering_hub.container_pilot import ContainerPilotTarget
-from engineering_hub.repository import HubRepository
-from tests.test_hub_container_pilot import IMAGE, PRINCIPAL, pilot_manifest, ready_run
+from engineering_hub.container_pilot_manifest import PilotManifest
+from engineering_hub.repository import HubError, HubRepository
+from tests.test_hub_container_pilot import FakeClient, IMAGE, PRINCIPAL, pilot_manifest, ready_run
+from tests.test_hub_container_pilot_manifest import make_manifest_data
 
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='Real Linux PilotOwner fencing')
 
@@ -23,6 +27,15 @@ def repo(tmp_path):
 @pytest.fixture
 def target():
     return ContainerPilotTarget.from_manifest(pilot_manifest())
+
+
+def next_target():
+    data = make_manifest_data()
+    data['candidate']['image_config_id'] = 'sha256:' + 'c' * 64
+    data['candidate']['source_commit'] = 'c' * 40
+    data['rollback']['image_config_id'] = 'sha256:' + 'e' * 64
+    data['rollback']['source_commit'] = 'e' * 40
+    return ContainerPilotTarget.from_manifest(PilotManifest.from_bytes(json.dumps(data).encode('utf-8')))
 
 
 @pytest.mark.asyncio
@@ -78,6 +91,35 @@ def test_release_evidence_read_does_not_pin_or_mutate_a_run(repo, target):
     assert evidence.candidate_deploy.state == 'not_started'
     assert before_binding is None and after_binding is None
     assert repo.get_run(run['id'])['revision'] == before_revision
+
+
+def test_release_evidence_uses_saved_manifest_after_workflow_recomposition(repo, target):
+    original_workflow, run = ready_run(repo, target)
+    replacement_workflow = type(original_workflow)(repo, FakeClient(), [next_target()])
+
+    evidence = pilot_release_evidence(repo, replacement_workflow, run['id'])
+
+    assert evidence.candidate_image_config_id == target.artifact_digest
+    assert evidence.pilot_manifest_digest == target.manifest_digest
+    assert evidence.rollback_image_config_id == target.rollback_image_config_id
+    assert evidence.candidate_deploy.state == 'not_started'
+    with pytest.raises(HubError, match='container_pilot_manifest_mismatch'):
+        replacement_workflow._target(run, pin=False)
+
+
+def test_release_evidence_rejects_saved_manifest_under_wrong_digest_key(repo, target):
+    workflow, run = ready_run(repo, target)
+    replacement = next_target()
+    replacement_binding = json.dumps(asdict(replacement), sort_keys=True, separators=(',', ':'))
+    with repo._transaction() as db:
+        db.execute('DELETE FROM hub_container_pilot_manifest_views')
+        db.execute(
+            'INSERT INTO hub_container_pilot_manifest_views(manifest_digest,binding) VALUES(?,?)',
+            (run['execution_manifest_digest'], replacement_binding),
+        )
+
+    with pytest.raises(HubError, match='container_pilot_manifest_history_invalid'):
+        pilot_release_evidence(repo, workflow, run['id'])
 
 
 @pytest.mark.asyncio

@@ -246,6 +246,49 @@ class ContainerPilotWorkflow:
                 raise HubError('container_pilot_manifest_changed', 409)
         return target
 
+    def _historical_target(self, run):
+        """Resolve the immutable manifest recorded for read-only run evidence.
+
+        Unlike ``_target``, this resolver never authorizes commands, claims or
+        recovery. Effects continue to require the currently configured target.
+        """
+        self._assert_pilot_owner()
+        digest = run.get('execution_manifest_digest') if type(run) is dict else None
+        if not isinstance(digest, str):
+            raise HubError('container_pilot_manifest_history_missing', 409)
+        with self.repo._connection() as db:
+            row = db.execute(
+                'SELECT binding FROM hub_container_pilot_manifest_views WHERE manifest_digest=?',
+                (digest,),
+            ).fetchone()
+            pinned = db.execute(
+                'SELECT binding FROM hub_container_pilot_bindings WHERE run_id=?',
+                (run.get('id'),),
+            ).fetchone()
+        if row is None:
+            raise HubError('container_pilot_manifest_history_missing', 409)
+        try:
+            binding = json.loads(row['binding'])
+            target = ContainerPilotTarget(**binding)
+            canonical = json.dumps(asdict(target), sort_keys=True, separators=(',', ':'))
+            if canonical != row['binding']:
+                raise ValueError('noncanonical_manifest_history')
+            target.validated_manifest()
+            if target.manifest_digest != digest:
+                raise ValueError('manifest_history_digest_mismatch')
+        except Exception:
+            raise HubError('container_pilot_manifest_history_invalid', 409) from None
+        if pinned is not None and pinned['binding'] != canonical:
+            raise HubError('container_pilot_manifest_changed', 409)
+        if (run.get('target') != target.target_id
+                or run.get('artifact_digest') != target.artifact_digest
+                or run.get('commit') != target.candidate_commit
+                or run.get('policy_revision') != target.policy_revision
+                or run.get('execution_actor') != self.repo.execution_principal):
+            raise HubError('container_pilot_manifest_mismatch', 403)
+        self._assert_pilot_owner()
+        return target
+
     def _event(self, run, event, *, phase, reason=None):
         self._assert_pilot_owner()
         if phase not in {'deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback', 'cleanup_candidate', 'cleanup_rollback'}:
