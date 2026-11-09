@@ -1,4 +1,9 @@
-"""Safe diagnostic evidence; no recovery, retry or transport fallback is added."""
+"""Safe diagnostic evidence for fatal native-source failures.
+
+A real held writer is fatal once the bounded SQLITE_BUSY retry budget is
+spent (kept tiny here); retry itself is covered by
+test_native_push_transient_retry.py. No transport fallback is added.
+"""
 from __future__ import annotations
 
 import json
@@ -92,7 +97,8 @@ def test_actual_busy_writer_fails_source_without_advancing_or_publishing(tmp_pat
     deliveries = []
     source = SQLiteEventSource(repository.path, MessageCursorReader(),
         lambda recipients, cursor: deliveries.append((recipients, cursor)),
-        busy_timeout_ms=30, on_error=observed.append)
+        busy_timeout_ms=30, on_error=observed.append,
+        transient_retry_initial_ms=10, transient_retry_max_ms=20, transient_retry_budget_ms=100)
     writer = sqlite3.connect(repository.path, isolation_level=None)
     try:
         source.start()
@@ -112,6 +118,8 @@ def test_actual_busy_writer_fails_source_without_advancing_or_publishing(tmp_pat
         assert source.stats['sqlite_errorcode'] == sqlite3.SQLITE_BUSY
         assert source.stats['sqlite_errorname'] == 'SQLITE_BUSY'
         assert source.stats['failure_stage'] == 'acquire_write_barrier'
+        assert source.stats['transient_retries'] >= 1
+        assert source.stats['last_transient_error'] == 'SQLITE_BUSY'
         assert source.stats['cursor'] == original_cursor
         assert source.stats['snapshot_reads'] == original_reads
         assert deliveries == []
@@ -136,7 +144,8 @@ async def test_health_exposes_safe_actual_busy_diagnostics_only(tmp_path, monkey
     real_source = SQLiteEventSource
 
     def bounded_source(*args, **kwargs):
-        return real_source(*args, **kwargs, busy_timeout_ms=30)
+        return real_source(*args, **kwargs, busy_timeout_ms=30, transient_retry_initial_ms=10,
+                           transient_retry_max_ms=20, transient_retry_budget_ms=100)
 
     monkeypatch.setattr(bus_app, 'SQLiteEventSource', bounded_source)
     app = bus_app.create_app(db_path=tmp_path / 'messages.sqlite3',
