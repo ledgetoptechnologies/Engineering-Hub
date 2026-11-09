@@ -11,6 +11,19 @@ _ACTIONS = (
 )
 
 
+def release_evidence_owner_allowed(principal, auth_config, owner_actor):
+    """Fail closed unless the authenticated human is the configured Hub owner."""
+    if not isinstance(principal, str):
+        return False
+    if auth_config.human_auth_mode == 'github':
+        owner_id = auth_config.beau_github_id
+        return owner_id is not None and principal == f'human:{owner_id}'
+    if auth_config.human_auth_mode == 'cloudflare_access':
+        return (isinstance(owner_actor, str) and owner_actor.startswith('human:cf:')
+                and principal == owner_actor)
+    return False
+
+
 def _command_evidence(repo, workflow, run, target, action):
     rollback = action in {'rollback_container', 'smoke_container_rollback'}
     expected_image = target.rollback_image_config_id if rollback else target.artifact_digest
