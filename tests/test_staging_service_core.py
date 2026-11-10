@@ -62,6 +62,38 @@ class CoreTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_verified_source_rejects_different_commit_at_job_admission(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        raw = zipped(mode=0o100644)
+        tree = _archive_tree(raw)[0]
+        commit_object = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+                         f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', commit_object)
+        payload = job(raw)
+        source_id = uid()
+        for invalid in (None, 7):
+            with self.assertRaises(Rejected):
+                self.service.put_source({'source_id': uid(), 'project': 'demo',
+                    'source_digest': payload['source_digest'], 'source_zip_base64': payload['source_zip_base64'],
+                    'source_commit': invalid, 'source_commit_object_base64': base64.b64encode(commit_object).decode()})
+        receipt = self.service.put_source({'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(commit_object).decode()})
+        self.assertEqual(receipt['source_binding']['commit_oid'], commit)
+        payload['source_id'] = source_id
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_mismatch')
+        payload['source_commit'] = commit
+        self.service.submit(payload); self.service.wait()
+        status = self.service.status(payload['job_id'])
+        self.assertEqual(status['result']['source_commit_verification'], 'git-sha1-tree-v1')
+        self.assertEqual(status['result']['source_binding'], receipt['source_binding'])
+        self.assertEqual(self.service.submit(payload), status)
+        self.service.close()
+        self.service = Service(self.temp.name, {'demo': profile()}, Backend())
+        self.assertEqual(self.service.submit(payload), status)
+
     def test_real_archive_build_registry_and_immutable_file(self):
         payload = job()
         self.service.submit(payload); self.service.wait()

@@ -65,7 +65,8 @@ def _archive_tree(raw: bytes) -> tuple[str, int, int]:
             if not infos or len(infos) > MAX_ENTRIES:
                 _fail("source_entry_limit")
             for info in infos:
-                if (info.is_dir() or info.orig_filename != info.filename or info.create_system != 3
+                if (info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                        or info.is_dir() or info.orig_filename != info.filename or info.create_system != 3
                         or info.flag_bits & 1 or info.file_size < 0 or info.compress_size < 0):
                     _fail("unsupported_source_archive_entry")
                 parts = _path(info.filename)
@@ -141,7 +142,7 @@ def _archive_tree(raw: bytes) -> tuple[str, int, int]:
 
 def _commit_tree(commit_object: bytes, expected_commit: str) -> str:
     if (type(commit_object) is not bytes or not commit_object or len(commit_object) > MAX_COMMIT_OBJECT
-            or not _OID.fullmatch(expected_commit)
+            or type(expected_commit) is not str or not _OID.fullmatch(expected_commit)
             or _object_id(b"commit", commit_object) != expected_commit):
         _fail("source_commit_object_mismatch")
     headers, separator, _message = commit_object.partition(b"\n\n")

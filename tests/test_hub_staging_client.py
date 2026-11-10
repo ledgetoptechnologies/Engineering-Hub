@@ -26,6 +26,26 @@ TOKEN = 'synthetic-private-worker-token-never-real'
 KINDS = ('workspace', 'build', 'test_run', 'preview')
 
 
+@pytest.mark.parametrize('mutation', ['missing', 'declared', 'commit', 'digest'])
+def test_operation_rejects_contradictory_source_proof(mutation):
+    binding = {'scheme': 'git-sha1-tree-v1', 'commit_oid': 'a' * 40, 'tree_oid': 'b' * 40,
+               'archive_sha256': 'c' * 64, 'commit_object_sha256': 'd' * 64,
+               'expanded_bytes': 1, 'entries': 1}
+    details = {'source_commit': 'a' * 40, 'source_digest': 'c' * 64,
+               'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': binding}
+    if mutation == 'missing':
+        del details['source_binding']
+    elif mutation == 'declared':
+        details['source_commit_verification'] = 'declared'
+    elif mutation == 'commit':
+        details['source_commit'] = 'e' * 40
+    else:
+        details['source_digest'] = 'e' * 64
+    with pytest.raises(StagingClientError):
+        StagingClient._operation({'command_id': str(uuid4()), 'job_id': str(uuid4()),
+                                  'state': 'succeeded', 'result': details})
+
+
 @pytest.fixture
 def config(tmp_path):
     secret = tmp_path / 'worker-token'
