@@ -718,19 +718,16 @@ dirty and a verified SQLite BUSY prevents reconciliation.
         assert self._barrier is not None and self._reader is not None
         began = False
         try:
-            if reason == "startup":
-                attempt_timeout_ms = self.busy_timeout_ms
-            else:
-                assert self._dirty_since is not None
-                retry_deadline = self._dirty_since + self.busy_retry_deadline_ms / 1000
-                remaining_ms = max(0, int((retry_deadline - time.monotonic()) * 1000))
-                attempt_timeout_ms = min(
-                    self.busy_timeout_ms, self.busy_retry_interval_ms, remaining_ms)
+            assert self._dirty_since is not None
+            retry_deadline = self._dirty_since + self.busy_retry_deadline_ms / 1000
+            remaining_ms = max(0, int((retry_deadline - time.monotonic()) * 1000))
+            attempt_timeout_ms = min(
+                self.busy_timeout_ms, self.busy_retry_interval_ms, remaining_ms)
             self._barrier.execute(f"PRAGMA busy_timeout={attempt_timeout_ms}")
             self._stage = "acquire_write_barrier"
             self._barrier.execute("BEGIN IMMEDIATE")
             began = True
-            self._assert_retry_deadline()
+            self._assert_retry_deadline(include_initial=reason == "startup")
             self._stage = "read_committed_cursor"
             recipients, next_cursor = self.read_after(self._reader, self._cursor)
             self._stage = "validate_cursor"
@@ -767,12 +764,14 @@ dirty and a verified SQLite BUSY prevents reconciliation.
                     pass
             raise
 
-    def _assert_retry_deadline(self) -> None:
-        if (self._retry_at is not None and self._dirty_since is not None
+    def _assert_retry_deadline(self, *, include_initial: bool = False) -> None:
+        if (self._dirty_since is not None
+                and (self._retry_at is not None or include_initial)
                 and time.monotonic() >= self._dirty_since + self.busy_retry_deadline_ms / 1000):
-            assert self._last_busy_error is not None
             self._stage = "acquire_write_barrier"
-            raise self._last_busy_error
+            if self._last_busy_error is not None:
+                raise self._last_busy_error
+            raise WatcherFailed("SQLite reconciliation exceeded its busy retry deadline")
 
     def _fail(self, exc: BaseException) -> None:
         with self._condition:
