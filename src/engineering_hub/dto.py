@@ -171,6 +171,43 @@ class RunDTO(EntityDTO):
     events: list[RunEventDTO]
 
 
+class PilotCommandEvidenceDTO(ResponseDTO):
+    action: Literal['deploy_container', 'smoke_container', 'rollback_container', 'smoke_container_rollback']
+    command_id: str
+    state: Literal['not_started', 'unknown', 'held', 'succeeded', 'failed', 'inconsistent']
+    expected_image_config_id: Digest
+    reported_image_config_id: Digest | None
+    reported_health: Literal['unknown', 'healthy', 'unhealthy'] | None
+    worker_state: Literal['pending', 'running', 'succeeded', 'failed', 'held'] | None
+    worker_evidence_verified: bool | None
+    protocol_verified: bool
+    journal_verified: bool
+    reason: Literal[
+        'inspect_required', 'paused', 'target_busy', 'stale_fence', 'identity_conflict',
+        'manifest_mismatch', 'policy_mismatch', 'image_unavailable', 'daemon_unavailable',
+        'container_conflict', 'evidence_mismatch', 'health_failed', 'effect_failed',
+        'recovery_required',
+    ] | None
+
+
+class PilotReleaseEvidenceDTO(ResponseDTO):
+    run_id: str
+    task_id: str
+    project: ProjectId
+    source_commit: Commit
+    review: RunReviewDTO
+    run_status: RunState
+    candidate_image_config_id: Digest
+    pilot_manifest_digest: Digest
+    rollback_image_config_id: Digest
+    candidate_deploy: PilotCommandEvidenceDTO
+    candidate_health_check: PilotCommandEvidenceDTO
+    rollback_deploy: PilotCommandEvidenceDTO
+    rollback_health_check: PilotCommandEvidenceDTO
+    evidence_basis: Literal['authenticated_worker_report']
+    independently_verified: Literal[False]
+
+
 class RecoveryDTO(ResponseDTO):
     run: RunDTO
     recovery: Literal['recovered', 'held', 'paused']
