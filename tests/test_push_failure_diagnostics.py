@@ -199,6 +199,56 @@ def test_startup_busy_writer_expires_fail_closed_without_becoming_ready(tmp_path
         source.stop()
 
 
+@pytest.mark.skipif(not sys_platform_linux(), reason='Actual Linux inotify/epoll integration')
+def test_startup_first_busy_wait_is_bounded_by_retry_deadline(tmp_path, monkeypatch):
+    repository = MessageRepository(tmp_path / 'messages.sqlite3')
+    deliveries = []
+    source = SQLiteEventSource(repository.path, MessageCursorReader(),
+        lambda recipients, cursor: deliveries.append((tuple(recipients), cursor)),
+        busy_timeout_ms=10_000, busy_retry_interval_ms=250,
+        busy_retry_deadline_ms=100)
+    writer = sqlite3.connect(repository.path, isolation_level=None)
+    setup_complete = threading.Event()
+    original_setup = source._setup
+    startup_errors = []
+
+    def observed_setup():
+        original_setup()
+        setup_complete.set()
+
+    monkeypatch.setattr(source, '_setup', observed_setup)
+
+    def start_source():
+        try:
+            source.start()
+        except BaseException as exc:
+            startup_errors.append(exc)
+
+    starter = threading.Thread(target=start_source, daemon=True)
+    try:
+        writer.execute('BEGIN IMMEDIATE')
+        starter.start()
+        assert setup_complete.wait(3), 'watcher did not finish SQLite setup'
+        # Keep the lock held through the retry deadline. A 10 s SQLite busy
+        # timeout would otherwise outlive the 100 ms source deadline.
+        assert source._thread_done.wait(3), 'startup exceeded its busy retry deadline'
+        writer.rollback()
+        starter.join(timeout=3)
+        assert not starter.is_alive(), 'startup did not terminate after the writer was released'
+        assert len(startup_errors) == 1 and isinstance(startup_errors[0], WatcherFailed), (
+            'startup did not fail closed while the writer remained busy')
+        assert source._thread_done.wait(3)
+        assert source.healthy is False
+        assert source.stats['cursor'] is None
+        assert source.stats['startup_catchups'] == 0
+        assert deliveries == []
+    finally:
+        writer.rollback()
+        writer.close()
+        starter.join(timeout=1)
+        source.stop()
+
+
 def test_retry_busy_timeout_never_exceeds_remaining_deadline(monkeypatch):
     source = object.__new__(SQLiteEventSource)
     source._barrier = None
