@@ -57,6 +57,13 @@ claim that a daemon service cgroup also contains Docker's container scopes.
 Allow headroom for their combined worst case (two CPUs and 4 GiB RAM).
 No root service, new
 account, global permission change, linger or boot autostart is installed.
+
+The daemon uses RootlessKit `--net=none` with no MTU override (`MTU=0`) and
+`DETACH_NETNS=false`. RootlessKit v3 rejects the Docker helper's default MTU
+1500 for the `none` driver, and the detached network namespace did not prove
+separation from the host network namespace in the staging preflight. Both
+settings are part of the versioned, reviewed host-controller command and must
+be verified against the installed Docker/RootlessKit versions before startup.
 The live staging user's existing subuid/subgid ranges and CPU/memory/pids
 delegation were observed; a short capped no-op user service completed cleanly.
 Those observations alone are not an accepted image/test run.

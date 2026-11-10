@@ -55,7 +55,8 @@ def test_clean_environment_and_fixed_command_do_not_inherit_remote_context(engin
     command = engine.command(selected)
     assert command[:2] == ['/usr/bin/env', '-i']
     assert 'DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none' in command
-    assert 'DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true' in command
+    assert 'DOCKERD_ROOTLESS_ROOTLESSKIT_MTU=0' in command
+    assert 'DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false' in command
     assert '--host=unix:///run/user/1000/engineering-hub-ci/docker.sock' in command
     assert '--iptables=false' in command and '--ip-forward=false' in command
     assert not any('2375' in value or 'eh-pilot' in value or 'secret' in value for value in command)

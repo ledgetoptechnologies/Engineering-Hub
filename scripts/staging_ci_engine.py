@@ -136,7 +136,12 @@ def command(value):
     return ['/usr/bin/env', '-i', f'HOME={value.home}', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin',
         f'XDG_RUNTIME_DIR={value.runtime}', f'DBUS_SESSION_BUS_ADDRESS={value.bus}',
         'DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none',
-        'DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=true',
+        # RootlessKit v3 rejects the dockerd-rootless.sh inherited default
+        # MTU=1500 for --net=none. Zero means no MTU override. Keep the daemon
+        # in its own network namespace; detach-netns would leave the intended
+        # isolation boundary unproven on the deployed Docker/RootlessKit pair.
+        'DOCKERD_ROOTLESS_ROOTLESSKIT_MTU=0',
+        'DOCKERD_ROOTLESS_ROOTLESSKIT_DETACH_NETNS=false',
         f'DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR={value.runtime / "rootlesskit"}',
         '/usr/bin/dockerd-rootless.sh', f'--host=unix://{value.socket}',
         f'--data-root={value.data}', f'--exec-root={value.runtime / "exec"}',
