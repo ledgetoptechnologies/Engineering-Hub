@@ -278,6 +278,29 @@ def test_retry_busy_timeout_never_exceeds_remaining_deadline(monkeypatch):
     assert 0 < configured[0] <= 25
 
 
+def test_first_barrier_acquired_after_deadline_is_rolled_back(monkeypatch):
+    source = object.__new__(SQLiteEventSource)
+    source._reader = object()
+    source._dirty_since = 1.0
+    source._retry_at = None
+    source._last_busy_error = None
+    source.busy_retry_deadline_ms = 100
+    source.busy_timeout_ms = 10_000
+    source.busy_retry_interval_ms = 250
+    commands = []
+
+    class Barrier:
+        def execute(self, statement):
+            commands.append(statement)
+
+    source._barrier = Barrier()
+    ticks = iter((1.0, 1.101))
+    monkeypatch.setattr('agent_message_bus.sqlite_events.time.monotonic', lambda: next(ticks))
+    with pytest.raises(WatcherFailed, match='busy retry deadline'):
+        source._reconcile(reason='startup')
+    assert commands == ['PRAGMA busy_timeout=100', 'BEGIN IMMEDIATE', 'ROLLBACK']
+
+
 def _capture_start_result(source, results, errors):
     try:
         results.append(source.start())
