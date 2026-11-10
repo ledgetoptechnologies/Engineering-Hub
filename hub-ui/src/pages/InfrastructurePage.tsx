@@ -10,7 +10,7 @@ import type { Hub } from "../hub";
 import { httpInfrastructure, writeFailureText, type DeviceDraft, type InfrastructureClient } from "../infrastructureApi";
 import { demoInfrastructure } from "../infrastructureDemo";
 import {
-  actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, needsAttention, observationView,
+  actorLabel, ago, inNetwork, ipFamily, isHostname, isIpAddress, isNetwork, isSlug, maintenanceView, METRICS_HOST_PATTERN, needsAttention, observationView,
   TEXT_MAX, type Device, type DeviceDetail, type DeviceList, type Maintenance,
 } from "../infrastructureModel";
 import { href, navigate, registerRouteLeaveGuard } from "../router";
@@ -173,6 +173,7 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
         {editing ? <DeviceEditor client={client} csrf={csrf} device={device} onDone={saved => { setEditing(false); if (saved) refresh(); }} />
           : <dl className="infra-facts">
             <dt>Hostname</dt><dd>{device.hostname ?? "Not recorded"}</dd>
+            {device.metrics_host && <><dt>Prometheus host</dt><dd><code>{device.metrics_host}</code></dd></>}
             <dt>Addresses</dt><dd>{device.addresses.length ? device.addresses.map(item => <code key={item}>{item}</code>) : "Not recorded"}</dd>
             <dt>Network</dt><dd>{device.network ?? "Not recorded"}</dd>
             <dt>VLAN</dt><dd>{device.vlan ?? "Not recorded"}</dd>
@@ -189,7 +190,7 @@ function DevicePage({ hub, actions, id }: { hub: Hub; actions: React.ReactNode; 
             return <li key={item.probe_id}><div><strong>{view.label}</strong><small><code>{item.probe_id}</code></small></div>
               <Badge tone={view.tone}>{view.line}</Badge></li>; })}</ul>}
       </section>
-      <MachineHealth hub={hub} deviceId={device.id} reading={reading} />
+      <MachineHealth hub={hub} device={{ id: device.id, name: device.metrics_host ?? device.hostname }} reading={reading} />
       <MaintenanceSection client={client} csrf={csrf} detail={detail} now={now} self={self}
         canWrite={detail.capabilities.maintenance_write && writable && !device.retired} onChanged={refresh} />
     </div>}
@@ -312,7 +313,7 @@ function MaintenanceForm({ client, csrf, deviceId, onChanged }: { client: Infras
   </form>;
 }
 
-interface EditorDraft { id: string; name: string; hostname: string; addresses: string; network: string; vlan: string; role: string }
+interface EditorDraft { id: string; name: string; hostname: string; metricsHost: string; addresses: string; network: string; vlan: string; role: string }
 function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   const problems: string[] = [];
   const addresses = draft.addresses.split(/\s+/).filter(Boolean);
@@ -320,6 +321,8 @@ function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   if (!draft.name.trim()) problems.push("Give the device a name.");
   if (!draft.role.trim()) problems.push("Say what the device is for.");
   if (draft.hostname && !isHostname(draft.hostname)) problems.push("The hostname isn't valid.");
+  if (draft.metricsHost.trim() && !METRICS_HOST_PATTERN.test(draft.metricsHost.trim()))
+    problems.push("The Prometheus host can use letters, numbers, dots, dashes and underscores, up to 64 characters.");
   if (addresses.length > 16) problems.push("At most 16 addresses.");
   const bad = addresses.filter(item => !isIpAddress(item));
   if (bad.length) problems.push(`Not an IP address: ${bad.join(", ")}.`);
@@ -336,13 +339,14 @@ function editorProblems(draft: EditorDraft, creating: boolean): string[] {
   return problems;
 }
 function toDraft(draft: EditorDraft, retired: boolean): DeviceDraft {
-  return { id: draft.id, name: draft.name.trim(), hostname: draft.hostname.trim() || null, addresses: draft.addresses.split(/\s+/).filter(Boolean),
+  return { id: draft.id, name: draft.name.trim(), hostname: draft.hostname.trim() || null, metrics_host: draft.metricsHost.trim() || null,
+    addresses: draft.addresses.split(/\s+/).filter(Boolean),
     network: draft.network.trim() || null, vlan: draft.vlan ? Number(draft.vlan) : null, role: draft.role.trim(), retired };
 }
 
 function DeviceEditor({ client, csrf, device, onDone }: { client: InfrastructureClient; csrf: string; device: Device | null; onDone: (saved: Device | null) => void }) {
   const creating = device === null;
-  const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "",
+  const initial: EditorDraft = { id: device?.id ?? "", name: device?.name ?? "", hostname: device?.hostname ?? "", metricsHost: device?.metrics_host ?? "",
     addresses: (device?.addresses ?? []).join("\n"), network: device?.network ?? "", vlan: device?.vlan?.toString() ?? "", role: device?.role ?? "" };
   const [draft, setDraft] = useState(initial);
   const [busy, setBusy] = useState(false);
@@ -371,6 +375,9 @@ function DeviceEditor({ client, csrf, device, onDone }: { client: Infrastructure
     <label className="field"><span className="field-label">Name</span><input required maxLength={100} value={draft.name} onChange={set("name")} /></label>
     <label className="field"><span className="field-label">Role</span><input required maxLength={100} value={draft.role} onChange={set("role")} placeholder="e.g. Staging builds" /></label>
     <label className="field"><span className="field-label">Hostname (optional)</span><input maxLength={253} value={draft.hostname} onChange={set("hostname")} /></label>
+    <label className="field"><span className="field-label">Prometheus host (optional)</span>
+      <input maxLength={64} value={draft.metricsHost} onChange={set("metricsHost")} placeholder="e.g. BEAST" />
+      <small>Only if Prometheus reports this machine under a different name than its hostname. It must match exactly, including capitals.</small></label>
     <label className="field"><span className="field-label">IP addresses (optional, one per line)</span>
       <textarea value={draft.addresses} onChange={set("addresses")} /></label>
     <div className="infra-form-row">

@@ -2,7 +2,7 @@ import { HISTORY_RANGES, formatRate, parseHistory, quickStats, readHistory } fro
 import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/infrastructure-metrics-v1.json";
 import discovered from "./fixtures/infrastructure-metrics-v2.json";
-import { formatBytes, formatUptime, groupMachines, parseMetrics, readMetrics } from "./infrastructureMetrics";
+import { formatBytes, formatUptime, grafanaLink, groupMachines, parseLinks, parseMetrics, readLinks, readMetrics } from "./infrastructureMetrics";
 
 const clone = () => JSON.parse(JSON.stringify(fixture)) as typeof fixture & Record<string, unknown>;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -36,10 +36,22 @@ describe("machine metrics", () => {
     const value = clone(); change(value);
     expect(() => parseMetrics(value)).toThrow();
   });
-  it("hides on 403, 404, 503 and a missing route; signs out on 401", async () => {
-    for (const status of [403, 404, 503]) expect(await readMetrics(new AbortController().signal, vi.fn(async () => json({}, status)))).toBeNull();
+  it("hides on 403, an unknown 404 and a missing route; signs out on 401", async () => {
+    for (const status of [403, 404]) expect(await readMetrics(new AbortController().signal, vi.fn(async () => json({}, status)))).toBeNull();
+    const gateway = json({ detail: { code: "gateway_route_forbidden" } }, 403);
+    expect(await readMetrics(new AbortController().signal, vi.fn(async () => gateway))).toBeNull();
     await expect(readMetrics(new AbortController().signal, vi.fn(async () => json({}, 401)))).rejects.toMatchObject({ status: 401 });
     await expect(readMetrics(new AbortController().signal, vi.fn(async () => json({}, 500)))).rejects.toMatchObject({ status: 500 });
+  });
+  it("says when an admitted reader's Hub isn't set up, and when it couldn't answer", async () => {
+    const unset = await readMetrics(new AbortController().signal, vi.fn(async () => json({ detail: { code: "infrastructure_metrics_not_configured" } }, 404)));
+    expect(unset).toMatchObject({ source: { status: "not_configured" }, targets: [] });
+    expect(await readMetrics(new AbortController().signal, vi.fn(async () => json({ detail: { code: "infrastructure_unavailable" } }, 503)))).toBe("unavailable");
+    expect(await readMetrics(new AbortController().signal, vi.fn(async () => new Response("down", { status: 503 })))).toBe("unavailable");
+    const history = await readHistory("host:" + "a".repeat(64), "6h", new AbortController().signal,
+      vi.fn(async () => json({ detail: { code: "infrastructure_metrics_not_configured" } }, 404)) as unknown as typeof fetch);
+    expect(history).toEqual({ range: "6h", source: "not_configured", series: [] });
+    expect(await readHistory("host:" + "a".repeat(64), "6h", new AbortController().signal, vi.fn(async () => json({}, 503)) as unknown as typeof fetch)).toBe("unavailable");
   });
   it("reads only the fixed same-origin route", async () => {
     const fetchImpl = vi.fn(async () => json(fixture));
@@ -178,5 +190,32 @@ describe("network rates and history", () => {
     expect(HISTORY_RANGES).toEqual(["1h", "6h", "24h", "7d"]);
     expect(formatRate(null)).toBe("not reported");
     expect(formatRate(2048)).toBe("2.0 KB/s");
+  });
+});
+
+describe("Grafana link", () => {
+  const template = "http://192.0.2.80:3000/d/node/machine?var-host={host}";
+  it("fills in the host label, encoded, and keeps the configured server", () => {
+    expect(grafanaLink(template, "BEAST")).toBe("http://192.0.2.80:3000/d/node/machine?var-host=BEAST");
+    expect(grafanaLink(template, "a b&c")).toBe("http://192.0.2.80:3000/d/node/machine?var-host=a%20b%26c");
+    expect(grafanaLink("https://grafana.example.test/d/x/{host}", "../../admin")).toBe("https://grafana.example.test/d/x/..%2F..%2Fadmin");
+  });
+  it("shows no link without a template, a host label, or a safe template", () => {
+    expect(grafanaLink(null, "BEAST")).toBeNull();
+    expect(grafanaLink(template, null)).toBeNull();
+    for (const bad of ["javascript:alert(1)//{host}", "https://{host}.example.test/d", "https://u:p@grafana.example.test/{host}",
+      "https://grafana.example.test/{host}/{host}", "https://grafana.example.test/d", "not a url {host}"])
+      expect(grafanaLink(bad, "BEAST")).toBeNull();
+  });
+  it("parses the links answer exactly and reads it from one fixed route", async () => {
+    expect(parseLinks({ schema_version: 1, grafana_host_url: template })).toBe(template);
+    expect(parseLinks({ schema_version: 1, grafana_host_url: null })).toBeNull();
+    expect(() => parseLinks({ schema_version: 1, grafana_host_url: template, extra: 1 })).toThrow();
+    expect(() => parseLinks({ schema_version: 1, grafana_host_url: "javascript:alert(1)//{host}" })).toThrow();
+    const fetchImpl = vi.fn(async () => json({ schema_version: 1, grafana_host_url: template }));
+    expect(await readLinks(new AbortController().signal, fetchImpl)).toBe(template);
+    expect(fetchImpl).toHaveBeenCalledWith("/api/hub/v1/infrastructure/metrics/links", expect.objectContaining({ method: "GET", credentials: "same-origin" }));
+    for (const status of [403, 404, 503]) expect(await readLinks(new AbortController().signal, vi.fn(async () => json({}, status)))).toBeNull();
+    expect(await readLinks(new AbortController().signal, vi.fn(async () => json({ schema_version: 2 })))).toBeNull();
   });
 });

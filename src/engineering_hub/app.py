@@ -783,7 +783,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
     attach_planning_routes(app, repository=notes_repository, actor=actor)
     from .infrastructure_api import attach_infrastructure_routes
     attach_infrastructure_routes(app, infrastructure.service, actor, metrics=infrastructure.metrics,
-                                 metrics_identity=metrics_identity)
+                                 metrics_identity=metrics_identity,
+                                 grafana_host_url=getattr(infrastructure, 'grafana_host_url', None))
     app.state.infrastructure = infrastructure
     from .label_sets_api import attach_label_set_routes
     attach_label_set_routes(app, repository=label_sets, actor=actor, human=human)

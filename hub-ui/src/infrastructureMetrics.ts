@@ -154,8 +154,29 @@ export function parseMetrics(value: unknown): MachineMetrics {
   return { generated_at: time(row.generated_at), source, targets };
 }
 
-/** null means this Hub or this person has no metrics: the panel is hidden, as for other optional routes. */
-export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineMetrics | null> {
+/**
+ * Why the Hub answered without readings. "not_configured" is only said after the person was
+ * admitted (the server checks access first), so it doesn't reveal anything to someone refused.
+ */
+export type MetricsGap = "not_configured" | "unavailable";
+async function metricsGap(response: Response): Promise<MetricsGap | null> {
+  if (response.status === 503) return "unavailable";
+  if (response.status !== 404 || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return null;
+  try {
+    const body: unknown = await response.clone().json();
+    return (body as { detail?: { code?: unknown } })?.detail?.code === "infrastructure_metrics_not_configured" ? "not_configured" : null;
+  } catch { return null; }
+}
+/** An admitted "not set up" answer, shown the same way as a Prometheus source that isn't configured. */
+export function notConfiguredMetrics(now = new Date()): MachineMetrics {
+  return { generated_at: now.toISOString(), source: { status: "not_configured", truncated: false, omitted_count: 0, warnings: [] }, targets: [] };
+}
+
+/**
+ * null means this person can't read metrics (or this Hub has no such route): the panel is hidden.
+ * "unavailable" means the Hub couldn't answer right now; "not set up" comes back as a not_configured source.
+ */
+export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineMetrics | "unavailable" | null> {
   let response: Response;
   try {
     response = await fetchImpl.call(globalThis, "/api/hub/v1/infrastructure/metrics",
@@ -165,7 +186,10 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
     throw new HubApiError(0, "network_unavailable");
   }
   if (response.status === 401) throw new HubApiError(401, "human_session_required");
-  if ([403, 404, 503].includes(response.status) || await isMissingRoute(response)) return null;
+  const gap = await metricsGap(response);
+  if (gap === "not_configured") return notConfiguredMetrics();
+  if (gap === "unavailable") return "unavailable";
+  if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "infrastructure_metrics_failed");
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
   let body: unknown;
@@ -198,7 +222,7 @@ export function parseHistory(value: unknown): MachineHistoryData {
     series: list(row.series, MAX_HISTORY_SERIES).map(historySeries) };
 }
 /** null means this person or Hub has no history for this machine: the charts are hidden. */
-export async function readHistory(hostKey: string, range: HistoryRange, signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineHistoryData | null> {
+export async function readHistory(hostKey: string, range: HistoryRange, signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineHistoryData | "unavailable" | null> {
   let response: Response;
   const query = new URLSearchParams({ host: hostKey, range });
   try {
@@ -209,12 +233,51 @@ export async function readHistory(hostKey: string, range: HistoryRange, signal: 
     throw new HubApiError(0, "network_unavailable");
   }
   if (response.status === 401) throw new HubApiError(401, "human_session_required");
-  if ([403, 404, 503].includes(response.status) || await isMissingRoute(response)) return null;
+  const gap = await metricsGap(response);
+  if (gap === "not_configured") return { range, source: "not_configured", series: [] };
+  if (gap === "unavailable") return "unavailable";
+  if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "infrastructure_history_failed");
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
   let body: unknown;
   try { body = await response.json(); } catch { return invalid(); }
   return parseHistory(body);
+}
+
+/**
+ * The owner's Grafana link for one machine: the configured template with the host label filled
+ * in. The template is validated again here, so a malformed setting shows no link rather than a
+ * wrong one, and the label can only land in the path or query.
+ */
+export function grafanaLink(template: string | null, hostLabel: string | null): string | null {
+  if (!template || !hostLabel || template.split("{host}").length !== 2) return null;
+  const href = template.replace("{host}", encodeURIComponent(hostLabel));
+  try {
+    const url = new URL(href);
+    const origin = new URL(template.replace("{host}", "x"));
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && url.host === origin.host ? href : null;
+  } catch { return null; }
+}
+export function parseLinks(value: unknown): string | null {
+  const row = record(value, ["schema_version", "grafana_host_url"]);
+  if (row.schema_version !== 1) return invalid();
+  if (row.grafana_host_url === null) return null;
+  const template = plain(row.grafana_host_url, 512);
+  return grafanaLink(template, "x") ? template : invalid();
+}
+/** The Grafana link template, or null when none is set up or this person can't read metrics. */
+export async function readLinks(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<string | null> {
+  let response: Response;
+  try {
+    response = await fetchImpl.call(globalThis, "/api/hub/v1/infrastructure/metrics/links",
+      { method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return null;
+  }
+  if (response.status === 401) throw new HubApiError(401, "human_session_required");
+  if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return null;
+  try { return parseLinks(await response.json()); } catch { return null; }
 }
 
 export interface MachineGroup {

@@ -350,13 +350,21 @@ test("machine health shows even when the device list is refused, and stays hidde
   await expect(page.locator("body")).not.toContainText("192.0.2.");
 });
 
-test("machine health stays hidden without metrics access or when not set up", async ({ page }) => {
-  for (const reply of [{ status: 403, body: { detail: { code: "forbidden" } } }, { status: 404, body: { detail: { code: "infrastructure_metrics_not_configured" } } }]) {
+test("machine health stays hidden without metrics access, and says so when not set up or unavailable", async ({ page }) => {
+  for (const reply of [{ status: 403, body: { detail: { code: "forbidden" } } }, { status: 403, body: { detail: { code: "gateway_route_forbidden" } } }]) {
     await page.unrouteAll();
     await fixture(page, { metrics: [reply] });
     await page.goto("/#/infrastructure");
     await expect(devicesPanel(page)).toContainText("Build PC");
     await expect(healthPanel(page)).toHaveCount(0);
+  }
+  for (const [reply, text] of [[{ status: 404, body: { detail: { code: "infrastructure_metrics_not_configured" } } }, "isn't connected to Prometheus yet"],
+    [{ status: 503, body: { detail: { code: "infrastructure_unavailable" } } }, "aren't available on this Hub right now"]] as const) {
+    await page.unrouteAll();
+    await fixture(page, { metrics: [reply] });
+    await page.goto("/#/infrastructure");
+    await expect(devicesPanel(page)).toContainText("Build PC");
+    await expect(healthPanel(page)).toContainText(text);
   }
 });
 
@@ -413,4 +421,38 @@ test("a current failed scrape says so; an old one is only out of date", async ({
   const panel = healthPanel(page);
   await expect(panel.getByRole("listitem").filter({ hasText: "field-pi" })).toContainText("Scrape failing");
   await expect(panel.getByRole("listitem").filter({ hasText: "gpu-box" })).toContainText("No GPU readings came back.");
+});
+
+test("a device page says when Prometheus has no matching machine, and the editor sets the Prometheus host", async ({ page }) => {
+  const state = await fixture(page, { metrics: [metrics()], writes: [{ status: 200, body: devices()[0] }] });
+  await page.goto("/#/infrastructure/build-pc");
+  await expect(healthPanel(page)).toContainText("Prometheus isn't reporting a machine named build.example.test");
+  await page.getByRole("region", { name: "Declared details" }).getByRole("button", { name: "Edit" }).click();
+  const form = page.getByRole("form", { name: "Edit device" });
+  await form.getByLabel(/Prometheus host/).fill("bad host");
+  await form.getByRole("button", { name: "Save changes" }).click();
+  await expect(form.getByRole("alert")).toContainText("The Prometheus host can use letters");
+  expect(state.writes).toHaveLength(0);
+  await form.getByLabel(/Prometheus host/).fill("BUILD-PC");
+  await form.getByRole("button", { name: "Save changes" }).click();
+  await expect.poll(() => state.writes.length).toBe(1);
+  expect(state.writes[0].body).toMatchObject({ hostname: "build.example.test", metrics_host: "BUILD-PC" });
+});
+
+test("a machine links to the owner's Grafana only when one is set up", async ({ page }) => {
+  const template = "http://192.0.2.80:3000/d/node/machine?var-host={host}";
+  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
+  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => route.fulfill({ status: 404, contentType: "application/json",
+    body: JSON.stringify({ detail: { code: "infrastructure_metrics_not_configured" } }) }));
+  await page.route("**/api/hub/v1/infrastructure/metrics/links", route => route.fulfill({ status: 200, contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, grafana_host_url: template }) }));
+  await page.goto("/#/infrastructure/build-pc");
+  const link = healthPanel(page).getByRole("link", { name: "View in Grafana" });
+  await expect(link).toHaveAttribute("href", "http://192.0.2.80:3000/d/node/machine?var-host=desk");
+  await expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(healthPanel(page)).toContainText("isn't connected to Prometheus yet");
+  await page.unroute("**/api/hub/v1/infrastructure/metrics/links");
+  await page.reload();
+  await expect(healthPanel(page)).toContainText("desk");
+  await expect(healthPanel(page).getByRole("link", { name: "View in Grafana" })).toHaveCount(0);
 });

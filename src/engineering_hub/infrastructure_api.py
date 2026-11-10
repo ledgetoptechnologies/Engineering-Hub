@@ -16,6 +16,7 @@ class Closed(BaseModel):
 class DeviceInput(Closed):
     name: str = Field(min_length=1,max_length=100)
     hostname: str | None = Field(default=None,max_length=253)
+    metrics_host: str | None = Field(default=None,max_length=64)
     addresses: list[str] = Field(max_length=16)
     network: str | None = Field(default=None,max_length=64)
     vlan: int | None = Field(default=None,ge=1,le=4094)
@@ -72,7 +73,7 @@ async def _payload(request,model,maximum=16384):
         raise HubError('invalid_infrastructure_input') from None
 
 
-def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identity=None):
+def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identity=None,grafana_host_url=None):
     if service is not None and type(service) is not InfrastructureService:
         raise TypeError('Explicit InfrastructureService required')
     if metrics is not None and (service is None or metrics.service is not service):
@@ -114,6 +115,16 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         if metrics is None or not hasattr(metrics,'history'):
             raise HubError('infrastructure_metrics_not_configured',404)
         return await metrics.history(identity,params['host'],params['range'])
+
+    @app.get('/api/hub/v1/infrastructure/metrics/links')
+    def machine_metric_links(request:Request):
+        # Same admission as the readings; the template itself is owner-written settings.
+        identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
+        if request.query_params:
+            raise HubError('invalid_infrastructure_filter')
+        if metrics is None:
+            raise HubError('infrastructure_metrics_not_configured',404)
+        return {'schema_version':1,'grafana_host_url':grafana_host_url}
 
     @app.get('/api/hub/v1/infrastructure/devices/{device_id}')
     def detail(device_id:str,request:Request):

@@ -9,7 +9,7 @@ import type { Hub } from "../hub";
 import { demoMachineHistory } from "../infrastructureDemo";
 import { HISTORY_RANGES, formatRate, percent, readHistory, type HistoryPoint, type HistoryRange, type HistorySeries, type MachineHistoryData } from "../infrastructureMetrics";
 
-type Load = { state: "loading" } | { state: "failed" } | { state: "gone" } | { state: "loaded"; value: MachineHistoryData };
+type Load = { state: "loading" } | { state: "failed" } | { state: "gone" } | { state: "unavailable" } | { state: "loaded"; value: MachineHistoryData };
 interface Line { name: string; slot: number; points: HistoryPoint[] }
 
 const RANGE_TEXT: Record<HistoryRange, string> = { "1h": "1 hour", "6h": "6 hours", "24h": "24 hours", "7d": "7 days" };
@@ -131,7 +131,7 @@ export function MachineHistory({ hub, hostKey }: { hub: Hub; hostKey: string }) 
     const controller = new AbortController();
     setLoad({ state: "loading" });
     readHistory(hostKey, range, controller.signal).then(value => {
-      if (!controller.signal.aborted) setLoad(value === null ? { state: "gone" } : { state: "loaded", value });
+      if (!controller.signal.aborted) setLoad(value === null ? { state: "gone" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
@@ -161,6 +161,7 @@ export function MachineHistory({ hub, hostKey }: { hub: Hub; hostKey: string }) 
     </div>
     {load.state === "loading" && <p role="status">Reading history…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">History couldn't be read. <button type="button" className="secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button></p>}
+    {load.state === "unavailable" && <p className="notice" role="status">History isn't available on this Hub right now. <button type="button" className="secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button></p>}
     {notice && <p className="notice" role="status">{notice}</p>}
     {load.state === "loaded" && load.value.source !== "not_configured" && load.value.source !== "unreachable" && series.length === 0 &&
       <p className="infra-empty">No history for this range.</p>}

@@ -71,6 +71,24 @@ def _unique(pairs):
     return result
 
 
+MAX_GRAFANA_URL = 512
+
+
+def grafana_host_url(value):
+    """Validate an owner-written Grafana link template; the browser fills in {host}.
+
+    One http(s) URL with no credentials, where {host} appears exactly once in the
+    path or query, so the host label can never change which server is opened.
+    """
+    from urllib.parse import urlsplit
+    _need(type(value) is str and 0 < len(value) <= MAX_GRAFANA_URL and value.isprintable() and value.strip() == value)
+    _need(value.count('{host}') == 1 and not set(value.replace('{host}', '')) & set('{}'))
+    parts = urlsplit(value)
+    _need(parts.scheme in ('http', 'https') and parts.netloc and '@' not in parts.netloc and '{host}' not in parts.netloc)
+    _need(not parts.fragment or '{host}' not in parts.fragment)
+    return value
+
+
 def _settings(path):
     path=Path(path).absolute()
     if os.name=='posix':
@@ -97,7 +115,7 @@ def _settings(path):
     value=json.loads(raw,object_pairs_hook=_unique,
                      parse_constant=lambda value:(_ for _ in ()).throw(ValueError()))
     required={'schema_version','enabled','principals'}
-    _need(type(value) is dict and required<=set(value)<=required|{'prometheus'})
+    _need(type(value) is dict and required<=set(value)<=required|{'prometheus','grafana'})
     _need(type(value['schema_version']) is int and value['schema_version']==1 and type(value['enabled']) is bool)
     _need(type(value['principals']) is list and len(value['principals'])<=128)
     grants={}
@@ -131,7 +149,11 @@ def _settings(path):
         _need(len({(item.device_id,item.probe_id) for item in mappings})==len(mappings))
         _need(all(sum(other.device_id==item.device_id for other in mappings)<=16 for item in mappings))
         prometheus=(origin,tuple(mappings))
-    return value['enabled'],grants,prometheus
+    grafana=None
+    if 'grafana' in value:
+        _need(type(value['grafana']) is dict and set(value['grafana'])=={'host_url'})
+        grafana=grafana_host_url(value['grafana']['host_url'])
+    return value['enabled'],grants,prometheus,grafana
 
 
 def _schema(db):
@@ -156,6 +178,8 @@ class InfrastructureModule:
     collector: object = None
     metrics: object = None
     prometheus_origin: object = None
+    # Owner-configured Grafana link template, or None: no link is shown.
+    grafana_host_url: object = None
     state: str = 'disabled'
     _directory_fd: object = None
     _registry: object = None
@@ -168,6 +192,7 @@ class InfrastructureModule:
         self.collector=None
         self.metrics=None
         self.prometheus_origin=None
+        self.grafana_host_url=None
         service,self.service=self.service,None
         registry,self._registry=self._registry,None
         try:
@@ -185,7 +210,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         return module
     used_default = False
     try:
-        enabled,grants,prometheus=_settings(path)
+        enabled,grants,prometheus,grafana=_settings(path)
     except FileNotFoundError:
         if default_owner is None:
             return module
@@ -194,7 +219,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         if (type(default_owner) is not str or re.fullmatch(
                 r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', default_owner) is None):
             module.state='invalid';return module
-        enabled, prometheus = True, None
+        enabled, prometheus, grafana = True, None, None
         used_default = True
         grants = {InfrastructurePrincipal('human', default_owner): CAPABILITIES}
         grants.update({InfrastructurePrincipal('agent', agent): frozenset({'read'}) for agent in AGENTS})
@@ -292,6 +317,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         elif used_default:
             from .infrastructure_prometheus import PrometheusOrigin
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
+        module.grafana_host_url=grafana
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
         root_fd=None;db=None

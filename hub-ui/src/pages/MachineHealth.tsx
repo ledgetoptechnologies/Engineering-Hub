@@ -9,13 +9,34 @@ import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
 import {
-  formatBytes, formatRate, formatUptime, groupMachines, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
+  formatBytes, formatRate, formatUptime, grafanaLink, groupMachines, percent, quickStats, readLinks, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
+
+/** Demo shows where the link sits; the address is illustrative and goes nowhere real. */
+const DEMO_GRAFANA = "https://grafana.example.test/d/machine?var-host={host}";
+/** The owner's Grafana link template, read once. Any failure just means no link. */
+export function useGrafanaTemplate(hub: Hub): string | null {
+  const [template, setTemplate] = useState<string | null>(null);
+  useEffect(() => {
+    if (hub.demo) { setTemplate(DEMO_GRAFANA); return; }
+    const controller = new AbortController();
+    readLinks(controller.signal).then(value => { if (!controller.signal.aborted) setTemplate(value); }).catch(error => {
+      if (controller.signal.aborted) return;
+      if (error instanceof HubApiError && error.status === 401) hub.clearPrivateWorkspace();
+    });
+    return () => controller.abort();
+  }, [hub.demo]);
+  return template;
+}
+function GrafanaLink({ template, group }: { template: string | null; group: MachineGroup }) {
+  const link = grafanaLink(template, group.targets[0]?.host_label ?? null);
+  return link ? <a className="machine-grafana" href={link} target="_blank" rel="noopener noreferrer">View in Grafana</a> : null;
+}
 import { href } from "../router";
 import { Badge, PanelTitle } from "../ui";
 import { MachineHistory } from "./MachineHistory";
 
-type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "loaded"; value: MachineMetrics };
+type Load = { state: "loading" } | { state: "hidden" } | { state: "failed" } | { state: "unavailable" } | { state: "loaded"; value: MachineMetrics };
 
 const SOURCE_TEXT = {
   ok: null,
@@ -31,13 +52,14 @@ function omittedText(metrics: MachineMetrics): string | null {
   if (warnings.includes("series_truncated")) parts.push("Some machines reported more disks, GPUs or programs than are listed.");
   return parts.length ? parts.join(" ") : null;
 }
-function MachineHead({ group, link }: { group: MachineGroup; link: boolean }) {
+function MachineHead({ group, link, grafana }: { group: MachineGroup; link: boolean; grafana: string | null }) {
   return <div className="machine-card-head">
     <strong>{link && group.device_id ? <a href={href({ page: "device", id: group.device_id })}>{group.title}</a> : group.title}</strong>
     {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
     {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
     {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
     {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
+    <GrafanaLink template={grafana} group={group} />
   </div>;
 }
 const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as const;
@@ -115,7 +137,7 @@ export function useMachineMetrics(hub: Hub): MachineReading {
     readMetrics(controller.signal).then(value => {
       if (controller.signal.aborted) return;
       setNow(new Date());
-      setLoad(value === null ? { state: "hidden" } : { state: "loaded", value });
+      setLoad(value === null ? { state: "hidden" } : value === "unavailable" ? { state: "unavailable" } : { state: "loaded", value });
     }).catch(error => {
       if (controller.signal.aborted) return;
       if (error instanceof HubApiError && error.status === 401) { hub.clearPrivateWorkspace(); return; }
@@ -165,15 +187,20 @@ function HistoryToggle({ hub, hostKey }: { hub: Hub; hostKey: string }) {
   </>;
 }
 
-export function MachineHealth({ hub, deviceId, reading, shownDevices }: { hub: Hub; deviceId?: string; reading: MachineReading; shownDevices?: Set<string> }) {
+/** On a device page: the name Prometheus would need to report for this device to get stats. */
+export interface DeviceMatch { id: string; name: string | null }
+
+export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub; device?: DeviceMatch; reading: MachineReading; shownDevices?: Set<string> }) {
   const { load, now, refresh } = reading;
+  const grafana = useGrafanaTemplate(hub);
+  const deviceId = device?.id;
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
   // A machine already shown under its device row isn't repeated here.
   const targets = metrics ? metrics.targets.filter(item => deviceId !== undefined ? item.device_id === deviceId
     : !(item.device_id && shownDevices?.has(item.device_id))) : [];
   if (metrics && shownDevices && targets.length === 0 && metrics.source.status === "ok") return null;
-  if (metrics && deviceId !== undefined && targets.length === 0) return null;
+  const unmatched = Boolean(metrics && device && targets.length === 0 && (metrics.source.status === "ok" || metrics.source.status === "partial"));
   const groups = groupMachines(targets);
   const notice = metrics ? SOURCE_TEXT[metrics.source.status] : null;
   const omitted = metrics && deviceId === undefined ? omittedText(metrics) : null;
@@ -182,15 +209,18 @@ export function MachineHealth({ hub, deviceId, reading, shownDevices }: { hub: H
       <button type="button" className="secondary" disabled={load.state === "loading"} onClick={refresh}>
         {load.state === "loading" ? "Reading…" : "Refresh"}</button>
     </PanelTitle>
-    <p className="panel-description">Read from Prometheus when you open this page or press Refresh. Values are what the exporters last reported.</p>
     {load.state === "loading" && !metrics && <p role="status">Reading machine health…</p>}
     {load.state === "failed" && <p className="notice error" role="alert">Machine health couldn't be read. Use Refresh to try again.</p>}
+    {load.state === "unavailable" && <p className="notice" role="status">Machine stats aren't available on this Hub right now. Use Refresh to try again.</p>}
+    {unmatched && <p className="infra-empty">{device!.name
+      ? <>Prometheus isn't reporting a machine named <code>{device!.name}</code>. If it uses a different name for this device, set it under Edit as the Prometheus host.</>
+      : <>No stats yet. Record a hostname, or the name Prometheus uses for this device, under Edit.</>}</p>}
     {notice && <p className="notice" role="status">{notice}</p>}
     {omitted && <p className="notice" role="status">{omitted}</p>}
-    {metrics && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
+    {metrics && !device && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
       <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card">
-      <MachineHead group={group} link={deviceId === undefined} />
+      <MachineHead group={group} link={deviceId === undefined} grafana={grafana} />
       {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
         <div className="machine-section-head">
           <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>

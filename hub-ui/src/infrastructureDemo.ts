@@ -12,7 +12,7 @@ export function demoDevices(now = new Date()): { devices: Device[]; history: Rec
   const probe = (id: string, label: string, state: "ok" | "failed", seen: number, valid = 5) =>
     ({ probe_id: id, source_label: label, state, observed_at: at(seen), valid_until: at(seen - valid) });
   const device = (over: Partial<Device> & Pick<Device, "id" | "name" | "role">): Device => ({
-    hostname: null, addresses: [], network: null, vlan: null, retired: false, revision: 1, updated_at: at(60 * 24),
+    hostname: null, metrics_host: null, addresses: [], network: null, vlan: null, retired: false, revision: 1, updated_at: at(60 * 24),
     observations: [], open_maintenance: null, ...over });
   const maintenance: Maintenance = { id: "6f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b", revision: 1, device_id: "build-pc",
     reason: "Planned shutdown to replace the disk.\nWill power back on after the new disk is in.", expected_end: at(20), state: "open",

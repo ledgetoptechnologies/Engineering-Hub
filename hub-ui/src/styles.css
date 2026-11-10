@@ -4279,3 +4279,9 @@ button.text-button.danger { color: #a3402f; }
 .history-legend li { display: flex; align-items: center; gap: 6px; }
 .history-swatch { width: 12px; height: 3px; border-radius: 2px; background: var(--series); }
 @media (max-width: 640px) { .machine-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.machine-grafana { margin-left: auto; font-size: 13px; white-space: nowrap; }
+/* Grid items size to their content by default; charts measure their box, so the box must be able to shrink. */
+.infra-detail { grid-template-columns: minmax(0, 1fr); }
+.infra-detail > .panel { min-width: 0; }
+.history-grid-layout { min-width: 0; }
+.history-plot { overflow: hidden; }
