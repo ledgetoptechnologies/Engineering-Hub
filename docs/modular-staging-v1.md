@@ -36,9 +36,11 @@ type Resource = {
 };
 ```
 
-All timestamps are UTC ISO8601; IDs are canonical UUIDs. Source commit is
-declared provenance until verified against a source provider; the submitted ZIP
-SHA256 is independently verified. Resource IDs and canonical ownership are
+All timestamps are UTC ISO8601; IDs are canonical UUIDs. New Hub submissions
+must supply a Git commit object and an independently approved exact task revision.
+Hub and worker verify the archive against the commit tree. This establishes
+object/tree consistency, not repository membership, authorship or a signature;
+Git SHA-1 collision resistance is a limitation. Resource IDs and canonical ownership are
 issued by EH, not supplied by a browser or inferred from Docker discovery.
 Unknown size stays null. A project record alone grants no execution or read access.
 
@@ -50,8 +52,8 @@ paths are canonical ASCII, with no query strings or SPA fallback routing yet.
 Use the [committed-source packager](staging-source-package.md) to prepare a
 development ref without including working-tree changes or fetching missing Git
 objects. It records the archive digest and exact dependency/cache-label inputs.
-This is local source verification only: worker commit provenance remains
-declared, and a matching reviewed CI cache/profile must still be enrolled before
+The package contains the separate commit-object proof; worker acceptance is a
+separate step, and a matching reviewed CI cache/profile must still be enrolled before
 repository tests can run. Packaging neither submits work nor grants access.
 
 ### EH API
@@ -65,6 +67,13 @@ repository tests can run. Packaging neither submits work nor grants access.
 - `GET /api/hub/v1/staging/resources?project=&kind=&state=&after=&limit=`:
   `{items: Resource[], next_after: string | null}`; limit 1–100.
 - `GET /api/hub/v1/staging/resources/{id}`: one Resource.
+- `POST /api/hub/v1/staging/jobs` requires `review_task_id`,
+  `review_task_revision`, `source_commit_object_base64`, exact source commit,
+  archive digest and archive bytes. The review must belong to the submitter,
+  name the same commit and be independently approved. The queue rechecks it at
+  submission, claim and durable dispatch intent; active work fences edits.
+  Legacy unreviewed queued rows remain blocked and need explicit reconciliation;
+  they are never upgraded or replayed automatically.
 - `POST /api/hub/v1/staging/resources/{id}/keep`:
   `{mode:'until'|'pinned'|'none', until?:string, reason:string,
   expected_revision:number}` → Resource. Human mutation requires existing CSRF.
@@ -91,6 +100,8 @@ EH's existing WorkQueue remains the authoritative machine reservation and
 production-first ordering source. A staged build/test action is a sandbox job,
 not production deployment or evidence that arbitrary code was independently
 reviewed. Existing deployment/review/held-work gates remain unchanged.
+The `staging-service.` action-key prefix is reserved for this module; queue
+admission fails closed if its staging submission table or binding is absent.
 
 Worker core API: `submit(payload)`, `status(job_id)`, `metadata(resource_id)`,
 `file(resource_id, relative_path)` and `cleanup(payload)`. HTTP equivalents:

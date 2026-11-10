@@ -398,6 +398,8 @@ class HubRepository:
             if item['status'] == 'withdrawn':
                 raise HubError('withdrawn', 409)
             self._no_active_run(db, identity)
+            if self._open_work_job(db, identity):
+                raise HubError('active_work_job', 409)
             item.update(candidate_commit=commit, review=None, status='in_review',
                         **({'candidate_family': item['owner_family']} if 'owner_family' in item else {}))
             return self._save(db, actor, 'task.candidate', 'task', item)
@@ -410,6 +412,8 @@ class HubRepository:
             item = self._get(db, identity, 'task')
             self._project(item['project'], db)
             self._cas(item, expected_revision)
+            if self._open_work_job(db, identity):
+                raise HubError('active_work_job', 409)
             if (item['owner'] == actor
                     or session_context.family(actor) == item.get('candidate_family', item.get('owner_family', item['owner']))):
                 raise HubError('independent_review_required', 403)
@@ -419,6 +423,101 @@ class HubRepository:
                         review=dict(actor=actor, commit=commit, verdict=verdict,
                             **({'family': session_context.family(actor)} if session_context.actor_allowed(actor) else {})) if verdict == 'approve' else None)
             return self._save(db, actor, 'task.reviewed', 'task', item)
+
+    def reviewed_task_matches(self, identity, actor, revision, commit, *, db=None):
+        """Check the exact independently reviewed candidate while holding the queue transaction."""
+        if db is None:
+            with self._connection() as connection:
+                return self.reviewed_task_matches(identity, actor, revision, commit, db=connection)
+        try:
+            task = self._get(db, identity, 'task')
+        except HubError:
+            return False
+        return self._reviewed_task_data_matches(task, actor, revision, commit, db=db)
+
+    def _reviewed_task_data_matches(self, task, actor, revision, commit, *, db=None):
+        """Validate an exact review and its persisted per-installation lineage.
+
+        Legacy agent identities are self-describing. Installation actors are
+        accepted only when the task's candidate and review audit events have
+        matching Hub-owned session provenance in the same database snapshot.
+        Actor/family strings in the task JSON alone are never sufficient.
+        """
+        review = task.get('review')
+        if not (type(revision) is int and task.get('revision') == revision
+                and task.get('status') == 'verified' and task.get('owner') == actor
+                and task.get('candidate_commit') == commit and type(review) is dict
+                and review.get('verdict') == 'approve' and review.get('commit') == commit
+                and type(review.get('actor')) is str and review.get('actor') != actor):
+            return False
+        candidate_family = task.get('candidate_family', task.get('owner_family', task.get('owner')))
+        if type(candidate_family) is not str:
+            return False
+
+        review_actor = review['actor']
+        if review_actor in AGENTS:
+            reviewer_family = review.get('family', review_actor)
+            reviewer_valid = reviewer_family == review_actor
+        else:
+            reviewer_family = review.get('family')
+            reviewer_valid = self._session_event_matches(
+                db, task['id'], 'task.reviewed', revision, review_actor,
+                reviewer_family, capability='task.review')
+
+        if actor in AGENTS:
+            candidate_valid = candidate_family == actor
+        else:
+            # The candidate event is the latest candidate transition no later
+            # than the exact reviewed revision. Its provenance is inserted in
+            # the same SQLite commit as task.candidate.
+            candidate_valid = self._latest_session_candidate_matches(
+                db, task['id'], revision, actor, candidate_family,
+                task.get('owner_session_id'))
+
+        return (reviewer_valid and candidate_valid
+                and type(reviewer_family) is str
+                and reviewer_family != candidate_family)
+
+    def _session_event_matches(self, db, task_id, action, revision, actor,
+                               family, session_id=None, *, capability):
+        if db is None:
+            with self._connection() as connection:
+                return self._session_event_matches(connection, task_id, action,
+                    revision, actor, family, session_id, capability=capability)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone():
+            return False
+        row = db.execute(
+            'SELECT a.actor,p.installation_id,p.session_id,p.family,p.capability '
+            'FROM hub_audit a JOIN hub_session_provenance p ON p.audit_sequence=a.sequence '
+            'WHERE a.entity_id=? AND a.action=? AND a.revision=?',
+            (task_id, action, revision)).fetchone()
+        if row is None or row['actor'] != actor:
+            return False
+        return (type(row['installation_id']) is str and actor == 'installation:' + row['installation_id']
+                and (session_id is None or row['session_id'] == session_id)
+                and type(row['session_id']) is str and bool(row['session_id'])
+                and row['family'] == family
+                and row['capability'] == capability)
+
+    def _latest_session_candidate_matches(self, db, task_id, reviewed_revision,
+                                          actor, family, session_id):
+        if db is None:
+            with self._connection() as connection:
+                return self._latest_session_candidate_matches(connection, task_id,
+                    reviewed_revision, actor, family, session_id)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_session_provenance'").fetchone():
+            return False
+        row = db.execute(
+            'SELECT a.revision,a.actor,p.installation_id,p.session_id,p.family,p.capability '
+            'FROM hub_audit a LEFT JOIN hub_session_provenance p ON p.audit_sequence=a.sequence '
+            "WHERE a.entity_id=? AND a.action='task.candidate' AND a.revision<? "
+            'ORDER BY a.revision DESC LIMIT 1', (task_id, reviewed_revision)).fetchone()
+        if row is None or row['actor'] != actor:
+            return False
+        return (type(row['installation_id']) is str and actor == 'installation:' + row['installation_id']
+                and row['session_id'] == session_id
+                and row['family'] == family
+                and row['capability'] == 'task.candidate')
 
     def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
         self._actor(actor)
@@ -461,6 +560,8 @@ class HubRepository:
                 if self.queued_pilot_enrolled(db):
                     raise HubError('queued_pilot_admission_required', 409)
                 self._no_active_run(db, identity)
+                if self._open_work_job(db, identity):
+                    raise HubError('active_work_job', 409)
                 if item.get('candidate_commit') is not None or item.get('review') is not None:
                     item.update(candidate_commit=None, review=None,
                                 status='claimed' if item.get('owner') else 'assigned')
@@ -596,6 +697,11 @@ class HubRepository:
             task = self._get(db, task_id, 'task')
             self._project(task['project'], db)
             self._cas(task, expected_revision)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_work_jobs'").fetchone():
+                if db.execute("SELECT 1 FROM hub_work_jobs WHERE action_key LIKE 'staging-service.%' "
+                              "AND json_extract(target,'$.task_id')=? AND state NOT IN "
+                              "('succeeded','failed','cancelled') LIMIT 1", (task_id,)).fetchone():
+                    raise HubError('active_work_job', 409)
             if self._paused(db):
                 raise HubError('paused', 409)
             if task['owner'] != actor:

@@ -31,6 +31,18 @@ def submit(queue, key='one', env='staging', action='validate', **kwargs):
                         environment=env, target=kwargs.pop('target', target()), **kwargs)
 
 
+def test_reserved_modular_prefix_without_enrollment_fails_closed(tmp_path):
+    repo = HubRepository(tmp_path / 'hub.sqlite3')
+    action = 'staging-service.' + 'a' * 24
+    queue = WorkQueue(repo, {action: WorkAction('machine', project='engineering-hub')},
+                      target_verifier=lambda *args: True)
+    target_value = WorkTarget(str(uuid.uuid4()), 'a' * 40, 'sha256:' + 'b' * 64,
+                              1, str(uuid.uuid4()))
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        queue.submit(actor='codex', request_id='one', action_key=action,
+                     environment='staging', target=target_value)
+
+
 def finish(queue, claimed, outcome='succeeded'):
     return queue.complete(job_id=claimed['id'], worker=WorkWorker(*claimed['worker'].split(':', 1)), fence=claimed['fence'], outcome=outcome)
 

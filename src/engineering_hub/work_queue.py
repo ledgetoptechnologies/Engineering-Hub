@@ -280,6 +280,37 @@ class WorkQueue:
         except Exception:
             return False
 
+    def _modular_target_in_transaction(self, db, actor, action_key, environment, target):
+        """Bind modular source and independent review to this SQLite snapshot."""
+        if not action_key.startswith('staging-service.'):
+            return True
+        if (environment != 'staging' or target.submission_id is None or target.review_revision is None
+                or target.ci_attempt_job_id is not None or target.build_receipt_digest is not None
+                or target.execution_release_digest is not None):
+            return False
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_staging_submissions'").fetchone():
+            return False
+        row = db.execute('SELECT data FROM hub_staging_submissions WHERE id=?', (target.submission_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            item = json.loads(row['data'])
+            task = self.repo._get(db, target.task_id, 'task')
+            self.repo._no_active_run(db, target.task_id)
+            key = 'staging-service.' + hashlib.sha256(json.dumps(
+                [item['project'], item['recipe']], sort_keys=True, separators=(',', ':'),
+                allow_nan=False).encode()).hexdigest()[:24]
+            return (key == action_key and item['actor'] == actor and item['phase'] in ('deposited', 'queued')
+                    and item['review_task_id'] == target.task_id
+                    and item['review_task_revision'] == target.review_revision
+                    and item['source_commit'] == target.source_commit
+                    and target.artifact_digest == 'sha256:' + item['source_digest']
+                    and task['project'] == item['project']
+                    and self.repo.reviewed_task_matches(target.task_id, actor, target.review_revision,
+                                                        target.source_commit, db=db))
+        except (KeyError, TypeError, ValueError, HubError):
+            return False
+
     def _event(self, db, action, job_id, actor):
         db.execute('UPDATE hub_work_jobs SET revision=revision+1 WHERE id=?', (job_id,))
         revision = db.execute('SELECT revision FROM hub_work_jobs WHERE id=?', (job_id,)).fetchone()[0]
@@ -319,6 +350,8 @@ class WorkQueue:
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
         with self.repo._transaction() as db:
             if not self.repo.task_allows_environment(target.task_id, environment, db=db):
+                raise HubError('work_target_not_verified', 403)
+            if not self._modular_target_in_transaction(db, actor, action_key, environment, target):
                 raise HubError('work_target_not_verified', 403)
             old = db.execute('SELECT * FROM hub_work_jobs WHERE actor=? AND request_id=?', (actor, request_id)).fetchone()
             if old:
@@ -449,12 +482,18 @@ class WorkQueue:
                     continue
             elif not self._eligible_target(row):
                 continue
+            if not self._modular_target_in_transaction(db, row['actor'], row['action_key'], row['environment'],
+                                                         WorkTarget(**json.loads(row['target']))):
+                continue
             if not self._admitted(worker, row):
                 continue
             return row
         return None
 
     def _reserve_claim(self, db, row, worker, now, lease_seconds):
+        if not self._modular_target_in_transaction(db, row['actor'], row['action_key'], row['environment'],
+                                                   WorkTarget(**json.loads(row['target']))):
+            return None
         db.execute('INSERT OR IGNORE INTO hub_work_machines VALUES(?,0,NULL)', (row['machine_id'],))
         db.execute('UPDATE hub_work_machines SET generation=generation+1,job_id=? WHERE machine_id=?', (row['id'], row['machine_id']))
         fence = db.execute('SELECT generation FROM hub_work_machines WHERE machine_id=?', (row['machine_id'],)).fetchone()[0]
@@ -567,6 +606,8 @@ class WorkQueue:
                     or action.project != row['project']
                     or action.requires_execution_proof != bool(row['requires_execution_proof'])
                     or row['environment'] not in action.environments
+                    or not self._modular_target_in_transaction(db, row['actor'], row['action_key'],
+                        row['environment'], WorkTarget(**json.loads(row['target'])))
                     or not self._admitted(worker, row)
                     or not self._approved(row)
                     or not self._target_verified(row['actor'], row['action_key'], row['environment'],

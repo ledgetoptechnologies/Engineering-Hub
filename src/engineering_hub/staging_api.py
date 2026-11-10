@@ -32,11 +32,14 @@ class ClosedInput(BaseModel):
 
 class StagingSubmission(ClosedInput):
     request_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+    review_task_id: str = Field(pattern=r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+    review_task_revision: int = Field(ge=1)
     project: Project
     recipe: str = Field(pattern=r'^[a-z0-9][a-z0-9_-]{0,63}$')
     source_commit: str = Field(pattern=r'^[a-f0-9]{40}$')
     source_digest: str = Field(pattern=r'^[a-f0-9]{64}$')
     source_zip_base64: str = Field(min_length=1, max_length=MAX_SOURCE_BASE64)
+    source_commit_object_base64: str = Field(min_length=1, max_length=87384)
     topic: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$')
 
 

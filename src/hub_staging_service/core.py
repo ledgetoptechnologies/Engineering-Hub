@@ -809,6 +809,9 @@ class Service:
         if self.scratch_slot is not None and (lease is None or not lease.backend_absent):
             state = 'held'
             result = {'error': 'scratch_cleanup_unproven'}
+        if state in TERMINAL and payload.get('source_binding') is not None:
+            result.update(source_commit=payload['source_commit'], source_digest=payload['source_digest'],
+                          source_commit_verification='git-sha1-tree-v1', source_binding=payload['source_binding'])
         with self.lock:
             self._terminal_receipt(payload['command_id'], state, result)
             if lease is not None and lease.backend_absent:

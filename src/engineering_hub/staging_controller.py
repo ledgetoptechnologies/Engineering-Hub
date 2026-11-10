@@ -12,11 +12,16 @@ import json
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import BoundedSemaphore
 
 from .repository import AGENTS, HubError
 from .staging_resources import KINDS
 from .staging_client import _FILE_TYPES, StagingNotAccepted
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
+
+_PROOF_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='staging-proof')
+_PROOF_SLOT = BoundedSemaphore(1)
 
 
 def _json(value):
@@ -147,10 +152,13 @@ class StagingController:
                 return old_target(actor, action, environment, value) if old_target else False
             try:
                 self._shared_guard(admission=True)
-                item = self._read(value.task_id)
+                item = self._read(value.submission_id)
                 self._grants(item['actor'], item['project'])
                 return (actor == item['actor'] and environment == 'staging' and item['phase'] != 'depositing'
                         and action == self.actions[(item['project'], item['recipe'])]
+                        and value.task_id == item['review_task_id']
+                        and value.review_revision == item['review_task_revision']
+                        and self.repo.reviewed_task_matches(value.task_id, actor, value.review_revision, value.source_commit)
                         and value.source_commit == item['source_commit']
                         and value.artifact_digest == 'sha256:' + item['source_digest'])
             except Exception:
@@ -162,7 +170,7 @@ class StagingController:
             self._shared_guard(admission=True)
             if self._unknown_production(machine, old_target):
                 return False
-            item = self._read(value.task_id)
+            item = self._read(value.submission_id)
             return (worker == self.worker and item['phase'] == 'queued'
                     and set(item['resource_ids']) == KINDS
                     and target(item['actor'], action, environment, value))
@@ -200,9 +208,13 @@ class StagingController:
     async def submit(self, actor, payload):
         self._shared_guard(admission=True)
         _require(actor in AGENTS, 'staging_agent_required', 403)
-        fields = {'request_id', 'project', 'recipe', 'source_commit', 'source_digest', 'source_zip_base64'}
+        fields = {'request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
+                  'source_commit', 'source_digest', 'source_zip_base64', 'source_commit_object_base64'}
         _require(type(payload) is dict and set(payload) in (fields, fields | {'topic'}))
         _id(payload['request_id'])
+        _id(payload['review_task_id'])
+        _require(type(payload['review_task_revision']) is int and payload['review_task_revision'] >= 1,
+                 'staging_review_required', 409)
         project, recipe = payload['project'], payload['recipe']
         _require((project, recipe) in self.actions, 'staging_profile_not_registered', 403)
         self._grants(actor, project)
@@ -215,13 +227,41 @@ class StagingController:
         except ValueError:
             raise HubError('invalid_staging_source') from None
         _require(len(raw) <= 8 * 1024**2 and hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'staging_source_digest_mismatch')
+        _require(type(payload['source_commit_object_base64']) is str
+                 and 0 < len(payload['source_commit_object_base64']) <= 87384, 'staging_source_binding_invalid')
+        with self.repo._connection() as db:
+            prior = db.execute('SELECT data FROM hub_staging_submissions WHERE actor=? AND request_id=?',
+                               (actor, payload['request_id'])).fetchone()
+        if prior is not None:
+            previous = json.loads(prior['data'])
+            _require(all(previous.get(key) == payload.get(key) for key in (
+                'review_task_id', 'review_task_revision', 'project', 'recipe', 'source_commit', 'source_digest'))
+                and previous.get('topic') == payload.get('topic'), 'staging_request_conflict', 409)
+        _require(_PROOF_SLOT.acquire(blocking=False), 'staging_source_verification_busy', 503)
+        from hub_staging_service.source_provenance import verify
+        try:
+            future = _PROOF_EXECUTOR.submit(verify, raw, payload['source_commit_object_base64'], payload['source_commit'])
+        except BaseException:
+            _PROOF_SLOT.release()
+            raise
+        future.add_done_callback(lambda _: _PROOF_SLOT.release())
+        try:
+            binding = await asyncio.shield(asyncio.wrap_future(future))
+        except ValueError:
+            raise HubError('staging_source_binding_invalid') from None
         topic = payload.get('topic')
         _require(topic is None or type(topic) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', topic))
-        public = {key: value for key, value in payload.items() if key != 'source_zip_base64'}
+        public = {key: value for key, value in payload.items()
+                  if key not in {'source_zip_base64', 'source_commit_object_base64'}}
+        public['source_binding'] = binding
         public['topic'] = topic  # Omitted and explicit null have one request identity.
         fingerprint = hashlib.sha256(_json(public).encode()).hexdigest()
         async with self._short_lock():
             with self.repo._transaction() as db:
+                _require(self.repo.reviewed_task_matches(payload['review_task_id'], actor,
+                    payload['review_task_revision'], payload['source_commit'], db=db)
+                    and self.repo._get(db, payload['review_task_id'], 'task')['project'] == project,
+                    'staging_review_required', 409)
                 old = db.execute('SELECT * FROM hub_staging_submissions WHERE actor=? AND request_id=?', (actor, payload['request_id'])).fetchone()
                 if old:
                     _require(old['fingerprint'] == fingerprint, 'staging_request_conflict', 409)
@@ -234,14 +274,18 @@ class StagingController:
             if item['phase'] == 'depositing':
                 self._shared_guard(admission=True)
                 receipt = await self.client.put_source({'source_id': item['source_id'], 'project': project,
-                    'source_digest': item['source_digest'], 'source_zip_base64': encoded})
+                    'source_digest': item['source_digest'], 'source_zip_base64': encoded,
+                    'source_commit': item['source_commit'],
+                    'source_commit_object_base64': payload['source_commit_object_base64']})
                 self._shared_guard()
                 _require(all(receipt.get(key) == item[key] for key in ('source_id', 'source_digest', 'project')),
                          'staging_source_receipt_mismatch', 502)
+                _require(receipt.get('source_binding') == binding, 'staging_source_binding_receipt_mismatch', 502)
                 item['phase'] = 'deposited'; self._save(item)
             if item['job_id'] is None:
                 self._shared_guard(admission=True)
-                target = WorkTarget(item['id'], item['source_commit'], 'sha256:' + item['source_digest'])
+                target = WorkTarget(item['review_task_id'], item['source_commit'], 'sha256:' + item['source_digest'],
+                                    item['review_task_revision'], item['id'])
                 job = self.queue.submit(actor=actor, request_id='staging:' + item['request_id'],
                     action_key=self.actions[(project, recipe)], environment='staging', target=target)
                 item['job_id'] = job['id']; self._save(item)
@@ -266,8 +310,12 @@ class StagingController:
         return self._view(item)
 
     def _view(self, item):
-        return {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
-                'resource_ids': item['resource_ids'], 'phase': item['phase']}
+        result = {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
+                  'resource_ids': item['resource_ids'], 'phase': item['phase']}
+        if 'source_binding' in item:
+            result['source_binding'] = item['source_binding']
+            result['source_commit_verification'] = 'git-sha1-tree-v1'
+        return result
 
     async def runtime(self, actor):
         self.repo._actor(actor, human=True)
@@ -387,8 +435,19 @@ class StagingController:
                 self._grants(item['actor'], item['project'])
                 self.queue.live_claim(job_id=claim['id'], worker=self.worker, fence=claim['fence'])
                 self._shared_guard(admission=True)
-                item['phase'], item['claim'] = 'dispatching', claim
-                self._save(item)  # Never retry POST after this durable boundary.
+                with self.repo._transaction() as db:
+                    row = self.queue._owned(db, claim['id'], self.worker, claim['fence'], self.queue._now())
+                    _require(not self.repo._paused(db) and not db.execute(
+                        'SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0], 'staging_admission_changed', 409)
+                    _require(self.queue._modular_target_in_transaction(db, row['actor'], row['action_key'],
+                        row['environment'], WorkTarget(**json.loads(row['target']))), 'staging_review_required', 409)
+                    current = db.execute('SELECT data FROM hub_staging_submissions WHERE id=?', (item['id'],)).fetchone()
+                    _require(current is not None and json.loads(current['data']) == item and item['phase'] == 'queued',
+                             'staging_admission_changed', 409)
+                    self.resources._authorize(db, item['actor'], item['project'], 'build')
+                    self.resources._authorize(db, item['actor'], item['project'], 'test')
+                    item['phase'], item['claim'] = 'dispatching', claim
+                    db.execute('UPDATE hub_staging_submissions SET data=? WHERE id=?', (_json(item), item['id']))
                 receipt = await self.client.submit({'job_id': item['job_id'], 'command_id': item['command_id'],
                     'idempotency_key': item['command_id'], 'project': item['project'], 'recipe': item['recipe'],
                     'source_commit': item['source_commit'], 'source_digest': item['source_digest'],
@@ -427,10 +486,16 @@ class StagingController:
     async def _finish(self, item, receipt, claim):
         self._shared_guard()
         outcome = receipt['state']
+        result = receipt['result']
+        _require(result.get('source_commit') == item['source_commit']
+                 and result.get('source_digest') == item['source_digest']
+                 and result.get('source_commit_verification') == 'git-sha1-tree-v1'
+                 and result.get('source_binding') == item['source_binding'],
+                 'staging_completion_proof_invalid', 502)
         if outcome == 'succeeded':
-            result = receipt['result']
             _require(all(result.get(key) == item[key] for key in ('source_commit', 'source_digest', 'resource_ids'))
-                     and result.get('source_commit_verification') == 'declared' and result.get('preview_ready') is True
+                     and result.get('source_commit_verification') == 'git-sha1-tree-v1'
+                     and result.get('source_binding') == item['source_binding'] and result.get('preview_ready') is True
                      and set(result.get('stages', {})) == {'build', 'test'}
                      and all(stage.get('exit_code') == 0 for stage in result['stages'].values()),
                      'staging_completion_proof_invalid', 502)

@@ -19,6 +19,7 @@ from engineering_hub.staging_client import StagingNotAccepted
 
 class Client:
     def __init__(self):
+        self.bindings = {}
         self.jobs, self.facts, self.posts, self.deposits = {}, {}, 0, 0
         self.lost_ack, self.cleanup_lost = False, False
         self.cleanup_receipts, self.cleanup_posts = {}, 0
@@ -30,17 +31,22 @@ class Client:
 
     async def put_source(self, payload):
         self.deposits += 1
-        return {key: payload[key] for key in ('source_id', 'project', 'source_digest')} | {'size_bytes': 1}
+        from hub_staging_service.source_provenance import verify
+        binding = verify(base64.b64decode(payload['source_zip_base64']), payload['source_commit_object_base64'], payload['source_commit'])
+        self.bindings[payload['source_id']] = binding
+        return {key: payload[key] for key in ('source_id', 'project', 'source_digest')} | {'size_bytes': 1, 'source_binding': binding}
 
     async def submit(self, payload):
         self.posts += 1
         result = {key: payload[key] for key in ('source_commit', 'source_digest', 'resource_ids')}
-        result.update(source_commit_verification='declared', preview_ready=True,
+        result.update(source_commit_verification='git-sha1-tree-v1', source_binding=self.bindings[payload['source_id']], preview_ready=True,
                       stages={stage: {'exit_code': 0, 'log_bytes': 0} for stage in ('build', 'test')})
         receipt = {'job_id': payload['job_id'], 'command_id': payload['command_id'], 'state': 'succeeded', 'result': result}
         self.jobs[payload['job_id']] = receipt
         if self.fail:
-            receipt.update(state='failed', result={'error': 'stage_test_failed'})
+            receipt.update(state='failed', result={'error': 'stage_test_failed',
+                'source_commit': payload['source_commit'], 'source_digest': payload['source_digest'],
+                'source_commit_verification': 'git-sha1-tree-v1', 'source_binding': self.bindings[payload['source_id']]})
         for kind, identity in payload['resource_ids'].items():
             manifest = {'index.html': {'bytes': len(self.bytes), 'sha256': hashlib.sha256(self.bytes).hexdigest()}}
             self.facts[identity] = {'id': identity, 'job_id': payload['job_id'], 'kind': kind, 'state': 'ready',
@@ -76,14 +82,25 @@ class Client:
         pass
 
 
-def payload(project='engineering-hub'):
+def payload(repo, project='engineering-hub'):
+    from hub_staging_service.source_provenance import _archive_tree, _object_id
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w') as bundle:
-        bundle.writestr('index.html', '<html>source</html>')
+        info = zipfile.ZipInfo('index.html'); info.create_system = 3; info.external_attr = 0o100644 << 16
+        bundle.writestr(info, '<html>source</html>')
     raw = stream.getvalue()
-    return {'request_id': str(uuid.uuid4()), 'project': project, 'recipe': 'static',
-            'source_commit': 'a' * 40, 'source_digest': hashlib.sha256(raw).hexdigest(),
-            'source_zip_base64': base64.b64encode(raw).decode()}
+    tree = _archive_tree(raw)[0]
+    obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+           f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+    commit = _object_id(b'commit', obj)
+    task = repo.create_task('human:1', project, 'fixture', str(uuid.uuid4()))
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    task = repo.set_candidate('codex', task['id'], task['revision'], commit)
+    task = repo.review_task('claude', task['id'], task['revision'], commit, 'approve')
+    return {'request_id': str(uuid.uuid4()), 'review_task_id': task['id'], 'review_task_revision': task['revision'],
+            'project': project, 'recipe': 'static', 'source_commit': commit,
+            'source_digest': hashlib.sha256(raw).hexdigest(), 'source_zip_base64': base64.b64encode(raw).decode(),
+            'source_commit_object_base64': base64.b64encode(obj).decode()}
 
 
 @pytest.fixture
@@ -104,8 +121,9 @@ def env(tmp_path):
 
 @pytest.mark.asyncio
 async def test_deposit_queue_build_proof_and_preview_bytes(env):
+    repo = env[4]
     controller, client, resources, _, _ = env
-    submitted = await controller.submit('codex', payload('landscripting'))
+    submitted = await controller.submit('codex', payload(repo, 'landscripting'))
     assert submitted['job']['state'] == 'queued'
     assert client.posts == 0
     finished = await controller.run_once()
@@ -120,8 +138,9 @@ async def test_deposit_queue_build_proof_and_preview_bytes(env):
 
 @pytest.mark.asyncio
 async def test_idempotency_blob_not_persisted_and_changed_request_denied(env):
+    repo = env[4]
     controller, client, _, _, repo = env
-    request = payload()
+    request = payload(repo)
     first = await controller.submit('codex', request)
     assert (await controller.submit('codex', request))['job']['id'] == first['job']['id']
     assert client.deposits == 1
@@ -134,8 +153,9 @@ async def test_idempotency_blob_not_persisted_and_changed_request_denied(env):
 
 @pytest.mark.asyncio
 async def test_revoked_test_grant_prevents_claim(env):
+    repo = env[4]
     controller, client, resources, _, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     resources.set_policy('human:1', 'engineering-hub', 1, {'codex': ['read', 'build']})
     assert await controller.run_once() is None
     assert client.posts == 0
@@ -144,8 +164,9 @@ async def test_revoked_test_grant_prevents_claim(env):
 
 @pytest.mark.asyncio
 async def test_lost_acceptance_holds_then_original_get_reconciles_without_repost(env):
+    repo = env[4]
     controller, client, _, _, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     client.lost_ack = True
     held = await controller.run_once()
     assert held['job']['state'] == 'held'
@@ -167,7 +188,7 @@ async def test_same_machine_existing_production_priority_and_verifiers_preserved
     resources = StagingResourceStore(repo, admin_actors=frozenset({'human:1'}), control_principal=principal)
     resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test']})
     controller = StagingController(repo, queue, Client(), resources=resources, control_principal=principal, actions=actions)
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(repo))
     assert await controller.run_once() is None
     assert queue.get_job(production['id'])['state'] == 'queued'
     assert queue.target_verifier('codex', 'production', 'production', target) is True
@@ -175,8 +196,9 @@ async def test_same_machine_existing_production_priority_and_verifiers_preserved
 
 @pytest.mark.asyncio
 async def test_cleanup_exact_receipt_tombstone_and_uncertainty_never_replayed(env):
+    repo = env[4]
     controller, client, resources, now, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     plan = resources.cleanup_plan('codex', 'engineering-hub', kinds=['preview'])
@@ -197,8 +219,9 @@ async def test_cleanup_exact_receipt_tombstone_and_uncertainty_never_replayed(en
 @pytest.mark.parametrize('failure', ['timeout', 'referenced', 'wrong-job'])
 @pytest.mark.asyncio
 async def test_cleanup_preflight_failure_restores_with_receipt_and_requires_new_plan(env, failure):
+    repo = env[4]
     controller, client, resources, now, repo = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     identity = submitted['resource_ids']['preview']
@@ -233,8 +256,9 @@ async def test_cleanup_preflight_failure_restores_with_receipt_and_requires_new_
 
 @pytest.mark.asyncio
 async def test_cleanup_preflight_cancellation_restores_without_post_and_replay_does_not_retry(env):
+    repo = env[4]
     controller, client, resources, now, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     identity = submitted['resource_ids']['preview']
@@ -258,8 +282,9 @@ async def test_cleanup_preflight_cancellation_restores_without_post_and_replay_d
 @pytest.mark.parametrize('with_journal', [False, True])
 @pytest.mark.asyncio
 async def test_replayed_preflight_after_restart_restores_without_worker_io(env, with_journal):
+    repo = env[4]
     controller, client, resources, now, repo = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     identity = submitted['resource_ids']['preview']
@@ -281,8 +306,9 @@ async def test_replayed_preflight_after_restart_restores_without_worker_io(env, 
 @pytest.mark.parametrize('reason', ['worker_busy', 'cleanup_revision_or_reference', 'resource_job_not_terminal'])
 @pytest.mark.asyncio
 async def test_cleanup_definitive_first_post_rejection_restores_but_is_not_not_dispatched(env, reason):
+    repo = env[4]
     controller, client, resources, now, repo = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     identity = submitted['resource_ids']['preview']
@@ -311,8 +337,9 @@ async def test_cleanup_definitive_first_post_rejection_restores_but_is_not_not_d
 
 @pytest.mark.asyncio
 async def test_unknown_post_error_is_not_reinterpreted_as_definitive_rejection(env):
+    repo = env[4]
     controller, client, resources, now, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     now[0] += 32 * 86400
     identity = submitted['resource_ids']['preview']
@@ -331,12 +358,14 @@ async def test_unknown_post_error_is_not_reinterpreted_as_definitive_rejection(e
 
 @pytest.mark.asyncio
 async def test_humans_cannot_impersonate_queue_agent(env):
+    repo = env[4]
     with pytest.raises(HubError, match='staging_agent_required'):
-        await env[0].submit('human:1', payload())
+        await env[0].submit('human:1', payload(repo))
 
 
 @pytest.mark.asyncio
 async def test_explicit_start_close_without_worker_effects(env):
+    repo = env[4]
     controller = env[0]
     assert (await controller.status('codex'))['running'] is False
     await controller.start()
@@ -357,21 +386,22 @@ async def test_unknown_approved_production_survives_registry_reload(tmp_path):
     resources.set_policy('human:1', 'engineering-hub', 0, {'codex': ['read', 'build', 'test']})
     client = Client()
     controller = StagingController(repo, queue, client, resources=resources, control_principal=principal, actions=actions)
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(repo))
     assert await controller.run_once() is None
     assert client.posts == 0
 
 
 @pytest.mark.asyncio
 async def test_new_failure_supersedes_only_old_latest_failure_protection(env):
+    repo = env[4]
     controller, client, resources, now, _ = env
     client.fail = True
-    first = await controller.submit('codex', payload())
+    first = await controller.submit('codex', payload(repo))
     assert (await controller.run_once())['job']['state'] == 'failed'
     old = resources.inspect_resource(controller.principal, first['resource_ids']['preview'])
     resources.set_protection(controller.principal, old['id'], old['revision'], old['protected'] +
                               [{'reason': 'decision_evidence', 'ref': 'retain-this'}])
-    second = await controller.submit('codex', payload())
+    second = await controller.submit('codex', payload(repo))
     assert (await controller.run_once())['job']['state'] == 'failed'
     old = resources.get_resource('codex', first['resource_ids']['preview'])
     assert {'reason': 'decision_evidence', 'ref': 'retain-this'} in old['protected']
@@ -384,11 +414,12 @@ async def test_new_failure_supersedes_only_old_latest_failure_protection(env):
 
 @pytest.mark.asyncio
 async def test_new_failure_does_not_revise_already_superseded_resources_with_uncertain_cleanup(env):
+    repo = env[4]
     controller, client, resources, now, _ = env
     client.fail = True
-    first = await controller.submit('codex', payload())
+    first = await controller.submit('codex', payload(repo))
     assert (await controller.run_once())['job']['state'] == 'failed'
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(repo))
     assert (await controller.run_once())['job']['state'] == 'failed'
     now[0] += 32 * 86400
     plan = resources.cleanup_plan('codex', 'engineering-hub', kinds=['test_run'])
@@ -396,7 +427,7 @@ async def test_new_failure_does_not_revise_already_superseded_resources_with_unc
     assert (await controller.cleanup_apply('codex', plan['plan_id'], plan['digest']))['failed']
     old = resources.get_resource('codex', first['resource_ids']['test_run'])
     assert old['state'] == 'deleting'
-    third = await controller.submit('codex', payload())
+    third = await controller.submit('codex', payload(repo))
     finished = await controller.run_once()
     assert finished['job']['state'] == 'failed' and finished['phase'] == 'verified'
     assert controller.queue.get_job(third['job']['id'])['state'] == 'failed'
@@ -405,6 +436,7 @@ async def test_new_failure_does_not_revise_already_superseded_resources_with_unc
 
 @pytest.mark.asyncio
 async def test_caller_cancellation_does_not_cancel_owned_dispatch_and_close_drains(env):
+    repo = env[4]
     controller, client, _, _, _ = env
     entered, release = asyncio.Event(), asyncio.Event()
     original = client.submit
@@ -413,7 +445,7 @@ async def test_caller_cancellation_does_not_cancel_owned_dispatch_and_close_drai
         await release.wait()
         return await original(request)
     client.submit = blocked
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     caller = asyncio.create_task(controller.run_once())
     await entered.wait()
     caller.cancel()
@@ -452,9 +484,10 @@ def test_archived_dynamic_profile_keeps_history_but_denies_new_admission(tmp_pat
 
 @pytest.mark.asyncio
 async def test_owner_rechecks_original_receipt_without_rerun(env):
+    repo = env[4]
     controller, client, _, _, _ = env
     client.lost_ack = True
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     assert (await controller.run_once())['phase'] == 'held'
     with pytest.raises(HubError):
         await controller.reconcile_for('codex', submitted['job']['id'])
@@ -473,9 +506,10 @@ async def test_owner_rechecks_original_receipt_without_rerun(env):
 
 @pytest.mark.asyncio
 async def test_restart_follows_held_original_receipt_without_post(env):
+    repo = env[4]
     old, client, resources, _, _ = env
     client.lost_ack = True
-    submitted = await old.submit('codex', payload())
+    submitted = await old.submit('codex', payload(repo))
     await old.run_once()
     restarted = StagingController(old.repo, old.queue, client, resources=resources,
         control_principal=old.principal, actions=old.actions, poll_interval=0.001)
@@ -492,8 +526,9 @@ async def test_restart_follows_held_original_receipt_without_post(env):
 
 @pytest.mark.asyncio
 async def test_revocation_after_claim_before_dispatch_releases_only_proven_no_effect(env, monkeypatch):
+    repo = env[4]
     controller, client, resources, _, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     original = controller.queue.claim
     def revoked_after_claim(**kwargs):
         claim = original(**kwargs)
@@ -512,22 +547,24 @@ async def test_revocation_after_claim_before_dispatch_releases_only_proven_no_ef
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reason,expected', [('project_not_allowed', 'failed'), ('worker_busy_or_held', 'held')])
 async def test_rejected_uncreated_command_distinct_from_unknown_busy_machine(env, reason, expected):
+    repo = env[4]
     controller, client, _, _, _ = env
     async def rejected(request):
         client.posts += 1
         raise StagingNotAccepted(reason)
     client.submit = rejected
-    await controller.submit('codex', payload())
+    await controller.submit('codex', payload(repo))
     result = await controller.run_once()
     assert result['job']['state'] == expected and client.posts == 1
 
 
 @pytest.mark.asyncio
 async def test_claim_crash_before_dispatch_is_proven_unstarted_after_expiry(env):
+    repo = env[4]
     controller, client, _, _, _ = env
     now = [1000.0]
     controller.queue.clock = lambda: now[0]
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     assert controller.queue.claim(worker=controller.worker, lease_seconds=10)
     # Simulate process death between the queue commit and dispatch-intent save.
     assert controller._read(job_id=submitted['job']['id'])['phase'] == 'queued'
@@ -540,9 +577,10 @@ async def test_claim_crash_before_dispatch_is_proven_unstarted_after_expiry(env)
 
 @pytest.mark.asyncio
 async def test_unchanged_unknown_hold_does_not_grow_audit_history(env):
+    repo = env[4]
     controller, client, _, _, _ = env
     client.lost_ack = True
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.run_once()
     async def unavailable(identity):
         raise HubError('staging_connection_unavailable', 503)
@@ -555,12 +593,13 @@ async def test_unchanged_unknown_hold_does_not_grow_audit_history(env):
 
 @pytest.mark.asyncio
 async def test_public_operations_report_busy_without_waiting_for_long_job(env):
+    repo = env[4]
     controller, client, _, _, _ = env
-    submitted = await controller.submit('codex', payload())
+    submitted = await controller.submit('codex', payload(repo))
     await controller.lock.acquire()
     try:
         async with asyncio.timeout(2):
-            for operation in (controller.submit('codex', payload()),
+            for operation in (controller.submit('codex', payload(repo)),
                               controller.cleanup_apply('human:1', str(uuid.uuid4()), 'sha256:' + 'a' * 64),
                               controller.reconcile_for('human:1', submitted['job']['id'])):
                 with pytest.raises(HubError, match='staging_busy'):
@@ -572,6 +611,7 @@ async def test_public_operations_report_busy_without_waiting_for_long_job(env):
 
 @pytest.mark.asyncio
 async def test_failed_background_still_closes_private_client(env):
+    repo = env[4]
     controller, client, _, _, _ = env
     closed = []
     async def failure():
@@ -587,6 +627,7 @@ async def test_failed_background_still_closes_private_client(env):
 
 @pytest.mark.asyncio
 async def test_actual_client_contract_through_registered_worker_core(env, tmp_path):
+    repo = env[4]
     import httpx
     from engineering_hub.staging_client import StagingClient, StagingConnectionConfig
     from hub_staging_service.core import Service
@@ -620,7 +661,7 @@ async def test_actual_client_contract_through_registered_worker_core(env, tmp_pa
     controller = env[0]
     controller.client = client
     try:
-        submitted = await controller.submit('codex', payload())
+        submitted = await controller.submit('codex', payload(repo))
         finished = await controller.run_once()
         assert finished['job']['state'] == 'succeeded'
         assert await controller.preview_file(submitted['resource_ids']['preview'], 'index.html') == (b'<html>real-contract</html>', 'text/html')

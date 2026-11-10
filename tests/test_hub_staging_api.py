@@ -137,8 +137,9 @@ def resource(env, *, kind='build', expired=False):
 
 def submission():
     return {'request_id': '33762456-e740-4f80-bda9-776f8dbcf753', 'project': PROJECT, 'recipe': 'static',
+            'review_task_id': '33762456-e740-4f80-bda9-776f8dbcf754', 'review_task_revision': 4,
             'source_commit': COMMIT, 'source_digest': 'c' * 64,
-            'source_zip_base64': 'eA==', 'topic': 'topic'}
+            'source_zip_base64': 'eA==', 'source_commit_object_base64': 'eA==', 'topic': 'topic'}
 
 
 def test_disabled_status_is_authenticated_and_actions_closed():
