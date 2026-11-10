@@ -451,7 +451,8 @@ class StagingController:
                 receipt = await self.client.submit({'job_id': item['job_id'], 'command_id': item['command_id'],
                     'idempotency_key': item['command_id'], 'project': item['project'], 'recipe': item['recipe'],
                     'source_commit': item['source_commit'], 'source_digest': item['source_digest'],
-                    'source_id': item['source_id'], 'resource_ids': item['resource_ids']})
+                    'source_id': item['source_id'], 'resource_ids': item['resource_ids'],
+                    'require_source_binding': True, 'expected_source_binding': item['source_binding']})
                 self._shared_guard()
                 item['phase'] = 'accepted'; self._save(item)
                 return await self._follow(item, receipt, claim)

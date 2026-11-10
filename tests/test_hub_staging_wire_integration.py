@@ -355,3 +355,18 @@ async def test_real_tls_preview_and_cleanup_cas_lost_ack_original_get_only(wire)
     assert wire.resources.get_resource('codex', identity)['state'] == 'deleted'
     assert wire.service.metadata(identity)['state'] == 'deleted'
     assert wire.service.metadata(identity)['revision'] == 2
+
+
+@pytest.mark.asyncio
+async def test_real_tls_missing_deposited_proof_rejected_before_worker_effects(wire):
+    submitted = await wire.controller.submit('codex', request(wire.repo))
+    with wire.service.lock:
+        wire.service.db.execute('DELETE FROM source_bindings WHERE source_id=?', (submitted['source_id'],))
+        wire.service.db.commit()
+    result = await wire.controller.run_once()
+    assert result['job']['state'] == 'held'
+    assert wire.posts() == 1
+    assert not wire.backend.entered.is_set()
+    with wire.service.lock:
+        assert wire.service.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0] == 0
+        assert wire.service.db.execute('SELECT COUNT(*) FROM resources').fetchone()[0] == 0

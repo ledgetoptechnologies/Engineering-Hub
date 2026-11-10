@@ -641,7 +641,12 @@ class Service:
 
     def submit(self, payload):
         fields = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe', 'source_commit', 'source_digest', 'resource_ids'}
-        ensure(isinstance(payload, dict) and set(payload) in (fields | {'source_id'}, fields | {'source_zip_base64'}), 'job_schema')
+        legacy = (fields | {'source_id'}, fields | {'source_zip_base64'})
+        bound = fields | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        ensure(isinstance(payload, dict) and set(payload) in (*legacy, bound), 'job_schema')
+        if 'require_source_binding' in payload:
+            ensure(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict,
+                   'job_schema')
         identifier(payload['job_id']); identifier(payload['command_id'])
         ensure(isinstance(payload['idempotency_key'], str) and 0 < len(payload['idempotency_key']) <= 128,
                'invalid_idempotency_key')
@@ -661,6 +666,11 @@ class Service:
             ensure(hashlib.sha256(raw).hexdigest() == payload['source_digest'], 'source_digest_mismatch')
             binding = (self._source_binding(payload['source_id'], payload['project'], payload['source_digest'])
                        if 'source_id' in payload else None)
+            if payload.get('require_source_binding') is True:
+                ensure(binding is not None and
+                       json.dumps(binding, sort_keys=True, separators=(',', ':')) ==
+                       json.dumps(payload['expected_source_binding'], sort_keys=True, separators=(',', ':')),
+                       'source_binding_required', 409)
             if binding is not None:
                 from .source_provenance import verify_tree_binding
                 try:

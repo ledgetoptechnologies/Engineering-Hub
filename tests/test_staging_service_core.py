@@ -85,6 +85,7 @@ class CoreTests(unittest.TestCase):
             self.service.submit(payload)
         self.assertEqual(caught.exception.code, 'source_binding_mismatch')
         payload['source_commit'] = commit
+        payload.update(require_source_binding=True, expected_source_binding=receipt['source_binding'])
         self.service.submit(payload); self.service.wait()
         status = self.service.status(payload['job_id'])
         self.assertEqual(status['result']['source_commit_verification'], 'git-sha1-tree-v1')
@@ -93,6 +94,44 @@ class CoreTests(unittest.TestCase):
         self.service.close()
         self.service = Service(self.temp.name, {'demo': profile()}, Backend())
         self.assertEqual(self.service.submit(payload), status)
+
+    def test_required_binding_denies_missing_or_changed_proof_before_execution(self):
+        from hub_staging_service.source_provenance import _archive_tree, _object_id
+        raw = zipped(mode=0o100644)
+        tree = _archive_tree(raw)[0]
+        obj = (f'tree {tree}\nauthor Test <test@example.invalid> 1 +0000\n'
+               f'committer Test <test@example.invalid> 1 +0000\n\nfixture\n').encode()
+        commit = _object_id(b'commit', obj)
+        payload = job(raw)
+        source_id = uid()
+        receipt = self.service.put_source({'source_id': source_id, 'project': 'demo',
+            'source_digest': payload['source_digest'], 'source_zip_base64': payload.pop('source_zip_base64'),
+            'source_commit': commit, 'source_commit_object_base64': base64.b64encode(obj).decode()})
+        payload.update(source_id=source_id, source_commit=commit, require_source_binding=True,
+                       expected_source_binding=receipt['source_binding'])
+        binding = dict(receipt['source_binding'], entries=True)
+        self.service.db.execute('UPDATE source_bindings SET binding=? WHERE source_id=?',
+                                (json.dumps(binding), source_id))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        binding = dict(receipt['source_binding'], commit_object_sha256='0' * 64)
+        self.service.db.execute('UPDATE source_bindings SET binding=? WHERE source_id=?',
+                                (json.dumps(binding), source_id))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        self.service.db.execute('DELETE FROM source_bindings WHERE source_id=?', (source_id,))
+        self.service.db.commit()
+        with self.assertRaises(Rejected) as caught:
+            self.service.submit(payload)
+        self.assertEqual(caught.exception.code, 'source_binding_required')
+        self.assertIsNone(self.service.active)
+        self.assertIsNone(self.service.thread)
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM operations').fetchone()[0], 0)
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM resources').fetchone()[0], 0)
 
     def test_failed_verified_job_preserves_binding_across_replay_and_restart(self):
         from hub_staging_service.source_provenance import _archive_tree, _object_id

@@ -486,7 +486,11 @@ class StagingClient:
     async def submit(self, payload):
         required = {'job_id', 'command_id', 'idempotency_key', 'project', 'recipe',
                     'source_commit', 'source_digest', 'resource_ids'}
-        _check(type(payload) is dict and set(payload) in (required | {'source_id'}, required | {'source_zip_base64'}))
+        legacy = (required | {'source_id'}, required | {'source_zip_base64'})
+        bound = required | {'source_id', 'require_source_binding', 'expected_source_binding'}
+        _check(type(payload) is dict and set(payload) in (*legacy, bound))
+        if 'require_source_binding' in payload:
+            _check(payload['require_source_binding'] is True and type(payload['expected_source_binding']) is dict)
         _uuid(payload['job_id']); _uuid(payload['command_id']); _key(payload['idempotency_key'])
         self._project(payload['project'], payload['recipe']); self._source(payload)
         _check(type(payload['source_commit']) is str and _COMMIT.fullmatch(payload['source_commit']))
