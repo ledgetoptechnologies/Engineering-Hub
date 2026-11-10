@@ -121,7 +121,6 @@ def browser_route_allowed(method, path):
                 or path == '/api/hub/v1/infrastructure/devices'
                 or path == '/api/hub/v1/infrastructure/metrics'
                 or path == '/api/hub/v1/infrastructure/metrics/history'
-                or path == '/api/hub/v1/infrastructure/metrics/links'
                 or re.fullmatch(r'/api/hub/v1/infrastructure/devices/' + _PROJECT_ID, path) is not None
                 or method == 'GET' and _diagnostic_path(path)
                 or re.fullmatch(r'/api/hub/v1/interactive-reviews/' + _UUID + r'(?:/state|/assets/' + _UUID + ')?', path) is not None

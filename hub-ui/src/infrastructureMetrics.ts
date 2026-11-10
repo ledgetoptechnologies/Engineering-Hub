@@ -244,44 +244,6 @@ export async function readHistory(hostKey: string, range: HistoryRange, signal: 
   return parseHistory(body);
 }
 
-/**
- * The owner's Grafana link for one machine: the configured template with the host label filled
- * in. The template is validated again here, so a malformed setting shows no link rather than a
- * wrong one, and the label can only land in the path or query.
- */
-export function grafanaLink(template: string | null, hostLabel: string | null): string | null {
-  if (!template || !hostLabel || template.split("{host}").length !== 2) return null;
-  const href = template.replace("{host}", encodeURIComponent(hostLabel));
-  try {
-    const url = new URL(href);
-    const origin = new URL(template.replace("{host}", "x"));
-    // Same rule as the server: a dashboard link carries no secret-looking query names.
-    const secret = [...origin.searchParams.keys()].some(name => /auth|token|key|secret|pass|session|sig|cred|bearer|jwt/i.test(name));
-    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && url.host === origin.host && !secret ? href : null;
-  } catch { return null; }
-}
-export function parseLinks(value: unknown): string | null {
-  const row = record(value, ["schema_version", "grafana_host_url"]);
-  if (row.schema_version !== 1) return invalid();
-  if (row.grafana_host_url === null) return null;
-  const template = plain(row.grafana_host_url, 512);
-  return grafanaLink(template, "x") ? template : invalid();
-}
-/** The Grafana link template, or null when none is set up or this person can't read metrics. */
-export async function readLinks(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<string | null> {
-  let response: Response;
-  try {
-    response = await fetchImpl.call(globalThis, "/api/hub/v1/infrastructure/metrics/links",
-      { method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal });
-  } catch (error) {
-    if (signal.aborted) throw error;
-    return null;
-  }
-  if (response.status === 401) throw new HubApiError(401, "human_session_required");
-  if (!response.ok || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return null;
-  try { return parseLinks(await response.json()); } catch { return null; }
-}
-
 export interface MachineGroup {
   key: string; title: string; labels: MachineTarget["labels"]; targets: MachineTarget[];
   /** The one recorded device every target here matched, if they agree. */

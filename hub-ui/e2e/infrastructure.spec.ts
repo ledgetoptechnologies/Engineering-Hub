@@ -438,21 +438,3 @@ test("a device page says when Prometheus has no matching machine, and the editor
   await expect.poll(() => state.writes.length).toBe(1);
   expect(state.writes[0].body).toMatchObject({ hostname: "build.example.test", metrics_host: "BUILD-PC" });
 });
-
-test("a machine links to the owner's Grafana only when one is set up", async ({ page }) => {
-  const template = "http://192.0.2.80:3000/d/node/machine?var-host={host}";
-  await fixture(page, { metrics: [metrics(value => { value.devices[0].device_id = "build-pc"; })] });
-  await page.route("**/api/hub/v1/infrastructure/metrics/history**", route => route.fulfill({ status: 404, contentType: "application/json",
-    body: JSON.stringify({ detail: { code: "infrastructure_metrics_not_configured" } }) }));
-  await page.route("**/api/hub/v1/infrastructure/metrics/links", route => route.fulfill({ status: 200, contentType: "application/json",
-    body: JSON.stringify({ schema_version: 1, grafana_host_url: template }) }));
-  await page.goto("/#/infrastructure/build-pc");
-  const link = healthPanel(page).getByRole("link", { name: "View in Grafana" });
-  await expect(link).toHaveAttribute("href", "http://192.0.2.80:3000/d/node/machine?var-host=desk");
-  await expect(link).toHaveAttribute("rel", "noopener noreferrer");
-  await expect(healthPanel(page)).toContainText("isn't connected to Prometheus yet");
-  await page.unroute("**/api/hub/v1/infrastructure/metrics/links");
-  await page.reload();
-  await expect(healthPanel(page)).toContainText("desk");
-  await expect(healthPanel(page).getByRole("link", { name: "View in Grafana" })).toHaveCount(0);
-});

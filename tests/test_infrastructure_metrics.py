@@ -326,12 +326,11 @@ def test_config_rejects_metrics_read_on_agents_and_accepts_exporter(tmp_path):
         _settings(settings(tmp_path,[{'kind':'agent','identity':'hermes','capabilities':['read','metrics_read']}]))
     with pytest.raises(ValueError):
         _settings(settings(tmp_path,[{'kind':'human','identity':'human:1','capabilities':['metrics_read']}]))
-    enabled,grants,prometheus,grafana=_settings(settings(tmp_path,
+    enabled,grants,prometheus=_settings(settings(tmp_path,
         [{'kind':'human','identity':'human:1','capabilities':['read','metrics_read']}],
         {'job':'windows','instance':'192.0.2.51:9182','device_id':'desk-pc','probe_id':'windows-scrape','exporter':'windows'}))
     assert enabled and grants[InfrastructurePrincipal('human','human:1')]==frozenset({'read','metrics_read'})
     assert prometheus[1][0].exporter=='windows'
-    assert grafana is None
     with pytest.raises(ValueError):
         _settings(settings(tmp_path,[],{'job':'node','instance':'192.0.2.1:9100','device_id':'a','probe_id':'b','exporter':'x'}))
 
@@ -390,17 +389,3 @@ async def test_malformed_health_on_a_matching_target_is_unknown(service,health):
     desk=result['devices'][0]
     # Scrape time is still real, so freshness is reported; up is unknown, never false.
     assert desk['up'] is None and desk['state']=='fresh' and result['source']=={'status':'ok'}
-
-
-def test_config_reads_an_optional_grafana_link_template(tmp_path):
-    path=settings(tmp_path,[{'kind':'human','identity':'human:1','capabilities':['read','metrics_read']}])
-    value=json.loads(path.read_text())
-    value['grafana']={'host_url':'http://192.0.2.80:3000/d/node/machine?var-host={host}'}
-    path.write_text(json.dumps(value))
-    assert _settings(path)[3]=='http://192.0.2.80:3000/d/node/machine?var-host={host}'
-    for bad in ({'host_url':'https://{host}.example.test/d'},{'host_url':'http://192.0.2.80:3000/d'},
-                {'host_url':'http://192.0.2.80/{host}','extra':1},'http://192.0.2.80/{host}'):
-        value['grafana']=bad
-        path.write_text(json.dumps(value))
-        with pytest.raises(ValueError):
-            _settings(path)

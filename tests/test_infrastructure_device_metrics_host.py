@@ -1,4 +1,4 @@
-"""Per-device Prometheus host mapping and the owner's Grafana link."""
+"""Per-device Prometheus host mapping."""
 import json
 import sqlite3
 
@@ -13,17 +13,13 @@ from agent_message_bus.auth import AuthSettings
 from engineering_hub.infrastructure import CAPABILITIES, InfrastructurePrincipal, InfrastructureRegistry
 from engineering_hub.infrastructure_api import attach_infrastructure_routes
 from engineering_hub.infrastructure_discovery import normalize_targets
-from engineering_hub.infrastructure_discovery_metrics import DiscoveryMetricsReader
 from engineering_hub.infrastructure_metrics_access import MetricsAccess
-from engineering_hub.infrastructure_module import grafana_host_url
 from engineering_hub.infrastructure_service import InfrastructureService
-from engineering_hub.private_gateway import browser_route_allowed
 from engineering_hub.repository import HubError
 
 
 OWNER = 'human:42'
 OWNER_HEADERS = {'X-Fixture-Human': OWNER}
-GRAFANA = 'http://192.0.2.80:3000/d/node/machine?var-host={host}'
 
 
 @pytest.fixture
@@ -116,58 +112,3 @@ def test_device_api_accepts_and_returns_metrics_host(setup):
         assert saved.json()['metrics_host'] == 'BEAST'
         assert client.get('/api/hub/v1/infrastructure/devices/beast').json()['device']['metrics_host'] == 'BEAST'
 
-
-def links_app(service, access, *, metrics=True, grafana=None):
-    reader = DiscoveryMetricsReader(service, None, authorize=access.authorize, inventory=access.inventory) if metrics else None
-    app = FastAPI()
-
-    def metrics_identity(request):
-        access.authorize(request)
-        return request
-    attach_infrastructure_routes(app, service, lambda request, mutation=False: OWNER, metrics=reader,
-                                 metrics_identity=metrics_identity, grafana_host_url=grafana)
-    return app
-
-
-def test_links_route_returns_the_configured_template_only_to_admitted_readers(setup):
-    service, access, _ = setup
-    links = '/api/hub/v1/infrastructure/metrics/links'
-    with TestClient(links_app(service, access, grafana=GRAFANA)) as client:
-        assert client.get(links, headers=OWNER_HEADERS).json() == {'schema_version': 1, 'grafana_host_url': GRAFANA}
-        assert client.get(links, headers={'X-Fixture-Human': 'human:other'}).status_code == 403
-        # Agents and any bearer caller never receive the template, even alongside the owner's session.
-        for bearer in ('Bearer synthetic-codex', 'Bearer synthetic-hermes', 'Bearer ehi_x'):
-            with pytest.raises(HubError, match='forbidden'):
-                client.get(links, headers={**OWNER_HEADERS, 'Authorization': bearer})
-        with pytest.raises(HubError, match='invalid_infrastructure_filter'):
-            client.get(links, params={'host': 'x'}, headers=OWNER_HEADERS)
-    with TestClient(links_app(service, access)) as client:
-        assert client.get(links, headers=OWNER_HEADERS).json() == {'schema_version': 1, 'grafana_host_url': None}
-    with TestClient(links_app(service, access, metrics=False)) as client:
-        with pytest.raises(HubError, match='infrastructure_metrics_not_configured'):
-            client.get(links, headers=OWNER_HEADERS)
-
-
-def test_grafana_template_validation():
-    for good in (GRAFANA, 'https://grafana.example.test/d/abc?var-host={host}&from=now-24h',
-                 'https://grafana.example.test/d/abc/{host}'):
-        assert grafana_host_url(good) == good
-    for bad in ('https://grafana.example.test/d/abc',                    # no {host}
-                'https://grafana.example.test/{host}/{host}',            # twice
-                'https://{host}.example.test/d/abc',                     # would pick the server
-                'https://user:pass@grafana.example.test/d?h={host}',     # credentials
-                'javascript:alert(1)//{host}', 'ftp://grafana.example.test/{host}',
-                'https://grafana.example.test/d?h={host}#{x}', ' https://grafana.example.test/{host}',
-                'https://grafana.example.test/d#{host}', 'https://grafana.example.test/' + 'a' * 600 + '{host}', None, 3,
-                # Query names that usually carry a secret: a dashboard link needs none.
-                'https://grafana.example.test/d?var-host={host}&auth=x', 'https://grafana.example.test/d?var-host={host}&api_key=x',
-                'https://grafana.example.test/d?var-host={host}&Token=x', 'https://grafana.example.test/d?var-host={host}&password=',
-                'https://grafana.example.test/d?var-host={host}&X-Session=1'):
-        with pytest.raises(ValueError):
-            grafana_host_url(bad)
-
-
-def test_gateway_allows_only_reads_of_the_links_route():
-    assert browser_route_allowed('GET', '/api/hub/v1/infrastructure/metrics/links')
-    assert not browser_route_allowed('POST', '/api/hub/v1/infrastructure/metrics/links')
-    assert not browser_route_allowed('GET', '/api/hub/v1/infrastructure/metrics/links/extra')

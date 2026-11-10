@@ -73,7 +73,7 @@ async def _payload(request,model,maximum=16384):
         raise HubError('invalid_infrastructure_input') from None
 
 
-def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identity=None,grafana_host_url=None):
+def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identity=None):
     if service is not None and type(service) is not InfrastructureService:
         raise TypeError('Explicit InfrastructureService required')
     if metrics is not None and (service is None or metrics.service is not service):
@@ -115,21 +115,6 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
         if metrics is None or not hasattr(metrics,'history'):
             raise HubError('infrastructure_metrics_not_configured',404)
         return await metrics.history(identity,params['host'],params['range'])
-
-    @app.get('/api/hub/v1/infrastructure/metrics/links')
-    def machine_metric_links(request:Request):
-        # Owner's browser only: the link opens the owner's Grafana, so agents and
-        # bearer callers never receive the template, whatever it contains.
-        if request.headers.getlist('authorization'):
-            raise HubError('forbidden',403)
-        identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
-        if metrics_identity is None and InfrastructureService.principal(identity).kind!='human':
-            raise HubError('forbidden',403)
-        if request.query_params:
-            raise HubError('invalid_infrastructure_filter')
-        if metrics is None:
-            raise HubError('infrastructure_metrics_not_configured',404)
-        return {'schema_version':1,'grafana_host_url':grafana_host_url}
 
     @app.get('/api/hub/v1/infrastructure/devices/{device_id}')
     def detail(device_id:str,request:Request):

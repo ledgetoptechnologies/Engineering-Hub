@@ -2,7 +2,7 @@ import { HISTORY_RANGES, formatRate, parseHistory, quickStats, readHistory } fro
 import { describe, expect, it, vi } from "vitest";
 import fixture from "./fixtures/infrastructure-metrics-v1.json";
 import discovered from "./fixtures/infrastructure-metrics-v2.json";
-import { formatBytes, formatUptime, grafanaLink, groupMachines, parseLinks, parseMetrics, readLinks, readMetrics } from "./infrastructureMetrics";
+import { formatBytes, formatUptime, groupMachines, parseMetrics, readMetrics } from "./infrastructureMetrics";
 
 const clone = () => JSON.parse(JSON.stringify(fixture)) as typeof fixture & Record<string, unknown>;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -190,33 +190,5 @@ describe("network rates and history", () => {
     expect(HISTORY_RANGES).toEqual(["1h", "6h", "24h", "7d"]);
     expect(formatRate(null)).toBe("not reported");
     expect(formatRate(2048)).toBe("2.0 KB/s");
-  });
-});
-
-describe("Grafana link", () => {
-  const template = "http://192.0.2.80:3000/d/node/machine?var-host={host}";
-  it("fills in the host label, encoded, and keeps the configured server", () => {
-    expect(grafanaLink(template, "BEAST")).toBe("http://192.0.2.80:3000/d/node/machine?var-host=BEAST");
-    expect(grafanaLink(template, "a b&c")).toBe("http://192.0.2.80:3000/d/node/machine?var-host=a%20b%26c");
-    expect(grafanaLink("https://grafana.example.test/d/x/{host}", "../../admin")).toBe("https://grafana.example.test/d/x/..%2F..%2Fadmin");
-  });
-  it("shows no link without a template, a host label, or a safe template", () => {
-    expect(grafanaLink(null, "BEAST")).toBeNull();
-    expect(grafanaLink(template, null)).toBeNull();
-    for (const bad of ["javascript:alert(1)//{host}", "https://{host}.example.test/d", "https://u:p@grafana.example.test/{host}",
-      "https://grafana.example.test/{host}/{host}", "https://grafana.example.test/d", "not a url {host}",
-      "https://grafana.example.test/d?var-host={host}&auth=x", "https://grafana.example.test/d?var-host={host}&apiKey=x"])
-      expect(grafanaLink(bad, "BEAST")).toBeNull();
-  });
-  it("parses the links answer exactly and reads it from one fixed route", async () => {
-    expect(parseLinks({ schema_version: 1, grafana_host_url: template })).toBe(template);
-    expect(parseLinks({ schema_version: 1, grafana_host_url: null })).toBeNull();
-    expect(() => parseLinks({ schema_version: 1, grafana_host_url: template, extra: 1 })).toThrow();
-    expect(() => parseLinks({ schema_version: 1, grafana_host_url: "javascript:alert(1)//{host}" })).toThrow();
-    const fetchImpl = vi.fn(async () => json({ schema_version: 1, grafana_host_url: template }));
-    expect(await readLinks(new AbortController().signal, fetchImpl)).toBe(template);
-    expect(fetchImpl).toHaveBeenCalledWith("/api/hub/v1/infrastructure/metrics/links", expect.objectContaining({ method: "GET", credentials: "same-origin" }));
-    for (const status of [403, 404, 503]) expect(await readLinks(new AbortController().signal, vi.fn(async () => json({}, status)))).toBeNull();
-    expect(await readLinks(new AbortController().signal, vi.fn(async () => json({ schema_version: 2 })))).toBeNull();
   });
 });

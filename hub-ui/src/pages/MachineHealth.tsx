@@ -9,29 +9,8 @@ import { HubApiError } from "../api";
 import type { Hub } from "../hub";
 import { demoMachineMetrics } from "../infrastructureDemo";
 import {
-  formatBytes, formatRate, formatUptime, grafanaLink, groupMachines, percent, quickStats, readLinks, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
+  formatBytes, formatRate, formatUptime, groupMachines, percent, quickStats, readMetrics, type MachineGroup, type MachineMetrics, type MachineTarget,
 } from "../infrastructureMetrics";
-
-/** Demo shows where the link sits; the address is illustrative and goes nowhere real. */
-const DEMO_GRAFANA = "https://grafana.example.test/d/machine?var-host={host}";
-/** The owner's Grafana link template, read once. Any failure just means no link. */
-export function useGrafanaTemplate(hub: Hub): string | null {
-  const [template, setTemplate] = useState<string | null>(null);
-  useEffect(() => {
-    if (hub.demo) { setTemplate(DEMO_GRAFANA); return; }
-    const controller = new AbortController();
-    readLinks(controller.signal).then(value => { if (!controller.signal.aborted) setTemplate(value); }).catch(error => {
-      if (controller.signal.aborted) return;
-      if (error instanceof HubApiError && error.status === 401) hub.clearPrivateWorkspace();
-    });
-    return () => controller.abort();
-  }, [hub.demo]);
-  return template;
-}
-function GrafanaLink({ template, group }: { template: string | null; group: MachineGroup }) {
-  const link = grafanaLink(template, group.targets[0]?.host_label ?? null);
-  return link ? <a className="machine-grafana" href={link} target="_blank" rel="noopener noreferrer">View in Grafana</a> : null;
-}
 import { href } from "../router";
 import { Badge, PanelTitle } from "../ui";
 import { MachineHistory } from "./MachineHistory";
@@ -52,14 +31,13 @@ function omittedText(metrics: MachineMetrics): string | null {
   if (warnings.includes("series_truncated")) parts.push("Some machines reported more disks, GPUs or programs than are listed.");
   return parts.length ? parts.join(" ") : null;
 }
-function MachineHead({ group, link, grafana }: { group: MachineGroup; link: boolean; grafana: string | null }) {
+function MachineHead({ group, link }: { group: MachineGroup; link: boolean }) {
   return <div className="machine-card-head">
     <strong>{link && group.device_id ? <a href={href({ page: "device", id: group.device_id })}>{group.title}</a> : group.title}</strong>
     {group.labels.role && <span className="infra-chip">{group.labels.role}</span>}
     {group.labels.env && <span className="infra-chip">{group.labels.env}</span>}
     {group.unregistered && <Badge tone="neutral">Not in devices</Badge>}
     {group.ambiguous && <Badge tone="amber">Matches more than one device</Badge>}
-    <GrafanaLink template={grafana} group={group} />
   </div>;
 }
 const EXPORTER_TEXT = { node: "Linux", windows: "Windows", nvidia: "GPUs" } as const;
@@ -192,7 +170,6 @@ export interface DeviceMatch { id: string; name: string | null }
 
 export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub; device?: DeviceMatch; reading: MachineReading; shownDevices?: Set<string> }) {
   const { load, now, refresh } = reading;
-  const grafana = useGrafanaTemplate(hub);
   const deviceId = device?.id;
   if (load.state === "hidden") return null;
   const metrics = load.state === "loaded" ? load.value : null;
@@ -220,7 +197,7 @@ export function MachineHealth({ hub, device, reading, shownDevices }: { hub: Hub
     {metrics && !device && targets.length === 0 && metrics.source.status !== "not_configured" && metrics.source.status !== "unreachable" &&
       <p className="infra-empty">Prometheus isn't scraping any machines yet.</p>}
     {groups.length > 0 && <ul className="machine-list">{groups.map(group => <li key={group.key} className="machine-card">
-      <MachineHead group={group} link={deviceId === undefined} grafana={grafana} />
+      <MachineHead group={group} link={deviceId === undefined} />
       {group.targets.map(item => <div key={`${item.job}\n${item.instance}`} className="machine-section">
         <div className="machine-section-head">
           <span>{item.exporter ? EXPORTER_TEXT[item.exporter] : item.job} <small><code>{item.instance}</code></small></span>
