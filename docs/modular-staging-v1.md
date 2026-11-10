@@ -74,6 +74,14 @@ repository tests can run. Packaging neither submits work nor grants access.
   submission, claim and durable dispatch intent; active work fences edits.
   Legacy unreviewed queued rows remain blocked and need explicit reconciliation;
   they are never upgraded or replayed automatically.
+  A legacy attempt without a complete matching source binding is reported as
+  `phase=held`, `hold_reason=source_binding_unavailable`, and is not polled or
+  reposted automatically. An unclaimed queued row remains queued in the
+  canonical queue without a fabricated machine reservation. A claimed or held
+  attempt retains its existing reservation. A pre-existing durable no-effect
+  proof remains recoverable, and historical terminal results are not rewritten.
+  Restoring a field or adding a later no-effect marker alone never clears the
+  sticky manual hold.
 - `POST /api/hub/v1/staging/resources/{id}/keep`:
   `{mode:'until'|'pinned'|'none', until?:string, reason:string,
   expected_revision:number}` → Resource. Human mutation requires existing CSRF.

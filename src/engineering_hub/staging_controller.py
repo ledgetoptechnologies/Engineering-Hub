@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore
 
 from .repository import AGENTS, HubError
+from .staging_source_binding import UNBOUND_HOLD as _UNBOUND_HOLD, valid_source_binding as _valid_source_binding
 from .staging_resources import KINDS
 from .staging_client import _FILE_TYPES, StagingNotAccepted
 from .work_queue import WorkAction, WorkQueue, WorkTarget, WorkWorker, STAGING_SERVICE_EXECUTOR
@@ -31,6 +32,8 @@ def _json(value):
 def _require(value, code='invalid_staging_request', status=400):
     if not value:
         raise HubError(code, status)
+
+
 
 
 def _id(value):
@@ -153,6 +156,8 @@ class StagingController:
             try:
                 self._shared_guard(admission=True)
                 item = self._read(value.submission_id)
+                if item.get('hold_reason') == _UNBOUND_HOLD or not _valid_source_binding(item):
+                    return False
                 self._grants(item['actor'], item['project'])
                 return (actor == item['actor'] and environment == 'staging' and item['phase'] != 'depositing'
                         and action == self.actions[(item['project'], item['recipe'])]
@@ -312,9 +317,11 @@ class StagingController:
     def _view(self, item):
         result = {'job': self.queue.get_job(item['job_id']), 'source_id': item['source_id'],
                   'resource_ids': item['resource_ids'], 'phase': item['phase']}
-        if 'source_binding' in item:
+        if item.get('hold_reason') != _UNBOUND_HOLD and _valid_source_binding(item):
             result['source_binding'] = item['source_binding']
             result['source_commit_verification'] = 'git-sha1-tree-v1'
+        if item.get('hold_reason') == _UNBOUND_HOLD:
+            result['hold_reason'] = _UNBOUND_HOLD
         return result
 
     async def runtime(self, actor):
@@ -347,19 +354,25 @@ class StagingController:
                 projects = tuple(result['profiles'])
                 entries = [] if not projects else [json.loads(row[0]) for row in db.execute(
                     "SELECT s.data FROM hub_staging_submissions s JOIN hub_work_jobs j ON j.id=json_extract(s.data,'$.job_id') "
-                    "WHERE j.state IN ('claimed','held') AND j.project IN (" + ','.join('?' for _ in projects) + ') ORDER BY j.sequence LIMIT 50', projects)]
+                    "WHERE (j.state IN ('claimed','held') OR (j.state='queued' AND json_extract(s.data,'$.phase')='held')) "
+                    "AND j.project IN (" + ','.join('?' for _ in projects) + ') ORDER BY j.sequence LIMIT 50', projects)]
             for item in entries:
                 if item['project'] not in result['profiles'] or item.get('job_id') is None:
                     continue
                 job = self.queue.get_job(item['job_id'])
-                if job['state'] not in ('claimed', 'held'):
+                if job['state'] not in ('queued', 'claimed', 'held'):
+                    continue
+                if job['state'] == 'queued' and item.get('phase') != 'held':
                     continue
                 if (job['state'] == 'claimed' and not job.get('requires_reconciliation')
                         and item['phase'] != 'held' and job.get('worker') == self.worker.encoded()):
                     continue  # Normal in-flight work is not a held outcome.
-                result['held_jobs'].append({'id': job['id'], 'project': item['project'],
+                held = {'id': job['id'], 'project': item['project'],
                     'recipe': item['recipe'], 'state': job['state'], 'phase': item['phase'],
-                    'source_commit': item['source_commit']})
+                    'source_commit': item['source_commit']}
+                if item.get('hold_reason') == _UNBOUND_HOLD:
+                    held['hold_reason'] = _UNBOUND_HOLD
+                result['held_jobs'].append(held)
                 if len(result['held_jobs']) == 50:
                     break
         return result
@@ -409,6 +422,29 @@ class StagingController:
                 self.queue.complete(job_id=item['job_id'], worker=self.worker, fence=claim['fence'], outcome='held')
             except HubError:
                 pass  # Expired claim already keeps the physical machine reserved.
+
+    def _hold_unbound(self, item):
+        """Preserve the original uncertain attempt; never infer or fabricate proof."""
+        current = self.queue.get_job(item['job_id'])
+        if current['state'] == 'queued':
+            # No machine was acquired. Report the local hold without fabricating
+            # a queue reservation; target checks will prevent any later claim.
+            if (item.get('phase') != 'held' or item.get('hold_reason') != _UNBOUND_HOLD
+                    or item.get('manual_recovery_only') is not True):
+                item.update(phase='held', hold_reason=_UNBOUND_HOLD, manual_recovery_only=True)
+                self._save(item)
+            return self._view(item)
+        if item.get('hold_reason') != _UNBOUND_HOLD:
+            item['hold_reason'] = _UNBOUND_HOLD
+            self._save(item)
+        claim = item.get('claim')
+        if not (type(claim) is dict and type(claim.get('fence')) is int and claim['fence'] > 0):
+            claim = None  # Preserve the original queue reservation; never invent a fence.
+        self._hold(item, claim)
+        if item.get('manual_recovery_only') is not True:
+            item['manual_recovery_only'] = True
+            self._save(item)
+        return self._view(item)
 
     async def run_once(self):
         _require(not self.stopping, 'staging_controller_closing', 503)
@@ -486,6 +522,8 @@ class StagingController:
 
     async def _finish(self, item, receipt, claim):
         self._shared_guard()
+        _require(_valid_source_binding(item) and item.get('hold_reason') != _UNBOUND_HOLD,
+                 'staging_source_binding_required', 409)
         outcome = receipt['state']
         result = receipt['result']
         _require(result.get('source_commit') == item['source_commit']
@@ -569,13 +607,20 @@ class StagingController:
             self._shared_guard()
             item = self._read(job_id=_id(identity))
             current = self.queue.get_job(identity)
+            if (current['state'] == 'claimed' and not current.get('requires_reconciliation')
+                    and current.get('worker') != self.worker.encoded()):
+                raise HubError('staging_reconciliation_pending', 409)
+            if item.get('hold_reason') == _UNBOUND_HOLD:
+                return self._hold_unbound(item)
+            if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
+                return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
+            if item['phase'] == 'verified' and current['state'] == item.get('outcome'):
+                return self._view(item)  # Historical terminal facts are not rewritten.
+            if not _valid_source_binding(item):
+                return self._hold_unbound(item)
             if (item['phase'] in ('queued', 'deposited') and
                     (current['state'] == 'held' or current.get('requires_reconciliation'))):
                 return self._finish_no_effect(item, None, 'never_sent', 'restart_before_dispatch')
-            if item.get('dispatch_proof') in ('never_sent', 'definitively_rejected'):
-                return self._finish_no_effect(item, None, item['dispatch_proof'], item['rejection_reason'])
-            if item['phase'] == 'verified' and current['state'] == item['outcome']:
-                return self._view(item)  # Public owner authorization was checked separately.
             _require(item['phase'] in ('held', 'dispatching', 'accepted', 'verified'), 'staging_reconcile_not_needed', 409)
             try:
                 return await self._follow(item, await self.client.job(identity), item.get('claim'))
@@ -759,12 +804,22 @@ class StagingController:
         for item in entries:
             if self.stopping or item.get('job_id') is None or item['phase'] not in ('queued', 'deposited', 'held', 'accepted', 'dispatching', 'verified'):
                 continue
+            if (item.get('hold_reason') == _UNBOUND_HOLD and item.get('manual_recovery_only') is True
+                    and item.get('phase') == 'held'):
+                continue  # Explicit operator reconciliation; never poll the old worker automatically.
             due, delay = self.recheck_backoff.get(item['job_id'], (0, 15))
             if time.monotonic() < due:
                 continue
             try:
                 job = self.queue.get_job(item['job_id'])
             except HubError:
+                continue
+            if job['state'] == 'queued' and (item.get('hold_reason') == _UNBOUND_HOLD
+                                             or not _valid_source_binding(item)):
+                try:
+                    await self.reconcile(item['job_id'])
+                except Exception:
+                    pass
                 continue
             if job['state'] not in ('claimed', 'held'):
                 continue

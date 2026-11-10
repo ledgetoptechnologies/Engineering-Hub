@@ -295,6 +295,9 @@ class WorkQueue:
             return False
         try:
             item = json.loads(row['data'])
+            from .staging_source_binding import UNBOUND_HOLD, valid_source_binding
+            if item.get('hold_reason') == UNBOUND_HOLD or not valid_source_binding(item):
+                return False
             task = self.repo._get(db, target.task_id, 'task')
             self.repo._no_active_run(db, target.task_id)
             key = 'staging-service.' + hashlib.sha256(json.dumps(
