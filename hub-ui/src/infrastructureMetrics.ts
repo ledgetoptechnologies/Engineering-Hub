@@ -255,7 +255,9 @@ export function grafanaLink(template: string | null, hostLabel: string | null): 
   try {
     const url = new URL(href);
     const origin = new URL(template.replace("{host}", "x"));
-    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && url.host === origin.host ? href : null;
+    // Same rule as the server: a dashboard link carries no secret-looking query names.
+    const secret = [...origin.searchParams.keys()].some(name => /auth|token|key|secret|pass|session|sig|cred|bearer|jwt/i.test(name));
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && url.host === origin.host && !secret ? href : null;
   } catch { return null; }
 }
 export function parseLinks(value: unknown): string | null {

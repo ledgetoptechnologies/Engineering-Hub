@@ -79,13 +79,16 @@ def grafana_host_url(value):
 
     One http(s) URL with no credentials, where {host} appears exactly once in the
     path or query, so the host label can never change which server is opened.
+    Query names that usually carry a secret are refused: a dashboard link needs none.
     """
-    from urllib.parse import urlsplit
+    from urllib.parse import parse_qsl, urlsplit
     _need(type(value) is str and 0 < len(value) <= MAX_GRAFANA_URL and value.isprintable() and value.strip() == value)
     _need(value.count('{host}') == 1 and not set(value.replace('{host}', '')) & set('{}'))
     parts = urlsplit(value)
     _need(parts.scheme in ('http', 'https') and parts.netloc and '@' not in parts.netloc and '{host}' not in parts.netloc)
     _need(not parts.fragment or '{host}' not in parts.fragment)
+    names = [name.lower() for name, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    _need(not any(re.search(r'auth|token|key|secret|pass|session|sig|cred|bearer|jwt', name) for name in names))
     return value
 
 

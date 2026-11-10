@@ -135,6 +135,10 @@ def test_links_route_returns_the_configured_template_only_to_admitted_readers(se
     with TestClient(links_app(service, access, grafana=GRAFANA)) as client:
         assert client.get(links, headers=OWNER_HEADERS).json() == {'schema_version': 1, 'grafana_host_url': GRAFANA}
         assert client.get(links, headers={'X-Fixture-Human': 'human:other'}).status_code == 403
+        # Agents and any bearer caller never receive the template, even alongside the owner's session.
+        for bearer in ('Bearer synthetic-codex', 'Bearer synthetic-hermes', 'Bearer ehi_x'):
+            with pytest.raises(HubError, match='forbidden'):
+                client.get(links, headers={**OWNER_HEADERS, 'Authorization': bearer})
         with pytest.raises(HubError, match='invalid_infrastructure_filter'):
             client.get(links, params={'host': 'x'}, headers=OWNER_HEADERS)
     with TestClient(links_app(service, access)) as client:
@@ -154,7 +158,11 @@ def test_grafana_template_validation():
                 'https://user:pass@grafana.example.test/d?h={host}',     # credentials
                 'javascript:alert(1)//{host}', 'ftp://grafana.example.test/{host}',
                 'https://grafana.example.test/d?h={host}#{x}', ' https://grafana.example.test/{host}',
-                'https://grafana.example.test/d#{host}', 'https://grafana.example.test/' + 'a' * 600 + '{host}', None, 3):
+                'https://grafana.example.test/d#{host}', 'https://grafana.example.test/' + 'a' * 600 + '{host}', None, 3,
+                # Query names that usually carry a secret: a dashboard link needs none.
+                'https://grafana.example.test/d?var-host={host}&auth=x', 'https://grafana.example.test/d?var-host={host}&api_key=x',
+                'https://grafana.example.test/d?var-host={host}&Token=x', 'https://grafana.example.test/d?var-host={host}&password=',
+                'https://grafana.example.test/d?var-host={host}&X-Session=1'):
         with pytest.raises(ValueError):
             grafana_host_url(bad)
 

@@ -204,7 +204,8 @@ describe("Grafana link", () => {
     expect(grafanaLink(null, "BEAST")).toBeNull();
     expect(grafanaLink(template, null)).toBeNull();
     for (const bad of ["javascript:alert(1)//{host}", "https://{host}.example.test/d", "https://u:p@grafana.example.test/{host}",
-      "https://grafana.example.test/{host}/{host}", "https://grafana.example.test/d", "not a url {host}"])
+      "https://grafana.example.test/{host}/{host}", "https://grafana.example.test/d", "not a url {host}",
+      "https://grafana.example.test/d?var-host={host}&auth=x", "https://grafana.example.test/d?var-host={host}&apiKey=x"])
       expect(grafanaLink(bad, "BEAST")).toBeNull();
   });
   it("parses the links answer exactly and reads it from one fixed route", async () => {

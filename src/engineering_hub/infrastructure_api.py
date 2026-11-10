@@ -118,8 +118,13 @@ def attach_infrastructure_routes(app,service,actor,*,metrics=None,metrics_identi
 
     @app.get('/api/hub/v1/infrastructure/metrics/links')
     def machine_metric_links(request:Request):
-        # Same admission as the readings; the template itself is owner-written settings.
+        # Owner's browser only: the link opens the owner's Grafana, so agents and
+        # bearer callers never receive the template, whatever it contains.
+        if request.headers.getlist('authorization'):
+            raise HubError('forbidden',403)
         identity=metrics_identity(request) if metrics_identity is not None else authorized(request,'metrics_read')
+        if metrics_identity is None and InfrastructureService.principal(identity).kind!='human':
+            raise HubError('forbidden',403)
         if request.query_params:
             raise HubError('invalid_infrastructure_filter')
         if metrics is None:
