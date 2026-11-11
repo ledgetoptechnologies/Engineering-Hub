@@ -586,3 +586,73 @@ def test_single_pilot_lost_denial_replays_after_adapter_reopen(tmp_path, monkeyp
         assert backend.events == [] and state.calls == []
     finally:
         reopened.close()
+
+
+def test_single_pilot_preflight_failure_retry_does_not_admit(tmp_path):
+    from types import SimpleNamespace
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    def preflight_failure():
+        raise RuntimeError('synthetic pending journal')
+    backend.operation_journal = SimpleNamespace(require_no_pending=preflight_failure)
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    cmd = command(manifest, 'deploy_container')
+    try:
+        first = adapter.submit(cmd)
+        assert first.state == 'held' and first.reason == 'inspect_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        gate = adapter.ledger.inspect_single_pilot()
+        retry = adapter.submit(cmd)
+        assert retry.state == 'held' and retry.reason == 'recovery_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        assert adapter.ledger.inspect_single_pilot() == gate
+        assert backend.events == [] and state.calls == []
+    finally:
+        adapter.close()
+
+
+def test_single_pilot_state_preflight_failure_reopen_concurrent_retries_stay_held(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    import hub_container_executor.single_pilot_evidence as pilot_evidence
+
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    monkeypatch.setattr(pilot_evidence, 'require_resources', lambda *_: None)
+    checks = []
+    backend.operation_journal = SimpleNamespace(require_no_pending=lambda: checks.append('journal'))
+    def reject_reservation(**_):
+        checks.append('reservation')
+        raise RuntimeError('synthetic incomplete reservation')
+    state.require_complete_reservations = reject_reservation
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    cmd = command(manifest, 'deploy_container')
+    path = adapter.ledger.path
+    try:
+        first = adapter.submit(cmd)
+        assert (first.state, first.reason) == ('held', 'inspect_required')
+        gate = adapter.ledger.inspect_single_pilot()
+        assert gate == {'state': 'effect_held', 'request': cmd.model_dump(mode='json')}
+        assert checks == ['journal', 'reservation']
+        assert adapter.ledger.get(cmd.command_id) is None
+    finally:
+        adapter.close()
+
+    reopened = HostAdapter(path, manifest, backend=backend, state_provisioner=state,
+                           single_pilot_protocol=True)
+    try:
+        start = threading.Barrier(4)
+        def retry():
+            start.wait(timeout=5)
+            return reopened.submit(cmd)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(lambda _: retry(), range(4)))
+        assert all((r.state, r.reason, r.replayed) == ('held', 'recovery_required', False)
+                   for r in responses)
+        assert reopened.ledger.get(cmd.command_id) is None
+        assert reopened.ledger.operation_rows(cmd.command_id) == ()
+        assert reopened.ledger.inspect_single_pilot() == gate
+        assert checks == ['journal', 'reservation']
+        assert backend.events == [] and state.calls == []
+    finally:
+        reopened.close()

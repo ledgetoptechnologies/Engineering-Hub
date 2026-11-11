@@ -199,6 +199,12 @@ class HostAdapter:
                 try:
                     gate = self.ledger.inspect_single_pilot()
                     if gate is not None:
+                        # A retained effect gate can predate admission (for
+                        # example, if preflight failed). Retrying it must not
+                        # create an operation without rerunning preflight.
+                        if (gate.get('state') == 'effect_held'
+                                and gate.get('request') == request.model_dump(mode='json')):
+                            return _make_response(request, state='held', reason='recovery_required')
                         admission = self.ledger.admit(request)
                         return admission.response
                     prior = self.ledger.admit(request)
