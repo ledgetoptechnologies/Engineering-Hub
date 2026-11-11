@@ -266,7 +266,11 @@ class QueuedContainerPilot:
     def _review(self, db, actor, target, *, original=None):
         task = self.repo._get(db, target.task_id, 'task')
         review = task.get('review')
-        if (actor not in AGENTS or task['owner'] != actor or task['project'] != 'engineering-hub'
+        # This pilot persists only the three-field target in its durable intent.
+        # Do not admit additional build/release or staging bindings until a
+        # trusted producer and durable verifier can carry and recheck them.
+        if (target != WorkTarget(target.task_id, target.source_commit, target.artifact_digest)
+                or actor not in AGENTS or task['owner'] != actor or task['project'] != 'engineering-hub'
                 or task['status'] != 'verified' or task['candidate_commit'] != target.source_commit
                 or target.source_commit != self.target.candidate_commit
                 or target.artifact_digest != self.target.artifact_digest
@@ -304,7 +308,9 @@ class QueuedContainerPilot:
                 self._active_admission(kinds={'claim', 'command'})
             return (worker == self.worker and action_key == self.action_key
                 and environment == 'staging' and machine_id == self.machine_id
-                and type(target) is WorkTarget and target.source_commit == self.target.candidate_commit
+                and type(target) is WorkTarget
+                and target == WorkTarget(target.task_id, target.source_commit, target.artifact_digest)
+                and target.source_commit == self.target.candidate_commit
                 and target.artifact_digest == self.target.artifact_digest)
         except Exception:
             return False

@@ -430,3 +430,35 @@ def test_missing_inprocess_bridge_never_treats_durable_marker_as_authority(rig):
         assert rig.repo.list_runs() == [] and rig.client.submissions == []
     finally:
         rig.repo._queued_pilot = rig.bridge
+
+
+@pytest.mark.parametrize('extra', [
+    {'review_revision': 4, 'submission_id': str(uuid.uuid4())},
+    {'ci_attempt_job_id': str(uuid.uuid4())},
+    {'build_receipt_digest': 'sha256:' + 'c' * 64},
+    {'execution_release_digest': 'sha256:' + 'd' * 64},
+    {'ci_attempt_job_id': str(uuid.uuid4()), 'build_receipt_digest': 'sha256:' + 'c' * 64,
+     'execution_release_digest': 'sha256:' + 'd' * 64},
+])
+def test_unpersisted_target_bindings_are_rejected_before_queue_admission(rig, extra):
+    task = reviewed_task(rig.repo, 'unsupported-target-binding')
+    target = WorkTarget(task['id'], COMMIT, IMAGE, **extra)
+    with pytest.raises(HubError, match='work_target_not_verified'):
+        rig.queue.submit(actor='codex', request_id='unsupported-binding', action_key=ACTION,
+                         environment='staging', target=target)
+    with rig.repo._connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] == 0
+    assert machine_job(rig) is None and rig.client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_corrupted_queued_extra_binding_is_not_claimed_or_dispatched(rig):
+    _, job = submit(rig, 'legacy-extra-binding')
+    with rig.repo._transaction() as db:
+        row = db.execute('SELECT target FROM hub_work_jobs WHERE id=?', (job['id'],)).fetchone()
+        target = json.loads(row['target'])
+        target['build_receipt_digest'] = 'sha256:' + 'c' * 64
+        db.execute('UPDATE hub_work_jobs SET target=? WHERE id=?', (json.dumps(target), job['id']))
+    assert await rig.bridge.run_once() is None
+    assert rig.queue.get_job(job['id'])['state'] == 'queued'
+    assert machine_job(rig) is None and rig.client.submissions == []
