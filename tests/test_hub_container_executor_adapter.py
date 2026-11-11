@@ -575,8 +575,14 @@ def test_single_pilot_lost_denial_replays_after_adapter_reopen(tmp_path, monkeyp
         assert reopened.get(denied.command_id).reason == 'identity_conflict'
         replay = reopened.submit(denied)
         assert replay.replayed and replay.reason == 'identity_conflict'
+        other = command(manifest, 'deploy_container')
+        reopened.ledger.arm_single_pilot(other)
         changed = denied.model_copy(update={'fencing_generation': denied.fencing_generation + 1})
-        assert reopened.submit(changed).reason == 'identity_conflict'
+        conflict = reopened.submit(changed)
+        assert conflict.reason == 'identity_conflict' and conflict.replayed is False
+        assert conflict.command_id == changed.command_id
+        assert conflict.fencing_generation == changed.fencing_generation
+        assert reopened.ledger.inspect_single_pilot()['request']['command_id'] == other.command_id
         assert backend.events == [] and state.calls == []
     finally:
         reopened.close()
