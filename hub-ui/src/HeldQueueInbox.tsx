@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { HubApiError } from "./api";
 import { link } from "./router";
 import { readQueueSnapshot, type QueueSnapshot } from "./workQueueApi";
+import type { Session } from "./types";
 
 /** The same authenticated, read-only projection used by the software queue. */
-export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }: {
-  enabled: boolean; stale: boolean; refreshToken: unknown; onUnauthorized: () => void;
+export function HeldQueueInbox({ enabled, session, stale, refreshToken, onUnauthorized }: {
+  enabled: boolean; session: Session | null; stale: boolean; refreshToken: unknown; onUnauthorized: () => void;
 }) {
-  const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
+  const [saved, setSnapshot] = useState<{ session: Session | null; value: QueueSnapshot } | null>(null);
+  const snapshot = saved?.session === session ? saved.value : null;
   const [state, setState] = useState("loading");
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
@@ -20,7 +22,7 @@ export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }:
     }
     setState("checking");
     void readQueueSnapshot(controller.signal).then(value => {
-      if (!controller.signal.aborted) { setSnapshot(value); setState("loaded"); }
+      if (!controller.signal.aborted) { setSnapshot({ session, value }); setState("loaded"); }
     }).catch(error => {
       if (controller.signal.aborted) return;
       setSnapshot(null);
@@ -29,8 +31,9 @@ export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }:
       } else setState(error instanceof HubApiError && error.status === 423 ? "unconfigured" : "unknown");
     });
     return () => controller.abort();
-  }, [enabled, refreshToken]);
+  }, [enabled, session, refreshToken]);
   if (!enabled) return null;
+  if (saved && saved.session !== session) return null;
   if (state === "unconfigured" || ((state === "loading" || state === "checking") && !snapshot)
       || (!stale && snapshot && (snapshot.counts.held ?? 0) === 0)) return null;
   const held = snapshot?.jobs.filter(job => job.state === "held") ?? [];

@@ -36,7 +36,7 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
         <WithdrawnList hub={hub} kind="decision" project={project === "all" ? undefined : project} />
         <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
       </section>
-      {project === "all" && <HeldQueueInbox enabled={!hub.demo && !!hub.session?.authenticated}
+      {project === "all" && <HeldQueueInbox enabled={!hub.demo && !!hub.session?.authenticated} session={hub.session}
         stale={hub.stale} refreshToken={hub.data} onUnauthorized={hub.clearPrivateWorkspace} />}
     </>
   );

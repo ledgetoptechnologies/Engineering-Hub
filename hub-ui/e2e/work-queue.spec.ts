@@ -14,14 +14,14 @@ function snapshot() {
 }
 
 async function fixture(page: Page) {
-  const state = { reads: 0, writes: 0, queueStatus: 200, overviewStatus: 200, queueDelay: 0, body: snapshot() };
+  const state = { reads: 0, writes: 0, actor: "human:42", queueStatus: 200, overviewStatus: 200, queueDelay: 0, body: snapshot() };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
     const respond = (body: unknown, status = 200) => route.fulfill({ status,
       contentType: "application/json", body: JSON.stringify(body) });
     if (request.method() !== "GET") { state.writes++; return respond({}, 405); }
     if (path.endsWith("/auth/me")) return respond({ authenticated: true,
-      actor: "human:42", github_id: 42, csrf_token: "fixture-csrf" });
+      actor: state.actor, github_id: 42, csrf_token: "fixture-csrf" });
     if (path.endsWith("/overview")) return respond(createDemoOverview(), state.overviewStatus);
     if (path.endsWith("/events/status")) return respond({ available: false,
       reason: "native_source_unsupported", observer_epoch: "fixture", cursor: 0 });
@@ -93,7 +93,7 @@ test("inbox hides zero and unconfigured queue states", async ({ page }) => {
   await expect(page.getByRole("region", { name: "Held software queue jobs" })).toHaveCount(0);
 });
 
-test("inbox retains last check during refresh, then clears it on error", async ({ page }) => {
+test("inbox clears the previous session's snapshot while a renewed read is pending and fails", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/#/inbox");
   const panel = page.getByRole("region", { name: "Held software queue jobs" });
@@ -101,9 +101,26 @@ test("inbox retains last check during refresh, then clears it on error", async (
   state.queueDelay = 500;
   state.queueStatus = 503;
   await page.getByRole("button", { name: "Refresh workspace" }).click();
-  await expect(panel.getByText("Checking again; last check: 1.")).toBeVisible();
+  await expect.poll(() => state.reads).toBeGreaterThan(1);
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
   await expect(panel.getByText("Queue status is unavailable.")).toBeVisible();
   await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+});
+
+test("inbox never carries actor A queue details into actor B's pending or failed read", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toBeVisible();
+  state.actor = "human:43";
+  state.queueDelay = 500;
+  state.queueStatus = 503;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect.poll(() => state.reads).toBeGreaterThan(1);
+  await expect(page.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+  await expect(panel.getByText("Queue status is unavailable.")).toBeVisible();
+  await expect(page.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+  expect(state.writes).toBe(0);
 });
 
 test("inbox does not present old queue details when workspace is stale", async ({ page }) => {
