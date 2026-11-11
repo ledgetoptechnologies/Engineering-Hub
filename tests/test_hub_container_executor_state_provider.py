@@ -451,3 +451,28 @@ def test_inspection_fails_closed_when_completion_cannot_be_bound(rig, change):
             (rig.root / state.generation_id / 'hub.sqlite3').unlink()
         deadline = float('nan') if change == 'bad_deadline' else time.monotonic()+10
         with pytest.raises(StateProvisionError): store.inspect_reservation(operation, deadline_monotonic=deadline)
+
+
+def test_post_marker_failure_leaves_completion_but_is_not_success(rig, monkeypatch):
+    operation, run = str(uuid4()), str(uuid4())
+    with rig.build() as store:
+        real = store._inventory_usage
+        calls = 0
+        def fail_after_marker(deadline):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise StateProvisionError('injected final inventory failure')
+            return real(deadline)
+        monkeypatch.setattr(store, '_inventory_usage', fail_after_marker)
+        with pytest.raises(StateProvisionError):
+            prepare(store, rig, operation=operation, run=run)
+        assert (rig.reservations / (operation + '.complete')).is_file()
+        # A completion marker alone cannot authorize a phase: no successful
+        # state-copy receipt was returned after the final checks failed.
+        # The owned generation is removed by failure cleanup, so inspection
+        # rejects the surviving marker instead of treating it as completion.
+        with pytest.raises(StateProvisionError):
+            store.inspect_reservation(operation, deadline_monotonic=time.monotonic()+10)
+        with pytest.raises(StateProvisionError):
+            prepare(store, rig, operation=operation, run=run)

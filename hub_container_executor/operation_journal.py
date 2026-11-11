@@ -347,7 +347,11 @@ class SQLiteOperationJournal:
                            (container_id, operation_id))
 
     def inspect_record(self, operation_id: str) -> JournalOperationRecord | None:
-        """Read kind and receipt in one owner-guarded transaction; never re-effect."""
+        """Read kind and receipt in one owner-guarded transaction; never re-effect.
+
+        This uses the normal read/write SQLite transaction and may recover a
+        rollback journal or sync storage. Any exception leaves authority held.
+        """
         _operation(operation_id)
         with self._transaction() as db:
             row = db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal WHERE operation_id=?",

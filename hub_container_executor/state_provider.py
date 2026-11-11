@@ -262,7 +262,9 @@ class FrozenSQLiteStateProvisioner:
         """Read guarded private metadata; incomplete never means no effect.
 
         A completed marker binds the current generation directory inode only.
-        This is not proof of current SQLite bytes, health or independent origin.
+        The marker is written before final copy checks, so it is not itself a
+        successful state-copy receipt. This is not proof of current SQLite bytes,
+        health or independent origin.
         Trusted same-UID ownership and the provider lock remain prerequisites.
         """
         if self._pid != os.getpid():
