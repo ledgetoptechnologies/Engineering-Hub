@@ -39,21 +39,25 @@ from tests.test_hub_container_executor_launch_supervisor import (
 
 
 @contextmanager
-def relay_server(path, app):
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); server.bind(str(path)); os.chmod(path, 0o600); server.listen(1)
+def relay_server(path, app, replay=False):
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); server.bind(str(path)); os.chmod(path, 0o600); server.listen(2)
     errors = []
     def run():
         try:
-            conn, _ = server.accept()
-            with conn:
-                data = b''
-                while b'\r\n\r\n' not in data: data += conn.recv(4096)
-                head, body = data.split(b'\r\n\r\n', 1)
-                length = int(next(line.split(b':', 1)[1] for line in head.split(b'\r\n') if line.lower().startswith(b'content-length:')))
-                while len(body) < length: body += conn.recv(4096)
-                with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
-                    start, end = runner.run(request(app, head, body))
-                conn.sendall(b'HTTP/1.1 ' + str(start['status']).encode() + b' OK\r\n' + b'\r\n'.join(k+b': '+v for k,v in start['headers']) + b'\r\n\r\n' + end['body'])
+            saved = None
+            for attempt in range(2 if replay else 1):
+                conn, _ = server.accept()
+                with conn:
+                    data = b''
+                    while b'\r\n\r\n' not in data: data += conn.recv(4096)
+                    head, body = data.split(b'\r\n\r\n', 1)
+                    length = int(next(line.split(b':', 1)[1] for line in head.split(b'\r\n') if line.lower().startswith(b'content-length:')))
+                    while len(body) < length: body += conn.recv(4096)
+                    if attempt == 0:
+                        with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
+                            start, end = runner.run(request(app, head, body))
+                        saved = b'HTTP/1.1 ' + str(start['status']).encode() + b' OK\r\n' + b'\r\n'.join(k+b': '+v for k,v in start['headers']) + b'\r\n\r\n' + end['body']
+                    conn.sendall(saved)
         except BaseException as error:
             errors.append(error)
     thread=threading.Thread(target=run); thread.start()
@@ -62,7 +66,8 @@ def relay_server(path, app):
         thread.join(5); server.close(); assert not thread.is_alive() and not errors
 
 
-def test_signed_executor_relay_is_pending_without_manual_acceptance(synthetic_issuer, monkeypatch):
+@pytest.mark.parametrize('scenario', ['accept', 'wrong_key', 'replay'])
+def test_signed_executor_relay_requires_matching_key_and_manual_acceptance(synthetic_issuer, monkeypatch, scenario):
     import engineering_hub.pilot_ownership as ownership
     old = ownership._local_filesystem
     monkeypatch.setattr(ownership, '_local_filesystem', lambda fd, **_: old(fd))
@@ -82,6 +87,8 @@ def test_signed_executor_relay_is_pending_without_manual_acceptance(synthetic_is
     data['release'] = {name: getattr(release, name) for name in release.__dataclass_fields__
                        if name not in {'public_key', 'platform'}}
     data['release'].update(public_key_hex=release.public_key.hex(), platform=release.platform.model_dump(mode='json'))
+    if scenario == 'wrong_key':
+        data['release']['public_key_hex'] = 'a' * 64
     data['launch'] = {name: getattr(launch, name) for name in launch.__dataclass_fields__}
     data['report']['executor'] = dict(data['launch'], image_config_id=release.image_config_id)
     data['report']['manifest_digest'] = config.manifest.digest()
@@ -93,10 +100,18 @@ def test_signed_executor_relay_is_pending_without_manual_acceptance(synthetic_is
     app = executor_app(NoCommands(), bearer_token=token, current_observation_transport=issuer_relay)
     composition = ColocatedTrustedSession(config=config, enrollment=enrollment, credential=token)
     try:
-        with owned_supervisor_wait(authority), relay_server(raw['executor_socket_path'], app), PilotOwner(config.database, allow_ephemeral_test_storage=True) as owner:
+        with owned_supervisor_wait(authority), relay_server(raw['executor_socket_path'], app, replay=scenario == 'replay'), PilotOwner(config.database, allow_ephemeral_test_storage=True) as owner:
             target = ContainerPilotTarget.from_manifest(config.manifest)
             gate = composition.reconciliation_factory(owner, target)
             assert gate.admission_state == 'pending'
+            if scenario in ('wrong_key', 'replay'):
+                from engineering_hub.current_executor_observation import CurrentExecutorObservationError
+                if scenario == 'replay':
+                    composition._current_verified()
+                with pytest.raises(CurrentExecutorObservationError):
+                    composition._current_verified()
+                assert gate.admission_state != 'accepted'
+                return
             repo = HubRepository(config.database, execution_principal='executor:container-pilot', pilot_owner=owner)
             client = DistinctContainerClient()
             workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
