@@ -114,6 +114,8 @@ class Settings:
         agent_auth = AuthSettings.from_env()
         if deployment is not None:
             agent_auth = replace(agent_auth, allowed_ips=frozenset(deployment.allowed_ips))
+        if deployment is None and os.environ.get("HUB_HUMAN_AUTH_MODE", "github") == "github_cloudflare":
+            raise ValueError("github_cloudflare requires an explicit version 3 deployment configuration")
         auth_config = deployment.auth_config if deployment is not None else AuthConfig(
             base_url=os.environ.get("HUB_BASE_URL", "https://hub.invalid"),
             github_client_id=os.environ.get("HUB_GITHUB_CLIENT_ID", ""),

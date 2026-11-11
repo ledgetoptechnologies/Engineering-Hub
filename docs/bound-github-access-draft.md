@@ -11,6 +11,12 @@ the Hub auth routes. GitHub OAuth verifies the enrolled numeric GitHub account.
 The resulting human principal is the existing Cloudflare-derived actor; this
 avoids silently assigning existing owner permissions to a new principal.
 
+Select this mode through the explicit version 3 deployment configuration, which
+contains the enrolled Access subject. Setting `HUB_HUMAN_AUTH_MODE` to
+`github_cloudflare` without that configuration is not supported and startup
+rejects it. The GitHub client secret is supplied separately through
+`HUB_GITHUB_CLIENT_SECRET`; neither setting creates an identity or access grant.
+
 Every human request needs a currently valid Access assertion for the enrolled
 identity. The Hub GitHub session has a fixed local lifetime (normally eight
 hours) and can be reused with a later valid Access assertion for the same
