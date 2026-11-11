@@ -334,3 +334,15 @@ def test_cli_invalid_arguments_sanitized_before_io(monkeypatch, capsys, argument
     assert module.main(arguments) == 2
     output = capsys.readouterr()
     assert output.out == '' and output.err == 'Installed executor unavailable\n'
+
+
+def test_single_pilot_requires_explicit_v2_schema_and_true():
+    legacy = configuration()
+    assert 'single_pilot_protocol' not in module.parse_configuration(canonical(legacy)).resources
+    legacy['resources']['single_pilot_protocol'] = True
+    with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(legacy))
+    legacy['schema'] = module.SCHEMA_SINGLE_PILOT
+    assert module.parse_configuration(canonical(legacy)).resources['single_pilot_protocol'] is True
+    for wrong in (False, 1, 'true'):
+        legacy['resources']['single_pilot_protocol'] = wrong
+        with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(legacy))

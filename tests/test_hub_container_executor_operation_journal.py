@@ -42,6 +42,8 @@ def test_opt_in_migration_keeps_legacy_pending_and_bound_ids_unique(path):
         store.begin_bound(bound, "create_candidate", value)
         assert store.inspect(bound).state == "pending"
         recorded = store.inspect_binding(bound)
+        record = store.inspect_record(bound)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (bound, 'create_candidate', 'pending', None)
         assert recorded == replace(value, owner_epoch=store._owner.epoch)
         with pytest.raises(OperationJournalConflict):
             store.begin_bound(str(uuid4()), "create_candidate", value)
@@ -187,6 +189,9 @@ def test_pending_and_completed_durable_reopen_and_no_replay(path, kind):
         assert store.inspect(identity) is None
         store.begin(identity, kind)
         observed = store.inspect(identity)
+        record = store.inspect_record(identity)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (identity, kind, 'pending', None)
+        assert store.inspect_record(str(uuid4())) is None
         assert observed.state == "pending" and observed.terminal is False and observed.container_id is None
         with pytest.raises(OperationJournalConflict):
             store.begin(identity, kind)
@@ -196,6 +201,8 @@ def test_pending_and_completed_durable_reopen_and_no_replay(path, kind):
             store.begin(identity, kind)
         store.completed(identity, kind, CID)
         completed = store.inspect(identity)
+        record = store.inspect_record(identity)
+        assert (record.operation_id, record.kind, record.state, record.container_id) == (identity, kind, 'completed', CID)
         assert completed.state == "completed" and completed.terminal is True and completed.container_id == CID
         store.completed(identity, kind, CID)  # Exact receipt replay alone is idempotent.
         with pytest.raises(OperationJournalConflict):

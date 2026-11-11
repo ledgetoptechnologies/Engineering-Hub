@@ -2,6 +2,14 @@
 
 The ledger is deliberately not a daemon driver. It provides durable admission,
 fencing and operation intents; ambiguity is retained as held and never replayed.
+
+The optional single-pilot ledger protocol is not exposed by the current adapter,
+ASGI route, ContainerPilotClient, controller, or installed-runner configuration.
+A future integration must serialize admission/reconcile, arm before any effect,
+verify journal/state/daemon evidence before recording the outcome, authenticate
+an explicit controller acknowledgment of the exact original response, and
+recover that acknowledgment after lost responses. This module does not attest
+those external facts or exclude older executables and stale dispatchers.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ from engineering_hub.container_pilot_client import (
     ContainerPilotEvidence,
     ContainerPilotRequest,
     ContainerPilotResponse,
+    single_pilot_outcome_digest,
 )
 
 TARGET_ID = "engineering-hub:staging"
@@ -313,12 +322,38 @@ class SQLiteLedger:
         payload = _canonical(request.model_dump(mode="json"))
         digest, commit, policy = self._expected
         with self._transaction() as db:
+            mode = db.execute("SELECT value FROM control WHERE key='single_pilot_protocol'").fetchone()
+            if mode is not None:
+                if mode['value'] != 'v1':
+                    raise PermissionError('single pilot protocol is invalid')
+                ack_row = db.execute('SELECT value FROM control WHERE key=?',
+                                     ('single_pilot_ack:' + request.command_id,)).fetchone()
+                if ack_row is not None:
+                    ack = json.loads(ack_row['value'])
+                    if ack.get('request') != json.loads(payload):
+                        return Admission(False, False, _make_response(request, state='held', reason='identity_conflict'))
+                    original = ContainerPilotResponse.model_validate(ack['outcome'])
+                    if ack.get('outcome_digest') != single_pilot_outcome_digest(original):
+                        raise PermissionError('single pilot acknowledgement is invalid')
+                    return Admission(False, True, original.model_copy(update={'replayed':True}))
+                gate_row = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+                gate = json.loads(gate_row['value']) if gate_row else None
+                if gate is None or gate.get('request') != json.loads(payload):
+                    return Admission(False, False, _make_response(request, state='held', reason='recovery_required'))
+                if gate.get('state') == 'awaiting_ack':
+                    stored = ContainerPilotResponse.model_validate(gate['outcome'])
+                    return Admission(False, True, stored.model_copy(update={'replayed':True}))
+                if gate.get('state') != 'effect_held':
+                    raise PermissionError('single pilot gate is invalid')
             old = db.execute("SELECT payload,response FROM commands WHERE command_id=?",
                              (request.command_id,)).fetchone()
             if old:
                 if old["payload"] != payload:
                     return Admission(False, False, _make_response(request, state="held", reason="identity_conflict"))
                 response = ContainerPilotResponse.model_validate_json(old["response"])
+                if mode is not None:
+                    # No unverified in-progress or terminal result is replayed.
+                    return Admission(False, False, _make_response(request, state='held', reason='recovery_required'))
                 response = response.model_copy(update={"replayed": True})
                 return Admission(False, True, response)
 
@@ -419,6 +454,13 @@ class SQLiteLedger:
                              (command_id,)).fetchone()
             if row is None or row["state"] != "running":
                 raise PermissionError("command is not effect-authorized")
+            mode = db.execute("SELECT value FROM control WHERE key='single_pilot_protocol'").fetchone()
+            if mode is not None:
+                gate_row = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+                gate = json.loads(gate_row['value']) if gate_row else None
+                if (mode['value'] != 'v1' or gate is None or gate.get('state') != 'effect_held'
+                        or gate.get('request') != json.loads(row['payload'])):
+                    raise PermissionError('single pilot gate does not authorize effect')
             command = json.loads(row["payload"])
             pause = db.execute("SELECT value FROM control WHERE key='paused'").fetchone()
             if pause and pause["value"] == "true":
@@ -581,8 +623,39 @@ class SQLiteLedger:
         except (ValueError, TypeError, AttributeError):
             return None
         with self._connection() as db:
+            db.execute('BEGIN')
             row = db.execute("SELECT response FROM commands WHERE command_id=?", (command_id,)).fetchone()
-        return ContainerPilotResponse.model_validate_json(row["response"]) if row else None
+            if row is None:
+                return None
+            raw = ContainerPilotResponse.model_validate_json(row['response'])
+            mode = db.execute("SELECT value FROM control WHERE key='single_pilot_protocol'").fetchone()
+            if mode is None:
+                return raw
+            if mode['value'] != 'v1':
+                raise PermissionError('single pilot protocol is invalid')
+            ack = db.execute('SELECT value FROM control WHERE key=?', ('single_pilot_ack:' + command_id,)).fetchone()
+            if ack:
+                record = json.loads(ack['value'])
+                outcome = ContainerPilotResponse.model_validate(record['outcome'])
+                if record.get('outcome_digest') != single_pilot_outcome_digest(outcome):
+                    raise PermissionError('single pilot acknowledgement is invalid')
+                return outcome
+            gate_row = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+            gate = json.loads(gate_row['value']) if gate_row else None
+            if (gate and gate.get('state') == 'awaiting_ack'
+                    and gate.get('request', {}).get('command_id') == command_id):
+                return ContainerPilotResponse.model_validate(gate['outcome'])
+            request = ContainerPilotRequest.model_validate(raw.model_dump(include=set(ContainerPilotRequest.model_fields)))
+            return _make_response(request, state='held', reason='recovery_required')
+
+    def single_pilot_enabled(self) -> bool:
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM control WHERE key='single_pilot_protocol'").fetchone()
+        if row is None:
+            return False
+        if row['value'] != 'v1':
+            raise PermissionError('single pilot protocol is invalid')
+        return True
 
     def _format_operation(self, row) -> dict:
         status = row["status"]
@@ -638,6 +711,115 @@ class SQLiteLedger:
             rows = db.execute("SELECT operation_id,command_id,kind,status,intent,receipt,receipt_mac "
                               "FROM operations WHERE command_id=? ORDER BY kind", (command_id,)).fetchall()
         return tuple(self._format_operation(row) for row in rows)
+
+    def enable_single_pilot_protocol(self) -> None:
+        """Explicitly enroll a fresh ledger; this does not activate a controller.
+
+        An older executable ignoring this control state can bypass it; an
+        externally enforced exclusive owner and version enrollment are required.
+        """
+        with self._transaction() as db:
+            if (db.execute("SELECT 1 FROM control WHERE key='single_pilot_protocol'").fetchone()
+                    or db.execute('SELECT 1 FROM commands LIMIT 1').fetchone()
+                    or any(db.execute('SELECT 1 FROM ' + table + ' LIMIT 1').fetchone()
+                           for table in ('operations','runs','targets','phases','control'))):
+                raise PermissionError('fresh single pilot ledger required')
+            db.execute("INSERT INTO control(key,value) VALUES('single_pilot_protocol','v1')")
+
+    def arm_single_pilot(self, request: ContainerPilotRequest) -> None:
+        """Durably hold one exact request before admission; never idempotently re-arm."""
+        if type(request) is not ContainerPilotRequest:
+            raise TypeError('exact pilot request required')
+        if (request.manifest_digest, request.candidate_commit, request.policy_revision) != self._expected:
+            raise PermissionError('pilot enrollment mismatch')
+        gate = _canonical({'state':'effect_held', 'request':request.model_dump(mode='json')})
+        with self._transaction() as db:
+            mode = db.execute("SELECT value FROM control WHERE key='single_pilot_protocol'").fetchone()
+            if mode is None or mode['value'] != 'v1':
+                raise PermissionError('single pilot protocol not enabled')
+            if (db.execute("SELECT 1 FROM control WHERE key='single_pilot_gate'").fetchone()
+                    or db.execute('SELECT 1 FROM commands WHERE command_id=?', (request.command_id,)).fetchone()
+                    or db.execute('SELECT 1 FROM control WHERE key=?', ('single_pilot_ack:'+request.command_id,)).fetchone()):
+                raise PermissionError('single pilot already held or identity used')
+            db.execute("INSERT INTO control(key,value) VALUES('single_pilot_gate',?)", (gate,))
+
+    def record_single_pilot_verified_outcome(self, request: ContainerPilotRequest,
+                                              outcome: ContainerPilotResponse) -> None:
+        """Store caller-verified outcome; caller must verify all external evidence.
+
+        This only binds the exact stored terminal response and authenticated
+        ledger receipts. It does not verify daemon generation, journal, state
+        reservation, profile, probes or exclusive ownership. No runtime calls it.
+        """
+        if type(request) is not ContainerPilotRequest or type(outcome) is not ContainerPilotResponse:
+            raise TypeError('exact pilot identities required')
+        if outcome.model_dump(include=set(ContainerPilotRequest.model_fields)) != request.model_dump():
+            raise PermissionError('pilot outcome identity mismatch')
+        deploy = request.action in {'deploy_container','rollback_container'}
+        eligible = ((deploy and outcome.state == 'succeeded' and outcome.reason is None
+                     and outcome.evidence.health == 'unknown' and outcome.evidence.evidence_verified is True)
+                    or (not deploy and outcome.evidence.evidence_verified is True
+                        and ((outcome.state == 'succeeded' and outcome.reason is None and outcome.evidence.health == 'healthy')
+                             or (outcome.state == 'failed' and outcome.reason == 'health_failed' and outcome.evidence.health == 'unhealthy'))))
+        if not eligible or outcome.replayed:
+            raise PermissionError('pilot outcome not eligible')
+        role = 'rollback' if request.action in {'rollback_container','smoke_container_rollback'} else 'candidate'
+        expected = ({'state_copy' if role == 'candidate' else 'rollback_state', 'create_'+role, 'start_'+role}
+                    if request.action in {'deploy_container','rollback_container'} else {'probe'})
+        gate_text = _canonical({'state':'effect_held', 'request':request.model_dump(mode='json')})
+        next_text = _canonical({'state':'awaiting_ack', 'request':request.model_dump(mode='json'),
+                                'outcome':outcome.model_dump(mode='json')})
+        with self._transaction() as db:
+            gate = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+            row = db.execute('SELECT payload,response FROM commands WHERE command_id=?', (request.command_id,)).fetchone()
+            if gate is not None and gate['value'] == next_text:
+                return  # Exact retry after an ambiguous commit is not an effect.
+            if gate is None or gate['value'] != gate_text or row is None or row['payload'] != _canonical(request.model_dump(mode='json')) or row['response'] != _canonical(outcome.model_dump(mode='json')):
+                raise PermissionError('pilot outcome does not match held command')
+            records = db.execute("SELECT operation_id,command_id,kind,status,intent,receipt,receipt_mac FROM operations WHERE command_id=?", (request.command_id,)).fetchall()
+            parsed = [self._format_operation(record) for record in records]
+            if (len(parsed) != len(expected) or {item['kind'] for item in parsed} != expected
+                    or any(item['status'] != 'completed' or item['receipt_authentic'] is not True
+                           or item['operation_id'] != str(uuid.uuid5(uuid.UUID(request.command_id), item['kind'])) for item in parsed)):
+                raise PermissionError('pilot ledger evidence incomplete')
+            db.execute("UPDATE control SET value=? WHERE key='single_pilot_gate'", (next_text,))
+
+    def acknowledge_single_pilot(self, request: ContainerPilotRequest, outcome_digest: str) -> None:
+        """Ack an exact outcome digest; exact repeats do not clear a later gate.
+
+        No caller authentication is supplied here. The controller must durably
+        save the exact request and outcome before sending authenticated ACK.
+        """
+        if type(request) is not ContainerPilotRequest or type(outcome_digest) is not str:
+            raise TypeError('exact pilot request and outcome digest required')
+        if not re.fullmatch(r'sha256:[a-f0-9]{64}', outcome_digest):
+            raise ValueError('invalid pilot outcome digest')
+        key = 'single_pilot_ack:' + request.command_id
+        with self._transaction() as db:
+            previous = db.execute('SELECT value FROM control WHERE key=?', (key,)).fetchone()
+            if previous is not None:
+                record = json.loads(previous['value'])
+                if record.get('request') != request.model_dump(mode='json') or record.get('outcome_digest') != outcome_digest:
+                    raise PermissionError('pilot acknowledgment identity conflict')
+                return
+            gate_row = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+            gate = json.loads(gate_row['value']) if gate_row else None
+            if (type(gate) is not dict or gate.get('state') != 'awaiting_ack'
+                    or gate.get('request') != request.model_dump(mode='json')):
+                raise PermissionError('pilot acknowledgment identity conflict')
+            outcome = ContainerPilotResponse.model_validate(gate.get('outcome'))
+            if single_pilot_outcome_digest(outcome) != outcome_digest:
+                raise PermissionError('pilot acknowledgment identity conflict')
+            record = _canonical({'request':request.model_dump(mode='json'),
+                                 'outcome':outcome.model_dump(mode='json'), 'outcome_digest':outcome_digest})
+            db.execute('INSERT INTO control(key,value) VALUES(?,?)', (key, record))
+            db.execute("DELETE FROM control WHERE key='single_pilot_gate'")
+
+    def inspect_single_pilot(self):
+        """Inspect persisted gate only; absence is not proof of no effect."""
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM control WHERE key='single_pilot_gate'").fetchone()
+        return None if row is None else json.loads(row['value'])
 
     def set_paused(self, paused: bool) -> None:
         if type(paused) is not bool:

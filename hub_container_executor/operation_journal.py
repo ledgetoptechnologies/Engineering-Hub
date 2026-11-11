@@ -110,6 +110,15 @@ def _schema(db, *, inspect_rows=False):
 
 
 @dataclass(frozen=True)
+class JournalOperationRecord:
+    """Stored operation and kind; evidence only, not authenticated origin."""
+    operation_id: str
+    kind: str
+    state: str
+    container_id: str | None
+
+
+@dataclass(frozen=True)
 class OperationBinding:
     """Caller-supplied evidence only: no fencing or recovery authority implied."""
     boot_id: str
@@ -336,6 +345,27 @@ class SQLiteOperationJournal:
             if row[2] == "pending":
                 db.execute("UPDATE private_operation_journal SET state='completed', container_id=? WHERE operation_id=?",
                            (container_id, operation_id))
+
+    def require_no_pending(self) -> None:
+        """Hold if the v1 journal contains any unresolved private intent."""
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (1,):
+                raise OperationJournalError('Single pilot requires v1 journal')
+            if db.execute("SELECT 1 FROM private_operation_journal WHERE state='pending' LIMIT 1").fetchone():
+                raise OperationJournalError('Private operation intent remains pending')
+
+    def inspect_record(self, operation_id: str) -> JournalOperationRecord | None:
+        """Read kind and receipt in one owner-guarded transaction; never re-effect.
+
+        This uses the normal read/write SQLite transaction and may recover a
+        rollback journal or sync storage. Any exception leaves authority held.
+        """
+        _operation(operation_id)
+        with self._transaction() as db:
+            row = db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal WHERE operation_id=?",
+                             (operation_id,)).fetchone()
+            _row(row)
+            return None if row is None else JournalOperationRecord(*row)
 
     def inspect(self, operation_id: str) -> OperationObservation | None:
         _operation(operation_id)

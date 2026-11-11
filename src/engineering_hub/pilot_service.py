@@ -25,7 +25,7 @@ REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS = int(8 * ContainerPilotClient.MAX_TIMEOU
 
 
 class OwnedPilotService:
-    def __init__(self, settings, client, targets, *, owner=None, supervisor_stop_grace_seconds=None):
+    def __init__(self, settings, client, targets, *, owner=None, supervisor_stop_grace_seconds=None, single_pilot_protocol=False):
         if (type(supervisor_stop_grace_seconds) is not int
                 or supervisor_stop_grace_seconds < REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS):
             raise ValueError('owned_pilot_supervisor_stop_grace_required')
@@ -52,7 +52,8 @@ class OwnedPilotService:
         self.tasks = OwnedPilotTasks()
         try:
             self.repo = HubRepository(settings.database, execution_principal='executor:container-pilot', pilot_owner=self.owner)
-            self.workflow = ContainerPilotWorkflow(self.repo, client, targets, pilot_owner=self.owner)
+            self.workflow = ContainerPilotWorkflow(self.repo, client, targets, pilot_owner=self.owner,
+                                                   single_pilot_protocol=single_pilot_protocol)
             self.dispatcher = StagingDispatcher(self.repo, self.workflow)
             self.recovery = PilotRecovery(self.workflow)
         except BaseException:

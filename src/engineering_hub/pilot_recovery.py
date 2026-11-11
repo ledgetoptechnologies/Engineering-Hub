@@ -1,4 +1,4 @@
-"""Bounded original-command GET recovery; never an executor POST or a service.
+"""Bounded original-command recovery; optional exact ACK never repeats an effect.
 
 The operator must already hold a live local PilotOwner. Recovery cannot establish
 host liveness, source provenance, current application health or user approval.
@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 
 from .container_pilot import ContainerPilotWorkflow
+from .container_pilot_client import ContainerPilotResponse, single_pilot_outcome_digest
 from .repository import AGENTS, HubError
 
 
@@ -189,6 +190,52 @@ class PilotRecovery:
                 response = await self.workflow.inspect(run_id, action)
                 command = self.workflow._request(run, target, action)
                 state = self.workflow._verified_state(response, command, target)
+                if self.workflow.single_pilot_protocol and saved['state'] not in {'succeeded', 'failed'}:
+                    # A terminal GET is not an ACK. Retain the exact result
+                    # before the idempotent no-effect ACK, including when the
+                    # original command response was lost.
+                    if (state not in {'succeeded','failed'} or self.repo.get_paused()
+                            or (state == 'failed' and (response.reason != 'health_failed'
+                                or response.evidence.health != 'unhealthy'
+                                or response.evidence.evidence_verified is not True))):
+                        raise ValueError('single pilot outcome not eligible')
+                    retain_outcome = saved['response_json'] is None
+                    if saved['response_json'] is not None:
+                        prior = ContainerPilotResponse.model_validate_json(saved['response_json'], strict=True)
+                        if saved['state'] == 'held' and prior.state == 'held':
+                            # A previously surfaced hold is not a terminal claim;
+                            # exact original GET may now provide verified outcome.
+                            if any(getattr(prior, key) != value for key,value in command.model_dump().items()):
+                                raise ValueError('single pilot held identity mismatch')
+                            retain_outcome = True
+                        elif single_pilot_outcome_digest(prior) != single_pilot_outcome_digest(response):
+                            raise ValueError('single pilot retained outcome mismatch')
+                    if retain_outcome:
+                        # Persist a received exact outcome before ACK. Guard the
+                        # recovery claim and original row in the same transaction.
+                        payload = response.model_dump_json()
+                        with self.repo._transaction() as db:
+                            claim = db.execute('SELECT occurrence,epoch,state FROM hub_container_pilot_recovery_claims WHERE run_id=?', (run_id,)).fetchone()
+                            if tuple(claim or ()) != (occurrence,self.owner.epoch,'inspecting'):
+                                raise ValueError('recovery claim changed')
+                            changed = db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=? AND payload=? AND state=? AND response_json IS ?',
+                                ('ack_pending',payload,run_id,action,saved['payload'],saved['state'],saved['response_json']))
+                            if changed.rowcount != 1:
+                                raise ValueError('recovery command changed')
+                        saved['state'], saved['response_json'] = 'ack_pending', payload
+                    if saved['state'] != 'ack_pending':
+                        raise ValueError('single pilot acknowledgement not pending')
+                    acknowledged = await self.workflow._ack_retained(run,target,action,command,finalize=False)
+                    if acknowledged != state:
+                        raise ValueError('single pilot acknowledgement uncertain')
+                if self.workflow.single_pilot_protocol and saved['state'] in {'succeeded','failed'}:
+                    with self.repo._connection() as db:
+                        ack = db.execute('SELECT payload,outcome_digest FROM hub_single_pilot_ack_receipts WHERE run_id=? AND action=?', (run_id,action)).fetchone()
+                    if (ack is None or ack['payload'] != saved['payload']
+                            or ack['outcome_digest'] != single_pilot_outcome_digest(response)):
+                        raise ValueError('single pilot acknowledgement receipt unavailable')
+                if self.workflow.single_pilot_protocol and saved['state'] == 'ack_pending':
+                    item['ack_digest'] = single_pilot_outcome_digest(response)
                 if saved['state'] in {'succeeded', 'failed'}:
                     prior = self.workflow._validated_response(type(response).model_validate_json(saved['response_json'], strict=True))
                     if (self.workflow._verified_state(prior, command, target) != saved['state']
@@ -250,6 +297,9 @@ class PilotRecovery:
                 return dict(run=current, recovery='held', occurrence=occurrence)
             if derived != 'held':
                 for item in evidence:
+                    if item.get('ack_digest') is not None:
+                        saved = by_action[item['action']]
+                        self.workflow._store_ack_receipt(db, run_id, item['action'], saved['payload'], item['ack_digest'])
                     db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                                (item['state'], item['response'], run_id, item['action']))
                 if reservation.active is not None:

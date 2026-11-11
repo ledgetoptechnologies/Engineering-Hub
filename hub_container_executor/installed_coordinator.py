@@ -33,6 +33,7 @@ from engineering_hub.work_queue import WorkTarget
 from .local_providers import ImmutableTestSecretResolver
 
 SCHEMA = 'engineering-hub.installed-coordinator.v1'
+SCHEMA_SINGLE_PILOT = 'engineering-hub.installed-coordinator.v2'
 ACTION = 'engineering-hub:container-pilot'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed pilot coordinator unavailable'
@@ -98,6 +99,7 @@ class CoordinatorConfiguration:
     roles: object
     stop_grace: int
     process_id: int
+    single_pilot_protocol: bool = False
 
 
 def parse_configuration(raw):
@@ -117,8 +119,11 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _object(value, _FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(type(value) is dict and value.get('schema') in {SCHEMA, SCHEMA_SINGLE_PILOT})
+        _object(value, _FIELDS | ({'single_pilot_protocol'} if value['schema'] == SCHEMA_SINGLE_PILOT else set()))
+        _require(_canonical(value) == raw)
+        if value['schema'] == SCHEMA_SINGLE_PILOT:
+            _require(value['single_pilot_protocol'] is True)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         _require(manifest.target_id == 'engineering-hub:staging'
                  and value['machine_id'] == 'staging-pc' and value['action_key'] == ACTION)
@@ -162,7 +167,8 @@ def parse_configuration(raw):
         return CoordinatorConfiguration(manifest, *paths[:3], port, frozenset(actors), auth,
             paths[3], tuple(bindings), MappingProxyType(roles),
             _integer(value['supervisor_stop_grace_seconds'],
-                     REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1), os.getpid())
+                     REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1), os.getpid(),
+            value['schema'] == SCHEMA_SINGLE_PILOT)
     except Exception:
         raise InstalledCoordinatorError() from None
 
@@ -239,7 +245,8 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             agent_allowed_hosts=('127.0.0.1', f'127.0.0.1:{config.port}'))
 
         def fresh_client():
-            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
+            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'],
+                **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
 
         def policy(actor, action_key, environment, target):
             return target_allowed(config, actor, action_key, environment, target)
@@ -249,7 +256,8 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             reconciliation_factory=reconciliation_factory,
             session_acceptance_factory=session_acceptance_factory,
             socket_path=config.coordinator_socket, supervisor_stop_grace_seconds=config.stop_grace,
-            agent_host='127.0.0.1', agent_port=config.port)
+            agent_host='127.0.0.1', agent_port=config.port,
+            **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
     except Exception:
         raise InstalledCoordinatorError() from None
 

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
+_ORIGINAL_HTTPX_SEND = httpx.Client.send
 import pytest
 
 pytest.importorskip("fcntl", reason="Owned local resources require Linux")
@@ -26,7 +27,7 @@ from hub_container_executor import local_resources as module
 from hub_container_executor.adapter import HostAdapter
 from hub_container_executor.build_enrollment import BuildEnrollment
 from hub_container_executor.daemon_backend import DockerEngineBackend, DockerEngineBinding
-from hub_container_executor.state_provider import StateProvisionError
+from hub_container_executor.state_provider import StateProvisionError, FrozenSQLiteStateProvisioner
 from tests.test_hub_container_executor_build_record import canonical, digest, make_record
 
 pytestmark = pytest.mark.skipif(os.getuid() != 10001 or os.getgid() != 10001,
@@ -426,3 +427,149 @@ async def test_concrete_factory_runs_in_owned_listener_and_exits_off_loop(rig):
     assert observed["exit_thread"] != main_thread
     assert observed["adapter"]._closed and observed["adapter"].backend._client.is_closed
     assert all(any(closed is obj for _, closed in rig.closed) for _, obj in rig.constructed)
+
+
+def test_opt_in_resources_enable_protocol_without_contacting_daemon(rig):
+    params=dict(rig.params, single_pilot_protocol=True)
+    with module.local_host_adapter_resources(**params) as adapter:
+        assert type(adapter) is HostAdapter
+        assert adapter.ledger.single_pilot_enabled()
+        assert adapter.ledger.inspect_single_pilot() is None
+        assert type(adapter.backend) is DockerEngineBackend
+        assert adapter.backend.operation_journal is not None
+        assert type(adapter.state_provisioner) is FrozenSQLiteStateProvisioner
+
+
+def _attach_synthetic_engine(adapter, params):
+    from tests.test_hub_container_executor_daemon_backend import container_inspect, docker_config, oci_archive, json_bytes
+    backend=adapter.backend; manifest=adapter.manifest
+    images={role:adapter._verified_image(role) for role in ('candidate','rollback')}
+    image_by_ref={image.runnable_reference:image for image in images.values()}
+    blobs={('sha256:'+path.name):path.read_bytes() for path in params['metadata_root'].iterdir()}
+    secrets=adapter._resolve_secrets(); baseline=adapter.baseline_provider.enrolled_baseline(manifest)
+    defaults=adapter._defaults_from_record(images['rollback'])
+    profile=adapter._profile(images['rollback'],defaults,baseline.state_generation_id,secrets)
+    containers={baseline.container_id:container_inspect(images['rollback'],profile,
+        str(params['binding'].generation_root + '/' + baseline.state_generation_id),baseline.container_id,'running')}
+    executions={}; posts=[]; counter=0
+    def handler(request):
+        nonlocal counter
+        path=request.url.raw_path.decode('ascii').split('?',1)[0]
+        if path.endswith('/info'):
+            return httpx.Response(200,json={'ID':manifest.runner_binding.daemon_identity,'OSType':'linux','Architecture':'amd64'})
+        if '/images/' in path and path.endswith('/json'):
+            image=next(v for k,v in image_by_ref.items() if k.replace(':','%3A') in path)
+            return httpx.Response(200,json=docker_config(image))
+        if '/images/' in path and path.endswith('/get'):
+            image=next(v for k,v in image_by_ref.items() if k.replace(':','%3A') in path)
+            return httpx.Response(200,content=oci_archive(image,blobs))
+        if '/containers/' in path and path.endswith('/json'):
+            cid=path.split('/containers/',1)[1].removesuffix('/json')
+            return httpx.Response(200,json=containers[cid]) if cid in containers else httpx.Response(404,json={'message':'absent'})
+        if path.endswith('/containers/create'):
+            posts.append(path); body=json.loads(request.content); image=image_by_ref[body['Image']]
+            cid='d'*64 if image.role=='candidate' else 'e'*64
+            source=body['HostConfig']['Mounts'][0]['Source']; generation=source.rsplit('/',1)[1]
+            active=adapter._profile(image,adapter._defaults_from_record(image),generation,secrets)
+            containers[cid]=container_inspect(image,active,source,cid,'created')
+            return httpx.Response(201,json={'Id':cid,'Warnings':[]})
+        if path.endswith('/start') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/start'); containers[cid]['State']['Status']='running'
+            return httpx.Response(204)
+        if path.endswith('/exec') and '/containers/' in path:
+            cid=path.split('/containers/',1)[1].removesuffix('/exec'); counter+=1; eid=f'{counter:064x}'
+            argv=json.loads(request.content)['Cmd']; failed=cid=='d'*64 and argv[4]=='health_json'
+            executions[eid]={'report':{'expectation_id':argv[7],'ok':not failed,'status':503 if failed else int(argv[6])},'exit':1 if failed else 0}
+            return httpx.Response(201,json={'Id':eid})
+        if path.endswith('/start') and '/exec/' in path:
+            eid=path.split('/exec/',1)[1].removesuffix('/start'); raw=json_bytes(executions[eid]['report'])
+            return httpx.Response(200,content=bytes([1,0,0,0])+len(raw).to_bytes(4,'big')+raw)
+        if path.endswith('/json') and '/exec/' in path:
+            eid=path.split('/exec/',1)[1].removesuffix('/json')
+            return httpx.Response(200,json={'ID':eid,'Running':False,'ExitCode':executions[eid]['exit']})
+        raise AssertionError('unexpected synthetic route '+path)
+    backend._client.close(); backend._client=httpx.Client(transport=httpx.MockTransport(handler),base_url='http://docker')
+    backend._client.send = _ORIGINAL_HTTPX_SEND.__get__(backend._client, httpx.Client)
+    backend._using_test_transport=True
+    return posts
+
+
+def test_single_pilot_concrete_resources_four_phases_and_ack_with_synthetic_engine(rig):
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    from tests.test_hub_container_executor_adapter import command
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    params=dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        manifest=adapter.manifest
+        posts=_attach_synthetic_engine(adapter,params)
+        run=str(uuid4())
+        for action, state, health in [('deploy_container','succeeded','unknown'),('smoke_container','failed','unhealthy'),
+                                      ('rollback_container','succeeded','unknown'),('smoke_container_rollback','succeeded','healthy')]:
+            req=command(manifest,action,run_id=run)
+            result=adapter.submit(req)
+            assert (result.state,result.evidence.health)==(state,health), (action,result)
+            assert adapter.ledger.inspect_single_pilot()['state']=='awaiting_ack'
+            acknowledged=adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
+            assert acknowledged.state == state
+        assert len(posts)==2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost', ['submit', 'ack'])
+async def test_concrete_controller_asgi_recovers_lost_response_without_effect_replay(rig, lost):
+    from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
+    from engineering_hub.container_pilot_client import ContainerPilotClient
+    from engineering_hub.pilot_ownership import PilotOwner
+    from engineering_hub.pilot_recovery import PilotRecovery
+    from engineering_hub.repository import HubRepository
+    from hub_container_executor.asgi import create_app
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    class LoseOnce(httpx.AsyncBaseTransport):
+        def __init__(self, app): self.inner=httpx.ASGITransport(app=app); self.lost=False
+        async def handle_async_request(self, request):
+            response=await self.inner.handle_async_request(request)
+            path=request.url.path
+            selected=(lost=='submit' and path=='/v2/container-pilot/commands') or (lost=='ack' and path.endswith('/acknowledge'))
+            if request.method=='POST' and selected and not self.lost:
+                self.lost=True
+                await response.aclose()
+                raise httpx.ReadError('synthetic response loss after server completed',request=request)
+            return response
+        async def aclose(self): await self.inner.aclose()
+    params=dict(rig.params,single_pilot_protocol=True,driver_identity_verifier=Driver())
+    controller_dir=rig.paths['adapter'].parent / 'controller'; controller_dir.mkdir(mode=0o700)
+    db=controller_dir/'hub.sqlite'
+    with module.local_host_adapter_resources(**params) as adapter:
+        posts=_attach_synthetic_engine(adapter,params)
+        app=create_app(adapter,bearer_token='synthetic-only')
+        transport=LoseOnce(app)
+        client=ContainerPilotClient('http://127.0.0.1','synthetic-only',transport=transport,single_pilot_protocol=True)
+        owner=PilotOwner(db,allow_ephemeral_test_storage=True)
+        try:
+            repo=HubRepository(db,execution_principal='executor:container-pilot',pilot_owner=owner)
+            target=ContainerPilotTarget.from_manifest(adapter.manifest)
+            workflow=ContainerPilotWorkflow(repo,client,[target],pilot_owner=owner,single_pilot_protocol=True)
+            task=repo.create_task('human:1234','engineering-hub','Synthetic pilot','synthetic')
+            task=repo.claim_task('codex',task['id'],task['revision'])
+            commit=adapter.manifest.candidate.source_commit
+            task=repo.set_candidate('codex',task['id'],task['revision'],commit)
+            task=repo.review_task('claude',task['id'],task['revision'],commit,'approve')
+            run=workflow.create_run('codex',task['id'],task['revision'],adapter.manifest.candidate.image_config_id,target.target_id)
+            held=await workflow.advance(run['id'])
+            assert held['status']=='held' and transport.lost and len(posts)==1
+        finally:
+            owner.close(); await client.aclose()
+        owner=PilotOwner(db,allow_ephemeral_test_storage=True)
+        client=ContainerPilotClient('http://127.0.0.1','synthetic-only',transport=httpx.ASGITransport(app=app),single_pilot_protocol=True)
+        try:
+            repo=HubRepository(db,execution_principal='executor:container-pilot',pilot_owner=owner)
+            resumed=ContainerPilotWorkflow(repo,client,[target],pilot_owner=owner,single_pilot_protocol=True)
+            recovered=await PilotRecovery(resumed).recover(run['id'])
+            assert recovered['recovery']=='recovered' and recovered['run']['status']=='running'
+            assert len(posts)==1
+            final=await resumed.advance(run['id'])
+            assert final['status']=='rolled_back' and len(posts)==2
+        finally:
+            owner.close(); await client.aclose()

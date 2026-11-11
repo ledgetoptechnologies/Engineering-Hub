@@ -20,6 +20,8 @@ from scripts.inspect_hub_image_identity import IdentityError, strict_json
 MAX_REQUEST_BYTES = 8192
 MAX_RESPONSE_BYTES = 16 * 1024
 COMMANDS = "/v1/container-pilot/commands"
+COMMANDS_V2 = "/v2/container-pilot/commands"
+CAPABILITY_V2 = "/v2/container-pilot/capability"
 CURRENT_OBSERVATION = "/v1/container-pilot/current-observation"
 _COMMAND_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -36,6 +38,10 @@ class PilotASGI:
                 or not math.isfinite(request_body_timeout_seconds)):
             raise ValueError("request body deadline must be finite and in (0, 60] seconds")
         self._adapter = adapter
+        mode = getattr(adapter, '_single_pilot_protocol', False)
+        if type(mode) is not bool:
+            raise ValueError('exact single pilot mode required')
+        self._single_pilot_protocol = mode
         self._authorization = ("Bearer " + bearer_token).encode("ascii")
         self._request_body_timeout_seconds = float(request_body_timeout_seconds)
         self._pid = os.getpid()
@@ -69,11 +75,72 @@ class PilotASGI:
             await self._error(send, 401, "unauthorized")
             return
 
+        # Versioned effect routes enforce compatibility on every request,
+        # not merely on a separate capability probe. They do not attest daemon
+        # generation or protect against a rogue peer holding the bearer.
+        if method == 'GET' and path == CAPABILITY_V2 and self._single_pilot_protocol:
+            try:
+                body = await self._read_body(receive, headers, allow_missing_length=True)
+                if body:
+                    raise ValueError()
+            except (TimeoutError, OverflowError, ValueError):
+                await self._error(send, 400, 'invalid_payload'); return
+            raw = b'{"protocol":"single-pilot-v2"}'
+            await send({'type':'http.response.start','status':200,'headers':[
+                (b'content-type',b'application/json'),(b'content-length',str(len(raw)).encode()),
+                (b'cache-control',b'no-store')]})
+            await send({'type':'http.response.body','body':raw})
+            return
+        if path == COMMANDS or path.startswith(COMMANDS + '/'):
+            if self._single_pilot_protocol:
+                await self._error(send, 404, 'command_not_found'); return
+        elif path == COMMANDS_V2 or path.startswith(COMMANDS_V2 + '/'):
+            if not self._single_pilot_protocol:
+                await self._error(send, 404, 'command_not_found'); return
+            path = COMMANDS + path[len(COMMANDS_V2):]
+
         if method == 'POST' and path == CURRENT_OBSERVATION and self._observe_current is not None:
             await self._observation(receive, send, headers)
             return
         if method == "POST" and path == COMMANDS:
             await self._submit(receive, send, headers)
+            return
+        suffix = '/acknowledge'
+        if method == 'POST' and path.startswith(COMMANDS + '/') and path.endswith(suffix):
+            command_id = path[len(COMMANDS) + 1:-len(suffix)]
+            if not self._valid_id(command_id):
+                await self._error(send, 400, 'invalid_payload')
+                return
+            content_types = [value for key, value in headers if key.lower() == b'content-type']
+            if len(content_types) != 1 or content_types[0].split(b';', 1)[0].strip().lower() != b'application/json':
+                await self._error(send, 400, 'invalid_payload')
+                return
+            try:
+                raw = await self._read_body(receive, headers, allow_missing_length=False)
+                data = strict_json(raw)
+                if type(data) is not dict or set(data) != {'request','outcome_digest'}:
+                    raise ValueError()
+                request = ContainerPilotRequest.model_validate(data['request'])
+                digest = data['outcome_digest']
+                if request.command_id != command_id or type(digest) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+                    raise ValueError()
+            except TimeoutError:
+                await self._error(send, 408, 'request_timeout'); return
+            except OverflowError:
+                await self._error(send, 413, 'invalid_payload'); return
+            except (IdentityError, ValueError, TypeError, UnicodeError, RecursionError):
+                await self._error(send, 400, 'invalid_payload'); return
+            try:
+                accepted, response = await self._invoke(send,
+                    lambda args: self._adapter.acknowledge_single_pilot(*args), (request,digest))
+            except Exception:
+                await self._error(send, 409, 'acknowledgment_unavailable'); return
+            if not accepted:
+                return
+            if response is None:
+                await self._error(send, 409, 'acknowledgment_unavailable')
+            else:
+                await self._response(send, 200, response)
             return
         if method == "GET" and path.startswith(COMMANDS + "/"):
             command_id = path[len(COMMANDS) + 1:]

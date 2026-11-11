@@ -12,7 +12,7 @@ import sqlite3
 import uuid
 from pathlib import Path
 
-from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse
+from .container_pilot_client import ContainerPilotClient, ContainerPilotRequest, ContainerPilotResponse, single_pilot_outcome_digest
 from .container_pilot_manifest import PilotManifest
 from .repository import HubError
 from .pilot_ownership import PilotOwner
@@ -130,7 +130,15 @@ class ContainerPilotWorkflow:
         except Exception:
             raise HubError('container_pilot_ownership_unavailable', 409) from None
 
-    def __init__(self, repo, client, targets, *, pilot_owner=None):
+    def __init__(self, repo, client, targets, *, pilot_owner=None, single_pilot_protocol=False):
+        if type(single_pilot_protocol) is not bool:
+            raise ValueError('single_pilot_protocol_requires_boolean')
+        client_mode = getattr(client, 'single_pilot_protocol', False)
+        if type(client_mode) is not bool or client_mode is not single_pilot_protocol:
+            raise ValueError('single_pilot_client_mode_mismatch')
+        if single_pilot_protocol and not callable(getattr(client, 'acknowledge_command', None)):
+            raise ValueError('single_pilot_ack_client_required')
+        self.single_pilot_protocol = single_pilot_protocol
         if repo.execution_principal is None:
             raise ValueError('execution_identity_required')
         if not isinstance(targets, (list, tuple)) or any(type(t) is not ContainerPilotTarget for t in targets):
@@ -164,6 +172,18 @@ class ContainerPilotWorkflow:
             for statement in statements:
                 self._assert_pilot_owner()
                 db.execute(statement)
+            marker_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_single_pilot_protocol'").fetchone()
+            if marker_table:
+                row = db.execute('SELECT mode FROM hub_single_pilot_protocol WHERE id=1').fetchone()
+                if row is None or row[0] != 'v1' or not single_pilot_protocol:
+                    raise ValueError('single_pilot_protocol_required')
+            elif single_pilot_protocol:
+                if db.execute('SELECT 1 FROM hub_container_pilot_commands LIMIT 1').fetchone():
+                    raise ValueError('fresh_single_pilot_controller_required')
+                db.execute('CREATE TABLE hub_single_pilot_protocol (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL)')
+                db.execute("INSERT INTO hub_single_pilot_protocol VALUES(1,'v1')")
+            if single_pilot_protocol:
+                db.execute('CREATE TABLE IF NOT EXISTS hub_single_pilot_ack_receipts (run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL, outcome_digest TEXT NOT NULL, PRIMARY KEY(run_id,action))')
             columns = {row[1] for row in db.execute('PRAGMA table_info(hub_container_pilot_commands)')}
             if 'response_json' not in columns:
                 # Preserve legacy unknown/held reservations; never reconstruct
@@ -283,6 +303,49 @@ class ContainerPilotWorkflow:
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
 
+    @staticmethod
+    def _store_ack_receipt(db, run_id, action, payload, digest):
+        db.execute('INSERT OR IGNORE INTO hub_single_pilot_ack_receipts VALUES(?,?,?,?)', (run_id,action,payload,digest))
+        row = db.execute('SELECT payload,outcome_digest FROM hub_single_pilot_ack_receipts WHERE run_id=? AND action=?', (run_id,action)).fetchone()
+        if row is None or tuple(row) != (payload,digest):
+            raise ValueError('single pilot acknowledgment receipt conflict')
+
+    async def _ack_retained(self, run, target, action, command, *, finalize=True):
+        """Retry only the exact idempotent ACK; never resubmit an effect."""
+        with self.repo._connection() as db:
+            row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                             (run['id'], action)).fetchone()
+        if row is None or row['state'] != 'ack_pending':
+            return None
+        canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if row['payload'] != canonical or row['response_json'] is None:
+            return 'held'
+        try:
+            response = self._validated_response(ContainerPilotResponse.model_validate_json(row['response_json']))
+            state = self._verified_state(response, command, target)
+            if (state not in {'succeeded','failed'} or (state == 'failed' and
+                    (response.reason != 'health_failed' or response.evidence.health != 'unhealthy'
+                     or response.evidence.evidence_verified is not True))):
+                return 'held'
+            digest = single_pilot_outcome_digest(response)
+            self._assert_pilot_owner()
+            acknowledgment = self._validated_response(await self.client.acknowledge_command(command,digest))
+            if single_pilot_outcome_digest(acknowledgment) != digest:
+                return 'held'
+            self._assert_pilot_owner()
+            if not finalize:
+                return state
+            with self.repo._transaction() as db:
+                self._assert_pilot_owner()
+                updated = db.execute("UPDATE hub_container_pilot_commands SET state=? WHERE run_id=? AND action=? AND state='ack_pending' AND payload=? AND response_json=?",
+                    (state,run['id'],action,canonical,row['response_json']))
+                if updated.rowcount != 1:
+                    return 'held'
+                self._store_ack_receipt(db, run['id'], action, canonical, digest)
+            return state
+        except Exception:
+            return 'held'
+
     async def _command(self, run, target, action):
         bridge = getattr(self.repo, '_queued_pilot', None)
         if bridge is not None and bridge.async_admission_required:
@@ -291,6 +354,10 @@ class ContainerPilotWorkflow:
         self.repo._assert_queued_pilot('command', run_id=run['id'], action=action)
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if self.single_pilot_protocol:
+            pending = await self._ack_retained(run, target, action, command)
+            if pending is not None:
+                return pending
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
             row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?', (run['id'], action)).fetchone()
@@ -314,10 +381,17 @@ class ContainerPilotWorkflow:
         except Exception:
             state = 'held'  # No endpoint, credential or exception output retained.
         self._assert_pilot_owner()
+        if self.single_pilot_protocol and state in {'succeeded','failed'}:
+            if state == 'failed' and (response.reason != 'health_failed' or response.evidence.health != 'unhealthy' or response.evidence.evidence_verified is not True):
+                state = 'held'
+            else:
+                state = 'ack_pending'
         with self.repo._transaction() as db:
             self._assert_pilot_owner()
             db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                        (state, response_json, run['id'], action))
+        if self.single_pilot_protocol and state == 'ack_pending':
+            return await self._ack_retained(run, target, action, command) or 'held'
         return state
 
     async def _command_with_preparation(self, run, target, action, bridge):
@@ -327,6 +401,10 @@ class ContainerPilotWorkflow:
         bridge.command_metadata(run['id'], action)
         command = self._request(run, target, action)
         canonical = json.dumps(command.model_dump(), sort_keys=True, separators=(',', ':'))
+        if self.single_pilot_protocol:
+            pending = await self._ack_retained(run, target, action, command)
+            if pending is not None:
+                return pending
         with self.repo._connection() as db:
             row = db.execute('SELECT payload,state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
                              (run['id'], action)).fetchone()
@@ -363,10 +441,17 @@ class ContainerPilotWorkflow:
             except Exception:
                 state = 'held'
             self._assert_pilot_owner()
+            if self.single_pilot_protocol and state in {'succeeded','failed'}:
+                if state == 'failed' and (response.reason != 'health_failed' or response.evidence.health != 'unhealthy' or response.evidence.evidence_verified is not True):
+                    state = 'held'
+                else:
+                    state = 'ack_pending'
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
                 db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=?',
                            (state, response_json, run['id'], action))
+            if self.single_pilot_protocol and state == 'ack_pending':
+                return await self._ack_retained(run, target, action, command) or 'held'
             return state
         # The retained child owns both accepted I/O and its evidence write. It
         # does not inherit permission for another command or queue admission.

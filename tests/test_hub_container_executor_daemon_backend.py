@@ -1754,3 +1754,90 @@ def test_adapter_holds_lost_create_response_and_reconcile_does_not_repeat_effect
     finally:
         adapter.close()
         driver.close()
+
+
+def test_adapter_with_v2_journal_holds_before_create_and_cannot_replay(tmp_path, monkeypatch):
+    from tests.test_hub_container_executor_adapter import command, make_fixture
+
+    adapter, _placeholder_backend, _state, manifest = make_fixture(tmp_path)
+    images = {role: adapter._verified_image(role) for role in ("candidate", "rollback")}
+    image_by_ref = {image.runnable_reference: image for image in images.values()}
+    blobs_by_id = dict(adapter.metadata_store.values)
+    secrets = dict(adapter.secret_resolver.values)
+    baseline = adapter.baseline_provider.baseline
+    baseline_path = safe_generation(tmp_path, baseline.state_generation_id)
+    safe_generation(tmp_path, "candidate-g1")
+    rollback = images["rollback"]
+    defaults = adapter._defaults_from_record(rollback)
+    baseline_profile = adapter._profile(rollback, defaults,
+                                        baseline.state_generation_id, secrets)
+    baseline_observation = container_inspect(
+        rollback, baseline_profile, baseline_path, baseline.container_id, "running"
+    )
+    requests = []
+    create_posts = 0
+
+    def engine_handler(request):
+        nonlocal create_posts
+        path = request.url.raw_path.decode("ascii").split("?", 1)[0]
+        requests.append((request.method, path))
+        if path.endswith("/info"):
+            return httpx.Response(200, json={"ID": manifest.runner_binding.daemon_identity,
+                                             "OSType": "linux", "Architecture": "amd64"})
+        if "/images/" in path and path.endswith("/json"):
+            image = next(value for reference, value in image_by_ref.items()
+                         if reference.replace(":", "%3A") in path)
+            return httpx.Response(200, json=docker_config(image))
+        if "/images/" in path and path.endswith("/get"):
+            image = next(value for reference, value in image_by_ref.items()
+                         if reference.replace(":", "%3A") in path)
+            return httpx.Response(200, content=oci_archive(image, blobs_by_id))
+        if path.endswith("/containers/" + baseline.container_id + "/json"):
+            return httpx.Response(200, json=baseline_observation)
+        if "/containers/" in path and path.endswith("/json"):
+            return httpx.Response(404, json={"message": "absent"})
+        if path.endswith("/containers/create"):
+            create_posts += 1
+            raise httpx.ReadTimeout("synthetic create response loss")
+        raise AssertionError(f"unexpected fake route {request.method} {path}")
+
+    from hub_container_executor.operation_journal import OperationJournalError, SQLiteOperationJournal
+    journal_dir = tmp_path / 'effect-journal'
+    journal_dir.mkdir(mode=0o700)
+    journal = SQLiteOperationJournal(journal_dir / 'operations.sqlite', create=True,
+                                     allow_ephemeral_test_storage=True)
+    journal.enable_bindings()
+    attempts = []
+    errors = []
+    real_begin = journal.begin
+    def observe_unbound_begin(operation_id, kind):
+        attempts.append((operation_id, kind))
+        try:
+            return real_begin(operation_id, kind)
+        except OperationJournalError as error:
+            errors.append((type(error), str(error)))
+            raise
+    monkeypatch.setattr(journal, 'begin', observe_unbound_begin)
+    driver = DockerEngineBackend(
+        binding(manifest, tmp_path), operation_journal=journal,
+        test_transport=httpx.MockTransport(engine_handler)
+    )
+    adapter.backend = driver
+    request = command(manifest, "deploy_container")
+    try:
+        response = adapter.submit(request)
+        assert response.state == "held" and response.reason == "inspect_required"
+        assert create_posts == 0
+        assert len(attempts) == 1 and attempts[0][1] == 'create_candidate'
+        assert errors == [(OperationJournalError, 'Unbound intents disabled after binding migration')]
+        assert journal.inspect(attempts[0][0]) is None
+        reconciled = adapter.reconcile(request.command_id)
+        assert reconciled.state == "held"
+        assert create_posts == 0
+        assert len(attempts) == 1
+        assert not any(path.endswith("/start") or path.endswith("/exec")
+                       for _, path in requests)
+    finally:
+        adapter.close()
+        driver.close()
+        journal.close()

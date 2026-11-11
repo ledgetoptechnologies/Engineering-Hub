@@ -831,3 +831,50 @@ async def test_changed_runtime_policy_has_new_digest_and_cannot_advance_old_run(
         rows = db.execute('SELECT manifest_digest,binding FROM hub_container_pilot_manifest_views').fetchall()
     assert {row['manifest_digest'] for row in rows} == {MANIFEST, changed_target.manifest_digest}
     assert json.loads(next(row['binding'] for row in rows if row['manifest_digest'] == MANIFEST))['canonical_manifest'] == target.canonical_manifest
+
+
+@pytest.mark.asyncio
+async def test_single_pilot_controller_durably_retries_only_ack_after_lost_reply(repo, target):
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    class AckClient(FakeClient):
+        single_pilot_protocol = True
+        def __init__(self):
+            super().__init__(); self.acks=[]; self.lose=True
+        async def acknowledge_command(self, command, digest):
+            with repo._connection() as db:
+                row=db.execute('SELECT state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                               (command.run_id,command.action)).fetchone()
+            assert row['state'] == 'ack_pending' and row['response_json']
+            self.acks.append((command,digest))
+            if self.lose:
+                self.lose=False
+                raise TimeoutError('synthetic lost acknowledgement')
+            response=self.response(command).model_copy(update={'replayed':True})
+            assert digest == single_pilot_outcome_digest(response)
+            return response
+    client=AckClient()
+    workflow=ContainerPilotWorkflow(repo,client,[target],single_pilot_protocol=True)
+    task=reviewed_task(repo)
+    run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,target.target_id)
+    assert await workflow._command(run,target,'deploy_container') == 'held'
+    assert len(client.submissions)==1 and len(client.acks)==1
+    reopened=ContainerPilotWorkflow(repo,client,[target],single_pilot_protocol=True)
+    assert await reopened._command(run,target,'deploy_container') == 'succeeded'
+    assert len(client.submissions)==1 and len(client.acks)==2
+    assert client.acks[0] == client.acks[1]
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
+        ContainerPilotWorkflow(repo,client,[target])
+
+
+def test_controller_refuses_both_client_protocol_mismatches_before_any_submit(repo,target):
+    legacy=FakeClient()
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
+        ContainerPilotWorkflow(repo,legacy,[target],single_pilot_protocol=True)
+    assert legacy.submissions == []
+    class V2(FakeClient):
+        single_pilot_protocol=True
+        async def acknowledge_command(self,command,digest): raise AssertionError('no effects')
+    modern=V2()
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
+        ContainerPilotWorkflow(repo,modern,[target])
+    assert modern.submissions == []

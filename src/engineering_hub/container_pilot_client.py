@@ -7,6 +7,7 @@ evidence is a typed adapter assertion, not independent proof of Docker effects.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import ssl
@@ -65,6 +66,16 @@ class ContainerPilotResponse(ContainerPilotRequest):
     replayed: bool
 
 
+def single_pilot_outcome_digest(outcome: ContainerPilotResponse) -> str:
+    """Canonical outcome identity; only the transport replay marker is ignored."""
+    if type(outcome) is not ContainerPilotResponse:
+        raise TypeError('exact pilot outcome required')
+    original = outcome.model_copy(update={'replayed':False})
+    raw = json.dumps(original.model_dump(mode='json'), sort_keys=True, separators=(',', ':'),
+                     ensure_ascii=False, allow_nan=False).encode('utf-8')
+    return 'sha256:' + hashlib.sha256(raw).hexdigest()
+
+
 class ContainerPilotClientError(Exception):
     """Safe public error without endpoint, response or credential reflection."""
 
@@ -114,7 +125,11 @@ class ContainerPilotClient:
     MAX_TIMEOUT_SECONDS = 125.0
 
     def __init__(self, base_url: str, service_token: str, *, timeout_seconds: float = 125.0,
-                 transport: httpx.AsyncBaseTransport | None = None):
+                 transport: httpx.AsyncBaseTransport | None = None, single_pilot_protocol: bool = False):
+        if type(single_pilot_protocol) is not bool:
+            raise ValueError('single pilot protocol must be boolean')
+        self.__single_pilot_protocol = single_pilot_protocol
+        self.__commands_path = '/v2/container-pilot/commands' if single_pilot_protocol else '/v1/container-pilot/commands'
         if (not isinstance(base_url, str) or "\\" in base_url
                 or any(ord(character) <= 32 or ord(character) == 127 for character in base_url)):
             raise ValueError("invalid container pilot origin")
@@ -140,7 +155,7 @@ class ContainerPilotClient:
         )
 
     @classmethod
-    def for_verified_https(cls, origin, service_token, ca_pem, *, timeout_seconds=125.0):
+    def for_verified_https(cls, origin, service_token, ca_pem, *, timeout_seconds=125.0, single_pilot_protocol=False):
         """Inert dedicated HTTPS client using only explicitly captured CA bytes.
 
         No environment CA/proxy/key-log discovery, redirects or transport retries.
@@ -169,10 +184,11 @@ class ContainerPilotClient:
         except Exception:
             raise ValueError('Invalid verified executor HTTPS configuration') from None
         transport = httpx.AsyncHTTPTransport(verify=context, trust_env=False, retries=0)
-        return cls(origin, service_token, timeout_seconds=timeout_seconds, transport=transport)
+        return cls(origin, service_token, timeout_seconds=timeout_seconds, transport=transport,
+                   single_pilot_protocol=single_pilot_protocol)
 
     @classmethod
-    def for_private_unix(cls, path, service_token, *, timeout_seconds=125.0):
+    def for_private_unix(cls, path, service_token, *, timeout_seconds=125.0, single_pilot_protocol=False):
         """Create an inert dedicated Linux UDS client; caller owns ``aclose``.
 
         Requires a current-UID mode0700 parent, mode0600 socket and trusted
@@ -197,7 +213,8 @@ class ContainerPilotClient:
             _socket_entry(target, fd, entry)
             transport = httpx.AsyncHTTPTransport(uds=str(target), retries=0, trust_env=False)
             return cls("http://127.0.0.1", service_token,
-                       timeout_seconds=timeout_seconds, transport=transport)
+                       timeout_seconds=timeout_seconds, transport=transport,
+                       single_pilot_protocol=single_pilot_protocol)
         except Exception:
             raise ValueError("invalid private container pilot socket") from None
         finally:
@@ -206,6 +223,11 @@ class ContainerPilotClient:
 
     def __repr__(self):
         return "ContainerPilotClient(credential=<redacted>)"
+
+    @property
+    def single_pilot_protocol(self) -> bool:
+        """Construction-time protocol selection; not a peer identity claim."""
+        return self.__single_pilot_protocol
 
     @property
     def timeout_seconds(self) -> float:
@@ -223,10 +245,12 @@ class ContainerPilotClient:
         await self.__client.aclose()
 
     async def _command(self, method: str, path: str, expected: ContainerPilotRequest,
-                       *, submit: bool = False) -> ContainerPilotResponse:
+                       *, submit: bool = False, acknowledgment: str | None = None) -> ContainerPilotResponse:
         if type(expected) is not ContainerPilotRequest:
             raise TypeError("expected a container pilot request")
-        kwargs = {"json": expected.model_dump()} if submit else {}
+        kwargs = ({"json": expected.model_dump()} if submit else
+                  {"json": {'request': expected.model_dump(), 'outcome_digest': acknowledgment}}
+                  if acknowledgment is not None else {})
         try:
             # HTTPX read timeouts bound each chunk; this also bounds a slow-drip
             # response across the complete operation, not just idle periods.
@@ -268,7 +292,7 @@ class ContainerPilotClient:
                 raise ValueError()
         except (ValueError, AttributeError, TypeError):
             raise ValueError("invalid connection probe identity") from None
-        path = "/v1/container-pilot/commands/" + command_id
+        path = self.__commands_path + "/" + command_id
         results = []
         try:
             async with asyncio.timeout(min(10.0, self.__timeout_seconds)):
@@ -316,12 +340,39 @@ class ContainerPilotClient:
                 "agent_token_reuse_checked": False, "executor_provenance_verified": False,
                 "idle_verified": False, "workflow_verified": False}
 
+    async def _require_single_pilot_capability(self, command_id: str) -> None:
+        """Bearer-authenticated format check, not peer or daemon attestation."""
+        try:
+            async with asyncio.timeout(min(10.0, self.__timeout_seconds)):
+                async with self.__client.stream('GET', '/v2/container-pilot/capability') as response:
+                    if response.status_code != 200:
+                        raise ValueError()
+                    raw = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(raw) + len(chunk) > 512:
+                            raise ValueError()
+                        raw.extend(chunk)
+            value = json.loads(bytes(raw).decode('utf-8'), object_pairs_hook=_unique_object,
+                               parse_constant=_reject_constant)
+            if value != {'protocol':'single-pilot-v2'}:
+                raise ValueError()
+        except Exception:
+            raise HeldProtocolError(command_id) from None
+
     async def submit_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
-        return await self._command("POST", "/v1/container-pilot/commands", command, submit=True)
+        if self.__single_pilot_protocol:
+            await self._require_single_pilot_capability(command.command_id)
+        return await self._command('POST', self.__commands_path, command, submit=True)
 
     async def get_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
-        return await self._command("GET", f"/v1/container-pilot/commands/{command.command_id}", command)
+        return await self._command('GET', f'{self.__commands_path}/{command.command_id}', command)
+
+    async def acknowledge_command(self, command: ContainerPilotRequest, outcome_digest: str) -> ContainerPilotResponse:
+        if not self.__single_pilot_protocol or type(outcome_digest) is not str or not __import__('re').fullmatch(r'sha256:[a-f0-9]{64}', outcome_digest):
+            raise ValueError('single pilot outcome digest required')
+        return await self._command('POST', f'{self.__commands_path}/{command.command_id}/acknowledge',
+                                   command, acknowledgment=outcome_digest)
 
     async def reconcile_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
         """Bodyless inspection only; never restart an exited workload or replay an effect."""
-        return await self._command("POST", f"/v1/container-pilot/commands/{command.command_id}/reconcile", command)
+        return await self._command("POST", f"{self.__commands_path}/{command.command_id}/reconcile", command)
