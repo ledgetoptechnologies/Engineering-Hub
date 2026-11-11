@@ -65,7 +65,7 @@ for token in (None, 'synthetic-invalid-token'):
     assert request(8770, '/api/hub/v1/overview', headers=headers)[0] == 401
 
 expected_tools = {'hub_overview', 'hub_task_get', 'hub_task_claim', 'hub_task_candidate',
-                  'hub_task_review', 'hub_decision_request', 'hub_run_list',
+                  'hub_task_review', 'hub_decision_request', 'hub_decision_get', 'hub_run_list',
                   'hub_topic_peers', 'hub_topic_preflight', 'hub_staging_task_propose',
                   'hub_planning_list', 'hub_planning_get', 'hub_planning_put',
                   'hub_label_set_create', 'hub_label_set_put_image', 'hub_label_set_results',

@@ -55,7 +55,7 @@ BUS = {'send_message','get_send_receipt','presence_status','receive_messages','w
  'knowledge_list','knowledge_search','semantic_search','semantic_status','file_put','file_get',
  'file_list','file_history','feedback_submit','feedback_get','feedback_list','feedback_update','bus_info'}
 HUB = {'hub_overview','hub_task_get','hub_task_claim','hub_task_candidate','hub_task_review',
- 'hub_decision_request','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose',
+ 'hub_decision_request', 'hub_decision_get','hub_run_list','hub_topic_peers','hub_topic_preflight','hub_staging_task_propose',
  'hub_planning_list','hub_planning_get','hub_planning_put',
  'hub_label_set_create','hub_label_set_put_image','hub_label_set_results',
  'hub_label_set_list','hub_entity_put_image','hub_entity_images','hub_entity_withdraw',
