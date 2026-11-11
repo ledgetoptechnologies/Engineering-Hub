@@ -455,6 +455,7 @@ def _attach_synthetic_engine(adapter, params):
     def handler(request):
         nonlocal counter
         path=request.url.raw_path.decode('ascii').split('?',1)[0]
+        if request.method == 'POST': posts.append(path)
         if path.endswith('/info'):
             return httpx.Response(200,json={'ID':manifest.runner_binding.daemon_identity,'OSType':'linux','Architecture':'amd64'})
         if '/images/' in path and path.endswith('/json'):
@@ -467,7 +468,7 @@ def _attach_synthetic_engine(adapter, params):
             cid=path.split('/containers/',1)[1].removesuffix('/json')
             return httpx.Response(200,json=containers[cid]) if cid in containers else httpx.Response(404,json={'message':'absent'})
         if path.endswith('/containers/create'):
-            posts.append(path); body=json.loads(request.content); image=image_by_ref[body['Image']]
+            body=json.loads(request.content); image=image_by_ref[body['Image']]
             cid='d'*64 if image.role=='candidate' else 'e'*64
             source=body['HostConfig']['Mounts'][0]['Source']; generation=source.rsplit('/',1)[1]
             active=adapter._profile(image,adapter._defaults_from_record(image),generation,secrets)
@@ -512,7 +513,7 @@ def test_single_pilot_concrete_resources_four_phases_and_ack_with_synthetic_engi
             assert adapter.ledger.inspect_single_pilot()['state']=='awaiting_ack'
             acknowledged=adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
             assert acknowledged.state == state
-        assert len(posts)==2
+        assert sum(path.endswith('/containers/create') for path in posts)==2
 
 
 @pytest.mark.asyncio
@@ -558,7 +559,9 @@ async def test_concrete_controller_asgi_recovers_lost_response_without_effect_re
             task=repo.review_task('claude',task['id'],task['revision'],commit,'approve')
             run=workflow.create_run('codex',task['id'],task['revision'],adapter.manifest.candidate.image_config_id,target.target_id)
             held=await workflow.advance(run['id'])
-            assert held['status']=='held' and transport.lost and len(posts)==1
+            assert held['status']=='held' and transport.lost
+            assert sum(path.endswith('/containers/create') for path in posts)==1
+            before_recovery = tuple(posts)
         finally:
             owner.close(); await client.aclose()
         owner=PilotOwner(db,allow_ephemeral_test_storage=True)
@@ -568,8 +571,9 @@ async def test_concrete_controller_asgi_recovers_lost_response_without_effect_re
             resumed=ContainerPilotWorkflow(repo,client,[target],pilot_owner=owner,single_pilot_protocol=True)
             recovered=await PilotRecovery(resumed).recover(run['id'])
             assert recovered['recovery']=='recovered' and recovered['run']['status']=='running'
-            assert len(posts)==1
+            assert tuple(posts) == before_recovery  # no create/start/exec effect during recovery
             final=await resumed.advance(run['id'])
-            assert final['status']=='rolled_back' and len(posts)==2
+            assert final['status']=='rolled_back'
+            assert sum(path.endswith('/containers/create') for path in posts)==2
         finally:
             owner.close(); await client.aclose()

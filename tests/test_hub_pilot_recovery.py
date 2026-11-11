@@ -441,3 +441,41 @@ async def test_single_pilot_recovery_never_finalizes_uncertain_ack(rig):
             assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=?',(run['id'],)).fetchone() is None
     finally:
         owner.close()
+
+
+@pytest.mark.asyncio
+async def test_single_pilot_pause_arriving_during_ack_keeps_local_pending_until_unpaused(rig):
+    class PauseClient(RecoveryClient):
+        single_pilot_protocol=True
+        def __init__(self):
+            super().__init__(); self.first=True; self.pause_repo=None; self.acks=0
+        async def acknowledge_command(self, command, digest):
+            self.acks+=1
+            if self.first:
+                self.first=False
+                raise TimeoutError('synthetic initial lost ack')
+            if self.pause_repo is not None:
+                self.pause_repo.set_pause('human:1234',True); self.pause_repo=None
+            return self.response(command)
+    client=PauseClient(); initial=rig.restart(client,single_pilot_protocol=True)
+    task=reviewed_task(initial.repo)
+    run=initial.workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    assert (await initial.workflow.advance(run['id']))['status']=='held'
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        recovery=PilotRecovery(resumed); client.pause_repo=repo
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='paused' and result['run']['status']=='held'
+        with repo._connection() as db:
+            assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                              (run['id'],'deploy_container')).fetchone()['state']=='ack_pending'
+            assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=?',(run['id'],)).fetchone() is None
+        repo.set_pause('human:1234',False)
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='recovered' and result['run']['status']=='running'
+        assert len(client.submissions)==1 and client.acks==3
+    finally:
+        owner.close()
