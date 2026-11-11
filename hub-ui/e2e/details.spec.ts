@@ -101,6 +101,23 @@ test("a typed answer is sent as the answer with CSRF and the current revision", 
     answer: "Run the NAS fixture first, then inspect the disk on Friday." } });
 });
 
+test("a typed answer box sits above the footer instead of under it", async ({ page }) => {
+  await fixture(page, (overview) => { overview.decisions[0].allow_text = true; });
+  await page.goto("/#/inbox");
+  const card = page.locator("form.decision").first();
+  const own = card.locator(".free-answer > .radio-option");
+  await own.getByRole("radio").check();
+  const input = card.getByRole("textbox", { name: "Your answer" });
+  await input.fill("approve plan");
+  const footer = card.locator(".decision-footer");
+  const [ownBox, inputBox, footerBox] = await Promise.all([own.boundingBox(), input.boundingBox(), footer.boundingBox()]);
+  if (!ownBox || !inputBox || !footerBox) throw new Error("decision layout is not rendered");
+  // The option stays one line tall, and the box and its counter end before the footer begins.
+  expect(ownBox.y + ownBox.height).toBeLessThanOrEqual(inputBox.y);
+  const counter = await card.locator(".free-answer small").boundingBox();
+  expect((counter ?? inputBox).y + (counter ?? inputBox).height).toBeLessThanOrEqual(footerBox.y);
+});
+
 test("closing an attached image never records a selected decision", async ({ page }) => {
   const { state } = await fixture(page, withDetails);
   state.attachments[DECISION_IDS[0]] = [IMAGE];
