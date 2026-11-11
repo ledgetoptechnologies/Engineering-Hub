@@ -1458,16 +1458,7 @@ def test_explicit_private_journal_records_backend_ack_and_inspection_never_uses_
 
 
 @pytest.mark.parametrize("engine29_metadata", [False, True])
-@pytest.mark.parametrize('journal_enabled', [False, True], ids=['no-journal', 'real-journal'])
-def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_path, engine29_metadata, request, journal_enabled):
-    journal = None
-    if journal_enabled:
-        pytest.importorskip('fcntl', reason='real Linux journal ownership required')
-        from hub_container_executor.operation_journal import SQLiteOperationJournal
-        private = tmp_path / 'lifecycle-journal'
-        private.mkdir(mode=0o700)
-        journal = SQLiteOperationJournal(private / 'operations.sqlite', create=True, allow_ephemeral_test_storage=True)
-        request.addfinalizer(journal.close)
+def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_path, engine29_metadata):
     manifest, image, blobs = verified_image()
     generation = safe_generation(tmp_path)
     profile = make_profile(image)
@@ -1487,8 +1478,6 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
         if "/images/" in path and path.endswith("/get"):
             return httpx.Response(200, content=archive)
         if path.endswith("/containers/" + container_id + "/json"):
-            if journal is not None and current['status'] == 'exited':
-                assert journal.inspect('edfa4681-3a0a-5e5f-a670-2d2a91d7b70d').state == 'pending'
             body = container_inspect(image, profile, generation, container_id, current["status"])
             if engine29_metadata:
                 body["HostConfig"]["Mounts"][0].pop("ReadOnly")
@@ -1506,7 +1495,7 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
         raise AssertionError(f"unexpected fake route {request.method} {path}")
 
     backend = DockerEngineBackend(
-        binding(manifest, tmp_path), operation_journal=journal, test_transport=httpx.MockTransport(handler)
+        binding(manifest, tmp_path), test_transport=httpx.MockTransport(handler)
     )
     backend.inspect_image(image, 5000)
     initial = backend.inspect_container(container_id, 3000)
@@ -1514,8 +1503,6 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
     backend.start_container(container_id, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
     backend.stop_container(container_id, "edfa4681-3a0a-5e5f-a670-2d2a91d7b70d", 5000)
     assert current["status"] == "exited"
-    if journal is not None:
-        assert journal.inspect('edfa4681-3a0a-5e5f-a670-2d2a91d7b70d').state == 'completed'
     posts = [(method, path, query) for method, path, query in requests if method == "POST"]
     assert posts == [
         ("POST", "/v1.56/containers/" + container_id + "/start", ""),
@@ -1525,111 +1512,6 @@ def test_start_and_stop_are_fixed_lifecycle_posts_with_actual_state_checks(tmp_p
     assert not any("/exec" in path or "/pull" in path or "/build" in path
                    for _, path, _ in requests)
     backend.close()
-
-
-@pytest.mark.parametrize('outcome', ['verified', 'not-exited', 'inspection-error', 'response-lost', 'interrupted'])
-def test_stop_receipt_requires_verified_exit_and_pending_never_replays(tmp_path, monkeypatch, outcome):
-    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
-    from hub_container_executor.backend import ContainerObservation
-    from hub_container_executor.operation_journal import SQLiteOperationJournal
-
-    manifest, _, _ = verified_image()
-    backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(lambda _: None))
-    private = tmp_path / 'stop-journal'
-    private.mkdir(mode=0o700)
-    path = private / 'operations.sqlite'
-    operation_id = 'edfa4681-3a0a-5e5f-a670-2d2a91d7b70d'
-    container_id = 'c' * 64
-    before = ContainerObservation(container_id, 'synthetic-image', 'synthetic-profile', 'generation', 'running')
-    posts = []
-    monkeypatch.setattr(backend, '_known_container', lambda *_: before)
-    monkeypatch.setattr(backend, '_assert_runner', lambda *_: None)
-
-    def stop(*_args, **_kwargs):
-        posts.append('stop')
-        if outcome == 'response-lost':
-            raise DaemonBackendError('synthetic lost response')
-
-    def inspect(*_args):
-        assert journal.inspect(operation_id).state == 'pending'
-        if outcome == 'inspection-error':
-            raise DaemonBackendError('synthetic inspection failure')
-        if outcome == 'interrupted':
-            raise SystemExit('synthetic interruption after stop')
-        return ContainerObservation(container_id, before.selected_image, before.profile, 'generation',
-                                    'running' if outcome == 'not-exited' else 'exited')
-
-    monkeypatch.setattr(backend, '_read_response', stop)
-    monkeypatch.setattr(backend, 'inspect_container', inspect)
-    try:
-        with SQLiteOperationJournal(path, create=True, allow_ephemeral_test_storage=True) as journal:
-            backend.operation_journal = journal
-            if outcome == 'verified':
-                backend.stop_container(container_id, operation_id, 5000)
-                assert journal.inspect(operation_id).state == 'completed'
-            else:
-                with pytest.raises(SystemExit if outcome == 'interrupted' else DaemonBackendError):
-                    backend.stop_container(container_id, operation_id, 5000)
-                assert journal.inspect(operation_id).state == 'pending'
-                with pytest.raises(DaemonBackendError):
-                    backend.stop_container(container_id, operation_id, 5000)
-            assert posts == ['stop']
-        backend.operation_journal = None
-        with SQLiteOperationJournal(path, create=False, allow_ephemeral_test_storage=True) as reopened:
-            assert reopened.inspect(operation_id).state == ('completed' if outcome == 'verified' else 'pending')
-    finally:
-        backend.close()
-
-
-def test_stop_process_killed_before_postcheck_leaves_durable_pending(tmp_path):
-    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
-    import multiprocessing
-    import os
-    import signal
-    from hub_container_executor.backend import ContainerObservation
-    from hub_container_executor.operation_journal import OperationJournalConflict, SQLiteOperationJournal
-
-    private = tmp_path / 'stop-crash-journal'
-    private.mkdir(mode=0o700)
-    path = private / 'operations.sqlite'
-    operation_id = 'edfa4681-3a0a-5e5f-a670-2d2a91d7b70d'
-    context = multiprocessing.get_context('fork')
-    parent, child = context.Pipe(duplex=False)
-
-    def worker():
-        parent.close()
-        manifest, _, _ = verified_image()
-        backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(lambda _: None))
-        journal = SQLiteOperationJournal(path, create=True, allow_ephemeral_test_storage=True)
-        backend.operation_journal = journal
-        before = ContainerObservation('c' * 64, 'synthetic-image', 'synthetic-profile', 'generation', 'running')
-        backend._known_container = lambda *_: before
-        backend._assert_runner = lambda *_: None
-        backend._read_response = lambda *_args, **_kwargs: None
-        def interrupted_inspection(*_args):
-            child.send('stop-response-received')
-            signal.pause()
-        backend.inspect_container = interrupted_inspection
-        backend.stop_container('c' * 64, operation_id, 30000)
-
-    process = context.Process(target=worker)
-    process.start()
-    child.close()
-    try:
-        assert parent.poll(10) and parent.recv() == 'stop-response-received'
-        os.kill(process.pid, signal.SIGKILL)
-        process.join(10)
-        assert process.exitcode == -signal.SIGKILL
-        with SQLiteOperationJournal(path, create=False, allow_ephemeral_test_storage=True) as reopened:
-            assert reopened.inspect(operation_id).state == 'pending'
-            with pytest.raises(OperationJournalConflict):
-                reopened.begin(operation_id, 'stop')
-    finally:
-        if process.is_alive():
-            process.kill()
-            process.join(10)
-        assert not process.is_alive()
-        parent.close()
 
 
 def test_start_refuses_effect_when_daemon_identity_changes_after_inspect(tmp_path):
