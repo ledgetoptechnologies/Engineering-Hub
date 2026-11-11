@@ -1,5 +1,6 @@
 """Synthetic harness contracts; no Docker/registry or rollback acceptance claim."""
 import importlib.util
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import subprocess
@@ -17,6 +18,16 @@ helpers = importlib.util.module_from_spec(spec); spec.loader.exec_module(helpers
 BASE, NEW = smoke.PACKAGE + '@sha256:' + 'a'*64, smoke.PACKAGE + '@sha256:' + 'b'*64
 OLD_COMMIT, NEW_COMMIT = '1'*40, '2'*40
 OLD_ID, NEW_ID = 'sha256:'+'c'*64, 'sha256:'+'d'*64
+
+
+@pytest.fixture(autouse=True)
+def mocked_session(monkeypatch):
+    @contextmanager
+    def session(host):
+        assert host == 'unix:///run/test/docker.sock'
+        monkeypatch.setattr(smoke.durable, '_docker', lambda *a, **k: smoke._docker(*a, **k))
+        yield (('/usr/bin/docker', '--host', host), {'PATH': '/usr/bin:/bin', 'DOCKER_CONFIG': '/test'})
+    monkeypatch.setattr(smoke.durable, 'docker_session', session)
 
 
 class Docker(helpers.Docker):
@@ -41,7 +52,7 @@ class Docker(helpers.Docker):
             self.calls.append((args,kwargs))
             return subprocess.CompletedProcess(args,1,stdout='',stderr='Error response from daemon: No such container: '+args[-1]+'\n')
         if args[:2] == ['image', 'inspect']:
-            old = args[-1] == BASE
+            old = args[-1] in (BASE, OLD_ID)
             out = json.dumps(dict({'id': OLD_ID if old else NEW_ID, 'revision': 'f'*40 if self.wrong_commit else
                 OLD_COMMIT if old else NEW_COMMIT, 'user': '568:568', 'digests': [args[-1]]},**self.image_changes))
         elif args[0] == 'create':
@@ -94,7 +105,7 @@ class Docker(helpers.Docker):
 
 def run(monkeypatch, docker, mode='direct'):
     monkeypatch.setattr(smoke, '_docker', docker)
-    return smoke.run_smoke(BASE, OLD_COMMIT, NEW, NEW_COMMIT, rollback_mode=mode)
+    return smoke.run_smoke(BASE, OLD_COMMIT, NEW, NEW_COMMIT, rollback_mode=mode, docker_host='unix:///run/test/docker.sock')
 
 
 def test_direct_candidate_write_survives_old_code_with_normal_exclusive_handoff(monkeypatch):
@@ -183,7 +194,7 @@ def test_restore_helper_unknown_or_failed_terminal_denies_old_writer(monkeypatch
 def test_input_validation_precedes_any_cli(monkeypatch,image,commit):
     cli=lambda *a,**k:pytest.fail('unexpected CLI')
     monkeypatch.setattr(smoke,'_docker',cli)
-    with pytest.raises(ValueError):smoke.run_smoke(image,commit,NEW,NEW_COMMIT)
+    with pytest.raises(ValueError):smoke.run_smoke(image,commit,NEW,NEW_COMMIT, docker_host='unix:///run/test/docker.sock')
 
 
 def test_incorrect_runtime_image_or_swap_denies_profile(monkeypatch):
@@ -237,7 +248,7 @@ def test_first_fixture_failure_has_safe_phase_code_and_no_private_error(monkeypa
             return subprocess.CompletedProcess(args,1,stdout='',stderr='permission denied SECRET_DO_NOT_PUBLISH')
         return docker(args,**kwargs)
     monkeypatch.setattr(smoke,'_docker',failure)
-    result=smoke.run_smoke(BASE,OLD_COMMIT,NEW,NEW_COMMIT)
+    result=smoke.run_smoke(BASE,OLD_COMMIT,NEW,NEW_COMMIT, docker_host='unix:///run/test/docker.sock')
     assert result['failure_phase']=='fixture.volume0.absence'
     assert result['entered_steps']==['baseline.image','candidate.image','fixture.volume0.absence']
     assert result['completed_steps']==['baseline.image','candidate.image']
@@ -251,3 +262,51 @@ def test_missing_inspect_timeout_remains_unknown(monkeypatch):
     monkeypatch.setattr(smoke,'_docker',timeout)
     with pytest.raises(TimeoutError):smoke._volume('hub-rollback-'+'a'*32+'-state','owner',missing_ok=True)
     assert smoke._failure(TimeoutError('private socket path'))=={'error_class':'timeout','error_code':'timeout'}
+
+
+def test_local_image_requires_opt_in_and_exact_id(monkeypatch):
+    with pytest.raises(ValueError):
+        smoke.validate(OLD_ID, OLD_COMMIT)
+    docker = Docker()
+    monkeypatch.setattr(smoke, '_docker', docker)
+    docker.image_changes = {'id': OLD_ID, 'revision': OLD_COMMIT, 'digests': None}
+    assert smoke._image(OLD_ID, OLD_COMMIT, local_images=True) == OLD_ID
+    docker.image_changes['id'] = NEW_ID
+    with pytest.raises(ValueError):
+        smoke._image(OLD_ID, OLD_COMMIT, local_images=True)
+    docker.image_changes.update(id=OLD_ID, user='0:0')
+    with pytest.raises(ValueError):
+        smoke._image(OLD_ID, OLD_COMMIT, local_images=True)
+    docker.image_changes.update(user='568:568', revision=NEW_COMMIT)
+    with pytest.raises(ValueError):
+        smoke._image(OLD_ID, OLD_COMMIT, local_images=True)
+
+
+def test_docker_requires_session_and_passes_bound_prefix_and_environment(monkeypatch):
+    with pytest.raises(RuntimeError, match='session'):
+        smoke._docker(['info'])
+    calls = []
+    class Child:
+        returncode = 0
+        def poll(self): return 0
+        def wait(self): return 0
+    monkeypatch.setattr(smoke.subprocess, 'Popen', lambda argv, **kw: calls.append((argv, kw)) or Child())
+    token = smoke._session.set((('/usr/bin/docker', '--host', 'unix:///run/test/docker.sock'), {'PATH': '/usr/bin:/bin'}))
+    try:
+        smoke._docker(['info'])
+    finally:
+        smoke._session.reset(token)
+    assert calls[0][0] == ['/usr/bin/docker', '--host', 'unix:///run/test/docker.sock', 'info']
+    assert calls[0][1]['env'] == {'PATH': '/usr/bin:/bin'}
+
+
+def test_local_images_complete_with_distinct_ids_and_cleanup(monkeypatch):
+    docker = Docker()
+    monkeypatch.setattr(smoke, '_docker', docker)
+    result = smoke.run_smoke(OLD_ID, OLD_COMMIT, NEW_ID, NEW_COMMIT,
+        docker_host='unix:///run/test/docker.sock', local_images=True)
+    assert result['state'] == 'passed' and result['cleanup'] == 'completed'
+    assert not docker.containers and not docker.volumes
+    with pytest.raises(ValueError):
+        smoke.run_smoke(OLD_ID, OLD_COMMIT, OLD_ID, NEW_COMMIT,
+            docker_host='unix:///run/test/docker.sock', local_images=True)
