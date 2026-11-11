@@ -409,3 +409,136 @@ def test_existing_directory_is_allowed_but_chmod_file_exists_fails_closed(tmp_pa
     assert failed.state == 'invalid' and failed.service is None
     assert 'state_directory_chmod_failed' in caplog.text
     assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+
+
+def _leftover(tmp_path, mode=0o600, content=b''):
+    """A first start that created the file and stopped before the schema."""
+    directory = tmp_path / 'infrastructure'; directory.mkdir(mode=0o700); directory.chmod(0o700)
+    database = directory / 'inventory.sqlite3'; database.write_bytes(content); database.chmod(mode)
+    return directory, database
+
+
+def _snapshot(directory):
+    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino) for p in directory.iterdir()}
+
+
+def _populated(tmp_path):
+    settings = write(tmp_path / 'settings.json', config())
+    first = compose_infrastructure(settings, state_root=tmp_path); assert first.state == 'ready'
+    first.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                expected_revision=0)
+    first.close()
+    return settings, tmp_path / 'infrastructure', tmp_path / 'infrastructure/inventory.sqlite3'
+
+
+@POSIX
+@pytest.mark.parametrize('mode', [0o600, 0o700])
+def test_empty_leftover_is_named_and_left_untouched(tmp_path, caplog, mode):
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, mode)
+    before = _snapshot(directory)
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert module.state == 'invalid' and module.service is None
+    assert 'database_empty_leftover_failed' in caplog.text and str(tmp_path) not in caplog.text
+    assert _snapshot(directory) == before
+
+
+@POSIX
+def test_after_owner_moves_the_leftover_a_fresh_inventory_starts_on_an_acl_dataset(tmp_path, monkeypatch):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, 0o700)
+    database.rename(directory / 'inventory.sqlite3.reviewed-empty')
+    real = os.fchmod
+
+    def acl_dataset(fd, mode):
+        # NFSv4-ACL datasets can report owner-only 0700 after fchmod(0600).
+        real(fd, 0o700)
+    monkeypatch.setattr(module.os, 'fchmod', acl_dataset)
+    first = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert first.state == 'ready'
+        assert stat.S_IMODE(database.stat().st_mode) == 0o700
+        first.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                    expected_revision=0)
+    finally:
+        first.close()
+    monkeypatch.undo()
+    reopened = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert reopened.state == 'ready'
+        assert reopened.service.get_device('human:1', 'fixture')['device']['revision'] == 1
+    finally:
+        reopened.close()
+    assert (directory / 'inventory.sqlite3.reviewed-empty').read_bytes() == b''
+
+
+@POSIX
+def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
+    settings, directory, database = _populated(tmp_path)
+    database.chmod(0o700)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    try:
+        assert module.state == 'ready'
+        assert module.service.get_device('hermes', 'fixture')['device']['revision'] == 1
+        assert stat.S_IMODE(database.stat().st_mode) == 0o700
+    finally:
+        module.close()
+
+
+@POSIX
+@pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200])
+def test_any_group_or_other_bit_or_missing_owner_rw_stays_closed(tmp_path, caplog, mode):
+    settings, directory, database = _populated(tmp_path)
+    database.chmod(mode)
+    before = _snapshot(directory)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    assert module.state == 'invalid' and module.service is None
+    assert 'database_file_failed' in caplog.text
+    assert _snapshot(directory) == before
+
+
+@POSIX
+@pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
+def test_sidecar_appearing_before_the_write_open_is_never_replayed(tmp_path, monkeypatch, caplog, late):
+    import engineering_hub.infrastructure_module as module
+    settings, directory, database = _populated(tmp_path)
+    original = database.read_bytes()
+    real = sqlite3.connect
+
+    def racing(target, *args, **kwargs):
+        connection = real(target, *args, **kwargs)
+        if 'immutable=1' in str(target):
+            (directory / ('inventory.sqlite3-' + late)).write_bytes(b'foreign uncommitted pages')
+        return connection
+    monkeypatch.setattr(module.sqlite3, 'connect', racing)
+    result = compose_infrastructure(settings, state_root=tmp_path)
+    monkeypatch.undo()
+    assert result.state == 'invalid' and result.service is None
+    assert 'database_open_failed' in caplog.text
+    assert database.read_bytes() == original
+    assert (directory / ('inventory.sqlite3-' + late)).read_bytes() == b'foreign uncommitted pages'
+
+
+@POSIX
+@pytest.mark.parametrize('result_mode,state', [(0o700, 'ready'), (0o640, 'invalid')])
+def test_refused_chmod_on_a_fresh_file_depends_only_on_the_resulting_mode(tmp_path, monkeypatch, caplog,
+                                                                           result_mode, state):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    real = os.fchmod
+
+    def restricted(fd, mode):
+        # An ACL-restricted dataset applies its own mode and refuses chmod.
+        real(fd, result_mode)
+        raise PermissionError(1, 'Operation not permitted')
+    monkeypatch.setattr(module.os, 'fchmod', restricted)
+    module_ = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert module_.state == state
+        if state == 'invalid':
+            assert 'database_file_failed' in caplog.text
+    finally:
+        module_.close()

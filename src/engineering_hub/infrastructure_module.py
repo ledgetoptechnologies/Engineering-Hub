@@ -149,8 +149,15 @@ def _owned_schema():
 
 
 def _file_info(info):
+    # Owner-only, not exactly 0600: NFSv4-ACL datasets (e.g. TrueNAS) can
+    # report an owner-only file as 0700 even after fchmod(0600). Execute on a
+    # data file grants nothing; any group/other bit still refuses.
+    mode=stat.S_IMODE(info.st_mode)
     _need(stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.getuid()
-          and stat.S_IMODE(info.st_mode)==0o600)
+          and not mode&0o077 and mode&0o600==0o600)
+
+
+_SIDECARS=('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal')
 
 
 @dataclass
@@ -243,7 +250,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         directory=selected/'infrastructure'
         _need(_identity(directory.stat(follow_symlinks=False))==_identity(info))
         stage='database_admission'
-        for name in ('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal'):
+        for name in _SIDECARS:
             try:os.stat(name,dir_fd=root_fd,follow_symlinks=False)
             except FileNotFoundError:continue
             raise ValueError('Inventory recovery requires review')
@@ -252,9 +259,24 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             file_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=root_fd)
             existing=True
         except FileNotFoundError:
-            file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
-            os.fchmod(file_fd,0o600);os.fsync(file_fd);os.fsync(root_fd)
             existing=False
+        if existing:
+            # A zero-byte file is usually a first start that stopped before its
+            # schema, but its history can't be proven here, so it is never
+            # adopted or moved automatically. Name it so an owner can review it.
+            stage='database_empty_leftover'
+            _need(os.fstat(file_fd).st_size!=0)
+            stage='database_admission'
+        else:
+            file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
+            try:os.fchmod(file_fd,0o600)
+            except PermissionError:
+                # ACL-managed datasets can refuse chmod. The file was created
+                # just now with O_EXCL; _file_info below still requires it to
+                # be owner-only, so a refused chmod never widens access.
+                pass
+            os.fsync(file_fd);os.fsync(root_fd)
+        stage='database_file'
         before=os.fstat(file_fd);_file_info(before)
         captured_fd=root_fd
         def directory_identity(value):
@@ -299,8 +321,14 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         _need(admission())
         stage='database_open'
+        for sidecar in _SIDECARS:
+            # Re-checked just before SQLite may replay one; never adopted.
+            try:os.stat(sidecar,dir_fd=root_fd,follow_symlinks=False)
+            except FileNotFoundError:continue
+            raise ValueError('Inventory recovery requires review')
         db=sqlite3.connect(sqlite_location.as_uri()+'?mode=rw',uri=True,check_same_thread=False)
         registry=InfrastructureRegistry(db,capabilities=grants,admission_guard=admission)
+        _need(_schema(db)==_owned_schema())
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         stage='service_setup'
         service=InfrastructureService(registry,on_change=on_change)
