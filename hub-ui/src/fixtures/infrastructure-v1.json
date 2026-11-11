@@ -2,7 +2,7 @@
   "list": {
     "items": [
       {
-        "id": "build-pc", "name": "Build PC", "hostname": "build.example.test", "addresses": ["198.51.100.20", "2001:db8::20"],
+        "id": "build-pc", "name": "Build PC", "hostname": "build.example.test", "metrics_host": null, "addresses": ["198.51.100.20", "2001:db8::20"],
         "network": null, "vlan": 20, "role": "Staging builds", "retired": false, "revision": 3,
         "updated_at": "2026-10-25T10:00:00+00:00",
         "observations": [
@@ -17,7 +17,7 @@
         }
       },
       {
-        "id": "camera-hub", "name": "Camera hub", "hostname": null, "addresses": [], "network": null, "vlan": null,
+        "id": "camera-hub", "name": "Camera hub", "hostname": null, "metrics_host": null, "addresses": [], "network": null, "vlan": null,
         "role": "Security cameras", "retired": false, "revision": 1, "updated_at": "2026-10-19T07:00:00+00:00",
         "observations": [], "open_maintenance": null
       }
@@ -26,7 +26,7 @@
   },
   "detail": {
     "device": {
-      "id": "camera-hub", "name": "Camera hub", "hostname": null, "addresses": [], "network": null, "vlan": null,
+      "id": "camera-hub", "name": "Camera hub", "hostname": null, "metrics_host": null, "addresses": [], "network": null, "vlan": null,
       "role": "Security cameras", "retired": false, "revision": 1, "updated_at": "2026-10-19T07:00:00+00:00",
       "observations": [], "open_maintenance": null
     },
