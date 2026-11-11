@@ -143,16 +143,84 @@ def test_volume_wrong_owner_is_not_removed(monkeypatch):
         smoke._volume('hub-durability-fixture', 'expected')
 
 
-def test_subprocess_is_bounded_and_never_shell(monkeypatch):
+def _fake_endpoint(monkeypatch):
+    from types import SimpleNamespace
+    import stat
+    monkeypatch.setattr(smoke, 'endpoint_realpath', lambda path: path)
+    def endpoint_stat(path):
+        if path in ('/run/docker.sock', '/var/run/docker.sock'):
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_mode=stat.S_IFSOCK, st_dev=1, st_ino=2)
+    monkeypatch.setattr(smoke, 'endpoint_stat', endpoint_stat)
+    monkeypatch.setattr(smoke.shutil, 'which', lambda *a, **k: '/usr/bin/docker')
+
+
+def test_subprocess_is_bounded_and_never_ambient(monkeypatch):
     calls = []
     def run(args, **kwargs):
         calls.append((args, kwargs))
         return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
     monkeypatch.setattr(smoke.subprocess, 'run', run)
-    smoke._docker(['version'])
+    with pytest.raises(RuntimeError, match='session required'):
+        smoke._docker(['version'])
+    _fake_endpoint(monkeypatch)
+    monkeypatch.setenv('DOCKER_CONTEXT', 'hostile')
+    with smoke.docker_session('unix:///run/user/1000/docker.sock') as (prefix, env):
+        smoke._docker(['version'])
+        config_dir = env['DOCKER_CONFIG']
+        assert list(Path(config_dir).iterdir()) == []
     args, kwargs = calls[0]
-    assert args == ['docker', 'version'] and kwargs['timeout'] == 30
+    assert args == [*prefix, 'version'] and kwargs['timeout'] == 30
+    assert kwargs['env'] == {'PATH': '/usr/bin:/bin', 'DOCKER_CONFIG': config_dir}
     assert 'shell' not in kwargs and kwargs['capture_output'] is True
+    assert not Path(config_dir).exists()
+    with pytest.raises(RuntimeError, match='session required'):
+        smoke._docker(['version'])
+
+
+@pytest.mark.parametrize('host', [None, 'default', 'unix:///var/run/docker.sock',
+    'unix:///run/docker.sock', 'unix:///run/containerd/containerd.sock',
+    'unix:///run/user/../docker.sock', 'tcp://localhost:2375'])
+def test_rejects_unsafe_endpoint_before_cli(monkeypatch, host):
+    _fake_endpoint(monkeypatch)
+    with pytest.raises(ValueError):
+        with smoke.docker_session(host):
+            pytest.fail('unsafe endpoint accepted')
+
+
+def test_rejects_alias_non_socket_and_shared_identity(monkeypatch):
+    from types import SimpleNamespace
+    import stat
+    _fake_endpoint(monkeypatch)
+    host = 'unix:///run/user/1000/docker.sock'
+    monkeypatch.setattr(smoke, 'endpoint_realpath', lambda path: '/run/docker.sock')
+    with pytest.raises(ValueError, match='aliases'):
+        with smoke.docker_session(host): pass
+    monkeypatch.setattr(smoke, 'endpoint_realpath', lambda path: path)
+    monkeypatch.setattr(smoke, 'endpoint_stat', lambda path: SimpleNamespace(st_mode=stat.S_IFREG, st_dev=1, st_ino=2))
+    with pytest.raises(ValueError, match='existing socket'):
+        with smoke.docker_session(host): pass
+    monkeypatch.setattr(smoke, 'endpoint_stat', lambda path: SimpleNamespace(st_mode=stat.S_IFSOCK, st_dev=1, st_ino=2))
+    with pytest.raises(ValueError, match='Shared system'):
+        with smoke.docker_session(host): pass
+
+
+def test_session_covers_cleanup_on_failure(monkeypatch):
+    _fake_endpoint(monkeypatch)
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs['env'].copy()))
+        if 'create' in args:
+            raise RuntimeError('fixture failure')
+        return subprocess.CompletedProcess(args, 1, stdout='', stderr='No such container No such volume')
+    monkeypatch.setattr(smoke.subprocess, 'run', run)
+    with pytest.raises(RuntimeError, match='fixture failure'):
+        with smoke.docker_session('unix:///run/user/1000/docker.sock'):
+            smoke.run_smoke(IMAGE, COMMIT)
+    assert len(calls) == 6
+    assert all(args[:3] == ['/usr/bin/docker', '--host', 'unix:///run/user/1000/docker.sock'] for args, _ in calls)
+    assert all(env == calls[0][1] for _, env in calls)
+    assert not Path(calls[0][1]['DOCKER_CONFIG']).exists()
 
 
 def test_probe_rejects_drifted_commit(monkeypatch):
