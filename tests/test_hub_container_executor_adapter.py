@@ -586,3 +586,26 @@ def test_single_pilot_lost_denial_replays_after_adapter_reopen(tmp_path, monkeyp
         assert backend.events == [] and state.calls == []
     finally:
         reopened.close()
+
+
+def test_single_pilot_preflight_failure_retry_does_not_admit(tmp_path):
+    from types import SimpleNamespace
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    def preflight_failure():
+        raise RuntimeError('synthetic pending journal')
+    backend.operation_journal = SimpleNamespace(require_no_pending=preflight_failure)
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    cmd = command(manifest, 'deploy_container')
+    try:
+        first = adapter.submit(cmd)
+        assert first.state == 'held' and first.reason == 'inspect_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        gate = adapter.ledger.inspect_single_pilot()
+        retry = adapter.submit(cmd)
+        assert retry.state == 'held' and retry.reason == 'recovery_required'
+        assert adapter.ledger.get(cmd.command_id) is None
+        assert adapter.ledger.inspect_single_pilot() == gate
+        assert backend.events == [] and state.calls == []
+    finally:
+        adapter.close()
