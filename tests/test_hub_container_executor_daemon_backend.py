@@ -670,6 +670,49 @@ def test_create_uses_only_immutable_digest_and_exact_closed_profile(tmp_path):
     _exercise_create_closed_profile(tmp_path)
 
 
+def test_nonsecret_projection_runtime_tracks_backend_create_body(tmp_path):
+    """A drift check, not proof of request equivalence or authority."""
+    from uuid import uuid4
+    from hub_container_executor.backend import ContainerPlan
+    from hub_container_executor.effect_binding_canonical import (
+        NonsecretEffectBinding, canonical_nonsecret_binding,
+    )
+    manifest, image, _ = verified_image()
+    generation = safe_generation(tmp_path)
+    profile = make_profile(image)
+    plan = ContainerPlan("hub-pilot-fixture-01234567-89a-candidate", image,
+                         image.runnable_reference, False, profile)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(lambda _: None))
+    try:
+        body = backend._create_body(plan, generation, profile.environment)
+    finally:
+        backend.close()
+    projection = NonsecretEffectBinding(str(uuid4()), str(uuid4()), "create_candidate", 1,
+        str(uuid4()), 123, 456, str(uuid4()), plan.resource_name, None,
+        image.runnable_reference, image.platform_manifest_digest, image.image_config_id,
+        profile.state_generation_id, tuple(name for name, _ in profile.environment),
+        profile.memory_bytes, profile.cpu_millicores, profile.pids_limit, profile.tmpfs[0][1], None)
+    projected = json.loads(canonical_nonsecret_binding(projection))
+    runtime, host = projected["runtime"], body["HostConfig"]
+    assert projected["image_index_digest"] == body["Image"]
+    assert projected["environment_names"] == sorted(item.split("=", 1)[0] for item in body["Env"])
+    assert body["User"] == f'{runtime["uid"]}:{runtime["gid"]}'
+    assert host["ReadonlyRootfs"] == runtime["read_only_root"]
+    assert host["CapDrop"] == runtime["cap_drop"]
+    assert host["SecurityOpt"] == ["no-new-privileges:true"] and runtime["no_new_privileges"] is True
+    assert host["NetworkMode"] == runtime["network_mode"] and host["CgroupnsMode"] == runtime["cgroupns_mode"]
+    assert "PidMode" not in host and runtime["pid_mode"] == "private"
+    assert "IpcMode" not in host and runtime["ipc_mode"] == "private"
+    assert host["Memory"] == runtime["memory_bytes"] and host["MemorySwap"] == runtime["memory_swap_bytes"]
+    assert host["NanoCpus"] == runtime["cpu_millicores"] * 1_000_000
+    assert host["PidsLimit"] == runtime["pids_limit"]
+    assert host["Tmpfs"] == {"/tmp": f'rw,noexec,nosuid,size={runtime["tmpfs_bytes"]},mode={runtime["tmpfs_mode"]}'}
+    assert runtime["tmpfs_noexec"] is True and runtime["tmpfs_nosuid"] is True
+    assert host["Mounts"] == [{"Type": "bind", "Source": str(generation),
+                                "Target": runtime["state_destination"], "ReadOnly": False}]
+    assert runtime["state_mode"] == "rw" and host["RestartPolicy"]["Name"] == runtime["restart"]
+
+
 @pytest.mark.parametrize("mode", ["host", "", None, "missing"])
 def test_effective_cgroup_namespace_readback_must_be_explicit_private(tmp_path, monkeypatch, mode):
     original = container_inspect
@@ -873,6 +916,59 @@ def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, l
         with SQLiteOperationJournal(journal_path, create=False,
                                     allow_ephemeral_test_storage=True) as reopened:
             assert reopened.inspect(operation_id).state == 'pending'
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("action", ["create", "start", "stop", "probe"])
+def test_v2_without_verified_binding_authority_never_sends_effect(tmp_path, action):
+    """Current backend is v1-only; v2 must not emit any mutating request."""
+    pytest.importorskip("fcntl", reason="real Linux journal ownership required")
+    from hub_container_executor.backend import ContainerPlan
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+
+    private = tmp_path / "v2-journal"
+    private.mkdir(mode=0o700)
+    if action == "create":
+        manifest, image, blobs = verified_image()
+        safe_generation(tmp_path)
+        plan = ContainerPlan("hub-pilot-fixture-01234567-89a-candidate", image,
+                             image.runnable_reference, False, make_profile(image))
+        requests = []
+        archive = oci_archive(image, blobs)
+        def handler(request):
+            path = request.url.path
+            requests.append((request.method, path))
+            if path.endswith("/info"):
+                return httpx.Response(200, json={"ID": manifest.runner_binding.daemon_identity,
+                    "OSType": "linux", "Architecture": "amd64"})
+            if "/images/" in path and path.endswith("/json"):
+                return httpx.Response(200, json=docker_config(image))
+            if "/images/" in path and path.endswith("/get"):
+                return httpx.Response(200, content=archive)
+            raise AssertionError("unexpected mutating request")
+        backend = DockerEngineBackend(binding(manifest, tmp_path), test_transport=httpx.MockTransport(handler))
+    elif action == "probe":
+        backend, manifest, _, requests = probe_fixture(tmp_path)
+    else:
+        backend, _, _, requests = engine29_inspection_fixture(
+            tmp_path, status="created" if action == "start" else "running")
+    try:
+        with SQLiteOperationJournal(private / "operations.sqlite", create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            journal.enable_bindings()
+            backend.operation_journal = journal
+            before = len(requests)
+            with pytest.raises(DaemonBackendError, match="private operation journal unavailable"):
+                if action == "create":
+                    backend.create_container(plan, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                elif action == "start":
+                    backend.start_container("c" * 64, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                elif action == "stop":
+                    backend.stop_container("c" * 64, "4c96d3f7-19c5-5ff4-a29e-302f6f661009", 5000)
+                else:
+                    run_readiness(backend, manifest.probes.candidate)
+            assert all(row[0] != "POST" for row in requests[before:])
     finally:
         backend.close()
 
