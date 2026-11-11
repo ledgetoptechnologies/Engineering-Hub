@@ -28,6 +28,7 @@ import re
 from pathlib import Path
 import sqlite3
 import stat
+import time
 
 from .infrastructure import CAPABILITIES, HUMAN_ONLY, InfrastructurePrincipal, InfrastructureRegistry
 from .infrastructure_service import InfrastructureService
@@ -157,56 +158,39 @@ def _file_info(info):
           and not mode&0o077 and mode&0o600==0o600)
 
 
-# SQLite's unix VFS takes POSIX byte-range locks in this region (PENDING,
-# RESERVED and SHARED bytes). Holding a write lock on all of it excludes every
-# other process's SQLite reader or writer on the same inode.
-_SQLITE_LOCK_START=0x40000000
-_SQLITE_LOCK_LENGTH=512
 _SIDECARS=('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal')
+_PRESERVED='inventory.sqlite3.empty-'
+MAX_PRESERVED=3
 
 
-def _owned_image():
-    memory=sqlite3.connect(':memory:')
-    try:
-        InfrastructureRegistry(memory).db.commit()
-        return memory.serialize()
-    finally:memory.close()
+def _preserve_empty(root_fd,name,fd):
+    """Move a zero-byte, sidecar-free, owner-only leftover aside; never open it.
 
-
-def _initialize_empty(root_fd,name,expected):
-    """Write a fresh owned schema into a still-empty file, fenced from SQLite.
-
-    SQLite is not used on the file here, so a sidecar that appears late is
-    never replayed or deleted; it only makes this fail closed. On any failure
-    after writing began, our own bytes are truncated away again.
+    A first start that stopped before writing its schema leaves exactly this.
+    Its inode is kept under a new name (nothing is written, truncated or
+    deleted) so the ordinary first-start path can create a fresh database.
+    If anything about it changes while moving, it is put back and startup
+    fails closed. Returns False for any non-empty file.
     """
-    import fcntl
-    data=_owned_image()
-    fd=os.open(name,os.O_RDWR|os.O_NOFOLLOW,dir_fd=root_fd)
-    try:
-        info=os.fstat(fd)
-        _need(_identity(info)==_identity(expected) and info.st_size==0)
-        fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,_SQLITE_LOCK_LENGTH,_SQLITE_LOCK_START,os.SEEK_SET)
-        try:
-            for sidecar in _SIDECARS:
-                try:os.stat(sidecar,dir_fd=root_fd,follow_symlinks=False)
-                except FileNotFoundError:continue
-                raise ValueError('Inventory recovery requires review')
-            _need(os.fstat(fd).st_size==0)
-            written=0
-            try:
-                while written<len(data):
-                    count=os.pwrite(fd,data[written:],written)
-                    _need(count>0);written+=count
-                os.fsync(fd)
-                _need(os.fstat(fd).st_size==len(data))
-            except BaseException:
-                if written:
-                    os.ftruncate(fd,0);os.fsync(fd)
-                raise
-        finally:
-            fcntl.lockf(fd,fcntl.LOCK_UN,_SQLITE_LOCK_LENGTH,_SQLITE_LOCK_START,os.SEEK_SET)
-    finally:os.close(fd)
+    info=os.fstat(fd)
+    if info.st_size!=0:
+        return False
+    _file_info(info)
+    _need(sum(item.startswith(_PRESERVED) for item in os.listdir(root_fd))<MAX_PRESERVED)
+    target=_PRESERVED+str(time.time_ns())
+    try:os.stat(target,dir_fd=root_fd,follow_symlinks=False)
+    except FileNotFoundError:pass
+    else:raise ValueError('Preserved name collision')
+    _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(info))
+    os.rename(name,target,src_dir_fd=root_fd,dst_dir_fd=root_fd)
+    os.fsync(root_fd)
+    moved=os.stat(target,dir_fd=root_fd,follow_symlinks=False)
+    if _identity(moved)!=_identity(info) or moved.st_size!=0 or os.fstat(fd).st_size!=0:
+        try:os.stat(name,dir_fd=root_fd,follow_symlinks=False)
+        except FileNotFoundError:
+            os.rename(target,name,src_dir_fd=root_fd,dst_dir_fd=root_fd);os.fsync(root_fd)
+        raise ValueError('Leftover changed while preserving it')
+    return True
 
 
 @dataclass
@@ -304,13 +288,21 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             except FileNotFoundError:continue
             raise ValueError('Inventory recovery requires review')
         name='inventory.sqlite3'
+        preserved_empty=False
         try:
             file_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=root_fd)
             existing=True
         except FileNotFoundError:
+            existing=False
+        if existing:
+            stage='database_empty_preserve'
+            if _preserve_empty(root_fd,name,file_fd):
+                os.close(file_fd);file_fd=None
+                existing=False;preserved_empty=True
+            stage='database_admission'
+        if not existing:
             file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
             os.fchmod(file_fd,0o600);os.fsync(file_fd);os.fsync(root_fd)
-            existing=False
         stage='database_file'
         before=os.fstat(file_fd);_file_info(before)
         captured_fd=root_fd
@@ -347,15 +339,6 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         # registry read/write boundary and permanently veto path replacement.
         sqlite_location=Path('/proc/self/fd')/str(root_fd)/name
         stage='database_schema'
-        empty_existing=existing and before.st_size==0
-        if empty_existing:
-            # A zero-byte main file with no sidecars holds no pages: typically a
-            # first start that stopped before writing its schema. Fill it in
-            # place while excluding every SQLite process; nothing is replaced,
-            # moved or deleted. It then faces the same exact-schema check.
-            stage='database_empty_initialize'
-            _initialize_empty(root_fd,name,before)
-            stage='database_schema'
         if existing:
             # immutable prevents SQLite from creating WAL/SHM files while
             # inspecting an unknown database. Sidecars above are never adopted.
@@ -365,6 +348,11 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         _need(admission())
         stage='database_open'
+        for sidecar in _SIDECARS:
+            # Re-checked just before SQLite may replay one; never adopted.
+            try:os.stat(sidecar,dir_fd=root_fd,follow_symlinks=False)
+            except FileNotFoundError:continue
+            raise ValueError('Inventory recovery requires review')
         db=sqlite3.connect(sqlite_location.as_uri()+'?mode=rw',uri=True,check_same_thread=False)
         registry=InfrastructureRegistry(db,capabilities=grants,admission_guard=admission)
         _need(_schema(db)==_owned_schema())
@@ -385,8 +373,8 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
-        if empty_existing:
-            logger.warning('Infrastructure startup: empty_database_initialized')
+        if preserved_empty:
+            logger.warning('Infrastructure startup: empty_database_preserved')
         logger.info('Infrastructure startup: ready')
         root_fd=None;db=None
         return module

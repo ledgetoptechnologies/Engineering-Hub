@@ -411,6 +411,7 @@ def test_existing_directory_is_allowed_but_chmod_file_exists_fails_closed(tmp_pa
     assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
 
 
+
 def _leftover(tmp_path, mode=0o600, content=b''):
     """A first start that created the file and stopped before the schema."""
     directory = tmp_path / 'infrastructure'; directory.mkdir(mode=0o700); directory.chmod(0o700)
@@ -418,9 +419,17 @@ def _leftover(tmp_path, mode=0o600, content=b''):
     return directory, database
 
 
+def _snapshot(directory):
+    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_ino) for p in directory.iterdir()}
+
+
+def _preserved(directory):
+    return sorted(p for p in directory.iterdir() if p.name.startswith('inventory.sqlite3.empty-'))
+
+
 @POSIX
 @pytest.mark.parametrize('mode', [0o600, 0o700])
-def test_empty_leftover_database_is_initialized_in_place(tmp_path, caplog, mode):
+def test_empty_leftover_is_kept_aside_and_a_fresh_inventory_starts(tmp_path, caplog, mode):
     caplog.set_level('INFO')
     path = tmp_path / 'infrastructure.json'
     directory, database = _leftover(tmp_path, mode)
@@ -428,15 +437,16 @@ def test_empty_leftover_database_is_initialized_in_place(tmp_path, caplog, mode)
     module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     try:
         assert module.state == 'ready' and not path.exists()
-        assert module.service.list_devices('human:1')['items'] == []
         module.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
                                      expected_revision=0)
     finally:
         module.close()
-    assert 'empty_database_initialized' in caplog.text and str(tmp_path) not in caplog.text
-    # Same file, mode left alone, nothing else created or removed.
-    assert database.stat().st_ino == inode and stat.S_IMODE(database.stat().st_mode) == mode
-    assert {p.name for p in directory.iterdir()} == {'inventory.sqlite3'}
+    assert 'empty_database_preserved' in caplog.text and str(tmp_path) not in caplog.text
+    [kept] = _preserved(directory)
+    # The old inode is kept untouched; the live inventory is a new file.
+    assert kept.stat().st_ino == inode and kept.read_bytes() == b'' and stat.S_IMODE(kept.stat().st_mode) == mode
+    assert database.stat().st_ino != inode
+    assert {p.name for p in directory.iterdir()} == {'inventory.sqlite3', kept.name}
     caplog.clear()
     reopened = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     try:
@@ -444,7 +454,7 @@ def test_empty_leftover_database_is_initialized_in_place(tmp_path, caplog, mode)
         assert reopened.service.get_device('human:1', 'fixture')['device']['revision'] == 1
     finally:
         reopened.close()
-    assert 'empty_database_initialized' not in caplog.text
+    assert 'empty_database_preserved' not in caplog.text and len(_preserved(directory)) == 1
 
 
 @POSIX
@@ -466,7 +476,8 @@ def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
 
 @POSIX
 @pytest.mark.parametrize('unsafe', ['group_read', 'other_read', 'group_exec', 'owner_read_only', 'hardlink',
-                                    'wal_sidecar', 'shm_sidecar', 'journal_sidecar', 'empty_sidecar'])
+                                    'wal_sidecar', 'shm_sidecar', 'journal_sidecar', 'empty_sidecar',
+                                    'already_preserved'])
 def test_empty_leftover_with_any_other_doubt_stays_closed_and_untouched(tmp_path, caplog, unsafe):
     path = tmp_path / 'infrastructure.json'
     mode = {'group_read': 0o640, 'other_read': 0o604, 'group_exec': 0o610, 'owner_read_only': 0o400}.get(unsafe, 0o600)
@@ -475,63 +486,46 @@ def test_empty_leftover_with_any_other_doubt_stays_closed_and_untouched(tmp_path
         os.link(database, directory / 'preserved.sqlite3')
     elif unsafe == 'empty_sidecar':
         (directory / 'inventory.sqlite3-wal').write_bytes(b'')
+    elif unsafe == 'already_preserved':
+        for index in range(3):
+            (directory / ('inventory.sqlite3.empty-' + str(index))).write_bytes(b'')
     elif unsafe.endswith('_sidecar'):
         (directory / ('inventory.sqlite3-' + unsafe.split('_')[0])).write_bytes(b'unknown original pages')
-    before = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
+    before = _snapshot(directory)
     module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     assert module.state == 'invalid' and module.service is None
-    after = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
-    assert after == before
-    assert 'empty_database_initialized' not in caplog.text and str(tmp_path) not in caplog.text
+    assert _snapshot(directory) == before
+    assert 'empty_database_preserved' not in caplog.text and str(tmp_path) not in caplog.text
 
 
 @POSIX
-def test_nonempty_unknown_bytes_are_never_treated_as_empty(tmp_path):
+def test_nonempty_unknown_bytes_are_never_moved_or_opened(tmp_path):
     path = tmp_path / 'infrastructure.json'
     directory, database = _leftover(tmp_path, 0o600, b'\0' * 4096)
+    before = _snapshot(directory)
     module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     assert module.state == 'invalid' and module.service is None
-    assert database.read_bytes() == b'\0' * 4096
-
-
-def _snapshot(directory):
-    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
+    assert _snapshot(directory) == before
 
 
 @POSIX
-@pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
-def test_sidecar_appearing_after_admission_is_never_replayed_or_removed(tmp_path, monkeypatch, late):
+def test_leftover_filled_while_being_moved_is_put_back_unchanged(tmp_path, monkeypatch):
     import engineering_hub.infrastructure_module as module
     path = tmp_path / 'infrastructure.json'
     directory, database = _leftover(tmp_path)
-    real = module._owned_image
+    inode = database.stat().st_ino
+    real = os.rename
 
-    def racing():
-        (directory / ('inventory.sqlite3-' + late)).write_bytes(b'foreign uncommitted pages')
-        return real()
-    monkeypatch.setattr(module, '_owned_image', racing)
+    def racing(src, dst, **kwargs):
+        if src == 'inventory.sqlite3':
+            foreign = sqlite3.connect(database)
+            foreign.execute('CREATE TABLE someone_else(id TEXT)'); foreign.commit(); foreign.close()
+        return real(src, dst, **kwargs)
+    monkeypatch.setattr(module.os, 'rename', racing)
     result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    monkeypatch.undo()
     assert result.state == 'invalid' and result.service is None
-    after = _snapshot(directory)
-    assert set(after) == {'inventory.sqlite3', 'inventory.sqlite3-' + late}
-    assert after['inventory.sqlite3'] == (b'', 0o600)
-    assert after['inventory.sqlite3-' + late][0] == b'foreign uncommitted pages'
-
-
-@POSIX
-def test_file_populated_after_admission_keeps_the_foreign_bytes(tmp_path, monkeypatch):
-    import engineering_hub.infrastructure_module as module
-    path = tmp_path / 'infrastructure.json'
-    directory, database = _leftover(tmp_path)
-    real = module._owned_image
-
-    def racing():
-        foreign = sqlite3.connect(database)
-        foreign.execute('CREATE TABLE someone_else(id TEXT)'); foreign.commit(); foreign.close()
-        return real()
-    monkeypatch.setattr(module, '_owned_image', racing)
-    result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
-    assert result.state == 'invalid' and result.service is None
+    assert database.stat().st_ino == inode and not _preserved(directory)
     check = sqlite3.connect(database)
     try:
         assert check.execute("SELECT name FROM sqlite_master").fetchall() == [('someone_else',)]
@@ -540,51 +534,41 @@ def test_file_populated_after_admission_keeps_the_foreign_bytes(tmp_path, monkey
 
 
 @POSIX
-@pytest.mark.parametrize('hold,stage', [
-    # A writer's journal is caught by the sidecar check; a reader leaves no
-    # file, so only the SQLite lock-region fence can see it.
-    ('BEGIN IMMEDIATE', 'database_admission_failed'),
-    ('BEGIN"); db.execute("SELECT count(*) FROM sqlite_master', 'database_empty_initialize_failed')])
-def test_another_sqlite_process_holding_the_file_blocks_initialization(tmp_path, caplog, hold, stage):
-    import subprocess, sys
-    path = tmp_path / 'infrastructure.json'
-    directory, database = _leftover(tmp_path)
-    holder = subprocess.Popen([sys.executable, '-c',
-        'import sqlite3,sys\n'
-        'db=sqlite3.connect(sys.argv[1],isolation_level=None)\n'
-        'db.execute("' + hold + '")\n'
-        'print("held",flush=True)\n'
-        'sys.stdin.readline()\n'
-        'db.execute("ROLLBACK");db.close()\n', str(database)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    try:
-        assert holder.stdout.readline().strip() == 'held'
-        before = _snapshot(directory)
-        result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
-        assert result.state == 'invalid' and result.service is None
-        assert _snapshot(directory) == before
-        assert stage in caplog.text
-    finally:
-        holder.communicate('\n', timeout=10)
-    later = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
-    assert later.state == 'ready'; later.close()
-
-
-@POSIX
-def test_interrupted_initialization_removes_only_its_own_bytes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
+def test_sidecar_appearing_before_open_is_never_replayed(tmp_path, monkeypatch, caplog, late):
     import engineering_hub.infrastructure_module as module
     path = tmp_path / 'infrastructure.json'
     directory, database = _leftover(tmp_path)
-    real = os.pwrite
+    real = module._preserve_empty
 
-    def partial(fd, data, offset):
-        if offset:
-            raise OSError('simulated device failure')
-        return real(fd, data[:1024], offset)
-    monkeypatch.setattr(module.os, 'pwrite', partial)
+    def racing(*args):
+        moved = real(*args)
+        (directory / ('inventory.sqlite3-' + late)).write_bytes(b'foreign uncommitted pages')
+        return moved
+    monkeypatch.setattr(module, '_preserve_empty', racing)
     result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
-    assert result.state == 'invalid'
+    assert result.state == 'invalid' and result.service is None
+    assert 'database_open_failed' in caplog.text
+    # SQLite never opened the new file, so the sidecar was neither replayed nor removed.
+    assert database.read_bytes() == b''
+    assert (directory / ('inventory.sqlite3-' + late)).read_bytes() == b'foreign uncommitted pages'
+    assert [p.read_bytes() for p in _preserved(directory)] == [b'']
+
+
+@POSIX
+def test_interruption_after_moving_aside_recovers_on_the_next_start(tmp_path, monkeypatch):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path)
+
+    def interrupted(fd, mode):
+        raise OSError('simulated stop after the move')
+    monkeypatch.setattr(module.os, 'fchmod', interrupted)
+    assert compose_infrastructure(path, state_root=tmp_path, default_owner='human:1').state == 'invalid'
     monkeypatch.undo()
-    assert _snapshot(directory) == {'inventory.sqlite3': (b'', 0o600)}
     later = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
-    assert later.state == 'ready'; later.close()
+    try:
+        assert later.state == 'ready'
+    finally:
+        later.close()
+    assert [p.read_bytes() for p in _preserved(directory)] == [b'', b'']
