@@ -6,7 +6,10 @@ GitHub sign-in, TrueNAS, reboot recovery, or a real staging deployment.
 """
 import argparse
 import json
+from os import stat as endpoint_stat
+from os.path import realpath as endpoint_realpath
 import re
+import stat
 import subprocess
 import uuid
 
@@ -120,8 +123,21 @@ def run_smoke(image, expected_commit=None, *, docker_host=None):
         raise ValueError('An immutable local image ID is required')
     if expected_commit is not None and (not isinstance(expected_commit, str) or not re.fullmatch('[0-9a-f]{40}', expected_commit)):
         raise ValueError('Expected commit must be lowercase 40-character SHA')
-    if not isinstance(docker_host, str) or not re.fullmatch(r'unix:///run/[A-Za-z0-9_./-]+\.sock', docker_host) or '..' in docker_host.split('/') or docker_host in ('unix:///run/docker.sock', 'unix:///run/containerd/containerd.sock'):
+    if not isinstance(docker_host, str) or not re.fullmatch(r'unix:///run/[A-Za-z0-9_./-]+\.sock', docker_host) or any(part in ('', '.', '..') for part in docker_host[8:].split('/')) or docker_host in ('unix:///run/docker.sock', 'unix:///run/containerd/containerd.sock'):
         raise ValueError('An explicit dedicated local Unix Docker socket is required')
+    socket_path = docker_host[7:]
+    if endpoint_realpath(socket_path) != socket_path:
+        raise ValueError('Docker socket aliases are not allowed')
+    socket_info = endpoint_stat(socket_path)
+    if not stat.S_ISSOCK(socket_info.st_mode):
+        raise ValueError('Docker endpoint must be an existing socket')
+    for shared in ('/run/docker.sock', '/var/run/docker.sock'):
+        try:
+            shared_info = endpoint_stat(shared)
+        except FileNotFoundError:
+            continue
+        if (shared_info.st_dev, shared_info.st_ino) == (socket_info.st_dev, socket_info.st_ino):
+            raise ValueError('Shared system Docker socket is not allowed')
     docker = ['docker', '--host', docker_host]
     owner = uuid.uuid4().hex
     name = 'hub-dashboard-smoke-' + owner

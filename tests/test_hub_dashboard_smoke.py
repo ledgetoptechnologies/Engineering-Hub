@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,12 @@ def fake_docker(monkeypatch):
     calls = []
     controls = {"startup": None, "exec": None, "inspect": None, "remove": None}
     monkeypatch.setattr(smoke.uuid, "uuid4", lambda: SimpleNamespace(hex=OWNER))
+    monkeypatch.setattr(smoke, "endpoint_realpath", lambda path: path)
+    def socket_stat(path):
+        if path == DOCKER_HOST[7:]:
+            return SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_dev=1, st_ino=2)
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(smoke, "endpoint_stat", socket_stat)
 
     def run(argv, **kwargs):
         assert argv[:3] == ["docker", "--host", DOCKER_HOST]
@@ -204,9 +211,25 @@ def test_cleanup_error_retains_primary_error_in_exception_chain(fake_docker):
     assert captured.value.__context__ is primary
 
 
-@pytest.mark.parametrize("endpoint", [None, "", "tcp://host:2375", "unix:///var/run/docker.sock", "unix:///run/docker.sock", "unix:///run/../docker.sock"])
+@pytest.mark.parametrize("endpoint", [None, "", "tcp://host:2375", "unix:///var/run/docker.sock", "unix:///run/docker.sock", "unix:///run/../docker.sock", "unix:///run//docker.sock", "unix:///run/./docker.sock"])
 def test_ambient_or_shared_endpoint_is_rejected_before_docker(fake_docker, endpoint):
     calls, _ = fake_docker
     with pytest.raises(ValueError, match="dedicated local Unix"):
         run_smoke(IMAGE, docker_host=endpoint)
+    assert not calls
+
+
+def test_socket_symlink_alias_is_rejected(fake_docker, monkeypatch):
+    calls, _ = fake_docker
+    monkeypatch.setattr(smoke, "endpoint_realpath", lambda path: "/run/docker.sock")
+    with pytest.raises(ValueError, match="aliases"):
+        run_smoke(IMAGE)
+    assert not calls
+
+
+def test_shared_socket_inode_is_rejected(fake_docker, monkeypatch):
+    calls, _ = fake_docker
+    monkeypatch.setattr(smoke, "endpoint_stat", lambda path: SimpleNamespace(st_mode=stat.S_IFSOCK, st_dev=1, st_ino=2))
+    with pytest.raises(ValueError, match="Shared system"):
+        run_smoke(IMAGE)
     assert not calls
