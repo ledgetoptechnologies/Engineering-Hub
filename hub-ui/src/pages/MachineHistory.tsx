@@ -14,7 +14,7 @@ interface Line { name: string; slot: number; points: HistoryPoint[] }
 
 const RANGE_TEXT: Record<HistoryRange, string> = { "1h": "1 hour", "6h": "6 hours", "24h": "24 hours", "7d": "7 days" };
 const SOURCE_TEXT = {
-  ok: null, partial: "Some history didn't come back from Prometheus, so a chart may be missing.",
+  ok: null, partial: "Some history didn't come back from Prometheus or wasn't charted, so a chart may be missing or incomplete.",
   not_configured: "This Hub isn't connected to Prometheus yet.", unreachable: "Prometheus didn't answer, so there's no history to show.",
 } as const;
 const MAX_DISKS = 4, HEIGHT = 168, LEFT = 44, RIGHT = 8, TOP = 8, BOTTOM = 22;

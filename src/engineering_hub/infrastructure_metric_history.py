@@ -120,6 +120,8 @@ async def read_history(reader, actor, host_key, span, targets_parser):
     results = {}
     planned = 0
     missing = False
+    # More targets for one host than are charted: say so instead of reporting ok.
+    truncated = False
     try:
         async with asyncio.timeout(DEADLINE_SECONDS):
             async with httpx.AsyncClient(
@@ -138,6 +140,7 @@ async def read_history(reader, actor, host_key, span, targets_parser):
                     rows = [row for row in normalize_targets(targets, inventory)['rows'] if row['host_key'] == host_key]
                     if not rows:
                         missing = True
+                    truncated = len(rows) > MAX_TARGETS_PER_HOST
                     plan = [(index, kind, query)
                             for index, row in enumerate(rows[:MAX_TARGETS_PER_HOST])
                             for kind in ((row['exporter'],) if row['exporter'] in ('node', 'windows')
@@ -179,4 +182,4 @@ async def read_history(reader, actor, host_key, span, targets_parser):
         for label, samples in sorted(rows, key=lambda row: row[0] or '')[:MAX_DISKS]:
             seen.add((key, label))
             series.append({'key': key, 'label': label, 'unit': unit, 'points': _points(samples, unit, start, end, step)})
-    return _envelope(reader, host_key, span, 'ok' if len(results) == planned else 'partial', series)
+    return _envelope(reader, host_key, span, 'ok' if len(results) == planned and not truncated else 'partial', series)

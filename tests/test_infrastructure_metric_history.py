@@ -141,3 +141,34 @@ def test_gateway_exposes_the_read_only():
     path = '/api/hub/v1/infrastructure/metrics/history'
     assert browser_route_allowed('GET', path)
     assert not browser_route_allowed('POST', path)
+
+
+@pytest.mark.asyncio
+async def test_more_targets_than_charted_for_one_host_is_partial_and_stays_bounded():
+    from engineering_hub.infrastructure_metric_history import MAX_TARGETS_PER_HOST
+    many = [{'labels': {'job': f'node{index}' if index else 'node', 'instance': f'nas:{9100 + index}', 'host': 'nas'},
+             'health': 'up', 'lastScrape': '2026-11-06T11:59:50Z', 'scrapeInterval': '15s'}
+            for index in range(MAX_TARGETS_PER_HOST + 1)]
+    calls = []
+
+    def respond(request):
+        if request.url.raw_path.decode() == TARGET_PATH:
+            return json_response({'status': 'success', 'data': {'activeTargets': many}})
+        calls.append(parse_qs(request.url.query.decode())['query'][0])
+        return json_response({'status': 'success', 'data': {'resultType': 'matrix', 'result': []}})
+
+    key = next(row['host_key'] for row in normalize_targets(many, INVENTORY)['rows'] if row['host_label'] == 'nas')
+    result = await reader(respond).history('internal', key, '1h')
+    assert result['source']['status'] == 'partial'
+    # The fifth target is never queried: the bound holds, and the answer says something was left out.
+    assert not any(f'nas:{9100 + MAX_TARGETS_PER_HOST}' in query for query in calls)
+    assert any(f'nas:{9100 + MAX_TARGETS_PER_HOST - 1}' in query for query in calls)
+
+    exact = many[:MAX_TARGETS_PER_HOST]
+
+    def respond_exact(request):
+        if request.url.raw_path.decode() == TARGET_PATH:
+            return json_response({'status': 'success', 'data': {'activeTargets': exact}})
+        return json_response({'status': 'success', 'data': {'resultType': 'matrix', 'result': []}})
+
+    assert (await reader(respond_exact).history('internal', key, '1h'))['source']['status'] == 'ok'
