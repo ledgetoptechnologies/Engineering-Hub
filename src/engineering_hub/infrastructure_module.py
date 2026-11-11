@@ -22,6 +22,7 @@ are not protection against hostile root racing within an individual syscall.
 """
 from dataclasses import dataclass
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -32,6 +33,8 @@ from .infrastructure import CAPABILITIES, HUMAN_ONLY, InfrastructurePrincipal, I
 from .infrastructure_service import InfrastructureService
 from .repository import AGENTS, HubRepository
 
+
+logger = logging.getLogger(__name__)
 
 MAX_CONFIG_BYTES = 16384
 # Existing private Prometheus endpoint, independently observed serving active
@@ -182,46 +185,64 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
     """Load optional settings; closed failures expose no paths or raw errors."""
     module=InfrastructureModule()
     if path is None:
+        logger.warning('Infrastructure startup: config_not_selected')
         return module
     used_default = False
     try:
         enabled,grants,prometheus=_settings(path)
     except FileNotFoundError:
         if default_owner is None:
+            logger.warning('Infrastructure startup: config_missing_no_default_owner')
             return module
         # Explicit app-owned defaults remove manual settings-file setup. An
         # existing file, including enabled:false, always retains precedence.
         if (type(default_owner) is not str or re.fullmatch(
                 r'human:(?:[1-9][0-9]{0,19}|cf:[0-9a-f]{64})', default_owner) is None):
-            module.state='invalid';return module
+            module.state='invalid'
+            logger.warning('Infrastructure startup: invalid_default_owner')
+            return module
         enabled, prometheus = True, None
         used_default = True
         grants = {InfrastructurePrincipal('human', default_owner): CAPABILITIES}
         grants.update({InfrastructurePrincipal('agent', agent): frozenset({'read'}) for agent in AGENTS})
     except Exception:
-        module.state='invalid';return module
+        module.state='invalid'
+        logger.warning('Infrastructure startup: config_unreadable_or_invalid')
+        return module
     if not enabled:
+        logger.warning('Infrastructure startup: explicitly_disabled')
         return module
     db=None;root_fd=None;file_fd=None
+    stage='state_directory'
     try:
         _need(os.name=='posix')
         import fcntl
         selected=Path(state_root).absolute()
         parent=_directory(selected)
         try:
+            stage='state_directory_create'
             try:
                 os.mkdir('infrastructure',0o700,dir_fd=parent)
-                os.chmod('infrastructure',0o700,dir_fd=parent,follow_symlinks=False)
             except FileExistsError:
                 pass
+            else:
+                stage='state_directory_chmod'
+                os.chmod('infrastructure',0o700,dir_fd=parent,follow_symlinks=False)
+            stage='state_directory_open'
             root_fd=os.open('infrastructure',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
             selected_info=os.fstat(parent)
         finally:os.close(parent)
         info=os.fstat(root_fd)
-        _need(info.st_uid==os.getuid() and stat.S_IMODE(info.st_mode)==0o700)
+        stage='state_directory_owner'
+        _need(info.st_uid==os.getuid())
+        stage='state_directory_mode'
+        _need(stat.S_IMODE(info.st_mode)==0o700)
+        stage='state_lock'
         fcntl.flock(root_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        stage='state_directory_identity'
         directory=selected/'infrastructure'
         _need(_identity(directory.stat(follow_symlinks=False))==_identity(info))
+        stage='database_admission'
         for name in ('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal'):
             try:os.stat(name,dir_fd=root_fd,follow_symlinks=False)
             except FileNotFoundError:continue
@@ -268,6 +289,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         # SQLite VFS sidecar paths. Named identity gates are checked at every
         # registry read/write boundary and permanently veto path replacement.
         sqlite_location=Path('/proc/self/fd')/str(root_fd)/name
+        stage='database_schema'
         if existing:
             # immutable prevents SQLite from creating WAL/SHM files while
             # inspecting an unknown database. Sidecars above are never adopted.
@@ -276,9 +298,11 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             finally:readonly.close()
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         _need(admission())
+        stage='database_open'
         db=sqlite3.connect(sqlite_location.as_uri()+'?mode=rw',uri=True,check_same_thread=False)
         registry=InfrastructureRegistry(db,capabilities=grants,admission_guard=admission)
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
+        stage='service_setup'
         service=InfrastructureService(registry,on_change=on_change)
         if prometheus is not None:
             from .infrastructure_prometheus import PrometheusCollector
@@ -294,10 +318,12 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
+        logger.info('Infrastructure startup: ready')
         root_fd=None;db=None
         return module
     except Exception:
         module.state='invalid'
+        logger.warning('Infrastructure startup: %s_failed', stage)
         return module
     finally:
         if db is not None:db.close()
