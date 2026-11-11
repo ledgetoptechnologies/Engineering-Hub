@@ -8,7 +8,7 @@ an installed pilot, host approval or a network connection to TrueNAS.
 ## Separate validation and serving
 
 The explicit module operations are `validate --config <absolute-path>` and
-`serve --config <absolute-path>`. Both require Linux PID1, real/effective
+`serve --config <absolute-path> --session-config <absolute-path>`. Both require Linux PID1, real/effective
 UID/GID10001, and a canonical regular single-link configuration file owned by
 that UID, mode0600 on a read-only mount. The file must remain stable while read
 and cannot sit beneath the writable database parent. No paths are provisioned
@@ -17,7 +17,13 @@ or repaired. A valid file or canonical JSON is not approval of its contents.
 `validate` reads only the configuration and validates its data/model shape.
 It does not open secrets, sockets, providers or the database, contact an
 identity provider, or establish host readiness. It does not validate an actual
-supervisor's drain behavior. `serve` separately resolves four distinct TEST
+supervisor's drain behavior, and it rejects `--session-config`. `serve` requires
+an independently reviewed manual-session file on a read-only mount, read via
+the protected current-UID mode0600 file and mode0700 parent checks. Parsing it
+does not prove its operator assertions. The session begins pending and requires
+the named human's acceptance and a fresh signed executor observation; the report
+must reflect independently established inventory, writer exclusion and absence
+of unresolved effects. `serve` separately resolves four distinct TEST
 credentials and calls the owned queue service. A missing required core Unix
 client API is rejected before secrets or owner state are touched. That check
 is compatibility evidence, not authentication of the core artifact.
