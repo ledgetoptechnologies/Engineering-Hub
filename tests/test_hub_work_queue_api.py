@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from agent_message_bus.auth import AuthSettings
 from engineering_hub.auth import AuthConfig, SessionStore, require_human
 from engineering_hub.repository import AGENTS, HubError, HubRepository
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 from engineering_hub.work_queue import WorkAction, WorkQueue
 from engineering_hub.work_queue_api import attach_work_queue_routes
 
@@ -184,8 +185,7 @@ def test_production_priority_is_not_approval_and_claim_rechecks_review(rig):
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
     staging = submission()
     assert client.post(BASE + '/jobs', headers=bearer(), json=staging).status_code == 201
-    current = repo.get_task(staging['target']['task_id'])
-    repo.set_candidate('codex', current['id'], current['revision'], 'c' * 40)
+    corrupt_review_after_active_work(repo, staging['target']['task_id'])
     assert client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())}).json()['job'] is None
 
 

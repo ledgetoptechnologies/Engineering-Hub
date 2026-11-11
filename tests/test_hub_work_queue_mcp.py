@@ -11,6 +11,7 @@ import pytest
 from agent_message_bus.auth import AuthSettings
 from engineering_hub.mcp import HubMCPAuthMiddleware, build_hub_mcp
 from engineering_hub.repository import HubError, HubRepository
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 from engineering_hub.work_queue import WorkAction, WorkQueue
 from engineering_hub.work_queue_api import attach_work_queue_routes
 
@@ -202,8 +203,7 @@ def test_production_remains_blocked_and_stale_review_not_claimable(rig):
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
     body = payload()
     call(client, 'hub_work_submit', body)
-    item = repo.get_task(body['target']['task_id'])
-    repo.set_candidate('codex', item['id'], item['revision'], 'c' * 40)
+    corrupt_review_after_active_work(repo, body['target']['task_id'])
     assert call(client, 'hub_work_claim', {'instance_id': str(uuid4())})['job'] is None
 
 
