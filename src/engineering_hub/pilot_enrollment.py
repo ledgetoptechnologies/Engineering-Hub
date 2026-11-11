@@ -61,6 +61,7 @@ _DDL = {
     'hub_interactive_review_requests': 'CREATE TABLE hub_interactive_review_requests (actor TEXT NOT NULL,key TEXT NOT NULL,fingerprint TEXT NOT NULL,review_id TEXT NOT NULL,PRIMARY KEY(actor,key))',
     'hub_interactive_review_answer_events': 'CREATE TABLE hub_interactive_review_answer_events (review_id TEXT NOT NULL,revision INTEGER NOT NULL,item_id TEXT NOT NULL,actor TEXT NOT NULL,value TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(review_id,revision,item_id))',
     'hub_interactive_asset_bindings': 'CREATE TABLE hub_interactive_asset_bindings (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)',
+    'hub_decision_requests': 'CREATE TABLE hub_decision_requests (actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(actor,project,key))',
 }
 # Exact current native-module indexes only; this is not generic index admission.
 _INDEX_DDL = {

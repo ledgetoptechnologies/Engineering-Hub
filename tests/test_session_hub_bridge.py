@@ -377,8 +377,11 @@ def test_session_decision_read_cross_surface_and_project_grants(unified):
     installation, token, _ = pair(env, caps=('decision.request', 'decision.read'))
     _, no_read, _ = pair(env, name='no-read', caps=('decision.request',))
     invoke, _ = sdk(client, token); denied, _ = sdk(client, no_read)
-    created = data(invoke('hub_decision_request', {'project':PROJECT,'title':'Shared question',
-                                                   'options':['A','B']}))
+    request = {'project': PROJECT, 'title': 'Shared question', 'options': ['A', 'B'],
+               'client_request_id': 'shared-question-1'}
+    created = data(invoke('hub_decision_request', request))
+    assert data(invoke('hub_decision_request', request))['id'] == created['id']
+    assert invoke('hub_decision_request', {**request, 'title': 'Changed'})['isError']
     overview = client.get('/api/hub/v1/overview').json()
     assert next(row for row in overview['decisions'] if row['id']==created['id'])['status']=='open'
     response = client.post('/api/hub/v1/decisions/'+created['id']+'/answer', headers=csrf,
@@ -386,6 +389,12 @@ def test_session_decision_read_cross_surface_and_project_grants(unified):
     assert response.status_code==200
     answer = data(invoke('hub_decision_get', {'decision_id':created['id']}))
     assert answer['status']=='answered' and answer['answer']=='B' and answer['execution_authorization'] is False
+    request_only = {**request, 'client_request_id': 'request-only'}
+    created_without_read = data(denied('hub_decision_request', request_only))
+    response = client.post('/api/hub/v1/decisions/'+created_without_read['id']+'/answer', headers=csrf,
+                           json={'expected_revision':1,'answer':'B'})
+    assert response.status_code == 200
+    assert data(denied('hub_decision_request', request_only)) == created_without_read
     assert denied('hub_decision_get', {'decision_id':created['id']})['isError']
     other = app.state.repository.create_decision(OWNER, 'project-alpha', 'Private scope', ['A','B'])
     cross=invoke('hub_decision_get', {'decision_id':other['id']})

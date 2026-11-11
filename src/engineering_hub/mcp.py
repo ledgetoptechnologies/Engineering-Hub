@@ -197,11 +197,15 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
     @registration.tool()
     def hub_decision_request(project: str, title: str, options: list[str], ctx: Context, protected: bool = False,
                               details: str | None = None, links: list[dict[str, str]] | None = None,
-                              allow_text: bool = False) -> dict:
-        """Request a human decision; this tool cannot answer or grant approval."""
+                              allow_text: bool = False, client_request_id: str | None = None) -> dict:
+        """Request a human decision. Reuse client_request_id for the original creation receipt.
+
+        Without a request ID each call creates a new decision. This grants no approval.
+        """
         principal = identity(ctx)
         return invoke(lambda: repo.create_decision(principal, project, title, options, protected,
-                                                  details=details, links=links, allow_text=allow_text))
+                                                  details=details, links=links, allow_text=allow_text,
+                                                  client_request_id=client_request_id))
 
     @registration.tool()
     def hub_decision_get(decision_id: str, ctx: Context) -> dict:

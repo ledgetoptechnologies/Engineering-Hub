@@ -87,6 +87,10 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
+                CREATE TABLE IF NOT EXISTS hub_decision_requests (
+                    actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL, receipt TEXT NOT NULL,
+                    PRIMARY KEY(actor,project,key));
             '''
             # executescript commits an existing transaction implicitly, which
             # would bypass the final capability check and rollback boundary.
@@ -519,7 +523,8 @@ class HubRepository:
                 and row['family'] == family
                 and row['capability'] == 'task.candidate')
 
-    def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False):
+    def create_decision(self, actor, project, title, options, protected=False, *, details=None, links=None, allow_text=False,
+                        client_request_id=None):
         self._actor(actor)
         title = self._text(title)
         if type(protected) is not bool or not isinstance(options, list) or not 2 <= len(options) <= 5:
@@ -532,11 +537,24 @@ class HubRepository:
         context = self._context(details, links)
         if allow_text:
             context['allow_text'] = True
+        key = self._text(client_request_id) if client_request_id is not None else None
+        fingerprint = hashlib.sha256(_json([title, options, protected, context]).encode()).hexdigest()
         with self._transaction() as db:
             self._project(project, db)
-            return self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
+            if key is not None:
+                prior = db.execute('SELECT fingerprint,receipt FROM hub_decision_requests '
+                                   'WHERE actor=? AND project=? AND key=?', (actor, project, key)).fetchone()
+                if prior:
+                    if prior['fingerprint'] != fingerprint:
+                        raise HubError('idempotency_conflict', 409)
+                    return json.loads(prior['receipt'])
+            item = self._save(db, actor, 'decision.created', 'decision', dict(id=str(uuid.uuid4()), project=project,
                 title=title, options=options, protected=protected, status='open', answer=None,
                 execution_authorization=False, **context), new=True)
+            if key is not None:
+                db.execute('INSERT INTO hub_decision_requests VALUES(?,?,?,?,?)',
+                           (actor, project, key, fingerprint, _json(item)))
+            return item
 
     def update_context(self, actor, kind, identity, expected_revision, details, links):
         """Human-only CAS edit; task review never survives changed instructions."""
