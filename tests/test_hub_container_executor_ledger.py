@@ -12,7 +12,7 @@ import pytest
 
 from engineering_hub.container_pilot_client import ContainerPilotEvidence, ContainerPilotRequest
 import hub_container_executor.ledger as ledger_module
-from hub_container_executor.ledger import OwnerBusy, SQLiteLedger, _mount_type_for
+from hub_container_executor.ledger import OwnerBusy, SQLiteLedger, _mount_type_for, single_pilot_outcome_digest
 
 MANIFEST = "sha256:" + "a" * 64
 COMMIT = "b" * 40
@@ -467,7 +467,10 @@ def test_single_pilot_gate_requires_exact_verified_outcome_and_ack_after_reopen(
     # An already recorded success is not surfaced until the trusted caller has
     # verified external effects and explicitly stores the exact outcome.
     assert ledger.admit(cmd).response.state == 'held'
+    assert ledger.get(cmd.command_id).state == 'held'
     ledger.record_single_pilot_verified_outcome(cmd, result)
+    ledger.record_single_pilot_verified_outcome(cmd, result)
+    assert ledger.get(cmd.command_id).state == 'succeeded'
     assert ledger.inspect_single_pilot()['state'] == 'awaiting_ack'
     replay = ledger.admit(cmd)
     assert replay.replayed and replay.response.state == 'succeeded'
@@ -477,13 +480,15 @@ def test_single_pilot_gate_requires_exact_verified_outcome_and_ack_after_reopen(
     try:
         assert ledger.inspect_single_pilot()['state'] == 'awaiting_ack'
         conflict = cmd.model_copy(update={'fencing_generation':cmd.fencing_generation+1})
-        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(conflict, result)
+        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(conflict, single_pilot_outcome_digest(result))
         altered = result.model_copy(update={'reason':'effect_failed'})
-        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(cmd, altered)
-        ledger.acknowledge_single_pilot(cmd,result)
-        ledger.acknowledge_single_pilot(cmd,result)
-        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(conflict,result)
+        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(cmd, single_pilot_outcome_digest(altered))
+        ledger.acknowledge_single_pilot(cmd,single_pilot_outcome_digest(replay.response))
+        ledger.acknowledge_single_pilot(cmd,single_pilot_outcome_digest(result))
+        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(conflict,single_pilot_outcome_digest(result))
         assert ledger.inspect_single_pilot() is None
+        assert ledger.admit(cmd).replayed and ledger.admit(cmd).response.state == 'succeeded'
+        assert single_pilot_outcome_digest(replay.response) == single_pilot_outcome_digest(result)
         ledger.arm_single_pilot(other)
         assert ledger.admit(other).accepted is False  # Existing target phase still fences it.
     finally:
@@ -518,7 +523,7 @@ def test_single_pilot_unverified_or_incomplete_result_cannot_advance(tmp_path):
                                            health='unknown', evidence_verified=True))
         with pytest.raises(PermissionError): ledger.record_single_pilot_verified_outcome(cmd,result)
         assert ledger.inspect_single_pilot()['state'] == 'effect_held'
-        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(cmd,result)
+        with pytest.raises(PermissionError): ledger.acknowledge_single_pilot(cmd,single_pilot_outcome_digest(result))
     finally:
         ledger.close()
 
@@ -546,5 +551,59 @@ def test_single_pilot_process_exit_preserves_gate(tmp_path, stage):
         assert ledger.inspect_single_pilot()['state'] == stage
         assert not ledger.admit(request()).accepted
         with pytest.raises(PermissionError): ledger.arm_single_pilot(cmd)
+    finally:
+        ledger.close()
+
+
+def _single_pilot_uncommitted_child(database_path):
+    db = sqlite3.connect(database_path, isolation_level=None)
+    db.execute('BEGIN IMMEDIATE')
+    db.execute("DELETE FROM control WHERE key='single_pilot_gate'")
+    os._exit(0)
+
+
+def test_uncommitted_ack_crash_does_not_release_gate(tmp_path):
+    ledger = open_ledger(tmp_path); cmd = request()
+    ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(cmd)
+    result = _single_pilot_synthetic_terminal(ledger,cmd)
+    ledger.record_single_pilot_verified_outcome(cmd,result)
+    path=str(ledger.path); ledger.close()
+    ctx=multiprocessing.get_context('spawn')
+    child=ctx.Process(target=_single_pilot_uncommitted_child,args=(path,))
+    child.start(); child.join(15); assert child.exitcode == 0
+    ledger=open_ledger(tmp_path)
+    try:
+        assert ledger.inspect_single_pilot()['state'] == 'awaiting_ack'
+        assert not ledger.admit(request()).accepted
+        ledger.acknowledge_single_pilot(cmd,single_pilot_outcome_digest(result))
+        ledger.acknowledge_single_pilot(cmd,single_pilot_outcome_digest(result))
+    finally:
+        ledger.close()
+
+
+def test_concurrent_arming_has_one_winner(tmp_path):
+    ledger=open_ledger(tmp_path); ledger.enable_single_pilot_protocol()
+    results=[]; barrier=threading.Barrier(3)
+    def arm(cmd):
+        barrier.wait()
+        try:
+            ledger.arm_single_pilot(cmd); results.append('armed')
+        except PermissionError:
+            results.append('held')
+    threads=[threading.Thread(target=arm,args=(request(),)) for _ in range(2)]
+    try:
+        for thread in threads: thread.start()
+        barrier.wait()
+        for thread in threads: thread.join(10)
+        assert sorted(results) == ['armed','held']
+    finally:
+        ledger.close()
+
+
+def test_protocol_enable_refuses_existing_control_or_run_state(tmp_path):
+    ledger=open_ledger(tmp_path)
+    try:
+        ledger.set_paused(True)
+        with pytest.raises(PermissionError): ledger.enable_single_pilot_protocol()
     finally:
         ledger.close()

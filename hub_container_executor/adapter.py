@@ -181,11 +181,17 @@ class HostAdapter:
             return admission.response
         deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
         try:
-            return self._execute(request, deadline)
+            result = self._execute(request, deadline)
+            if self.ledger.single_pilot_enabled():
+                # A stored success is not observable until a future trusted
+                # verifier records the exact outcome in the protocol gate.
+                return self.ledger.get(request.command_id)
+            return result
         except _Held as held:
             return self._finish(request, "held", held.reason)
         except _TerminalOperationFailed:
-            return self._finish(request, "failed", "effect_failed")
+            result = self._finish(request, "failed", "effect_failed")
+            return self.ledger.get(request.command_id) if self.ledger.single_pilot_enabled() else result
         except (BuildRecordError, ValueError, TypeError):
             # Never reflect parser details, paths, builder metadata or secrets.
             return self._finish(request, "held", "image_unavailable")
@@ -526,6 +532,10 @@ class HostAdapter:
     def reconcile(self, command_id: str) -> ContainerPilotResponse | None:
         """Inspect exact durable operation IDs only; never re-effect or re-probe."""
         with self._active_operation():
+            if self.ledger.single_pilot_enabled():
+                # Reconciliation mutates ledger evidence; it must not race the
+                # future single-pilot verifier. Until wired, only inspect gate.
+                return self.ledger.get(command_id)
             return self._reconcile_active(command_id)
 
     def _reconcile_active(self, command_id: str) -> ContainerPilotResponse | None:

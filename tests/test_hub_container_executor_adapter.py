@@ -518,3 +518,34 @@ def test_reentrant_close_from_effect_callback_is_deferred_until_result_commit(tm
     replacement = HostAdapter(adapter.ledger.path, manifest)
     assert replacement.get(request.command_id).state == "succeeded"
     replacement.close()
+
+
+def test_single_pilot_get_and_reconcile_never_surface_unverified_terminal(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    cmd = command(manifest, 'deploy_container')
+    try:
+        adapter.ledger.enable_single_pilot_protocol()
+        adapter.ledger.arm_single_pilot(cmd)
+        assert adapter.ledger.admit(cmd).accepted
+        adapter.ledger.finish(cmd.command_id, state='succeeded', reason=None,
+                              evidence=adapter._evidence('c'*64, manifest.candidate.image_config_id, 'unknown', True))
+        assert adapter.get(cmd.command_id).state == 'held'
+        before = list(backend.events)
+        assert adapter.reconcile(cmd.command_id).state == 'held'
+        assert backend.events == before
+    finally:
+        adapter.close()
+
+
+def test_single_pilot_submit_does_not_surface_unverified_success(tmp_path):
+    adapter, backend, _state, manifest = make_fixture(tmp_path)
+    cmd = command(manifest, 'deploy_container')
+    try:
+        adapter.ledger.enable_single_pilot_protocol()
+        adapter.ledger.arm_single_pilot(cmd)
+        response = adapter.submit(cmd)
+        assert response.state == 'held' and response.reason == 'recovery_required'
+        assert 'create' in backend.events and 'start' in backend.events
+        assert adapter.get(cmd.command_id).state == 'held'
+    finally:
+        adapter.close()
