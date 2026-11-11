@@ -30,7 +30,7 @@ def validate_colocated_session(config, enrollment):
 
 
 def require_core_compatibility():
-    """Reject older core releases before loading operator session material."""
+    """Reject cores missing the required read-only reader API before loading session material."""
     from engineering_hub.unified_pilot_startup import read_protected_file
     try:
         parameter = inspect.signature(read_protected_file).parameters['require_readonly']
