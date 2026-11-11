@@ -1666,17 +1666,22 @@ def test_adapter_with_v2_journal_holds_before_create_and_cannot_replay(tmp_path,
             raise httpx.ReadTimeout("synthetic create response loss")
         raise AssertionError(f"unexpected fake route {request.method} {path}")
 
-    from hub_container_executor.operation_journal import SQLiteOperationJournal
+    from hub_container_executor.operation_journal import OperationJournalError, SQLiteOperationJournal
     journal_dir = tmp_path / 'effect-journal'
     journal_dir.mkdir(mode=0o700)
     journal = SQLiteOperationJournal(journal_dir / 'operations.sqlite', create=True,
                                      allow_ephemeral_test_storage=True)
     journal.enable_bindings()
     attempts = []
+    errors = []
     real_begin = journal.begin
     def observe_unbound_begin(operation_id, kind):
         attempts.append((operation_id, kind))
-        return real_begin(operation_id, kind)
+        try:
+            return real_begin(operation_id, kind)
+        except OperationJournalError as error:
+            errors.append((type(error), str(error)))
+            raise
     monkeypatch.setattr(journal, 'begin', observe_unbound_begin)
     driver = DockerEngineBackend(
         binding(manifest, tmp_path), operation_journal=journal,
@@ -1689,6 +1694,7 @@ def test_adapter_with_v2_journal_holds_before_create_and_cannot_replay(tmp_path,
         assert response.state == "held" and response.reason == "inspect_required"
         assert create_posts == 0
         assert len(attempts) == 1 and attempts[0][1] == 'create_candidate'
+        assert errors == [(OperationJournalError, 'Unbound intents disabled after binding migration')]
         assert journal.inspect(attempts[0][0]) is None
         reconciled = adapter.reconcile(request.command_id)
         assert reconciled.state == "held"
