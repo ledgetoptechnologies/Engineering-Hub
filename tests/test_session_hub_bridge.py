@@ -442,6 +442,55 @@ def test_decision_read_holds_session_writer_until_result_is_authorized(env):
             pass
 
 
+@pytest.mark.parametrize('kind', ['session', 'grant'])
+def test_decision_read_expiry_after_fetch_denies_result(env, kind):
+    installation, token, _ = pair(env, caps=('decision.read',))
+    if kind == 'grant':
+        env.bridge.grant_put(OWNER, installation, 1, [PROJECT], ['decision.read'], 60)
+    item = env.repo.create_decision(OWNER, PROJECT, 'Question', ['A', 'B'])
+    returned = []
+    with pytest.raises(AgentSessionError if kind == 'session' else HubError):
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id': item['id']}, op)
+            value = env.repo.get_decision(item['id'])
+            env.clock.value += 901 if kind == 'session' else 61
+            op.before_commit(env.repo.path, None)
+            returned.append(value)
+    assert returned == []
+
+
+def test_decision_read_serializes_session_revocation(env):
+    _, token, _ = pair(env, caps=('decision.read',))
+    session_id = env.sessions.authenticate_session(token).session_id
+    item = env.repo.create_decision(OWNER, PROJECT, 'Question', ['A', 'B'])
+    entered, release, attempting, revoked = (threading.Event() for _ in range(4))
+    def read():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id': item['id']}, op)
+            value = env.repo.get_decision(item['id'])
+            entered.set(); assert release.wait(5)
+            op.before_commit(env.repo.path, None)
+            return value
+    def revoke():
+        attempting.set()
+        env.sessions.revoke_session(OWNER, session_id, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(read)
+        try:
+            assert entered.wait(5)
+            revoke_future = pool.submit(revoke)
+            assert attempting.wait(5)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert read_future.result(timeout=5)['id'] == item['id']
+        revoke_future.result(timeout=5)
+    with pytest.raises(AgentSessionError):
+        with env.bridge.admit(token, 'hub_decision_get'):
+            pass
+
+
 def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
