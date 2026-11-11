@@ -31,6 +31,14 @@ of unresolved effects. `serve` separately resolves four distinct TEST
 credentials and calls the owned queue service. A missing required core Unix
 client API is rejected before secrets or owner state are touched. That check
 is compatibility evidence, not authentication of the core artifact.
+For a static check of independently prepared files, an operator may run
+`python -I -m hub_container_executor.colocated_pair_preflight --runner <path> --coordinator <path> --session <path>`
+under the files' owner. It reads protected files from read-only mounts and
+compares manifest, protocol mode, executor bearer digest and independently
+enrolled release pins. `static_pair_consistent_not_approved` means only those
+data agree. It does not resolve bearer values, prove that differently mounted
+socket paths reach the same socket, check host ownership, validate live launch
+identity, grant operator acceptance or start any service.
 The executor wheel also requires a core with the protected reader's
 `require_readonly` keyword; the image compatibility check and `serve` reject an
 older core before reading session material. Use a separately reviewed matching

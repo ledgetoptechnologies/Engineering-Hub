@@ -39,7 +39,7 @@ def archive(extra=(), *, comment=REVISION, omit=None):
                for name in MODULE._METADATA]
     members += [(f"hub_container_executor/{name}", b"# inert fixture\n", tarfile.REGTYPE)
                 for name in ("__init__.py", "service.py", "local_resources.py", "runtime_identity.py",
-                             "installed_runner.py", "installed_coordinator.py", "colocated_session.py",
+                             "installed_runner.py", "installed_coordinator.py", "colocated_session.py", "colocated_pair_preflight.py",
                              "coordinator_observation_transport.py", "launch_supervisor.py",
                              "launcher_cli.py", "launch_transport.py", "configuration_commitment.py")]
     members += [("scripts/not_shipped.py", b"raise RuntimeError()", tarfile.REGTYPE),
@@ -64,7 +64,7 @@ def test_prepare_stages_only_explicit_library_and_helper(tmp_path):
     assert actual == set(MODULE._METADATA.values()) | {
         f"src/hub_container_executor/{name}" for name in (
             "__init__.py", "service.py", "local_resources.py", "runtime_identity.py",
-            "installed_runner.py", "installed_coordinator.py", "colocated_session.py",
+            "installed_runner.py", "installed_coordinator.py", "colocated_session.py", "colocated_pair_preflight.py",
             "coordinator_observation_transport.py", "launch_supervisor.py",
             "launcher_cli.py", "launch_transport.py", "configuration_commitment.py", "_executor_source.json")}
     record = json.loads((out / "src/hub_container_executor/_executor_source.json").read_text())
@@ -93,6 +93,7 @@ def test_invalid_members_do_not_publish_output(tmp_path, extra):
     {"omit": "hub_container_executor/installed_runner.py"},
     {"omit": "hub_container_executor/installed_coordinator.py"},
     {"omit": "hub_container_executor/colocated_session.py"},
+    {"omit": "hub_container_executor/colocated_pair_preflight.py"},
     {"omit": "hub_container_executor/coordinator_observation_transport.py"},
     {"omit": "hub_container_executor/launch_supervisor.py"},
     {"omit": "hub_container_executor/launcher_cli.py"},
