@@ -492,12 +492,18 @@ def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
 @pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200, 0o1600, 0o2600, 0o4600, 0o1700])
 def test_unsafe_file_modes_stay_closed(tmp_path, caplog, mode):
     settings, directory, database = _populated(tmp_path)
-    database.chmod(mode)
-    before = _snapshot(directory)
-    module = compose_infrastructure(settings, state_root=tmp_path)
-    assert module.state == 'invalid' and module.service is None
-    assert 'database_file_failed' in caplog.text
-    assert _snapshot(directory) == before
+    with database.open('rb') as retained:
+        database.chmod(mode)
+        before = (retained.read(), stat.S_IMODE(database.stat().st_mode), database.stat().st_ino)
+        entries = {p.name for p in directory.iterdir()}
+        module = compose_infrastructure(settings, state_root=tmp_path)
+        assert module.state == 'invalid' and module.service is None
+        expected_stage = 'database_admission_failed' if mode == 0o200 else 'database_file_failed'
+        assert expected_stage in caplog.text
+        retained.seek(0)
+        after = (retained.read(), stat.S_IMODE(database.stat().st_mode), database.stat().st_ino)
+        assert after == before
+        assert {p.name for p in directory.iterdir()} == entries
 
 
 @POSIX
