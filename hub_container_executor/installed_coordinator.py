@@ -219,15 +219,19 @@ def target_allowed(config, actor, action_key, environment, target):
 
 
 async def run_installed_coordinator(config, *, reconciliation_factory=None,
-                                     session_acceptance_factory=None):
+                                     session_acceptance_factory=None, session_enrollment=None):
+    composition = None
     try:
         _process()
         _require(type(config) is CoordinatorConfiguration and config.process_id == os.getpid())
         from engineering_hub.queued_pilot_service import _synchronous
         # Fixed JSON/CLI input cannot impersonate the missing trusted operator
         # channel. An explicit Python composition must supply that dependency.
-        _require(_synchronous(reconciliation_factory))
-        _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        if session_enrollment is None:
+            _require(_synchronous(reconciliation_factory))
+            _require(session_acceptance_factory is None or _synchronous(session_acceptance_factory))
+        else:
+            _require(reconciliation_factory is None and session_acceptance_factory is None)
         # The optional wheel can coexist with an older core having the same
         # distribution version. Deny that unsupported composition before even
         # reading TEST secrets. API presence is compatibility, not attestation
@@ -238,6 +242,12 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
         _require(len(set(tokens.values())) == 4 and all(
             type(token) is str and token and all(33 <= ord(char) <= 126 for char in token)
             for token in tokens.values()))
+        if session_enrollment is not None:
+            from .colocated_session import ColocatedTrustedSession
+            composition = ColocatedTrustedSession(config=config, enrollment=session_enrollment,
+                                                   credential=tokens['executor'])
+            reconciliation_factory = composition.reconciliation_factory
+            session_acceptance_factory = composition.session_acceptance_factory
         settings = Settings(Path(config.database), AuthSettings(
             hermes_token=tokens['hermes'], codex_token=tokens['codex'], claude_token=tokens['claude'],
             allowed_ips=frozenset({'127.0.0.1'})), config.auth, work_queue_enabled=True,
@@ -260,6 +270,9 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
     except Exception:
         raise InstalledCoordinatorError() from None
+    finally:
+        if composition is not None:
+            composition.close()
 
 
 class _Parser(argparse.ArgumentParser):
@@ -272,11 +285,21 @@ def main(argv=None):
         parser = _Parser(description='Explicit colocated TEST pilot coordinator', allow_abbrev=False)
         parser.add_argument('operation', choices=('validate', 'serve'))
         parser.add_argument('--config', required=True, action='append')
+        parser.add_argument('--session-config', action='append')
         args = parser.parse_args(argv)
         _require(len(args.config) == 1)
+        _require(args.session_config is None or len(args.session_config) == 1)
         config = load_configuration(args.config[0])
         if args.operation == 'serve':
-            asyncio.run(run_installed_coordinator(config))
+            _require(args.session_config is not None)
+            from engineering_hub.unified_pilot_startup import read_protected_file
+            from engineering_hub.trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES
+            session_path = _path(args.session_config[0])
+            enrollment = parse_enrollment(read_protected_file(Path(session_path), maximum_bytes=MAX_ENROLLMENT_BYTES,
+                                                               require_readonly=True))
+            asyncio.run(run_installed_coordinator(config, session_enrollment=enrollment))
+        else:
+            _require(args.session_config is None)
         return 0
     except KeyboardInterrupt:
         return 130

@@ -127,7 +127,7 @@ def _file_identity(info, *, private):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def read_protected_file(path, *, maximum_bytes, private=True):
+def read_protected_file(path, *, maximum_bytes, private=True, require_readonly=False):
     """Read stable retained bytes through no-follow FDs, never reopen as TLS input.
 
     Secret/profile leaves require current-UID0600 and parent0700. Public CA
@@ -136,7 +136,7 @@ def read_protected_file(path, *, maximum_bytes, private=True):
     """
     directory = fd = None
     try:
-        _require(sys.platform == 'linux' and type(private) is bool)
+        _require(sys.platform == 'linux' and type(private) is bool and type(require_readonly) is bool)
         path = _path(os.fspath(path))
         if private:
             directory, parent_identity = _private_parent(path)
@@ -159,6 +159,8 @@ def read_protected_file(path, *, maximum_bytes, private=True):
             parent = os.fstat(directory)
             parent_identity = parent.st_dev, parent.st_ino
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+        if require_readonly:
+            _require(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
         before = _file_identity(os.fstat(fd), private=private)
         _require(0 < before[2] <= maximum_bytes)
         _require(_file_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False), private=private) == before)
@@ -171,6 +173,8 @@ def read_protected_file(path, *, maximum_bytes, private=True):
         _require(len(pieces) == before[2]
                  and _file_identity(os.fstat(fd), private=private) == before
                  and _file_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False), private=private) == before)
+        if require_readonly:
+            _require(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
         if private:
             _check_parent(path, directory, parent_identity)
         else:
