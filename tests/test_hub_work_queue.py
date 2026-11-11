@@ -76,6 +76,17 @@ def test_status_does_not_disclose_holder_outside_fifty_jobs(setup_queue):
                for item in jobs)
 
 
+def test_status_limit_one_does_not_disclose_hidden_holder(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    jobs = q.status(limit=1)['jobs']
+    assert len(jobs) == 1 and jobs[0]['id'] == waiting['id']
+    assert jobs[0]['blocked_reason'] == 'machine_reserved'
+    assert jobs[0]['reservation_holder_job_id'] is None and original['id'] != waiting['id']
+
+
 def test_status_reservation_and_visible_state_share_one_snapshot(setup_queue, monkeypatch):
     q, _, _, _ = setup_queue
     original = submit(q, key='holder')

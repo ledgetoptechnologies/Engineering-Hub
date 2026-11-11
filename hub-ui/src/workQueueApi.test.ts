@@ -19,9 +19,10 @@ describe("read-only software queue", () => {
     const holder = { ...data.jobs[0], id: waiting.reservation_holder_job_id, state: "held", blocked_reason: "requires_reconciliation", requires_reconciliation: true };
     const snapshot = { ...data, jobs: [waiting, holder] };
     expect(parseQueueSnapshot(snapshot).jobs[0].reservation_holder_job_id).toBe(holder.id);
-    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting] })).toThrow("invalid_queue_snapshot");
-    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, machine_id: "other" }] })).toThrow("invalid_queue_snapshot");
-    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, state: "succeeded" }] })).toThrow("invalid_queue_snapshot");
+    expect(parseQueueSnapshot({ ...data, jobs: [waiting] }).jobs[0].reservation_holder_job_id).toBeNull();
+    expect(parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, machine_id: "other" }] }).jobs[0].reservation_holder_job_id).toBeNull();
+    expect(parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, state: "succeeded" }] }).jobs[0].reservation_holder_job_id).toBeNull();
+    expect(() => parseQueueSnapshot({ ...data, jobs: [{ ...waiting, reservation_holder_job_id: "bad" }] })).toThrow("invalid_queue_snapshot");
     expect(parseQueueSnapshot({ ...data, jobs: [{ ...waiting, reservation_holder_job_id: null }] }).jobs[0].reservation_holder_job_id).toBeNull();
     expect(parseQueueSnapshot(fixture()).jobs[0].reservation_holder_job_id).toBeNull();
   });

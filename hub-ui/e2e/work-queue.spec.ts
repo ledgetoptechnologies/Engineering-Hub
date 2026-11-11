@@ -62,9 +62,45 @@ test("shows only an authoritative visible reservation holder", async ({ page }) 
     blocked_reason: "machine_reserved", reservation_holder_job_id: holder.id });
   await page.goto("/#/staging");
   const panel = page.getByRole("region", { name: "Software validation queue" });
-  await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (held).`)).toBeVisible();
+  await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (held for reconciliation).`)).toBeVisible();
   expect(state.writes).toBe(0);
   expect(await panel.getByRole("button").count()).toBe(1);
+});
+
+test("keeps queue visible when optional reservation reference does not match", async ({ page }) => {
+  const state = await fixture(page);
+  const holder = state.body.jobs[0];
+  const waitingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  state.body.jobs.push({ ...holder, id: waitingId, state: "queued", requires_reconciliation: false,
+    blocked_reason: "machine_reserved", reservation_holder_job_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" });
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText("Reservation holder is not identified in this snapshot.")).toBeVisible();
+  await expect(panel.getByText("Job " + waitingId, { exact: false })).toBeVisible();
+  expect(state.writes).toBe(0);
+});
+
+test("describes a claimed holder without implying execution", async ({ page }) => {
+  const state = await fixture(page);
+  state.body.jobs[0].state = "claimed";
+  state.body.jobs[0].requires_reconciliation = false;
+  state.body.jobs[0].blocked_reason = null;
+  state.body.jobs.push({ ...state.body.jobs[0], id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    state: "queued", blocked_reason: "machine_reserved", reservation_holder_job_id: jobId });
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (claimed; execution not confirmed).`)).toBeVisible();
+  expect(state.writes).toBe(0);
+});
+
+test("reports pause without claiming an unpaused executor is running", async ({ page }) => {
+  const state = await fixture(page);
+  state.body.master_paused = true;
+  state.body.paused = true;
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText("Master pause: Paused · Queue pause: Not paused · Effective pause: Paused")).toBeVisible();
+  expect(state.writes).toBe(0);
 });
 
 test("queue becoming unavailable clears old rows instead of showing an empty healthy queue", async ({ page }) => {

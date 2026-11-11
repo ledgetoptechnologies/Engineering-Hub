@@ -52,7 +52,7 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
     {stale && <p role="status">Workspace events are stale. Queue information is not continuously verified.</p>}
     {state !== "loaded" && <p role={state === "unknown" ? "alert" : "status"}>{messages[state]}</p>}
     {snapshot && <>
-      <p>Master pause: {snapshot.master_paused ? "On" : "Off"} · Queue pause: {snapshot.queue_paused ? "On" : "Off"} · Effective pause: {snapshot.paused ? "On" : "Off"}</p>
+      <p>Master pause: {snapshot.master_paused ? "Paused" : "Not paused"} · Queue pause: {snapshot.queue_paused ? "Paused" : "Not paused"} · Effective pause: {snapshot.paused ? "Paused" : "Not paused"}</p>
       <p>Claim admission: {snapshot.claim_admission_state === "unconfigured" ? "Not configured — claims are closed"
         : snapshot.claim_admission_state === "worker_policy" ? "Worker-specific policy — runtime not verified here"
         : "Trusted local composition — runtime not verified here"}.</p>
@@ -67,7 +67,7 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
           : job.eligible ? "Conditionally eligible — admission, ownership and execution proof still required."
           : "Not eligible for a new claim."}</p>
         {job.blocked_reason === "machine_reserved" && <p>{job.reservation_holder_job_id
-          ? <>Reservation holder at this check: job {job.reservation_holder_job_id} ({snapshot.jobs.find(candidate => candidate.id === job.reservation_holder_job_id)?.state}).</>
+          ? <>Reservation holder at this check: job {job.reservation_holder_job_id} ({snapshot.jobs.find(candidate => candidate.id === job.reservation_holder_job_id)?.state === "held" ? "held for reconciliation" : "claimed; execution not confirmed"}).</>
           : "Reservation holder is not identified in this snapshot."}</p>}
         {job.eligible_requires_worker_admission && <p>Exact worker enrollment must still be checked.</p>}
         <details><summary>Exact task and artifact</summary><p>Task: {job.target.task_id}</p>

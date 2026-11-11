@@ -56,7 +56,11 @@ export function parseQueueSnapshot(value: unknown): QueueSnapshot {
     if (job.reservation_holder_job_id !== null) {
       const holder = jobs.find(candidate => candidate.id === job.reservation_holder_job_id);
       if (job.state !== "queued" || job.blocked_reason !== "machine_reserved" || !holder
-          || holder.machine_id !== job.machine_id || !["held", "claimed"].includes(holder.state)) return invalid();
+          || holder.machine_id !== job.machine_id || !["held", "claimed"].includes(holder.state)) {
+        // A stale or inconsistent optional reference is not evidence of a
+        // holder. Keep the otherwise valid queue snapshot available.
+        job.reservation_holder_job_id = null;
+      }
     }
   }
   const result: QueueSnapshot = { paused: bool(row.paused), queue_paused: bool(row.queue_paused), master_paused: bool(row.master_paused),
