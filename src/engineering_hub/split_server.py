@@ -166,7 +166,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
             pair = pair_factory()
             if (type(pair) is not HubFrontends or pair.state != 'new'
                     or pair.settings.ingress_mode != 'combined'
-                    or pair.settings.auth_config.human_auth_mode != 'cloudflare_access'
+                    or pair.settings.auth_config.human_auth_mode not in {'cloudflare_access', 'github_cloudflare'}
                     or pair.settings.auth_config.cloudflare_config is None):
                 raise SplitServerError()
             if (getattr(pair.core.state, 'staging_runtime', None) is not None
@@ -196,6 +196,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
                 pair.browser, agent_auth=pair.settings.agent_auth,
                 cloudflare_config=pair.settings.auth_config.cloudflare_config,
                 access_verifier=pair.access_verifier,
+                allow_bound_oauth_callback=pair.settings.auth_config.human_auth_mode == 'github_cloudflare',
                 preview_origin=getattr(pair.core.state, 'preview_origin', None),
                 preview_app=pair.browser if getattr(pair.core.state, 'preview_app', None) is not None else None)
             async with pair.lifespan():
@@ -216,7 +217,7 @@ async def serve_private_coordinator(pair_factory, *, socket_path,
 
 async def serve_public_browser(client_factory, *, browser_port=8771,
                                stop_event=None, on_ready=None,
-                               install_signals=True, preview_origin=None):
+                               install_signals=True, preview_origin=None, allow_bound_oauth_callback=False):
     """Bind only literal loopback, then accept one dedicated private UDS client.
 
     ``on_ready(browser_sockname)`` runs only after listener startup. The factory
@@ -226,6 +227,8 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
     returning remains responsible for its unaccepted resources. The accepted
     client closes only after requests drain, even on repeated cancellation.
     """
+    if type(allow_bound_oauth_callback) is not bool:
+        raise ValueError('Explicit callback opt-in must be boolean')
     _preview_host(preview_origin)  # Reject invalid opt-in before binding or accepting a client.
     _options(client_factory, (browser_port,), stop_event, on_ready, install_signals)
     stop = stop_event if stop_event is not None else asyncio.Event()
@@ -241,7 +244,7 @@ async def serve_public_browser(client_factory, *, browser_port=8771,
             if type(client) is not httpx.AsyncClient:
                 raise SplitServerError()
             try:
-                gateway = PublicBrowserGateway(client, preview_origin=preview_origin)
+                gateway = PublicBrowserGateway(client, preview_origin=preview_origin, allow_bound_oauth_callback=allow_bound_oauth_callback)
                 await _serve_listeners((gateway,), (browser,), stop, on_ready,
                                        (browser.getsockname(),))
             finally:
