@@ -14,6 +14,7 @@ from hub_container_executor.asgi import create_app
 from hub_container_executor.coordinator_observation_transport import CoordinatorObservationTransport
 from hub_container_executor.launch_supervisor import _Process
 from hub_container_executor.launch_transport import UnixCurrentObservationTransport
+from hub_container_executor.runtime_identity import RuntimeIdentityError
 from tests.test_hub_container_executor_launch_supervisor import (
     short_root, root_journal, synthetic_issuer, current_pins, current_ready,
 )
@@ -71,7 +72,7 @@ def _executor(issuer_path, relay_path, connection):
 def test_distinct_executor_peer_v2_and_signed_observation(synthetic_issuer, short_root):
     from engineering_hub.container_pilot_client import ContainerPilotClient
 
-    authority, issuer_path, _ = synthetic_issuer
+    authority, issuer_path, checks = synthetic_issuer
     relay_path = str(short_root / 'relay.sock')
     context = multiprocessing.get_context('fork')
     parent, child = context.Pipe()
@@ -86,6 +87,21 @@ def test_distinct_executor_peer_v2_and_signed_observation(synthetic_issuer, shor
         authority._consumer = _Process(process.pid)
         current_ready(authority)
         release, launch = current_pins(authority)
+        # The parent has the same UID/GID as the child but is the wrong PID.
+        # Capture the server's actual rejection, not just a client exception.
+        results = []
+        rejected = threading.Thread(target=lambda: results.append(
+            authority.serve_one_current_observation(timeout_ms=1000)))
+        rejected.start()
+        wrong_peer = UnixCurrentObservationTransport(socket_path=str(issuer_path),
+            expected_issuer_uid=os.geteuid(), expected_issuer_gid=os.getegid())
+        try:
+            with pytest.raises(RuntimeIdentityError):
+                wrong_peer.observe_current_launch(nonce='a' * 64, timeout_ms=1000)
+        finally:
+            wrong_peer.close()
+            rejected.join(2)
+        assert not rejected.is_alive() and results == [False] and checks == []
         transport = CoordinatorObservationTransport(socket_path=relay_path, credential='synthetic-token')
         observer = CurrentExecutorObserver(release=release, launch=launch, transport=transport)
         try:
