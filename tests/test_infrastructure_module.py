@@ -489,8 +489,8 @@ def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
 
 
 @POSIX
-@pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200])
-def test_any_group_or_other_bit_or_missing_owner_rw_stays_closed(tmp_path, caplog, mode):
+@pytest.mark.parametrize('mode', [0o640, 0o604, 0o610, 0o601, 0o400, 0o200, 0o1600, 0o2600, 0o4600, 0o1700])
+def test_unsafe_file_modes_stay_closed(tmp_path, caplog, mode):
     settings, directory, database = _populated(tmp_path)
     database.chmod(mode)
     before = _snapshot(directory)

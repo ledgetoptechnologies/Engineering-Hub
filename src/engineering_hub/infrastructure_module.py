@@ -151,10 +151,10 @@ def _owned_schema():
 def _file_info(info):
     # Owner-only, not exactly 0600: NFSv4-ACL datasets (e.g. TrueNAS) can
     # report an owner-only file as 0700 even after fchmod(0600). Execute on a
-    # data file grants nothing; any group/other bit still refuses.
+    # data file grants nothing; special, group and other bits still refuse.
     mode=stat.S_IMODE(info.st_mode)
     _need(stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.getuid()
-          and not mode&0o077 and mode&0o600==0o600)
+          and mode in (0o600,0o700))
 
 
 _SIDECARS=('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal')
