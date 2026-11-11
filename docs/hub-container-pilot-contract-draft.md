@@ -192,10 +192,11 @@ Actions are `deploy_container`, `smoke_container`, `rollback_container` and
 container creation/start is not proof of successful rollback. Per-run phase
 dedupe must not be bypassed by a fresh command UUID.
 
-GET by command UUID is read-only. In legacy mode explicit bodyless reconcile
-inspects the original effect without replay; in single-pilot mode reconcile
-returns the ledger's current view and does not inspect the daemon or clear a
-gate. Unknown outcomes stay held until inspected;
+GET by command UUID returns the ledger's current view without dispatching an
+effect. In legacy mode explicit bodyless reconcile can inspect original durable
+operation IDs for a held command when a backend is available, without replay;
+in single-pilot mode reconcile returns the ledger's current view and does not
+inspect the daemon or clear a gate. Unknown outcomes stay held until inspected;
 no timeout, lease expiry or new process grants permission to repeat a Docker
 effect. Responses echo every request field and report state, fixed safe reason
 and bounded actual-container evidence. No exception, secret, host path, session
