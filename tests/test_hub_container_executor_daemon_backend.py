@@ -771,7 +771,8 @@ def test_create_rejects_profile_mismatch_and_symlink_generation_before_post(tmp_
     backend.close()
 
 
-def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=False, role="candidate",
+def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=False,
+                  lose_start_number=None, role="candidate",
                   reports=None, exec_state=None, start_callback=None):
     manifest, image, blobs = verified_image(role)
     generation = safe_generation(tmp_path)
@@ -807,7 +808,7 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=
                                  if probe.expectation_id == arguments[7])
             return httpx.Response(201, json={"Id": f"{exec_number:064x}"})
         if path.endswith("/exec/" + f"{exec_number:064x}" + "/start"):
-            if lose_start:
+            if lose_start or exec_number == lose_start_number:
                 raise httpx.ReadTimeout("synthetic response loss")
             if start_callback is not None:
                 start_callback(exec_number)
@@ -840,7 +841,7 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=
     return backend, manifest, image, requests
 
 
-@pytest.mark.parametrize('lost', ['create', 'start'])
+@pytest.mark.parametrize('lost', ['create', 'start', 'second_start'])
 def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, lost):
     pytest.importorskip('fcntl', reason='real Linux journal ownership required')
     from hub_container_executor.operation_journal import SQLiteOperationJournal
@@ -848,9 +849,11 @@ def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, l
     private = tmp_path / 'private-journal'
     private.mkdir(mode=0o700)
     journal_path = private / 'operations.sqlite'
+    # This is the exact caller-supplied operation ID used by run_readiness.
     operation_id = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
     backend, manifest, _, requests = probe_fixture(
-        tmp_path, lose_create=lost == 'create', lose_start=lost == 'start')
+        tmp_path, lose_create=lost == 'create', lose_start=lost == 'start',
+        lose_start_number=2 if lost == 'second_start' else None)
     try:
         with SQLiteOperationJournal(journal_path, create=True,
                                     allow_ephemeral_test_storage=True) as journal:
@@ -859,6 +862,10 @@ def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, l
                 run_readiness(backend, manifest.probes.candidate)
             assert journal.inspect(operation_id).state == 'pending'
             posts = [item for item in requests if item[0] == 'POST']
+            if lost == 'second_start':
+                assert len(posts) == 4
+                assert any(item[0] == 'GET' and item[1].endswith('/exec/' + f'{1:064x}' + '/json')
+                           for item in requests)
             with pytest.raises(DaemonBackendError):
                 run_readiness(backend, manifest.probes.candidate)
             assert [item for item in requests if item[0] == 'POST'] == posts
