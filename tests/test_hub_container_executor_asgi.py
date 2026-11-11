@@ -249,3 +249,27 @@ def test_missing_protocol_mode_fails_closed():
                      '/v2/container-pilot/capability'):
             assert (await request(app, 'GET', path)).status_code == 500
     run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('path', ['/v1/container-pilot/commands', '/v2/container-pilot/commands'])
+def test_missing_protocol_mode_rejects_authenticated_post_before_body_or_adapter(path):
+    class Adapter:
+        def submit(self, request):
+            raise AssertionError('adapter must not be called')
+
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    messages = []
+
+    async def receive():
+        raise AssertionError('request body must not be consumed')
+
+    async def send(message):
+        messages.append(message)
+
+    async def exercise():
+        await app({'type': 'http', 'method': 'POST', 'path': path,
+                   'headers': [(b'authorization', b'Bearer test-token-only')]}, receive, send)
+
+    run_owned_loop(exercise())
+    assert messages[0]['type'] == 'http.response.start'
+    assert messages[0]['status'] == 500
