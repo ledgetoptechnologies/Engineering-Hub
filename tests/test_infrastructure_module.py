@@ -520,3 +520,25 @@ def test_sidecar_appearing_before_the_write_open_is_never_replayed(tmp_path, mon
     assert 'database_open_failed' in caplog.text
     assert database.read_bytes() == original
     assert (directory / ('inventory.sqlite3-' + late)).read_bytes() == b'foreign uncommitted pages'
+
+
+@POSIX
+@pytest.mark.parametrize('result_mode,state', [(0o700, 'ready'), (0o640, 'invalid')])
+def test_refused_chmod_on_a_fresh_file_depends_only_on_the_resulting_mode(tmp_path, monkeypatch, caplog,
+                                                                           result_mode, state):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    real = os.fchmod
+
+    def restricted(fd, mode):
+        # An ACL-restricted dataset applies its own mode and refuses chmod.
+        real(fd, result_mode)
+        raise PermissionError(1, 'Operation not permitted')
+    monkeypatch.setattr(module.os, 'fchmod', restricted)
+    module_ = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert module_.state == state
+        if state == 'invalid':
+            assert 'database_file_failed' in caplog.text
+    finally:
+        module_.close()

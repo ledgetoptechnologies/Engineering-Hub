@@ -269,7 +269,13 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             stage='database_admission'
         else:
             file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
-            os.fchmod(file_fd,0o600);os.fsync(file_fd);os.fsync(root_fd)
+            try:os.fchmod(file_fd,0o600)
+            except PermissionError:
+                # ACL-managed datasets can refuse chmod. The file was created
+                # just now with O_EXCL; _file_info below still requires it to
+                # be owner-only, so a refused chmod never widens access.
+                pass
+            os.fsync(file_fd);os.fsync(root_fd)
         stage='database_file'
         before=os.fstat(file_fd);_file_info(before)
         captured_fd=root_fd
