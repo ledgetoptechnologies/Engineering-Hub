@@ -156,4 +156,3 @@ def test_signed_record_metadata_contains_artifact_and_rejects_tampering():
     altered[att_id] = blobs[att_id] + b' '
     with pytest.raises(BuildRecordError, match='metadata blob'):
         verify_fixture(manifest, record_raw, altered, FakeTrust())
-
