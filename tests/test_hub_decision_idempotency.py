@@ -43,19 +43,29 @@ def test_concurrent_decision_retries_commit_once(tmp_path):
         assert db.execute("SELECT count(*) FROM hub_audit WHERE action='decision.created'").fetchone()[0] == 1
 
 
-def test_existing_database_migrates_and_receipt_failure_rolls_back(tmp_path):
+def test_existing_receipt_table_failure_rolls_back(tmp_path):
     path = tmp_path / 'hub.sqlite3'
     repo = HubRepository(path)
-    with sqlite3.connect(path) as db:
-        db.execute('DROP TABLE hub_decision_requests')
-    repo = HubRepository(path)
+    repo.create_decision('codex', 'treedar', 'First', ['Yes', 'No'], client_request_id='first')
     with sqlite3.connect(path) as db:
         db.execute("CREATE TRIGGER reject_receipt BEFORE INSERT ON hub_decision_requests "
                    "BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
     with pytest.raises(sqlite3.IntegrityError, match='injected failure'):
         repo.create_decision('codex', 'treedar', 'Question', ['Yes', 'No'], client_request_id='key')
-    assert repo.list_decisions() == []
-    assert repo.list_audit() == []
+    assert len(repo.list_decisions()) == 1
+    assert len(repo.list_audit()) == 1
     with sqlite3.connect(path) as db:
         db.execute('DROP TRIGGER reject_receipt')
     assert repo.create_decision('codex', 'treedar', 'Question', ['Yes', 'No'], client_request_id='key')
+
+
+def test_failed_first_keyed_request_rolls_back_table_creation(tmp_path, monkeypatch):
+    path = tmp_path / 'hub.sqlite3'
+    repo = HubRepository(path)
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected failure')
+    monkeypatch.setattr(repo, '_save', fail)
+    with pytest.raises(RuntimeError, match='injected failure'):
+        repo.create_decision('codex', 'treedar', 'Question', ['Yes', 'No'], client_request_id='key')
+    with sqlite3.connect(path) as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='hub_decision_requests'").fetchone()

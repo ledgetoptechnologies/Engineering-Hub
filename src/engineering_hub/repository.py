@@ -87,10 +87,6 @@ class HubRepository:
                 CREATE TABLE IF NOT EXISTS hub_run_requests (
                     actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
                     run_id TEXT NOT NULL, PRIMARY KEY(actor,key));
-                CREATE TABLE IF NOT EXISTS hub_decision_requests (
-                    actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL, receipt TEXT NOT NULL,
-                    PRIMARY KEY(actor,project,key));
             '''
             # executescript commits an existing transaction implicitly, which
             # would bypass the final capability check and rollback boundary.
@@ -542,6 +538,11 @@ class HubRepository:
         with self._transaction() as db:
             self._project(project, db)
             if key is not None:
+                # Keep unkeyed databases readable by earlier enrollment tools.
+                # DDL, creation, and receipt commit in the same transaction.
+                db.execute('CREATE TABLE IF NOT EXISTS hub_decision_requests ('
+                           'actor TEXT NOT NULL, project TEXT NOT NULL, key TEXT NOT NULL, '
+                           'fingerprint TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(actor,project,key))')
                 prior = db.execute('SELECT fingerprint,receipt FROM hub_decision_requests '
                                    'WHERE actor=? AND project=? AND key=?', (actor, project, key)).fetchone()
                 if prior:

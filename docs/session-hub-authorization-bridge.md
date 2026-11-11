@@ -31,6 +31,21 @@ the granted active projects, including sensitive answer text. Grant it only
 where that visibility is intended. It grants no answer or execution authority.
 Existing grants do not acquire this new capability automatically.
 
+`hub_decision_request` accepts an optional `client_request_id`. Reusing the
+same ID for the same normalized request by the same installation and project
+returns the original creation receipt, including after an answer; use
+`decision.read` for current state. Changing the request under that ID conflicts.
+Without an ID, each call creates a new decision.
+
+The first keyed request creates a persistent receipt table atomically with the
+decision. Back up the complete database and retain its receipts. Earlier cold
+enrollment tools reject this additional table; do not drop it to force a
+rollback. Earlier binaries do not honor keyed retries even before the table
+exists. Stop old writers and hold/reconcile outstanding requests before any
+version change. Use a reviewed compatible binary or a verified coherent backup
+and an operator-approved recovery plan; restoring an older backup can lose later
+decisions and receipts. This does not establish a live rollback procedure.
+
 There are no implicit capability dependencies. A permitted mutation returns
 its own result; a later read needs its separate read capability. A grant is the
 explicit cross product of its projects and capabilities. Wildcards, unknown

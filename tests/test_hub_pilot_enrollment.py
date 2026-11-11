@@ -51,6 +51,19 @@ def snapshot(path):
         return enrollment._snapshot(db)
 
 
+def test_unkeyed_decisions_preserve_old_enrollment_schema(ledger, monkeypatch):
+    path, repo, _, _ = ledger
+    # The previous enrollment allowlist was identical except for this table.
+    old_ddl = {name: ddl for name, ddl in enrollment._DDL.items() if name != 'hub_decision_requests'}
+    monkeypatch.setattr(enrollment, '_DDL', old_ddl)
+    assert 'hub_decision_requests' not in snapshot(path)['tables']
+    repo.create_decision('codex', 'engineering-hub', 'Another question', ['Yes', 'No'])
+    assert 'hub_decision_requests' not in snapshot(path)['tables']
+    repo.create_decision('codex', 'engineering-hub', 'Keyed question', ['Yes', 'No'], client_request_id='key')
+    with pytest.raises(enrollment.EnrollmentError):
+        snapshot(path)
+
+
 def test_plan_is_read_only_fingerprints_no_secrets_and_apply_preserves_every_existing_row(ledger):
     path, legacy, store, session = ledger
     before = path.read_bytes()
