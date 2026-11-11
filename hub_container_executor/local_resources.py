@@ -94,7 +94,7 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
         journal_database, journal_create, record_root, metadata_root,
         baseline_receipt_root, secret_root, secret_bindings, build_enrollments,
         baseline_receipt_digest, baseline_runtime_profile_digest, frozen_backup,
-        reservation_root, state_reservations_create, driver_identity_verifier):
+        reservation_root, state_reservations_create, driver_identity_verifier, single_pilot_protocol=False):
     """Yield one freshly constructed exact HostAdapter with concrete providers.
 
     All directories must already exist, be canonical and pairwise nonnested;
@@ -127,7 +127,7 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 or type(manifest) is not PilotManifest
                 or type(binding) is not DockerEngineBinding
                 or type(journal_create) is not bool
-                or type(state_reservations_create) is not bool
+                or type(state_reservations_create) is not bool or type(single_pilot_protocol) is not bool
                 or not callable(getattr(driver_identity_verifier, "implementation_commit", None))):
             raise LocalResourcesError("Explicit private Linux resource configuration required")
         manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
@@ -191,6 +191,7 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 provenance_verifier=verifier, backend=backend,
                 baseline_provider=baseline, state_provisioner=state,
                 secret_resolver=secrets, driver_identity_verifier=driver_identity_verifier,
+                single_pilot_protocol=single_pilot_protocol,
             )
             resources.callback(adapter.close)
             yield adapter

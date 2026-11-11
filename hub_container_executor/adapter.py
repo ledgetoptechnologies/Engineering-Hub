@@ -44,7 +44,7 @@ from .build_record import (
     VerifiedImage,
     verify_image_record,
 )
-from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger
+from .ledger import Admission, InheritedLedgerUse, LedgerClosed, SQLiteLedger, _make_response
 from .runtime_profile import derive_runtime_profile, probe_set_digest
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -75,9 +75,17 @@ class HostAdapter:
                  provenance_verifier: TrustedBuildVerifier | None = None,
                  backend: PilotBackend | None = None,
                  baseline_provider=None, state_provisioner=None, secret_resolver=None,
-                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None):
+                 driver_identity_verifier: TrustedDriverIdentityVerifier | None = None,
+                 single_pilot_protocol: bool = False):
         if type(manifest) is not PilotManifest:
             raise TypeError("shared PilotManifest required")
+        if type(single_pilot_protocol) is not bool:
+            raise TypeError('single pilot protocol requires explicit boolean')
+        if single_pilot_protocol:
+            from .single_pilot_evidence import require_resources
+            require_resources(backend, state_provisioner)
+        self._single_pilot_protocol = single_pilot_protocol
+        self._pilot_mutex = threading.RLock()
         self.manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         self.manifest_bytes = self.manifest.canonical_bytes()
         self.manifest_digest = self.manifest.digest()
@@ -102,6 +110,15 @@ class HostAdapter:
             candidate_commit=self.manifest.candidate.source_commit,
             policy_revision=self.manifest.policy_revision,
         )
+        try:
+            enrolled = self.ledger.single_pilot_enabled()
+            if enrolled and not single_pilot_protocol:
+                raise PermissionError('single pilot protocol required for enrolled ledger')
+            if single_pilot_protocol and not enrolled:
+                self.ledger.enable_single_pilot_protocol()
+        except BaseException:
+            self.ledger.close()
+            raise
 
     @contextmanager
     def _active_operation(self):
@@ -169,11 +186,29 @@ class HostAdapter:
 
     def get(self, command_id: str) -> ContainerPilotResponse | None:
         with self._active_operation():
-            return self.ledger.get(command_id)
+            with self._pilot_mutex:
+                return self.ledger.get(command_id)
 
     def submit(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         with self._active_operation():
-            return self._submit_active(request)
+            with self._pilot_mutex:
+                if not self._single_pilot_protocol:
+                    return self._submit_active(request)
+                try:
+                    gate = self.ledger.inspect_single_pilot()
+                    if gate is not None:
+                        admission = self.ledger.admit(request)
+                        return admission.response
+                    prior = self.ledger.admit(request)
+                    if prior.replayed or prior.response.reason == 'identity_conflict':
+                        return prior.response
+                    self.ledger.arm_single_pilot(request)
+                    deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
+                    self.backend.operation_journal.require_no_pending()
+                    self.state_provisioner.require_complete_reservations(deadline_monotonic=deadline)
+                    return self._submit_active(request)
+                except Exception:
+                    return _make_response(request, state='held', reason='inspect_required')
 
     def _submit_active(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         admission = self.ledger.admit(request)
@@ -182,9 +217,12 @@ class HostAdapter:
         deadline = time.monotonic() + self.manifest.timeouts.total_command_ms / 1000
         try:
             result = self._execute(request, deadline)
+            if self._single_pilot_protocol:
+                from .single_pilot_evidence import verify_phase
+                verify_phase(self, request, result, deadline)
+                self.ledger.record_single_pilot_verified_outcome(request, result)
+                return self.ledger.get(request.command_id)
             if self.ledger.single_pilot_enabled():
-                # A stored success is not observable until a future trusted
-                # verifier records the exact outcome in the protocol gate.
                 return self.ledger.get(request.command_id)
             return result
         except _Held as held:
@@ -532,11 +570,19 @@ class HostAdapter:
     def reconcile(self, command_id: str) -> ContainerPilotResponse | None:
         """Inspect exact durable operation IDs only; never re-effect or re-probe."""
         with self._active_operation():
-            if self.ledger.single_pilot_enabled():
-                # Reconciliation mutates ledger evidence; it must not race the
-                # future single-pilot verifier. Until wired, only inspect gate.
-                return self.ledger.get(command_id)
-            return self._reconcile_active(command_id)
+            with self._pilot_mutex:
+                if self.ledger.single_pilot_enabled():
+                    return self.ledger.get(command_id)
+                return self._reconcile_active(command_id)
+
+    def acknowledge_single_pilot(self, request, outcome_digest):
+        """Local trusted entry; service authentication is a separate boundary."""
+        with self._active_operation():
+            with self._pilot_mutex:
+                if not self._single_pilot_protocol:
+                    raise PermissionError('single pilot protocol unavailable')
+                self.ledger.acknowledge_single_pilot(request, outcome_digest)
+                return self.ledger.get(request.command_id)
 
     def _reconcile_active(self, command_id: str) -> ContainerPilotResponse | None:
         response = self.ledger.get(command_id)

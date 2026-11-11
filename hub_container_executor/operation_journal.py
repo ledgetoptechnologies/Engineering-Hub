@@ -346,6 +346,14 @@ class SQLiteOperationJournal:
                 db.execute("UPDATE private_operation_journal SET state='completed', container_id=? WHERE operation_id=?",
                            (container_id, operation_id))
 
+    def require_no_pending(self) -> None:
+        """Hold if the v1 journal contains any unresolved private intent."""
+        with self._transaction() as db:
+            if db.execute('PRAGMA user_version').fetchone() != (1,):
+                raise OperationJournalError('Single pilot requires v1 journal')
+            if db.execute("SELECT 1 FROM private_operation_journal WHERE state='pending' LIMIT 1").fetchone():
+                raise OperationJournalError('Private operation intent remains pending')
+
     def inspect_record(self, operation_id: str) -> JournalOperationRecord | None:
         """Read kind and receipt in one owner-guarded transaction; never re-effect.
 

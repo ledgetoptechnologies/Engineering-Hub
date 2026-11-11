@@ -258,6 +258,21 @@ class FrozenSQLiteStateProvisioner:
             values.append((intent, completion_name))
         return values
 
+    def require_complete_reservations(self, *, deadline_monotonic):
+        """Hold on an incomplete or uninspectable reservation under this owner."""
+        if self._pid != os.getpid():
+            raise StateProvisionError('State provisioner is process bound')
+        with self._mutex:
+            self._check(deadline_monotonic)
+            records = self._records(deadline_monotonic)
+            if len(records) > 2:
+                raise StateProvisionError('Single pilot reservation bound exceeded')
+            for intent, _ in records:
+                seen = self.inspect_reservation(intent['operation'], deadline_monotonic=deadline_monotonic)
+                if seen is None or not seen.complete:
+                    raise StateProvisionError('Private state reservation uncertain')
+            self._check(deadline_monotonic)
+
     def inspect_reservation(self, operation_id, *, deadline_monotonic):
         """Read guarded private metadata; incomplete never means no effect.
 

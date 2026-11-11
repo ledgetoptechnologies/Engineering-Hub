@@ -52,7 +52,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
                                  agent_host='0.0.0.0', agent_port=8770,
                                  stop_event=None, on_ready=None,
                                  install_signals=True, recover_socket=False,
-                                 session_acceptance_factory=None, access_verifier=None):
+                                 session_acceptance_factory=None, access_verifier=None, single_pilot_protocol=False):
     """Bind first, then own exactly one persistent private queue composition.
 
     ``client_factory`` must synchronously return a new, dedicated, exact
@@ -67,7 +67,7 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
     closing the accepted client and finally its newly constructed PilotOwner.
     """
     try:
-        if (type(settings) is not Settings or settings.ingress_mode != 'combined'
+        if (type(single_pilot_protocol) is not bool or type(settings) is not Settings or settings.ingress_mode != 'combined'
                 or type(settings.auth_config) is not AuthConfig
                 or settings.auth_config.human_auth_mode != 'cloudflare_access'
                 or settings.auth_config.cloudflare_config is None
@@ -126,7 +126,8 @@ async def serve_owned_queued_pilot(settings, manifest, client_factory, *,
         client = accepted
         repo = HubRepository(settings.database,
             execution_principal='executor:container-pilot', pilot_owner=owner)
-        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner,
+                                          single_pilot_protocol=single_pilot_protocol)
         try:
             staging_draft = prepare_shared_staging(repo,
                 path=settings.staging_config_path or Path(settings.database).parent / 'staging-service.json',

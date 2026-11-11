@@ -7,6 +7,7 @@ evidence is a typed adapter assertion, not independent proof of Docker effects.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import ssl
@@ -63,6 +64,16 @@ class ContainerPilotResponse(ContainerPilotRequest):
     ] | None
     evidence: ContainerPilotEvidence
     replayed: bool
+
+
+def single_pilot_outcome_digest(outcome: ContainerPilotResponse) -> str:
+    """Canonical outcome identity; only the transport replay marker is ignored."""
+    if type(outcome) is not ContainerPilotResponse:
+        raise TypeError('exact pilot outcome required')
+    original = outcome.model_copy(update={'replayed':False})
+    raw = json.dumps(original.model_dump(mode='json'), sort_keys=True, separators=(',', ':'),
+                     ensure_ascii=False, allow_nan=False).encode('utf-8')
+    return 'sha256:' + hashlib.sha256(raw).hexdigest()
 
 
 class ContainerPilotClientError(Exception):
@@ -223,10 +234,12 @@ class ContainerPilotClient:
         await self.__client.aclose()
 
     async def _command(self, method: str, path: str, expected: ContainerPilotRequest,
-                       *, submit: bool = False) -> ContainerPilotResponse:
+                       *, submit: bool = False, acknowledgment: str | None = None) -> ContainerPilotResponse:
         if type(expected) is not ContainerPilotRequest:
             raise TypeError("expected a container pilot request")
-        kwargs = {"json": expected.model_dump()} if submit else {}
+        kwargs = ({"json": expected.model_dump()} if submit else
+                  {"json": {'request': expected.model_dump(), 'outcome_digest': acknowledgment}}
+                  if acknowledgment is not None else {})
         try:
             # HTTPX read timeouts bound each chunk; this also bounds a slow-drip
             # response across the complete operation, not just idle periods.
@@ -321,6 +334,12 @@ class ContainerPilotClient:
 
     async def get_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
         return await self._command("GET", f"/v1/container-pilot/commands/{command.command_id}", command)
+
+    async def acknowledge_command(self, command: ContainerPilotRequest, outcome_digest: str) -> ContainerPilotResponse:
+        if type(outcome_digest) is not str or not __import__('re').fullmatch(r'sha256:[a-f0-9]{64}', outcome_digest):
+            raise ValueError('invalid outcome digest')
+        return await self._command('POST', f'/v1/container-pilot/commands/{command.command_id}/acknowledge',
+                                   command, acknowledgment=outcome_digest)
 
     async def reconcile_command(self, command: ContainerPilotRequest) -> ContainerPilotResponse:
         """Bodyless inspection only; never restart an exited workload or replay an effect."""

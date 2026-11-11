@@ -75,6 +75,43 @@ class PilotASGI:
         if method == "POST" and path == COMMANDS:
             await self._submit(receive, send, headers)
             return
+        suffix = '/acknowledge'
+        if method == 'POST' and path.startswith(COMMANDS + '/') and path.endswith(suffix):
+            command_id = path[len(COMMANDS) + 1:-len(suffix)]
+            if not self._valid_id(command_id):
+                await self._error(send, 400, 'invalid_payload')
+                return
+            content_types = [value for key, value in headers if key.lower() == b'content-type']
+            if len(content_types) != 1 or content_types[0].split(b';', 1)[0].strip().lower() != b'application/json':
+                await self._error(send, 400, 'invalid_payload')
+                return
+            try:
+                raw = await self._read_body(receive, headers, allow_missing_length=False)
+                data = strict_json(raw)
+                if type(data) is not dict or set(data) != {'request','outcome_digest'}:
+                    raise ValueError()
+                request = ContainerPilotRequest.model_validate(data['request'])
+                digest = data['outcome_digest']
+                if request.command_id != command_id or type(digest) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+                    raise ValueError()
+            except TimeoutError:
+                await self._error(send, 408, 'request_timeout'); return
+            except OverflowError:
+                await self._error(send, 413, 'invalid_payload'); return
+            except (IdentityError, ValueError, TypeError, UnicodeError, RecursionError):
+                await self._error(send, 400, 'invalid_payload'); return
+            try:
+                accepted, response = await self._invoke(send,
+                    lambda args: self._adapter.acknowledge_single_pilot(*args), (request,digest))
+            except Exception:
+                await self._error(send, 409, 'acknowledgment_unavailable'); return
+            if not accepted:
+                return
+            if response is None:
+                await self._error(send, 409, 'acknowledgment_unavailable')
+            else:
+                await self._response(send, 200, response)
+            return
         if method == "GET" and path.startswith(COMMANDS + "/"):
             command_id = path[len(COMMANDS) + 1:]
             if not self._valid_id(command_id):

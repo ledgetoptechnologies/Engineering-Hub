@@ -31,6 +31,7 @@ from engineering_hub.container_pilot_client import (
     ContainerPilotEvidence,
     ContainerPilotRequest,
     ContainerPilotResponse,
+    single_pilot_outcome_digest,
 )
 
 TARGET_ID = "engineering-hub:staging"
@@ -70,14 +71,6 @@ class Admission:
 def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False)
-
-
-def single_pilot_outcome_digest(outcome: ContainerPilotResponse) -> str:
-    """Stable exact outcome identity, independent of transport replay marker."""
-    if type(outcome) is not ContainerPilotResponse:
-        raise TypeError('exact pilot outcome required')
-    original = outcome.model_copy(update={'replayed':False})
-    return 'sha256:' + hashlib.sha256(_canonical(original.model_dump(mode='json')).encode('utf-8')).hexdigest()
 
 
 def _make_response(request: ContainerPilotRequest, *, state="running", reason=None,

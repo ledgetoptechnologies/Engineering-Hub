@@ -33,6 +33,7 @@ from .service import serve_owned_host_executor_unix
 
 
 SCHEMA = 'engineering-hub.installed-executor.v1'
+SCHEMA_SINGLE_PILOT = 'engineering-hub.installed-executor.v2'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -129,7 +130,7 @@ def parse_configuration(raw):
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
         _object(value, _ROOT_FIELDS)
-        _require(value['schema'] == SCHEMA and _canonical(value) == raw)
+        _require(value['schema'] in {SCHEMA, SCHEMA_SINGLE_PILOT} and _canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         binding_data = dict(_object(value['docker_binding'], DockerEngineBinding.__dataclass_fields__))
         binding_data['platform'] = Platform.model_validate(binding_data['platform'])
@@ -140,7 +141,9 @@ def parse_configuration(raw):
         _require(binding.runner_id == runner.runner_id
                  and binding.daemon_identity == runner.daemon_identity
                  and binding.platform == runner.platform)
-        resources = dict(_object(value['resources'], _RESOURCE_FIELDS))
+        resources = dict(_object(value['resources'], _RESOURCE_FIELDS | ({'single_pilot_protocol'} if value['schema'] == SCHEMA_SINGLE_PILOT else set())))
+        if value['schema'] == SCHEMA_SINGLE_PILOT:
+            _require(resources['single_pilot_protocol'] is True)
         for name in _RESOURCE_PATHS:
             _path(resources[name])
         for name in ('journal_create', 'state_reservations_create'):
