@@ -199,11 +199,18 @@ class PilotRecovery:
                                 or response.evidence.health != 'unhealthy'
                                 or response.evidence.evidence_verified is not True))):
                         raise ValueError('single pilot outcome not eligible')
+                    retain_outcome = saved['response_json'] is None
                     if saved['response_json'] is not None:
                         prior = ContainerPilotResponse.model_validate_json(saved['response_json'], strict=True)
-                        if single_pilot_outcome_digest(prior) != single_pilot_outcome_digest(response):
+                        if saved['state'] == 'held' and prior.state == 'held':
+                            # A previously surfaced hold is not a terminal claim;
+                            # exact original GET may now provide verified outcome.
+                            if any(getattr(prior, key) != value for key,value in command.model_dump().items()):
+                                raise ValueError('single pilot held identity mismatch')
+                            retain_outcome = True
+                        elif single_pilot_outcome_digest(prior) != single_pilot_outcome_digest(response):
                             raise ValueError('single pilot retained outcome mismatch')
-                    else:
+                    if retain_outcome:
                         # Persist a received exact outcome before ACK. Guard the
                         # recovery claim and original row in the same transaction.
                         payload = response.model_dump_json()
@@ -211,8 +218,8 @@ class PilotRecovery:
                             claim = db.execute('SELECT occurrence,epoch,state FROM hub_container_pilot_recovery_claims WHERE run_id=?', (run_id,)).fetchone()
                             if tuple(claim or ()) != (occurrence,self.owner.epoch,'inspecting'):
                                 raise ValueError('recovery claim changed')
-                            changed = db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=? AND payload=? AND state=? AND response_json IS NULL',
-                                ('ack_pending',payload,run_id,action,saved['payload'],saved['state']))
+                            changed = db.execute('UPDATE hub_container_pilot_commands SET state=?,response_json=? WHERE run_id=? AND action=? AND payload=? AND state=? AND response_json IS ?',
+                                ('ack_pending',payload,run_id,action,saved['payload'],saved['state'],saved['response_json']))
                             if changed.rowcount != 1:
                                 raise ValueError('recovery command changed')
                         saved['state'], saved['response_json'] = 'ack_pending', payload

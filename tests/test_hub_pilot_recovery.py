@@ -364,17 +364,20 @@ async def test_changed_original_request_is_not_reconstructed_or_queried(rig):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('lost', ['submit', 'ack'])
+@pytest.mark.parametrize('lost', ['submit', 'ack', 'held'])
 async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, lost):
     from engineering_hub.container_pilot_client import single_pilot_outcome_digest
     class AckRecoveryClient(RecoveryClient):
         def __init__(self):
-            super().__init__(); self.acks=[]; self.lose_submit=lost=='submit'; self.lose_ack=lost=='ack'
+            super().__init__(); self.acks=[]; self.lose_submit=lost=='submit'; self.lose_ack=lost=='ack'; self.held=lost=='held'
         async def submit_command(self, command):
             response=await super().submit_command(command)
             if self.lose_submit:
                 self.lose_submit=False
                 raise TimeoutError('synthetic lost original response')
+            if self.held:
+                self.held=False
+                return response.model_copy(update={'state':'held','reason':'inspect_required'})
             return response
         async def acknowledge_command(self, command, digest):
             self.acks.append((command,digest))
