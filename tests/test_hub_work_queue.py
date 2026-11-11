@@ -398,3 +398,31 @@ def test_production_status_explains_unapproved_job(setup_queue):
     status = q.status()['jobs'][0]
     assert status['blocked_reason'] == 'production_approval_required'
     assert not status['eligible']
+
+
+def test_target_receipt_bindings_survive_queue_and_change_idempotency(setup_queue):
+    from dataclasses import replace
+    q, _, repo, actions = setup_queue
+    t = WorkTarget(str(uuid.uuid4()), 'a' * 40, 'sha256:' + 'b' * 64,
+                   review_revision=3, submission_id=str(uuid.uuid4()),
+                   ci_attempt_job_id=str(uuid.uuid4()),
+                   build_receipt_digest='sha256:' + 'c' * 64,
+                   execution_release_digest='sha256:' + 'd' * 64)
+    job = submit(q, 'bound', target=t)
+    reopened = WorkQueue(repo, actions, target_verifier=lambda *args: True, clock=lambda: 1000.0)
+    assert WorkTarget(**reopened.get_job(job['id'])['target']) == t
+    assert submit(reopened, 'bound', target=t)['id'] == job['id']
+    for field, value in [('review_revision', 4), ('submission_id', str(uuid.uuid4())),
+                         ('ci_attempt_job_id', str(uuid.uuid4())),
+                         ('build_receipt_digest', 'sha256:' + 'e' * 64),
+                         ('execution_release_digest', 'sha256:' + 'f' * 64)]:
+        with pytest.raises(HubError, match='work_request_conflict'):
+            submit(reopened, 'bound', target=replace(t, **{field: value}))
+
+
+def test_legacy_target_retains_idempotency_fingerprint(setup_queue):
+    q, _, _, _ = setup_queue
+    t = target()
+    job = submit(q, 'legacy', target=t)
+    assert submit(q, 'legacy', target=t)['id'] == job['id']
+    assert set(job['target']) == {'task_id', 'source_commit', 'artifact_digest'}
