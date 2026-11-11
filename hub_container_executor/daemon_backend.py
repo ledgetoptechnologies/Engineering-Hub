@@ -1328,12 +1328,17 @@ class DockerEngineBackend:
         route = self._route("/containers/" + container_id + "/stop")
         self._read_response("POST", route, deadline, expected_status=204,
                             params={"t": "5"})
-        self._journal_complete(operation_id, "stop", container_id)
         self._assert_runner(deadline)
         after = self.inspect_container(container_id, self._remaining_ms(deadline))
         if (type(after) is not ContainerObservation or after.status != "exited"
                 or after.selected_image != before.selected_image or after.profile != before.profile):
             raise DaemonBackendError("stopped container state is not verified")
+        # A successful Engine response alone is not a verified stopped state.
+        # Historical completed stop rows written by older versions cannot be
+        # distinguished here and must not be treated as post-inspection proof.
+        # Uncertain post-inspection leaves the durable intent pending; retrying
+        # the same operation must not issue the stop a second time.
+        self._journal_complete(operation_id, "stop", container_id)
         self._remaining(deadline)
 
     def _exec_frame(self, raw):
