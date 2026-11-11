@@ -5,8 +5,13 @@ Callers must use a dedicated journal database on approved local Linux storage.
 No environment discovery, service activation, tokens or Docker labels are used.
 Bindings are explicit opt-in stored evidence only: no backend effect uses them,
 and they do not authenticate a daemon, MAC, lease, or enable reconciliation.
-Old binaries reject a migrated v2 journal. An exception during commit or fsync
+No MAC key is provisioned or verified here; callers must not supply secrets or
+claim authentication. Old binaries reject a migrated v2 journal; rollback needs
+a compatible reader or an unmigrated backup. An exception during commit or fsync
 can occur after commit; reopen and inspect instead of inferring rollback.
+After migration, unbound begin is rejected: the current backend still calls it,
+so do not migrate any active deployment until separately reviewed integration.
+The stored local owner epoch is history, not a daemon or dispatch fence.
 """
 from __future__ import annotations
 
@@ -39,7 +44,8 @@ _SCHEMA = ("CREATE TABLE private_operation_journal (operation_id TEXT PRIMARY KE
            "kind TEXT NOT NULL, state TEXT NOT NULL, container_id TEXT)")
 _BINDING_SCHEMA = ("CREATE TABLE private_operation_binding (operation_id TEXT PRIMARY KEY, "
                    "boot_id TEXT NOT NULL, daemon_pid INTEGER NOT NULL, daemon_start INTEGER NOT NULL, "
-                   "resource_name TEXT UNIQUE, target_id TEXT, request_mac TEXT NOT NULL, fence INTEGER NOT NULL)")
+                   "resource_name TEXT UNIQUE, target_id TEXT, request_mac TEXT NOT NULL, fence INTEGER NOT NULL, "
+                   "owner_epoch TEXT NOT NULL)")
 _TABLES = {"hub_pilot_owner", "hub_pilot_owner_epochs", "private_operation_journal"}
 _BUSY_SECONDS = .25
 
@@ -97,8 +103,10 @@ def _schema(db, *, inspect_rows=False):
         for row in db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal"):
             _row(row)
         if version == 2:
-            for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
+            for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
                 _validate_binding_row(row)
+                if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[-1],)).fetchone() is None:
+                    raise OperationJournalError("Unknown binding owner epoch")
 
 
 @dataclass(frozen=True)
@@ -111,13 +119,15 @@ class OperationBinding:
     target_id: str | None
     request_mac: str
     fence: int
+    owner_epoch: str | None = None
 
 
 def _validate_binding_row(row):
-    operation_id, kind, boot_id, daemon_pid, daemon_start, name, target, mac, fence = row
+    operation_id, kind, boot_id, daemon_pid, daemon_start, name, target, mac, fence, owner_epoch = row
     _operation(operation_id)
     _kind(kind)
     _operation(boot_id)
+    _operation(owner_epoch)
     if (type(daemon_pid) is not int or not 1 < daemon_pid <= 2**63-1
             or type(daemon_start) is not int or not 1 <= daemon_start <= 2**63-1
             or type(fence) is not int or not 1 <= fence <= 2**63-1
@@ -259,6 +269,8 @@ class SQLiteOperationJournal:
         _operation(operation_id)
         _kind(kind)
         with self._transaction() as db:
+            if db.execute("PRAGMA user_version").fetchone() != (1,):
+                raise OperationJournalError("Unbound intents disabled after binding migration")
             if db.execute("SELECT 1 FROM private_operation_journal WHERE operation_id=?", (operation_id,)).fetchone():
                 raise OperationJournalConflict("Operation intent already exists; effect must not replay")
             db.execute("INSERT INTO private_operation_journal VALUES (?,?,'pending',NULL)", (operation_id, kind))
@@ -279,23 +291,23 @@ class SQLiteOperationJournal:
         The caller must independently authenticate the generation and MAC. This
         method grants no authority to act, adopt, retry, or infer non-creation.
         """
-        if type(binding) is not OperationBinding:
+        if type(binding) is not OperationBinding or binding.owner_epoch is not None:
             raise OperationJournalError("Exact operation binding required")
-        row = (operation_id, kind, binding.boot_id, binding.daemon_pid, binding.daemon_start,
-               binding.resource_name, binding.target_id, binding.request_mac, binding.fence)
-        _validate_binding_row(row)
         with self._transaction() as db:
             if db.execute("PRAGMA user_version").fetchone() != (2,):
                 raise OperationJournalError("Explicit binding migration required")
+            row = (operation_id, kind, binding.boot_id, binding.daemon_pid, binding.daemon_start,
+                   binding.resource_name, binding.target_id, binding.request_mac, binding.fence, self._owner.epoch)
+            _validate_binding_row(row)
             if db.execute("SELECT 1 FROM private_operation_journal WHERE operation_id=?", (operation_id,)).fetchone():
                 raise OperationJournalConflict("Operation intent already exists; effect must not replay")
             if binding.resource_name is not None and db.execute(
                     "SELECT 1 FROM private_operation_binding WHERE resource_name=?", (binding.resource_name,)).fetchone():
                 raise OperationJournalConflict("Bound resource name already used")
             db.execute("INSERT INTO private_operation_journal VALUES (?,?,'pending',NULL)", (operation_id, kind))
-            db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?,?)",
                        (operation_id, binding.boot_id, binding.daemon_pid, binding.daemon_start,
-                        binding.resource_name, binding.target_id, binding.request_mac, binding.fence))
+                        binding.resource_name, binding.target_id, binding.request_mac, binding.fence, self._owner.epoch))
 
     def inspect_binding(self, operation_id: str) -> OperationBinding | None:
         """Read stored evidence only; never turn it into a terminal outcome."""
@@ -303,10 +315,12 @@ class SQLiteOperationJournal:
         with self._transaction() as db:
             if db.execute("PRAGMA user_version").fetchone() != (2,):
                 return None
-            row = db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id WHERE b.operation_id=?", (operation_id,)).fetchone()
+            row = db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id WHERE b.operation_id=?", (operation_id,)).fetchone()
             if row is None:
                 return None
             _validate_binding_row(row)
+            if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[-1],)).fetchone() is None:
+                raise OperationJournalError("Unknown binding owner epoch")
             return OperationBinding(*row[2:])
 
     def completed(self, operation_id: str, kind: str, container_id: str | None = None) -> None:

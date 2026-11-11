@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -36,16 +37,20 @@ def test_opt_in_migration_keeps_legacy_pending_and_bound_ids_unique(path):
         store.enable_bindings()
         assert store.inspect(legacy).state == "pending"
         assert store.inspect_binding(legacy) is None
+        with pytest.raises(OperationJournalError):
+            store.begin(str(uuid4()), "create_candidate")
         store.begin_bound(bound, "create_candidate", value)
         assert store.inspect(bound).state == "pending"
-        assert store.inspect_binding(bound) == value
+        recorded = store.inspect_binding(bound)
+        assert recorded == replace(value, owner_epoch=store._owner.epoch)
         with pytest.raises(OperationJournalConflict):
             store.begin_bound(str(uuid4()), "create_candidate", value)
         with pytest.raises(OperationJournalConflict):
             store.begin_bound(bound, "create_candidate", value)
     with journal(path, create=False) as store:
         assert store.inspect(legacy).state == "pending"
-        assert store.inspect_binding(bound) == value
+        assert store.inspect_binding(bound) == recorded
+        assert recorded.owner_epoch != store._owner.epoch
 
 
 @LINUX
@@ -55,7 +60,9 @@ def test_bound_target_validation_and_no_plaintext_binding(path):
         identity = str(uuid4())
         value = binding(name=None, target=CID)
         store.begin_bound(identity, "start", value)
-        assert store.inspect_binding(identity) == value
+        assert store.inspect_binding(identity) == replace(value, owner_epoch=store._owner.epoch)
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(str(uuid4()), "start", replace(value, owner_epoch=str(uuid4())))
         for invalid in (binding(name=None, target=None), binding(name=None, target=CID, mac="secret-token"),
                         binding(name="../foreign")):
             with pytest.raises(OperationJournalError):
@@ -108,11 +115,27 @@ def test_orphan_binding_rejected_before_owner_reopen(path):
         store.enable_bindings()
     with sqlite3.connect(path) as db:
         value = binding()
-        db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?,?)",
                    (str(uuid4()), value.boot_id, value.daemon_pid, value.daemon_start,
-                    value.resource_name, value.target_id, value.request_mac, value.fence))
+                    value.resource_name, value.target_id, value.request_mac, value.fence, str(uuid4())))
     with pytest.raises(OperationJournalError):
         journal(path, create=False)
+
+
+@LINUX
+def test_unknown_owner_epoch_rejected_before_owner_reopen(path):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, "create_candidate", binding())
+    with sqlite3.connect(path) as db:
+        owner_before = db.execute("SELECT * FROM hub_pilot_owner").fetchall()
+        db.execute("UPDATE private_operation_binding SET owner_epoch=? WHERE operation_id=?",
+                   (str(uuid4()), identity))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT * FROM hub_pilot_owner").fetchall() == owner_before
 
 
 @LINUX
@@ -135,7 +158,7 @@ os._exit(23)
         assert store.inspect(identity).state == "pending"
         assert store.inspect_binding(identity).boot_id == boot_id
         with pytest.raises(OperationJournalConflict):
-            store.begin_bound(identity, "create_candidate", store.inspect_binding(identity))
+            store.begin_bound(identity, "create_candidate", replace(store.inspect_binding(identity), owner_epoch=None))
 
 
 @pytest.fixture
