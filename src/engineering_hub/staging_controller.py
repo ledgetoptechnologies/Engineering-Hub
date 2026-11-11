@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore
 
 from .repository import AGENTS, HubError
+from .staging_action_key import staging_action_key
 from .staging_source_binding import UNBOUND_HOLD as _UNBOUND_HOLD, valid_source_binding as _valid_source_binding
 from .staging_resources import KINDS
 from .staging_client import _FILE_TYPES, StagingNotAccepted
@@ -51,7 +52,7 @@ def compose_queue(repo, existing_queue, projects, machine_id):
         repo._project(project)
         for recipe in recipes:
             _require(type(recipe) is str and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', recipe))
-            key = 'staging-service.' + hashlib.sha256(_json([project, recipe]).encode()).hexdigest()[:24]
+            key = staging_action_key(project, recipe)
             mapping[(project, recipe)] = key
             actions[key] = WorkAction(machine_id, project=project)
     _require(bool(actions), 'invalid_staging_configuration')
@@ -607,6 +608,13 @@ class StagingController:
             self._shared_guard()
             item = self._read(job_id=_id(identity))
             current = self.queue.get_job(identity)
+            # Retired-key work predates the transactional binding. Preserve
+            # its terminal history, but never reinterpret or release an open
+            # reservation through the new action registry.
+            if current['action_key'].startswith('modular.'):
+                if item['phase'] == 'verified' and current['state'] == item.get('outcome'):
+                    return self._view(item)
+                raise HubError('staging_legacy_action_reconciliation_required', 409)
             if (current['state'] == 'claimed' and not current.get('requires_reconciliation')
                     and current.get('worker') != self.worker.encoded()):
                 raise HubError('staging_reconciliation_pending', 409)
@@ -814,6 +822,8 @@ class StagingController:
                 job = self.queue.get_job(item['job_id'])
             except HubError:
                 continue
+            if job['action_key'].startswith('modular.'):
+                continue  # Preserve legacy work for explicit operator review.
             if job['state'] == 'queued' and (item.get('hold_reason') == _UNBOUND_HOLD
                                              or not _valid_source_binding(item)):
                 try:

@@ -304,6 +304,11 @@ class WorkQueue:
 
     def _modular_target_in_transaction(self, db, actor, action_key, environment, target):
         """Bind modular source and independent review to this SQLite snapshot."""
+        # The retired namespace can contain legacy jobs that never passed this
+        # transaction gate. Preserve them, but do not claim or replay them.
+        from .staging_action_key import legacy_staging_action
+        if legacy_staging_action(action_key, target):
+            return False
         if not action_key.startswith('staging-service.'):
             return True
         if (environment != 'staging' or target.submission_id is None or target.review_revision is None
@@ -322,9 +327,8 @@ class WorkQueue:
                 return False
             task = self.repo._get(db, target.task_id, 'task')
             self.repo._no_active_run(db, target.task_id)
-            key = 'staging-service.' + hashlib.sha256(json.dumps(
-                [item['project'], item['recipe']], sort_keys=True, separators=(',', ':'),
-                allow_nan=False).encode()).hexdigest()[:24]
+            from .staging_action_key import staging_action_key
+            key = staging_action_key(item['project'], item['recipe'])
             return (key == action_key and item['actor'] == actor and item['phase'] in ('deposited', 'queued')
                     and item['review_task_id'] == target.task_id
                     and item['review_task_revision'] == target.review_revision

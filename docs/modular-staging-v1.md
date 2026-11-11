@@ -110,6 +110,14 @@ not production deployment or evidence that arbitrary code was independently
 reviewed. Existing deployment/review/held-work gates remain unchanged.
 The `staging-service.` action-key prefix is reserved for this module; queue
 admission fails closed if its staging submission table or binding is absent.
+Configured and shared compositions now use that same canonical key. Previously
+configured `modular.<64 lowercase hex>` work remains in the existing ledger;
+open legacy rows cannot be claimed or automatically reconciled, polled, replayed,
+or released, including rows with an earlier no-effect proof or worker receipt.
+An operator must review the original reservation and evidence through a separately
+trusted recovery process. Do not re-enroll or resubmit to bypass it. Terminal
+history remains readable. Unrelated generic `modular.*` actions are unchanged
+unless bound to a staging submission.
 
 Worker core API: `submit(payload)`, `status(job_id)`, `metadata(resource_id)`,
 `file(resource_id, relative_path)` and `cleanup(payload)`. HTTP equivalents:

@@ -698,7 +698,9 @@ class HubRepository:
             self._project(task['project'], db)
             self._cas(task, expected_revision)
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_work_jobs'").fetchone():
-                if db.execute("SELECT 1 FROM hub_work_jobs WHERE action_key LIKE 'staging-service.%' "
+                if db.execute("SELECT 1 FROM hub_work_jobs WHERE (action_key LIKE 'staging-service.%' OR (action_key GLOB 'modular.*' AND "
+                              "((length(action_key)=72 AND substr(action_key,9) NOT GLOB '*[^0-9a-f]*') "
+                              "OR json_extract(target,'$.submission_id') IS NOT NULL))) "
                               "AND json_extract(target,'$.task_id')=? AND state NOT IN "
                               "('succeeded','failed','cancelled') LIMIT 1", (task_id,)).fetchone():
                     raise HubError('active_work_job', 409)

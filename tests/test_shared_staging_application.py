@@ -220,8 +220,11 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
         entered.set()
         await release.wait()
         state.events.append('upload-remote-returned')
+        from hub_staging_service.source_provenance import verify
+        raw = base64.b64decode(value['source_zip_base64'])
+        binding = verify(raw, value['source_commit_object_base64'], value['source_commit'])
         return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
-                             {'size_bytes': len(base64.b64decode(value['source_zip_base64']))})
+                             {'size_bytes': len(raw), 'source_binding': binding})
     state.modular_handler = upload
     stop, task, addresses = await start(state)
     request_task = None
@@ -230,7 +233,7 @@ async def test_listener_stop_drains_accepted_http_upload_before_transport_and_ow
         controller.resources.set_policy(state.owner_actor, 'engineering-hub', 0,
                                         {'codex': ['read', 'build', 'test']})
         async with connections(addresses, state) as (agent, _):
-            request_task = asyncio.create_task(agent.post(BASE + '/staging/jobs', json=payload()))
+            request_task = asyncio.create_task(agent.post(BASE + '/staging/jobs', json=payload(controller.repo)))
             await asyncio.wait_for(entered.wait(), 3)
             stop.set()
             await until(lambda: state.core.state.shared_staging._closing)
@@ -292,3 +295,62 @@ async def test_private_socket_service_uses_same_shared_queue_and_owned_shutdown(
         await serving
     private.assert_closed(state)
     assert len(clients) == 1 and clients[0]._client.is_closed and composition.is_drained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('point', ['submit', 'claim', 'dispatch'])
+async def test_shared_configured_action_rechecks_review_at_boundaries(shared_app, monkeypatch, point):
+    from tests.test_hub_staging_controller import payload
+    from hub_staging_service.source_provenance import verify
+    state = shared_app
+    async def worker(request):
+        assert request.url.path == '/v1/sources'
+        value = json.loads(request.content)
+        raw = base64.b64decode(value['source_zip_base64'])
+        return httpx.Response(200, json={key: value[key] for key in ('source_id', 'source_digest', 'project')} |
+            {'size_bytes': len(raw), 'source_binding': verify(raw, value['source_commit_object_base64'], value['source_commit'])})
+    state.modular_handler = worker
+    stop, task, addresses = await start(state)
+    try:
+        controller = state.core.state.shared_staging.controller
+        controller.resources.set_policy(state.owner_actor, 'engineering-hub', 0,
+                                        {'codex': ['read', 'build', 'test']})
+        request = payload(controller.repo)
+        def corrupt():
+            with controller.repo._transaction() as db:
+                item = controller.repo._get(db, request['review_task_id'], 'task')
+                item['review']['verdict'] = 'reject'
+                db.execute('UPDATE hub_entities SET data=? WHERE id=?', (json.dumps(item), item['id']))
+        if point == 'submit':
+            original = controller.queue._target_verified
+            def change_after_precheck(*args):
+                result = original(*args)
+                controller.repo.set_candidate('codex', request['review_task_id'], request['review_task_revision'], 'f' * 40)
+                return result
+            monkeypatch.setattr(controller.queue, '_target_verified', change_after_precheck)
+        async with connections(addresses, state) as (agent, _):
+            response = await agent.post(BASE + '/staging/jobs', json=request)
+        if point == 'submit':
+            assert response.status_code >= 400
+            with controller.repo._connection() as db:
+                assert db.execute('SELECT COUNT(*) FROM hub_work_jobs').fetchone()[0] == 0
+        else:
+            assert response.status_code == 202
+            job = response.json()['job']
+            if point == 'claim':
+                corrupt()
+                assert await controller.run_once() is None
+                assert controller.queue.get_job(job['id'])['state'] == 'queued'
+            else:
+                original = controller.queue.live_claim
+                def change_after_claim(**kwargs):
+                    result = original(**kwargs)
+                    corrupt()
+                    return result
+                monkeypatch.setattr(controller.queue, 'live_claim', change_after_claim)
+                await controller.run_once()
+                assert controller.queue.get_job(job['id'])['state'] == 'failed'
+        assert all(request.url.path != '/v1/jobs' for request in state.modular_requests)
+    finally:
+        stop.set()
+        await task
