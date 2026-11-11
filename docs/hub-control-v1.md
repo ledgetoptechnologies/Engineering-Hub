@@ -215,7 +215,7 @@ no API calls. The normal URL always uses the real cookie-authenticated API.
 
 The independent `docker/Dockerfile.hub-control` builds and bundles the dashboard;
 the live message-bus image and its port remain unchanged. It serves the UI and API
-from one origin. The image runs as UID/GID 10001 with `HUB_DB` defaulting to
+from one origin. The image runs as UID/GID 568 with `HUB_DB` defaulting to
 `/var/lib/hub/hub.sqlite3`. A real deployment must explicitly provide protected,
 durable local storage there; the image filesystem itself is not a backup.
 
