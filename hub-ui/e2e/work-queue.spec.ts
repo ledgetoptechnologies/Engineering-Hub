@@ -28,10 +28,11 @@ async function fixture(page: Page) {
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) {
       state.reads++;
+      const status = state.queueStatus;
       if (state.queueDelay) await new Promise(resolve => setTimeout(resolve, state.queueDelay));
       expect(request.headers()["authorization"]).toBeUndefined();
       expect(new URL(request.url()).searchParams.get("limit")).toBe("50");
-      return respond(state.queueStatus === 200 ? state.body : { detail: { code: "fixture-denial" } }, state.queueStatus);
+      return respond(status === 200 ? state.body : { detail: { code: "fixture-denial" } }, status).catch(() => {});
     }
     return respond({}, 404);
   });
@@ -120,6 +121,26 @@ test("inbox never carries actor A queue details into actor B's pending or failed
   await expect(page.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
   await expect(panel.getByText("Queue status is unavailable.")).toBeVisible();
   await expect(page.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+  expect(state.writes).toBe(0);
+});
+
+test("a late actor A queue 401 cannot clear actor B's workspace", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toBeVisible();
+  state.queueDelay = 1000;
+  state.queueStatus = 401;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect.poll(() => state.reads).toBeGreaterThan(1);
+  state.actor = "human:43";
+  state.queueDelay = 0;
+  state.queueStatus = 200;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect.poll(() => state.reads).toBeGreaterThan(2);
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toBeVisible();
+  await page.waitForTimeout(1200);
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toBeVisible();
   expect(state.writes).toBe(0);
 });
 

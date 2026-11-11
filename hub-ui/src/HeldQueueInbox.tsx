@@ -11,6 +11,8 @@ export function HeldQueueInbox({ enabled, session, stale, refreshToken, onUnauth
   const [saved, setSnapshot] = useState<{ session: Session | null; value: QueueSnapshot } | null>(null);
   const snapshot = saved?.session === session ? saved.value : null;
   const [state, setState] = useState("loading");
+  const current = useRef({ session, enabled });
+  current.current = { session, enabled };
   const unauthorized = useRef(onUnauthorized);
   unauthorized.current = onUnauthorized;
   useEffect(() => {
@@ -21,10 +23,11 @@ export function HeldQueueInbox({ enabled, session, stale, refreshToken, onUnauth
       return () => controller.abort();
     }
     setState("checking");
+    const isCurrent = () => !controller.signal.aborted && current.current.enabled && current.current.session === session;
     void readQueueSnapshot(controller.signal).then(value => {
-      if (!controller.signal.aborted) { setSnapshot({ session, value }); setState("loaded"); }
+      if (isCurrent()) { setSnapshot({ session, value }); setState("loaded"); }
     }).catch(error => {
-      if (controller.signal.aborted) return;
+      if (!isCurrent()) return;
       setSnapshot(null);
       if (error instanceof HubApiError && [401, 403].includes(error.status)) {
         setState("unauthorized"); unauthorized.current();
