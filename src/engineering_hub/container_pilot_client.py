@@ -225,6 +225,11 @@ class ContainerPilotClient:
         return "ContainerPilotClient(credential=<redacted>)"
 
     @property
+    def single_pilot_protocol(self) -> bool:
+        """Construction-time protocol selection; not a peer identity claim."""
+        return self.__single_pilot_protocol
+
+    @property
     def timeout_seconds(self) -> float:
         """Whole-operation deadline, including connection and response transport."""
         return self.__timeout_seconds

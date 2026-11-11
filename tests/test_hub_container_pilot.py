@@ -837,6 +837,7 @@ async def test_changed_runtime_policy_has_new_digest_and_cannot_advance_old_run(
 async def test_single_pilot_controller_durably_retries_only_ack_after_lost_reply(repo, target):
     from engineering_hub.container_pilot_client import single_pilot_outcome_digest
     class AckClient(FakeClient):
+        single_pilot_protocol = True
         def __init__(self):
             super().__init__(); self.acks=[]; self.lose=True
         async def acknowledge_command(self, command, digest):
@@ -861,5 +862,19 @@ async def test_single_pilot_controller_durably_retries_only_ack_after_lost_reply
     assert await reopened._command(run,target,'deploy_container') == 'succeeded'
     assert len(client.submissions)==1 and len(client.acks)==2
     assert client.acks[0] == client.acks[1]
-    with pytest.raises(ValueError,match='single_pilot_protocol_required'):
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
         ContainerPilotWorkflow(repo,client,[target])
+
+
+def test_controller_refuses_both_client_protocol_mismatches_before_any_submit(repo,target):
+    legacy=FakeClient()
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
+        ContainerPilotWorkflow(repo,legacy,[target],single_pilot_protocol=True)
+    assert legacy.submissions == []
+    class V2(FakeClient):
+        single_pilot_protocol=True
+        async def acknowledge_command(self,command,digest): raise AssertionError('no effects')
+    modern=V2()
+    with pytest.raises(ValueError,match='single_pilot_client_mode_mismatch'):
+        ContainerPilotWorkflow(repo,modern,[target])
+    assert modern.submissions == []

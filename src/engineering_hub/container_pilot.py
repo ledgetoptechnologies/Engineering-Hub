@@ -133,6 +133,9 @@ class ContainerPilotWorkflow:
     def __init__(self, repo, client, targets, *, pilot_owner=None, single_pilot_protocol=False):
         if type(single_pilot_protocol) is not bool:
             raise ValueError('single_pilot_protocol_requires_boolean')
+        client_mode = getattr(client, 'single_pilot_protocol', False)
+        if type(client_mode) is not bool or client_mode is not single_pilot_protocol:
+            raise ValueError('single_pilot_client_mode_mismatch')
         if single_pilot_protocol and not callable(getattr(client, 'acknowledge_command', None)):
             raise ValueError('single_pilot_ack_client_required')
         self.single_pilot_protocol = single_pilot_protocol

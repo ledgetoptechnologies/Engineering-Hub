@@ -90,12 +90,13 @@ def rig(tmp_path):
     owners = []
     target = ContainerPilotTarget.from_manifest(pilot_manifest())
 
-    def restart(client=None):
+    def restart(client=None, *, single_pilot_protocol=False):
         owner = PilotOwner(path, allow_ephemeral_test_storage=True)
         owners.append(owner)
         repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
         client = client or RecoveryClient()
-        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner)
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner,
+                                          single_pilot_protocol=single_pilot_protocol)
         return SimpleNamespace(owner=owner, repo=repo, client=client, workflow=workflow,
                                recovery=PilotRecovery(workflow))
 
@@ -368,6 +369,7 @@ async def test_changed_original_request_is_not_reconstructed_or_queried(rig):
 async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, lost):
     from engineering_hub.container_pilot_client import single_pilot_outcome_digest
     class AckRecoveryClient(RecoveryClient):
+        single_pilot_protocol = True
         def __init__(self):
             super().__init__(); self.acks=[]; self.lose_submit=lost=='submit'; self.lose_ack=lost=='ack'; self.held=lost=='held'
         async def submit_command(self, command):
@@ -388,8 +390,8 @@ async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, 
             assert single_pilot_outcome_digest(response)==digest
             return response
     client=AckRecoveryClient()
-    initial=rig.restart(client)
-    workflow=ContainerPilotWorkflow(initial.repo,client,[rig.target],pilot_owner=initial.owner,single_pilot_protocol=True)
+    initial=rig.restart(client, single_pilot_protocol=True)
+    workflow=initial.workflow
     task=reviewed_task(initial.repo)
     run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
     held=await workflow.advance(run['id'])
@@ -416,11 +418,12 @@ async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, 
 @pytest.mark.asyncio
 async def test_single_pilot_recovery_never_finalizes_uncertain_ack(rig):
     class AckUnavailable(RecoveryClient):
+        single_pilot_protocol = True
         async def acknowledge_command(self, command, digest):
             raise TimeoutError('synthetic acknowledgement unavailable')
     client=AckUnavailable()
-    initial=rig.restart(client)
-    workflow=ContainerPilotWorkflow(initial.repo,client,[rig.target],pilot_owner=initial.owner,single_pilot_protocol=True)
+    initial=rig.restart(client, single_pilot_protocol=True)
+    workflow=initial.workflow
     task=reviewed_task(initial.repo)
     run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
     assert (await workflow.advance(run['id']))['status']=='held'
