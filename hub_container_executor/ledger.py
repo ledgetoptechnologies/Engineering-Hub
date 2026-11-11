@@ -3,13 +3,10 @@
 The ledger is deliberately not a daemon driver. It provides durable admission,
 fencing and operation intents; ambiguity is retained as held and never replayed.
 
-The optional single-pilot ledger protocol is not exposed by the current adapter,
-ASGI route, ContainerPilotClient, controller, or installed-runner configuration.
-A future integration must serialize admission/reconcile, arm before any effect,
-verify journal/state/daemon evidence before recording the outcome, authenticate
-an explicit controller acknowledgment of the exact original response, and
-recover that acknowledgment after lost responses. This module does not attest
-those external facts or exclude older executables and stale dispatchers.
+The optional single-pilot protocol relies on trusted private ledger ownership.
+Its no-effect denial markers provide transactional consistency, not tamper-proof
+evidence against a writer that can alter the ledger. This module does not attest
+external daemon facts or exclude older executables and stale dispatchers.
 """
 from __future__ import annotations
 

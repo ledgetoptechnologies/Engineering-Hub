@@ -713,3 +713,21 @@ def test_single_pilot_corrupt_denial_marker_fails_closed(tmp_path):
         with pytest.raises(PermissionError): ledger.get(denied.command_id)
     finally:
         ledger.close()
+
+
+def test_single_pilot_denial_with_operation_conflict_keeps_gate(tmp_path):
+    ledger = open_ledger(tmp_path); denied = request('smoke_container')
+    try:
+        ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(denied)
+        # Model an inconsistent retained intent; never interpret it as no effect.
+        with ledger._transaction() as db:
+            db.execute("INSERT INTO operations VALUES (?,?,?,'intent',?,NULL,NULL)",
+                       (str(uuid4()), denied.command_id, 'probe', '{}'))
+        assert not ledger.admit(denied).accepted
+        assert ledger.inspect_single_pilot()['request']['command_id'] == denied.command_id
+        with ledger._connection() as db:
+            assert db.execute('SELECT 1 FROM control WHERE key=?',
+                              ('single_pilot_denial:' + denied.command_id,)).fetchone() is None
+        with pytest.raises(PermissionError): ledger.arm_single_pilot(request())
+    finally:
+        ledger.close()

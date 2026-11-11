@@ -549,3 +549,34 @@ def test_single_pilot_submit_does_not_surface_unverified_success(tmp_path):
         assert adapter.get(cmd.command_id).state == 'held'
     finally:
         adapter.close()
+
+
+def test_single_pilot_lost_denial_replays_after_adapter_reopen(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hub_container_executor.single_pilot_evidence as pilot_evidence
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    # Only no-effect admission is under test; no Docker or state operation runs.
+    monkeypatch.setattr(pilot_evidence, 'require_resources', lambda *_: None)
+    backend.operation_journal = SimpleNamespace(require_no_pending=lambda: None)
+    state.require_complete_reservations = lambda **_: None
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    denied = command(manifest, 'smoke_container')
+    path = adapter.ledger.path
+    try:
+        lost = adapter.submit(denied)
+        assert lost.state == 'held' and lost.reason == 'identity_conflict'
+        assert backend.events == [] and state.calls == []
+    finally:
+        adapter.close()
+    reopened = HostAdapter(path, manifest, backend=backend, state_provisioner=state,
+                           single_pilot_protocol=True)
+    try:
+        assert reopened.get(denied.command_id).reason == 'identity_conflict'
+        replay = reopened.submit(denied)
+        assert replay.replayed and replay.reason == 'identity_conflict'
+        changed = denied.model_copy(update={'fencing_generation': denied.fencing_generation + 1})
+        assert reopened.submit(changed).reason == 'identity_conflict'
+        assert backend.events == [] and state.calls == []
+    finally:
+        reopened.close()
