@@ -13,9 +13,12 @@ export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }:
   unauthorized.current = onUnauthorized;
   useEffect(() => {
     const controller = new AbortController();
-    setSnapshot(null);
-    if (!enabled) return () => controller.abort();
-    setState("loading");
+    if (!enabled) {
+      setSnapshot(null);
+      setState("loading");
+      return () => controller.abort();
+    }
+    setState("checking");
     void readQueueSnapshot(controller.signal).then(value => {
       if (!controller.signal.aborted) { setSnapshot(value); setState("loaded"); }
     }).catch(error => {
@@ -28,17 +31,16 @@ export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }:
     return () => controller.abort();
   }, [enabled, refreshToken]);
   if (!enabled) return null;
+  if (state === "unconfigured" || ((state === "loading" || state === "checking") && !snapshot)
+      || (!stale && snapshot && (snapshot.counts.held ?? 0) === 0)) return null;
   const held = snapshot?.jobs.filter(job => job.state === "held") ?? [];
   return <section className="panel" aria-label="Held software queue jobs">
     <h2>Held software queue jobs</h2>
-    <p className="panel-description">All projects · Read-only queue status, separate from decisions. Only jobs in the held state are shown; other jobs may also require reconciliation.</p>
     {stale ? <p role="status">Workspace updates are stale. Check the software queue for current status.</p>
-      : state === "loading" ? <p role="status">Reading queue status…</p>
-      : state === "unconfigured" ? <p role="status">Software queue is not configured.</p>
-      : state !== "loaded" || !snapshot ? <p role="status">Queue status is unavailable.</p>
+      : !snapshot ? <p role="status">Queue status is unavailable.</p>
       : <>
-        <p>Held at this check: {snapshot.counts.held ?? 0}.</p>
-        <p>Totals cover all jobs; showing held jobs among the latest {snapshot.jobs.length}, up to 50.</p>
+        <p>{state === "checking" ? "Checking again; last check" : "Held at this check"}: {snapshot.counts.held ?? 0}.</p>
+        <p>All projects; held jobs among the latest {snapshot.jobs.length}, up to 50. Other jobs may also require reconciliation.</p>
         {held.length > 0 && <ul>{held.map(job => <li key={job.id}>Job {job.id} · {job.machine_id} · held</li>)}</ul>}
         {(snapshot.counts.held ?? 0) > held.length && <p>Some held jobs are outside the displayed recent jobs.</p>}
       </>}

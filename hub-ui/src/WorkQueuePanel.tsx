@@ -48,11 +48,10 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
   return <section className="panel software-queue" id="software-queue" aria-label="Software validation queue">
     <div className="panel-title"><h2>Software validation queue</h2>
       <span className="panel-action"><button className="secondary" type="button" disabled={mode === "demo" || state === "loading"} onClick={() => setRevision(value => value + 1)}>Check queue</button></span></div>
-    <p className="panel-description">Read-only coordination, separate from agent presence. No deployment, approval or execution controls.</p>
     {stale && <p role="status">Workspace events are stale. Queue information is not continuously verified.</p>}
     {state !== "loaded" && <p role={state === "unknown" ? "alert" : "status"}>{messages[state]}</p>}
     {snapshot && <>
-      <p>Master pause: {snapshot.master_paused ? "Paused" : "Not paused"} · Queue pause: {snapshot.queue_paused ? "Paused" : "Not paused"} · Effective pause: {snapshot.paused ? "Paused" : "Not paused"}</p>
+      <p>Master: {snapshot.master_paused ? "Paused" : "Not paused"} · Queue: {snapshot.queue_paused ? "Paused" : "Not paused"} · New claims: {snapshot.paused ? "Paused" : "Not paused"}</p>
       <p>Claim admission: {snapshot.claim_admission_state === "unconfigured" ? "Not configured — claims are closed"
         : snapshot.claim_admission_state === "worker_policy" ? "Worker-specific policy — runtime not verified here"
         : "Trusted local composition — runtime not verified here"}.</p>
@@ -65,7 +64,7 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
         <p>{job.requires_reconciliation ? "Reconciliation required — machine reservation remains held."
           : job.blocked_reason ? `Blocked: ${job.blocked_reason.replaceAll("_", " ")}`
           : job.eligible ? "Conditionally eligible — admission, ownership and execution proof still required."
-          : "Not eligible for a new claim."}</p>
+          : job.state === "claimed" ? "Claimed; execution is not confirmed." : "Not eligible for a new claim."}</p>
         {job.blocked_reason === "machine_reserved" && <p>{job.reservation_holder_job_id
           ? <>Reservation holder at this check: job {job.reservation_holder_job_id} ({snapshot.jobs.find(candidate => candidate.id === job.reservation_holder_job_id)?.state === "held" ? "held for reconciliation" : "claimed; execution not confirmed"}).</>
           : "Reservation holder is not identified in this snapshot."}</p>}

@@ -14,7 +14,7 @@ function snapshot() {
 }
 
 async function fixture(page: Page) {
-  const state = { reads: 0, writes: 0, queueStatus: 200, body: snapshot() };
+  const state = { reads: 0, writes: 0, queueStatus: 200, overviewStatus: 200, queueDelay: 0, body: snapshot() };
   await page.route("**/api/hub/v1/**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
     const respond = (body: unknown, status = 200) => route.fulfill({ status,
@@ -22,12 +22,13 @@ async function fixture(page: Page) {
     if (request.method() !== "GET") { state.writes++; return respond({}, 405); }
     if (path.endsWith("/auth/me")) return respond({ authenticated: true,
       actor: "human:42", github_id: 42, csrf_token: "fixture-csrf" });
-    if (path.endsWith("/overview")) return respond(createDemoOverview());
+    if (path.endsWith("/overview")) return respond(createDemoOverview(), state.overviewStatus);
     if (path.endsWith("/events/status")) return respond({ available: false,
       reason: "native_source_unsupported", observer_epoch: "fixture", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) {
       state.reads++;
+      if (state.queueDelay) await new Promise(resolve => setTimeout(resolve, state.queueDelay));
       expect(request.headers()["authorization"]).toBeUndefined();
       expect(new URL(request.url()).searchParams.get("limit")).toBe("50");
       return respond(state.queueStatus === 200 ? state.body : { detail: { code: "fixture-denial" } }, state.queueStatus);
@@ -77,6 +78,43 @@ test("inbox clears the private workspace on queue authentication loss", async ({
   await expect.poll(() => state.reads).toBeGreaterThan(0);
   await expect(page.getByRole("region", { name: "Held software queue jobs" })).toHaveCount(0);
   expect(state.writes).toBe(0);
+});
+
+test("inbox hides zero and unconfigured queue states", async ({ page }) => {
+  const state = await fixture(page);
+  state.body.counts.held = 0;
+  state.body.jobs = [];
+  await page.goto("/#/inbox");
+  await expect.poll(() => state.reads).toBeGreaterThan(0);
+  await expect(page.getByRole("region", { name: "Held software queue jobs" })).toHaveCount(0);
+  state.queueStatus = 423;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect.poll(() => state.reads).toBeGreaterThan(1);
+  await expect(page.getByRole("region", { name: "Held software queue jobs" })).toHaveCount(0);
+});
+
+test("inbox retains last check during refresh, then clears it on error", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText("Held at this check: 1.")).toBeVisible();
+  state.queueDelay = 500;
+  state.queueStatus = 503;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(panel.getByText("Checking again; last check: 1.")).toBeVisible();
+  await expect(panel.getByText("Queue status is unavailable.")).toBeVisible();
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+});
+
+test("inbox does not present old queue details when workspace is stale", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText("Held at this check: 1.")).toBeVisible();
+  state.overviewStatus = 503;
+  await page.getByRole("button", { name: "Refresh workspace" }).click();
+  await expect(panel.getByText("Workspace updates are stale.", { exact: false })).toBeVisible();
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
 });
 
 test("held queue is visible without implying executor readiness; explicit refresh only reads", async ({ page }) => {
@@ -141,7 +179,7 @@ test("reports pause without claiming an unpaused executor is running", async ({ 
   state.body.paused = true;
   await page.goto("/#/staging");
   const panel = page.getByRole("region", { name: "Software validation queue" });
-  await expect(panel.getByText("Master pause: Paused · Queue pause: Not paused · Effective pause: Paused")).toBeVisible();
+  await expect(panel.getByText("Master: Paused · Queue: Not paused · New claims: Paused")).toBeVisible();
   expect(state.writes).toBe(0);
 });
 
