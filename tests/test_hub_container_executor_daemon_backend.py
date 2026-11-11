@@ -771,7 +771,7 @@ def test_create_rejects_profile_mismatch_and_symlink_generation_before_post(tmp_
     backend.close()
 
 
-def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candidate",
+def probe_fixture(tmp_path, *, first_report=None, lose_start=False, lose_create=False, role="candidate",
                   reports=None, exec_state=None, start_callback=None):
     manifest, image, blobs = verified_image(role)
     generation = safe_generation(tmp_path)
@@ -800,6 +800,8 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
             return httpx.Response(200, json=inspection)
         if path.endswith("/containers/" + container_id + "/exec"):
             exec_number += 1
+            if lose_create:
+                raise httpx.ReadTimeout("synthetic create response loss")
             arguments = json.loads(request.content)['Cmd']
             current_probe = next(probe for probe in manifest.probes.candidate
                                  if probe.expectation_id == arguments[7])
@@ -836,6 +838,36 @@ def probe_fixture(tmp_path, *, first_report=None, lose_start=False, role="candid
     observed = backend.inspect_container(container_id, 3000)
     assert observed is not None and observed.status == "running"
     return backend, manifest, image, requests
+
+
+@pytest.mark.parametrize('lost', ['create', 'start'])
+def test_probe_response_loss_stays_pending_and_same_id_cannot_replay(tmp_path, lost):
+    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+
+    private = tmp_path / 'private-journal'
+    private.mkdir(mode=0o700)
+    journal_path = private / 'operations.sqlite'
+    operation_id = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
+    backend, manifest, _, requests = probe_fixture(
+        tmp_path, lose_create=lost == 'create', lose_start=lost == 'start')
+    try:
+        with SQLiteOperationJournal(journal_path, create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            backend.operation_journal = journal
+            with pytest.raises(DaemonBackendError):
+                run_readiness(backend, manifest.probes.candidate)
+            assert journal.inspect(operation_id).state == 'pending'
+            posts = [item for item in requests if item[0] == 'POST']
+            with pytest.raises(DaemonBackendError):
+                run_readiness(backend, manifest.probes.candidate)
+            assert [item for item in requests if item[0] == 'POST'] == posts
+        backend.operation_journal = None
+        with SQLiteOperationJournal(journal_path, create=False,
+                                    allow_ephemeral_test_storage=True) as reopened:
+            assert reopened.inspect(operation_id).state == 'pending'
+    finally:
+        backend.close()
 
 
 def test_compiled_probes_use_fixed_exec_argv_and_return_health_evidence(tmp_path):
