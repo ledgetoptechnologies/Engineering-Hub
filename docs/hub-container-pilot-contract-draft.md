@@ -242,6 +242,14 @@ and cannot replay that denial exactly. Executors predating the single-pilot
 protocol can ignore its control rows entirely; the unchanged schema version is
 not a downgrade fence.
 
+The synthetic cross-version ledger checks in
+`tests/test_hub_container_executor_ledger.py` run when the exact `85411ff`
+Git object is available. A shallow checkout or source archive may lack it;
+the checks then explicitly skip and do not establish compatibility. To require
+the check for a review, run the ledger test file with
+`HUB_VERIFY_PRIOR_PILOT_LEDGER=1`; a missing object or Git executable then fails
+the test instead of skipping it. These checks do not validate a host rollback.
+
 An application-image rollback within the pilot is a separate operation from
 replacing or downgrading the executor. Before considering an executor change,
 preserve the ledger and its identity, stop and independently fence the prior
