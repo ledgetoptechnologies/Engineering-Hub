@@ -5,6 +5,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 import stat
 import warnings
@@ -274,3 +277,18 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert 'CMD ["--config", "/operator/runner.json"]' in lines
     assert not any(line.startswith(("ADD ", "COPY .", "HEALTHCHECK ", "EXPOSE ")) for line in lines)
     assert not any(term in text for term in ("pip install -e", "curl ", "wget ", "apt-get", "docker.sock", "signing_key"))
+
+
+def test_recipe_checks_venv_python_patch_before_imports(tmp_path):
+    text = (ROOT / 'docker/Dockerfile.hub-executor').read_text()
+    command = re.search(r'RUN --network=none /opt/venv/bin/python -I -B -c "([^"]+)"', text).group(1)
+    check = command.split('; root=', 1)[0]
+    config = tmp_path / 'pyvenv.cfg'
+    check = check.replace("'/opt/venv/pyvenv.cfg'", repr(str(config)))
+    config.write_text('version_info = ' + '.'.join(map(str, sys.version_info[:3])) + '\n')
+    assert subprocess.run([sys.executable, '-I', '-c', check], capture_output=True).returncode == 0
+    config.write_text('version_info = 0.0.0\n')
+    mismatch = subprocess.run([sys.executable, '-I', '-c', check], capture_output=True)
+    assert mismatch.returncode != 0 and b'Core venv Python version mismatch' in mismatch.stderr
+    config.write_text('home = /usr/local/bin\n')
+    assert subprocess.run([sys.executable, '-I', '-c', check], capture_output=True).returncode != 0
