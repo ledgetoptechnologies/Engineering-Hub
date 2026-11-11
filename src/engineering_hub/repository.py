@@ -574,6 +574,9 @@ class HubRepository:
     def list_decisions(self):
         return self._list('decision')
 
+    def get_decision(self, identity):
+        return self._read(identity, 'decision')
+
     @staticmethod
     def _open_work_job(db, task_id):
         """A queued, claimed or held work-queue job still owns this task; terminal ones don't."""

@@ -25,7 +25,11 @@ features:{task_recovery:true}}`. The capability catalog is finite:
 
 `project.read`, `component.read`, `component.write`, `task.read`, `task.propose`,
 `task.claim`, `task.candidate`, `task.review`, `planning.read`, `planning.write`,
-`decision.request`, `entity.withdraw`.
+`decision.request`, `decision.read`, `entity.withdraw`. `decision.read` is an
+explicit independent grant: it permits reading any decision and answer within
+the granted active projects, including sensitive answer text. Grant it only
+where that visibility is intended. It grants no answer or execution authority.
+Existing grants do not acquire this new capability automatically.
 
 There are no implicit capability dependencies. A permitted mutation returns
 its own result; a later read needs its separate read capability. A grant is the

@@ -371,6 +371,77 @@ def data(result):
     return result.get('structuredContent') or json.loads(result['content'][0]['text'])
 
 
+def test_session_decision_read_cross_surface_and_project_grants(unified):
+    client, app, bus, csrf = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('decision.request', 'decision.read'))
+    _, no_read, _ = pair(env, name='no-read', caps=('decision.request',))
+    invoke, _ = sdk(client, token); denied, _ = sdk(client, no_read)
+    created = data(invoke('hub_decision_request', {'project':PROJECT,'title':'Shared question',
+                                                   'options':['A','B']}))
+    overview = client.get('/api/hub/v1/overview').json()
+    assert next(row for row in overview['decisions'] if row['id']==created['id'])['status']=='open'
+    response = client.post('/api/hub/v1/decisions/'+created['id']+'/answer', headers=csrf,
+                           json={'expected_revision':1,'answer':'B'})
+    assert response.status_code==200
+    answer = data(invoke('hub_decision_get', {'decision_id':created['id']}))
+    assert answer['status']=='answered' and answer['answer']=='B' and answer['execution_authorization'] is False
+    assert denied('hub_decision_get', {'decision_id':created['id']})['isError']
+    other = app.state.repository.create_decision(OWNER, 'project-alpha', 'Private scope', ['A','B'])
+    cross=invoke('hub_decision_get', {'decision_id':other['id']})
+    missing=invoke('hub_decision_get', {'decision_id':'00000000-0000-4000-8000-000000000000'})
+    assert cross['isError'] and missing['isError'] and cross['content'][0]['text']==missing['content'][0]['text']
+    app.state.session_hub_bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_decision_get', {'decision_id':created['id']})['isError']
+
+
+def test_decision_read_denies_expired_grant_and_archived_project(env):
+    installation, token, _ = pair(env, caps=('decision.read',), projects=('project-alpha',))
+    item=env.repo.create_decision(OWNER, 'project-alpha', 'Question', ['A','B'])
+    def scoped():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id':item['id']}, op)
+            result=env.repo.get_decision(item['id'])
+            op.before_commit(env.repo.path, None)
+            return result
+    assert scoped()['id']==item['id']
+    env.projects.archive_project(OWNER, 'project-alpha', 1)
+    with pytest.raises(HubError, match='hub_decision_unavailable'):
+        scoped()
+    env.clock.value += 86401
+    with pytest.raises((HubError, AgentSessionError)):
+        scoped()
+
+
+def test_decision_read_holds_session_writer_until_result_is_authorized(env):
+    installation, token, _ = pair(env, caps=('decision.read',))
+    item=env.repo.create_decision(OWNER, PROJECT, 'Question', ['A','B'])
+    entered=threading.Event(); release=threading.Event(); revoked=threading.Event()
+    def read():
+        with env.bridge.admit(token, 'hub_decision_get') as op:
+            env.bridge._scope('hub_decision_get', {'decision_id':item['id']}, op)
+            value=env.repo.get_decision(item['id'])
+            entered.set(); assert release.wait(5)
+            op.before_commit(env.repo.path, None)
+            return value
+    def revoke():
+        env.bridge.grant_revoke(OWNER, installation, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future=pool.submit(read)
+        try:
+            assert entered.wait(5)
+            revoke_future=pool.submit(revoke)
+            assert not revoked.wait(.05)
+        finally:
+            release.set()
+        assert read_future.result(timeout=5)['id']==item['id']
+        revoke_future.result(timeout=5)
+    with pytest.raises(HubError, match='hub_grant_required'):
+        with env.bridge.admit(token, 'hub_decision_get'):
+            pass
+
+
 def test_real_owner_api_and_existing_mcp_tools_unified(unified):
     client, app, bus, csrf = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)

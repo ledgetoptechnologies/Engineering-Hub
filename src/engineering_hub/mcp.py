@@ -204,6 +204,12 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                                                   details=details, links=links, allow_text=allow_text))
 
     @registration.tool()
+    def hub_decision_get(decision_id: str, ctx: Context) -> dict:
+        """Read one shared decision and its answer; this grants no execution authority."""
+        identity(ctx)
+        return invoke(repo.get_decision, decision_id)
+
+    @registration.tool()
     def hub_entity_withdraw(kind: str, entity_id: str, expected_revision: int, reason: str, ctx: Context,
                             superseded_by: str | None = None) -> dict:
         """Withdraw a task or decision you created that is no longer needed; nothing is deleted.

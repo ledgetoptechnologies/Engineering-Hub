@@ -35,6 +35,7 @@ TOOLS = {
     'hub_task_candidate': 'task.candidate', 'hub_task_review': 'task.review',
     'hub_planning_list': 'planning.read', 'hub_planning_get': 'planning.read',
     'hub_planning_put': 'planning.write', 'hub_decision_request': 'decision.request',
+    'hub_decision_get': 'decision.read',
     'hub_entity_withdraw': 'entity.withdraw',
 }
 CAPABILITIES = tuple(sorted(set(TOOLS.values())))
@@ -381,6 +382,15 @@ class SessionHubBridge:
             project = arguments['project_id']
         elif tool in {'hub_task_get', 'hub_task_claim', 'hub_task_candidate', 'hub_task_review'}:
             project = self.repo.get_task(arguments['task_id'])['project']
+        elif tool == 'hub_decision_get':
+            try:
+                project = self.repo.get_decision(arguments['decision_id'])['project']
+                operation.project(project)
+            except HubError:
+                # Do not disclose whether an ID exists in an ungranted or
+                # archived project; neither becomes a read authority.
+                raise HubError('hub_decision_unavailable', 404) from None
+            return
         elif tool in {'hub_component_get', 'hub_component_update', 'hub_component_retire'}:
             identity = arguments.get('component_id', data.get('component_id'))
             project = self.components.get_component(identity)['project']

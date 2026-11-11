@@ -4,10 +4,14 @@ import { actorAvatar, actorFamily, actorName } from "./actors";
 import { waitingOn } from "./dashboardText";
 import wire from "./fixtures/agent-hub-bridge-wire-v1.json";
 import {
-  grantFailureText, httpHubGrants, parseBridgeTask, parseCatalog, parseClaims, parseGrant, parseHistory, parseRecoveryResult,
+  capabilityLabel, grantFailureText, httpHubGrants, parseBridgeTask, parseCatalog, parseClaims, parseGrant, parseHistory, parseRecoveryResult,
 } from "./hubGrantsApi";
 import { resourceMaker } from "./StagingResourcesPanel";
 import type { Task } from "./types";
+
+it("describes decision read as project-wide questions and answers", () => {
+  expect(capabilityLabel("decision.read")).toBe("Read all questions and answers in selected projects");
+});
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const installation = wire.active_grant.installation_id;
