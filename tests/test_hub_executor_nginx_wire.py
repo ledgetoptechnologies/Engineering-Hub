@@ -52,6 +52,7 @@ def command():
 
 
 class FixtureAdapter:
+    _single_pilot_protocol = False
     def __init__(self):
         self.calls = []
         self.receipts = {}

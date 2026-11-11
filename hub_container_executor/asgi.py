@@ -78,7 +78,7 @@ class PilotASGI:
         if (path == CAPABILITY_V2 or path == COMMANDS or path.startswith(COMMANDS + '/')
                 or path == COMMANDS_V2 or path.startswith(COMMANDS_V2 + '/')):
             try:
-                mode = getattr(self._adapter, '_single_pilot_protocol', False)
+                mode = getattr(self._adapter, '_single_pilot_protocol', None)
                 if type(mode) is not bool:
                     raise ValueError('exact single pilot mode required')
             except Exception:

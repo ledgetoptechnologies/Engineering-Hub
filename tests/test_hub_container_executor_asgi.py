@@ -182,6 +182,7 @@ def test_ack_route_requires_bearer_and_exact_command_identity(tmp_path):
     manifest = PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode())
     cmd = command(manifest); calls=[]
     class Adapter:
+        _single_pilot_protocol = False
         def acknowledge_single_pilot(self, request, digest):
             calls.append((request,digest))
             return _make_response(request, state='succeeded')
@@ -238,4 +239,13 @@ def test_invalid_protocol_mode_fails_closed_before_body_and_effect(mode):
                      '/v2/container-pilot/capability'):
             result = await request(app, 'GET', path)
             assert result.status_code == 500
+    run_owned_loop(exercise())
+
+
+def test_missing_protocol_mode_fails_closed():
+    app = create_app(object(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            assert (await request(app, 'GET', path)).status_code == 500
     run_owned_loop(exercise())
