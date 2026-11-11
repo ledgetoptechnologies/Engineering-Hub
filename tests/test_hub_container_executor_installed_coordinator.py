@@ -345,8 +345,14 @@ def test_single_pilot_coordinator_requires_explicit_v2_and_passes_opt_in(monkeyp
         with pytest.raises(module.InstalledCoordinatorError): module.parse_configuration(canonical(legacy))
     events=[]; captured=[]
     install_fakes(monkeypatch,events)
+    class CaptureClient:
+        @staticmethod
+        def for_private_unix(path, token, **kwargs):
+            assert path == '/pilot/executor/host.sock' and kwargs == {'single_pilot_protocol':True}
+            return object()
+    monkeypatch.setattr(module, 'ContainerPilotClient', CaptureClient)
     async def capture(settings, manifest, factory, **kwargs):
-        captured.append(kwargs)
+        captured.append(kwargs); assert factory() is not None
     monkeypatch.setattr(module,'serve_owned_queued_pilot',capture)
     run_owned_loop(module.run_installed_coordinator(config, reconciliation_factory=synthetic_reconciliation))
     assert len(captured)==1 and captured[0]['single_pilot_protocol'] is True

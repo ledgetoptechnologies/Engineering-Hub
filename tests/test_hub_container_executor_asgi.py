@@ -198,3 +198,29 @@ def test_ack_route_requires_bearer_and_exact_command_identity(tmp_path):
             good=await client.post(path,json=body,headers=headers)
             assert good.status_code == 200 and calls == [(cmd,body['outcome_digest'])]
     run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('client_mode,server_mode,allowed', [
+    (False,False,True),(True,True,True),(False,True,False),(True,False,False)])
+def test_versioned_capability_and_command_routes_fail_closed_before_effect(client_mode,server_mode,allowed):
+    from engineering_hub.container_pilot_client import ContainerPilotClient, ContainerPilotClientError
+    from hub_container_executor.ledger import _make_response
+    manifest=PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode()); cmd=command(manifest)
+    class Adapter:
+        _single_pilot_protocol=server_mode
+        def __init__(self): self.calls=[]
+        def submit(self, request): self.calls.append(request); return _make_response(request)
+    adapter=Adapter(); app=create_app(adapter,bearer_token='test-token-only')
+    async def exercise():
+        client=ContainerPilotClient('http://127.0.0.1','test-token-only',
+            transport=httpx.ASGITransport(app=app),single_pilot_protocol=client_mode)
+        try:
+            if allowed:
+                assert (await client.submit_command(cmd)).command_id == cmd.command_id
+                assert adapter.calls==[cmd]
+            else:
+                with pytest.raises(ContainerPilotClientError): await client.submit_command(cmd)
+                assert adapter.calls==[]
+        finally:
+            await client.aclose()
+    run_owned_loop(exercise())

@@ -245,7 +245,8 @@ async def run_installed_coordinator(config, *, reconciliation_factory=None,
             agent_allowed_hosts=('127.0.0.1', f'127.0.0.1:{config.port}'))
 
         def fresh_client():
-            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'])
+            return ContainerPilotClient.for_private_unix(config.executor_socket, tokens['executor'],
+                **({'single_pilot_protocol':True} if config.single_pilot_protocol else {}))
 
         def policy(actor, action_key, environment, target):
             return target_allowed(config, actor, action_key, environment, target)
