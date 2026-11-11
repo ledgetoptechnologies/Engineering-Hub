@@ -730,13 +730,21 @@ class WorkQueue:
         # A status read never mutates expired jobs; expose ambiguity explicitly.
         now = self._now()
         with self.repo._connection() as db:
-            rows = db.execute('SELECT * FROM hub_work_jobs ORDER BY sequence DESC LIMIT ?', (limit,)).fetchall()
+            # Read each visible job and the machine reservation in one SQLite
+            # statement so a concurrent release/reclaim cannot splice snapshots.
+            rows = db.execute('SELECT j.*, m.job_id AS _reservation_holder '
+                              'FROM hub_work_jobs AS j LEFT JOIN hub_work_machines AS m '
+                              'ON m.machine_id=j.machine_id ORDER BY j.sequence DESC LIMIT ?', (limit,)).fetchall()
+            visible = {row['id']: row for row in rows}
             queue_paused = bool(db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0])
             master_paused = bool(self.repo._paused(db))
             paused = queue_paused or master_paused
             jobs = []
             for row in rows:
                 item = self._public(row)
+                holder_id = item.pop('_reservation_holder')
+                visible_holder = visible.get(holder_id)
+                disclosed_holder = None
                 reconciliation = row['state'] == 'held' or (row['state'] == 'claimed' and row['lease_until'] <= now)
                 reason = 'requires_reconciliation' if reconciliation else None
                 if row['state'] == 'queued':
@@ -751,12 +759,16 @@ class WorkQueue:
                         reason = 'admission_not_configured'
                     elif not self._target_verified(row['actor'], row['action_key'], row['environment'], WorkTarget(**json.loads(row['target']))):
                         reason = 'target_not_verified'
-                    elif db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=? AND job_id IS NOT NULL', (row['machine_id'],)).fetchone():
+                    elif holder_id is not None:
                         reason = 'machine_reserved'
+                        # Never add an identity outside the existing result scope.
+                        if (visible_holder is not None and visible_holder['machine_id'] == row['machine_id']
+                                and visible_holder['state'] in ('claimed', 'held')):
+                            disclosed_holder = holder_id
                 item.update(requires_reconciliation=reconciliation,
                             eligible=row['state'] == 'queued' and reason is None,
                             eligible_requires_worker_admission=self.claim_verifier is not None and type(self.claim_verifier) is not ClosedClaimPolicy,
-                            blocked_reason=reason)
+                            blocked_reason=reason, reservation_holder_job_id=disclosed_holder)
                 jobs.append(item)
             return {'paused': paused, 'queue_paused': queue_paused, 'master_paused': master_paused,
                     'claim_admission_state': ('unconfigured' if type(self.claim_verifier) is ClosedClaimPolicy

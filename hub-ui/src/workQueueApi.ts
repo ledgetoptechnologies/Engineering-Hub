@@ -8,6 +8,7 @@ export interface QueueJob {
   state: WorkState; target: { task_id: string; source_commit: string; artifact_digest: string };
   blocked_reason: string | null; requires_reconciliation: boolean;
   eligible: boolean; eligible_requires_worker_admission: boolean;
+  reservation_holder_job_id: string | null;
 }
 export interface QueueSnapshot {
   paused: boolean; queue_paused: boolean; master_paused: boolean;
@@ -47,9 +48,17 @@ export function parseQueueSnapshot(value: unknown): QueueSnapshot {
       target: { task_id: text(target.task_id, uuid), source_commit: text(target.source_commit, /^[a-f0-9]{40}$/),
         artifact_digest: text(target.artifact_digest, /^sha256:[a-f0-9]{64}$/) },
       blocked_reason: job.blocked_reason as string | null, requires_reconciliation: bool(job.requires_reconciliation),
-      eligible: bool(job.eligible), eligible_requires_worker_admission: bool(job.eligible_requires_worker_admission) };
+      eligible: bool(job.eligible), eligible_requires_worker_admission: bool(job.eligible_requires_worker_admission),
+      reservation_holder_job_id: job.reservation_holder_job_id == null ? null : text(job.reservation_holder_job_id, uuid) };
   });
   if (new Set(jobs.map(job => job.id)).size !== jobs.length) return invalid();
+  for (const job of jobs) {
+    if (job.reservation_holder_job_id !== null) {
+      const holder = jobs.find(candidate => candidate.id === job.reservation_holder_job_id);
+      if (job.state !== "queued" || job.blocked_reason !== "machine_reserved" || !holder
+          || holder.machine_id !== job.machine_id || !["held", "claimed"].includes(holder.state)) return invalid();
+    }
+  }
   const result: QueueSnapshot = { paused: bool(row.paused), queue_paused: bool(row.queue_paused), master_paused: bool(row.master_paused),
     claim_admission_state: admission, counts, jobs };
   if (result.paused !== (result.queue_paused || result.master_paused)) return invalid();

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import uuid
 
 import pytest
@@ -45,6 +46,59 @@ def test_reserved_modular_prefix_without_enrollment_fails_closed(tmp_path):
 
 def finish(queue, claimed, outcome='succeeded'):
     return queue.complete(job_id=claimed['id'], worker=WorkWorker(*claimed['worker'].split(':', 1)), fence=claimed['fence'], outcome=outcome)
+
+
+def test_status_identifies_only_visible_same_machine_reservation(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    other = submit(q, key='other-machine', action='other')
+    jobs = {item['id']: item for item in q.status()['jobs']}
+    assert jobs[waiting['id']]['blocked_reason'] == 'machine_reserved'
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'claimed'
+    assert jobs[other['id']]['reservation_holder_job_id'] is None
+    finish(q, claimed, outcome='held')
+    jobs = {item['id']: item for item in q.status()['jobs']}
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'held'
+
+
+def test_status_does_not_disclose_holder_outside_fifty_jobs(setup_queue):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    q.claim(worker=w('codex'), lease_seconds=10)
+    for i in range(50): submit(q, key=f'waiting-{i}')
+    jobs = q.status(limit=50)['jobs']
+    assert original['id'] not in {item['id'] for item in jobs}
+    assert all(item['blocked_reason'] == 'machine_reserved' and item['reservation_holder_job_id'] is None
+               for item in jobs)
+
+
+def test_status_reservation_and_visible_state_share_one_snapshot(setup_queue, monkeypatch):
+    q, _, _, _ = setup_queue
+    original = submit(q, key='holder')
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    waiting = submit(q, key='waiting')
+    reading, resume = threading.Event(), threading.Event()
+    def block_after_read(*_args):
+        reading.set()
+        assert resume.wait(5)
+        return True
+    monkeypatch.setattr(q, '_target_verified', block_after_read)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(q.status)
+        try:
+            assert reading.wait(5)
+            finish(q, claimed)
+        finally:
+            resume.set()
+        jobs = {item['id']: item for item in future.result(timeout=5)['jobs']}
+    assert jobs[waiting['id']]['blocked_reason'] == 'machine_reserved'
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == original['id']
+    assert jobs[original['id']]['state'] == 'claimed'
+    assert q.get_job(original['id'])['state'] == 'succeeded'
 
 
 def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):

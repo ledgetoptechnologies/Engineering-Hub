@@ -54,6 +54,19 @@ test("held queue is visible without implying executor readiness; explicit refres
   await expect(panel.getByRole("button")).toHaveCount(1);
 });
 
+test("shows only an authoritative visible reservation holder", async ({ page }) => {
+  const state = await fixture(page);
+  const holder = state.body.jobs[0];
+  const waitingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  state.body.jobs.push({ ...holder, id: waitingId, state: "queued", requires_reconciliation: false,
+    blocked_reason: "machine_reserved", reservation_holder_job_id: holder.id });
+  await page.goto("/#/staging");
+  const panel = page.getByRole("region", { name: "Software validation queue" });
+  await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (held).`)).toBeVisible();
+  expect(state.writes).toBe(0);
+  expect(await panel.getByRole("button").count()).toBe(1);
+});
+
 test("queue becoming unavailable clears old rows instead of showing an empty healthy queue", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/#/staging");

@@ -116,6 +116,20 @@ def test_reads_require_identity_and_all_agents_can_read(rig):
             assert client.get(BASE + path, headers=bearer(name)).status_code == 200
 
 
+def test_holder_identity_is_only_exposed_after_existing_authentication(rig):
+    client, _, _, _, _, submission, _, _ = rig
+    first = client.post(BASE + '/jobs', headers=bearer(), json=submission()).json()
+    claim = client.post(BASE + '/claim', headers=bearer(), json={'instance_id': str(uuid4())})
+    assert claim.status_code == 200 and claim.json()['job']['id'] == first['id']
+    waiting = client.post(BASE + '/jobs', headers=bearer(), json=submission()).json()
+    assert client.get(BASE + '/status').status_code == 401
+    assert client.get(BASE + '/status', headers={'Authorization': 'Bearer invalid'}).status_code == 401
+    response = client.get(BASE + '/status', headers=bearer())
+    assert response.status_code == 200
+    jobs = {row['id']: row for row in response.json()['jobs']}
+    assert jobs[waiting['id']]['reservation_holder_job_id'] == first['id']
+
+
 def test_unconfigured_returns423_after_auth_for_all_routes(rig):
     _, _, _, build, _, submission, *_ = rig
     with build(None) as client:

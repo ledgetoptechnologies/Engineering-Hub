@@ -66,6 +66,9 @@ export function WorkQueuePanel({ mode, refreshToken, stale, onUnauthorized }: Wo
           : job.blocked_reason ? `Blocked: ${job.blocked_reason.replaceAll("_", " ")}`
           : job.eligible ? "Conditionally eligible — admission, ownership and execution proof still required."
           : "Not eligible for a new claim."}</p>
+        {job.blocked_reason === "machine_reserved" && <p>{job.reservation_holder_job_id
+          ? <>Reservation holder at this check: job {job.reservation_holder_job_id} ({snapshot.jobs.find(candidate => candidate.id === job.reservation_holder_job_id)?.state}).</>
+          : "Reservation holder is not identified in this snapshot."}</p>}
         {job.eligible_requires_worker_admission && <p>Exact worker enrollment must still be checked.</p>}
         <details><summary>Exact task and artifact</summary><p>Task: {job.target.task_id}</p>
           <p>Commit: {job.target.source_commit}</p><p>Artifact: {job.target.artifact_digest}</p></details>

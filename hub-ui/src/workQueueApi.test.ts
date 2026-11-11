@@ -13,6 +13,18 @@ const response = (value: unknown, status = 200) => new Response(JSON.stringify(v
   status, headers: { "Content-Type": "application/json" },
 });
 describe("read-only software queue", () => {
+  it("accepts only a visible same-machine claimed or held reservation holder", () => {
+    const data = fixture();
+    const waiting = { ...data.jobs[0], blocked_reason: "machine_reserved", reservation_holder_job_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+    const holder = { ...data.jobs[0], id: waiting.reservation_holder_job_id, state: "held", blocked_reason: "requires_reconciliation", requires_reconciliation: true };
+    const snapshot = { ...data, jobs: [waiting, holder] };
+    expect(parseQueueSnapshot(snapshot).jobs[0].reservation_holder_job_id).toBe(holder.id);
+    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting] })).toThrow("invalid_queue_snapshot");
+    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, machine_id: "other" }] })).toThrow("invalid_queue_snapshot");
+    expect(() => parseQueueSnapshot({ ...data, jobs: [waiting, { ...holder, state: "succeeded" }] })).toThrow("invalid_queue_snapshot");
+    expect(parseQueueSnapshot({ ...data, jobs: [{ ...waiting, reservation_holder_job_id: null }] }).jobs[0].reservation_holder_job_id).toBeNull();
+    expect(parseQueueSnapshot(fixture()).jobs[0].reservation_holder_job_id).toBeNull();
+  });
   it("projects only displayed fields, preserving closed admission and exact target", () => {
     const result = parseQueueSnapshot(fixture());
     expect(result.claim_admission_state).toBe("unconfigured");
