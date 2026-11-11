@@ -252,7 +252,11 @@ def test_recipe_is_separate_pinned_offline_consumer_not_mutable_checkout_install
     assert lines[0] == "ARG CORE_IMAGE"
     assert "ARG CORE_IMAGE=" not in text
     assert "FROM ${CORE_IMAGE} AS core" in lines
-    assert any(line.startswith("FROM python:3.12-slim@sha256:") for line in lines)
+    # This is the exact Python base pinned for the reviewed 70312191 core;
+    # version-prefix equality alone permits copying a venv onto another patch.
+    assert [line for line in lines if line.endswith(" AS python-runtime")] == [
+        "FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS python-runtime"
+    ]
     assert "FROM scratch" in lines
     assert "COPY executor.whl /build/engineering_hub_container_executor-0.1.0-py3-none-any.whl" in lines
     assert "COPY validate_executor_wheel.py /build/validate_executor_wheel.py" in lines
