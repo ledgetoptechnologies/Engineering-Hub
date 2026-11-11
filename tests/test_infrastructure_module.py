@@ -492,3 +492,99 @@ def test_nonempty_unknown_bytes_are_never_treated_as_empty(tmp_path):
     module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
     assert module.state == 'invalid' and module.service is None
     assert database.read_bytes() == b'\0' * 4096
+
+
+def _snapshot(directory):
+    return {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
+
+
+@POSIX
+@pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
+def test_sidecar_appearing_after_admission_is_never_replayed_or_removed(tmp_path, monkeypatch, late):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path)
+    real = module._owned_image
+
+    def racing():
+        (directory / ('inventory.sqlite3-' + late)).write_bytes(b'foreign uncommitted pages')
+        return real()
+    monkeypatch.setattr(module, '_owned_image', racing)
+    result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert result.state == 'invalid' and result.service is None
+    after = _snapshot(directory)
+    assert set(after) == {'inventory.sqlite3', 'inventory.sqlite3-' + late}
+    assert after['inventory.sqlite3'] == (b'', 0o600)
+    assert after['inventory.sqlite3-' + late][0] == b'foreign uncommitted pages'
+
+
+@POSIX
+def test_file_populated_after_admission_keeps_the_foreign_bytes(tmp_path, monkeypatch):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path)
+    real = module._owned_image
+
+    def racing():
+        foreign = sqlite3.connect(database)
+        foreign.execute('CREATE TABLE someone_else(id TEXT)'); foreign.commit(); foreign.close()
+        return real()
+    monkeypatch.setattr(module, '_owned_image', racing)
+    result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert result.state == 'invalid' and result.service is None
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT name FROM sqlite_master").fetchall() == [('someone_else',)]
+    finally:
+        check.close()
+
+
+@POSIX
+@pytest.mark.parametrize('hold,stage', [
+    # A writer's journal is caught by the sidecar check; a reader leaves no
+    # file, so only the SQLite lock-region fence can see it.
+    ('BEGIN IMMEDIATE', 'database_admission_failed'),
+    ('BEGIN"); db.execute("SELECT count(*) FROM sqlite_master', 'database_empty_initialize_failed')])
+def test_another_sqlite_process_holding_the_file_blocks_initialization(tmp_path, caplog, hold, stage):
+    import subprocess, sys
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path)
+    holder = subprocess.Popen([sys.executable, '-c',
+        'import sqlite3,sys\n'
+        'db=sqlite3.connect(sys.argv[1],isolation_level=None)\n'
+        'db.execute("' + hold + '")\n'
+        'print("held",flush=True)\n'
+        'sys.stdin.readline()\n'
+        'db.execute("ROLLBACK");db.close()\n', str(database)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == 'held'
+        before = _snapshot(directory)
+        result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+        assert result.state == 'invalid' and result.service is None
+        assert _snapshot(directory) == before
+        assert stage in caplog.text
+    finally:
+        holder.communicate('\n', timeout=10)
+    later = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert later.state == 'ready'; later.close()
+
+
+@POSIX
+def test_interrupted_initialization_removes_only_its_own_bytes(tmp_path, monkeypatch):
+    import engineering_hub.infrastructure_module as module
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path)
+    real = os.pwrite
+
+    def partial(fd, data, offset):
+        if offset:
+            raise OSError('simulated device failure')
+        return real(fd, data[:1024], offset)
+    monkeypatch.setattr(module.os, 'pwrite', partial)
+    result = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert result.state == 'invalid'
+    monkeypatch.undo()
+    assert _snapshot(directory) == {'inventory.sqlite3': (b'', 0o600)}
+    later = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert later.state == 'ready'; later.close()

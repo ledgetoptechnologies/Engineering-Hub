@@ -157,6 +157,58 @@ def _file_info(info):
           and not mode&0o077 and mode&0o600==0o600)
 
 
+# SQLite's unix VFS takes POSIX byte-range locks in this region (PENDING,
+# RESERVED and SHARED bytes). Holding a write lock on all of it excludes every
+# other process's SQLite reader or writer on the same inode.
+_SQLITE_LOCK_START=0x40000000
+_SQLITE_LOCK_LENGTH=512
+_SIDECARS=('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal')
+
+
+def _owned_image():
+    memory=sqlite3.connect(':memory:')
+    try:
+        InfrastructureRegistry(memory).db.commit()
+        return memory.serialize()
+    finally:memory.close()
+
+
+def _initialize_empty(root_fd,name,expected):
+    """Write a fresh owned schema into a still-empty file, fenced from SQLite.
+
+    SQLite is not used on the file here, so a sidecar that appears late is
+    never replayed or deleted; it only makes this fail closed. On any failure
+    after writing began, our own bytes are truncated away again.
+    """
+    import fcntl
+    data=_owned_image()
+    fd=os.open(name,os.O_RDWR|os.O_NOFOLLOW,dir_fd=root_fd)
+    try:
+        info=os.fstat(fd)
+        _need(_identity(info)==_identity(expected) and info.st_size==0)
+        fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,_SQLITE_LOCK_LENGTH,_SQLITE_LOCK_START,os.SEEK_SET)
+        try:
+            for sidecar in _SIDECARS:
+                try:os.stat(sidecar,dir_fd=root_fd,follow_symlinks=False)
+                except FileNotFoundError:continue
+                raise ValueError('Inventory recovery requires review')
+            _need(os.fstat(fd).st_size==0)
+            written=0
+            try:
+                while written<len(data):
+                    count=os.pwrite(fd,data[written:],written)
+                    _need(count>0);written+=count
+                os.fsync(fd)
+                _need(os.fstat(fd).st_size==len(data))
+            except BaseException:
+                if written:
+                    os.ftruncate(fd,0);os.fsync(fd)
+                raise
+        finally:
+            fcntl.lockf(fd,fcntl.LOCK_UN,_SQLITE_LOCK_LENGTH,_SQLITE_LOCK_START,os.SEEK_SET)
+    finally:os.close(fd)
+
+
 @dataclass
 class InfrastructureModule:
     service: object = None
@@ -247,7 +299,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         directory=selected/'infrastructure'
         _need(_identity(directory.stat(follow_symlinks=False))==_identity(info))
         stage='database_admission'
-        for name in ('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal'):
+        for name in _SIDECARS:
             try:os.stat(name,dir_fd=root_fd,follow_symlinks=False)
             except FileNotFoundError:continue
             raise ValueError('Inventory recovery requires review')
@@ -296,24 +348,26 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         sqlite_location=Path('/proc/self/fd')/str(root_fd)/name
         stage='database_schema'
         empty_existing=existing and before.st_size==0
-        if existing and not empty_existing:
+        if empty_existing:
+            # A zero-byte main file with no sidecars holds no pages: typically a
+            # first start that stopped before writing its schema. Fill it in
+            # place while excluding every SQLite process; nothing is replaced,
+            # moved or deleted. It then faces the same exact-schema check.
+            stage='database_empty_initialize'
+            _initialize_empty(root_fd,name,before)
+            stage='database_schema'
+        if existing:
             # immutable prevents SQLite from creating WAL/SHM files while
             # inspecting an unknown database. Sidecars above are never adopted.
             readonly=sqlite3.connect(sqlite_location.as_uri()+'?mode=ro&immutable=1',uri=True)
             try:_need(_schema(readonly)==_owned_schema())
             finally:readonly.close()
-        elif empty_existing:
-            # A zero-byte main file with no sidecars holds no pages, so SQLite
-            # itself treats it as a new database. Initialize it in place, under
-            # the lifetime lock and identity gates; nothing is replaced, moved
-            # or deleted. Any non-empty file still needs the exact schema.
-            stage='database_empty_initialize'
-            _need(os.fstat(file_fd).st_size==0)
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         _need(admission())
         stage='database_open'
         db=sqlite3.connect(sqlite_location.as_uri()+'?mode=rw',uri=True,check_same_thread=False)
         registry=InfrastructureRegistry(db,capabilities=grants,admission_guard=admission)
+        _need(_schema(db)==_owned_schema())
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         stage='service_setup'
         service=InfrastructureService(registry,on_change=on_change)
