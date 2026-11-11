@@ -326,6 +326,12 @@ class SQLiteLedger:
             if mode is not None:
                 if mode['value'] != 'v1':
                     raise PermissionError('single pilot protocol is invalid')
+                denial = self._single_pilot_denial(db, request.command_id)
+                if denial is not None:
+                    original_request, original_response = denial
+                    if original_request != json.loads(payload):
+                        return Admission(False, False, _make_response(request, state='held', reason='identity_conflict'))
+                    return Admission(False, True, original_response.model_copy(update={'replayed': True}))
                 ack_row = db.execute('SELECT value FROM control WHERE key=?',
                                      ('single_pilot_ack:' + request.command_id,)).fetchone()
                 if ack_row is not None:
@@ -423,7 +429,42 @@ class SQLiteLedger:
         db.execute("INSERT INTO commands VALUES (?,?,?,?,?,?,?)",
                    (request.command_id, request.run_id, request.target_id, request.action,
                     payload, "held", _canonical(response.model_dump(mode="json"))))
+        # Admission and this denial are in the same write transaction. Only
+        # the exact freshly rejected request may release its gate, and only
+        # when no operation intent exists for it. A crash rolls both changes
+        # back; a previously admitted or ambiguous command never reaches here.
+        gate = _canonical({'state': 'effect_held', 'request': request.model_dump(mode='json')})
+        marker = _canonical({'request': request.model_dump(mode='json'), 'response': response.model_dump(mode='json')})
+        inserted = db.execute("INSERT INTO control(key,value) SELECT ?,? WHERE "
+                   "EXISTS (SELECT 1 FROM control WHERE key='single_pilot_gate' AND value=?) "
+                   "AND EXISTS (SELECT 1 FROM control WHERE key='single_pilot_protocol' AND value='v1') "
+                   "AND NOT EXISTS (SELECT 1 FROM operations WHERE command_id=?)",
+                   ('single_pilot_denial:' + request.command_id, marker, gate, request.command_id))
+        if inserted.rowcount:
+            db.execute("DELETE FROM control WHERE key='single_pilot_gate' AND value=?", (gate,))
         return Admission(False, False, response)
+
+    @staticmethod
+    def _single_pilot_denial(db, command_id):
+        marker = db.execute('SELECT value FROM control WHERE key=?', ('single_pilot_denial:' + command_id,)).fetchone()
+        if marker is None:
+            return None
+        row = db.execute('SELECT payload,response,state FROM commands WHERE command_id=?', (command_id,)).fetchone()
+        try:
+            value = json.loads(marker['value'])
+            if (type(value) is not dict or set(value) != {'request', 'response'} or row is None
+                    or row['state'] != 'held' or _canonical(value['request']) != row['payload']
+                    or _canonical(value['response']) != row['response']
+                    or db.execute('SELECT 1 FROM operations WHERE command_id=?', (command_id,)).fetchone()):
+                raise ValueError()
+            request = ContainerPilotRequest.model_validate(value['request'])
+            response = ContainerPilotResponse.model_validate(value['response'])
+            if (request.command_id != command_id or response.state != 'held' or response.replayed
+                    or response.model_dump(include=set(ContainerPilotRequest.model_fields)) != request.model_dump()):
+                raise ValueError()
+            return value['request'], response
+        except Exception:
+            raise PermissionError('single pilot denial evidence is invalid') from None
 
     @staticmethod
     def _phase_denial(db, request) -> str | None:
@@ -633,6 +674,9 @@ class SQLiteLedger:
                 return raw
             if mode['value'] != 'v1':
                 raise PermissionError('single pilot protocol is invalid')
+            denial = self._single_pilot_denial(db, command_id)
+            if denial is not None:
+                return denial[1]
             ack = db.execute('SELECT value FROM control WHERE key=?', ('single_pilot_ack:' + command_id,)).fetchone()
             if ack:
                 record = json.loads(ack['value'])
