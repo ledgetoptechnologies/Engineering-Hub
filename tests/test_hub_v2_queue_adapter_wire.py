@@ -113,6 +113,11 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
                 next_job = queue.submit(actor='codex', request_id=str(uuid4()), action_key=ACTION,
                     environment='staging', target=WorkTarget(next_task['id'],
                         manifest.candidate.source_commit, manifest.candidate.image_config_id))
+                def reserved_job():
+                    with repo._connection() as db:
+                        return db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?',
+                                          (MACHINE,)).fetchone()['job_id']
+                assert reserved_job() == job['id']
                 assert await bridge.run_once() is None
                 assert queue.get_job(next_job['id'])['state'] == 'queued'
                 assert len(transport.posts) == 1
@@ -132,6 +137,7 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
                 assert state.calls == state_calls_before
                 assert repo.list_runs()[0]['status'] == 'running'
                 assert adapter.ledger.inspect_single_pilot() is None
+                assert reserved_job() == job['id']
                 assert await bridge.run_once() is None
                 assert queue.get_job(next_job['id'])['state'] == 'queued'
                 assert len(transport.posts) == 1
