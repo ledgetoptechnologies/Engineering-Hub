@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests.manual_session_fixtures import synthetic_workflow_reconciliation
+from tests.work_queue_review_faults import corrupt_review_after_active_work
 
 from engineering_hub.container_pilot import ContainerPilotTarget, ContainerPilotWorkflow
 from engineering_hub.container_pilot_manifest import PilotManifest
@@ -140,8 +141,7 @@ async def test_private_worker_only_and_fence_cannot_be_forged(rig):
 @pytest.mark.asyncio
 async def test_changed_review_prevents_claim_and_any_host_submission(rig):
     task, _ = submit(rig)
-    current = rig.repo.get_task(task["id"])
-    rig.repo.set_candidate("codex", task["id"], current["revision"], "f" * 40)
+    corrupt_review_after_active_work(rig.repo, task["id"])
     assert await rig.bridge.run_once() is None
     assert rig.client.submissions == [] and rig.repo.list_runs() == []
 
