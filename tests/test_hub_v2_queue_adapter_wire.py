@@ -145,3 +145,79 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
                 assert state.calls == state_calls_before
     finally:
         adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_lost_ack_controller_owner_reopen_keeps_machine_reserved(tmp_path, monkeypatch):
+    """Reopen durable controller ownership; the synthetic executor stays alive."""
+    pytest.importorskip('fcntl')
+    from hub_container_executor import single_pilot_evidence
+    adapter, backend, state, manifest = make_fixture(tmp_path)
+    backend.probe_health = ['healthy', 'healthy']
+    backend.operation_journal = SimpleNamespace(require_no_pending=lambda: None)
+    state.require_complete_reservations = lambda **_: None
+    monkeypatch.setattr(single_pilot_evidence, 'verify_phase', lambda *_: None)
+    adapter.ledger.enable_single_pilot_protocol()
+    adapter._single_pilot_protocol = True
+    transport = FaultTransport(PilotASGI(adapter, 'synthetic-token'), fault='ack-response')
+    private = tmp_path / 'reopen-controller'
+    private.mkdir(mode=0o700)
+    path = private / 'hub.sqlite3'
+    target = ContainerPilotTarget.from_manifest(manifest)
+
+    def compose(owner, client):
+        repo = HubRepository(path, execution_principal=PRINCIPAL, pilot_owner=owner)
+        workflow = ContainerPilotWorkflow(repo, client, [target], pilot_owner=owner, single_pilot_protocol=True)
+        queue = WorkQueue(repo, {ACTION: WorkAction(MACHINE, project='engineering-hub')})
+        bridge = QueuedContainerPilot(queue, workflow, action_key=ACTION, machine_id=MACHINE,
+            reconciliation=synthetic_workflow_reconciliation(workflow))
+        return repo, queue, bridge
+
+    def reservation(repo):
+        with repo._connection() as db:
+            return db.execute('SELECT job_id FROM hub_work_machines WHERE machine_id=?',
+                              (MACHINE,)).fetchone()['job_id']
+
+    try:
+        async with ContainerPilotClient('http://127.0.0.1', 'synthetic-token',
+                transport=transport, single_pilot_protocol=True) as client:
+            with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+                original_epoch = owner.epoch
+                repo, queue, bridge = compose(owner, client)
+                task = reviewed_task(repo, 'first-reopen')
+                job = queue.submit(actor='codex', request_id=str(uuid4()), action_key=ACTION,
+                    environment='staging', target=WorkTarget(task['id'], manifest.candidate.source_commit,
+                                                           manifest.candidate.image_config_id))
+                assert (await bridge.run_once())['state'] == 'held'
+                assert transport.lost and transport.ack_status == [200]
+                assert repo.list_runs()[0]['events'][-1]['reason'] == 'candidate_outcome_uncertain'
+                next_task = reviewed_task(repo, 'second-reopen')
+                next_job = queue.submit(actor='codex', request_id=str(uuid4()), action_key=ACTION,
+                    environment='staging', target=WorkTarget(next_task['id'], manifest.candidate.source_commit,
+                                                           manifest.candidate.image_config_id))
+                assert reservation(repo) == job['id']
+                original_command = transport.posts[0]
+                effects = [e for e in backend.events if e in {'create', 'start', 'stop', 'probe'}]
+                state_calls = list(state.calls)
+            with PilotOwner(path, allow_ephemeral_test_storage=True) as owner:
+                assert owner.epoch != original_epoch
+                repo, queue, bridge = compose(owner, client)
+                assert reservation(repo) == job['id']
+                assert await bridge.run_once() is None
+                assert queue.get_job(next_job['id'])['state'] == 'queued'
+                recovered = await bridge.recover(job['id'])
+                assert recovered['state'] == 'held'
+                assert reservation(repo) == job['id']
+                assert transport.posts == [original_command]
+                assert transport.acks == [original_command, original_command]
+                assert transport.ack_status == [200, 200]
+                assert [e for e in backend.events if e in {'create', 'start', 'stop', 'probe'}] == effects
+                assert state.calls == state_calls
+                assert adapter.ledger.inspect_single_pilot() is None
+                assert await bridge.run_once() is None
+                assert queue.get_job(next_job['id'])['state'] == 'queued'
+                assert transport.posts == [original_command]
+                assert [e for e in backend.events if e in {'create', 'start', 'stop', 'probe'}] == effects
+                assert state.calls == state_calls
+    finally:
+        adapter.close()
