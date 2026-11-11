@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 import threading
 import uuid
 
@@ -127,6 +128,40 @@ def test_status_counts_and_jobs_share_snapshot_during_transition(setup_queue, mo
     assert snapshot['counts'].get('claimed') == 1
     assert snapshot['counts'].get('held', 0) == 0
     assert q.get_job(job['id'])['state'] == 'held'
+
+
+@pytest.mark.parametrize('owned', [False, True], ids=['legacy', 'pilot-owner'])
+def test_status_snapshot_exception_closes_connection_and_allows_writer(tmp_path, monkeypatch, owned):
+    from contextlib import nullcontext
+    if owned:
+        pytest.importorskip('fcntl')
+        from engineering_hub.pilot_ownership import PilotOwner
+        private = tmp_path / 'private'
+        private.mkdir(mode=0o700)
+        path = private / 'hub.sqlite3'
+        owner_context = PilotOwner(path, allow_ephemeral_test_storage=True)
+    else:
+        path = tmp_path / 'hub.sqlite3'
+        owner_context = nullcontext(None)
+    with owner_context as owner:
+        repo = HubRepository(path, pilot_owner=owner)
+        queue = WorkQueue(repo, {'validate': WorkAction('machine-one', project='engineering-hub',
+                          requires_execution_proof=False)}, target_verifier=lambda *_: True)
+        job = submit(queue)
+        seen = []
+        original = repo._paused
+        def fail_inside_snapshot(db):
+            assert db.in_transaction
+            seen.append(db)
+            raise RuntimeError('synthetic status failure')
+        monkeypatch.setattr(repo, '_paused', fail_inside_snapshot)
+        with pytest.raises(RuntimeError, match='synthetic status failure'):
+            queue.status()
+        assert len(seen) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            seen[0].execute('SELECT 1')
+        monkeypatch.setattr(repo, '_paused', original)
+        assert queue.claim(worker=w('codex'))['id'] == job['id']
 
 
 def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):
