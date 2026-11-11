@@ -57,6 +57,7 @@ def fake_docker(monkeypatch):
     calls = []
     controls = {"startup": None, "exec": None, "inspect": None, "remove": None}
     monkeypatch.setattr(smoke.uuid, "uuid4", lambda: SimpleNamespace(hex=OWNER))
+    monkeypatch.setattr(smoke.shutil, "which", lambda name, path: "/usr/bin/docker")
     monkeypatch.setattr(smoke, "endpoint_realpath", lambda path: path)
     def socket_stat(path):
         if path == DOCKER_HOST[7:]:
@@ -65,8 +66,11 @@ def fake_docker(monkeypatch):
     monkeypatch.setattr(smoke, "endpoint_stat", socket_stat)
 
     def run(argv, **kwargs):
-        assert argv[:3] == ["docker", "--host", DOCKER_HOST]
-        argv = [argv[0], *argv[3:]]
+        assert argv[:3] == ["/usr/bin/docker", "--host", DOCKER_HOST]
+        assert set(kwargs["env"]) == {"PATH", "DOCKER_CONFIG"}
+        assert kwargs["env"]["PATH"] == "/usr/bin:/bin"
+        assert Path(kwargs["env"]["DOCKER_CONFIG"]).is_dir()
+        argv = ["docker", *argv[3:]]
         calls.append((argv, kwargs))
         assert argv[0] == "docker"
         assert kwargs.get("shell", False) is False
@@ -233,3 +237,11 @@ def test_shared_socket_inode_is_rejected(fake_docker, monkeypatch):
     with pytest.raises(ValueError, match="Shared system"):
         run_smoke(IMAGE)
     assert not calls
+
+
+def test_docker_config_is_removed_after_run(fake_docker):
+    calls, _ = fake_docker
+    run_smoke(IMAGE)
+    paths = {kwargs["env"]["DOCKER_CONFIG"] for _, kwargs in calls}
+    assert len(paths) == 1
+    assert not Path(next(iter(paths))).exists()

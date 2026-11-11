@@ -10,6 +10,8 @@ from os import stat as endpoint_stat
 from os.path import realpath as endpoint_realpath
 import re
 import stat
+import shutil
+import tempfile
 import subprocess
 import uuid
 
@@ -138,50 +140,59 @@ def run_smoke(image, expected_commit=None, *, docker_host=None):
             continue
         if (shared_info.st_dev, shared_info.st_ino) == (socket_info.st_dev, socket_info.st_ino):
             raise ValueError('Shared system Docker socket is not allowed')
-    docker = ['docker', '--host', docker_host]
-    owner = uuid.uuid4().hex
-    name = 'hub-dashboard-smoke-' + owner
-    run = [
-        *docker, 'run', '--detach', '--pull', 'never', '--name', name,
-        '--label', 'engineering-hub.smoke-owner=' + owner, '--network', 'none',
-        '--user', '568:568', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
-        '--tmpfs', '/var/lib/hub:rw,noexec,nosuid,size=64m,uid=568,gid=568,mode=0700',
-        '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
-        '--env', 'HERMES_TOKEN=fixture-only-hermes-not-a-service-token',
-        '--env', 'CODEX_TOKEN=fixture-only-codex-not-a-service-token',
-        '--env', 'CLAUDE_TOKEN=fixture-only-claude-not-a-service-token',
-        '--env', 'HUB_BASE_URL=http://127.0.0.1:8770', image,
-    ]
-    # No shell, token retrieval, user configuration, or shared Docker resources.
-    try:
-        subprocess.run(run, check=True, capture_output=True, text=True, timeout=60)
-        probe = [*docker, 'exec', name, 'python', '-c', PROBE]
-        if expected_commit is not None:
-            probe.append(expected_commit)
-        result = subprocess.run(probe,
-                                check=True, capture_output=True, text=True, timeout=30)
-        report = json.loads(result.stdout)
-        if not isinstance(report, dict) or report.get('image_smoke') != 'passed':
-            raise ValueError('Smoke probe did not report success')
-        if expected_commit is not None and report.get('build_commit') != expected_commit:
-            raise ValueError('Smoke build identity did not match')
-        return report
-    finally:
-        # docker run may have created the container even if its response was
-        # interrupted. Reconcile by unique ownership label, never by a shared
-        # name or a broad cleanup command. Inspect only public identity fields.
-        identity = subprocess.run([*docker, 'container', 'inspect', '--format',
-            '{{.Id}}|{{index .Config.Labels "engineering-hub.smoke-owner"}}', name],
-            capture_output=True, text=True, timeout=15)
-        if identity.returncode == 0:
-            container_id, _, actual_owner = identity.stdout.strip().partition('|')
-            if not re.fullmatch(r'[a-f0-9]{64}', container_id) or actual_owner != owner:
-                raise RuntimeError('Smoke ownership could not be verified; container not removed')
-            subprocess.run([*docker, 'rm', '--force', container_id], check=True,
-                           capture_output=True, text=True, timeout=30)
-        elif 'No such container' not in identity.stderr and 'No such object' not in identity.stderr:
-            raise RuntimeError('Smoke container cleanup could not be verified')
+    executable = shutil.which('docker', path='/usr/bin:/bin')
+    if executable is None:
+        raise RuntimeError('System Docker CLI is unavailable')
+    docker = [executable, '--host', docker_host]
+    with tempfile.TemporaryDirectory(prefix='eh-smoke-docker-config-') as config_dir:
+        child_env = {'PATH': '/usr/bin:/bin', 'DOCKER_CONFIG': config_dir}
+
+        def invoke(argv, **kwargs):
+            return subprocess.run(argv, env=child_env, **kwargs)
+
+        owner = uuid.uuid4().hex
+        name = 'hub-dashboard-smoke-' + owner
+        run = [
+            *docker, 'run', '--detach', '--pull', 'never', '--name', name,
+            '--label', 'engineering-hub.smoke-owner=' + owner, '--network', 'none',
+            '--user', '568:568', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+            '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
+            '--tmpfs', '/var/lib/hub:rw,noexec,nosuid,size=64m,uid=568,gid=568,mode=0700',
+            '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
+            '--env', 'HERMES_TOKEN=fixture-only-hermes-not-a-service-token',
+            '--env', 'CODEX_TOKEN=fixture-only-codex-not-a-service-token',
+            '--env', 'CLAUDE_TOKEN=fixture-only-claude-not-a-service-token',
+            '--env', 'HUB_BASE_URL=http://127.0.0.1:8770', image,
+        ]
+        # No shell, token retrieval, user configuration, or shared Docker resources.
+        try:
+            invoke(run, check=True, capture_output=True, text=True, timeout=60)
+            probe = [*docker, 'exec', name, 'python', '-c', PROBE]
+            if expected_commit is not None:
+                probe.append(expected_commit)
+            result = invoke(probe,
+                                    check=True, capture_output=True, text=True, timeout=30)
+            report = json.loads(result.stdout)
+            if not isinstance(report, dict) or report.get('image_smoke') != 'passed':
+                raise ValueError('Smoke probe did not report success')
+            if expected_commit is not None and report.get('build_commit') != expected_commit:
+                raise ValueError('Smoke build identity did not match')
+            return report
+        finally:
+            # docker run may have created the container even if its response was
+            # interrupted. Reconcile by unique ownership label, never by a shared
+            # name or a broad cleanup command. Inspect only public identity fields.
+            identity = invoke([*docker, 'container', 'inspect', '--format',
+                '{{.Id}}|{{index .Config.Labels "engineering-hub.smoke-owner"}}', name],
+                capture_output=True, text=True, timeout=15)
+            if identity.returncode == 0:
+                container_id, _, actual_owner = identity.stdout.strip().partition('|')
+                if not re.fullmatch(r'[a-f0-9]{64}', container_id) or actual_owner != owner:
+                    raise RuntimeError('Smoke ownership could not be verified; container not removed')
+                invoke([*docker, 'rm', '--force', container_id], check=True,
+                               capture_output=True, text=True, timeout=30)
+            elif 'No such container' not in identity.stderr and 'No such object' not in identity.stderr:
+                raise RuntimeError('Smoke container cleanup could not be verified')
 
 
 def main():
