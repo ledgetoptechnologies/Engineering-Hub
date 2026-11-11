@@ -149,8 +149,12 @@ def _owned_schema():
 
 
 def _file_info(info):
+    # Owner-only, not exactly 0600: NFSv4-ACL datasets (e.g. TrueNAS) can
+    # report an owner-only file as 0700 even after fchmod(0600). Execute on a
+    # data file grants nothing; any group/other bit still refuses.
+    mode=stat.S_IMODE(info.st_mode)
     _need(stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.getuid()
-          and stat.S_IMODE(info.st_mode)==0o600)
+          and not mode&0o077 and mode&0o600==0o600)
 
 
 @dataclass
@@ -255,6 +259,7 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
             os.fchmod(file_fd,0o600);os.fsync(file_fd);os.fsync(root_fd)
             existing=False
+        stage='database_file'
         before=os.fstat(file_fd);_file_info(before)
         captured_fd=root_fd
         def directory_identity(value):
@@ -290,12 +295,20 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         # registry read/write boundary and permanently veto path replacement.
         sqlite_location=Path('/proc/self/fd')/str(root_fd)/name
         stage='database_schema'
-        if existing:
+        empty_existing=existing and before.st_size==0
+        if existing and not empty_existing:
             # immutable prevents SQLite from creating WAL/SHM files while
             # inspecting an unknown database. Sidecars above are never adopted.
             readonly=sqlite3.connect(sqlite_location.as_uri()+'?mode=ro&immutable=1',uri=True)
             try:_need(_schema(readonly)==_owned_schema())
             finally:readonly.close()
+        elif empty_existing:
+            # A zero-byte main file with no sidecars holds no pages, so SQLite
+            # itself treats it as a new database. Initialize it in place, under
+            # the lifetime lock and identity gates; nothing is replaced, moved
+            # or deleted. Any non-empty file still needs the exact schema.
+            stage='database_empty_initialize'
+            _need(os.fstat(file_fd).st_size==0)
         _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(before))
         _need(admission())
         stage='database_open'
@@ -318,6 +331,8 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
+        if empty_existing:
+            logger.warning('Infrastructure startup: empty_database_initialized')
         logger.info('Infrastructure startup: ready')
         root_fd=None;db=None
         return module

@@ -409,3 +409,86 @@ def test_existing_directory_is_allowed_but_chmod_file_exists_fails_closed(tmp_pa
     assert failed.state == 'invalid' and failed.service is None
     assert 'state_directory_chmod_failed' in caplog.text
     assert 'private failure detail' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+def _leftover(tmp_path, mode=0o600, content=b''):
+    """A first start that created the file and stopped before the schema."""
+    directory = tmp_path / 'infrastructure'; directory.mkdir(mode=0o700); directory.chmod(0o700)
+    database = directory / 'inventory.sqlite3'; database.write_bytes(content); database.chmod(mode)
+    return directory, database
+
+
+@POSIX
+@pytest.mark.parametrize('mode', [0o600, 0o700])
+def test_empty_leftover_database_is_initialized_in_place(tmp_path, caplog, mode):
+    caplog.set_level('INFO')
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, mode)
+    inode = database.stat().st_ino
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert module.state == 'ready' and not path.exists()
+        assert module.service.list_devices('human:1')['items'] == []
+        module.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                     expected_revision=0)
+    finally:
+        module.close()
+    assert 'empty_database_initialized' in caplog.text and str(tmp_path) not in caplog.text
+    # Same file, mode left alone, nothing else created or removed.
+    assert database.stat().st_ino == inode and stat.S_IMODE(database.stat().st_mode) == mode
+    assert {p.name for p in directory.iterdir()} == {'inventory.sqlite3'}
+    caplog.clear()
+    reopened = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    try:
+        assert reopened.state == 'ready'
+        assert reopened.service.get_device('human:1', 'fixture')['device']['revision'] == 1
+    finally:
+        reopened.close()
+    assert 'empty_database_initialized' not in caplog.text
+
+
+@POSIX
+def test_populated_owner_only_database_with_execute_bit_reopens(tmp_path):
+    settings = write(tmp_path / 'settings.json', config())
+    first = compose_infrastructure(settings, state_root=tmp_path); assert first.state == 'ready'
+    first.service.upsert_device('human:1', dict(id='fixture', name='Fixture', addresses=[], role='Fixture'),
+                                expected_revision=0)
+    first.close()
+    database = tmp_path / 'infrastructure/inventory.sqlite3'; database.chmod(0o700)
+    module = compose_infrastructure(settings, state_root=tmp_path)
+    try:
+        assert module.state == 'ready'
+        assert module.service.get_device('hermes', 'fixture')['device']['revision'] == 1
+        assert stat.S_IMODE(database.stat().st_mode) == 0o700
+    finally:
+        module.close()
+
+
+@POSIX
+@pytest.mark.parametrize('unsafe', ['group_read', 'other_read', 'group_exec', 'owner_read_only', 'hardlink',
+                                    'wal_sidecar', 'shm_sidecar', 'journal_sidecar', 'empty_sidecar'])
+def test_empty_leftover_with_any_other_doubt_stays_closed_and_untouched(tmp_path, caplog, unsafe):
+    path = tmp_path / 'infrastructure.json'
+    mode = {'group_read': 0o640, 'other_read': 0o604, 'group_exec': 0o610, 'owner_read_only': 0o400}.get(unsafe, 0o600)
+    directory, database = _leftover(tmp_path, mode)
+    if unsafe == 'hardlink':
+        os.link(database, directory / 'preserved.sqlite3')
+    elif unsafe == 'empty_sidecar':
+        (directory / 'inventory.sqlite3-wal').write_bytes(b'')
+    elif unsafe.endswith('_sidecar'):
+        (directory / ('inventory.sqlite3-' + unsafe.split('_')[0])).write_bytes(b'unknown original pages')
+    before = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert module.state == 'invalid' and module.service is None
+    after = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in directory.iterdir()}
+    assert after == before
+    assert 'empty_database_initialized' not in caplog.text and str(tmp_path) not in caplog.text
+
+
+@POSIX
+def test_nonempty_unknown_bytes_are_never_treated_as_empty(tmp_path):
+    path = tmp_path / 'infrastructure.json'
+    directory, database = _leftover(tmp_path, 0o600, b'\0' * 4096)
+    module = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
+    assert module.state == 'invalid' and module.service is None
+    assert database.read_bytes() == b'\0' * 4096
