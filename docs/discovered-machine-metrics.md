@@ -67,7 +67,8 @@ The browser endpoint `/api/hub/v1/infrastructure/metrics` and the MCP tool retur
 the same schema 3 envelope: `schema_version`, `generated_at`, `source`, `devices`.
 Schema 3 adds `net_rx_bytes_per_second` and `net_tx_bytes_per_second` (node and
 windows exporters only; null otherwise). The UI accepts schemas 1–3, but older UI
-builds reject 3, so the UI and backend must ship in the same release.
+builds reject 3, so the UI and backend must ship in the same release. External
+MCP consumers that validate schema 2 must be updated before relying on schema 3.
 Per-PC credentials remain MCP-only; this feature does not open Hub REST to them.
 Admission is checked before upstream I/O, after it, and before returning metrics.
 

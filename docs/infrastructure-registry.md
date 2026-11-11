@@ -131,7 +131,7 @@ addresses are checked before network I/O and again before writes.
 ### Legacy mapped machine metrics adapter
 
 The following describes the retained schema 1 `MetricsReader` adapter and its
-standalone route binding. The Hub application now composes schema 2 discovery
+standalone route binding. The Hub application now composes schema 3 discovery
 with owner/internal-agent admission; use [discovered machine metrics](discovered-machine-metrics.md)
 for its defaults, routes and installation classification. Schema 1 remains a
 compatibility input while the UI transition is integrated.
