@@ -3,9 +3,12 @@ import multiprocessing
 import os
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
+import types
 from contextlib import contextmanager
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -731,3 +734,70 @@ def test_single_pilot_denial_with_operation_conflict_keeps_gate(tmp_path):
         with pytest.raises(PermissionError): ledger.arm_single_pilot(request())
     finally:
         ledger.close()
+
+
+def _prior_protocol_ledger():
+    """Load the exact reviewed old source, without changing the worktree."""
+    result = None
+    for executable in ('git', 'git.exe'):
+        try:
+            result = subprocess.run([executable, 'show', '85411ff5639470a2176111285bc5634837b24479:hub_container_executor/ledger.py'],
+                                    cwd=Path(__file__).resolve().parents[1], capture_output=True, check=True, timeout=10)
+            break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if result is None:
+        if os.environ.get('HUB_VERIFY_PRIOR_PILOT_LEDGER') == '1':
+            pytest.fail('required reviewed prior ledger source is unavailable')
+        pytest.skip('optional cross-version check: prior Git object unavailable; set HUB_VERIFY_PRIOR_PILOT_LEDGER=1 to require it')
+    module = types.ModuleType('prior_protocol_ledger_for_test')
+    exec(compile(result.stdout, 'prior_protocol_ledger.py', 'exec'), module.__dict__)
+    return module.SQLiteLedger
+
+
+@pytest.mark.parametrize('required', [False, True])
+def test_cross_version_check_reports_missing_history(monkeypatch, required):
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError('synthetic missing Git')
+    monkeypatch.setattr(subprocess, 'run', unavailable)
+    if required:
+        monkeypatch.setenv('HUB_VERIFY_PRIOR_PILOT_LEDGER', '1')
+    else:
+        monkeypatch.delenv('HUB_VERIFY_PRIOR_PILOT_LEDGER', raising=False)
+    with pytest.raises(pytest.fail.Exception if required else pytest.skip.Exception):
+        _prior_protocol_ledger()
+
+
+def test_previous_protocol_executor_holds_new_denial_and_preserves_other_gate(tmp_path):
+    prior = _prior_protocol_ledger()
+    ledger = open_ledger(tmp_path); denied, other = request('smoke_container'), request()
+    ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(denied)
+    assert not ledger.admit(denied).accepted
+    ledger.arm_single_pilot(other)
+    path = ledger.path; ledger.close()
+    old = prior(path, manifest_digest=MANIFEST, candidate_commit=COMMIT, policy_revision=1)
+    try:
+        assert old.get(denied.command_id).reason == 'recovery_required'
+        retry = old.admit(denied)
+        assert not retry.accepted and not retry.replayed and retry.response.reason == 'recovery_required'
+        assert old.inspect_single_pilot()['request']['command_id'] == other.command_id
+    finally:
+        old.close()
+
+
+def test_new_executor_does_not_release_prior_unmarked_denial(tmp_path):
+    prior = _prior_protocol_ledger()
+    initial = open_ledger(tmp_path); path = initial.path; initial.close()
+    old = prior(path, manifest_digest=MANIFEST, candidate_commit=COMMIT, policy_revision=1)
+    denied = request('smoke_container')
+    old.enable_single_pilot_protocol(); old.arm_single_pilot(denied)
+    assert not old.admit(denied).accepted
+    old.close()
+    current = open_ledger(tmp_path)
+    try:
+        assert current.get(denied.command_id).reason == 'recovery_required'
+        assert not current.admit(denied).accepted
+        assert current.inspect_single_pilot()['request']['command_id'] == denied.command_id
+        with pytest.raises(PermissionError): current.arm_single_pilot(request())
+    finally:
+        current.close()
