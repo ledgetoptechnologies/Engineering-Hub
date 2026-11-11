@@ -192,8 +192,10 @@ Actions are `deploy_container`, `smoke_container`, `rollback_container` and
 container creation/start is not proof of successful rollback. Per-run phase
 dedupe must not be bypassed by a fresh command UUID.
 
-GET by command UUID is read-only. Explicit bodyless reconcile inspects the
-original effect without replay. Unknown outcomes stay held until inspected;
+GET by command UUID is read-only. In legacy mode explicit bodyless reconcile
+inspects the original effect without replay; in single-pilot mode reconcile
+returns the ledger's current view and does not inspect the daemon or clear a
+gate. Unknown outcomes stay held until inspected;
 no timeout, lease expiry or new process grants permission to repeat a Docker
 effect. Responses echo every request field and report state, fixed safe reason
 and bounded actual-container evidence. No exception, secret, host path, session
@@ -231,6 +233,16 @@ local storage, never SMB SQLite/lock files. Reserve before I/O; inspect exact
 daemon container ID, image/config, mounts and ownership metadata after an
 uncertain result. Labels or a file receipt alone cannot certify a real container.
 Do not silently start an exited workload during reconciliation.
+
+In single-pilot mode, a failure after arming the effect-held gate but before
+command admission can leave that exact gate held even when there is no command
+or operation row. Matching retries deliberately remain held, including after
+restart. Missing rows alone do not prove that no effect occurred: do not delete
+or reset the gate on that basis. Recovery requires a reviewed procedure that
+first stops and independently fences the owner and dispatcher, preserves the
+ledger, and examines the relevant external evidence. The implemented reconcile
+route does not clear this gate, and a safe clear procedure for this condition is
+not yet implemented.
 
 The executor's no-effect denial replay marker is a row in the existing private
 ledger `control` table; it does not change the ledger schema version. A current
