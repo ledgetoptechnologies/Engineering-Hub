@@ -11,29 +11,36 @@ from engineering_hub.trusted_queued_session import (
 from .coordinator_observation_transport import CoordinatorObservationTransport
 
 
+def validate_colocated_session(config, enrollment):
+    """Validate static binding and freshness; establishes no operator authority."""
+    from .installed_coordinator import CoordinatorConfiguration
+    _require(type(config) is CoordinatorConfiguration and type(enrollment) is ManualSessionEnrollment)
+    e = parse_enrollment(enrollment_bytes(enrollment))
+    _require(config.manifest.digest() == e.manifest_digest
+             and config.manifest.target_id == e.target_id and e.machine_id == 'staging-pc'
+             and config.manifest.driver.implementation_commit == e.release.implementation_commit
+             and config.manifest.runner_binding.platform == e.release.platform
+             and config.manifest.runner_binding.daemon_identity == e.launch.engine_id
+             and Path(config.database).is_absolute())
+    mono, wall = _clock()
+    _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
+             and wall < e.expires_at_ms <= e.launch.approval_expires_at_ms)
+    return e, mono, wall
+
+
 class ColocatedTrustedSession(TrustedQueuedSessionComposition):
     """Same report/challenge checks as the unified selector, via pinned issuer UDS."""
     def __init__(self, *, config, enrollment, credential):
-        from .installed_coordinator import CoordinatorConfiguration
         self._pid, self._closed = os.getpid(), False
         self._observer = self._audit = self._gate = self._broker = self._owner = self._target = None
         self._transport = None
         try:
-            _require(type(config) is CoordinatorConfiguration and type(enrollment) is ManualSessionEnrollment)
-            self._enrollment = parse_enrollment(enrollment_bytes(enrollment))
+            self._enrollment, mono, wall = validate_colocated_session(config, enrollment)
             e = self._enrollment
-            _require(config.manifest.digest() == e.manifest_digest
-                     and config.manifest.target_id == e.target_id and e.machine_id == 'staging-pc'
-                     and config.manifest.driver.implementation_commit == e.release.implementation_commit
-                     and config.manifest.runner_binding.platform == e.release.platform
-                     and config.manifest.runner_binding.daemon_identity == e.launch.engine_id)
             self._database = Path(config.database)
             _require(self._database.is_absolute())
             self._manifest = e.manifest_digest
             self._identity = ExecutorSessionIdentity(e.launch.launch_id, e.release.image_config_id)
-            mono, wall = _clock()
-            _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
-                     and wall < e.expires_at_ms <= e.launch.approval_expires_at_ms)
             self._last_mono, self._last_wall = mono, wall
             self._deadline = mono + (e.expires_at_ms - wall) / 1000
             self._transport = CoordinatorObservationTransport(socket_path=config.executor_socket, credential=credential)

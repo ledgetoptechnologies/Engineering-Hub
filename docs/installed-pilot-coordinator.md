@@ -17,7 +17,11 @@ or repaired. A valid file or canonical JSON is not approval of its contents.
 `validate` reads only the configuration and validates its data/model shape.
 It does not open secrets, sockets, providers or the database, contact an
 identity provider, or establish host readiness. It does not validate an actual
-supervisor's drain behavior, and it rejects `--session-config`. `serve` requires
+supervisor's drain behavior. When `--session-config` is supplied, `validate`
+also checks the protected file's closed shape, static manifest/engine binding and
+report freshness using the same checks as composition. It opens no secrets or
+sockets and does not establish operator authority, current host state or readiness.
+`serve` requires
 an independently reviewed manual-session file on a read-only mount, read via
 the protected current-UID mode0600 file and mode0700 parent checks. Parsing it
 does not prove its operator assertions. The session begins pending and requires

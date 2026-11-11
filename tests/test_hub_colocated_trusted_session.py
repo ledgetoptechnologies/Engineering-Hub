@@ -171,6 +171,45 @@ def test_readonly_requirement_is_checked_on_open_file(tmp_path, monkeypatch):
     assert calls == [path.stat().st_ino]
 
 
+@pytest.mark.parametrize('change', ['valid', 'manifest', 'engine', 'expired', 'invalid'])
+def test_cli_session_preflight_is_static_and_opens_no_authority(tmp_path, monkeypatch, change):
+    from hub_container_executor import installed_coordinator as module
+    from engineering_hub import unified_pilot_startup as startup
+    config = parse_configuration(canonical(configuration()))
+    data = document()
+    data['report']['manifest_digest'] = config.manifest.digest()
+    data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
+    data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
+    data['launch']['engine_id'] = config.manifest.runner_binding.daemon_identity
+    data['report']['executor'] = dict(data['launch'], image_config_id=data['release']['image_config_id'])
+    if change == 'manifest': data['report']['manifest_digest'] = 'sha256:' + '0' * 64
+    if change == 'engine':
+        data['launch']['engine_id'] = 'wrong-engine'
+        data['report']['executor']['engine_id'] = 'wrong-engine'
+    if change == 'expired': data['report']['observed_at_ms'] -= 400_000
+    if change == 'invalid': data['report']['attestations']['writers_excluded'] = False
+    parent = tmp_path / 'operator'; parent.mkdir(mode=0o700)
+    path = parent / 'session.json'; path.write_bytes(encode(data)); path.chmod(0o600)
+    monkeypatch.setattr(module, 'load_configuration', lambda _: config)
+    monkeypatch.setattr(startup.os, 'fstatvfs', lambda _: SimpleNamespace(f_flag=os.ST_RDONLY))
+    def forbidden(*_args, **_kwargs): pytest.fail('preflight reached authority or service')
+    monkeypatch.setattr(module, 'ImmutableTestSecretResolver', forbidden)
+    monkeypatch.setattr(module, 'serve_owned_queued_pilot', forbidden)
+    monkeypatch.setattr('hub_container_executor.colocated_session.CoordinatorObservationTransport', forbidden)
+    assert module.main(['validate', '--config', '/unused', '--session-config', str(path)]) == (0 if change == 'valid' else 2)
+
+
+def test_cli_session_preflight_rejects_writable_mount(tmp_path, monkeypatch):
+    from hub_container_executor import installed_coordinator as module
+    from engineering_hub import unified_pilot_startup as startup
+    config = parse_configuration(canonical(configuration()))
+    parent = tmp_path / 'operator'; parent.mkdir(mode=0o700)
+    path = parent / 'session.json'; path.write_bytes(b'{}'); path.chmod(0o600)
+    monkeypatch.setattr(module, 'load_configuration', lambda _: config)
+    monkeypatch.setattr(startup.os, 'fstatvfs', lambda _: SimpleNamespace(f_flag=0))
+    assert module.main(['validate', '--config', '/unused', '--session-config', str(path)]) == 2
+
+
 def test_expired_session_reconciliation_refuses_observation(tmp_path, monkeypatch):
     from engineering_hub import trusted_queued_session as trusted
     raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True

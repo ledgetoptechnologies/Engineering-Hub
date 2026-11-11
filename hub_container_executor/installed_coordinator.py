@@ -290,16 +290,18 @@ def main(argv=None):
         _require(len(args.config) == 1)
         _require(args.session_config is None or len(args.session_config) == 1)
         config = load_configuration(args.config[0])
-        if args.operation == 'serve':
-            _require(args.session_config is not None)
+        if args.session_config is not None:
             from engineering_hub.unified_pilot_startup import read_protected_file
             from engineering_hub.trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES
             session_path = _path(args.session_config[0])
             enrollment = parse_enrollment(read_protected_file(Path(session_path), maximum_bytes=MAX_ENROLLMENT_BYTES,
                                                                require_readonly=True))
+        if args.operation == 'serve':
+            _require(args.session_config is not None)
             asyncio.run(run_installed_coordinator(config, session_enrollment=enrollment))
-        else:
-            _require(args.session_config is None)
+        elif args.session_config is not None:
+            from .colocated_session import validate_colocated_session
+            validate_colocated_session(config, enrollment)
         return 0
     except KeyboardInterrupt:
         return 130
