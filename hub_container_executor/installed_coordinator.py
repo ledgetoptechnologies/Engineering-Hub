@@ -293,6 +293,8 @@ def main(argv=None):
         if args.session_config is not None:
             from engineering_hub.unified_pilot_startup import read_protected_file
             from engineering_hub.trusted_queued_session import parse_enrollment, MAX_ENROLLMENT_BYTES
+            from .colocated_session import require_core_compatibility
+            require_core_compatibility()
             session_path = _path(args.session_config[0])
             enrollment = parse_enrollment(read_protected_file(Path(session_path), maximum_bytes=MAX_ENROLLMENT_BYTES,
                                                                require_readonly=True))

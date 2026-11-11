@@ -247,7 +247,10 @@ def test_cli_supplies_both_owned_factories_and_v2(monkeypatch):
     data['report']['executor'] = dict(data['launch'], image_config_id=data['release']['image_config_id'])
     monkeypatch.setattr(module, 'load_configuration', lambda _: config)
     monkeypatch.setattr(module.os, 'statvfs', lambda _: SimpleNamespace(f_flag=os.ST_RDONLY))
-    monkeypatch.setattr(unified_pilot_startup, 'read_protected_file', lambda *a, **kw: encode(data))
+    def protected(_path, *, maximum_bytes, private=True, require_readonly=False):
+        assert require_readonly is True
+        return encode(data)
+    monkeypatch.setattr(unified_pilot_startup, 'read_protected_file', protected)
     calls = []
     async def serve(received, **kwargs):
         assert received is config and received.single_pilot_protocol is True
@@ -256,6 +259,20 @@ def test_cli_supplies_both_owned_factories_and_v2(monkeypatch):
     monkeypatch.setattr(module, 'run_installed_coordinator', serve)
     assert module.main(['serve','--config','/unused','--session-config','/approved/session.json']) == 0
     assert calls == [True]
+
+
+def test_old_core_without_fd_readonly_support_is_rejected(monkeypatch):
+    from engineering_hub import unified_pilot_startup
+    from hub_container_executor.colocated_session import require_core_compatibility
+    from hub_container_executor import installed_coordinator as module
+    from engineering_hub.trusted_queued_session import TrustedSessionError
+    def old_reader(_path, *, maximum_bytes, private=True):
+        raise AssertionError('must not read')
+    monkeypatch.setattr(unified_pilot_startup, 'read_protected_file', old_reader)
+    with pytest.raises(TrustedSessionError):
+        require_core_compatibility()
+    monkeypatch.setattr(module, 'load_configuration', lambda _: parse_configuration(canonical(configuration())))
+    assert module.main(['serve', '--config', '/unused', '--session-config', '/operator/session']) == 2
 
 
 def test_owned_coordinator_composes_v2_with_same_socket_and_bearer(monkeypatch):

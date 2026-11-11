@@ -35,7 +35,8 @@ package = root / 'hub_container_executor'
 record = json.loads((package / '_executor_source.json').read_bytes())
 assert record['schema_version'] == 1 and record['source_commit'] == sys.argv[1]
 names = ('service', 'local_resources', 'runtime_identity', 'installed_runner',
-         'installed_coordinator', 'launch_supervisor', 'launcher_cli', 'launch_transport', 'configuration_commitment')
+         'installed_coordinator', 'colocated_session', 'coordinator_observation_transport',
+         'launch_supervisor', 'launcher_cli', 'launch_transport', 'configuration_commitment')
 for name in names:
     module = importlib.import_module('hub_container_executor.' + name)
     path = pathlib.Path(module.__file__)
@@ -47,6 +48,8 @@ assert pathlib.Path(helper.__file__) == root / 'scripts/inspect_hub_image_identi
 assert hashlib.sha256(pathlib.Path(helper.__file__).read_bytes()).hexdigest() == record['source_files']['src/scripts/inspect_hub_image_identity.py']
 from engineering_hub.container_pilot_client import ContainerPilotClient
 assert callable(getattr(ContainerPilotClient, 'for_private_unix', None)), 'incompatible core'
+from hub_container_executor.colocated_session import require_core_compatibility
+require_core_compatibility()
 print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names),
                   'private_unix_client': True, 'installed_artifact': 'passed'}))
 '''

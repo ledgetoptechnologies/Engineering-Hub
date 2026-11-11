@@ -31,6 +31,10 @@ of unresolved effects. `serve` separately resolves four distinct TEST
 credentials and calls the owned queue service. A missing required core Unix
 client API is rejected before secrets or owner state are touched. That check
 is compatibility evidence, not authentication of the core artifact.
+The executor wheel also requires a core with the protected reader's
+`require_readonly` keyword; the image compatibility check and `serve` reject an
+older core before reading session material. Use a separately reviewed matching
+core image, not merely the same package version.
 
 The closed `engineering-hub.installed-coordinator.v1` configuration contains:
 

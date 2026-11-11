@@ -1,5 +1,6 @@
 """Fixed issuer-UDS composition of an independently approved manual session."""
 import os
+import inspect
 from pathlib import Path
 
 from engineering_hub.current_executor_observation import CurrentExecutorObserver
@@ -26,6 +27,16 @@ def validate_colocated_session(config, enrollment):
     _require(0 <= wall - e.observed_at_ms <= MAX_REPORT_AGE_MS
              and wall < e.expires_at_ms <= e.launch.approval_expires_at_ms)
     return e, mono, wall
+
+
+def require_core_compatibility():
+    """Reject older core releases before loading operator session material."""
+    from engineering_hub.unified_pilot_startup import read_protected_file
+    try:
+        parameter = inspect.signature(read_protected_file).parameters['require_readonly']
+        _require(parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is False)
+    except (KeyError, TypeError, ValueError):
+        raise TrustedSessionError() from None
 
 
 class ColocatedTrustedSession(TrustedQueuedSessionComposition):
