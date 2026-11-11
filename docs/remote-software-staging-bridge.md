@@ -19,6 +19,18 @@ rejected on versioned command routes before the request body is read or the
 adapter is called. The mode declares protocol compatibility; it does not prove
 daemon identity or exclusive ownership.
 
+The colocated coordinator's `serve` selector requires `--session-config` on a
+read-only mount, with a protected current-UID file and parent. This is an
+operator-authored, independently reviewed session report: its retained source,
+freshness, inventory reconciliation, writer exclusion and unresolved-effect
+claims must come from actual operator evidence, not from the executor's signed
+identity response. The session remains pending until the named operator accepts
+the challenge; expired reports cannot authorize a new observation or effect.
+The observation relay uses the same private executor socket and dedicated bearer
+as commands. That bearer has command authority and must be protected accordingly;
+it is not an observation-only credential. No configured session or signed
+identity establishes baseline health, installed acceptance or production release.
+
 `WorkQueue` separately supplies production-first eligible ordering and physical
 machine reservations. Its default claim admission is closed. Production priority
 does not grant production deployment authority; the first executor remains

@@ -171,6 +171,31 @@ def test_readonly_requirement_is_checked_on_open_file(tmp_path, monkeypatch):
     assert calls == [path.stat().st_ino]
 
 
+def test_expired_session_reconciliation_refuses_observation(tmp_path, monkeypatch):
+    from engineering_hub import trusted_queued_session as trusted
+    raw = configuration(); raw['schema'] = SCHEMA_SINGLE_PILOT; raw['single_pilot_protocol'] = True
+    database_root = tmp_path / 'database'; database_root.mkdir(mode=0o700)
+    raw['database_path'] = str(database_root / 'hub.sqlite3')
+    config = parse_configuration(canonical(raw)); data = document()
+    data['report']['manifest_digest'] = config.manifest.digest()
+    data['release']['implementation_commit'] = config.manifest.driver.implementation_commit
+    data['release']['platform'] = config.manifest.runner_binding.platform.model_dump(mode='json')
+    data['launch']['engine_id'] = config.manifest.runner_binding.daemon_identity
+    data['report']['executor'] = dict(data['launch'], image_config_id=data['release']['image_config_id'])
+    composition = ColocatedTrustedSession(config=config, enrollment=parse_enrollment(encode(data)), credential='test-token')
+    try:
+        with PilotOwner(config.database, allow_ephemeral_test_storage=True) as owner:
+            gate = composition.reconciliation_factory(owner, ContainerPilotTarget.from_manifest(config.manifest))
+            assert gate.admission_state == 'pending'
+            monkeypatch.setattr(composition._observer, 'observe_verified', lambda: pytest.fail('expired report reached observer'))
+            monkeypatch.setattr(trusted, '_clock', lambda: (composition._deadline + 1, composition._last_wall))
+            with pytest.raises(trusted.TrustedSessionError):
+                composition._current_verified()
+            assert gate.admission_state != 'accepted'
+    finally:
+        composition.close()
+
+
 def test_cli_supplies_both_owned_factories_and_v2(monkeypatch):
     from hub_container_executor import installed_coordinator as module
     from engineering_hub import unified_pilot_startup
