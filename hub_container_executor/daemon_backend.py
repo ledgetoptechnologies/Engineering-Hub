@@ -34,7 +34,7 @@ from .backend import (
     ProbeObservation,
     RunnerObservation,
 )
-from .build_record import VerifiedImage
+from .build_record import VerifiedImage, BuildRecordError, _check_buildkit_attestation
 
 API_RE = re.compile(r"1\.(?:0|[1-9][0-9]{0,2})\Z")
 OPAQUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -409,12 +409,21 @@ def _archive_image(entries, image: VerifiedImage):
                 keys = {"mediaType", "digest", "size"}
                 if "platform" in child:
                     keys.add("platform")
+                if "annotations" in child:
+                    keys.add("annotations")
                 if set(child) != keys:
                     raise DaemonBackendError("daemon image descriptor shape is invalid")
                 child_id = child.get("digest")
                 child_size = child.get("size")
                 if type(child_size) is not int or not 1 <= child_size <= _MAX_METADATA_ENTRY:
                     raise DaemonBackendError("daemon image descriptor size is invalid")
+                if "annotations" in child:
+                    try:
+                        _check_buildkit_attestation(child, document["manifests"],
+                                                    load(child_id, media, child_size))
+                    except BuildRecordError:
+                        raise DaemonBackendError("invalid BuildKit attestation descriptor") from None
+                    continue
                 child_platform = child.get("platform")
                 if child_platform is not None:
                     if (not isinstance(child_platform, dict)

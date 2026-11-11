@@ -43,6 +43,37 @@ class BuildRecordError(ValueError):
     """A safe validation error without record, image or credential contents."""
 
 
+def _check_buildkit_attestation(descriptor, siblings, raw):
+    """Recognize an opaque BuildKit OCI artifact; never establish provenance trust."""
+    fail = lambda: BuildRecordError("invalid BuildKit attestation descriptor")
+    if (set(descriptor) != {"mediaType", "digest", "size", "platform", "annotations"}
+            or descriptor.get("mediaType") != "application/vnd.oci.image.manifest.v1+json"
+            or descriptor.get("platform") != {"os": "unknown", "architecture": "unknown"}):
+        raise fail()
+    annotations = descriptor.get("annotations")
+    if (not isinstance(annotations, dict)
+            or set(annotations) != {"vnd.docker.reference.type", "vnd.docker.reference.digest"}
+            or annotations.get("vnd.docker.reference.type") != "attestation-manifest"):
+        raise fail()
+    target = annotations.get("vnd.docker.reference.digest")
+    matches = [item for item in siblings if isinstance(item, dict)
+               and item.get("digest") == target and item.get("mediaType") in MANIFEST_TYPES
+               and "annotations" not in item]
+    if len(matches) != 1:
+        raise fail()
+    try:
+        artifact = strict_json(raw)
+    except (IdentityError, RecursionError):
+        raise fail() from None
+    subject = {key: matches[0].get(key) for key in ("mediaType", "digest", "size")}
+    if (not isinstance(artifact, dict) or artifact.get("schemaVersion") != 2
+            or type(artifact.get("schemaVersion")) is not int
+            or artifact.get("mediaType") != descriptor["mediaType"]
+            or artifact.get("artifactType") != "application/vnd.docker.attestation.manifest.v1+json"
+            or artifact.get("subject") != subject):
+        raise fail()
+
+
 class ContentStore(Protocol):
     def get(self, digest: str) -> bytes: ...
 
@@ -235,8 +266,12 @@ def _verify_descriptor_chain(record: dict, platform: Platform, blob_data: dict[s
                     raise BuildRecordError("descriptor traversal exceeds limit")
                 if not isinstance(descriptor, dict):
                     raise BuildRecordError("invalid index descriptor")
-                _exact(descriptor, {"mediaType", "digest", "size"} if "platform" not in descriptor
-                       else {"mediaType", "digest", "size", "platform"}, "index descriptor")
+                if "annotations" in descriptor:
+                    _exact(descriptor, {"mediaType", "digest", "size", "platform", "annotations"},
+                           "attestation descriptor")
+                else:
+                    _exact(descriptor, {"mediaType", "digest", "size"} if "platform" not in descriptor
+                           else {"mediaType", "digest", "size", "platform"}, "index descriptor")
                 child_id = _sha(descriptor["digest"], "descriptor")
                 child_media = descriptor["mediaType"]
                 if child_media not in INDEX_TYPES | MANIFEST_TYPES:
@@ -248,6 +283,9 @@ def _verify_descriptor_chain(record: dict, platform: Platform, blob_data: dict[s
                 if child_id in referenced:
                     raise BuildRecordError("duplicate descriptor reference")
                 referenced.add(child_id)
+                if "annotations" in descriptor:
+                    _check_buildkit_attestation(descriptor, index["manifests"], raw)
+                    continue
                 descriptor_platform = descriptor.get("platform")
                 if descriptor_platform is not None:
                     if not isinstance(descriptor_platform, dict):
