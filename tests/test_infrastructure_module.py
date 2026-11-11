@@ -498,7 +498,8 @@ def test_unsafe_file_modes_stay_closed(tmp_path, caplog, mode):
         entries = {p.name for p in directory.iterdir()}
         module = compose_infrastructure(settings, state_root=tmp_path)
         assert module.state == 'invalid' and module.service is None
-        expected_stage = 'database_admission_failed' if mode == 0o200 else 'database_file_failed'
+        expected_stage = ('database_admission_failed' if mode == 0o200 and not os.access(database, os.R_OK)
+                          else 'database_file_failed')
         assert expected_stage in caplog.text
         retained.seek(0)
         after = (retained.read(), stat.S_IMODE(database.stat().st_mode), database.stat().st_ino)
