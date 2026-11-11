@@ -28,7 +28,6 @@ import re
 from pathlib import Path
 import sqlite3
 import stat
-import time
 
 from .infrastructure import CAPABILITIES, HUMAN_ONLY, InfrastructurePrincipal, InfrastructureRegistry
 from .infrastructure_service import InfrastructureService
@@ -159,38 +158,6 @@ def _file_info(info):
 
 
 _SIDECARS=('inventory.sqlite3-wal','inventory.sqlite3-shm','inventory.sqlite3-journal')
-_PRESERVED='inventory.sqlite3.empty-'
-MAX_PRESERVED=3
-
-
-def _preserve_empty(root_fd,name,fd):
-    """Move a zero-byte, sidecar-free, owner-only leftover aside; never open it.
-
-    A first start that stopped before writing its schema leaves exactly this.
-    Its inode is kept under a new name (nothing is written, truncated or
-    deleted) so the ordinary first-start path can create a fresh database.
-    If anything about it changes while moving, it is put back and startup
-    fails closed. Returns False for any non-empty file.
-    """
-    info=os.fstat(fd)
-    if info.st_size!=0:
-        return False
-    _file_info(info)
-    _need(sum(item.startswith(_PRESERVED) for item in os.listdir(root_fd))<MAX_PRESERVED)
-    target=_PRESERVED+str(time.time_ns())
-    try:os.stat(target,dir_fd=root_fd,follow_symlinks=False)
-    except FileNotFoundError:pass
-    else:raise ValueError('Preserved name collision')
-    _need(_identity(os.stat(name,dir_fd=root_fd,follow_symlinks=False))==_identity(info))
-    os.rename(name,target,src_dir_fd=root_fd,dst_dir_fd=root_fd)
-    os.fsync(root_fd)
-    moved=os.stat(target,dir_fd=root_fd,follow_symlinks=False)
-    if _identity(moved)!=_identity(info) or moved.st_size!=0 or os.fstat(fd).st_size!=0:
-        try:os.stat(name,dir_fd=root_fd,follow_symlinks=False)
-        except FileNotFoundError:
-            os.rename(target,name,src_dir_fd=root_fd,dst_dir_fd=root_fd);os.fsync(root_fd)
-        raise ValueError('Leftover changed while preserving it')
-    return True
 
 
 @dataclass
@@ -288,19 +255,19 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             except FileNotFoundError:continue
             raise ValueError('Inventory recovery requires review')
         name='inventory.sqlite3'
-        preserved_empty=False
         try:
             file_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=root_fd)
             existing=True
         except FileNotFoundError:
             existing=False
         if existing:
-            stage='database_empty_preserve'
-            if _preserve_empty(root_fd,name,file_fd):
-                os.close(file_fd);file_fd=None
-                existing=False;preserved_empty=True
+            # A zero-byte file is usually a first start that stopped before its
+            # schema, but its history can't be proven here, so it is never
+            # adopted or moved automatically. Name it so an owner can review it.
+            stage='database_empty_leftover'
+            _need(os.fstat(file_fd).st_size!=0)
             stage='database_admission'
-        if not existing:
+        else:
             file_fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root_fd)
             os.fchmod(file_fd,0o600);os.fsync(file_fd);os.fsync(root_fd)
         stage='database_file'
@@ -373,8 +340,6 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             module.prometheus_origin=PrometheusOrigin(DEFAULT_PROMETHEUS_ADDRESS,DEFAULT_PROMETHEUS_PORT)
         module.service,module.state,module._directory_fd=service,'ready',root_fd
         module._registry=registry
-        if preserved_empty:
-            logger.warning('Infrastructure startup: empty_database_preserved')
         logger.info('Infrastructure startup: ready')
         root_fd=None;db=None
         return module
