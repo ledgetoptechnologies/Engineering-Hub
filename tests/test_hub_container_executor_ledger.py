@@ -607,3 +607,127 @@ def test_protocol_enable_refuses_existing_control_or_run_state(tmp_path):
         with pytest.raises(PermissionError): ledger.enable_single_pilot_protocol()
     finally:
         ledger.close()
+
+
+def test_single_pilot_denied_fresh_phase_releases_only_its_gate(tmp_path):
+    ledger = open_ledger(tmp_path)
+    denied, permitted = request('smoke_container'), request()
+    try:
+        ledger.enable_single_pilot_protocol()
+        ledger.arm_single_pilot(denied)
+        admission = ledger.admit(denied)
+        assert not admission.accepted and admission.response.reason == 'identity_conflict'
+        assert ledger.inspect_single_pilot() is None
+        assert ledger.operation_rows(denied.command_id) == ()
+        replay = ledger.admit(denied)
+        assert replay.replayed and replay.response.reason == 'identity_conflict'
+        assert ledger.get(denied.command_id).reason == 'identity_conflict'
+        changed = denied.model_copy(update={'fencing_generation': denied.fencing_generation + 1})
+        assert ledger.admit(changed).response.reason == 'identity_conflict'
+        ledger.arm_single_pilot(permitted)
+        assert ledger.admit(permitted).accepted
+        # Replaying a denied identity must not release a different gate.
+        assert not ledger.admit(denied).accepted
+        assert ledger.inspect_single_pilot()['request']['command_id'] == permitted.command_id
+    finally:
+        ledger.close()
+    ledger = open_ledger(tmp_path)
+    try:
+        assert ledger.admit(denied).replayed
+        assert ledger.get(denied.command_id).reason == 'identity_conflict'
+        assert ledger.inspect_single_pilot()['request']['command_id'] == permitted.command_id
+    finally:
+        ledger.close()
+
+
+def _crash_during_single_pilot_denial(database_path, payload):
+    ledger = SQLiteLedger(database_path, manifest_digest=MANIFEST,
+                          candidate_commit=COMMIT, policy_revision=1)
+    original = ledger._store_denial
+    def crash_after_uncommitted_delete(*args):
+        original(*args)
+        os._exit(0)
+    ledger._store_denial = crash_after_uncommitted_delete
+    ledger.admit(ContainerPilotRequest.model_validate(payload))
+
+
+def test_single_pilot_denial_crash_preserves_gate(tmp_path):
+    ledger = open_ledger(tmp_path)
+    denied = request('smoke_container')
+    ledger.enable_single_pilot_protocol()
+    ledger.arm_single_pilot(denied)
+    path = str(ledger.path)
+    ledger.close()
+    child = multiprocessing.get_context('spawn').Process(
+        target=_crash_during_single_pilot_denial, args=(path, denied.model_dump(mode='json')))
+    child.start(); child.join(15)
+    assert child.exitcode == 0
+    ledger = open_ledger(tmp_path)
+    try:
+        assert ledger.inspect_single_pilot()['request']['command_id'] == denied.command_id
+        assert ledger.get(denied.command_id) is None
+        with pytest.raises(PermissionError): ledger.arm_single_pilot(request())
+        assert not ledger.admit(denied).accepted
+        assert ledger.inspect_single_pilot() is None
+    finally:
+        ledger.close()
+
+
+def test_single_pilot_denial_and_competing_arm_are_serialized(tmp_path):
+    ledger = open_ledger(tmp_path)
+    denied, other = request('smoke_container'), request()
+    ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(denied)
+    barrier = threading.Barrier(3); outcomes = []
+    def reject():
+        barrier.wait(); outcomes.append(('denied', ledger.admit(denied).accepted))
+    def arm():
+        barrier.wait()
+        try:
+            ledger.arm_single_pilot(other); outcomes.append(('arm', True))
+        except PermissionError:
+            outcomes.append(('arm', False))
+    threads = [threading.Thread(target=reject), threading.Thread(target=arm)]
+    try:
+        for thread in threads: thread.start()
+        barrier.wait()
+        for thread in threads: thread.join(10)
+        assert all(not thread.is_alive() for thread in threads)
+        assert ('denied', False) in outcomes
+        armed = ('arm', True) in outcomes
+        gate = ledger.inspect_single_pilot()
+        assert (gate is not None) == armed
+        if armed:
+            assert gate['request']['command_id'] == other.command_id
+    finally:
+        ledger.close()
+
+
+def test_single_pilot_corrupt_denial_marker_fails_closed(tmp_path):
+    ledger = open_ledger(tmp_path); denied = request('smoke_container')
+    try:
+        ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(denied)
+        assert not ledger.admit(denied).accepted
+        with ledger._transaction() as db:
+            db.execute("UPDATE control SET value='{}' WHERE key=?", ('single_pilot_denial:' + denied.command_id,))
+        with pytest.raises(PermissionError): ledger.admit(denied)
+        with pytest.raises(PermissionError): ledger.get(denied.command_id)
+    finally:
+        ledger.close()
+
+
+def test_single_pilot_denial_with_operation_conflict_keeps_gate(tmp_path):
+    ledger = open_ledger(tmp_path); denied = request('smoke_container')
+    try:
+        ledger.enable_single_pilot_protocol(); ledger.arm_single_pilot(denied)
+        # Model an inconsistent retained intent; never interpret it as no effect.
+        with ledger._transaction() as db:
+            db.execute("INSERT INTO operations VALUES (?,?,?,'intent',?,NULL,NULL)",
+                       (str(uuid4()), denied.command_id, 'probe', '{}'))
+        assert not ledger.admit(denied).accepted
+        assert ledger.inspect_single_pilot()['request']['command_id'] == denied.command_id
+        with ledger._connection() as db:
+            assert db.execute('SELECT 1 FROM control WHERE key=?',
+                              ('single_pilot_denial:' + denied.command_id,)).fetchone() is None
+        with pytest.raises(PermissionError): ledger.arm_single_pilot(request())
+    finally:
+        ledger.close()
