@@ -110,7 +110,8 @@ async def test_real_unix_operations_preserve_token_request_identity_and_inspecti
     assert calls[1][2] == calls[2][2] == b""
 
 
-async def test_fresh_inert_transport_has_no_retry_proxy_or_injected_hook(endpoint, monkeypatch):
+@pytest.mark.parametrize("mode", [False, True])
+async def test_fresh_inert_transport_has_no_retry_proxy_or_injected_hook(endpoint, monkeypatch, mode):
     original, transports, options = httpx.AsyncHTTPTransport, [], []
     def capture(*args, **kwargs):
         value = original(*args, **kwargs)
@@ -119,20 +120,30 @@ async def test_fresh_inert_transport_has_no_retry_proxy_or_injected_hook(endpoin
         return value
     with private_browser_socket(endpoint):
         monkeypatch.setattr(httpx, "AsyncHTTPTransport", capture)
-        first = ContainerPilotClient.for_private_unix(endpoint, TOKEN)
-        second = ContainerPilotClient.for_private_unix(endpoint, TOKEN)
+        first = ContainerPilotClient.for_private_unix(endpoint, TOKEN, single_pilot_protocol=mode)
+        second = ContainerPilotClient.for_private_unix(endpoint, TOKEN, single_pilot_protocol=mode)
         try:
             assert len(transports) == 2 and transports[0] is not transports[1]
             assert options == [((), dict(uds=str(endpoint), retries=0, trust_env=False))] * 2
             for client in (first, second):
+                assert client.single_pilot_protocol is mode
                 inner = client._ContainerPilotClient__client
                 assert not inner.follow_redirects and not inner._trust_env
                 assert inner.event_hooks == {"request": [], "response": []}
             signature = inspect.signature(ContainerPilotClient.for_private_unix)
-            assert set(signature.parameters) == {"path", "service_token", "timeout_seconds"}
+            assert set(signature.parameters) == {"path", "service_token", "timeout_seconds", "single_pilot_protocol"}
+            mode = signature.parameters["single_pilot_protocol"]
+            assert mode.kind is inspect.Parameter.KEYWORD_ONLY and mode.default is False
         finally:
             await first.aclose()
             await second.aclose()
+
+
+@pytest.mark.parametrize("mode", [None, 0, 1, "true"])
+async def test_private_unix_protocol_mode_requires_exact_boolean(endpoint, mode):
+    with private_browser_socket(endpoint):
+        with pytest.raises(ValueError):
+            ContainerPilotClient.for_private_unix(endpoint, TOKEN, single_pilot_protocol=mode)
 
 
 @pytest.mark.parametrize("status", [301, 307, 401, 403, 409, 500])

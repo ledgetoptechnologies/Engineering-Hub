@@ -790,7 +790,8 @@ class SQLiteLedger:
 
         This only binds the exact stored terminal response and authenticated
         ledger receipts. It does not verify daemon generation, journal, state
-        reservation, profile, probes or exclusive ownership. No runtime calls it.
+        reservation, profile, probes or exclusive ownership. The opted-in adapter
+        calls it after its own evidence checks; those checks remain necessary.
         """
         if type(request) is not ContainerPilotRequest or type(outcome) is not ContainerPilotResponse:
             raise TypeError('exact pilot identities required')
