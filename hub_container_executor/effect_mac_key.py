@@ -6,6 +6,11 @@ This does not protect against hostile same-UID processes or prove any Docker
 effect. A creation or fsync failure preserves partial files for inspection.
 The creation key ID must be stored and supplied from an independently trusted
 enrollment; a caller-supplied ID alone does not prove key continuity.
+Because the key is held alongside the journal, it must not be used to protect
+low-entropy secret inputs from offline guessing by a reader of that directory.
+Canonical binding fields must exclude environment values and other secrets.
+Restoring a journal under a different inode requires separately trusted
+re-enrollment; this module never silently adopts a replacement journal.
 """
 from __future__ import annotations
 
