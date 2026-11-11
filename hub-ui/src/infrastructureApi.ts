@@ -7,7 +7,7 @@ import { parseDevice, parseDeviceDetail, parseDeviceList, parseMaintenance, type
 
 const base = "/api/hub/v1/infrastructure";
 export interface DeviceDraft {
-  id: string; name: string; hostname: string | null; addresses: string[]; network: string | null; vlan: number | null; role: string; retired: boolean;
+  id: string; name: string; hostname: string | null; metrics_host: string | null; addresses: string[]; network: string | null; vlan: number | null; role: string; retired: boolean;
 }
 export interface InfrastructureClient {
   list(signal: AbortSignal, includeRetired: boolean): Promise<DeviceList>;
@@ -53,9 +53,9 @@ export function httpInfrastructure(fetchImpl: typeof fetch = globalThis.fetch): 
     detail: async (id, signal) => parseDeviceDetail(await call(`/devices/${encodeURIComponent(id)}`, read(signal), fetchImpl)),
     saveDevice: async (draft, expectedRevision, csrf) => {
       // Pick only declared fields, whatever the caller passed.
-      const { id, name, hostname, addresses, network, vlan, role, retired } = draft;
+      const { id, name, hostname, metrics_host, addresses, network, vlan, role, retired } = draft;
       return parseDevice(await call(`/devices/${encodeURIComponent(id)}`,
-        write("PUT", { name, hostname, addresses, network, vlan, role, retired, expected_revision: expectedRevision }, csrf), fetchImpl));
+        write("PUT", { name, hostname, metrics_host, addresses, network, vlan, role, retired, expected_revision: expectedRevision }, csrf), fetchImpl));
     },
     openMaintenance: async (deviceId, { reason, expected_end, client_request_id }, csrf) => parseMaintenance(await call(
       `/devices/${encodeURIComponent(deviceId)}/maintenance`, write("POST", { reason, expected_end, client_request_id }, csrf), fetchImpl)),

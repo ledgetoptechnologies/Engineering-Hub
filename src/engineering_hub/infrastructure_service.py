@@ -46,6 +46,8 @@ class InfrastructureService:
         probes = self.registry.probe_states(principal, item['id'])['items']
         return {key: item[key] for key in ('id','name','hostname','addresses','network','vlan',
                                          'role','retired','revision','updated_at')} | {
+            # Recorded before this field existed means none was set.
+            'metrics_host': item.get('metrics_host'),
             'observations': [{'probe_id': probe['probe_id'], 'source_label': probe['source_label'],
                               'state': {'healthy':'ok','unhealthy':'failed','unknown':'unknown','stale':'stale'}[probe['status']],
                               'observed_at': probe['observed_at'], 'valid_until': probe['valid_until']}

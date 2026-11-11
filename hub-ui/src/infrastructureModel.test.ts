@@ -13,6 +13,13 @@ const clone = <T,>(value: T): T => structuredClone(value);
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 describe("parsing", () => {
+  it("reads the Prometheus host when the Hub sends it, and none from an older Hub", () => {
+    const row = { ...clone(fixture.list).items[0] } as Record<string, unknown>;
+    expect(parseDevice(row).metrics_host).toBeNull();
+    expect(parseDevice({ ...row, metrics_host: "BEAST" }).metrics_host).toBe("BEAST");
+    expect(parseDevice({ ...row, metrics_host: null }).metrics_host).toBeNull();
+    for (const bad of ["", "two words", "-x", "a".repeat(65), 7]) expect(() => parseDevice({ ...row, metrics_host: bad })).toThrow(HubApiError);
+  });
   it("accepts the fixture and the demo", () => {
     expect(parseDeviceList(fixture.list).items.map(item => item.id)).toEqual(["build-pc", "camera-hub"]);
     expect(parseDeviceDetail(fixture.detail).maintenance.items[0].state).toBe("resolved");
@@ -90,12 +97,12 @@ describe("provisional HTTP adapter", () => {
   it("sends only declared fields with CSRF and the expected revision", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
     const fetchImpl = (async (url: string, init: RequestInit) => { calls.push({ url, init }); return json(fixture.list.items[1]); }) as unknown as typeof fetch;
-    const draft = { id: "camera-hub", name: "Camera hub", hostname: null, addresses: [], network: null, vlan: null, role: "Security cameras",
+    const draft = { id: "camera-hub", name: "Camera hub", hostname: null, metrics_host: "CAMHUB-01", addresses: [], network: null, vlan: null, role: "Security cameras",
       retired: false, sneaky: "x" } as never;
     await httpInfrastructure(fetchImpl).saveDevice(draft, 1, "token");
     expect(calls[0].url).toBe("/api/hub/v1/infrastructure/devices/camera-hub");
     expect(calls[0].init.method).toBe("PUT");
-    expect(JSON.parse(calls[0].init.body as string)).toEqual({ name: "Camera hub", hostname: null, addresses: [], network: null, vlan: null,
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ name: "Camera hub", hostname: null, metrics_host: "CAMHUB-01", addresses: [], network: null, vlan: null,
       role: "Security cameras", retired: false, expected_revision: 1 });
     expect((calls[0].init.headers as Record<string, string>)["X-Hub-CSRF"]).toBe("token");
   });

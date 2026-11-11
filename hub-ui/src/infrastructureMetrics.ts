@@ -2,8 +2,8 @@
  * Machine health read from the Hub's Prometheus: every active target it discovers, grouped by
  * the operator's host label and matched to a recorded device where exactly one fits. The parser
  * is exact-key and bounded like the rest of Infrastructure, and pinned to the contract fixture
- * (fixtures/infrastructure-metrics-v2.json); schema 1 (explicit mappings) is still read during
- * rollout. A missing value stays null and is shown as "not reported", never as zero; an
+ * (fixtures/infrastructure-metrics-v2.json). Schema 3 adds network rates; schemas 1 and 2 are still
+ * read during rollout. A missing value stays null and is shown as "not reported", never as zero; an
  * unreachable source is unknown, never down.
  */
 import { HubApiError, isMissingRoute } from "./api";
@@ -24,6 +24,7 @@ export interface MachineTarget {
   labels: { host?: string; role?: string; env?: string }; up: boolean | null; last_scrape: string | null;
   state: typeof SCRAPE_STATES[number]; cpu_busy_ratio: number | null; mem_total_bytes: number | null;
   mem_available_bytes: number | null; uptime_seconds: number | null; disks: Disk[]; gpus: Gpu[]; top_processes: ProcessRow[];
+  net_rx_bytes_per_second: number | null; net_tx_bytes_per_second: number | null;
 }
 export interface MetricsSource { status: typeof SOURCE_STATES[number]; truncated: boolean; omitted_count: number | null; warnings: Warning[] }
 export interface MachineMetrics { generated_at: string; source: MetricsSource; targets: MachineTarget[] }
@@ -92,8 +93,9 @@ function mappedTarget(value: unknown): MachineTarget {
   return { ...metrics, host_key: metrics.labels.host ? `v1-host:${metrics.labels.host}` : `v1-device:${row.device_id}`,
     host_label: metrics.labels.host ?? null, association: "matched", device_id: row.device_id, probe_id: row.probe_id };
 }
-function discoveredTarget(value: unknown): MachineTarget {
-  const row = record(value, ["host_key", "host_label", "association", "device_id", "probe_id", ...METRIC_KEYS]);
+function discoveredTarget(value: unknown, network: boolean): MachineTarget {
+  const row = record(value, ["host_key", "host_label", "association", "device_id", "probe_id", ...METRIC_KEYS,
+    ...(network ? ["net_rx_bytes_per_second", "net_tx_bytes_per_second"] : [])]);
   if (typeof row.host_key !== "string" || !hostKey.test(row.host_key)) return invalid();
   const association = oneOf(row.association, ASSOCIATIONS);
   // Only a unique inventory match names a device; unregistered and ambiguous targets never do.
@@ -102,7 +104,9 @@ function discoveredTarget(value: unknown): MachineTarget {
   const label = row.host_label === null ? null : plain(row.host_label, 64);
   if ((label === null) !== row.host_key.startsWith("target:")) return invalid();
   return { ...target(row), host_key: row.host_key, host_label: label, association,
-    device_id: row.device_id as string | null, probe_id: row.probe_id as string | null };
+    device_id: row.device_id as string | null, probe_id: row.probe_id as string | null,
+    net_rx_bytes_per_second: network ? number(row.net_rx_bytes_per_second) : null,
+    net_tx_bytes_per_second: network ? number(row.net_tx_bytes_per_second) : null };
 }
 function target(row: Record<string, unknown>): MachineTarget {
   if (!row.labels || typeof row.labels !== "object" || Array.isArray(row.labels)) return invalid();
@@ -125,6 +129,7 @@ function target(row: Record<string, unknown>): MachineTarget {
     mem_available_bytes: available, uptime_seconds: number(row.uptime_seconds, { integer: true }),
     disks: list(row.disks, MAX_DISKS).map(disk), gpus: list(row.gpus, MAX_GPUS).map(gpu),
     top_processes: list(row.top_processes, MAX_PROCESSES).map(processRow),
+    net_rx_bytes_per_second: null, net_tx_bytes_per_second: null,
   };
 }
 function discoveredSource(value: unknown): MetricsSource {
@@ -138,19 +143,40 @@ function discoveredSource(value: unknown): MetricsSource {
 }
 export function parseMetrics(value: unknown): MachineMetrics {
   const row = record(value, ["schema_version", "generated_at", "source", "devices"]);
-  if (row.schema_version !== 1 && row.schema_version !== 2) return invalid();
-  const v2 = row.schema_version === 2;
+  if (row.schema_version !== 1 && row.schema_version !== 2 && row.schema_version !== 3) return invalid();
+  const v2 = row.schema_version !== 1, network = row.schema_version === 3;
   const source: MetricsSource = v2 ? discoveredSource(row.source)
     : { status: oneOf(record(row.source, ["status"]).status, ["ok", "partial", "unreachable"] as const), truncated: false, omitted_count: 0, warnings: [] };
-  const targets = list(row.devices, MAX_TARGETS).map(v2 ? discoveredTarget : mappedTarget);
+  const targets = list(row.devices, MAX_TARGETS).map(item => v2 ? discoveredTarget(item, network) : mappedTarget(item));
   if (new Set(targets.map(item => `${item.job}\n${item.instance}`)).size !== targets.length) return invalid();
   // Not configured means nothing was fetched; unreachable keeps no stale rows.
   if ((source.status === "not_configured" || (v2 && source.status === "unreachable")) && targets.length > 0) return invalid();
   return { generated_at: time(row.generated_at), source, targets };
 }
 
-/** null means this Hub or this person has no metrics: the panel is hidden, as for other optional routes. */
-export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineMetrics | null> {
+/**
+ * Why the Hub answered without readings. "not_configured" is only said after the person was
+ * admitted (the server checks access first), so it doesn't reveal anything to someone refused.
+ */
+export type MetricsGap = "not_configured" | "unavailable";
+async function metricsGap(response: Response): Promise<MetricsGap | null> {
+  if (response.status === 503) return "unavailable";
+  if (response.status !== 404 || !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return null;
+  try {
+    const body: unknown = await response.clone().json();
+    return (body as { detail?: { code?: unknown } })?.detail?.code === "infrastructure_metrics_not_configured" ? "not_configured" : null;
+  } catch { return null; }
+}
+/** An admitted "not set up" answer, shown the same way as a Prometheus source that isn't configured. */
+export function notConfiguredMetrics(now = new Date()): MachineMetrics {
+  return { generated_at: now.toISOString(), source: { status: "not_configured", truncated: false, omitted_count: 0, warnings: [] }, targets: [] };
+}
+
+/**
+ * null means this person can't read metrics (or this Hub has no such route): the panel is hidden.
+ * "unavailable" means the Hub couldn't answer right now; "not set up" comes back as a not_configured source.
+ */
+export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineMetrics | "unavailable" | null> {
   let response: Response;
   try {
     response = await fetchImpl.call(globalThis, "/api/hub/v1/infrastructure/metrics",
@@ -160,12 +186,62 @@ export async function readMetrics(signal: AbortSignal, fetchImpl: typeof fetch =
     throw new HubApiError(0, "network_unavailable");
   }
   if (response.status === 401) throw new HubApiError(401, "human_session_required");
-  if ([403, 404, 503].includes(response.status) || await isMissingRoute(response)) return null;
+  const gap = await metricsGap(response);
+  if (gap === "not_configured") return notConfiguredMetrics();
+  if (gap === "unavailable") return "unavailable";
+  if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
   if (!response.ok) throw new HubApiError(response.status, "infrastructure_metrics_failed");
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
   let body: unknown;
   try { body = await response.json(); } catch { return invalid(); }
   return parseMetrics(body);
+}
+
+export const HISTORY_RANGES = ["1h", "6h", "24h", "7d"] as const;
+export type HistoryRange = typeof HISTORY_RANGES[number];
+export type HistoryPoint = [number, number | null];
+const HISTORY_KEYS = ["cpu", "memory", "disk", "network_rx", "network_tx"] as const;
+export interface HistorySeries { key: typeof HISTORY_KEYS[number]; label: string | null; unit: "ratio" | "bytes_per_second"; points: HistoryPoint[] }
+export interface MachineHistoryData { range: HistoryRange; source: typeof SOURCE_STATES[number]; series: HistorySeries[] }
+const MAX_HISTORY_SERIES = 80, MAX_HISTORY_POINTS = 250;
+
+function historySeries(value: unknown): HistorySeries {
+  const row = record(value, ["key", "label", "unit", "points"]);
+  const unit = oneOf(row.unit, ["ratio", "bytes_per_second"] as const);
+  const points = list(row.points, MAX_HISTORY_POINTS).map((item): HistoryPoint => {
+    if (!Array.isArray(item) || item.length !== 2) return invalid();
+    return [number(item[0], { integer: true, nullable: false })!, number(item[1], unit === "ratio" ? { max: 1 } : {})];
+  });
+  if (!points.length) return invalid();
+  return { key: oneOf(row.key, HISTORY_KEYS), label: row.label === null ? null : plain(row.label, 128), unit, points };
+}
+export function parseHistory(value: unknown): MachineHistoryData {
+  const row = record(value, ["schema_version", "generated_at", "host_key", "range", "step_seconds", "source", "series"]);
+  if (row.schema_version !== 1) return invalid();
+  return { range: oneOf(row.range, HISTORY_RANGES), source: oneOf(record(row.source, ["status"]).status, SOURCE_STATES),
+    series: list(row.series, MAX_HISTORY_SERIES).map(historySeries) };
+}
+/** null means this person or Hub has no history for this machine: the charts are hidden. */
+export async function readHistory(hostKey: string, range: HistoryRange, signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<MachineHistoryData | "unavailable" | null> {
+  let response: Response;
+  const query = new URLSearchParams({ host: hostKey, range });
+  try {
+    response = await fetchImpl.call(globalThis, `/api/hub/v1/infrastructure/metrics/history?${query}`,
+      { method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", headers: { Accept: "application/json" }, signal });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new HubApiError(0, "network_unavailable");
+  }
+  if (response.status === 401) throw new HubApiError(401, "human_session_required");
+  const gap = await metricsGap(response);
+  if (gap === "not_configured") return { range, source: "not_configured", series: [] };
+  if (gap === "unavailable") return "unavailable";
+  if ([403, 404].includes(response.status) || await isMissingRoute(response)) return null;
+  if (!response.ok) throw new HubApiError(response.status, "infrastructure_history_failed");
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
+  let body: unknown;
+  try { body = await response.json(); } catch { return invalid(); }
+  return parseHistory(body);
 }
 
 export interface MachineGroup {
@@ -191,6 +267,25 @@ export function groupMachines(targets: MachineTarget[]): MachineGroup[] {
   }).sort((a, b) => a.title.localeCompare(b.title));
 }
 
+export interface QuickStats {
+  cpu: number | null; memory: number | null; memoryText: string; disk: Disk | null; diskRatio: number | null;
+  down: number | null; up: number | null; reporting: boolean;
+}
+/** The few numbers shown under a device. Storage is the fullest disk, since that's the one to watch. */
+export function quickStats(group: MachineGroup): QuickStats {
+  const items = group.targets.filter(item => item.exporter !== "nvidia");
+  const main = items.find(item => item.cpu_busy_ratio !== null || item.mem_total_bytes !== null) ?? items[0];
+  const total = main?.mem_total_bytes ?? null, free = main?.mem_available_bytes ?? null;
+  const used = total !== null && free !== null ? total - free : null;
+  const disks = items.flatMap(item => item.disks).filter(item => item.free_bytes !== null);
+  const usedShare = (item: Disk) => (item.size_bytes - item.free_bytes!) / item.size_bytes;
+  const disk = disks.length ? disks.reduce((a, b) => usedShare(b) > usedShare(a) ? b : a) : null;
+  return { cpu: main?.cpu_busy_ratio ?? null, memory: used !== null && total ? used / total : null,
+    memoryText: used !== null ? `${formatBytes(used)} of ${formatBytes(total)}` : "not reported",
+    disk, diskRatio: disk ? usedShare(disk) : null, down: main?.net_rx_bytes_per_second ?? null, up: main?.net_tx_bytes_per_second ?? null,
+    reporting: group.targets.some(item => item.up === true && item.state === "fresh") };
+}
+
 export function formatBytes(value: number | null): string {
   if (value === null) return "not reported";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -198,6 +293,7 @@ export function formatBytes(value: number | null): string {
   while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit++; }
   return `${amount >= 100 || unit === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unit]}`;
 }
+export const formatRate = (value: number | null) => value === null ? "not reported" : `${formatBytes(Math.round(value))}/s`;
 export const percent = (ratio: number | null) => ratio === null ? "not reported" : `${Math.round(ratio * 100)}%`;
 export function formatUptime(seconds: number | null): string {
   if (seconds === null) return "not reported";
