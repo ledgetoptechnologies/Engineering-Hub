@@ -7,6 +7,7 @@ import { answeredDecisions, DecisionList, openDecisions, RecentAnswers } from ".
 import { TaskTable } from "./tasks";
 import { WithdrawnList } from "./Withdraw";
 import { ownershipRows, UNCLAIMED, WorkOwnership } from "./WorkOwnership";
+import { HeldQueueInbox } from "../HeldQueueInbox";
 
 export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode }) {
   const [project, setProject] = useState("all");
@@ -35,6 +36,8 @@ export function InboxPage({ hub, actions }: { hub: Hub; actions: React.ReactNode
         <WithdrawnList hub={hub} kind="decision" project={project === "all" ? undefined : project} />
         <p className="panel-footnote">Only your signed-in session can answer. Agents can request, not approve.</p>
       </section>
+      {project === "all" && <HeldQueueInbox enabled={!hub.demo && !!hub.session?.authenticated}
+        stale={hub.stale} refreshToken={hub.data} onUnauthorized={hub.clearPrivateWorkspace} />}
     </>
   );
 }

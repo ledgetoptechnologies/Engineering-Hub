@@ -37,6 +37,48 @@ async function fixture(page: Page) {
   return state;
 }
 
+test("inbox shows held queue status separately from decisions and only reads", async ({ page }) => {
+  const state = await fixture(page);
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText("Held at this check: 1.")).toBeVisible();
+  await expect(panel.getByText(`Job ${jobId} · staging-pc · held`)).toBeVisible();
+  await expect(panel.getByRole("link", { name: "Open software queue" })).toHaveAttribute("href", /staging/);
+  expect(state.writes).toBe(0);
+});
+
+test("inbox reports a partial held list without guessing the missing job", async ({ page }) => {
+  const state = await fixture(page);
+  state.body.jobs[0].state = "queued";
+  state.body.jobs[0].requires_reconciliation = false;
+  state.body.jobs[0].blocked_reason = null;
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText("Held at this check: 1.")).toBeVisible();
+  await expect(panel.getByText("Some held jobs are outside the displayed recent jobs.")).toBeVisible();
+  await expect(panel.getByText(`Job ${jobId}`, { exact: false })).toHaveCount(0);
+  expect(state.writes).toBe(0);
+});
+
+test("inbox does not treat unavailable queue status as empty", async ({ page }) => {
+  const state = await fixture(page);
+  state.queueStatus = 503;
+  await page.goto("/#/inbox");
+  const panel = page.getByRole("region", { name: "Held software queue jobs" });
+  await expect(panel.getByText("Queue status is unavailable.")).toBeVisible();
+  await expect(panel.getByText("Held at this check:", { exact: false })).toHaveCount(0);
+  expect(state.writes).toBe(0);
+});
+
+test("inbox clears the private workspace on queue authentication loss", async ({ page }) => {
+  const state = await fixture(page);
+  state.queueStatus = 401;
+  await page.goto("/#/inbox");
+  await expect.poll(() => state.reads).toBeGreaterThan(0);
+  await expect(page.getByRole("region", { name: "Held software queue jobs" })).toHaveCount(0);
+  expect(state.writes).toBe(0);
+});
+
 test("held queue is visible without implying executor readiness; explicit refresh only reads", async ({ page }) => {
   const state = await fixture(page);
   await page.goto("/#/staging");
