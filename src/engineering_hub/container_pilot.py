@@ -179,6 +179,8 @@ class ContainerPilotWorkflow:
                     raise ValueError('fresh_single_pilot_controller_required')
                 db.execute('CREATE TABLE hub_single_pilot_protocol (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL)')
                 db.execute("INSERT INTO hub_single_pilot_protocol VALUES(1,'v1')")
+            if single_pilot_protocol:
+                db.execute('CREATE TABLE IF NOT EXISTS hub_single_pilot_ack_receipts (run_id TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL, outcome_digest TEXT NOT NULL, PRIMARY KEY(run_id,action))')
             columns = {row[1] for row in db.execute('PRAGMA table_info(hub_container_pilot_commands)')}
             if 'response_json' not in columns:
                 # Preserve legacy unknown/held reservations; never reconstruct
@@ -298,7 +300,14 @@ class ContainerPilotWorkflow:
             manifest_digest=target.manifest_digest, candidate_commit=target.candidate_commit,
             policy_revision=target.policy_revision, fencing_generation=run['fencing_generation'])
 
-    async def _ack_retained(self, run, target, action, command):
+    @staticmethod
+    def _store_ack_receipt(db, run_id, action, payload, digest):
+        db.execute('INSERT OR IGNORE INTO hub_single_pilot_ack_receipts VALUES(?,?,?,?)', (run_id,action,payload,digest))
+        row = db.execute('SELECT payload,outcome_digest FROM hub_single_pilot_ack_receipts WHERE run_id=? AND action=?', (run_id,action)).fetchone()
+        if row is None or tuple(row) != (payload,digest):
+            raise ValueError('single pilot acknowledgment receipt conflict')
+
+    async def _ack_retained(self, run, target, action, command, *, finalize=True):
         """Retry only the exact idempotent ACK; never resubmit an effect."""
         with self.repo._connection() as db:
             row = db.execute('SELECT payload,state,response_json FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
@@ -321,12 +330,15 @@ class ContainerPilotWorkflow:
             if single_pilot_outcome_digest(acknowledgment) != digest:
                 return 'held'
             self._assert_pilot_owner()
+            if not finalize:
+                return state
             with self.repo._transaction() as db:
                 self._assert_pilot_owner()
                 updated = db.execute("UPDATE hub_container_pilot_commands SET state=? WHERE run_id=? AND action=? AND state='ack_pending' AND payload=? AND response_json=?",
                     (state,run['id'],action,canonical,row['response_json']))
                 if updated.rowcount != 1:
                     return 'held'
+                self._store_ack_receipt(db, run['id'], action, canonical, digest)
             return state
         except Exception:
             return 'held'

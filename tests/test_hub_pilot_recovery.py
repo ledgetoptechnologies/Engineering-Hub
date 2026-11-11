@@ -361,3 +361,77 @@ async def test_changed_original_request_is_not_reconstructed_or_queried(rig):
     assert result['recovery'] == 'held'
     assert current.client.inspections == current.client.submissions == []
     assert reservations(current.repo, run['id'])[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost', ['submit', 'ack'])
+async def test_single_pilot_public_recovery_retries_only_ack_after_restart(rig, lost):
+    from engineering_hub.container_pilot_client import single_pilot_outcome_digest
+    class AckRecoveryClient(RecoveryClient):
+        def __init__(self):
+            super().__init__(); self.acks=[]; self.lose_submit=lost=='submit'; self.lose_ack=lost=='ack'
+        async def submit_command(self, command):
+            response=await super().submit_command(command)
+            if self.lose_submit:
+                self.lose_submit=False
+                raise TimeoutError('synthetic lost original response')
+            return response
+        async def acknowledge_command(self, command, digest):
+            self.acks.append((command,digest))
+            if self.lose_ack:
+                self.lose_ack=False
+                raise TimeoutError('synthetic lost ack response')
+            response=self.response(command).model_copy(update={'replayed':True})
+            assert single_pilot_outcome_digest(response)==digest
+            return response
+    client=AckRecoveryClient()
+    initial=rig.restart(client)
+    workflow=ContainerPilotWorkflow(initial.repo,client,[rig.target],pilot_owner=initial.owner,single_pilot_protocol=True)
+    task=reviewed_task(initial.repo)
+    run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    held=await workflow.advance(run['id'])
+    assert held['status']=='held' and len(client.submissions)==1
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        recovery=PilotRecovery(resumed)
+        result=await recovery.recover(run['id'])
+        assert result['recovery']=='recovered' and result['run']['status']=='running'
+        assert len(client.submissions)==1  # recovery never repeats deployment
+        assert len(client.acks)==(2 if lost=='ack' else 1)
+        second=await recovery.recover(run['id'])
+        assert second['recovery']=='recovered' and len(client.submissions)==1
+        completed=await resumed.advance(run['id'])
+        assert completed['status']=='succeeded'
+        assert [x.action for x in client.submissions]==['deploy_container','smoke_container']
+    finally:
+        owner.close()
+
+
+@pytest.mark.asyncio
+async def test_single_pilot_recovery_never_finalizes_uncertain_ack(rig):
+    class AckUnavailable(RecoveryClient):
+        async def acknowledge_command(self, command, digest):
+            raise TimeoutError('synthetic acknowledgement unavailable')
+    client=AckUnavailable()
+    initial=rig.restart(client)
+    workflow=ContainerPilotWorkflow(initial.repo,client,[rig.target],pilot_owner=initial.owner,single_pilot_protocol=True)
+    task=reviewed_task(initial.repo)
+    run=workflow.create_run('codex',task['id'],task['revision'],IMAGE,rig.target.target_id)
+    assert (await workflow.advance(run['id']))['status']=='held'
+    initial.owner.close()
+    owner=PilotOwner(rig.path,allow_ephemeral_test_storage=True)
+    try:
+        repo=HubRepository(rig.path,execution_principal=PRINCIPAL,pilot_owner=owner)
+        resumed=ContainerPilotWorkflow(repo,client,[rig.target],pilot_owner=owner,single_pilot_protocol=True)
+        result=await PilotRecovery(resumed).recover(run['id'])
+        assert result['recovery']=='held' and result['run']['status']=='held'
+        assert len(client.submissions)==1
+        with repo._connection() as db:
+            assert db.execute('SELECT state FROM hub_container_pilot_commands WHERE run_id=? AND action=?',
+                              (run['id'],'deploy_container')).fetchone()['state']=='ack_pending'
+            assert db.execute('SELECT 1 FROM hub_single_pilot_ack_receipts WHERE run_id=?',(run['id'],)).fetchone() is None
+    finally:
+        owner.close()
