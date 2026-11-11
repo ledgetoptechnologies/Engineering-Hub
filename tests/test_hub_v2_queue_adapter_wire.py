@@ -23,10 +23,10 @@ from tests.test_hub_container_pilot import PRINCIPAL, reviewed_task
 from tests.test_hub_queued_pilot import ACTION, MACHINE
 
 
-class LoseFirstAck(httpx.AsyncBaseTransport):
-    def __init__(self, app, *, lose):
+class FaultTransport(httpx.AsyncBaseTransport):
+    def __init__(self, app, *, fault):
         self.inner = httpx.ASGITransport(app=app)
-        self.lose = lose
+        self.fault = fault
         self.posts = []
         self.acks = []
         self.ack_status = []
@@ -39,14 +39,20 @@ class LoseFirstAck(httpx.AsyncBaseTransport):
                 self.acks.append(body['request']['command_id'])
             elif request.url.path.endswith('/commands'):
                 self.posts.append(body['command_id'])
+        ack = request.url.path.endswith('/acknowledge')
+        command = request.url.path.endswith('/commands') and request.method == 'POST'
+        if ack and self.fault == 'ack-request' and not self.lost:
+            self.lost = True
+            raise httpx.WriteError('synthetic lost ACK request before server', request=request)
         response = await self.inner.handle_async_request(request)
         if request.url.path.endswith('/acknowledge'):
             self.ack_status.append(response.status_code)
-        if request.url.path.endswith('/acknowledge') and self.lose and not self.lost:
+        if not self.lost and ((ack and self.fault == 'ack-response') or
+                              (command and self.fault == 'command-response')):
             assert response.status_code == 200
             self.lost = True
             await response.aclose()
-            raise httpx.ReadError('synthetic lost acknowledgement', request=request)
+            raise httpx.ReadError('synthetic lost response after acceptance', request=request)
         return response
 
     async def aclose(self):
@@ -54,8 +60,8 @@ class LoseFirstAck(httpx.AsyncBaseTransport):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('lose', [False, True], ids=['healthy', 'lost-ack'])
-async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypatch, lose):
+@pytest.mark.parametrize('fault', ['none', 'command-response', 'ack-request', 'ack-response'])
+async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypatch, fault):
     pytest.importorskip('fcntl')
     from hub_container_executor import single_pilot_evidence
     adapter, backend, state, manifest = make_fixture(tmp_path)
@@ -67,7 +73,7 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
     monkeypatch.setattr(single_pilot_evidence, 'verify_phase', lambda *_: None)
     adapter.ledger.enable_single_pilot_protocol()
     adapter._single_pilot_protocol = True
-    transport = LoseFirstAck(PilotASGI(adapter, 'synthetic-token'), lose=lose)
+    transport = FaultTransport(PilotASGI(adapter, 'synthetic-token'), fault=fault)
     private = tmp_path / 'controller'
     private.mkdir(mode=0o700)
     try:
@@ -86,28 +92,39 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
                     environment='staging', target=WorkTarget(task['id'],
                         manifest.candidate.source_commit, manifest.candidate.image_config_id))
                 outcome = await bridge.run_once()
-                if not lose:
+                if fault == 'none':
                     assert outcome['state'] == 'succeeded'
                     assert len(transport.posts) == len(set(transport.posts)) == 2
                     assert transport.ack_status == [200, 200]
+                    assert transport.acks == transport.posts
                     assert backend.events.count('create') == backend.events.count('start') == 1
                     assert backend.events.count('probe') == 1
                     assert repo.list_runs()[0]['status'] == 'succeeded'
                     assert adapter.ledger.inspect_single_pilot() is None
                     return
                 assert outcome['state'] == 'held'
+                assert repo.list_runs()[0]['events'][-1]['reason'] == 'candidate_outcome_uncertain'
                 assert transport.lost and len(transport.posts) == 1
                 assert backend.events.count('create') == backend.events.count('start') == 1
                 first = transport.posts[0]
                 effects_before = [event for event in backend.events if event in {'create', 'start', 'stop', 'probe'}]
                 state_calls_before = list(state.calls)
+                next_task = reviewed_task(repo, key='second-task')
+                next_job = queue.submit(actor='codex', request_id=str(uuid4()), action_key=ACTION,
+                    environment='staging', target=WorkTarget(next_task['id'],
+                        manifest.candidate.source_commit, manifest.candidate.image_config_id))
+                assert await bridge.run_once() is None
+                assert queue.get_job(next_job['id'])['state'] == 'queued'
+                assert len(transport.posts) == 1
+                assert [event for event in backend.events if event in {'create', 'start', 'stop', 'probe'}] == effects_before
+                assert state.calls == state_calls_before
                 recovered = await bridge.recover(job['id'])
                 # Recovery may inspect and acknowledge the original command,
                 # but cannot dispatch the previously unissued smoke phase.
                 assert recovered['state'] == 'held'
                 assert transport.posts.count(first) == 1
-                assert transport.acks.count(first) >= 2
-                assert transport.ack_status[:2] == [200, 200]
+                assert transport.acks.count(first) == (1 if fault == 'command-response' else 2)
+                assert transport.ack_status == ([200, 200] if fault == 'ack-response' else [200])
                 assert len(transport.posts) == 1
                 assert backend.events.count('create') == backend.events.count('start') == 1
                 assert backend.events.count('probe') == 0
@@ -115,5 +132,10 @@ async def test_v2_queue_ack_and_recovery_do_not_repeat_effect(tmp_path, monkeypa
                 assert state.calls == state_calls_before
                 assert repo.list_runs()[0]['status'] == 'running'
                 assert adapter.ledger.inspect_single_pilot() is None
+                assert await bridge.run_once() is None
+                assert queue.get_job(next_job['id'])['state'] == 'queued'
+                assert len(transport.posts) == 1
+                assert [event for event in backend.events if event in {'create', 'start', 'stop', 'probe'}] == effects_before
+                assert state.calls == state_calls_before
     finally:
         adapter.close()
