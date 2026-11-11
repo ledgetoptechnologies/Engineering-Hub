@@ -224,3 +224,18 @@ def test_versioned_capability_and_command_routes_fail_closed_before_effect(clien
         finally:
             await client.aclose()
     run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('mode', [None, 1, 'true'])
+def test_invalid_protocol_mode_fails_closed_before_body_and_effect(mode):
+    class Adapter:
+        _single_pilot_protocol = mode
+        def submit(self, request):
+            raise AssertionError('must not submit')
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            result = await request(app, 'GET', path)
+            assert result.status_code == 500
+    run_owned_loop(exercise())
