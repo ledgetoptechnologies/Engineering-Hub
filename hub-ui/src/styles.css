@@ -3442,6 +3442,14 @@ img.brand-mark {
   font: 11px var(--mono);
   color: var(--ink-3);
 }
+/* The typed answer gets the full row, and its option stays one line tall
+   instead of stretching over the box below it. */
+.decision .free-answer {
+  grid-column: 1 / -1;
+}
+.decision .free-answer > .radio-option {
+  height: auto;
+}
 .image-viewer-tools {
   display: flex;
   align-items: center;
