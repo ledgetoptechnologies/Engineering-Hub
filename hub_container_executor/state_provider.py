@@ -7,6 +7,7 @@ they are never automatically adopted, retried, removed or chowned.
 from __future__ import annotations
 
 import fcntl
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -61,6 +62,17 @@ def _entries(path, maximum, deadline=None):
             if len(result) > maximum:
                 raise StateProvisionError("Private state entry capacity exceeded")
     return result
+
+
+@dataclass(frozen=True)
+class StateReservationObservation:
+    """Private reservation metadata only; no content or health verification."""
+    operation_id: str
+    run_id: str
+    role: str
+    generation_id: str
+    complete: bool
+    generation_inode: tuple[int, int] | None
 
 
 class FrozenSQLiteStateProvisioner:
@@ -245,6 +257,55 @@ class FrozenSQLiteStateProvisioner:
             # cannot replace a durable intent with invented success.
             values.append((intent, completion_name))
         return values
+
+    def inspect_reservation(self, operation_id, *, deadline_monotonic):
+        """Read guarded private metadata; incomplete never means no effect.
+
+        A completed marker binds the current generation directory inode only.
+        This is not proof of current SQLite bytes, health or independent origin.
+        Trusted same-UID ownership and the provider lock remain prerequisites.
+        """
+        if self._pid != os.getpid():
+            raise StateProvisionError("State provisioner is process bound")
+        try:
+            valid_deadline = type(deadline_monotonic) in {int, float} and math.isfinite(deadline_monotonic)
+        except OverflowError:
+            valid_deadline = False
+        if not valid_deadline:
+            raise StateProvisionError("Finite inspection deadline required")
+        try:
+            _uuid(operation_id)
+            with self._mutex:
+                self._check(deadline_monotonic)
+                matches = [(intent, completion) for intent, completion in self._records(deadline_monotonic)
+                           if intent['operation'] == operation_id]
+                if not matches:
+                    self._check(deadline_monotonic)
+                    return None
+                intent, completion_name = matches[0]
+                names = _entries(self.reservations, 4098, deadline_monotonic)
+                inode = None
+                if completion_name in names:
+                    completion = self._read_json(completion_name)
+                    generation_path = self.root / intent['generation']
+                    _private_dir(generation_path)
+                    info = generation_path.stat(follow_symlinks=False)
+                    inode = _identity(info)
+                    if (type(completion) is not dict or set(completion) != {'generation', 'inode'}
+                            or completion['generation'] != intent['generation']
+                            or type(completion['inode']) is not list
+                            or len(completion['inode']) != 2
+                            or any(type(value) is not int or value < 0 for value in completion['inode'])
+                            or tuple(completion['inode']) != inode):
+                        raise StateProvisionError('State completion identity mismatch')
+                    _private_file(generation_path / 'hub.sqlite3')
+                self._check(deadline_monotonic)
+                return StateReservationObservation(operation_id, intent['run'], intent['role'],
+                    intent['generation'], inode is not None, inode)
+        except StateProvisionError:
+            raise
+        except Exception:
+            raise StateProvisionError('Private state reservation unavailable') from None
 
     def _generation(self, run, operation, role):
         return role + "-" + uuid5(NAMESPACE_URL, self._manifest_digest + "/" + run + "/" + operation + "/" + role).hex
