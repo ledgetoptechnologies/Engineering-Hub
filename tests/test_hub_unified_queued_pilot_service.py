@@ -135,6 +135,15 @@ async def start(rig, **changes):
     return stop, task, addresses
 
 
+@pytest.mark.asyncio
+async def test_v2_unified_rejects_legacy_client_before_command(rig):
+    with pytest.raises(service.QueuedPilotServiceError):
+        await service.serve_owned_unified_queued_pilot(
+            rig.settings, rig.manifest, rig.client_factory,
+            **options(rig, single_pilot_protocol=True))
+    assert rig.requests == []
+
+
 def url(address):
     return 'http://' + address[0] + ':' + str(address[1])
 

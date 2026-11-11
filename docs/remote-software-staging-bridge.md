@@ -19,6 +19,13 @@ rejected on versioned command routes before the request body is read or the
 adapter is called. The mode declares protocol compatibility; it does not prove
 daemon identity or exclusive ownership.
 
+The unified HTTPS selector retains v1 by default. Its closed profile schema
+`engineering-hub.unified-pilot.v2` requires the exact boolean
+`single_pilot_protocol: true` and passes that mode to both the client and the
+owned workflow. The inert executor NGINX template lists the corresponding v2
+routes; adding source support does not install a proxy, grant access, or prove
+remote reachability. Both ends must independently use matching modes.
+
 The colocated coordinator's `serve` selector requires `--session-config` on a
 read-only mount, with a protected current-UID file and parent. This is an
 operator-authored, independently reviewed session report: its retained source,
