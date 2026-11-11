@@ -3,6 +3,10 @@
 This records uncertainty, never health, recovery authority or retry permission.
 Callers must use a dedicated journal database on approved local Linux storage.
 No environment discovery, service activation, tokens or Docker labels are used.
+Bindings are explicit opt-in stored evidence only: no backend effect uses them,
+and they do not authenticate a daemon, MAC, lease, or enable reconciliation.
+Old binaries reject a migrated v2 journal. An exception during commit or fsync
+can occur after commit; reopen and inspect instead of inferring rollback.
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ import sqlite3
 import sys
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from uuid import UUID
 
 from engineering_hub.pilot_ownership import PilotOwner
@@ -32,6 +37,9 @@ _KINDS = frozenset({"create_candidate", "create_rollback", "start", "stop", "pro
 _CONTAINER = re.compile(r"[a-f0-9]{64}\Z")
 _SCHEMA = ("CREATE TABLE private_operation_journal (operation_id TEXT PRIMARY KEY, "
            "kind TEXT NOT NULL, state TEXT NOT NULL, container_id TEXT)")
+_BINDING_SCHEMA = ("CREATE TABLE private_operation_binding (operation_id TEXT PRIMARY KEY, "
+                   "boot_id TEXT NOT NULL, daemon_pid INTEGER NOT NULL, daemon_start INTEGER NOT NULL, "
+                   "resource_name TEXT UNIQUE, target_id TEXT, request_mac TEXT NOT NULL, fence INTEGER NOT NULL)")
 _TABLES = {"hub_pilot_owner", "hub_pilot_owner_epochs", "private_operation_journal"}
 _BUSY_SECONDS = .25
 
@@ -73,17 +81,55 @@ def _row(row):
 def _schema(db, *, inspect_rows=False):
     rows = db.execute("SELECT name, type, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").fetchall()
     tables = {name for name, kind, _ in rows if kind == "table"}
-    if tables != _TABLES or any(kind != "table" for _, kind, _ in rows):
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version not in (1, 2):
+        raise OperationJournalError("Unsupported operation journal version")
+    expected = _TABLES | ({"private_operation_binding"} if version == 2 else set())
+    if tables != expected or any(kind != "table" for _, kind, _ in rows):
         raise OperationJournalError("Dedicated operation journal schema required")
     if next(sql for name, _, sql in rows if name == "private_operation_journal") != _SCHEMA:
         raise OperationJournalError("Dedicated operation journal schema required")
-    if db.execute("PRAGMA user_version").fetchone() != (1,):
-        raise OperationJournalError("Unsupported operation journal version")
+    if version == 2 and next(sql for name, _, sql in rows if name == "private_operation_binding") != _BINDING_SCHEMA:
+        raise OperationJournalError("Dedicated binding schema required")
     if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
         raise OperationJournalError("Operation journal integrity unavailable")
     if inspect_rows:
         for row in db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal"):
             _row(row)
+        if version == 2:
+            for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
+                _validate_binding_row(row)
+
+
+@dataclass(frozen=True)
+class OperationBinding:
+    """Caller-supplied evidence only: no fencing or recovery authority implied."""
+    boot_id: str
+    daemon_pid: int
+    daemon_start: int
+    resource_name: str | None
+    target_id: str | None
+    request_mac: str
+    fence: int
+
+
+def _validate_binding_row(row):
+    operation_id, kind, boot_id, daemon_pid, daemon_start, name, target, mac, fence = row
+    _operation(operation_id)
+    _kind(kind)
+    _operation(boot_id)
+    if (type(daemon_pid) is not int or not 1 < daemon_pid <= 2**63-1
+            or type(daemon_start) is not int or not 1 <= daemon_start <= 2**63-1
+            or type(fence) is not int or not 1 <= fence <= 2**63-1
+            or type(mac) is not str or not re.fullmatch(r"hmac-sha256:[a-f0-9]{64}", mac)):
+        raise OperationJournalError("Invalid operation binding")
+    if kind.startswith("create_"):
+        if (type(name) is not str or len(name) > 127
+                or not re.fullmatch(r"hub-pilot-[a-z0-9][a-z0-9-]{0,39}-[0-9a-f-]{12}-(candidate|rollback)", name)
+                or target is not None or not name.endswith("-" + kind.removeprefix("create_"))):
+            raise OperationJournalError("Invalid create binding")
+    elif name is not None or type(target) is not str or not _CONTAINER.fullmatch(target):
+        raise OperationJournalError("Invalid target binding")
 
 
 class SQLiteOperationJournal:
@@ -216,6 +262,52 @@ class SQLiteOperationJournal:
             if db.execute("SELECT 1 FROM private_operation_journal WHERE operation_id=?", (operation_id,)).fetchone():
                 raise OperationJournalConflict("Operation intent already exists; effect must not replay")
             db.execute("INSERT INTO private_operation_journal VALUES (?,?,'pending',NULL)", (operation_id, kind))
+
+    def enable_bindings(self) -> None:
+        """Explicitly migrate v1 atomically; existing operations stay unchanged."""
+        with self._transaction() as db:
+            if db.execute("PRAGMA user_version").fetchone() != (1,):
+                raise OperationJournalConflict("Bindings already enabled")
+            _schema(db, inspect_rows=True)
+            db.execute(_BINDING_SCHEMA)
+            db.execute("PRAGMA user_version=2")
+            _schema(db, inspect_rows=True)
+
+    def begin_bound(self, operation_id: str, kind: str, binding: OperationBinding) -> None:
+        """Atomically persist untrusted binding and intent; never replay an ID.
+
+        The caller must independently authenticate the generation and MAC. This
+        method grants no authority to act, adopt, retry, or infer non-creation.
+        """
+        if type(binding) is not OperationBinding:
+            raise OperationJournalError("Exact operation binding required")
+        row = (operation_id, kind, binding.boot_id, binding.daemon_pid, binding.daemon_start,
+               binding.resource_name, binding.target_id, binding.request_mac, binding.fence)
+        _validate_binding_row(row)
+        with self._transaction() as db:
+            if db.execute("PRAGMA user_version").fetchone() != (2,):
+                raise OperationJournalError("Explicit binding migration required")
+            if db.execute("SELECT 1 FROM private_operation_journal WHERE operation_id=?", (operation_id,)).fetchone():
+                raise OperationJournalConflict("Operation intent already exists; effect must not replay")
+            if binding.resource_name is not None and db.execute(
+                    "SELECT 1 FROM private_operation_binding WHERE resource_name=?", (binding.resource_name,)).fetchone():
+                raise OperationJournalConflict("Bound resource name already used")
+            db.execute("INSERT INTO private_operation_journal VALUES (?,?,'pending',NULL)", (operation_id, kind))
+            db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?)",
+                       (operation_id, binding.boot_id, binding.daemon_pid, binding.daemon_start,
+                        binding.resource_name, binding.target_id, binding.request_mac, binding.fence))
+
+    def inspect_binding(self, operation_id: str) -> OperationBinding | None:
+        """Read stored evidence only; never turn it into a terminal outcome."""
+        _operation(operation_id)
+        with self._transaction() as db:
+            if db.execute("PRAGMA user_version").fetchone() != (2,):
+                return None
+            row = db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id WHERE b.operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return None
+            _validate_binding_row(row)
+            return OperationBinding(*row[2:])
 
     def completed(self, operation_id: str, kind: str, container_id: str | None = None) -> None:
         _operation(operation_id)

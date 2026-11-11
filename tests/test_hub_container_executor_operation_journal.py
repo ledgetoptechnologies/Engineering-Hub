@@ -5,7 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from uuid import uuid4
 
 import pytest
@@ -13,11 +13,129 @@ import pytest
 pytest.importorskip("fcntl", reason="Host executor package requires actual Linux kernel ownership")
 
 from hub_container_executor.operation_journal import (
-    SQLiteOperationJournal, OperationJournalConflict, OperationJournalError,
+    SQLiteOperationJournal, OperationJournalConflict, OperationJournalError, OperationBinding,
 )
 
 LINUX = pytest.mark.skipif(sys.platform != "linux", reason="Actual private Linux journal ownership")
 CID = "a" * 64
+
+
+def binding(*, name="hub-pilot-demo-0123456789ab-candidate", target=None, mac=None):
+    return OperationBinding(str(uuid4()), 123, 456, name, target,
+                            mac or "hmac-sha256:" + "a" * 64, 1)
+
+
+@LINUX
+def test_opt_in_migration_keeps_legacy_pending_and_bound_ids_unique(path):
+    legacy, bound = str(uuid4()), str(uuid4())
+    value = binding()
+    with journal(path) as store:
+        store.begin(legacy, "create_candidate")
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(bound, "create_candidate", value)
+        store.enable_bindings()
+        assert store.inspect(legacy).state == "pending"
+        assert store.inspect_binding(legacy) is None
+        store.begin_bound(bound, "create_candidate", value)
+        assert store.inspect(bound).state == "pending"
+        assert store.inspect_binding(bound) == value
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(str(uuid4()), "create_candidate", value)
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(bound, "create_candidate", value)
+    with journal(path, create=False) as store:
+        assert store.inspect(legacy).state == "pending"
+        assert store.inspect_binding(bound) == value
+
+
+@LINUX
+def test_bound_target_validation_and_no_plaintext_binding(path):
+    with journal(path) as store:
+        store.enable_bindings()
+        identity = str(uuid4())
+        value = binding(name=None, target=CID)
+        store.begin_bound(identity, "start", value)
+        assert store.inspect_binding(identity) == value
+        for invalid in (binding(name=None, target=None), binding(name=None, target=CID, mac="secret-token"),
+                        binding(name="../foreign")):
+            with pytest.raises(OperationJournalError):
+                store.begin_bound(str(uuid4()), "start", invalid)
+        assert b"secret-token" not in path.read_bytes()
+
+
+@LINUX
+def test_interrupted_migration_rolls_back_both_schema_and_version(path, monkeypatch):
+    with journal(path) as store:
+        original = __import__("hub_container_executor.operation_journal", fromlist=["_schema"])
+        real = original._schema
+        def reject_v2(db, **kwargs):
+            if db.execute("PRAGMA user_version").fetchone() == (2,):
+                raise OperationJournalError("injected migration failure")
+            return real(db, **kwargs)
+        monkeypatch.setattr(original, "_schema", reject_v2)
+        with pytest.raises(OperationJournalError):
+            store.enable_bindings()
+        monkeypatch.setattr(original, "_schema", real)
+        with sqlite3.connect(path) as db:
+            assert db.execute("PRAGMA user_version").fetchone() == (1,)
+            assert db.execute("SELECT 1 FROM sqlite_master WHERE name='private_operation_binding'").fetchone() is None
+
+
+@LINUX
+def test_binding_insert_failure_rolls_back_intent(path, monkeypatch):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        original = store._connection
+        @contextmanager
+        def rejecting(*args, **kwargs):
+            with original(*args, **kwargs) as db:
+                db.set_authorizer(lambda action, table, *rest: sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_INSERT and table == "private_operation_binding"
+                    else sqlite3.SQLITE_OK)
+                yield db
+        monkeypatch.setattr(store, "_connection", rejecting)
+        with pytest.raises(OperationJournalError):
+            store.begin_bound(identity, "create_candidate", binding())
+        monkeypatch.setattr(store, "_connection", original)
+        assert store.inspect(identity) is None
+        assert store.inspect_binding(identity) is None
+
+
+@LINUX
+def test_orphan_binding_rejected_before_owner_reopen(path):
+    with journal(path) as store:
+        store.enable_bindings()
+    with sqlite3.connect(path) as db:
+        value = binding()
+        db.execute("INSERT INTO private_operation_binding VALUES (?,?,?,?,?,?,?,?)",
+                   (str(uuid4()), value.boot_id, value.daemon_pid, value.daemon_start,
+                    value.resource_name, value.target_id, value.request_mac, value.fence))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+
+
+@LINUX
+def test_bound_pending_survives_writer_crash_without_replay(path):
+    identity = str(uuid4())
+    boot_id = str(uuid4())
+    script = """
+import os,sys
+from hub_container_executor.operation_journal import SQLiteOperationJournal, OperationBinding
+s=SQLiteOperationJournal(sys.argv[1],create=True,allow_ephemeral_test_storage=True)
+s.enable_bindings()
+b=OperationBinding(sys.argv[3],123,456,'hub-pilot-demo-0123456789ab-candidate',None,'hmac-sha256:'+'a'*64,1)
+s.begin_bound(sys.argv[2],'create_candidate',b)
+os._exit(23)
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(path), identity, boot_id],
+                            timeout=10, capture_output=True, text=True)
+    assert result.returncode == 23
+    with journal(path, create=False) as store:
+        assert store.inspect(identity).state == "pending"
+        assert store.inspect_binding(identity).boot_id == boot_id
+        with pytest.raises(OperationJournalConflict):
+            store.begin_bound(identity, "create_candidate", store.inspect_binding(identity))
 
 
 @pytest.fixture
