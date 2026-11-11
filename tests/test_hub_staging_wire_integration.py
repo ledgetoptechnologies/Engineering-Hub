@@ -1,14 +1,12 @@
 """Actual private HTTPS/controller/queue wire tests; explicitly no Docker backend.
 
 The backend below only copies synthetic fixture bytes. These tests do not prove
-Docker isolation, Git provenance, NAS connectivity or browser/phone delivery.
+Docker isolation, repository membership, NAS connectivity or browser/phone delivery.
 """
 import asyncio
-import base64
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
-import io
 import ipaddress
 import json
 import os
@@ -17,7 +15,6 @@ import socket
 import ssl
 import threading
 import uuid
-import zipfile
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -36,18 +33,15 @@ from hub_staging_service.core import Service
 
 
 pytestmark = pytest.mark.skipif(os.name != 'posix', reason='Real private credential file modes require POSIX')
-HTML = b'<!doctype html><title>Synthetic wire integration</title><p>fixture only</p>\n'
+HTML = b'<html>source</html>'
 PROJECTS = {'engineering-hub': {'recipes': ['static']}}
 
 
-def request():
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, 'w') as bundle:
-        bundle.writestr('index.html', HTML)
-    raw = stream.getvalue()
-    return {'request_id': str(uuid.uuid4()), 'project': 'engineering-hub', 'recipe': 'static',
-            'source_commit': 'a' * 40, 'source_digest': hashlib.sha256(raw).hexdigest(),
-            'source_zip_base64': base64.b64encode(raw).decode()}
+def request(repo):
+    # Creates an independently approved task and a commit/tree proof matching
+    # the actual uploaded ZIP, without relying on a checked-out repository.
+    from tests.test_hub_staging_controller import payload
+    return payload(repo)
 
 
 class SyntheticCopyBackend:
@@ -232,10 +226,10 @@ async def wire(tmp_path):
 
 @pytest.mark.asyncio
 async def test_real_tls_lost_acceptance_restart_get_reconciliation_reserves_machine(wire):
-    first = await wire.controller.submit('codex', request())
+    first = await wire.controller.submit('codex', request(wire.repo))
     wire.drop_jobs = True
     assert (await wire.controller.run_once())['job']['state'] == 'held'
-    second = await wire.controller.submit('codex', request())
+    second = await wire.controller.submit('codex', request(wire.repo))
     assert await wire.controller.run_once() is None
     assert wire.posts() == 1
     assert wire.controller.queue.get_job(second['job']['id'])['state'] == 'queued'
@@ -253,7 +247,7 @@ async def test_real_tls_lost_acceptance_restart_get_reconciliation_reserves_mach
 
 @pytest.mark.asyncio
 async def test_real_tls_revoked_grant_prevents_any_job_post(wire):
-    submitted = await wire.controller.submit('codex', request())
+    submitted = await wire.controller.submit('codex', request(wire.repo))
     wire.resources.set_policy('human:1', 'engineering-hub', 1, {'codex': ['read', 'build']})
     assert await wire.controller.run_once() is None
     assert wire.posts() == 0
@@ -283,7 +277,7 @@ async def test_real_tls_existing_production_priority_and_upstream_verifiers(tmp_
         production = queue.submit(actor='codex', request_id='synthetic-production', action_key='production',
                                   environment='production', target=pinned, approval_id='approved')
         controller = wire.new_controller(queue)
-        staging = await controller.submit('codex', request())
+        staging = await controller.submit('codex', request(wire.repo))
         assert controller.queue is queue
         assert await controller.run_once() is None
         assert wire.posts() == 0
@@ -299,8 +293,8 @@ async def test_real_tls_existing_production_priority_and_upstream_verifiers(tmp_
 @pytest.mark.asyncio
 async def test_real_tls_cancelled_caller_drains_same_claim_without_second_post(wire):
     wire.backend.block()
-    first = await wire.controller.submit('codex', request())
-    second = await wire.controller.submit('codex', request())
+    first = await wire.controller.submit('codex', request(wire.repo))
+    second = await wire.controller.submit('codex', request(wire.repo))
     caller = asyncio.create_task(wire.controller.run_once())
     await wire.wait_backend()
     caller.cancel()
@@ -322,7 +316,7 @@ async def test_real_tls_cancelled_caller_drains_same_claim_without_second_post(w
 
 @pytest.mark.asyncio
 async def test_real_tls_preview_and_cleanup_cas_lost_ack_original_get_only(wire):
-    submitted = await wire.controller.submit('codex', request())
+    submitted = await wire.controller.submit('codex', request(wire.repo))
     assert (await wire.controller.run_once())['job']['state'] == 'succeeded'
     identity = submitted['resource_ids']['preview']
     fact = await wire.controller.client.resource(identity)

@@ -60,13 +60,35 @@ class WorkTarget:
     task_id: str
     source_commit: str
     artifact_digest: str
+    review_revision: int | None = None
+    submission_id: str | None = None
+    ci_attempt_job_id: str | None = None
+    build_receipt_digest: str | None = None
+    execution_release_digest: str | None = None
 
     def __post_init__(self):
         try:
             valid = type(self.task_id) is str and str(uuid.UUID(self.task_id)) == self.task_id
         except ValueError:
             valid = False
-        if not valid or type(self.source_commit) is not str or re.fullmatch(r'[a-f0-9]{40}', self.source_commit) is None or type(self.artifact_digest) is not str or re.fullmatch(r'sha256:[a-f0-9]{64}', self.artifact_digest) is None:
+        if (not valid or type(self.source_commit) is not str
+                or re.fullmatch(r'[a-f0-9]{40}', self.source_commit) is None
+                or type(self.artifact_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.artifact_digest) is None
+                or self.ci_attempt_job_id is not None
+                and (type(self.ci_attempt_job_id) is not str
+                or re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', self.ci_attempt_job_id) is None)
+                or self.build_receipt_digest is not None
+                and (type(self.build_receipt_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.build_receipt_digest) is None)
+                or self.execution_release_digest is not None
+                and (type(self.execution_release_digest) is not str
+                or re.fullmatch(r'sha256:[a-f0-9]{64}', self.execution_release_digest) is None)
+                or self.review_revision is not None
+                and (type(self.review_revision) is not int or self.review_revision < 1)
+                or self.submission_id is not None and (type(self.submission_id) is not str
+                or re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', self.submission_id) is None)
+                or (self.review_revision is None) != (self.submission_id is None)):
             raise HubError('invalid_work_target')
 
 
@@ -349,7 +371,8 @@ class WorkQueue:
             raise HubError('invalid_work_target')
         if not self._target_verified(actor, action_key, environment, target):
             raise HubError('work_target_not_verified', 403)
-        target_json = json.dumps(dict(task_id=target.task_id, source_commit=target.source_commit, artifact_digest=target.artifact_digest), sort_keys=True, separators=(',', ':'))
+        target_fields = {name: getattr(target, name) for name in target.__dataclass_fields__ if getattr(target, name) is not None}
+        target_json = json.dumps(target_fields, sort_keys=True, separators=(',', ':'))
         fingerprint = json.dumps([action_key, environment, action.machine_id, action.project, action.requires_execution_proof, approval_id, target_json], separators=(',', ':'))
         with self.repo._transaction() as db:
             if not self.repo.task_allows_environment(target.task_id, environment, db=db):
