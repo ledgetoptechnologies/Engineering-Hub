@@ -1,5 +1,26 @@
 # Release readiness — 2026-10-22 checkpoint
 
+## 2026-11-11 isolated staging image acceptance
+
+Source `e63abaf93dbe3146306d3e558ea67d3732ba2375` was built on the staging PC
+as immutable local image
+`sha256:982ee548809afd6fb7da8faad5902a26c96a3449bbcb0556ae3e22aec12f4210`.
+On the dedicated rootless Engine, real network-disabled container checks passed:
+dashboard assets, exact health identity, unauthenticated API denial, three-agent
+MCP discovery, same-container restart, SQLite backup/restore and restored task
+state. Direct rollback preserved candidate writes; backup-restore recovered only
+the original state. Both rollback checks used the retained staged ancestor
+`e65a1cecb691a4150bd20536bfb357f4cf7a5d7c`, image
+`sha256:3d33b5cc0f7c1dde314e55ebebd2742c2b4fb6838d0353346c7fd2a2aa078378`.
+Test containers and volumes were verified absent and the daemon stopped.
+
+This accepts that staged image pair only. It does not clear the historical
+production-format recovery gate below, prove a Hub-dispatched pilot, authorize
+NAS changes, or establish human OAuth, installed upgrade, or reboot acceptance.
+The subsequent smoke-script commits are test harness changes, not a rebuilt
+application image. The manual hosted rollback workflow still needs adaptation
+to the required explicit dedicated Docker endpoint before it can be used.
+
 ## Superseding PR52 recovery gate
 
 The dated checkpoint below is retained as historical evidence, **not current
