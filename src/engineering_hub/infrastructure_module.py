@@ -149,9 +149,9 @@ def _owned_schema():
 
 
 def _file_info(info):
-    # Owner-only, not exactly 0600: NFSv4-ACL datasets (e.g. TrueNAS) can
-    # report an owner-only file as 0700 even after fchmod(0600). Execute on a
-    # data file grants nothing; special, group and other bits still refuse.
+    # Accept reported mode 0700 as well as 0600, including on ACL-managed
+    # datasets where chmod may not yield 0600. Reported POSIX mode alone does
+    # not establish effective NFSv4 ACL permissions; those need separate review.
     mode=stat.S_IMODE(info.st_mode)
     _need(stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.getuid()
           and mode in (0o600,0o700))
@@ -272,8 +272,8 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
             try:os.fchmod(file_fd,0o600)
             except PermissionError:
                 # ACL-managed datasets can refuse chmod. The file was created
-                # just now with O_EXCL; _file_info below still requires it to
-                # be owner-only, so a refused chmod never widens access.
+                # with O_EXCL; _file_info still checks its reported mode. That
+                # check does not establish its effective ACL permissions.
                 pass
             os.fsync(file_fd);os.fsync(root_fd)
         stage='database_file'
@@ -322,7 +322,9 @@ def compose_infrastructure(path,*,state_root,on_change=None,default_owner=None):
         _need(admission())
         stage='database_open'
         for sidecar in _SIDECARS:
-            # Re-checked just before SQLite may replay one; never adopted.
+            # Refuse sidecars observed before the write open. The directory
+            # lock coordinates cooperating owners; an uncooperative writer can
+            # still create a sidecar between this check and SQLite's open.
             try:os.stat(sidecar,dir_fd=root_fd,follow_symlinks=False)
             except FileNotFoundError:continue
             raise ValueError('Inventory recovery requires review')

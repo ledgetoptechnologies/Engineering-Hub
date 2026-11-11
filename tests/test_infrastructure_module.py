@@ -446,7 +446,7 @@ def test_empty_leftover_is_named_and_left_untouched(tmp_path, caplog, mode):
 
 
 @POSIX
-def test_after_owner_moves_the_leftover_a_fresh_inventory_starts_on_an_acl_dataset(tmp_path, monkeypatch):
+def test_after_owner_moves_leftover_fresh_inventory_accepts_simulated_0700_mode(tmp_path, monkeypatch):
     import engineering_hub.infrastructure_module as module
     path = tmp_path / 'infrastructure.json'
     directory, database = _leftover(tmp_path, 0o700)
@@ -454,7 +454,7 @@ def test_after_owner_moves_the_leftover_a_fresh_inventory_starts_on_an_acl_datas
     real = os.fchmod
 
     def acl_dataset(fd, mode):
-        # NFSv4-ACL datasets can report owner-only 0700 after fchmod(0600).
+        # Simulate a reported 0700 mode; this does not test effective ACLs.
         real(fd, 0o700)
     monkeypatch.setattr(module.os, 'fchmod', acl_dataset)
     first = compose_infrastructure(path, state_root=tmp_path, default_owner='human:1')
@@ -502,7 +502,7 @@ def test_unsafe_file_modes_stay_closed(tmp_path, caplog, mode):
 
 @POSIX
 @pytest.mark.parametrize('late', ['journal', 'wal', 'shm'])
-def test_sidecar_appearing_before_the_write_open_is_never_replayed(tmp_path, monkeypatch, caplog, late):
+def test_sidecar_observed_at_pre_open_check_is_refused(tmp_path, monkeypatch, caplog, late):
     import engineering_hub.infrastructure_module as module
     settings, directory, database = _populated(tmp_path)
     original = database.read_bytes()
@@ -531,7 +531,7 @@ def test_refused_chmod_on_a_fresh_file_depends_only_on_the_resulting_mode(tmp_pa
     real = os.fchmod
 
     def restricted(fd, mode):
-        # An ACL-restricted dataset applies its own mode and refuses chmod.
+        # Simulate a resulting mode and refused chmod, not an actual ACL.
         real(fd, result_mode)
         raise PermissionError(1, 'Operation not permitted')
     monkeypatch.setattr(module.os, 'fchmod', restricted)
