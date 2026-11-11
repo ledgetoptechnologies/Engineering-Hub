@@ -13,6 +13,12 @@ to `PilotASGI` and `HostAdapter`. The host owns its private command/operation
 ledger, pinned Engine binding, approved build records, baseline and state.
 `OwnedPilotService` supplies control-side ownership, workflow and recovery.
 
+Custom legacy adapters passed to `PilotASGI` must explicitly provide
+`_single_pilot_protocol = False` as a boolean. Missing or non-boolean mode is
+rejected on versioned command routes before the request body is read or the
+adapter is called. The mode declares protocol compatibility; it does not prove
+daemon identity or exclusive ownership.
+
 `WorkQueue` separately supplies production-first eligible ordering and physical
 machine reservations. Its default claim admission is closed. Production priority
 does not grant production deployment authority; the first executor remains

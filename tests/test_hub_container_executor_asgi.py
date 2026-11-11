@@ -182,6 +182,7 @@ def test_ack_route_requires_bearer_and_exact_command_identity(tmp_path):
     manifest = PilotManifest.from_bytes(json.dumps(make_manifest_data()).encode())
     cmd = command(manifest); calls=[]
     class Adapter:
+        _single_pilot_protocol = False
         def acknowledge_single_pilot(self, request, digest):
             calls.append((request,digest))
             return _make_response(request, state='succeeded')
@@ -224,3 +225,51 @@ def test_versioned_capability_and_command_routes_fail_closed_before_effect(clien
         finally:
             await client.aclose()
     run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('mode', [None, 1, 'true'])
+def test_invalid_protocol_mode_fails_closed_before_body_and_effect(mode):
+    class Adapter:
+        _single_pilot_protocol = mode
+        def submit(self, request):
+            raise AssertionError('must not submit')
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            result = await request(app, 'GET', path)
+            assert result.status_code == 500
+    run_owned_loop(exercise())
+
+
+def test_missing_protocol_mode_fails_closed():
+    app = create_app(object(), bearer_token='test-token-only')
+    async def exercise():
+        for path in ('/v1/container-pilot/commands', '/v2/container-pilot/commands',
+                     '/v2/container-pilot/capability'):
+            assert (await request(app, 'GET', path)).status_code == 500
+    run_owned_loop(exercise())
+
+
+@pytest.mark.parametrize('path', ['/v1/container-pilot/commands', '/v2/container-pilot/commands'])
+def test_missing_protocol_mode_rejects_authenticated_post_before_body_or_adapter(path):
+    class Adapter:
+        def submit(self, request):
+            raise AssertionError('adapter must not be called')
+
+    app = create_app(Adapter(), bearer_token='test-token-only')
+    messages = []
+
+    async def receive():
+        raise AssertionError('request body must not be consumed')
+
+    async def send(message):
+        messages.append(message)
+
+    async def exercise():
+        await app({'type': 'http', 'method': 'POST', 'path': path,
+                   'headers': [(b'authorization', b'Bearer test-token-only')]}, receive, send)
+
+    run_owned_loop(exercise())
+    assert messages[0]['type'] == 'http.response.start'
+    assert messages[0]['status'] == 500

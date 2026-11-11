@@ -38,10 +38,6 @@ class PilotASGI:
                 or not math.isfinite(request_body_timeout_seconds)):
             raise ValueError("request body deadline must be finite and in (0, 60] seconds")
         self._adapter = adapter
-        mode = getattr(adapter, '_single_pilot_protocol', False)
-        if type(mode) is not bool:
-            raise ValueError('exact single pilot mode required')
-        self._single_pilot_protocol = mode
         self._authorization = ("Bearer " + bearer_token).encode("ascii")
         self._request_body_timeout_seconds = float(request_body_timeout_seconds)
         self._pid = os.getpid()
@@ -78,7 +74,16 @@ class PilotASGI:
         # Versioned effect routes enforce compatibility on every request,
         # not merely on a separate capability probe. They do not attest daemon
         # generation or protect against a rogue peer holding the bearer.
-        if method == 'GET' and path == CAPABILITY_V2 and self._single_pilot_protocol:
+        mode = False
+        if (path == CAPABILITY_V2 or path == COMMANDS or path.startswith(COMMANDS + '/')
+                or path == COMMANDS_V2 or path.startswith(COMMANDS_V2 + '/')):
+            try:
+                mode = getattr(self._adapter, '_single_pilot_protocol', None)
+                if type(mode) is not bool:
+                    raise ValueError('exact single pilot mode required')
+            except Exception:
+                await self._error(send, 500, 'internal_error'); return
+        if method == 'GET' and path == CAPABILITY_V2 and mode:
             try:
                 body = await self._read_body(receive, headers, allow_missing_length=True)
                 if body:
@@ -92,10 +97,10 @@ class PilotASGI:
             await send({'type':'http.response.body','body':raw})
             return
         if path == COMMANDS or path.startswith(COMMANDS + '/'):
-            if self._single_pilot_protocol:
+            if mode:
                 await self._error(send, 404, 'command_not_found'); return
         elif path == COMMANDS_V2 or path.startswith(COMMANDS_V2 + '/'):
-            if not self._single_pilot_protocol:
+            if not mode:
                 await self._error(send, 404, 'command_not_found'); return
             path = COMMANDS + path[len(COMMANDS_V2):]
 
