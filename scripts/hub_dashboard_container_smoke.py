@@ -115,15 +115,18 @@ print(json.dumps({'image_smoke': 'passed', 'assets': len(assets),
 '''
 
 
-def run_smoke(image, expected_commit=None):
+def run_smoke(image, expected_commit=None, *, docker_host=None):
     if not isinstance(image, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', image):
         raise ValueError('An immutable local image ID is required')
     if expected_commit is not None and (not isinstance(expected_commit, str) or not re.fullmatch('[0-9a-f]{40}', expected_commit)):
         raise ValueError('Expected commit must be lowercase 40-character SHA')
+    if not isinstance(docker_host, str) or not re.fullmatch(r'unix:///run/[A-Za-z0-9_./-]+\.sock', docker_host) or '..' in docker_host.split('/') or docker_host in ('unix:///run/docker.sock', 'unix:///run/containerd/containerd.sock'):
+        raise ValueError('An explicit dedicated local Unix Docker socket is required')
+    docker = ['docker', '--host', docker_host]
     owner = uuid.uuid4().hex
     name = 'hub-dashboard-smoke-' + owner
     run = [
-        'docker', 'run', '--detach', '--pull', 'never', '--name', name,
+        *docker, 'run', '--detach', '--pull', 'never', '--name', name,
         '--label', 'engineering-hub.smoke-owner=' + owner, '--network', 'none',
         '--user', '568:568', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
         '--pids-limit', '64', '--memory', '512m', '--cpus', '1',
@@ -137,7 +140,7 @@ def run_smoke(image, expected_commit=None):
     # No shell, token retrieval, user configuration, or shared Docker resources.
     try:
         subprocess.run(run, check=True, capture_output=True, text=True, timeout=60)
-        probe = ['docker', 'exec', name, 'python', '-c', PROBE]
+        probe = [*docker, 'exec', name, 'python', '-c', PROBE]
         if expected_commit is not None:
             probe.append(expected_commit)
         result = subprocess.run(probe,
@@ -152,14 +155,14 @@ def run_smoke(image, expected_commit=None):
         # docker run may have created the container even if its response was
         # interrupted. Reconcile by unique ownership label, never by a shared
         # name or a broad cleanup command. Inspect only public identity fields.
-        identity = subprocess.run(['docker', 'container', 'inspect', '--format',
+        identity = subprocess.run([*docker, 'container', 'inspect', '--format',
             '{{.Id}}|{{index .Config.Labels "engineering-hub.smoke-owner"}}', name],
             capture_output=True, text=True, timeout=15)
         if identity.returncode == 0:
             container_id, _, actual_owner = identity.stdout.strip().partition('|')
             if not re.fullmatch(r'[a-f0-9]{64}', container_id) or actual_owner != owner:
                 raise RuntimeError('Smoke ownership could not be verified; container not removed')
-            subprocess.run(['docker', 'rm', '--force', container_id], check=True,
+            subprocess.run([*docker, 'rm', '--force', container_id], check=True,
                            capture_output=True, text=True, timeout=30)
         elif 'No such container' not in identity.stderr and 'No such object' not in identity.stderr:
             raise RuntimeError('Smoke container cleanup could not be verified')
@@ -168,11 +171,12 @@ def run_smoke(image, expected_commit=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True, help='Already-built immutable local sha256 image ID')
+    parser.add_argument('--docker-host', required=True, help='Verified dedicated local Unix Docker socket; never the shared system Engine')
     parser.add_argument('--expected-commit', help='Require the app health response to identify this exact source commit')
     args = parser.parse_args()
     if not re.fullmatch(r'sha256:[a-f0-9]{64}', args.image):
         parser.error('An immutable local sha256 image ID is required')
-    print(json.dumps(run_smoke(args.image, args.expected_commit)))
+    print(json.dumps(run_smoke(args.image, args.expected_commit, docker_host=args.docker_host)))
 
 
 if __name__ == '__main__':
