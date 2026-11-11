@@ -157,6 +157,10 @@ class SQLiteOperationJournal:
     ``begin`` is deliberately NOT idempotent: the daemon proceeds with an effect
     whenever it returns. Any prior operation ID therefore raises a conflict.
     Only an exactly identical completed receipt may be re-recorded idempotently.
+    A completed stop records the Engine response, not proof that the container
+    exited or that the target is quiescent. Historical rows cannot establish
+    that a later post-stop inspection succeeded. Do not use them to release a
+    held machine reservation.
     The 250ms SQLite busy timeout bounds individual waits, not total disk I/O or
     constructor duration. Private-path guards do not sandbox hostile same-UID
     processes that intentionally race filesystem replacement between checks.
