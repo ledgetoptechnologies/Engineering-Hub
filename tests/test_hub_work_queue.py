@@ -112,6 +112,23 @@ def test_status_reservation_and_visible_state_share_one_snapshot(setup_queue, mo
     assert q.get_job(original['id'])['state'] == 'succeeded'
 
 
+def test_status_counts_and_jobs_share_snapshot_during_transition(setup_queue, monkeypatch):
+    q, _, repo, _ = setup_queue
+    job = submit(q)
+    claimed = q.claim(worker=w('codex'), lease_seconds=10)
+    original_paused = repo._paused
+    def transition_after_rows(db):
+        finish(q, claimed, outcome='held')
+        return original_paused(db)
+    monkeypatch.setattr(repo, '_paused', transition_after_rows)
+    snapshot = q.status()
+    assert snapshot['jobs'][0]['id'] == job['id']
+    assert snapshot['jobs'][0]['state'] == 'claimed'
+    assert snapshot['counts'].get('claimed') == 1
+    assert snapshot['counts'].get('held', 0) == 0
+    assert q.get_job(job['id'])['state'] == 'held'
+
+
 def test_get_exact_job_is_read_only_and_exposes_expired_claim(setup_queue):
     q, clock, repo, _ = setup_queue
     job = submit(q)

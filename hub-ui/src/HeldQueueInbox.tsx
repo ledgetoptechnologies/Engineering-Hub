@@ -31,7 +31,7 @@ export function HeldQueueInbox({ enabled, stale, refreshToken, onUnauthorized }:
   const held = snapshot?.jobs.filter(job => job.state === "held") ?? [];
   return <section className="panel" aria-label="Held software queue jobs">
     <h2>Held software queue jobs</h2>
-    <p className="panel-description">All projects · Read-only queue status, separate from decisions.</p>
+    <p className="panel-description">All projects · Read-only queue status, separate from decisions. Only jobs in the held state are shown; other jobs may also require reconciliation.</p>
     {stale ? <p role="status">Workspace updates are stale. Check the software queue for current status.</p>
       : state === "loading" ? <p role="status">Reading queue status…</p>
       : state === "unconfigured" ? <p role="status">Software queue is not configured.</p>

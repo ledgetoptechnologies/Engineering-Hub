@@ -730,6 +730,9 @@ class WorkQueue:
         # A status read never mutates expired jobs; expose ambiguity explicitly.
         now = self._now()
         with self.repo._connection() as db:
+            # Keep the rows, totals and pause flags in one read snapshot. End
+            # it before calling external target verification below.
+            db.execute('BEGIN')
             # Read each visible job and the machine reservation in one SQLite
             # statement so a concurrent release/reclaim cannot splice snapshots.
             rows = db.execute('SELECT j.*, m.job_id AS _reservation_holder '
@@ -738,6 +741,8 @@ class WorkQueue:
             visible = {row['id']: row for row in rows}
             queue_paused = bool(db.execute('SELECT paused FROM hub_work_policy WHERE id=1').fetchone()[0])
             master_paused = bool(self.repo._paused(db))
+            counts = dict(db.execute('SELECT state,COUNT(*) FROM hub_work_jobs GROUP BY state').fetchall())
+            db.commit()
             paused = queue_paused or master_paused
             jobs = []
             for row in rows:
@@ -779,5 +784,5 @@ class WorkQueue:
                                      'requires_execution_proof': action.requires_execution_proof,
                                      'coordination_only': not action.requires_execution_proof}
                                 for key, action in self.actions.items()},
-                    'counts': dict(db.execute('SELECT state,COUNT(*) FROM hub_work_jobs GROUP BY state').fetchall()),
+                    'counts': counts,
                     'jobs': jobs}
