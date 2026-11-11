@@ -232,6 +232,24 @@ daemon container ID, image/config, mounts and ownership metadata after an
 uncertain result. Labels or a file receipt alone cannot certify a real container.
 Do not silently start an exited workload during reconciliation.
 
+The executor's no-effect denial replay marker is a row in the existing private
+ledger `control` table; it does not change the ledger schema version. A current
+executor can read an older ledger, but it does not infer that an older held
+denial is safe to release when the marker is absent. The previous protocol-aware
+executor at `85411ff` does not understand the new marker: after a downgrade it
+can reopen the ledger, but it masks the original denial as `recovery_required`
+and cannot replay that denial exactly. Executors predating the single-pilot
+protocol can ignore its control rows entirely; the unchanged schema version is
+not a downgrade fence.
+
+An application-image rollback within the pilot is a separate operation from
+replacing or downgrading the executor. Before considering an executor change,
+preserve the ledger and its identity, stop and independently fence the prior
+owner, and establish a reviewed compatibility and recovery procedure for the
+exact executable and retained state. Do not remove denial markers or reset the
+ledger to force a downgrade. These notes do not authorize a deployment or
+establish that rollback or recovery has been validated on a host.
+
 Acceptance must exercise actual app rollout and HTTP/assets/auth-disabled smoke,
 a declared real candidate startup/health failure and actual data-safe rollback,
 then controller/executor restart with retained ledgers. Kill before Docker effect
