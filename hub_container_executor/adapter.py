@@ -186,14 +186,16 @@ class HostAdapter:
 
     def get(self, command_id: str) -> ContainerPilotResponse | None:
         with self._active_operation():
+            if not self._single_pilot_protocol:
+                return self.ledger.get(command_id)
             with self._pilot_mutex:
                 return self.ledger.get(command_id)
 
     def submit(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         with self._active_operation():
+            if not self._single_pilot_protocol:
+                return self._submit_active(request)
             with self._pilot_mutex:
-                if not self._single_pilot_protocol:
-                    return self._submit_active(request)
                 try:
                     gate = self.ledger.inspect_single_pilot()
                     if gate is not None:
@@ -570,10 +572,12 @@ class HostAdapter:
     def reconcile(self, command_id: str) -> ContainerPilotResponse | None:
         """Inspect exact durable operation IDs only; never re-effect or re-probe."""
         with self._active_operation():
-            with self._pilot_mutex:
+            if not self._single_pilot_protocol:
                 if self.ledger.single_pilot_enabled():
                     return self.ledger.get(command_id)
                 return self._reconcile_active(command_id)
+            with self._pilot_mutex:
+                return self.ledger.get(command_id)
 
     def acknowledge_single_pilot(self, request, outcome_digest):
         """Local trusted entry; service authentication is a separate boundary."""

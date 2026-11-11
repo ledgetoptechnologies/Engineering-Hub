@@ -330,3 +330,23 @@ def test_file_denials_without_providers(tmp_path, monkeypatch, kind):
     elif kind == 'oversize': path.write_bytes(b'x' * (module.MAX_CONFIG_BYTES + 1))
     with pytest.raises(module.InstalledCoordinatorError):
         module.load_configuration(str(path))
+
+
+def test_single_pilot_coordinator_requires_explicit_v2_and_passes_opt_in(monkeypatch):
+    legacy=configuration()
+    assert module.parse_configuration(canonical(legacy)).single_pilot_protocol is False
+    legacy['single_pilot_protocol']=True
+    with pytest.raises(module.InstalledCoordinatorError): module.parse_configuration(canonical(legacy))
+    legacy['schema']=module.SCHEMA_SINGLE_PILOT
+    config=module.parse_configuration(canonical(legacy))
+    assert config.single_pilot_protocol is True
+    for wrong in (False, 1, 'true'):
+        legacy['single_pilot_protocol']=wrong
+        with pytest.raises(module.InstalledCoordinatorError): module.parse_configuration(canonical(legacy))
+    events=[]; captured=[]
+    install_fakes(monkeypatch,events)
+    async def capture(settings, manifest, factory, **kwargs):
+        captured.append(kwargs)
+    monkeypatch.setattr(module,'serve_owned_queued_pilot',capture)
+    run_owned_loop(module.run_installed_coordinator(config, reconciliation_factory=synthetic_reconciliation))
+    assert len(captured)==1 and captured[0]['single_pilot_protocol'] is True
