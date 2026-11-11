@@ -22,7 +22,8 @@ import uvicorn
 if sys.platform != 'linux':
     pytest.skip('Real nginx and Unix socket fixture requires Linux', allow_module_level=True)
 
-from engineering_hub.container_pilot_client import ContainerPilotRequest, ContainerPilotResponse
+from engineering_hub.container_pilot_client import (ContainerPilotClient, ContainerPilotClientError,
+    ContainerPilotRequest, ContainerPilotResponse)
 from hub_container_executor.asgi import PilotASGI
 from tests.test_hub_unified_pilot_startup import certificate
 from tests.test_hub_container_pilot import pilot_manifest
@@ -73,9 +74,13 @@ class FixtureAdapter:
         self.calls.append(('reconcile', identity))
         return self.receipts.get(identity)
 
+    def acknowledge_single_pilot(self, request, digest):
+        self.calls.append(('ack', request.command_id, digest))
+        return self.receipts.get(request.command_id)
+
 
 @asynccontextmanager
-async def proxy_fixture(current_observation_transport=None):
+async def proxy_fixture(current_observation_transport=None, *, single_mode=False):
     nginx = nginx_command()
     with tempfile.TemporaryDirectory(prefix='eh-nx-', dir='/tmp') as directory:
         root = Path(directory)
@@ -84,6 +89,7 @@ async def proxy_fixture(current_observation_transport=None):
         cert_path.write_bytes(ca); key_path.write_bytes(key); key_path.chmod(0o600)
         socket_path = root / 'executor.sock'
         adapter = FixtureAdapter()
+        adapter._single_pilot_protocol = single_mode
         application = PilotASGI(adapter, TOKEN, current_observation_transport=current_observation_transport)
         state = dict(seen=[], fail=False)
         async def observed(scope, receive, send):
@@ -175,6 +181,29 @@ async def raw_request(rig, method, path, *, auth=(TOKEN,), body=b'', extra_heade
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_actual_nginx_v2_client_auth_mode_and_ack():
+    async with proxy_fixture(single_mode=True) as rig:
+        origin = f"https://localhost:{rig['port']}"
+        valid = ContainerPilotClient.for_verified_https(origin, TOKEN, rig['ca'], single_pilot_protocol=True)
+        wrong = ContainerPilotClient.for_verified_https(origin, 'wrong-token', rig['ca'], single_pilot_protocol=True)
+        legacy = ContainerPilotClient.for_verified_https(origin, TOKEN, rig['ca'])
+        request = command()
+        try:
+            with pytest.raises(ContainerPilotClientError): await wrong.submit_command(request)
+            with pytest.raises(ContainerPilotClientError): await legacy.submit_command(request)
+            assert rig['adapter'].calls == []
+            assert (await valid.submit_command(request)).command_id == request.command_id
+            digest = 'sha256:' + 'a' * 64
+            assert (await valid.acknowledge_command(request, digest)).command_id == request.command_id
+            assert rig['adapter'].calls == [('submit', request.command_id), ('ack', request.command_id, digest)]
+            rig['adapter']._single_pilot_protocol = False
+            with pytest.raises(ContainerPilotClientError): await valid.submit_command(request)
+            assert rig['adapter'].calls == [('submit', request.command_id), ('ack', request.command_id, digest)]
+        finally:
+            await valid.aclose(); await wrong.aclose(); await legacy.aclose()
 
 
 @pytest.mark.asyncio
