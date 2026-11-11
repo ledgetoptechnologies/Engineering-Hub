@@ -36,6 +36,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - name: Prepare dedicated rootless runtime directory
+        id: runtime
+        run: |
+          runtime="/run/eh-rollback-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime"
+          echo "directory=$runtime" >> "$GITHUB_OUTPUT"
+      - name: Start isolated rollback Engine
+        id: engine
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5
+        with:
+          version: v29.5.2
+          rootless: true
+          runtime-basedir: ${{ steps.runtime.outputs.directory }}
       - name: Validate fixed package inputs before registry access
         env:
           BASELINE_DIGEST: ${{ inputs.baseline_digest }}
@@ -58,13 +71,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull only the two immutable Hub control images
         env:
+          ENGINE_ENDPOINT: ${{ steps.engine.outputs.sock }}
           BASELINE_DIGEST: ${{ inputs.baseline_digest }}
           CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
         run: |
-          timeout 180s docker pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$BASELINE_DIGEST"
-          timeout 180s docker pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CANDIDATE_DIGEST"
+          test -n "$ENGINE_ENDPOINT"
+          env -u DOCKER_CONTEXT timeout 180s docker --host "$ENGINE_ENDPOINT" pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$BASELINE_DIGEST"
+          env -u DOCKER_CONTEXT timeout 180s docker --host "$ENGINE_ENDPOINT" pull "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CANDIDATE_DIGEST"
       - name: Verify disposable rollback (no network or host ports)
         env:
+          ENGINE_ENDPOINT: ${{ steps.engine.outputs.sock }}
           BASELINE_DIGEST: ${{ inputs.baseline_digest }}
           CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
           BASELINE_COMMIT: ${{ inputs.baseline_commit }}
@@ -72,6 +88,7 @@ jobs:
           ROLLBACK_MODE: ${{ inputs.rollback_mode }}
         run: |
           python -B scripts/hub_rollback_container_smoke.py \
+            --docker-host "$ENGINE_ENDPOINT" \
             --baseline-image "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$BASELINE_DIGEST" \
             --baseline-commit "$BASELINE_COMMIT" \
             --candidate-image "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CANDIDATE_DIGEST" \

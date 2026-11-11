@@ -18,8 +18,9 @@ This accepts that staged image pair only. It does not clear the historical
 production-format recovery gate below, prove a Hub-dispatched pilot, authorize
 NAS changes, or establish human OAuth, installed upgrade, or reboot acceptance.
 The subsequent smoke-script commits are test harness changes, not a rebuilt
-application image. The manual hosted rollback workflow still needs adaptation
-to the required explicit dedicated Docker endpoint before it can be used.
+application image. The manual hosted rollback workflow now declares a dedicated
+rootless Engine and passes its explicit endpoint to both pulls and the probe;
+that workflow change has local policy validation but has not run on a hosted runner.
 
 ## Superseding PR52 recovery gate
 
