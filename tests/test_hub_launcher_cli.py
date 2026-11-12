@@ -505,3 +505,15 @@ def test_worker_exit_observed_after_deadline_is_not_success(module, monkeypatch)
         def poll(self,timeout): return [(10,select.POLLIN)]
     monkeypatch.setattr(select,'poll',Poll)
     assert module._wait_for_daemon_exit(scope,stop,5,stop.requests) is False
+
+
+@pytest.mark.parametrize('ready_flag', ['POLLIN', 'POLLHUP'])
+def test_worker_mixed_poll_error_is_rejected(module, monkeypatch, ready_flag):
+    import select
+    stop=module._Stop(); stop.request(0,None)
+    scope=SimpleNamespace(_processes=(SimpleNamespace(fd=10),))
+    class Poll:
+        def register(self,fd,mask): pass
+        def poll(self,timeout): return [(10,select.POLLERR | getattr(select,ready_flag))]
+    monkeypatch.setattr(select,'poll',Poll)
+    with pytest.raises(RuntimeError): module._wait_for_daemon_exit(scope,stop,5,stop.requests)

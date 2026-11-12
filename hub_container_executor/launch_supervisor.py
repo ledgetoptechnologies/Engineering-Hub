@@ -199,7 +199,7 @@ def _poll_ready(sources, timeout):
     events = poller.poll(math.ceil(timeout * 1000))
     ready = []
     for fd, event in events:
-        _require(fd in mapping and not event & select.POLLNVAL
+        _require(fd in mapping and not event & (select.POLLNVAL | select.POLLERR)
                  and bool(event & (select.POLLIN | select.POLLHUP)))
         ready.append(mapping[fd])
     return ready

@@ -145,7 +145,7 @@ def _wait_for_daemon_exit(scope, stop, seconds, initial_requests):
             return False
         ready = poller.poll(max(1, int(min(.1, remaining) * 1000)))
         for fd, event in ready:
-            if (fd not in pending or event & select.POLLNVAL
+            if (fd not in pending or event & (select.POLLNVAL | select.POLLERR)
                     or not event & (select.POLLIN | select.POLLHUP)):
                 raise RuntimeError('retained worker pidfd unavailable')
             pending.remove(fd)

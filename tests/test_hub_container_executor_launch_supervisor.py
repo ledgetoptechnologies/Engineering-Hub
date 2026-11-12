@@ -2031,3 +2031,12 @@ def test_invalid_polled_descriptor_fails_closed():
             launch._poll_ready([read_fd], 0)
     finally:
         os.close(write_fd)
+
+
+@pytest.mark.parametrize('ready_flag', ['POLLIN', 'POLLHUP'])
+def test_supervisor_mixed_poll_error_is_rejected(monkeypatch, ready_flag):
+    class Poll:
+        def register(self,fd,mask): pass
+        def poll(self,timeout): return [(10,launch.select.POLLERR | getattr(launch.select,ready_flag))]
+    monkeypatch.setattr(launch.select, 'poll', Poll)
+    with pytest.raises(launch.LaunchSupervisorError): launch._poll_ready([10],0)
