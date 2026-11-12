@@ -52,6 +52,10 @@ def build_guarded_bound_runtime(adapter, key, effects, *, observer, release, lau
         if os.getpid() != pid or adapter.ledger is not ledger or backend.operation_journal is not journal:
             return False
         ledger._check_open()
+        # Pause vetoes the next effect, including when it changes while the
+        # signed observer is in flight. It cannot undo an accepted Engine POST.
+        if ledger.is_paused():
+            return False
         held = os.fstat(ledger._lock_fd)
         named = os.stat(ledger.lock_path, follow_symlinks=False)
         if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
