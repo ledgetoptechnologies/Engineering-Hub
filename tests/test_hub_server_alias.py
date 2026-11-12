@@ -17,6 +17,7 @@ from engineering_hub.app import Settings, create_app
 from engineering_hub.auth import AuthConfig
 from engineering_hub.events import EventBroker
 from engineering_hub.frontends import HubFrontends
+from tests.test_hub_unified_mcp import BUS_TOOLS, HUB_TOOLS
 
 
 AUTH = AuthSettings('alias-hermes', 'alias-codex', claude_token='alias-claude')
@@ -262,9 +263,9 @@ async def test_unified_stateful_session_and_native_notifications_cross_agent_ali
         async with mcp_client(primary, AUTH.codex_token) as (codex, events, sid, initialized):
             assert initialized.capabilities.resources.subscribe is True
             tools = (await codex.list_tools()).tools
-            assert len(tools) == 54 and {
-                'hub_overview', 'hub_component_create', 'hub_component_update', 'hub_component_retire',
-            } <= {tool.name for tool in tools}
+            expected = BUS_TOOLS | HUB_TOOLS
+            assert len(expected) == 60
+            assert len(tools) == len(expected) and {tool.name for tool in tools} == expected
             await codex.subscribe_resource('agentbus://inbox/codex')
             async with httpx.AsyncClient(headers={'Host': 'hub.test'}, trust_env=False) as http:
                 rpc = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}
@@ -273,8 +274,8 @@ async def test_unified_stateful_session_and_native_notifications_cross_agent_ali
                 response = await http.post(url(alias) + '/mcp', headers=headers, json=rpc)
                 assert response.status_code == 200
                 body = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith('data: '))) if response.headers['content-type'].startswith('text/event-stream') else response.json()
-                assert len(body['result']['tools']) == 54
-                assert {tool['name'] for tool in body['result']['tools']} == {tool.name for tool in tools}
+                assert len(body['result']['tools']) == len(expected)
+                assert {tool['name'] for tool in body['result']['tools']} == expected
                 foreign = {**headers, 'Authorization': 'Bearer ' + AUTH.hermes_token}
                 assert (await http.post(url(alias) + '/mcp', headers=foreign, json=rpc)).status_code == 404
             async with mcp_client(alias, AUTH.hermes_token) as (hermes, _, _, _):
