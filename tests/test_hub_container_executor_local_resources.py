@@ -689,7 +689,7 @@ async def test_concrete_controller_asgi_recovers_lost_response_without_effect_re
         finally:
             owner.close(); await client.aclose()
 
-@pytest.mark.parametrize('scenario', ['success', 'lost_stop', 'restarted_candidate'])
+@pytest.mark.parametrize('scenario', ['success', 'lost_stop', 'restarted_candidate', 'revoked_stop'])
 def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, scenario):
     """Real local journals, fake Engine and synthetic verifier; no host assurance."""
     import time
@@ -748,20 +748,23 @@ def test_bound_v3_rollback_stops_candidate_before_replacement(rig, monkeypatch, 
                     stop=replace(create,operation_id=str(uuid5(UUID(rollback.command_id),'stop')),kind='stop',resource_name=None)
                     effects.append(DeferredTargetEffect(stop,req.command_id))
             adapter.backend.effect_binding_provider=enrolled_effect_provider(journal,key,tuple(effects),
-                source_ledger=adapter.ledger,verify_generation=lambda actual, _: True)
+                source_ledger=adapter.ledger,verify_generation=lambda actual, _: not (
+                    scenario=='revoked_stop' and actual.context.kind=='stop'))
             adapter.effect_context_guard=TrustedEffectContextGuard(lambda _: True,adapter.backend.effect_context_scope)
             for req,expected in ((deploy,'succeeded'),(smoke,'failed')):
                 result=adapter.submit(req)
                 assert result.state==expected, result
                 adapter.acknowledge_single_pilot(req,single_pilot_outcome_digest(result))
             result=adapter.submit(rollback)
-            if scenario=='lost_stop':
+            if scenario in ('lost_stop','revoked_stop'):
                 assert result.state=='held',result
                 assert adapter.ledger.target_snapshot(rollback.target_id)['container_id']=='d'*64
                 before=list(posts)
                 assert adapter.submit(rollback).state=='held'
                 assert posts==before
                 assert sum(p.endswith('/containers/create') for p in posts)==1
+                if scenario=='revoked_stop':
+                    assert not any(p.endswith('/stop') for p in posts)
             elif scenario=='restarted_candidate':
                 assert result.state=='held',result
                 before=list(posts)
