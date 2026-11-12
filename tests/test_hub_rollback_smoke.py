@@ -205,6 +205,53 @@ def test_incorrect_runtime_image_or_swap_denies_profile(monkeypatch):
     with pytest.raises(ValueError,match='profile'):smoke._profile('x',OLD_ID,{})
 
 
+def workflow_run_commands(text):
+    """Extract inline and block run commands without reading step env values."""
+    lines = text.splitlines()
+    commands = []
+    i = 0
+    while i < len(lines):
+        match = re.match(r'^(\s*)(?:-\s+)?run:\s*(.*)$', lines[i])
+        if not match:
+            i += 1
+            continue
+        indent, value = len(match.group(1)), match.group(2)
+        if value in ('|', '|-', '|+', '>', '>-', '>+'):
+            body = []
+            i += 1
+            while i < len(lines):
+                line = lines[i]
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                body.append(line)
+                i += 1
+            commands.append('\n'.join(body))
+        else:
+            commands.append(value)
+            i += 1
+    return commands
+
+
+def has_direct_input_expression(command):
+    return bool(re.search(r'\$\{\{(?:(?!\}\}).)*?\binputs\s*(?:\.|\[)',
+                          command, re.IGNORECASE | re.DOTALL))
+
+
+@pytest.mark.parametrize('command', [
+    'echo ${{ inputs.baseline_digest }}',
+    'echo ${{inputs.baseline_digest}}',
+    'echo ${{  inputs  .baseline_digest }}',
+    'echo ${{ INPUTS . baseline_digest }}',
+    "echo ${{ inputs ['baseline_digest'] }}",
+    'echo ${{ format("{0}", inputs.baseline_digest) }}',
+])
+@pytest.mark.parametrize('run', ['        run: |\n          {}\n', '        run: {}\n',
+                                '      - run: {}\n'])
+def test_direct_input_interpolation_is_rejected_for_block_and_inline(run, command):
+    commands = workflow_run_commands(run.format(command))
+    assert len(commands) == 1 and has_direct_input_expression(commands[0])
+
+
 def test_workflow_manual_main_read_only_package_scope_and_receipt_only():
     text=(ROOT/'.github/workflows/hub-rollback-verification.yml').read_text()
     assert 'workflow_dispatch:' in text and "github.ref == 'refs/heads/main'" in text
@@ -224,9 +271,9 @@ def test_workflow_manual_main_read_only_package_scope_and_receipt_only():
     assert '[[ "$BASELINE_DIGEST" =~ ^[a-f0-9]{64}$ ]]' in text
     assert '[[ "$CANDIDATE_DIGEST" =~ ^[a-f0-9]{64}$ ]]' in text
     assert 'path: rollback-receipt.json' in text and 'docker push' not in text and 'internal-mcp' not in text
-    run_blocks = re.findall(r'(?m)^        run: \|\n((?:^ {10}.*\n|^\n)*)', text)
-    assert len(run_blocks) == 4
-    assert all('${{ inputs.' not in block for block in run_blocks)
+    commands = workflow_run_commands(text)
+    assert len(commands) == 4
+    assert all(not has_direct_input_expression(command) for command in commands)
 
 
 @pytest.mark.parametrize('kind', ['volume','container'])
