@@ -64,3 +64,12 @@ def test_child_only_adds_required_typed_local_call_and_retains_guards():
     assert 'run: python -B scripts/hub_executor_compatibility_ci.py validate' in text
     assert 'run: python -B scripts/publish_hub_executor.py' in text
     assert 'ref: ${{ github.sha }}' in text and 'persist-credentials: false' in text
+
+
+def test_executor_workflows_use_one_explicit_isolated_engine():
+    for name in ('hub-executor-compatibility.yml', 'hub-executor-publication.yml'):
+        source = (ROOT / '.github' / 'workflows' / name).read_text()
+        assert 'rootless: true' in source
+        assert 'EH_EXECUTOR_DOCKER_HOST: ${{ steps.executor-engine.outputs.sock }}' in source
+        assert 'docker --host "${{ steps.executor-engine.outputs.sock }}" pull' in source
+        assert "github.ref == 'refs/heads/main'" in source

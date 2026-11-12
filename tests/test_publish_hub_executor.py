@@ -398,6 +398,7 @@ def test_terminal_probe_identity_and_resource_mismatch_rejected(monkeypatch, fie
 
 @pytest.mark.parametrize('wrong_owner', [False, True])
 def test_attach_timeout_cleans_only_verified_owned_locator(monkeypatch, wrong_owner):
+    monkeypatch.setattr(SMOKE, 'docker_command', lambda a: (['docker', *a], {}))
     calls, cleaned = [], []
     monkeypatch.setattr(P.uuid, 'uuid4', lambda: types.SimpleNamespace(hex='f' * 32))
     monkeypatch.setattr(P, 'image', lambda *a: {})

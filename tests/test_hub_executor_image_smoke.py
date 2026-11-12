@@ -117,6 +117,7 @@ def test_start_failure_still_runs_owned_cleanup(monkeypatch):
 
 
 def test_cleanup_refuses_unknown_owner(monkeypatch):
+    monkeypatch.setattr(MODULE, 'docker_command', lambda a: (['docker', *a], {}))
     monkeypatch.setattr(MODULE.subprocess, 'run', lambda *a, **k:
         subprocess.CompletedProcess(a, 0, json.dumps([runtime('someone-else')]), ''))
     monkeypatch.setattr(MODULE, 'run', lambda *a, **k: pytest.fail('remove called'))
@@ -136,9 +137,38 @@ def test_probe_fixed_installed_paths_and_required_core_api():
 
 
 def test_subprocess_failure_does_not_reflect_output(monkeypatch):
+    monkeypatch.setattr(MODULE, 'docker_command', lambda a: (['docker', *a], {}))
     def fail(*args, **kwargs):
         raise subprocess.CalledProcessError(1, args, stderr='private-engine-output')
     monkeypatch.setattr(MODULE.subprocess, 'run', fail)
     with pytest.raises(RuntimeError) as error:
         MODULE.run('docker', 'fixture')
     assert 'private-engine-output' not in str(error.value)
+
+
+@pytest.mark.parametrize('host', ['', 'tcp://localhost:2375', 'unix:///run/docker.sock',
+    'unix:///run/a/../docker.sock', 'unix:///var/run/docker.sock'])
+def test_docker_command_rejects_ambient_and_shared_endpoints(monkeypatch, host):
+    monkeypatch.setenv('EH_EXECUTOR_DOCKER_HOST', host)
+    with pytest.raises(ValueError):
+        MODULE.docker_command(['image', 'inspect', IMAGE])
+
+
+def test_docker_command_binds_socket_and_preserves_registry_config(monkeypatch):
+    from types import SimpleNamespace
+    host = 'unix:///run/eh-fixture/engine.sock'
+    class SocketPath:
+        def __init__(self, path): self.path = path
+        def __str__(self): return self.path
+        def resolve(self, strict): return self
+        def stat(self): return SimpleNamespace(st_mode=0o140600, st_dev=1, st_ino=2)
+    monkeypatch.setattr(MODULE, 'Path', SocketPath)
+    monkeypatch.setattr(MODULE.os, 'stat', lambda path: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setenv('EH_EXECUTOR_DOCKER_HOST', host)
+    monkeypatch.setenv('DOCKER_CONFIG', '/fixture/auth')
+    monkeypatch.setenv('DOCKER_CONTEXT', 'wrong')
+    monkeypatch.setenv('DOCKER_HOST', 'tcp://wrong')
+    command, env = MODULE.docker_command(['container', 'inspect', 'fixture'])
+    assert command == ['docker', '--host', host, 'container', 'inspect', 'fixture']
+    assert env['DOCKER_CONFIG'] == '/fixture/auth'
+    assert 'DOCKER_CONTEXT' not in env and 'DOCKER_HOST' not in env

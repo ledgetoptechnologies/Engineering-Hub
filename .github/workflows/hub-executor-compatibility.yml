@@ -59,6 +59,19 @@ jobs:
           python-version: '3.12.15'
       - name: Build canonical wheel with exact hashed backend, no dependencies
         run: python -B scripts/hub_executor_compatibility_ci.py wheel
+      - name: Prepare isolated executor runtime directory
+        id: executor-runtime
+        run: |
+          runtime="/run/eh-executor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime"
+          echo "directory=$runtime" >> "$GITHUB_OUTPUT"
+      - name: Start isolated executor Engine
+        id: executor-engine
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5
+        with:
+          version: v29.5.2
+          rootless: true
+          runtime-basedir: ${{ steps.executor-runtime.outputs.directory }}
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -66,9 +79,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull only pinned core and pinned public Python runtime
         run: |
-          timeout 180s docker pull --platform linux/amd64 "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CORE_DIGEST"
-          timeout 180s docker pull --platform linux/amd64 python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+          env -u DOCKER_CONTEXT timeout 180s docker --host "${{ steps.executor-engine.outputs.sock }}" pull --platform linux/amd64 "ghcr.io/ledgetoptechnologies/engineering-hub-control@sha256:$CORE_DIGEST"
+          env -u DOCKER_CONTEXT timeout 180s docker --host "${{ steps.executor-engine.outputs.sock }}" pull --platform linux/amd64 python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
       - name: Build disposable executor and verify inert installed imports
+        env:
+          EH_EXECUTOR_DOCKER_HOST: ${{ steps.executor-engine.outputs.sock }}
         run: python -B scripts/hub_executor_compatibility_ci.py compatibility
       - uses: actions/upload-artifact@v4
         if: always()

@@ -10,6 +10,40 @@ import json
 import re
 import subprocess
 import uuid
+import os
+import stat
+from pathlib import Path
+
+
+def docker_command(args):
+    """Bind all Docker CLI operations to the explicitly selected private socket.
+
+    Preserve the existing Docker config for registry auth and Buildx; never
+    inherit a Docker context or endpoint. This is not host attestation.
+    """
+    host = os.environ.get("EH_EXECUTOR_DOCKER_HOST", "")
+    if (not re.fullmatch(r"unix:///run/[A-Za-z0-9_./-]+\.sock", host)
+            or any(part in ("", ".", "..") for part in host[8:].split("/"))
+            or host in ("unix:///run/docker.sock", "unix:///run/containerd/containerd.sock")):
+        raise ValueError("Explicit dedicated Docker socket required")
+    path = Path(host[7:])
+    if str(path.resolve(strict=True)) != str(path):
+        raise ValueError("Docker socket aliases are forbidden")
+    info = path.stat()
+    if not stat.S_ISSOCK(info.st_mode):
+        raise ValueError("Docker endpoint must be a socket")
+    for name in ("/run/docker.sock", "/var/run/docker.sock"):
+        try:
+            other = os.stat(name)
+        except FileNotFoundError:
+            continue
+        if (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino):
+            raise ValueError("Shared Docker socket forbidden")
+    env = dict(os.environ)
+    for name in ("DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS_VERIFY",
+                 "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "BUILDX_BUILDER"):
+        env.pop(name, None)
+    return ["docker", "--host", host, *args], env
 
 
 OWNER = 'hub.executor-smoke-owner'
@@ -57,7 +91,8 @@ print(json.dumps({'source_commit': sys.argv[1], 'installed_modules': list(names)
 
 def run(*args, timeout=60):
     try:
-        return subprocess.run(args, check=True, capture_output=True, text=True,
+        command, env = docker_command(args[1:]) if args and args[0] == 'docker' else (args, None)
+        return subprocess.run(command, env=env, check=True, capture_output=True, text=True,
                               timeout=timeout).stdout.strip()
     except (subprocess.SubprocessError, OSError):
         # Never reflect arbitrary Docker/image output or local configuration.
@@ -75,8 +110,8 @@ def verify_defaults(info):
 
 
 def remove_owned(name, owner):
-    result = subprocess.run(['docker', 'container', 'inspect', name],
-                            capture_output=True, text=True, timeout=15)
+    command, env = docker_command(['container', 'inspect', name])
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
     if result.returncode:
         if 'no such container' in result.stderr.lower():
             return
