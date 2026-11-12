@@ -23,6 +23,8 @@ from types import MappingProxyType
 
 from engineering_hub.container_pilot_manifest import PilotManifest, Platform
 from engineering_hub.pilot_service import REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS
+from engineering_hub.current_executor_observation import CurrentExecutorObserver, CurrentExecutorReleasePins
+from .bound_installed_config import InstalledBoundProfile, parse_bound_profile
 from .build_enrollment import BuildEnrollment
 from .daemon_backend import DockerEngineBinding
 from .launch_transport import UnixLaunchReceiptTransport, UnixCurrentObservationTransport
@@ -34,6 +36,7 @@ from .service import serve_owned_host_executor_unix
 
 SCHEMA = 'engineering-hub.installed-executor.v1'
 SCHEMA_SINGLE_PILOT = 'engineering-hub.installed-executor.v2'
+SCHEMA_BOUND_PILOT = 'engineering-hub.installed-executor.v3'
 MAX_CONFIG_BYTES = 256 * 1024
 _ERROR = 'Installed executor unavailable'
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
@@ -110,6 +113,7 @@ class RunnerConfiguration:
     socket_path: str
     bearer_slot: tuple
     process_id: int
+    bound_profile: InstalledBoundProfile | None = None
 
 
 def parse_configuration(raw):
@@ -129,8 +133,9 @@ def parse_configuration(raw):
 
         value = json.loads(raw, object_pairs_hook=unique, parse_float=reject,
                            parse_constant=reject)
-        _object(value, _ROOT_FIELDS)
-        _require(value['schema'] in {SCHEMA, SCHEMA_SINGLE_PILOT} and _canonical(value) == raw)
+        _require(type(value) is dict and value.get('schema') in {SCHEMA, SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT})
+        _object(value, _ROOT_FIELDS | ({'bound_profile'} if value['schema'] == SCHEMA_BOUND_PILOT else set()))
+        _require(_canonical(value) == raw)
         manifest = PilotManifest.from_bytes(_canonical(value['manifest']))
         binding_data = dict(_object(value['docker_binding'], DockerEngineBinding.__dataclass_fields__))
         binding_data['platform'] = Platform.model_validate(binding_data['platform'])
@@ -141,9 +146,12 @@ def parse_configuration(raw):
         _require(binding.runner_id == runner.runner_id
                  and binding.daemon_identity == runner.daemon_identity
                  and binding.platform == runner.platform)
-        resources = dict(_object(value['resources'], _RESOURCE_FIELDS | ({'single_pilot_protocol'} if value['schema'] == SCHEMA_SINGLE_PILOT else set())))
-        if value['schema'] == SCHEMA_SINGLE_PILOT:
+        resources = dict(_object(value['resources'], _RESOURCE_FIELDS | ({'single_pilot_protocol'} if value['schema'] in {SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT} else set())))
+        if value['schema'] in {SCHEMA_SINGLE_PILOT, SCHEMA_BOUND_PILOT}:
             _require(resources['single_pilot_protocol'] is True)
+        bound = parse_bound_profile(value['bound_profile']) if value['schema'] == SCHEMA_BOUND_PILOT else None
+        if bound is not None:
+            _require(resources['journal_create'] is False and bound.launch.engine_id == binding.daemon_identity)
         for name in _RESOURCE_PATHS:
             _path(resources[name])
         for name in ('journal_create', 'state_reservations_create'):
@@ -205,7 +213,7 @@ def parse_configuration(raw):
             _integer(value['exchange_timeout_ms'], 100, 10000),
             _integer(value['supervisor_stop_grace_seconds'],
                      REQUIRED_SUPERVISOR_STOP_GRACE_SECONDS, 2**31 - 1),
-            socket_path, bearer_slot, os.getpid())
+            socket_path, bearer_slot, os.getpid(), bound)
     except Exception:
         raise InstalledRunnerError() from None
 
@@ -269,11 +277,19 @@ async def run_installed_executor(config):
                      == config.manifest.driver.implementation_commit)
             observations = UnixCurrentObservationTransport(**config.transport)
             owned.callback(observations.close)
+            bound_options = {}
+            if config.bound_profile is not None:
+                pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
+                    for name in CurrentExecutorReleasePins.__dataclass_fields__})
+                observer = CurrentExecutorObserver(release=pins, launch=config.bound_profile.launch,
+                    transport=observations, exchange_timeout_ms=config.timeout_ms)
+                owned.callback(observer.close)
+                bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer, bound_release=pins)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)
             factory = partial(local_host_adapter_resources, manifest=config.manifest,
-                binding=config.binding, **config.resources, driver_identity_verifier=verifier)
+                binding=config.binding, **config.resources, driver_identity_verifier=verifier, **bound_options)
             await serve_owned_host_executor_unix(factory, bearer_token=bearer,
                 supervisor_stop_grace_seconds=config.stop_grace_seconds,
                 socket_path=config.socket_path, current_observation_transport=observations,

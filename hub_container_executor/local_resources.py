@@ -94,7 +94,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
         journal_database, journal_create, record_root, metadata_root,
         baseline_receipt_root, secret_root, secret_bindings, build_enrollments,
         baseline_receipt_digest, baseline_runtime_profile_digest, frozen_backup,
-        reservation_root, state_reservations_create, driver_identity_verifier, single_pilot_protocol=False):
+        reservation_root, state_reservations_create, driver_identity_verifier, single_pilot_protocol=False,
+        bound_profile=None, bound_observer=None, bound_release=None):
     """Yield one freshly constructed exact HostAdapter with concrete providers.
 
     All directories must already exist, be canonical and pairwise nonnested;
@@ -123,6 +124,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
     Direct users must likewise stop admission/drain work before context exit.
     """
     try:
+        from .bound_installed_config import InstalledBoundProfile
+        from engineering_hub.current_executor_observation import CurrentExecutorObserver, CurrentExecutorReleasePins
         if (sys.platform != "linux" or os.getuid() != 10001 or os.getgid() != 10001
                 or type(manifest) is not PilotManifest
                 or type(binding) is not DockerEngineBinding
@@ -130,6 +133,12 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 or type(state_reservations_create) is not bool or type(single_pilot_protocol) is not bool
                 or not callable(getattr(driver_identity_verifier, "implementation_commit", None))):
             raise LocalResourcesError("Explicit private Linux resource configuration required")
+        if bound_profile is None:
+            if bound_observer is not None or bound_release is not None:
+                raise LocalResourcesError('Unexpected bound runtime input')
+        elif (type(bound_profile) is not InstalledBoundProfile or type(bound_observer) is not CurrentExecutorObserver
+              or type(bound_release) is not CurrentExecutorReleasePins or not single_pilot_protocol or journal_create):
+            raise LocalResourcesError('Explicit pre-existing bound pilot enrollment required')
         manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
         # Both models are frozen, but a trusted in-process caller can bypass
         # that restriction. Revalidate independent snapshots, not shared models.
@@ -184,6 +193,15 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
             resources.callback(state.close)
             journal = SQLiteOperationJournal(journal_path, create=journal_create)
             resources.callback(journal.close)
+            key = None
+            if bound_profile is not None:
+                from .effect_mac_key import EffectMacKey
+                with journal._transaction() as db:
+                    if db.execute('PRAGMA user_version').fetchone() != (2,):
+                        raise LocalResourcesError('Pre-existing bound journal required')
+                journal.require_no_pending(allow_bound=True)
+                key = EffectMacKey(journal_path.parent, journal_path.name, expected_key_id=bound_profile.key_id)
+                resources.callback(key.close)
             backend = DockerEngineBackend(binding, operation_journal=journal)
             resources.callback(backend.close)
             adapter = HostAdapter(
@@ -194,6 +212,16 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 single_pilot_protocol=single_pilot_protocol,
             )
             resources.callback(adapter.close)
+            if bound_profile is not None:
+                from dataclasses import replace
+                from .enrolled_effect_provider import DeferredTargetEffect
+                from .guarded_bound_runtime import build_guarded_bound_runtime
+                effects = tuple(DeferredTargetEffect(replace(item.template, owner_epoch=journal._owner.epoch), item.create_command_id)
+                    if type(item) is DeferredTargetEffect else replace(item, owner_epoch=journal._owner.epoch)
+                    for item in bound_profile.effects)
+                runtime = build_guarded_bound_runtime(adapter, key, effects, observer=bound_observer,
+                    release=bound_release, launch=bound_profile.launch)
+                backend.effect_binding_provider, adapter.effect_context_guard = runtime.provider, runtime.guard
             yield adapter
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise

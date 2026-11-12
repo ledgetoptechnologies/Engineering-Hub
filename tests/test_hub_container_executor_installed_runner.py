@@ -1,7 +1,7 @@
 """Synthetic parser/lifecycle fixtures, not installed PID1, mount or Engine proof."""
 import asyncio
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
@@ -346,3 +346,34 @@ def test_single_pilot_requires_explicit_v2_schema_and_true():
     for wrong in (False, 1, 'true'):
         legacy['resources']['single_pilot_protocol'] = wrong
         with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(legacy))
+
+
+def test_bound_pilot_requires_closed_v3_profile_and_preexisting_journal():
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    source = configuration()
+    source['schema'] = module.SCHEMA_BOUND_PILOT
+    source['resources']['single_pilot_protocol'] = True
+    source['resources']['journal_create'] = False
+    binding = asdict(fixture())
+    binding.pop('owner_epoch')
+    binding['environment_names'] = list(binding['environment_names'])
+    source['bound_profile'] = dict(key_id=digest('b'), launch=dict(
+        launch_id=str(uuid4()), boot_id=str(uuid4()), authenticated_host_pid=500,
+        process_start_ticks=600, container_id='c'*64,
+        engine_id=source['docker_binding']['daemon_identity'], engine_pid=700,
+        engine_start_ticks=800, approval_expires_at_ms=1800000000000),
+        effects=[dict(binding=binding, create_command_id=None)])
+    result = module.parse_configuration(canonical(source))
+    assert result.bound_profile.key_id == digest('b')
+    assert result.resources['single_pilot_protocol'] is True
+    for transform in (
+        lambda v: v['resources'].__setitem__('journal_create', True),
+        lambda v: v['bound_profile'].__setitem__('key_id', 'secret-value'),
+        lambda v: v['bound_profile']['launch'].__setitem__('engine_id', 'wrong-engine'),
+        lambda v: v['bound_profile']['effects'].append(v['bound_profile']['effects'][0]),
+        lambda v: v['bound_profile']['effects'][0]['binding'].__setitem__('owner_epoch', str(uuid4())),
+    ):
+        import copy
+        invalid = copy.deepcopy(source)
+        transform(invalid)
+        with pytest.raises(module.InstalledRunnerError): module.parse_configuration(canonical(invalid))

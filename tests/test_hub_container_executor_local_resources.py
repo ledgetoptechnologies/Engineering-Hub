@@ -29,6 +29,7 @@ from hub_container_executor.build_enrollment import BuildEnrollment
 from hub_container_executor.daemon_backend import DockerEngineBackend, DockerEngineBinding
 from hub_container_executor.state_provider import StateProvisionError, FrozenSQLiteStateProvisioner
 from tests.test_hub_container_executor_build_record import canonical, digest, make_record
+from tests.test_hub_current_executor_observation import setup as signed_observer_setup, Signer
 
 pytestmark = pytest.mark.skipif(os.getuid() != 10001 or os.getgid() != 10001,
                                 reason="Actual app UID/GID10001 required")
@@ -438,6 +439,39 @@ def test_opt_in_resources_enable_protocol_without_contacting_daemon(rig):
         assert type(adapter.backend) is DockerEngineBackend
         assert adapter.backend.operation_journal is not None
         assert type(adapter.state_provisioner) is FrozenSQLiteStateProvisioner
+
+
+def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(rig, signed_observer_setup):
+    from engineering_hub.current_executor_observation import CurrentExecutorObserver
+    from hub_container_executor.bound_installed_config import InstalledBoundProfile
+    from hub_container_executor.effect_mac_key import create_for_new_journal
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    clock, release, launch, signer, old_observer = signed_observer_setup
+    class Driver:
+        def implementation_commit(self): return rig.params['manifest'].driver.implementation_commit
+    path = rig.params['journal_database']
+    key_id = create_for_new_journal(path.parent, path.name)
+    params = dict(rig.params, single_pilot_protocol=True, driver_identity_verifier=Driver())
+    with module.local_host_adapter_resources(**params) as adapter:
+        adapter.backend.operation_journal.enable_bindings()
+    release = replace(release, implementation_commit=rig.params['manifest'].driver.implementation_commit,
+                      platform=rig.params['binding'].platform)
+    launch = replace(launch, engine_id=rig.params['binding'].daemon_identity)
+    observer = CurrentExecutorObserver(release=release, launch=launch, transport=Signer(release, launch, signer.key, clock))
+    profile = InstalledBoundProfile(key_id, launch, (fixture(),))
+    params.update(journal_create=False, state_reservations_create=False,
+                  bound_profile=profile, bound_observer=observer, bound_release=release)
+    try:
+        with module.local_host_adapter_resources(**params) as adapter:
+            assert adapter.effect_context_guard.scope.__self__ is adapter.backend
+            assert adapter.backend.effect_binding_provider.source_ledger is adapter.ledger
+            adapter.backend.operation_journal.require_no_pending(allow_bound=True)
+        with pytest.raises(module.LocalResourcesError):
+            with module.local_host_adapter_resources(**(params | {'bound_observer': object()})):
+                pass
+    finally:
+        observer.close()
+        old_observer.close()
 
 
 def _attach_synthetic_engine(adapter, params):
