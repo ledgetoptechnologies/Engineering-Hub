@@ -14,7 +14,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib.parse import quote
 from uuid import UUID
 
@@ -224,6 +224,20 @@ class TrustedPrivateOperationJournal(Protocol):
                   container_id: str | None = None) -> None: ...
 
     def inspect(self, operation_id: str) -> OperationObservation | None: ...
+
+
+@dataclass(frozen=True)
+class TrustedEffectBindingProvider:
+    """Explicit operator-supplied binding factory; not host attestation.
+
+    The operator must independently enroll generation, fence and MAC custody.
+    This wrapper neither provisions nor validates those authorities.
+    """
+    create: Callable
+
+    def __post_init__(self):
+        if not callable(self.create):
+            raise TypeError("binding factory required")
 
 
 class _ChunkReader:
@@ -521,13 +535,18 @@ class DockerEngineBackend:
 
     def __init__(self, binding: DockerEngineBinding, *,
                  operation_journal: TrustedPrivateOperationJournal | None = None,
+                 effect_binding_provider: TrustedEffectBindingProvider | None = None,
                  test_transport: httpx.MockTransport | None = None):
         if type(binding) is not DockerEngineBinding:
             raise TypeError("explicit DockerEngineBinding required")
         if test_transport is not None and type(test_transport) is not httpx.MockTransport:
             raise TypeError("only an explicit httpx.MockTransport test transport is accepted")
+        if effect_binding_provider is not None and (type(effect_binding_provider) is not TrustedEffectBindingProvider
+                                                    or operation_journal is None):
+            raise TypeError("explicit trusted provider and journal required")
         self.binding = binding
         self.operation_journal = operation_journal
+        self.effect_binding_provider = effect_binding_provider
         self._using_test_transport = test_transport is not None
         transport = (test_transport if test_transport is not None
                      else httpx.HTTPTransport(uds=binding.unix_socket_path))
@@ -745,12 +764,20 @@ class DockerEngineBackend:
         except (ValueError, TypeError, AttributeError):
             raise DaemonBackendError("invalid durable operation identity") from None
 
-    def _journal_begin(self, operation_id, kind):
+    def _journal_begin(self, operation_id, kind, *, resource_name=None, target_id=None):
         self._operation_id(operation_id)
         if self.operation_journal is None:
             return
         try:
-            self.operation_journal.begin(operation_id, kind)
+            if self.effect_binding_provider is None:
+                self.operation_journal.begin(operation_id, kind)
+            else:
+                from .operation_journal import OperationBinding
+                bound = self.effect_binding_provider.create(operation_id, kind, resource_name, target_id)
+                if (type(bound) is not OperationBinding or bound.owner_epoch is not None
+                        or bound.resource_name != resource_name or bound.target_id != target_id):
+                    raise ValueError("effect binding differs from actual target")
+                self.operation_journal.begin_bound(operation_id, kind, bound)
         except Exception:
             raise DaemonBackendError("private operation journal unavailable") from None
 
@@ -1000,7 +1027,7 @@ class DockerEngineBackend:
              "Volumes": (cached[1].get("config") or {}).get("Volumes")},
         )
         self._remaining(deadline)
-        self._journal_begin(operation_id, "create_" + plan.image.role)
+        self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name)
         name_route = self._route("/containers/" + quote(plan.resource_name, safe="") + "/json")
         status, _ = self._response_bytes("GET", name_route, deadline,
                                          expected_statuses={200, 404}, body_limit=_MAX_JSON)
@@ -1307,7 +1334,7 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "created", deadline)
-        self._journal_begin(operation_id, "start")
+        self._journal_begin(operation_id, "start", target_id=container_id)
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/start")
         self._read_response("POST", route, deadline, expected_status=204)
@@ -1323,7 +1350,7 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "running", deadline)
-        self._journal_begin(operation_id, "stop")
+        self._journal_begin(operation_id, "stop", target_id=container_id)
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
         self._read_response("POST", route, deadline, expected_status=204,
@@ -1479,7 +1506,7 @@ class DockerEngineBackend:
                 or self._container_images.get(container_id, image) != image):
             raise DaemonBackendError("probe target lacks a verified source-image binding")
         self._remaining(deadline)
-        self._journal_begin(operation_id, "probe")
+        self._journal_begin(operation_id, "probe", target_id=container_id)
         health_ok = True
         for index, (probe, budget) in enumerate(zip(probes, timeout_ms, strict=True)):
             self._remaining(deadline)

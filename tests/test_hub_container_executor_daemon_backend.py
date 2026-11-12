@@ -15,13 +15,43 @@ from hub_container_executor.daemon_backend import (
     DaemonBackendError,
     DockerEngineBinding,
     DockerEngineBackend,
+    TrustedEffectBindingProvider,
 )
+from hub_container_executor.operation_journal import OperationBinding
 from hub_container_executor.build_record import verify_image_record
 from tests.test_hub_container_executor_build_record import FakeStore, FakeTrust, make_record
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
 MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
 CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"
+
+
+def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
+    manifest, _, _ = verified_image()
+    calls = []
+    target = 'a' * 64
+    operation = '12a15ad8-1c7c-4bd5-bfbf-e6df128ec5a7'
+    class Journal:
+        def begin_bound(self, *args):
+            calls.append(args)
+    def provider(op, kind, name, actual_target):
+        assert (op, kind, name, actual_target) == (operation, 'stop', None, target)
+        return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                                None, target, 'hmac-sha256:' + 'a' * 64, 1)
+    backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
+                                 effect_binding_provider=TrustedEffectBindingProvider(provider),
+                                 test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
+    try:
+        backend._journal_begin(operation, 'stop', target_id=target)
+        assert len(calls) == 1 and calls[0][:2] == (operation, 'stop')
+        backend.effect_binding_provider = TrustedEffectBindingProvider(
+            lambda *_: OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1))
+        with pytest.raises(DaemonBackendError):
+            backend._journal_begin(operation, 'stop', target_id=target)
+        assert len(calls) == 1
+    finally:
+        backend.close()
 
 
 def sha(raw: bytes) -> str:
