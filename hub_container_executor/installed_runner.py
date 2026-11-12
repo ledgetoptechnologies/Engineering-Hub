@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import sys
 from types import MappingProxyType
@@ -261,6 +262,25 @@ def load_configuration(path):
             os.close(fd)
 
 
+async def _wait_for_approval_with_startup_signals(**kwargs):
+    """Cancellation closes the native wait before serving has installed signals."""
+    from .postlaunch_delivery import wait_for_postlaunch_approval
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+    if task is None:
+        raise InstalledRunnerError()
+    previous = []
+    try:
+        for number in (signal.SIGINT, signal.SIGTERM):
+            old = signal.getsignal(number)
+            loop.add_signal_handler(number, task.cancel)
+            previous.append((number, old))
+        return await wait_for_postlaunch_approval(**kwargs)
+    finally:
+        for number, old in reversed(previous):
+            loop.remove_signal_handler(number)
+            signal.signal(number, old)
+
+
 async def run_installed_executor(config):
     """Obtain direct identity before provider state; drain before closing identity."""
     try:
@@ -279,10 +299,9 @@ async def run_installed_executor(config):
             owned.callback(observations.close)
             bound_options = {}
             if config.bound_profile is not None:
-                from .postlaunch_delivery import wait_for_postlaunch_approval
                 pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
                     for name in CurrentExecutorReleasePins.__dataclass_fields__})
-                lease = await wait_for_postlaunch_approval(config.bound_profile.approval_path,
+                lease = await _wait_for_approval_with_startup_signals(path=config.bound_profile.approval_path,
                     verifier=verifier, release=pins, approver_public_key=config.bound_profile.approver_public_key,
                     expected_engine_id=config.binding.daemon_identity, timeout_ms=config.bound_profile.approval_wait_ms)
                 observer = CurrentExecutorObserver(release=pins, launch=lease.approval.launch,
@@ -318,6 +337,8 @@ def main(argv=None):
         asyncio.run(run_installed_executor(config))
         return 0
     except KeyboardInterrupt:
+        return 130
+    except asyncio.CancelledError:
         return 130
     except Exception:
         print(_ERROR, file=sys.stderr)

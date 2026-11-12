@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import select
 import socket
 import sqlite3
@@ -47,6 +48,7 @@ from .configuration_commitment import configuration_commitment
 _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
+APPROVAL_PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
 _TARGETS = {
     'engine_socket': '/run/engineering-hub/docker.sock',
     'issuer_socket': '/run/engineering-hub/issuer.sock',
@@ -618,6 +620,7 @@ class LaunchSupervisor:
         self._closed = False
         self._issuance_open = False
         self._receipt_served = False
+        self._receipt_id = self._receipt_digest = None
         self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
@@ -1048,6 +1051,8 @@ class LaunchSupervisor:
                 peer.shutdown(socket.SHUT_WR)
                 _remaining(deadline)
                 self._journal.issuance_state(self._launch_id, 'sent', hashlib.sha256(raw).hexdigest())
+                self._receipt_id = payload['receipt_id']
+                self._receipt_digest = hashlib.sha256(raw).hexdigest()
                 self._receipt_served = True
                 return payload['receipt_id']
             except BaseException:
@@ -1126,6 +1131,61 @@ class LaunchSupervisor:
         except BaseException:
             self._hold()
             raise LaunchSupervisorError() from None
+
+    def approval_proposal(self, *, timeout_ms):
+        """Return a fresh issuer-signed proposal, never an independent approval.
+
+        The caller must deliver it through a separately protected operator
+        channel. This does not reveal bearer values or change launch authority.
+        """
+        _require(type(timeout_ms) is int and 100 <= timeout_ms <= 10000)
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self._observation_mutex(deadline):
+            self._guard()
+            _require(self._receipt_served and type(self._receipt_id) is str
+                     and type(self._receipt_digest) is str and _HEX.fullmatch(self._receipt_digest))
+            nonce = secrets.token_hex(32)
+            raw = self._observe_current_launch_locked(nonce, deadline)
+            observation = _strict(raw, current_observation.MAX_OBSERVATION_BYTES)
+            payload = {'schema': 'engineering-hub.launch-approval-proposal.v1',
+                       'receipt_id': self._receipt_id, 'receipt_sha256': self._receipt_digest,
+                       'observation': observation}
+            signature = base64.urlsafe_b64encode(self._signer.sign(
+                APPROVAL_PROPOSAL_DOMAIN + _canonical(payload))).rstrip(b'=').decode()
+            result = _canonical({'payload': payload, 'signature': signature})
+            _require(len(result) <= 16384)
+            self._validate_live(deadline)
+            _remaining(deadline)
+            return result
+
+    def write_approval_proposal(self, path, *, timeout_ms):
+        """Write one fresh signed proposal to a new root-private operator file.
+
+        Exclusive creation never replaces or removes an existing file. An I/O
+        failure leaves any partially written file for explicit reconciliation.
+        """
+        path = _path(path)
+        raw = self.approval_proposal(timeout_ms=timeout_ms)
+        parent = _root_parent(path, private=True)
+        fd = None
+        try:
+            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=parent)
+            info = os.fstat(fd)
+            _require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                     and stat.S_IMODE(info.st_mode) == 0o600)
+            remaining = memoryview(raw)
+            while remaining:
+                written = os.write(fd, remaining)
+                _require(written > 0)
+                remaining = remaining[written:]
+            os.fsync(fd)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            _require(_identity(named) == _identity(info) and named.st_size == len(raw))
+            os.fsync(parent)
+        finally:
+            if fd is not None: os.close(fd)
+            os.close(parent)
 
     def observe_current_launch(self, *, nonce, timeout_ms):
         """Fresh signed current identity; no create/start/stop or approval renewal.

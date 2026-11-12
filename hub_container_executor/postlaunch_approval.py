@@ -12,10 +12,12 @@ import time
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from engineering_hub import current_executor_observation as current
 from engineering_hub.current_executor_observation import CurrentExecutorReleasePins, CurrentLaunchPins
 from .runtime_identity import LaunchReceiptIdentityVerifier
 
 DOMAIN = b'engineering-hub-independent-launch-approval-v1\x00'
+PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
 MAX_BYTES = 16384
 
 
@@ -30,8 +32,67 @@ class AcceptedPostLaunchApproval:
     expires_at_ms: int
 
 
+@dataclass(frozen=True)
+class VerifiedLaunchProposal:
+    receipt_id: str
+    receipt_sha256: str
+    launch: CurrentLaunchPins
+    observation_expires_at_ms: int
+
+
 def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode('ascii')
+
+
+def verify_launch_proposal(raw, *, release, expected_engine_id):
+    """Verify issuer proposal for independent review; it is never approval."""
+    try:
+        if type(raw) is not bytes or not 1 <= len(raw) <= MAX_BYTES or type(release) is not CurrentExecutorReleasePins:
+            raise ValueError
+        def unique(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d: raise ValueError
+                d[k] = v
+            return d
+        def reject(_): raise ValueError
+        envelope = json.loads(raw, object_pairs_hook=unique, parse_float=reject, parse_constant=reject)
+        if type(envelope) is not dict or set(envelope) != {'payload', 'signature'} or _canonical(envelope) != raw:
+            raise ValueError
+        def verify(signature, domain, data):
+            if type(signature) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{86}', signature): raise ValueError
+            value = base64.urlsafe_b64decode(signature + '==')
+            if len(value) != 64 or base64.urlsafe_b64encode(value).rstrip(b'=').decode() != signature: raise ValueError
+            Ed25519PublicKey.from_public_bytes(release.public_key).verify(value, domain + _canonical(data))
+        payload = envelope['payload']
+        if (type(payload) is not dict or set(payload) != {'schema', 'receipt_id', 'receipt_sha256', 'observation'}
+                or payload['schema'] != 'engineering-hub.launch-approval-proposal.v1'
+                or type(payload['receipt_id']) is not str or str(UUID(payload['receipt_id'])) != payload['receipt_id']
+                or type(payload['receipt_sha256']) is not str or not re.fullmatch(r'[a-f0-9]{64}', payload['receipt_sha256'])):
+            raise ValueError
+        verify(envelope['signature'], PROPOSAL_DOMAIN, payload)
+        obs = payload['observation']
+        if type(obs) is not dict or set(obs) != {'payload', 'signature'}: raise ValueError
+        body = obs['payload']
+        if type(body) is not dict or set(body) != current._PAYLOAD_FIELDS: raise ValueError
+        verify(obs['signature'], current.SIGNATURE_DOMAIN, body)
+        if body['protocol'] != current.PROTOCOL or body['audience'] != current.AUDIENCE:
+            raise ValueError
+        for name in current._RELEASE_FIELDS:
+            expected = getattr(release, name)
+            if name == 'platform': expected = expected.model_dump(mode='json')
+            if type(body[name]) is not type(expected) or body[name] != expected: raise ValueError
+        if (type(body['nonce']) is not str or not re.fullmatch(r'[a-f0-9]{64}', body['nonce'])
+                or type(body['observation_id']) is not str or str(UUID(body['observation_id'])) != body['observation_id']):
+            raise ValueError
+        launch = CurrentLaunchPins(**{f.name: body[f.name] for f in fields(CurrentLaunchPins)})
+        observed, expires, now = body['observed_at_ms'], body['expires_at_ms'], int(time.time() * 1000)
+        if (launch.engine_id != expected_engine_id or type(observed) is not int or type(expires) is not int
+                or not observed <= now < expires <= launch.approval_expires_at_ms or expires - observed > 5000):
+            raise ValueError
+        return VerifiedLaunchProposal(payload['receipt_id'], payload['receipt_sha256'], launch, expires)
+    except Exception:
+        raise PostLaunchApprovalError('Signed launch proposal unavailable') from None
 
 
 def verify_postlaunch_approval(raw, *, verifier, release, approver_public_key, expected_engine_id):

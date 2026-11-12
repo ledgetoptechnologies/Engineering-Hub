@@ -324,6 +324,36 @@ def current_pins(authority):
     return release, launch_pin
 
 
+def test_signed_proposal_is_available_to_separate_operator_process(synthetic_issuer, short_root):
+    """Real receipt/owner file + separate reader; host/Engine attestation is synthetic."""
+    authority, path, _ = synthetic_issuer
+    thread, result = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    try:
+        verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+            max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+        receipt = verifier.accepted_launch_receipt()
+        verifier.close()
+    finally:
+        transport.close()
+        thread.join(5)
+    assert not thread.is_alive() and result == [receipt[0]]
+    proposal = short_root / 'operator-proposal.json'
+    authority.write_approval_proposal(str(proposal), timeout_ms=1000)
+    assert stat.S_IMODE(proposal.stat().st_mode) == 0o600
+    child = '''import json,sys\nfrom engineering_hub.current_executor_observation import CurrentExecutorReleasePins\nfrom engineering_hub.container_pilot_manifest import Platform\nfrom hub_container_executor.postlaunch_approval import verify_launch_proposal\nv=json.loads(sys.stdin.read());v["public_key"]=bytes.fromhex(v["public_key"]);v["platform"]=Platform(**v["platform"])\nr=verify_launch_proposal(open(sys.argv[1],"rb").read(),release=CurrentExecutorReleasePins(**v),expected_engine_id="synthetic-engine")\nprint(r.receipt_id)\n'''
+    public = {name: getattr(authority.release, name) for name in authority.release.__dataclass_fields__}
+    public['public_key'] = public['public_key'].hex()
+    public['platform'] = authority.release.platform.model_dump(mode='json')
+    result = subprocess.run([sys.executable, '-c', child, str(proposal)], input=json.dumps(public),
+                            text=True, capture_output=True, timeout=5, check=True)
+    assert result.stdout.strip() == receipt[0]
+    original = proposal.read_bytes()
+    with pytest.raises(FileExistsError): authority.write_approval_proposal(str(proposal), timeout_ms=1000)
+    assert proposal.read_bytes() == original
+
+
 def current_exchange(path, *, nonce, timeout_ms):
     """Test-only direct UDS client; the production relay is tested separately."""
     with socket.socket(socket.AF_UNIX) as peer:

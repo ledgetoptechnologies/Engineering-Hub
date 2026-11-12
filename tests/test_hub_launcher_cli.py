@@ -59,6 +59,10 @@ def harness(module, monkeypatch, *, failure=None, stop_at='wait', close_failure=
         def serve_one_receipt(self):
             self.perform('receipt')
 
+        def write_approval_proposal(self, path, *, timeout_ms):
+            assert path == '/protected/proposal.json' and timeout_ms == 10000
+            self.perform('proposal')
+
         def wait_for_stop_with_observations(self, *, timeout_ms, stop_requested):
             assert type(timeout_ms) is int and 1000 <= timeout_ms <= 3600000
             self.perform('observation-wait')
@@ -98,6 +102,14 @@ def test_dry_default_never_constructs_or_installs_handlers(module, monkeypatch, 
     assert module.main(ARGS + ['--create-journal']) == 0
     assert calls == []
     assert capsys.readouterr().out == 'not_executed\n'
+
+
+def test_explicit_proposal_is_written_after_receipt_before_observation_service(module, monkeypatch, capsys):
+    calls = harness(module, monkeypatch)
+    assert module.main(ARGS + ['--execute', '--create-journal',
+                               '--approval-proposal-file', '/protected/proposal.json']) == 0
+    assert calls.index('receipt') < calls.index('proposal') < calls.index('observation-wait')
+    assert capsys.readouterr().out == 'receipt_served\napproval_proposal_ready\nstopped\n'
 
 
 def test_help_never_loads_native_constructor_or_installs_handlers(module, monkeypatch, capsys):

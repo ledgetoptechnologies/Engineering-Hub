@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -16,6 +17,29 @@ pytest.importorskip('fcntl', reason='Optional executor uses Linux ownership prov
 from engineering_hub.container_pilot_manifest import PilotManifest
 from hub_container_executor import installed_runner as module
 from tests.test_hub_container_pilot_manifest import make_manifest_data
+
+
+@pytest.mark.asyncio
+async def test_postlaunch_startup_signal_cancels_wait_and_restores_handlers(monkeypatch):
+    from hub_container_executor import postlaunch_delivery
+    import asyncio
+    loop = asyncio.get_running_loop()
+    started, drained = asyncio.Event(), asyncio.Event()
+    previous = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)}
+    async def waiting(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+    monkeypatch.setattr(postlaunch_delivery, 'wait_for_postlaunch_approval', waiting)
+    task = asyncio.create_task(module._wait_for_approval_with_startup_signals())
+    await started.wait()
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert drained.is_set()
+    assert all(signal.getsignal(n) == previous[n] for n in previous)
 
 
 def canonical(value):

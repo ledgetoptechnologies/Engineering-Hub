@@ -140,6 +140,9 @@ def _execute(options):
                     if ready and not stop.requested:
                         supervisor.serve_one_receipt()
                         print('receipt_served', flush=True)
+                        if options.approval_proposal_file is not None:
+                            supervisor.write_approval_proposal(options.approval_proposal_file, timeout_ms=10000)
+                            print('approval_proposal_ready', flush=True)
                     elif not stop.requested:
                         raise RuntimeError('receipt readiness unavailable')
                 requested = stop.requested or supervisor.wait_for_stop_with_observations(
@@ -173,6 +176,7 @@ def main(argv=None):
     parser.add_argument('--enrollment-file', required=True)
     parser.add_argument('--signing-key-file', required=True)
     parser.add_argument('--journal-file', required=True)
+    parser.add_argument('--approval-proposal-file', help='new root-private signed proposal, not an approval')
     parser.add_argument('--wait-seconds', required=True, type=int,
                         help='post-receipt stop-request waiting bound, 1..3600; expiry does not stop')
     parser.add_argument('--execute', action='store_true')
@@ -182,6 +186,8 @@ def main(argv=None):
         options = parser.parse_args(argv)
         paths = (options.enrollment_file, options.signing_key_file, options.journal_file)
         if (not all(_path(value) for value in paths) or len(set(paths)) != 3
+                or options.approval_proposal_file is not None and (
+                    not _path(options.approval_proposal_file) or options.approval_proposal_file in paths)
                 or not 1 <= options.wait_seconds <= 3600):
             raise _UsageError()
         if not options.execute:
