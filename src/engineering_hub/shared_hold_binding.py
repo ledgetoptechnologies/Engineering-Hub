@@ -147,10 +147,13 @@ def modular_hold_matches(db, *, repo, queue, policies, modular_controller, reser
         _require(type(job['lease_until']) in (int, float) and math.isfinite(job['lease_until'])
                  and job['lease_until'] > 0)
         target = _json(job['target'], budget)
-        _require(set(target) == {'task_id', 'source_commit', 'artifact_digest',
-                                 'review_revision', 'submission_id'})
-        _uuid(target['task_id']); _uuid(target['submission_id'])
-        _require(type(target['review_revision']) is int and target['review_revision'] >= 1)
+        legacy = set(target) == {'task_id', 'source_commit', 'artifact_digest'}
+        _require(legacy or set(target) == {'task_id', 'source_commit', 'artifact_digest',
+                                           'review_revision', 'submission_id'})
+        _uuid(target['task_id'])
+        if not legacy:
+            _uuid(target['submission_id'])
+            _require(type(target['review_revision']) is int and target['review_revision'] >= 1)
         match = None
         identity_counts = {key: Counter() for key in ('id', 'job_id', 'source_id', 'command_id')}
         cross_role_counts = Counter()
@@ -169,9 +172,14 @@ def modular_hold_matches(db, *, repo, queue, policies, modular_controller, reser
         row, item = match
         for key in ('id', 'request_id', 'source_id', 'command_id'):
             _uuid(item[key])
-        _uuid(item['review_task_id'])
-        _require(type(item['review_task_revision']) is int and item['review_task_revision'] >= 1
-                 and valid_source_binding(item))
+        if legacy:
+            # Preserve only the exact pre-review shape. Legacy unbound holds
+            # remain manual-only in the controller; recognition grants no work.
+            _require(not {'review_task_id', 'review_task_revision', 'source_binding'} & set(item))
+        else:
+            _uuid(item['review_task_id'])
+            _require(type(item['review_task_revision']) is int and item['review_task_revision'] >= 1
+                     and valid_source_binding(item))
         _require(len({item[k] for k in ('id', 'source_id', 'command_id')}) == 3)
         _require(all(counts[item[key]] == 1 for key, counts in identity_counts.items()))
         _require(all(cross_role_counts[item[key]] == 1 for key in ('id', 'source_id', 'command_id')))
@@ -183,14 +191,17 @@ def modular_hold_matches(db, *, repo, queue, policies, modular_controller, reser
                  and item['phase'] in {'queued', 'dispatching', 'accepted', 'held'}
                  and re.fullmatch('[a-f0-9]{40}', item['source_commit'])
                  and re.fullmatch('[a-f0-9]{64}', item['source_digest'])
-                 and target == {'task_id': item['review_task_id'], 'source_commit': item['source_commit'],
-                                'artifact_digest': 'sha256:' + item['source_digest'],
-                                'review_revision': item['review_task_revision'], 'submission_id': item['id']})
+                 and target == ({'task_id': item['id'], 'source_commit': item['source_commit'],
+                                 'artifact_digest': 'sha256:' + item['source_digest']} if legacy else
+                                {'task_id': item['review_task_id'], 'source_commit': item['source_commit'],
+                                 'artifact_digest': 'sha256:' + item['source_digest'],
+                                 'review_revision': item['review_task_revision'], 'submission_id': item['id']}))
         _require(item.get('topic') is None or type(item['topic']) is str
                  and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', item['topic']))
-        public = {key: item[key] for key in
-                  ('request_id', 'review_task_id', 'review_task_revision', 'project', 'recipe',
-                   'source_commit', 'source_digest', 'source_binding', 'topic')}
+        public_keys = ('request_id', 'project', 'recipe', 'source_commit', 'source_digest', 'topic')
+        if not legacy:
+            public_keys += ('review_task_id', 'review_task_revision', 'source_binding')
+        public = {key: item[key] for key in public_keys}
         _require(row['fingerprint'] == hashlib.sha256(_canonical(public).encode()).hexdigest())
         fingerprint = [job['action_key'], job['environment'], job['machine_id'], job['project'],
                        bool(job['requires_execution_proof']), job['approval_id'], job['target']]
