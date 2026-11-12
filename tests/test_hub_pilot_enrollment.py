@@ -100,6 +100,12 @@ async def test_cold_copy_preserves_real_auth_queue_and_delivery_history_after_ow
     # delivery, job execution, or a production state-migration procedure.
     source, repo, _, github_session = ledger
     task = repo.list_tasks()[0]
+    # Queue admission requires the exact task candidate to be independently
+    # reviewed. Keep these real transitions in the copied history as well.
+    task = repo.claim_task('codex', task['id'], task['revision'])
+    task = repo.set_candidate('codex', task['id'], task['revision'], 'a' * 40)
+    task = repo.review_task('claude', task['id'], task['revision'], 'a' * 40, 'approve')
+    assert task['status'] == 'verified' and task['review']['actor'] == 'claude'
     config = AuthConfig(
         base_url='https://hub.example.com', human_auth_mode='cloudflare_access',
         cloudflare_issuer='https://disposable-test.cloudflareaccess.com',
