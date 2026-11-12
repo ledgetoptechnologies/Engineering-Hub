@@ -236,3 +236,28 @@ for (const [name, size] of [["desktop", { width: 1280, height: 800 }], ["phone",
     await page.screenshot({ path: test.info().outputPath(`new-project-${name}.png`) });
   });
 }
+
+
+test("project tracking starts at the first page after changing project", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const first = overview.projects[0].id as string, second = overview.projects[1].id as string;
+  const requests: string[] = [];
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", async route => {
+    const url = new URL(route.request().url());
+    const project = url.pathname.split("/")[5];
+    requests.push(`${project}:${url.searchParams.get("after_task_id") ?? "first"}`);
+    const cursor = url.searchParams.get("after_task_id");
+    const next = "11111111-1111-4111-8111-111111111111";
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({project,
+      tasks: [{id: cursor ?? next, project, title: cursor ? "Later page" : `${project} first record`,
+        status: "open", created_by: "codex", execution_authorization: false, updates: []}],
+      truncated: project === first && !cursor, next_after: project === first && !cursor ? next : null}) });
+  });
+  await page.goto(`/#/projects/${first}/work`);
+  await page.getByRole("button", {name: "Next page"}).click();
+  await expect(page.getByText("Later page")).toBeVisible();
+  await page.goto(`/#/projects/${second}/work`);
+  await expect(page.getByText(`${second} first record`)).toBeVisible();
+  expect(requests).toContain(`${second}:first`);
+  expect(requests.filter(value => value.startsWith(`${second}:`))).toEqual([`${second}:first`]);
+});
