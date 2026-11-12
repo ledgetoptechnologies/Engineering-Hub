@@ -151,15 +151,7 @@ class EnrolledCgroupScope:
             self._identity = _identity(os.fstat(self._fd))
             self._boot = _boot_id()
             self._processes = processes
-            self._check_scope()
-            for item in processes:
-                item.check()
-                _require(item.boot == self._boot)
-                _membership(item, scope)
-            ids = tuple(sorted(item.pid for item in processes))
-            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
-            for item in processes: item.check()
-            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
+            self.assert_enrolled_live()
             self._original = tuple(sorted((item.pid, item.start) for item in processes))
         except BaseException:
             self.close()
@@ -203,6 +195,22 @@ class EnrolledCgroupScope:
                          for entry in os.scandir(self._fd)))
         path = _CGROUP_ROOT / self._scope
         _require(path.resolve(strict=True) == path and _identity(os.stat(path, follow_symlinks=False)) == self._identity)
+
+    def assert_enrolled_live(self):
+        """Recheck exact retained live members and nondelegable scope."""
+        try:
+            self._check_scope()
+            for item in self._processes:
+                item.check()
+                _require(item.boot == self._boot)
+                _membership(item, self._scope)
+            ids = tuple(sorted(item.pid for item in self._processes))
+            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
+            for item in self._processes: item.check()
+            self._check_scope()
+            _require(_members(_read(self._fd, 'cgroup.procs')) == ids)
+        except Exception:
+            raise ScopeEvidenceError('cgroup scope evidence unavailable') from None
 
     def observe_empty(self):
         try:

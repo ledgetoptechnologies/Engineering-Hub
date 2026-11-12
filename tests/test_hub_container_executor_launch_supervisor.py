@@ -1779,3 +1779,50 @@ def test_legacy_version_with_unprotected_scope_evidence_requires_review(root_jou
     with sqlite3.connect(path) as db:
         assert db.execute('PRAGMA user_version').fetchone() == (1,)
         assert json.loads(db.execute('SELECT data FROM launch').fetchone()[0]) == data
+
+
+def test_launcher_scope_preflight_failure_never_calls_fake_engine(root_journal, short_root, monkeypatch):
+    """Real launcher/supervisor preflight; no fake Engine POST on invalid scope."""
+    from dataclasses import replace
+    from hub_container_executor import launcher_cli, cgroup_scope_evidence as cgroups
+    authority, _ = synthetic_launcher(root_journal)
+    engine, journal_path = authority._engine, str(root_journal.path)
+    daemon = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    daemon_process = launch._Process(daemon.pid)
+    try:
+        authority._daemon_pin = launch._DaemonPin('/synthetic/daemon.sock', daemon.pid,
+            daemon_process.start, 10001, 10001, 'synthetic-engine', '1.45')
+        authority._engine.process = daemon_process
+        fake_root = short_root / 'cgroup-preflight'
+        fake_root.mkdir(mode=0o700)
+        for name in ('cgroup.procs', 'cgroup.threads'):
+            (fake_root / name).write_text('')
+            (fake_root / name).chmod(0o600)
+        monkeypatch.setattr(cgroups, '_CGROUP_ROOT', fake_root)
+        monkeypatch.setattr(cgroups, '_filesystem', lambda fd: None)
+        monkeypatch.setattr(cgroups, '_mount_root', lambda: None)
+        class Policy:
+            scope = 'missing-scope'
+            def check(self, supervisor, scope=None): pass
+        monkeypatch.setattr(launcher_cli, '_load_daemon_scope_policy', lambda path: Policy())
+        monkeypatch.setattr(launcher_cli, '_load_supervisor', lambda: lambda **kwargs: authority)
+        monkeypatch.setattr(launcher_cli, '_install_handlers', lambda stop: [])
+        monkeypatch.setattr(launcher_cli, '_restore_handlers', lambda previous: None)
+        options = SimpleNamespace(enrollment_file='/fake/enrollment', signing_key_file='/fake/key',
+            journal_file='/fake/journal', daemon_scope_policy='/fake/scope', approval_proposal_file=None,
+            proposal_refresh_socket=None, wait_seconds=5)
+        code, phase = launcher_cli._execute(options)
+        assert (code, phase) == (2, 'unavailable_preserve_evidence')
+        assert engine.effect_calls == []
+        import sqlite3
+        with sqlite3.connect(journal_path) as db:
+            assert db.execute('SELECT COUNT(*) FROM launch').fetchone() == (0,)
+    finally:
+        daemon_process.close()
+        if daemon.poll() is None:
+            daemon.terminate()
+            try: daemon.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=2)

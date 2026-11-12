@@ -304,7 +304,8 @@ def test_host_rejects_missing_kernel_or_signal_facilities(module, monkeypatch, m
     assert module._host_available() is False
 
 
-@pytest.mark.parametrize('outcome', ['complete', 'wait_timeout', 'policy_changed', 'record_failed'])
+@pytest.mark.parametrize('outcome', ['complete', 'wait_timeout', 'policy_changed', 'record_failed',
+                                     'invalid_scope', 'scope_mismatch'])
 def test_explicit_scope_policy_lifecycle_never_signals_daemon(module, monkeypatch, capsys, outcome):
     calls = []
     stop_ref = SimpleNamespace(value=None)
@@ -317,16 +318,22 @@ def test_explicit_scope_policy_lifecycle_never_signals_daemon(module, monkeypatc
         wait_seconds = 5
         def check(self, supervisor, observed=None):
             calls.append('policy-check-scoped' if observed else 'policy-check')
-            if outcome == 'policy_changed' and calls.count('policy-check-scoped') == 2:
+            if ((outcome == 'policy_changed' and calls.count('policy-check-scoped') == 3)
+                    or (outcome == 'scope_mismatch' and observed is not None)):
                 raise ValueError()
     class Supervisor:
         def __init__(self, **kwargs):
             self._engine = SimpleNamespace(process=SimpleNamespace(check=lambda: calls.append('daemon-check')))
             calls.append('construct')
         def launch(self): calls.append('launch')
-        def enroll_daemon_scope(self, scope_path, *, timeout_ms):
+        def preflight_daemon_scope(self, scope_path, *, timeout_ms):
             assert scope_path == 'dedicated/daemon' and timeout_ms == 10000
-            calls.append('enroll'); return scope
+            calls.append('preflight')
+            if outcome == 'invalid_scope': raise ValueError()
+            return scope
+        def verify_preflight_daemon_scope(self, value, *, timeout_ms):
+            assert value is scope and timeout_ms == 10000
+            calls.append('postlaunch-verify')
         def wait_for_receipt_request(self, **kwargs): calls.append('readiness'); return True
         def serve_one_receipt(self): calls.append('receipt')
         def wait_for_stop_with_observations(self, **kwargs):
@@ -350,9 +357,12 @@ def test_explicit_scope_policy_lifecycle_never_signals_daemon(module, monkeypatc
     monkeypatch.setattr(module, '_wait_for_daemon_exit', wait_scope)
     status = module.main(ARGS + ['--execute', '--create-journal', '--daemon-scope-policy', '/protected/scope.json'])
     assert status == (0 if outcome == 'complete' else 2)
-    assert calls.index('policy-check') < calls.index('launch') < calls.index('enroll') < calls.index('receipt')
-    assert calls.index('consumer-stop') < calls.index('daemon-wait') < calls.index('scope-close') < calls.index('supervisor-close')
-    assert ('record' in calls) == (outcome in ('complete', 'record_failed'))
+    if outcome in ('invalid_scope', 'scope_mismatch'):
+        assert 'launch' not in calls and 'consumer-stop' not in calls and 'record' not in calls
+    else:
+        assert calls.index('policy-check') < calls.index('preflight') < calls.index('launch') < calls.index('postlaunch-verify') < calls.index('receipt')
+        assert calls.index('consumer-stop') < calls.index('daemon-wait') < calls.index('scope-close') < calls.index('supervisor-close')
+        assert ('record' in calls) == (outcome in ('complete', 'record_failed'))
     assert 'daemon_scope_observed_no_effect_outcome' in capsys.readouterr().out if outcome == 'complete' else True
 
 

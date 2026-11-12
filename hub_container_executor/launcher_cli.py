@@ -153,13 +153,14 @@ def _execute(options):
                 journal_file=options.journal_file, create_journal=True)
             if policy is not None:
                 policy.check(supervisor)
-                supervisor._engine.process.check()
+                scope = supervisor.preflight_daemon_scope(policy.scope, timeout_ms=10000)
+                policy.check(supervisor, scope)
             if stop.requested:
                 code, phase = 130, 'interrupted_before_launch'
             else:
                 supervisor.launch()
                 if policy is not None:
-                    scope = supervisor.enroll_daemon_scope(policy.scope, timeout_ms=10000)
+                    supervisor.verify_preflight_daemon_scope(scope, timeout_ms=10000)
                     policy.check(supervisor, scope)
                 # Cold-start imports must not consume the frame-exchange budget.
                 # The callback reads a signal flag only, outside native locks.

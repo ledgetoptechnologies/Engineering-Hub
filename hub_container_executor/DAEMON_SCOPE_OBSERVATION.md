@@ -49,8 +49,10 @@ path; `scope_device` and `scope_inode` pin its actual `stat` identity;
 match the separately enrolled live daemon; and `wait_seconds` is 1..3600.
 None of these values is discovered or enrolled by the option.
 
-The launcher checks this file and daemon before launching, enrolls the scope
-while the daemon is alive, and preserves the existing explicit consumer stop.
+The launcher checks the file, daemon, scope inode, cgroup controls and exact
+live membership before launching. It pins that scope, then rechecks the same
+scope and live membership after launch. It preserves the existing explicit
+consumer stop.
 After printing `consumer_stopped_waiting_daemon_exit`, it waits only on the
 retained daemon pidfd for the specified bound. An operator must independently
 stop the dedicated daemon; the launcher never signals it. A second stop signal

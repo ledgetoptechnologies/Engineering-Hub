@@ -1458,6 +1458,49 @@ class LaunchSupervisor:
                 self._hold()
                 raise LaunchSupervisorError() from None
 
+    def preflight_daemon_scope(self, scope_path, *, timeout_ms):
+        """Pin the exact live daemon scope before any launch Engine effect."""
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            scope = None
+            try:
+                self._guard()
+                _require(self._launch_id is None and self._engine is not None
+                         and type(self._engine.process) is _Process
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._engine.process.check()
+                scope = EnrolledCgroupScope(scope_path, processes=(self._engine.process,))
+                self._engine.process.check()
+                _remaining(deadline)
+                return scope
+            except BaseException:
+                if scope is not None: scope.close()
+                raise LaunchSupervisorError() from None
+
+    def verify_preflight_daemon_scope(self, scope, *, timeout_ms):
+        """Recheck the preflight scope against the actual running launch."""
+        from .cgroup_scope_evidence import EnrolledCgroupScope
+        _require(self._pid == os.getpid() and type(timeout_ms) is int and 1 <= timeout_ms <= 10000)
+        with self._mutex:
+            try:
+                self._guard()
+                _require(type(scope) is EnrolledCgroupScope and scope._pid == self._pid
+                         and self._launch_id is not None and self._consumer is not None
+                         and self._engine is not None and type(self._engine.process) is _Process
+                         and any(item is self._engine.process for item in scope._processes)
+                         and self._engine.process.pid == self._daemon_pin.pid
+                         and self._engine.process.start == self._daemon_pin.start_ticks)
+                deadline = time.monotonic() + timeout_ms / 1000
+                self._validate_live(deadline)
+                scope.assert_enrolled_live()
+                self._validate_live(deadline)
+                _remaining(deadline)
+            except Exception:
+                raise LaunchSupervisorError() from None
+
     def enroll_daemon_scope(self, scope_path, *, timeout_ms):
         """Retain a root-controlled daemon-only scope while its identity is live.
 

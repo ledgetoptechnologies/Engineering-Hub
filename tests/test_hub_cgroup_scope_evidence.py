@@ -97,3 +97,15 @@ def test_scope_denies_ambiguous_or_delegated_state(fixture, mutation):
         with pytest.raises(module.ScopeEvidenceError): enrolled.observe_empty()
     finally:
         enrolled.close()
+
+
+def test_live_scope_recheck_denies_new_member_before_use(fixture):
+    scope, child, process = fixture
+    enrolled = module.EnrolledCgroupScope('scope', processes=(process,))
+    try:
+        enrolled.assert_enrolled_live()
+        (scope / 'cgroup.procs').write_text(str(child.pid) + '\n999999\n')
+        with pytest.raises(module.ScopeEvidenceError):
+            enrolled.assert_enrolled_live()
+    finally:
+        enrolled.close()
