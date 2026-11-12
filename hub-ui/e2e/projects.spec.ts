@@ -262,6 +262,37 @@ test("project tracking starts at the first page after changing project", async (
   expect(requests.filter(value => value.startsWith(`${second}:`))).toEqual([`${second}:first`]);
 });
 
+test("tracking defaults to unfinished and resets paging when filter changes", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  const requests: string[] = [];
+  const next = "11111111-1111-4111-8111-111111111111";
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => {
+    const url = new URL(route.request().url());
+    const filter = url.searchParams.get("unfinished") === "true" ? "unfinished" : "all";
+    const cursor = url.searchParams.get("after_task_id");
+    requests.push(`${filter}:${cursor ?? "first"}`);
+    const title = filter === "all" ? "Verified task" : cursor ? "Needs review" : "Open task";
+    return route.fulfill({contentType: "application/json", body: JSON.stringify({project,
+      tasks: [{id: cursor ?? next, revision: 1, project, title,
+        status: filter === "all" ? "completion_verified" : cursor ? "completion_claimed" : "open",
+        created_by: "codex", execution_authorization: false, updates: []}],
+      truncated: filter === "unfinished" && !cursor, next_after: filter === "unfinished" && !cursor ? next : null})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  await expect(page.getByText("Open task")).toBeVisible();
+  await page.getByRole("button", {name: "Next page"}).click();
+  await expect(page.getByText("Needs review")).toBeVisible();
+  await expect(page.getByText("Completion claimed — unverified")).toBeVisible();
+  await page.getByRole("button", {name: "First page"}).click();
+  await expect(page.getByText("Open task")).toBeVisible();
+  await page.getByRole("button", {name: "Next page"}).click();
+  await page.getByLabel("Tracking records").selectOption("all");
+  await expect(page.getByText("Verified task")).toBeVisible();
+  expect(requests).toContain("all:first");
+  expect(requests).not.toContain(`all:${next}`);
+});
+
 test("tracking completion review requires evidence acknowledgement and sends exact revision", async ({ page }) => {
   const { overview } = await fixture(page);
   const project = overview.projects[0].id as string;

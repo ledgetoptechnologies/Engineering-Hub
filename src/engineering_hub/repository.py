@@ -299,11 +299,14 @@ class HubRepository:
     def list_tasks(self):
         return self._list('task')
 
-    def tracking_tasks(self, project, limit, after):
+    def tracking_tasks(self, project, limit, after, unfinished=False):
         """Read inert agent tracking records; none is an execution task."""
+        if type(unfinished) is not bool:
+            raise HubError('invalid_input', 422)
         with self._connection() as db:
             self._project(project, db)
-            rows = db.execute("SELECT data FROM hub_entities WHERE kind='tracking_task' AND json_extract(data, '$.project')=? AND id>? ORDER BY id LIMIT ?",
+            state = " AND json_extract(data, '$.status') IN ('open','completion_claimed')" if unfinished else ''
+            rows = db.execute("SELECT data FROM hub_entities WHERE kind='tracking_task' AND json_extract(data, '$.project')=? AND id>?" + state + " ORDER BY id LIMIT ?",
                               (project, after or '', limit + 1)).fetchall()
             return [json.loads(row['data']) for row in rows]
 

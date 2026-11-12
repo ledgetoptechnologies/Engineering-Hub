@@ -1054,7 +1054,8 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return image_versions_for(notes_repository)
 
     @app.get("/api/hub/v1/projects/{project}/tracking-tasks")
-    def project_tracking_tasks(project: str, request: Request, limit: int = 50, after_task_id: str | None = None):
+    def project_tracking_tasks(project: str, request: Request, limit: int = 50, after_task_id: str | None = None,
+                               unfinished: bool = False):
         """Human-only inert tracking, scoped to an active project."""
         human(request)
         if not 1 <= limit <= 200:
@@ -1065,7 +1066,7 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
                     raise ValueError()
             except (ValueError, TypeError, AttributeError):
                 raise HubError('invalid_cursor', 422) from None
-        rows = repo.tracking_tasks(project, limit, after_task_id)
+        rows = repo.tracking_tasks(project, limit, after_task_id, unfinished)
         more = len(rows) > limit
         return {'project': project, 'tasks': rows[:limit], 'truncated': more,
                 'next_after': rows[limit - 1]['id'] if more else None}

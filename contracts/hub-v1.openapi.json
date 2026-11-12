@@ -2821,6 +2821,127 @@
         }
       }
     },
+    "/api/hub/v1/projects/{project}/tracking-tasks": {
+      "get": {
+        "summary": "Project Tracking Tasks",
+        "description": "Human-only inert tracking, scoped to an active project.",
+        "operationId": "project_tracking_tasks_api_hub_v1_projects__project__tracking_tasks_get",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "after_task_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Task Id"
+            }
+          },
+          {
+            "name": "unfinished",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Unfinished"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hub/v1/tracking-tasks/{task_id}/review": {
+      "post": {
+        "summary": "Review Tracking Task",
+        "operationId": "review_tracking_task_api_hub_v1_tracking_tasks__task_id__review_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrackingReview"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/agents": {
       "get": {
         "summary": "List Agents",
@@ -3470,6 +3591,45 @@
         }
       }
     },
+    "/api/hub/v1/container-pilot/runs/{run_id}/release-evidence": {
+      "get": {
+        "summary": "Container Pilot Release Evidence",
+        "operationId": "container_pilot_release_evidence_api_hub_v1_container_pilot_runs__run_id__release_evidence_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotReleaseEvidenceDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hub/v1/runs/{run_id}/dispatch": {
       "post": {
         "summary": "Dispatch",
@@ -4033,6 +4193,18 @@
             "type": "integer",
             "minimum": 0.0,
             "title": "Open Total"
+          },
+          "open_counts_truncated": {
+            "type": "boolean",
+            "title": "Open Counts Truncated"
+          },
+          "recent_links_truncated": {
+            "type": "boolean",
+            "title": "Recent Links Truncated"
+          },
+          "topics_truncated": {
+            "type": "boolean",
+            "title": "Topics Truncated"
           }
         },
         "additionalProperties": false,
@@ -4043,7 +4215,10 @@
           "agents",
           "topics",
           "open",
-          "open_total"
+          "open_total",
+          "open_counts_truncated",
+          "recent_links_truncated",
+          "topics_truncated"
         ],
         "title": "AgentActivityDTO"
       },
@@ -5878,6 +6053,152 @@
         ],
         "title": "PauseDTO"
       },
+      "PilotCommandEvidenceDTO": {
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "deploy_container",
+              "smoke_container",
+              "rollback_container",
+              "smoke_container_rollback",
+              "cleanup_candidate",
+              "cleanup_rollback"
+            ],
+            "title": "Action"
+          },
+          "command_id": {
+            "type": "string",
+            "title": "Command Id"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "unknown",
+              "held",
+              "succeeded",
+              "failed",
+              "ack_pending",
+              "inconsistent"
+            ],
+            "title": "State"
+          },
+          "expected_image_config_id": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Image Config Id"
+          },
+          "reported_image_config_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported Image Config Id"
+          },
+          "reported_health": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "healthy",
+                  "unhealthy"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported Health"
+          },
+          "worker_state": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "held"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker State"
+          },
+          "worker_evidence_verified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Evidence Verified"
+          },
+          "protocol_verified": {
+            "type": "boolean",
+            "title": "Protocol Verified"
+          },
+          "journal_verified": {
+            "type": "boolean",
+            "title": "Journal Verified"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "inspect_required",
+                  "paused",
+                  "target_busy",
+                  "stale_fence",
+                  "identity_conflict",
+                  "manifest_mismatch",
+                  "policy_mismatch",
+                  "image_unavailable",
+                  "daemon_unavailable",
+                  "container_conflict",
+                  "evidence_mismatch",
+                  "health_failed",
+                  "effect_failed",
+                  "recovery_required"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "action",
+          "command_id",
+          "state",
+          "expected_image_config_id",
+          "reported_image_config_id",
+          "reported_health",
+          "worker_state",
+          "worker_evidence_verified",
+          "protocol_verified",
+          "journal_verified",
+          "reason"
+        ],
+        "title": "PilotCommandEvidenceDTO"
+      },
       "PilotLifecycleDTO": {
         "properties": {
           "state": {
@@ -5925,6 +6246,122 @@
           "tasks"
         ],
         "title": "PilotLifecycleDTO"
+      },
+      "PilotReleaseEvidenceDTO": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "project": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Project"
+          },
+          "source_commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Source Commit"
+          },
+          "review": {
+            "$ref": "#/components/schemas/RunReviewDTO"
+          },
+          "run_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "held"
+            ],
+            "title": "Run Status"
+          },
+          "candidate_image_config_id": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Candidate Image Config Id"
+          },
+          "pilot_manifest_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Pilot Manifest Digest"
+          },
+          "rollback_image_config_id": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Rollback Image Config Id"
+          },
+          "candidate_deploy": {
+            "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+          },
+          "candidate_health_check": {
+            "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+          },
+          "rollback_deploy": {
+            "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+          },
+          "rollback_health_check": {
+            "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+          },
+          "candidate_cleanup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rollback_cleanup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotCommandEvidenceDTO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_basis": {
+            "type": "string",
+            "const": "authenticated_worker_report",
+            "title": "Evidence Basis"
+          },
+          "independently_verified": {
+            "type": "boolean",
+            "const": false,
+            "title": "Independently Verified"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "run_id",
+          "task_id",
+          "project",
+          "source_commit",
+          "review",
+          "run_status",
+          "candidate_image_config_id",
+          "pilot_manifest_digest",
+          "rollback_image_config_id",
+          "candidate_deploy",
+          "candidate_health_check",
+          "rollback_deploy",
+          "rollback_health_check",
+          "candidate_cleanup",
+          "rollback_cleanup",
+          "evidence_basis",
+          "independently_verified"
+        ],
+        "title": "PilotReleaseEvidenceDTO"
       },
       "PilotTasksDTO": {
         "properties": {
@@ -7727,6 +8164,56 @@
           "snapshot_revision"
         ],
         "title": "TopicSnapshot"
+      },
+      "TrackingReview": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "client_request_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Request Id"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "verify",
+              "reopen"
+            ],
+            "title": "Verdict"
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Note"
+          },
+          "evidence_links": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "title": "Evidence Links"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "client_request_id",
+          "verdict",
+          "note",
+          "evidence_links"
+        ],
+        "title": "TrackingReview"
       },
       "ValidationError": {
         "properties": {

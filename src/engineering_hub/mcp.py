@@ -253,8 +253,8 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
 
     @registration.tool()
     def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
-                               after_task_id: str | None = None) -> dict:
-        """Read inert project tracking records; a completion claim is not verified completion."""
+                               after_task_id: str | None = None, unfinished: StrictBool = False) -> dict:
+        """Read inert tracking records; unfinished includes open work and unverified claims."""
         identity(ctx)
         if not 1 <= limit <= 200:
             raise ToolError('invalid_limit')
@@ -265,7 +265,7 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                     raise ValueError()
             except (ValueError, TypeError, AttributeError):
                 raise ToolError('invalid_cursor') from None
-        rows = invoke(repo.tracking_tasks, project, limit, after_task_id)
+        rows = invoke(repo.tracking_tasks, project, limit, after_task_id, unfinished)
         more = len(rows) > limit
         return {'project': project, 'tasks': rows[:limit], 'truncated': more,
                 'next_after': rows[limit - 1]['id'] if more else None}

@@ -395,6 +395,42 @@ def test_human_project_tracking_is_scoped_paginated_and_non_executable(hub):
     assert client.post(path).status_code == 405
 
 
+def test_unfinished_tracking_filters_before_pagination_and_reopened_returns(hub, monkeypatch):
+    import uuid
+    client, app, settings = hub
+    human_headers(client, app, settings)
+    repo = app.state.repository
+    ids = iter(uuid.UUID(int=i, version=4) for i in range(1, 100))
+    monkeypatch.setattr('engineering_hub.repository.uuid.uuid4', lambda: next(ids))
+    evidence = [{'label': 'Proof', 'url': 'https://example.com/proof'}]
+    verified = []
+    for i in range(52):
+        item = repo.propose_tracking_task('codex', '3d-viewer', f'Finished {i}', f'list-done-{i}')
+        repo.update_tracking_task('codex', item['id'], 1, f'list-claim-{i}',
+                                  progress='Done', evidence_links=evidence, completion_claim=True)
+        verified.append(repo.review_tracking_task('claude', item['id'], 2, f'list-review-{i}',
+                         verdict='verify', note='Checked', evidence_links=evidence))
+    open_item = repo.propose_tracking_task('codex', '3d-viewer', 'Open work', 'list-open')
+    claim = repo.propose_tracking_task('codex', '3d-viewer', 'Needs review', 'list-needs-review')
+    repo.update_tracking_task('codex', claim['id'], 1, 'list-new-claim',
+                              progress='Ready', evidence_links=evidence, completion_claim=True)
+    repo.propose_tracking_task('codex', 'project-alpha', 'Other project', 'list-other')
+    path = BASE + '/projects/3d-viewer/tracking-tasks'
+    legacy = client.get(path, params={'limit': 50}).json()
+    assert legacy['truncated'] and len(legacy['tasks']) == 50
+    assert all(item['status'] == 'completion_verified' for item in legacy['tasks'])
+    first = client.get(path, params={'limit': 1, 'unfinished': 'true'}).json()
+    second = client.get(path, params={'limit': 1, 'unfinished': 'true', 'after_task_id': first['next_after']}).json()
+    assert first['truncated'] and not second['truncated']
+    assert {first['tasks'][0]['id'], second['tasks'][0]['id']} == {open_item['id'], claim['id']}
+    assert {first['tasks'][0]['status'], second['tasks'][0]['status']} == {'open', 'completion_claimed'}
+    assert client.get(path, params={'unfinished': 'not-a-bool'}).status_code == 422
+    repo.review_tracking_task('claude', verified[0]['id'], 3, 'list-reopen',
+                              verdict='reopen', note='More work', evidence_links=[])
+    page = client.get(path, params={'unfinished': 'true'}).json()
+    assert {item['id'] for item in page['tasks']} == {verified[0]['id'], open_item['id'], claim['id']}
+
+
 def test_human_tracking_review_requires_session_csrf_and_current_claim(hub):
     client, app, settings = hub
     item = app.state.repository.propose_tracking_task('codex', '3d-viewer', 'Review task', 'hr-propose')

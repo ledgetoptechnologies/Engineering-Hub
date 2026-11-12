@@ -9,10 +9,11 @@ export type TrackingTask = { id: string; project: string; title: string; status:
   updates: { actor: string; progress: string; evidence_links: Evidence[]; completion_claim: boolean }[];
   reviews?: { actor: string; verdict: "verify" | "reopen"; note: string; evidence_links: Evidence[] }[] };
 type Page = { project: string; tasks: TrackingTask[]; truncated: boolean; next_after: string | null };
-export async function readTracking(project: string, after: string | null, signal: AbortSignal): Promise<Page> {
+export async function readTracking(project: string, after: string | null, signal: AbortSignal, unfinished = false): Promise<Page> {
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(project)) throw new HubApiError(422, "invalid_project");
   const params = new URLSearchParams({ limit: "50" });
   if (after) params.set("after_task_id", after);
+  if (unfinished) params.set("unfinished", "true");
   const response = await fetch(`/api/hub/v1/projects/${project}/tracking-tasks?${params}`, {
     credentials: "same-origin", cache: "no-store", redirect: "error", headers: { Accept: "application/json" }, signal,
   });
@@ -79,19 +80,23 @@ export function ProjectTrackingPanel({ project, demo, csrf, onUnauthorized }: { 
   const [page, setPage] = useState<Page | null>(null);
   const [state, setState] = useState<"loading" | "loaded" | "error">("loading");
   const [cursor, setCursor] = useState<string | null>(null);
+  const [unfinished, setUnfinished] = useState(true);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => { setPage(null); setCursor(null); setRevision(n => n + 1); }, []);
   useEffect(() => {
     const controller = new AbortController();
     setPage(null); setState("loading");
     if (demo) { setState("loaded"); return () => controller.abort(); }
-    readTracking(project, cursor, controller.signal).then(value => { if (!controller.signal.aborted) { setPage(value); setState("loaded"); } })
+    readTracking(project, cursor, controller.signal, unfinished).then(value => { if (!controller.signal.aborted) { setPage(value); setState("loaded"); } })
       .catch(error => { if (controller.signal.aborted) return; if (error instanceof HubApiError && [401,403].includes(error.status)) onUnauthorized(); else setState("error"); });
     return () => controller.abort();
-  }, [project, cursor, revision, demo, onUnauthorized]);
+  }, [project, cursor, revision, demo, onUnauthorized, unfinished]);
   return <section className="panel" aria-label="Project tracking">
     <h2>Project tracking</h2>
     <p>Agent-reported progress and evidence. These records do not authorize execution; each completion claim requires a separate review.</p>
+    {!demo && <label>Show <select aria-label="Tracking records" value={unfinished ? "unfinished" : "all"} onChange={event => {
+      setPage(null); setCursor(null); setUnfinished(event.target.value === "unfinished");
+    }}><option value="unfinished">Needs work or review</option><option value="all">All tracking records</option></select></label>}
     {state === "loading" && <p role="status">Loading project tracking…</p>}
     {state === "error" && <p role="alert">Project tracking could not be loaded. <button type="button" onClick={refresh}>Retry</button></p>}
     {state === "loaded" && demo && <p>Tracking is unavailable in demo mode.</p>}

@@ -121,11 +121,15 @@ def test_tracking_task_idempotency_evidence_and_no_execution_authority(hub):
     assert call(client, 'hub_tracking_task_review', {**review, 'evidence_links': [{'label':'Other','url':'https://example.com/other'}]}, 'fixture-claude')['isError']
     verified = call(client, 'hub_tracking_task_review', review, 'fixture-claude')['structuredContent']
     assert verified['status'] == 'completion_verified' and verified['execution_authorization'] is False
+    assert call(client, 'hub_tracking_task_list', {'project': '3d-viewer', 'unfinished': True})['structuredContent']['tasks'] == []
+    assert call(client, 'hub_tracking_task_list', {'project': '3d-viewer'})['structuredContent']['tasks'][0]['id'] == item['id']
+    assert call(client, 'hub_tracking_task_list', {'project': '3d-viewer', 'unfinished': 'true'})['isError']
     assert verified['reviews'][0]['claim_revision'] == 2
     assert call(client, 'hub_tracking_task_review', review, 'fixture-claude')['structuredContent']['revision'] == 3
     assert call(client, 'hub_tracking_task_update', {**update, 'expected_revision': 3, 'client_request_id': 'after-review'})['isError']
     reopen = {**review, 'expected_revision': 3, 'client_request_id': 'reopen-1', 'verdict': 'reopen', 'evidence_links': []}
     assert call(client, 'hub_tracking_task_review', reopen, 'fixture-claude')['structuredContent']['status'] == 'open'
+    assert call(client, 'hub_tracking_task_list', {'project': '3d-viewer', 'unfinished': True})['structuredContent']['tasks'][0]['id'] == item['id']
 
 
 def test_decisions_are_requests_not_approval_or_dispatch(hub):

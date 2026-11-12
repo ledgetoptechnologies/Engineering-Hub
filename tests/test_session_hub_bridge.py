@@ -124,7 +124,10 @@ def test_tracking_and_project_enumeration_require_distinct_grants(env):
         env.repo.propose_tracking_task(actor, PROJECT, 'Inert test', 'tracking-key'))
     with pytest.raises(HubError, match='hub_project_forbidden'):
         call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks('project-alpha', 100, None))
+    with pytest.raises(HubError, match='hub_project_forbidden'):
+        call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks('project-alpha', 100, None, True))
     assert call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks(PROJECT, 100, None))[0]['id'] == item['id']
+    assert call(env, token, 'hub_tracking_task_list', lambda _: env.repo.tracking_tasks(PROJECT, 100, None, True))[0]['id'] == item['id']
     env.bridge.grant_revoke(OWNER, installation, 2)
     with pytest.raises(HubError, match='hub_grant_required'):
         call(env, token, 'hub_tracking_task_list', lambda _: None)
