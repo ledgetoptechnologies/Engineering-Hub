@@ -49,6 +49,7 @@ _HEX = re.compile(r'[0-9a-f]{64}\Z')
 _SHA = re.compile(r'sha256:[0-9a-f]{64}\Z')
 CURRENT_REQUEST_PROTOCOL = 'engineering-hub.executor-current-observation-request.v1'
 PROPOSAL_REQUEST_PROTOCOL = 'engineering-hub.launch-proposal-request.v1'
+_CGROUPFS_ROOT = Path('/sys/fs/cgroup')
 APPROVAL_PROPOSAL_DOMAIN = b'engineering-hub-launch-approval-proposal-v1\x00'
 _TARGETS = {
     'engine_socket': '/run/engineering-hub/docker.sock',
@@ -259,6 +260,8 @@ class ExecutorLaunchProfile(_Closed):
     mounts: tuple[ExecutorLaunchMount, ...]
     runner_file: str
     runner_digest: str
+    cgroup_parent: str | None = None
+    cgroup_host_parent: str | None = None
 
     @field_validator('supplementary_groups', 'entrypoint', 'command', 'environment', 'mounts', mode='before')
     @classmethod
@@ -288,6 +291,15 @@ class ExecutorLaunchProfile(_Closed):
                      if item.role not in {'engine_socket', 'issuer_socket'}))
         _require(all(not (left == right or left in right.parents or right in left.parents)
                      for index, left in enumerate(sources) for right in sources[index + 1:]))
+        if self.cgroup_parent is None or self.cgroup_host_parent is None:
+            _require(self.cgroup_parent is None and self.cgroup_host_parent is None)
+        else:
+            _require(type(self.cgroup_parent) is str
+                     and re.fullmatch(r'[a-z][a-z0-9-]{0,60}\.slice', self.cgroup_parent)
+                     and type(self.cgroup_host_parent) is str and self.cgroup_host_parent.startswith('/')
+                     and os.path.normpath(self.cgroup_host_parent) == self.cgroup_host_parent
+                     and '..' not in Path(self.cgroup_host_parent).parts
+                     and Path(self.cgroup_host_parent).name == self.cgroup_parent)
         _path(self.runner_file)
         _require(self.runner_file.endswith('/hub_container_executor/installed_runner.py')
                  and not any(self.runner_file == item.target or Path(item.target) in Path(self.runner_file).parents
@@ -295,7 +307,11 @@ class ExecutorLaunchProfile(_Closed):
         return self
 
     def digest(self):
-        return 'sha256:' + hashlib.sha256(_canonical(self.model_dump(mode='json'))).hexdigest()
+        value = self.model_dump(mode='json')
+        if self.cgroup_parent is None:
+            del value['cgroup_parent']
+            del value['cgroup_host_parent']
+        return 'sha256:' + hashlib.sha256(_canonical(value)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -675,6 +691,7 @@ class LaunchSupervisor:
         self._approval_expires_at_ms = None
         self._held = False
         self._source_pins = {}
+        self._cgroup_parent_identity = None
         try:
             _require(sys.platform == 'linux' and os.geteuid() == os.getuid() == 0
                      and hasattr(socket, 'SO_PEERCRED') and hasattr(os, 'pidfd_open'))
@@ -814,9 +831,36 @@ class LaunchSupervisor:
         os.chmod(pinned, 0o660, follow_symlinks=False)
         self._listener.listen(1)
 
+    def _pin_cgroup_parent(self):
+        """Pin the independently enrolled, pre-provisioned host cgroup path."""
+        if self.profile.cgroup_parent is None:
+            return
+        from .cgroup_scope_evidence import _filesystem
+        path = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
+        _require(path.resolve(strict=True) == path and path != _CGROUPFS_ROOT)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _filesystem(fd)
+            info = os.fstat(fd)
+            _require(stat.S_ISDIR(info.st_mode) and _identity(info) == _identity(os.stat(path, follow_symlinks=False)))
+            self._cgroup_parent_identity = _identity(info)
+        finally:
+            os.close(fd)
+
+    def _check_cgroup_parent_membership(self, process_cgroup):
+        """Compare kernel-observed membership with the retained host parent."""
+        if self.profile.cgroup_parent is None:
+            return
+        parent = _CGROUPFS_ROOT / self.profile.cgroup_host_parent.lstrip('/')
+        observed = _CGROUPFS_ROOT / process_cgroup.lstrip('/')
+        _require(getattr(self, '_cgroup_parent_identity', None) is not None
+                 and parent.resolve(strict=True) == parent and observed.resolve(strict=True) == observed
+                 and parent in observed.parents
+                 and _identity(os.stat(parent, follow_symlinks=False)) == self._cgroup_parent_identity)
+
     def _create_body(self):
         p = self.profile
-        return {'Image': self.image.runnable_reference, 'User': p.user,
+        body = {'Image': self.image.runnable_reference, 'User': p.user,
             'Entrypoint': list(p.entrypoint), 'Cmd': list(p.command), 'Env': list(p.environment),
             'WorkingDir': '/', 'Hostname': '', 'Domainname': '', 'AttachStdin': False,
             'AttachStdout': False, 'AttachStderr': False, 'OpenStdin': False, 'Tty': False,
@@ -831,6 +875,9 @@ class LaunchSupervisor:
                             'ReadOnly': item.read_only, 'BindOptions': {'Propagation': 'rprivate'}} for item in p.mounts],
                 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0}, 'AutoRemove': False,
                 'Devices': [], 'DeviceRequests': [], 'ExtraHosts': [], 'Links': [], 'VolumesFrom': []}}
+        if p.cgroup_parent is not None:
+            body['HostConfig']['CgroupParent'] = p.cgroup_parent
+        return body
 
     def _inspect(self, deadline, *, running):
         _, info = self._engine.json('GET', '/containers/' + self._container_id + '/json', deadline)
@@ -905,6 +952,7 @@ class LaunchSupervisor:
                 deadline = time.monotonic() + self._launch_ms / 1000
                 self._bind_issuer()
                 self._pin_sources()
+                self._pin_cgroup_parent()
                 defaults = self._engine.image(self.image, deadline)
                 _require(not defaults.get('Volumes') and not defaults.get('Healthcheck') and not defaults.get('OnBuild')
                          and tuple(defaults.get('Entrypoint') or ()) == self.profile.entrypoint
@@ -970,6 +1018,7 @@ class LaunchSupervisor:
         _require(os.path.normpath(relative) == relative and '..' not in Path(relative).parts)
         cgroup = Path('/sys/fs/cgroup') / relative.lstrip('/')
         _require(cgroup.resolve(strict=True) == cgroup)
+        self._check_cgroup_parent_membership(relative)
         def value(name):
             raw = (cgroup / name).read_bytes()
             _require(len(raw) <= 4096)

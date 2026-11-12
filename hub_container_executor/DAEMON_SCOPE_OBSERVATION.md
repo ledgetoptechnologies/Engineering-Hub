@@ -61,3 +61,21 @@ records the bounded observation, and prints
 `daemon_scope_observed_no_effect_outcome`. Timeout, changed policy, signal,
 missing scope or uncertainty returns failure and preserves evidence. This
 option proves neither all effect workers quiesced nor an operation outcome.
+
+### Optional executor cgroup parent
+
+An independently reviewed executor launch profile may supply both
+`cgroup_parent` (the exact systemd slice name passed as Docker `CgroupParent`)
+and `cgroup_host_parent` (its pre-existing absolute cgroup-v2 path as seen in
+host `/proc/<pid>/cgroup`). The two must name the same slice. Both fields are
+bound into the profile digest; omitting both preserves the earlier profile
+digest and behavior. The supervisor pins the existing parent inode before the
+first Engine POST, checks Docker's returned `CgroupParent`, and then checks the
+actual executor PID's kernel cgroup membership is a descendant of that pinned
+parent. An absent, replaced, mismatched or unreadable parent fails closed.
+
+This does not enroll, configure, or prove an aggregate resource limit, contain
+containerd/shims, or establish application-container membership. In particular,
+the app backend runs in a separate PID namespace and needs an independently
+trusted host-side membership observer before application containment can be
+claimed. These checks provide no effect-outcome or recovery authority.

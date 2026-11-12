@@ -892,6 +892,7 @@ def synthetic_launcher(journal, *, failure=None, image_kind='config'):
             original = authority._create_body()
             host = deepcopy(original.pop('HostConfig'))
             if failure == 'privileged-inspect': host['Privileged'] = True
+            if failure == 'wrong-cgroup-parent': host['CgroupParent'] = 'other.slice'
             if failure == 'wrong-tmpfs': host['Tmpfs']['/tmp'] = 'rw,size=1024'
             if failure == 'tag-config': original['Image'] = 'unapproved:latest'
             mounts = [{'Type': 'bind', 'Source': item.source, 'Destination': item.target,
@@ -1826,3 +1827,77 @@ def test_launcher_scope_preflight_failure_never_calls_fake_engine(root_journal, 
             except subprocess.TimeoutExpired:
                 daemon.kill()
                 daemon.wait(timeout=2)
+
+
+def test_launcher_cgroup_parent_is_enrolled_and_bound_to_profile(root_journal):
+    """Synthetic profile readback only; no real Docker containment is claimed."""
+    legacy = profile_data()
+    profile = launch.ExecutorLaunchProfile.model_validate(legacy)
+    assert profile.digest() == 'sha256:' + hashlib.sha256(launch._canonical(legacy)).hexdigest()
+    configured = dict(legacy, cgroup_parent='ehcontaintrial.slice',
+                      cgroup_host_parent='/user.slice/user-10001.slice/ehcontaintrial.slice')
+    pinned = launch.ExecutorLaunchProfile.model_validate(configured)
+    assert pinned.digest() != profile.digest()
+    assert pinned.digest() == 'sha256:' + hashlib.sha256(launch._canonical(configured)).hexdigest()
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        authority.profile = pinned
+        assert authority._create_body()['HostConfig']['CgroupParent'] == 'ehcontaintrial.slice'
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize('parent, host', [
+    ('ehcontaintrial.slice', None), (None, '/user.slice/ehcontaintrial.slice'),
+    ('other.slice', '/user.slice/ehcontaintrial.slice'),
+    ('../escape.slice', '/user.slice/escape.slice'),
+    ('ehcontaintrial.slice', '/user.slice/../ehcontaintrial.slice')])
+def test_launcher_rejects_partial_or_mismatched_cgroup_enrollment(parent, host):
+    with pytest.raises(Exception):
+        launch.ExecutorLaunchProfile.model_validate(dict(profile_data(), cgroup_parent=parent,
+                                                       cgroup_host_parent=host))
+
+
+def test_launcher_checks_kernel_membership_against_exact_pinned_parent(root_journal, short_root, monkeypatch):
+    """Synthetic paths exercise comparison; real kernel attestation is separate."""
+    root = short_root / 'cgroupfs'
+    root.mkdir()
+    parent = root / 'parent.slice'
+    parent.mkdir()
+    child = parent / 'runner.scope'
+    child.mkdir()
+    outside = root / 'other.scope'
+    outside.mkdir()
+    monkeypatch.setattr(launch, '_CGROUPFS_ROOT', root)
+    authority, _ = synthetic_launcher(root_journal)
+    try:
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/parent.slice'))
+        authority._cgroup_parent_identity = launch._identity(parent.stat())
+        authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority._check_cgroup_parent_membership('/other.scope')
+        authority._cgroup_parent_identity = (0, 0)
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority._check_cgroup_parent_membership('/parent.slice/runner.scope')
+    finally:
+        authority.close()
+
+
+
+def test_launcher_wrong_cgroup_parent_readback_holds_before_start(root_journal):
+    """Engine readback is checked, but is not claimed as kernel membership proof."""
+    authority, _ = synthetic_launcher(root_journal, failure='wrong-cgroup-parent')
+    try:
+        authority.profile = launch.ExecutorLaunchProfile.model_validate(dict(profile_data(),
+            cgroup_parent='parent.slice', cgroup_host_parent='/user.slice/parent.slice'))
+        authority._pin_cgroup_parent = lambda: None  # no real cgroup in this fixture
+        with pytest.raises(launch.LaunchSupervisorError):
+            authority.launch()
+        calls = authority._engine.effect_calls
+        assert any(method == 'POST' and '/containers/create?' in route for method, route in calls)
+        assert not any(method == 'POST' and route.endswith('/start') for method, route in calls)
+        with root_journal.transaction() as db:
+            assert db.execute('SELECT state FROM launch').fetchone() == ('held',)
+    finally:
+        authority.close()
