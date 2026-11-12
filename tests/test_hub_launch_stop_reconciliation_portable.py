@@ -6,6 +6,7 @@ constructing an authority, accessing a key, or connecting to any Engine.
 """
 import ast
 from copy import deepcopy
+import math
 import os
 from pathlib import Path
 import threading
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def authority_fixture(states, *, error=None, response_delay=0):
+def authority_fixture(states, *, error=None, response_delay=0, poll_events=None):
     source = Path(__file__).parents[1] / 'hub_container_executor/launch_supervisor.py'
     parsed = ast.parse(source.read_text(encoding='utf-8'))
     native = next(item for item in parsed.body if isinstance(item, ast.ClassDef)
@@ -32,10 +33,18 @@ def authority_fixture(states, *, error=None, response_delay=0):
     def remaining(deadline):
         require(deadline > clock.now)
         return deadline - clock.now
-    namespace = {'os': os, 'time': SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
+    class Poll:
+        def register(self, fd, events):
+            assert (fd, events) == (17, 7)
+        def poll(self, timeout_ms):
+            assert 0 < timeout_ms <= 1000
+            return [(17, 1)] if poll_events is None else poll_events
+    namespace = {'os': os, 'math': math, 'time': SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep),
                  '_require': require, '_remaining': remaining, 'LaunchSupervisorError': RuntimeError,
-                 'select': SimpleNamespace(select=lambda *args: ([17], [], []))}
-    body = ast.Module(body=[ast.ClassDef(name='Native', bases=[], keywords=[], body=methods,
+                 'select': SimpleNamespace(poll=Poll, POLLIN=1, POLLHUP=2, POLLERR=4, POLLNVAL=8)}
+    poll_ready = next(node for node in parsed.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_poll_ready')
+    body = ast.Module(body=[poll_ready, ast.ClassDef(name='Native', bases=[], keywords=[], body=methods,
                                        decorator_list=[])], type_ignores=[])
     exec(compile(ast.fix_missing_locations(body), str(source), 'exec'), namespace)
     authority = namespace['Native']()
@@ -47,7 +56,7 @@ def authority_fixture(states, *, error=None, response_delay=0):
     authority.profile = SimpleNamespace(user='10001:10001', entrypoint=('python',),
         command=('-m', 'approved'), environment=('PATH=/bin',), memory_bytes=1024,
         cpu_millicores=100, pids_limit=32, supplementary_groups=(), tmpfs_bytes=1024,
-        mounts=())
+        mounts=(), cgroup_parent=None)
     authority.image = SimpleNamespace(runnable_reference='sha256:' + '1' * 64,
         image_config_id='sha256:' + '2' * 64, platform_manifest_digest='sha256:' + '3' * 64)
     authority._guard = lambda **kwargs: None
@@ -87,6 +96,15 @@ def authority_fixture(states, *, error=None, response_delay=0):
 
 RUNNING = dict(Running=True, Status='running', Pid=123)
 EXITED = dict(Running=False, Status='exited', Pid=0)
+
+
+@pytest.mark.parametrize('events', [[], [(17, 4)], [(17, 8)]])
+def test_poll_uncertainty_holds_without_accounting_or_cleanup(events):
+    a, _, journal, effects, reads, cleanup = authority_fixture([(EXITED, None)], poll_events=events)
+    with pytest.raises(RuntimeError):
+        a.graceful_stop()
+    assert journal == ['term_reserved', 'held'] and a._held
+    assert len(effects) == 1 and not reads and not cleanup
 
 
 def test_delayed_engine_accounting_reads_only_under_original_stop_deadline():
