@@ -1152,7 +1152,7 @@ def test_readiness_retries_only_proven_terminal_health_under_one_journal_operati
     monkeypatch.setattr(module.time, 'monotonic', clock.now)
     monkeypatch.setattr(module.time, 'sleep', clock.sleep)
     journal = []
-    monkeypatch.setattr(backend, '_journal_begin', lambda *args: journal.append(('begin', args)))
+    monkeypatch.setattr(backend, '_journal_begin', lambda *args, **kwargs: journal.append(('begin', args)))
     monkeypatch.setattr(backend, '_journal_complete', lambda *args: journal.append(('complete', args)))
     try:
         result = run_readiness(backend, readiness_probes(manifest))
@@ -1485,6 +1485,50 @@ def test_explicit_private_journal_records_backend_ack_and_inspection_never_uses_
     assert len(requests) == request_count
     assert "fake-codex" not in repr(journal.events)
     backend.close()
+
+
+@pytest.mark.parametrize('failure', ['none', 'provider', 'mismatch', 'journal'])
+def test_bound_create_is_durable_before_post_and_failures_never_post(tmp_path, monkeypatch, failure):
+    pytest.importorskip('fcntl', reason='real Linux journal ownership required')
+    from hub_container_executor.operation_journal import SQLiteOperationJournal
+    private = tmp_path / 'bound-journal'
+    private.mkdir(mode=0o700)
+    operation = '4c96d3f7-19c5-5ff4-a29e-302f6f661009'
+    backend, _manifest, _image, plan, requests = create_transcript(tmp_path)
+    try:
+        with SQLiteOperationJournal(private / 'operations.sqlite', create=True,
+                                    allow_ephemeral_test_storage=True) as journal:
+            journal.enable_bindings()
+            backend.operation_journal = journal
+            def provider(op, kind, name, target):
+                if failure == 'provider':
+                    raise ValueError('unavailable')
+                assert (op, kind, name, target) == (operation, 'create_candidate', plan.resource_name, None)
+                return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
+                    'wrong-name' if failure == 'mismatch' else name, None,
+                    'hmac-sha256:' + 'a' * 64, 1)
+            backend.effect_binding_provider = TrustedEffectBindingProvider(provider)
+            original = backend._read_response
+            def checked(method, route, *args, **kwargs):
+                if method == 'POST' and route.endswith('/containers/create'):
+                    row = journal.inspect_record(operation)
+                    bound = journal.inspect_binding(operation)
+                    assert row.state == 'pending' and bound.resource_name == plan.resource_name
+                return original(method, route, *args, **kwargs)
+            monkeypatch.setattr(backend, '_read_response', checked)
+            if failure == 'journal':
+                monkeypatch.setattr(journal, 'begin_bound', lambda *_: (_ for _ in ()).throw(RuntimeError()))
+            if failure == 'none':
+                assert backend.create_container(plan, operation, 5000) == 'c' * 64
+                assert journal.inspect_binding(operation).resource_name == plan.resource_name
+                assert journal.inspect_record(operation).state == 'completed'
+            else:
+                with pytest.raises(DaemonBackendError):
+                    backend.create_container(plan, operation, 5000)
+                assert not any(method == 'POST' for method, _ in requests)
+                assert journal.inspect_record(operation) is None
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize("engine29_metadata", [False, True])
