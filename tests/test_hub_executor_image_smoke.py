@@ -164,11 +164,12 @@ def test_docker_command_binds_socket_and_preserves_registry_config(monkeypatch):
         def stat(self): return SimpleNamespace(st_mode=0o140600, st_dev=1, st_ino=2)
     monkeypatch.setattr(MODULE, 'Path', SocketPath)
     monkeypatch.setattr(MODULE.os, 'stat', lambda path: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(MODULE.shutil, 'which', lambda name, path: '/usr/bin/docker')
     monkeypatch.setenv('EH_EXECUTOR_DOCKER_HOST', host)
     monkeypatch.setenv('DOCKER_CONFIG', '/fixture/auth')
     monkeypatch.setenv('DOCKER_CONTEXT', 'wrong')
     monkeypatch.setenv('DOCKER_HOST', 'tcp://wrong')
     command, env = MODULE.docker_command(['container', 'inspect', 'fixture'])
-    assert command == ['docker', '--host', host, 'container', 'inspect', 'fixture']
+    assert command == ['/usr/bin/docker', '--host', host, 'container', 'inspect', 'fixture']
     assert env['DOCKER_CONFIG'] == '/fixture/auth'
     assert 'DOCKER_CONTEXT' not in env and 'DOCKER_HOST' not in env

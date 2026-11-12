@@ -12,6 +12,7 @@ import subprocess
 import uuid
 import os
 import stat
+import shutil
 from pathlib import Path
 
 
@@ -43,7 +44,10 @@ def docker_command(args):
     for name in ("DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS_VERIFY",
                  "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "BUILDX_BUILDER"):
         env.pop(name, None)
-    return ["docker", "--host", host, *args], env
+    executable = shutil.which("docker", path="/usr/bin:/bin")
+    if executable is None or not executable.startswith("/"):
+        raise ValueError("System Docker CLI required")
+    return [executable, "--host", host, *args], env
 
 
 OWNER = 'hub.executor-smoke-owner'
