@@ -189,7 +189,24 @@ class HostAdapter:
             if not self._single_pilot_protocol:
                 return self.ledger.get(command_id)
             with self._pilot_mutex:
-                return self.ledger.get(command_id)
+                return self._single_pilot_snapshot(command_id)
+
+    def _single_pilot_snapshot(self, command_id):
+        response = self.ledger.get(command_id)
+        if response is not None:
+            return response
+        # A preflight failure can arm the gate before a command row exists.
+        # This read-only projection never clears the gate or replays an effect.
+        gate = self.ledger.inspect_single_pilot()
+        if type(gate) is not dict or gate.get('state') != 'effect_held':
+            return None
+        try:
+            request = ContainerPilotRequest.model_validate(gate.get('request'))
+        except (ValueError, TypeError):
+            return None
+        if request.command_id != command_id:
+            return None
+        return _make_response(request, state='held', reason='recovery_required')
 
     def submit(self, request: ContainerPilotRequest) -> ContainerPilotResponse:
         with self._active_operation():
@@ -583,7 +600,7 @@ class HostAdapter:
                     return self.ledger.get(command_id)
                 return self._reconcile_active(command_id)
             with self._pilot_mutex:
-                return self.ledger.get(command_id)
+                return self._single_pilot_snapshot(command_id)
 
     def acknowledge_single_pilot(self, request, outcome_digest):
         """Local trusted entry; service authentication is a separate boundary."""

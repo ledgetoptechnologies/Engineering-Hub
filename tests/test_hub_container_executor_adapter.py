@@ -641,6 +641,11 @@ def test_single_pilot_state_preflight_failure_reopen_concurrent_retries_stay_hel
     reopened = HostAdapter(path, manifest, backend=backend, state_provisioner=state,
                            single_pilot_protocol=True)
     try:
+        for inspect in (reopened.get, reopened.reconcile):
+            held = inspect(cmd.command_id)
+            assert (held.state, held.reason, held.replayed) == ('held', 'recovery_required', False)
+            assert held.command_id == cmd.command_id
+            assert inspect('00000000-0000-4000-8000-000000000000') is None
         start = threading.Barrier(4)
         def retry():
             start.wait(timeout=5)
