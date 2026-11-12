@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import time
 from types import SimpleNamespace
 
@@ -195,6 +196,15 @@ async def test_ack_retried_from_a_new_session_after_its_response_was_ignored(tmp
         async with mcp_client(url, AGENTS["codex"]) as (codex, _, _, _):
             retried = await codex.call_tool("ack_message", {"message_id": message_id})
             assert not retried.isError
-            assert retried.structuredContent == first.structuredContent
+            def decoded(result):
+                value = result.structuredContent
+                if value is None:
+                    assert len(result.content) == 1 and result.content[0].type == 'text'
+                    value = json.loads(result.content[0].text)
+                assert isinstance(value, dict) and value
+                assert value.get('id') == message_id and value.get('status') == 'acknowledged'
+                return value
+
+            assert decoded(retried) == decoded(first)
     stored = app.state.repository.get(message_id)
     assert stored.status == "acknowledged" and stored.claimed_by == "codex"
