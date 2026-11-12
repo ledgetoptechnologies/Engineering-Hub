@@ -144,6 +144,41 @@ def test_gateway_exposes_the_read_only():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_disk_series_are_not_silently_reported_complete():
+    def values(query, params):
+        if 'node_filesystem' not in query:
+            return []
+        start = int(params['start'][0])
+        return [{'metric': {'mountpoint': '/'}, 'values': [[start, '0.1']]},
+                {'metric': {'mountpoint': '/'}, 'values': [[start, '0.2']]}]
+
+    result = await reader(prometheus(values)).history('internal', key_for('nas'), '1h')
+    assert result['source']['status'] == 'partial'
+    assert len([item for item in result['series'] if item['key'] == 'disk']) == 1
+
+
+@pytest.mark.asyncio
+async def test_overlapping_exporters_mark_history_partial():
+    targets = [
+        {'labels': {'job': 'node', 'instance': 'nas:9100', 'host': 'nas'}},
+        {'labels': {'job': 'windows', 'instance': 'nas:9182', 'host': 'nas'}},
+    ]
+    def respond(request):
+        if request.url.raw_path.decode() == TARGET_PATH:
+            return json_response({'status': 'success', 'data': {'activeTargets': targets}})
+        params = parse_qs(request.url.query.decode())
+        query = params['query'][0]
+        values = [[int(params['start'][0]), '0.5']] if '_cpu_' in query else []
+        return json_response({'status': 'success', 'data': {'resultType': 'matrix',
+                             'result': [{'metric': {}, 'values': values}] if values else []}})
+
+    key = normalize_targets(targets, INVENTORY)['rows'][0]['host_key']
+    result = await reader(respond).history('internal', key, '1h')
+    assert result['source']['status'] == 'partial'
+    assert len([item for item in result['series'] if item['key'] == 'cpu']) == 1
+
+
+@pytest.mark.asyncio
 async def test_more_targets_than_charted_for_one_host_is_partial_and_stays_bounded():
     from engineering_hub.infrastructure_metric_history import MAX_TARGETS_PER_HOST
     many = [{'labels': {'job': f'node{index}' if index else 'node', 'instance': f'nas:{9100 + index}', 'host': 'nas'},

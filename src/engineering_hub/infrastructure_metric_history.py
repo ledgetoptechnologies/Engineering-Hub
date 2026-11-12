@@ -171,15 +171,21 @@ async def read_history(reader, actor, host_key, span, targets_parser):
     if targets is None:
         return _envelope(reader, host_key, span, 'unreachable')
     series, seen = [], set()
+    omitted_series = False
     for (_, _, key), (unit, label_name, found) in sorted(results.items()):
         rows = []
         for labels, samples in found:
             label = labels.get(label_name) if label_name else None
             if label_name and not _plain(label, 128):
                 continue
-            if (key, label) not in seen and any(value is not None for value in samples.values()):
-                rows.append((label, samples))
+            if any(value is not None for value in samples.values()):
+                if (key, label) in seen or any(existing == label for existing, _ in rows):
+                    omitted_series = True
+                else:
+                    rows.append((label, samples))
+        if len(rows) > MAX_DISKS:
+            omitted_series = True
         for label, samples in sorted(rows, key=lambda row: row[0] or '')[:MAX_DISKS]:
             seen.add((key, label))
             series.append({'key': key, 'label': label, 'unit': unit, 'points': _points(samples, unit, start, end, step)})
-    return _envelope(reader, host_key, span, 'ok' if len(results) == planned and not truncated else 'partial', series)
+    return _envelope(reader, host_key, span, 'ok' if len(results) == planned and not truncated and not omitted_series else 'partial', series)
