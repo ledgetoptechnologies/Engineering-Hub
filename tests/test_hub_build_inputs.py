@@ -1,10 +1,11 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from scripts.verify_hub_build_inputs import verify_inputs
+from scripts.verify_hub_build_inputs import read_manifest, verify_inputs
 
 
 def fixture(tmp_path):
@@ -61,3 +62,32 @@ def test_symlink_rejected(tmp_path):
         pytest.skip('symlink creation unavailable')
     with pytest.raises(ValueError, match='links'):
         verify_inputs(**args)
+
+
+def test_walk_errors_do_not_allow_partial_snapshot(tmp_path, monkeypatch):
+    args = fixture(tmp_path)
+    def broken_walk(root, *, followlinks, onerror):
+        onerror(PermissionError('synthetic unreadable subtree'))
+        return iter(())
+    monkeypatch.setattr(os, 'walk', broken_walk)
+    with pytest.raises(ValueError, match='traversal failed'):
+        verify_inputs(**args)
+
+
+def test_manifest_regular_and_bounded(tmp_path):
+    path = tmp_path / 'manifest.json'
+    path.write_bytes(b'{}')
+    assert read_manifest(path) == b'{}'
+    path.write_bytes(b'X' * (256 * 1024 + 1))
+    with pytest.raises(ValueError, match='regular bounded'):
+        read_manifest(path)
+    with pytest.raises((ValueError, OSError)):
+        read_manifest(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='FIFO unsupported')
+def test_fifo_manifest_rejected_without_blocking(tmp_path):
+    path = tmp_path / 'pipe'
+    os.mkfifo(path)
+    with pytest.raises(ValueError, match='regular bounded'):
+        read_manifest(path)

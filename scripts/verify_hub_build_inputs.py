@@ -32,6 +32,30 @@ def _unique(pairs):
     return result
 
 
+def read_manifest(path: Path) -> bytes:
+    """Read a bounded regular manifest without following a final symlink."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError('regular bounded manifest required')
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+                 | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_MANIFEST:
+            raise ValueError('regular bounded manifest required')
+        data = bytearray()
+        while len(data) <= MAX_MANIFEST:
+            chunk = os.read(fd, min(65536, MAX_MANIFEST + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) != info.st_size or len(data) > MAX_MANIFEST:
+            raise ValueError('regular bounded manifest required')
+        return bytes(data)
+    finally:
+        os.close(fd)
+
+
 def verify_inputs(*, node_image: str, manifest: bytes, manifest_sha256: str, model_dir: Path):
     if type(node_image) is not str or not NODE.fullmatch(node_image):
         raise ValueError('independently pinned Node image required')
@@ -59,7 +83,9 @@ def verify_inputs(*, node_image: str, manifest: bytes, manifest_sha256: str, mod
     if not root.is_dir() or root.is_symlink():
         raise ValueError('regular snapshot directory required')
     actual, total = set(), 0
-    for current, dirs, files in os.walk(root, followlinks=False):
+    def walk_error(error):
+        raise ValueError('model snapshot traversal failed') from error
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         base = Path(current)
         for entry in dirs:
             if (base / entry).is_symlink():
@@ -71,7 +97,8 @@ def verify_inputs(*, node_image: str, manifest: bytes, manifest_sha256: str, mod
                 raise ValueError('unexpected model file')
             if path.is_symlink():
                 raise ValueError('model links forbidden')
-            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+                         | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode):
@@ -103,9 +130,7 @@ def main():
     parser.add_argument('--manifest-sha256', required=True)
     parser.add_argument('--model-dir', required=True, type=Path)
     args = parser.parse_args()
-    if args.manifest.is_symlink() or args.manifest.stat().st_size > MAX_MANIFEST:
-        raise ValueError('regular bounded manifest required')
-    result = verify_inputs(node_image=args.node_image, manifest=args.manifest.read_bytes(),
+    result = verify_inputs(node_image=args.node_image, manifest=read_manifest(args.manifest),
                            manifest_sha256=args.manifest_sha256, model_dir=args.model_dir)
     print(json.dumps(result, sort_keys=True))
 
