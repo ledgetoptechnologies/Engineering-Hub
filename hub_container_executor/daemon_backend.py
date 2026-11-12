@@ -7,12 +7,14 @@ transports are accepted solely through the explicit ``test_transport`` keyword.
 from __future__ import annotations
 
 import hashlib
+import contextvars
 import json
 import os
 import re
 import stat
 import time
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import quote
@@ -234,10 +236,72 @@ class TrustedEffectBindingProvider:
     This wrapper neither provisions nor validates those authorities.
     """
     create: Callable
+    compare_actual: Callable | None = None
 
     def __post_init__(self):
         if not callable(self.create):
             raise TypeError("binding factory required")
+        if self.compare_actual is not None and not callable(self.compare_actual):
+            raise TypeError("actual effect comparator must be callable")
+
+
+@dataclass(frozen=True)
+class ActualEffectInputs:
+    """Observed effect inputs; not runner-generation or fence attestation."""
+    context: object
+    engine_binding: DockerEngineBinding
+    plan: ContainerPlan | None
+    observation: ContainerObservation | None
+    image: VerifiedImage
+    probes: tuple | None
+
+
+def compare_enrolled_effect(actual, expected, verify_generation):
+    """Compare actual typed inputs; external verifier must prove runner/fence.
+
+    The callback must independently authenticate the current daemon generation,
+    live fencing and enrollment. This comparison is not atomic host attestation.
+    """
+    from .effect_binding_canonical import NonsecretEffectBinding, canonical_nonsecret_binding
+    from .runtime_profile import probe_set_digest
+    if type(actual) is not ActualEffectInputs or type(expected) is not NonsecretEffectBinding or not callable(verify_generation):
+        return False
+    canonical_nonsecret_binding(expected)
+    context = actual.context
+    effect_kind = ('start' if context.kind in {'start_candidate', 'start_rollback'} else context.kind)
+    if (context.operation_id != expected.operation_id or context.request.run_id != expected.run_id
+            or context.request.fencing_generation != expected.fence or effect_kind != expected.kind):
+        return False
+    plan, observed, image = actual.plan, actual.observation, actual.image
+    if plan is not None:
+        if type(plan) is not ContainerPlan or observed is not None:
+            return False
+        if expected.resource_name != plan.resource_name or expected.container_id is not None or image != plan.image:
+            return False
+        profile = plan.profile
+    else:
+        if type(observed) is not ContainerObservation or expected.container_id != observed.container_id or expected.resource_name is not None:
+            return False
+        if (observed.selected_image.runnable_reference != image.runnable_reference
+                or observed.selected_image.platform_manifest_digest != image.platform_manifest_digest
+                or observed.selected_image.image_config_id != image.image_config_id):
+            return False
+        profile = observed.profile
+    if (type(profile) is not EffectiveProfile or image.runnable_reference != expected.image_index_digest
+            or image.platform_manifest_digest != expected.platform_manifest_digest
+            or image.image_config_id != expected.image_config_id
+            or profile.state_generation_id != expected.state_generation_id
+            or tuple(sorted(name for name, _ in profile.environment)) != tuple(sorted(expected.environment_names))
+            or profile.memory_bytes != expected.memory_bytes or profile.cpu_millicores != expected.cpu_millicores
+            or profile.pids_limit != expected.pids_limit or len(profile.tmpfs) != 1
+            or profile.tmpfs[0][1] != expected.tmpfs_bytes):
+        return False
+    if (probe_set_digest(actual.probes) if actual.probes is not None else None) != expected.probe_set_digest:
+        return False
+    return verify_generation(actual, expected) is True
+
+
+_effect_context = contextvars.ContextVar('hub_daemon_effect_context', default=None)
 
 
 class _ChunkReader:
@@ -567,6 +631,20 @@ class DockerEngineBackend:
             self._closed = True
             self._client.close()
 
+    @contextmanager
+    def effect_context_scope(self, context):
+        """Carry the guard's exact admitted request in this synchronous call."""
+        from .adapter import EffectCallContext
+        from engineering_hub.container_pilot_client import ContainerPilotRequest
+        if (type(context) is not EffectCallContext or type(context.request) is not ContainerPilotRequest
+                or _effect_context.get() is not None):
+            raise DaemonBackendError('invalid or nested effect context')
+        token = _effect_context.set((self, context))
+        try:
+            yield
+        finally:
+            _effect_context.reset(token)
+
     def _deadline(self, timeout_ms):
         if type(timeout_ms) is not int or not 1 <= timeout_ms <= 120_000:
             raise DaemonBackendError("invalid daemon timeout")
@@ -764,7 +842,8 @@ class DockerEngineBackend:
         except (ValueError, TypeError, AttributeError):
             raise DaemonBackendError("invalid durable operation identity") from None
 
-    def _journal_begin(self, operation_id, kind, *, resource_name=None, target_id=None):
+    def _journal_begin(self, operation_id, kind, *, resource_name=None, target_id=None,
+                       plan=None, observation=None, image=None, probes=None):
         self._operation_id(operation_id)
         if self.operation_journal is None:
             return
@@ -773,6 +852,22 @@ class DockerEngineBackend:
                 self.operation_journal.begin(operation_id, kind)
             else:
                 from .operation_journal import OperationBinding
+                selected = _effect_context.get()
+                if (selected is None or selected[0] is not self
+                        or selected[1].operation_id != operation_id
+                        or self.effect_binding_provider.compare_actual is None
+                        or type(image) is not VerifiedImage):
+                    raise ValueError('verified effect context unavailable')
+                context = selected[1]
+                expected_kinds = {'start': {'start_candidate', 'start_rollback'},
+                                  'probe': {'probe'}, 'stop': {'stop'},
+                                  'create_candidate': {'create_candidate'},
+                                  'create_rollback': {'create_rollback'}}
+                if context.kind not in expected_kinds.get(kind, set()):
+                    raise ValueError('effect kind differs from admitted context')
+                actual = ActualEffectInputs(context, self.binding, plan, observation, image, probes)
+                if self.effect_binding_provider.compare_actual(actual) is not True:
+                    raise ValueError('actual effect differs from independent enrollment')
                 bound = self.effect_binding_provider.create(operation_id, kind, resource_name, target_id)
                 if (type(bound) is not OperationBinding or bound.owner_epoch is not None
                         or bound.resource_name != resource_name or bound.target_id != target_id):
@@ -1027,7 +1122,8 @@ class DockerEngineBackend:
              "Volumes": (cached[1].get("config") or {}).get("Volumes")},
         )
         self._remaining(deadline)
-        self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name)
+        self._journal_begin(operation_id, "create_" + plan.image.role, resource_name=plan.resource_name,
+                            plan=plan, image=plan.image)
         name_route = self._route("/containers/" + quote(plan.resource_name, safe="") + "/json")
         status, _ = self._response_bytes("GET", name_route, deadline,
                                          expected_statuses={200, 404}, body_limit=_MAX_JSON)
@@ -1334,7 +1430,8 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "created", deadline)
-        self._journal_begin(operation_id, "start", target_id=container_id)
+        self._journal_begin(operation_id, "start", target_id=container_id, observation=before,
+                            image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/start")
         self._read_response("POST", route, deadline, expected_status=204)
@@ -1350,7 +1447,8 @@ class DockerEngineBackend:
         deadline = self._deadline(timeout_ms)
         self._operation_id(operation_id)
         before = self._known_container(container_id, "running", deadline)
-        self._journal_begin(operation_id, "stop", target_id=container_id)
+        self._journal_begin(operation_id, "stop", target_id=container_id, observation=before,
+                            image=self._container_images.get(container_id))
         self._assert_runner(deadline)
         route = self._route("/containers/" + container_id + "/stop")
         self._read_response("POST", route, deadline, expected_status=204,
@@ -1506,7 +1604,8 @@ class DockerEngineBackend:
                 or self._container_images.get(container_id, image) != image):
             raise DaemonBackendError("probe target lacks a verified source-image binding")
         self._remaining(deadline)
-        self._journal_begin(operation_id, "probe", target_id=container_id)
+        self._journal_begin(operation_id, "probe", target_id=container_id, observation=observation,
+                            image=image, probes=probes)
         health_ok = True
         for index, (probe, budget) in enumerate(zip(probes, timeout_ms, strict=True)):
             self._remaining(deadline)

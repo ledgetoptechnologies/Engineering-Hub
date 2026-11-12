@@ -6,6 +6,8 @@ import io
 import json
 import tarfile
 from contextlib import closing
+from dataclasses import replace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -16,9 +18,12 @@ from hub_container_executor.daemon_backend import (
     DockerEngineBinding,
     DockerEngineBackend,
     TrustedEffectBindingProvider,
+    ActualEffectInputs, compare_enrolled_effect,
 )
 from hub_container_executor.operation_journal import OperationBinding
 from hub_container_executor.build_record import verify_image_record
+from hub_container_executor.adapter import EffectCallContext
+from engineering_hub.container_pilot_client import ContainerPilotRequest
 from tests.test_hub_container_executor_build_record import FakeStore, FakeTrust, make_record
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
@@ -27,7 +32,7 @@ CONFIG_TYPE = "application/vnd.oci.image.config.v1+json"
 
 
 def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
-    manifest, _, _ = verified_image()
+    manifest, image, _ = verified_image()
     calls = []
     target = 'a' * 64
     operation = '12a15ad8-1c7c-4bd5-bfbf-e6df128ec5a7'
@@ -39,17 +44,56 @@ def test_opt_in_bound_journal_matches_exact_target_before_effect(tmp_path):
         return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
                                 None, target, 'hmac-sha256:' + 'a' * 64, 1)
     backend = DockerEngineBackend(binding(manifest, tmp_path), operation_journal=Journal(),
-                                 effect_binding_provider=TrustedEffectBindingProvider(provider),
+                                 effect_binding_provider=TrustedEffectBindingProvider(provider, lambda actual: True),
                                  test_transport=httpx.MockTransport(lambda _: pytest.fail('unexpected effect')))
     try:
-        backend._journal_begin(operation, 'stop', target_id=target)
+        context = EffectCallContext(ContainerPilotRequest.model_construct(run_id=str(uuid4()), fencing_generation=1), operation, 'stop')
+        with backend.effect_context_scope(context):
+            backend._journal_begin(operation, 'stop', target_id=target, image=image)
         assert len(calls) == 1 and calls[0][:2] == (operation, 'stop')
         backend.effect_binding_provider = TrustedEffectBindingProvider(
             lambda *_: OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
-                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1))
-        with pytest.raises(DaemonBackendError):
-            backend._journal_begin(operation, 'stop', target_id=target)
+                                         None, 'b' * 64, 'hmac-sha256:' + 'a' * 64, 1), lambda actual: True)
+        with backend.effect_context_scope(context), pytest.raises(DaemonBackendError):
+            backend._journal_begin(operation, 'stop', target_id=target, image=image)
         assert len(calls) == 1
+    finally:
+        backend.close()
+
+
+def test_enrolled_actual_projection_rejects_mismatch_and_unverified_generation(tmp_path):
+    from hub_container_executor.backend import ActualImageSelection, ContainerObservation
+    from hub_container_executor.runtime_profile import probe_set_digest
+    from tests.test_hub_container_effect_binding_canonical import fixture
+    backend, manifest, image, plan, _ = create_transcript(tmp_path)
+    try:
+        operation, run_id = str(uuid4()), str(uuid4())
+        request = ContainerPilotRequest.model_construct(run_id=run_id, fencing_generation=3)
+        context = EffectCallContext(request, operation, 'create_candidate')
+        profile = plan.profile
+        expected = replace(fixture(), operation_id=operation, run_id=run_id, fence=3,
+            resource_name=plan.resource_name, image_index_digest=image.runnable_reference,
+            platform_manifest_digest=image.platform_manifest_digest, image_config_id=image.image_config_id,
+            state_generation_id=profile.state_generation_id,
+            environment_names=tuple(name for name, _ in profile.environment),
+            memory_bytes=profile.memory_bytes, cpu_millicores=profile.cpu_millicores,
+            pids_limit=profile.pids_limit, tmpfs_bytes=profile.tmpfs[0][1])
+        actual = ActualEffectInputs(context, backend.binding, plan, None, image, None)
+        assert compare_enrolled_effect(actual, expected, lambda *_: True)
+        assert not compare_enrolled_effect(actual, expected, lambda *_: False)
+        assert not compare_enrolled_effect(actual, replace(expected, fence=4), lambda *_: True)
+        assert not compare_enrolled_effect(actual, replace(expected, memory_bytes=expected.memory_bytes + 1), lambda *_: True)
+        assert not compare_enrolled_effect(actual, replace(expected, boot_id=str(uuid4())), lambda a, e: e.boot_id == expected.boot_id)
+        target = 'c' * 64
+        selected = ActualImageSelection(image.runnable_reference, image.platform_manifest_digest, image.image_config_id, image.platform)
+        observed = ContainerObservation(target, selected, profile, profile.state_generation_id, 'running')
+        probes = manifest.probes.candidate
+        probe_context = EffectCallContext(request, operation, 'probe')
+        probe_actual = ActualEffectInputs(probe_context, backend.binding, None, observed, image, probes)
+        probe_expected = replace(expected, kind='probe', resource_name=None, container_id=target,
+                                 probe_set_digest=probe_set_digest(probes))
+        assert compare_enrolled_effect(probe_actual, probe_expected, lambda *_: True)
+        assert not compare_enrolled_effect(probe_actual, replace(probe_expected, probe_set_digest='sha256:' + 'a' * 64), lambda *_: True)
     finally:
         backend.close()
 
@@ -1507,7 +1551,7 @@ def test_bound_create_is_durable_before_post_and_failures_never_post(tmp_path, m
                 return OperationBinding('2b201b1d-2327-437e-8705-135b9ccf128b', 50, 60,
                     'wrong-name' if failure == 'mismatch' else name, None,
                     'hmac-sha256:' + 'a' * 64, 1)
-            backend.effect_binding_provider = TrustedEffectBindingProvider(provider)
+            backend.effect_binding_provider = TrustedEffectBindingProvider(provider, lambda actual: True)
             original = backend._read_response
             def checked(method, route, *args, **kwargs):
                 if method == 'POST' and route.endswith('/containers/create'):
@@ -1518,15 +1562,17 @@ def test_bound_create_is_durable_before_post_and_failures_never_post(tmp_path, m
             monkeypatch.setattr(backend, '_read_response', checked)
             if failure == 'journal':
                 monkeypatch.setattr(journal, 'begin_bound', lambda *_: (_ for _ in ()).throw(RuntimeError()))
-            if failure == 'none':
-                assert backend.create_container(plan, operation, 5000) == 'c' * 64
-                assert journal.inspect_binding(operation).resource_name == plan.resource_name
-                assert journal.inspect_record(operation).state == 'completed'
-            else:
-                with pytest.raises(DaemonBackendError):
-                    backend.create_container(plan, operation, 5000)
-                assert not any(method == 'POST' for method, _ in requests)
-                assert journal.inspect_record(operation) is None
+            context = EffectCallContext(ContainerPilotRequest.model_construct(run_id=str(uuid4()), fencing_generation=1), operation, 'create_candidate')
+            with backend.effect_context_scope(context):
+                if failure == 'none':
+                    assert backend.create_container(plan, operation, 5000) == 'c' * 64
+                    assert journal.inspect_binding(operation).resource_name == plan.resource_name
+                    assert journal.inspect_record(operation).state == 'completed'
+                else:
+                    with pytest.raises(DaemonBackendError):
+                        backend.create_container(plan, operation, 5000)
+                    assert not any(method == 'POST' for method, _ in requests)
+                    assert journal.inspect_record(operation) is None
     finally:
         backend.close()
 
