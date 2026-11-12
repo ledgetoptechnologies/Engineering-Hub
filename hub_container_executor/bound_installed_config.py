@@ -7,7 +7,6 @@ from dataclasses import dataclass, fields, replace
 import re
 from uuid import UUID
 
-from engineering_hub.current_executor_observation import CurrentLaunchPins
 from .effect_binding_canonical import NonsecretEffectBinding, canonical_nonsecret_binding
 from .enrolled_effect_provider import DeferredTargetEffect
 
@@ -15,19 +14,24 @@ from .enrolled_effect_provider import DeferredTargetEffect
 @dataclass(frozen=True)
 class InstalledBoundProfile:
     key_id: str
-    launch: CurrentLaunchPins
+    approval_path: str
+    approver_public_key: bytes
+    approval_wait_ms: int
     effects: tuple
 
 
 def parse_bound_profile(value):
-    if type(value) is not dict or set(value) != {'key_id', 'launch', 'effects'}:
+    if type(value) is not dict or set(value) != {'key_id', 'approval_path', 'approver_public_key_hex', 'approval_wait_ms', 'effects'}:
         raise ValueError('closed bound profile required')
     if type(value['key_id']) is not str or not re.fullmatch(r'sha256:[a-f0-9]{64}', value['key_id']):
         raise ValueError('independent key identity required')
-    launch_data = value['launch']
-    if type(launch_data) is not dict or set(launch_data) != {f.name for f in fields(CurrentLaunchPins)}:
-        raise ValueError('independent launch pins required')
-    launch = CurrentLaunchPins(**launch_data)
+    import os
+    path, public_hex, wait_ms = value['approval_path'], value['approver_public_key_hex'], value['approval_wait_ms']
+    if (type(path) is not str or not path.startswith('/') or path.startswith('//') or path == '/'
+            or os.path.normpath(path) != path or '\x00' in path
+            or type(public_hex) is not str or not re.fullmatch(r'[a-f0-9]{64}', public_hex)
+            or type(wait_ms) is not int or not 100 <= wait_ms <= 3600000):
+        raise ValueError('protected postlaunch approval admission required')
     rows = value['effects']
     if type(rows) is not list or not 1 <= len(rows) <= 128:
         raise ValueError('bounded effect enrollment required')
@@ -57,4 +61,4 @@ def parse_bound_profile(value):
             result.append(DeferredTargetEffect(effect, origin))
     if len({(x.template if type(x) is DeferredTargetEffect else x).operation_id for x in result}) != len(result):
         raise ValueError('duplicate effect identity')
-    return InstalledBoundProfile(value['key_id'], launch, tuple(result))
+    return InstalledBoundProfile(value['key_id'], path, bytes.fromhex(public_hex), wait_ms, tuple(result))

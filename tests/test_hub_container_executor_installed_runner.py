@@ -357,11 +357,8 @@ def test_bound_pilot_requires_closed_v3_profile_and_preexisting_journal():
     binding = asdict(fixture())
     binding.pop('owner_epoch')
     binding['environment_names'] = list(binding['environment_names'])
-    source['bound_profile'] = dict(key_id=digest('b'), launch=dict(
-        launch_id=str(uuid4()), boot_id=str(uuid4()), authenticated_host_pid=500,
-        process_start_ticks=600, container_id='c'*64,
-        engine_id=source['docker_binding']['daemon_identity'], engine_pid=700,
-        engine_start_ticks=800, approval_expires_at_ms=1800000000000),
+    source['bound_profile'] = dict(key_id=digest('b'), approval_path='/fixture/approval.json',
+        approver_public_key_hex='e'*64, approval_wait_ms=30000,
         effects=[dict(binding=binding, create_command_id=None)])
     result = module.parse_configuration(canonical(source))
     assert result.bound_profile.key_id == digest('b')
@@ -369,7 +366,7 @@ def test_bound_pilot_requires_closed_v3_profile_and_preexisting_journal():
     for transform in (
         lambda v: v['resources'].__setitem__('journal_create', True),
         lambda v: v['bound_profile'].__setitem__('key_id', 'secret-value'),
-        lambda v: v['bound_profile']['launch'].__setitem__('engine_id', 'wrong-engine'),
+        lambda v: v['bound_profile'].__setitem__('approval_path', '../not-absolute'),
         lambda v: v['bound_profile']['effects'].append(v['bound_profile']['effects'][0]),
         lambda v: v['bound_profile']['effects'][0]['binding'].__setitem__('owner_epoch', str(uuid4())),
     ):

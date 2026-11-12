@@ -441,10 +441,12 @@ def test_opt_in_resources_enable_protocol_without_contacting_daemon(rig):
         assert type(adapter.state_provisioner) is FrozenSQLiteStateProvisioner
 
 
-def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(rig, signed_observer_setup):
+def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(rig, signed_observer_setup, monkeypatch):
     from engineering_hub.current_executor_observation import CurrentExecutorObserver
     from hub_container_executor.bound_installed_config import InstalledBoundProfile
     from hub_container_executor.effect_mac_key import create_for_new_journal
+    from hub_container_executor.postlaunch_delivery import ProtectedApprovalLease
+    from hub_container_executor.runtime_identity import LaunchReceiptIdentityVerifier
     from tests.test_hub_container_effect_binding_canonical import fixture
     clock, release, launch, signer, old_observer = signed_observer_setup
     class Driver:
@@ -458,9 +460,14 @@ def test_bound_resources_reopen_only_with_real_signed_observer_and_existing_key(
                       platform=rig.params['binding'].platform)
     launch = replace(launch, engine_id=rig.params['binding'].daemon_identity)
     observer = CurrentExecutorObserver(release=release, launch=launch, transport=Signer(release, launch, signer.key, clock))
-    profile = InstalledBoundProfile(key_id, launch, (fixture(),))
+    profile = InstalledBoundProfile(key_id, '/fixture/approval.json', bytes(32), 30000, (fixture(),))
+    # This resource-lifecycle fixture isolates sequencing; crypto/delivery
+    # checks are covered by postlaunch approval tests, not this synthetic lease.
+    lease = ProtectedApprovalLease('/fixture/approval.json', bytes(32), SimpleNamespace(launch=launch),
+                                   object.__new__(LaunchReceiptIdentityVerifier), release, bytes(32), launch.engine_id)
+    monkeypatch.setattr(ProtectedApprovalLease, 'check', lambda self: self.approval)
     params.update(journal_create=False, state_reservations_create=False,
-                  bound_profile=profile, bound_observer=observer, bound_release=release)
+                  bound_profile=profile, bound_observer=observer, bound_release=release, bound_approval_lease=lease)
     try:
         with module.local_host_adapter_resources(**params) as adapter:
             assert adapter.effect_context_guard.scope.__self__ is adapter.backend

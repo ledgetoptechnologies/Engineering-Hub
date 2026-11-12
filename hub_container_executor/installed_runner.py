@@ -151,7 +151,7 @@ def parse_configuration(raw):
             _require(resources['single_pilot_protocol'] is True)
         bound = parse_bound_profile(value['bound_profile']) if value['schema'] == SCHEMA_BOUND_PILOT else None
         if bound is not None:
-            _require(resources['journal_create'] is False and bound.launch.engine_id == binding.daemon_identity)
+            _require(resources['journal_create'] is False)
         for name in _RESOURCE_PATHS:
             _path(resources[name])
         for name in ('journal_create', 'state_reservations_create'):
@@ -279,12 +279,17 @@ async def run_installed_executor(config):
             owned.callback(observations.close)
             bound_options = {}
             if config.bound_profile is not None:
+                from .postlaunch_delivery import wait_for_postlaunch_approval
                 pins = CurrentExecutorReleasePins(**{name: getattr(config.release, name)
                     for name in CurrentExecutorReleasePins.__dataclass_fields__})
-                observer = CurrentExecutorObserver(release=pins, launch=config.bound_profile.launch,
+                lease = wait_for_postlaunch_approval(config.bound_profile.approval_path,
+                    verifier=verifier, release=pins, approver_public_key=config.bound_profile.approver_public_key,
+                    expected_engine_id=config.binding.daemon_identity, timeout_ms=config.bound_profile.approval_wait_ms)
+                observer = CurrentExecutorObserver(release=pins, launch=lease.approval.launch,
                     transport=observations, exchange_timeout_ms=config.timeout_ms)
                 owned.callback(observer.close)
-                bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer, bound_release=pins)
+                bound_options = dict(bound_profile=config.bound_profile, bound_observer=observer,
+                                     bound_release=pins, bound_approval_lease=lease)
             with ImmutableTestSecretResolver(config.resources['secret_root'],
                     bindings=config.resources['secret_bindings']) as secrets:
                 bearer = secrets.resolve_test_secret(*config.bearer_slot)

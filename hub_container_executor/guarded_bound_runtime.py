@@ -27,7 +27,7 @@ class GuardedBoundRuntime:
     guard: TrustedEffectContextGuard
 
 
-def build_guarded_bound_runtime(adapter, key, effects, *, observer, release, launch):
+def build_guarded_bound_runtime(adapter, key, effects, *, observer, release, launch, approval_lease=None):
     """Build explicit guard/provider using one independently enrolled observer.
 
     The owner supplies pre-enrolled effects and original launch/release pins.
@@ -47,6 +47,10 @@ def build_guarded_bound_runtime(adapter, key, effects, *, observer, release, lau
     backend = adapter.backend
     journal = backend.operation_journal
     pid = os.getpid()
+    if approval_lease is not None:
+        from .postlaunch_delivery import ProtectedApprovalLease
+        if type(approval_lease) is not ProtectedApprovalLease or approval_lease.check().launch != launch:
+            raise ValueError('independent postlaunch approval required')
 
     def current_request(context):
         if os.getpid() != pid or adapter.ledger is not ledger or backend.operation_journal is not journal:
@@ -70,10 +74,13 @@ def build_guarded_bound_runtime(adapter, key, effects, *, observer, release, lau
                     and target['state'] == 'running')
 
     def fresh():
+        if approval_lease is not None and approval_lease.check().launch != launch:
+            return False
         proof = observer.observe_verified()
         return (type(proof) is VerifiedExecutorObservation and proof.expires_wall_ms is not None
                 and time.monotonic() < proof.expires_monotonic
-                and int(time.time() * 1000) < proof.expires_wall_ms)
+                and int(time.time() * 1000) < proof.expires_wall_ms
+                and (approval_lease is None or approval_lease.check().launch == launch))
 
     def guard_verify(context):
         return current_request(context) and fresh() and current_request(context)

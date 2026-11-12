@@ -95,7 +95,7 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
         baseline_receipt_root, secret_root, secret_bindings, build_enrollments,
         baseline_receipt_digest, baseline_runtime_profile_digest, frozen_backup,
         reservation_root, state_reservations_create, driver_identity_verifier, single_pilot_protocol=False,
-        bound_profile=None, bound_observer=None, bound_release=None):
+        bound_profile=None, bound_observer=None, bound_release=None, bound_approval_lease=None):
     """Yield one freshly constructed exact HostAdapter with concrete providers.
 
     All directories must already exist, be canonical and pairwise nonnested;
@@ -125,6 +125,8 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
     """
     try:
         from .bound_installed_config import InstalledBoundProfile
+        from .postlaunch_delivery import ProtectedApprovalLease
+        from .runtime_identity import LaunchReceiptIdentityVerifier
         from engineering_hub.current_executor_observation import CurrentExecutorObserver, CurrentExecutorReleasePins
         if (sys.platform != "linux" or os.getuid() != 10001 or os.getgid() != 10001
                 or type(manifest) is not PilotManifest
@@ -134,9 +136,15 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                 or not callable(getattr(driver_identity_verifier, "implementation_commit", None))):
             raise LocalResourcesError("Explicit private Linux resource configuration required")
         if bound_profile is None:
-            if bound_observer is not None or bound_release is not None:
+            if bound_observer is not None or bound_release is not None or bound_approval_lease is not None:
                 raise LocalResourcesError('Unexpected bound runtime input')
         elif (type(bound_profile) is not InstalledBoundProfile or type(bound_observer) is not CurrentExecutorObserver
+              or type(bound_approval_lease) is not ProtectedApprovalLease
+              or type(bound_approval_lease.verifier) is not LaunchReceiptIdentityVerifier
+              or bound_approval_lease.path != bound_profile.approval_path
+              or bound_approval_lease.approver_public_key != bound_profile.approver_public_key
+              or bound_approval_lease.expected_engine_id != binding.daemon_identity
+              or bound_approval_lease.release != bound_release
               or type(bound_release) is not CurrentExecutorReleasePins or not single_pilot_protocol or journal_create):
             raise LocalResourcesError('Explicit pre-existing bound pilot enrollment required')
         manifest = PilotManifest.from_bytes(manifest.canonical_bytes())
@@ -220,7 +228,7 @@ def local_host_adapter_resources(*, manifest, binding, adapter_database,
                     if type(item) is DeferredTargetEffect else replace(item, owner_epoch=journal._owner.epoch)
                     for item in bound_profile.effects)
                 runtime = build_guarded_bound_runtime(adapter, key, effects, observer=bound_observer,
-                    release=bound_release, launch=bound_profile.launch)
+                    release=bound_release, launch=bound_approval_lease.check().launch, approval_lease=bound_approval_lease)
                 backend.effect_binding_provider, adapter.effect_context_guard = runtime.provider, runtime.guard
             yield adapter
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
