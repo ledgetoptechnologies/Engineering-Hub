@@ -450,6 +450,36 @@ def test_tracking_mutation_does_not_disclose_cross_project_or_archived_ids(unifi
     assert repo._read(valid['id'], 'tracking_task')['revision'] == verified['revision']
 
 
+def test_tracking_history_and_compaction_obey_live_project_grants(unified):
+    client, app, bus, _ = unified
+    env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)
+    installation, token, _ = pair(env, caps=('tracking.read', 'tracking.update'), projects=(PROJECT, '3d-viewer'))
+    invoke, _ = sdk(client, token)
+    repo = app.state.repository
+    valid = repo.propose_tracking_task('codex', PROJECT, 'Long work', 'history-valid')
+    for i in range(51):
+        valid = repo.update_tracking_task('codex', valid['id'], valid['revision'], f'history-{i}',
+                                          progress=f'Update {i}', evidence_links=[])
+    private = repo.propose_tracking_task('codex', 'project-alpha', 'Private', 'history-private')
+    archived = repo.propose_tracking_task('codex', '3d-viewer', 'Archived', 'history-archived')
+    env.bridge.projects.archive_project(OWNER, '3d-viewer', 1)
+    missing = '00000000-0000-4000-8000-000000000000'
+    for tool, args in (
+        ('hub_tracking_task_history', {'kind': 'updates'}),
+        ('hub_tracking_task_compact', {'expected_revision': 1, 'client_request_id': 'compact-private'}),
+    ):
+        results = [invoke(tool, {**args, 'task_id': task_id}) for task_id in (private['id'], archived['id'], missing)]
+        assert all(result['isError'] for result in results)
+        assert len({result['content'][0]['text'] for result in results}) == 1
+        assert 'hub_tracking_task_unavailable' in results[0]['content'][0]['text']
+    page = data(invoke('hub_tracking_task_history', {'task_id': valid['id'], 'kind': 'updates'}))
+    assert page['records'][0]['progress'] == 'Update 0'
+    env.bridge.grant_revoke(OWNER, installation, 1)
+    assert invoke('hub_tracking_task_history', {'task_id': valid['id'], 'kind': 'updates'})['isError']
+    assert invoke('hub_tracking_task_compact', {'task_id': valid['id'], 'expected_revision': valid['revision'],
+                  'client_request_id': 'after-revoke'})['isError']
+
+
 def test_session_id_tools_do_not_disclose_unavailable_entities(unified):
     client, app, bus, _ = unified
     env = SimpleNamespace(sessions=bus.state.agent_sessions, bridge=app.state.session_hub_bridge)

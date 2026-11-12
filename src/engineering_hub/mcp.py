@@ -252,6 +252,18 @@ def build_hub_mcp(repo, auth, *, topic_peers=None, topic_preflight=None, autonom
                       client_request_id, verdict=verdict, note=note, evidence_links=evidence_links))
 
     @registration.tool()
+    def hub_tracking_task_compact(task_id: str, expected_revision: StrictInt, client_request_id: str, ctx: Context) -> dict:
+        """Explicitly compact old tracking history, preserving it in bounded pages."""
+        return invoke(repo.compact_tracking_history, identity(ctx), task_id, expected_revision, client_request_id)
+
+    @registration.tool()
+    def hub_tracking_task_history(task_id: str, kind: str, ctx: Context,
+                                  before: StrictInt | None = None) -> dict:
+        """Read one bounded page of older tracking updates or reviews."""
+        identity(ctx)
+        return invoke(repo.tracking_history, task_id, kind, before)
+
+    @registration.tool()
     def hub_tracking_task_list(project: str, ctx: Context, limit: StrictInt = 100,
                                after_task_id: str | None = None, unfinished: StrictBool = False) -> dict:
         """Read inert tracking records; unfinished includes open work and unverified claims."""

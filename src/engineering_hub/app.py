@@ -1071,6 +1071,11 @@ def create_app(settings: Settings | None = None, *, repository=None, github_clie
         return {'project': project, 'tasks': rows[:limit], 'truncated': more,
                 'next_after': rows[limit - 1]['id'] if more else None}
 
+    @app.get('/api/hub/v1/tracking-tasks/{task_id}/history')
+    def tracking_task_history(task_id: str, request: Request, kind: str, before: int | None = None):
+        human(request)
+        return repo.tracking_history(task_id, kind, before)
+
     @app.post('/api/hub/v1/tracking-tasks/{task_id}/review')
     def review_tracking_task(task_id: str, payload: TrackingReview, request: Request):
         return repo.review_tracking_task(human(request, mutation=True), task_id, payload.expected_revision,

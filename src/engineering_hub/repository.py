@@ -310,6 +310,118 @@ class HubRepository:
                               (project, after or '', limit + 1)).fetchall()
             return [json.loads(row['data']) for row in rows]
 
+    @staticmethod
+    def _tracking_segment_id(identity, kind, index):
+        return str(uuid.uuid5(uuid.UUID(identity), f'tracking-history:{kind}:{index}'))
+
+    def _tracking_rollover(self, db, item, kind, *, force=False):
+        """Move a full bounded window into an immutable, task-scoped segment."""
+        records = item.setdefault(kind, [])
+        if not force and len(records) < 50 and len(_json(item).encode('utf-8')) < 256 * 1024:
+            return
+        if type(records) is not list or len(records) > 50:
+            raise HubError('tracking_history_corrupt', 409)
+        # An oversized window of the other kind can precede this kind's first
+        # record, e.g. a large completion claim followed by its first review.
+        if not records:
+            if not force:
+                other = 'reviews' if kind == 'updates' else 'updates'
+                self._tracking_rollover(db, item, other, force=True)
+            return
+        # Preserve the latest visible update/review for old clients and, for
+        # claims, the exact record used by independent review.
+        keep = 1
+        if len(records) <= keep:
+            if not force and len(_json(item).encode('utf-8')) >= 256 * 1024:
+                other = 'reviews' if kind == 'updates' else 'updates'
+                self._tracking_rollover(db, item, other, force=True)
+            return
+        counts = item.setdefault('history_segments', {})
+        index = counts.get(kind, 0)
+        if type(index) is not int or index < 0:
+            raise HubError('tracking_history_corrupt', 409)
+        # Legacy 50-entry windows may exceed the enrollment cell limit. Split
+        # them without loss, keeping each immutable segment bounded by bytes as
+        # well as record count; cursors remain stable as new segments appear.
+        pending = list(records[:-keep] if keep else records)
+        while pending:
+            chunk = []
+            while pending and len(chunk) < 50:
+                candidate = chunk + [pending[0]]
+                value = dict(task_id=item['id'], project=item['project'], kind=kind, index=index, records=candidate)
+                if len(_json(value).encode('utf-8')) > 256 * 1024:
+                    break
+                chunk.append(pending.pop(0))
+            if not chunk:
+                raise HubError('tracking_history_corrupt', 409)
+            segment = dict(task_id=item['id'], project=item['project'], kind=kind, index=index, records=chunk)
+            try:
+                db.execute('INSERT INTO hub_entities(id,kind,data) VALUES(?,?,?)',
+                           (self._tracking_segment_id(item['id'], kind, index), 'tracking_history', _json(segment)))
+            except (sqlite3.IntegrityError, ValueError):
+                raise HubError('tracking_history_corrupt', 409) from None
+            index += 1
+        counts[kind] = index
+        item[kind] = records[-keep:] if keep else []
+        if not force and len(_json(item).encode('utf-8')) >= 256 * 1024:
+            other = 'reviews' if kind == 'updates' else 'updates'
+            self._tracking_rollover(db, item, other, force=True)
+
+    def tracking_history(self, identity, kind, before=None):
+        """Read one older immutable segment, never an unbounded history."""
+        if kind not in ('updates', 'reviews') or (before is not None and (type(before) is not int or before < 1)):
+            raise HubError('invalid_input', 422)
+        with self._connection() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            count = item.get('history_segments', {}).get(kind, 0)
+            if type(count) is not int or count < 0 or (before is not None and before > count):
+                raise HubError('invalid_cursor', 422)
+            index = (count if before is None else before) - 1
+            if index < 0:
+                return dict(task_id=identity, kind=kind, records=[], next_before=None)
+            try:
+                segment = self._get(db, self._tracking_segment_id(identity, kind, index), 'tracking_history')
+            except (HubError, ValueError):
+                raise HubError('tracking_history_corrupt', 409) from None
+            if (segment.get('task_id') != identity or segment.get('project') != item['project']
+                    or segment.get('kind') != kind or segment.get('index') != index
+                    or type(segment.get('records')) is not list or not 1 <= len(segment['records']) <= 50):
+                raise HubError('tracking_history_corrupt', 409)
+            return dict(task_id=identity, kind=kind, records=segment['records'],
+                        next_before=index if index else None)
+
+    def compact_tracking_history(self, actor, identity, expected_revision, client_request_id):
+        """Explicit, audited legacy conversion; no execution or status change."""
+        self._actor(actor, agent=True)
+        key = self._text(client_request_id, 128)
+        fingerprint = hashlib.sha256(_json(['tracking_compact', identity, expected_revision]).encode()).hexdigest()
+        with self._transaction() as db:
+            item = self._get(db, identity, 'tracking_task')
+            self._project(item['project'], db)
+            prior = db.execute('SELECT * FROM hub_requests WHERE actor=? AND key=?', (actor, key)).fetchone()
+            if prior:
+                if prior['fingerprint'] != fingerprint:
+                    raise HubError('idempotency_conflict', 409)
+                return self._get(db, prior['entity_id'], 'tracking_task')
+            self._cas(item, expected_revision)
+            before = _json(item)
+            # Legacy claims lacked their own revision. Preserve the original
+            # inferred claim revision before an audit-only compaction bumps the
+            # task revision, so later review still names the exact claim.
+            if item.get('status') == 'completion_claimed':
+                updates = item.get('updates', [])
+                if not updates or updates[-1].get('completion_claim') is not True:
+                    raise HubError('tracking_history_corrupt', 409)
+                if 'revision' not in updates[-1]:
+                    updates[-1]['revision'] = item['revision']
+            self._tracking_rollover(db, item, 'updates', force=True)
+            self._tracking_rollover(db, item, 'reviews', force=True)
+            if _json(item) != before:
+                item = self._save(db, actor, 'tracking_task.history_compacted', 'tracking_task', item)
+            db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))
+            return item
+
     def project_task_page(self, project, limit, after):
         """Bounded project-only rows, with status audit selected by revision."""
         with self._connection() as db:
@@ -373,8 +485,7 @@ class HubRepository:
             self._cas(item, expected_revision)
             if item['status'] == 'completion_verified':
                 raise HubError('tracking_reopen_required', 409)
-            if len(item['updates']) >= 50:
-                raise HubError('tracking_history_full', 409)
+            self._tracking_rollover(db, item, 'updates')
             item['updates'].append(dict(actor=actor, progress=progress, evidence_links=links,
                                         completion_claim=completion_claim, actor_family=session_context.family(actor),
                                         revision=expected_revision + 1))
@@ -420,12 +531,13 @@ class HubRepository:
             if verdict == 'verify' and any(link not in claim.get('evidence_links', []) for link in links):
                 raise HubError('tracking_evidence_mismatch', 409)
             reviews = item.setdefault('reviews', [])
-            if len(reviews) >= 50:
-                raise HubError('tracking_history_full', 409)
+            claim_revision = claim.get('revision', expected_revision if item['status'] == 'completion_claimed'
+                                       else reviews[-1]['claim_revision'])
+            self._tracking_rollover(db, item, 'reviews')
+            reviews = item['reviews']
             reviews.append(dict(actor=actor, actor_family=session_context.family(actor), verdict=verdict,
                                 note=note, evidence_links=links,
-                                claim_revision=claim.get('revision', expected_revision if item['status'] == 'completion_claimed'
-                                                         else reviews[-1]['claim_revision'])))
+                                claim_revision=claim_revision))
             item['status'] = 'completion_verified' if verdict == 'verify' else 'open'
             item = self._save(db, actor, 'tracking_task.reviewed', 'tracking_task', item)
             db.execute('INSERT INTO hub_requests VALUES(?,?,?,?)', (actor, key, fingerprint, item['id']))

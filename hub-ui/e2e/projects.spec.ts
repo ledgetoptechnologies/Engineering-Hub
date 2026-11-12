@@ -262,6 +262,53 @@ test("project tracking starts at the first page after changing project", async (
   expect(requests.filter(value => value.startsWith(`${second}:`))).toEqual([`${second}:first`]);
 });
 
+test("earlier tracking history is paged and keeps claim and review meanings", async ({ page }) => {
+  const { overview } = await fixture(page);
+  const project = overview.projects[0].id as string;
+  const id = "11111111-1111-4111-8111-111111111111";
+  await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json", body:JSON.stringify({project,
+    tasks:[{id,project,title:"Long work",status:"open",revision:110,created_by:"codex",execution_authorization:false,
+      updates:[{actor:"codex",progress:"Current",evidence_links:[],completion_claim:false}],history_segments:{updates:2,reviews:1}}],
+    truncated:false,next_after:null})}));
+  await page.route("**/api/hub/v1/tracking-tasks/*/history*", route => {
+    const url = new URL(route.request().url()), kind = url.searchParams.get("kind"), before = url.searchParams.get("before");
+    const records = kind === "updates" ? [{actor:"codex",progress:before ? "Oldest" : "Claimed", completion_claim:!before,
+      evidence_links:[{label:"Evidence",url:"https://example.test/proof"}]}] : [{actor:"claude",verdict:"verify",note:"Checked",evidence_links:[]}];
+    return route.fulfill({contentType:"application/json",body:JSON.stringify({task_id:id,kind,records,next_before:kind === "updates" && !before ? 1 : null})});
+  });
+  await page.goto(`/#/projects/${project}/work`);
+  const panel = page.getByRole("region", {name:"Project tracking"});
+  await panel.getByText("Earlier updates", {exact:true}).click();
+  await panel.getByRole("button", {name:"Load earlier updates"}).click();
+  await expect(panel.getByText("Completion claimed — unverified", {exact:false})).toBeVisible();
+  await expect(panel.getByRole("link", {name:"Evidence"})).toHaveAttribute("href", "https://example.test/proof");
+  await panel.getByRole("button", {name:"Older updates"}).click();
+  await expect(panel.getByText("Oldest", {exact:false})).toBeVisible();
+  await expect(panel.getByText("Claimed", {exact:false})).toHaveCount(0);
+  await panel.getByText("Earlier reviews", {exact:true}).click();
+  await panel.getByRole("button", {name:"Load earlier reviews"}).click();
+  await expect(panel.getByText("Verified claim", {exact:false})).toBeVisible();
+});
+
+for (const status of [401, 403]) {
+  test(`earlier history ${status} clears loaded private task data`, async ({ page }) => {
+    const { overview } = await fixture(page);
+    const project = overview.projects[0].id as string, id = "11111111-1111-4111-8111-111111111111";
+    await page.route("**/api/hub/v1/projects/*/tracking-tasks*", route => route.fulfill({contentType:"application/json",body:JSON.stringify({project,
+      tasks:[{id,project,title:"Private tracked task",status:"open",revision:55,created_by:"codex",execution_authorization:false,
+        updates:[{actor:"codex",progress:"Private current progress",evidence_links:[],completion_claim:false}],history_segments:{updates:1}}],
+      truncated:false,next_after:null})}));
+    await page.route("**/api/hub/v1/tracking-tasks/*/history*", route => route.fulfill({status,contentType:"application/json",body:JSON.stringify({detail:{code:status === 401 ? "human_session_required" : "forbidden"}})}));
+    await page.goto(`/#/projects/${project}/work`);
+    await expect(page.getByText("Private current progress", {exact:false})).toBeVisible();
+    await page.getByText("Earlier updates", {exact:true}).click();
+    await page.getByRole("button", {name:"Load earlier updates"}).click();
+    await expect(page.getByRole("link", {name:"Sign in securely"})).toBeVisible();
+    await expect(page.getByText("Private current progress", {exact:false})).toHaveCount(0);
+    await expect(page.getByText("Private tracked task", {exact:true})).toHaveCount(0);
+  });
+}
+
 test("tracking defaults to unfinished and resets paging when filter changes", async ({ page }) => {
   const { overview } = await fixture(page);
   const project = overview.projects[0].id as string;

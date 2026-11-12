@@ -264,7 +264,7 @@ async def test_unified_stateful_session_and_native_notifications_cross_agent_ali
             assert initialized.capabilities.resources.subscribe is True
             tools = (await codex.list_tools()).tools
             expected = BUS_TOOLS | HUB_TOOLS
-            assert len(expected) == 60
+            assert len(expected) == 62
             assert len(tools) == len(expected) and {tool.name for tool in tools} == expected
             await codex.subscribe_resource('agentbus://inbox/codex')
             async with httpx.AsyncClient(headers={'Host': 'hub.test'}, trust_env=False) as http:
