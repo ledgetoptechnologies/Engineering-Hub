@@ -73,6 +73,62 @@ def test_bound_target_validation_and_no_plaintext_binding(path):
 
 
 @LINUX
+@pytest.mark.parametrize("kind", ("start", "stop", "probe"))
+def test_bound_completion_requires_original_container_and_allows_exact_retry(path, kind):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, kind, binding(name=None, target=CID))
+        with pytest.raises(OperationJournalConflict):
+            store.completed(identity, kind, "b" * 64)
+        assert store.inspect_record(identity).state == "pending"
+        assert store.inspect_record(identity).container_id is None
+        store.completed(identity, kind, CID)
+        store.completed(identity, kind, CID)
+    with journal(path, create=False) as store:
+        assert store.inspect_record(identity).container_id == CID
+        store.completed(identity, kind, CID)
+        with pytest.raises(OperationJournalConflict):
+            store.completed(identity, kind, "b" * 64)
+
+
+@LINUX
+@pytest.mark.parametrize("kind", ("start", "stop", "probe"))
+def test_conflicting_bound_receipt_rejected_before_owner_reopen(path, kind):
+    identity = str(uuid4())
+    with journal(path) as store:
+        store.enable_bindings()
+        store.begin_bound(identity, kind, binding(name=None, target=CID))
+        store.completed(identity, kind, CID)
+    with sqlite3.connect(path) as db:
+        owner_before = db.execute("SELECT * FROM hub_pilot_owner").fetchall()
+        epochs_before = db.execute("SELECT * FROM hub_pilot_owner_epochs").fetchall()
+        db.execute("UPDATE private_operation_journal SET container_id=? WHERE operation_id=?",
+                   ("b" * 64, identity))
+    with pytest.raises(OperationJournalError):
+        journal(path, create=False)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT * FROM hub_pilot_owner").fetchall() == owner_before
+        assert db.execute("SELECT * FROM hub_pilot_owner_epochs").fetchall() == epochs_before
+
+
+@LINUX
+def test_bound_completion_preserves_legacy_and_create_receipts(path):
+    legacy, created = str(uuid4()), str(uuid4())
+    with journal(path) as store:
+        store.begin(legacy, "stop")
+        store.completed(legacy, "stop", CID)
+        store.enable_bindings()
+        store.completed(legacy, "stop", CID)
+        store.begin_bound(created, "create_candidate", binding())
+        store.completed(created, "create_candidate", "b" * 64)
+    with journal(path, create=False) as store:
+        assert store.inspect_record(legacy).container_id == CID
+        assert store.inspect_binding(legacy) is None
+        assert store.inspect_record(created).container_id == "b" * 64
+
+
+@LINUX
 def test_interrupted_migration_rolls_back_both_schema_and_version(path, monkeypatch):
     with journal(path) as store:
         original = __import__("hub_container_executor.operation_journal", fromlist=["_schema"])

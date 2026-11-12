@@ -103,10 +103,12 @@ def _schema(db, *, inspect_rows=False):
         for row in db.execute("SELECT operation_id,kind,state,container_id FROM private_operation_journal"):
             _row(row)
         if version == 2:
-            for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
-                _validate_binding_row(row)
-                if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[-1],)).fetchone() is None:
+            for row in db.execute("SELECT b.operation_id,j.kind,b.boot_id,b.daemon_pid,b.daemon_start,b.resource_name,b.target_id,b.request_mac,b.fence,b.owner_epoch,j.state,j.container_id FROM private_operation_binding b LEFT JOIN private_operation_journal j ON j.operation_id=b.operation_id"):
+                _validate_binding_row(row[:10])
+                if db.execute("SELECT 1 FROM hub_pilot_owner_epochs WHERE epoch=?", (row[9],)).fetchone() is None:
                     raise OperationJournalError("Unknown binding owner epoch")
+                if row[10] == "completed" and row[6] is not None and row[11] != row[6]:
+                    raise OperationJournalError("Operation receipt conflicts with bound target")
 
 
 @dataclass(frozen=True)
@@ -346,6 +348,11 @@ class SQLiteOperationJournal:
             _row(row)
             if row is None or row[1] != kind or (row[2] == "completed" and row[3] != container_id):
                 raise OperationJournalConflict("Operation receipt conflicts with durable intent")
+            if db.execute("PRAGMA user_version").fetchone() == (2,):
+                binding = db.execute("SELECT target_id FROM private_operation_binding WHERE operation_id=?",
+                                     (operation_id,)).fetchone()
+                if binding is not None and binding[0] is not None and binding[0] != container_id:
+                    raise OperationJournalConflict("Operation receipt conflicts with bound target")
             if row[2] == "pending":
                 db.execute("UPDATE private_operation_journal SET state='completed', container_id=? WHERE operation_id=?",
                            (container_id, operation_id))
