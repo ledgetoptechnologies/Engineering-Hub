@@ -1,5 +1,6 @@
 """Exact read-only hold recognition; real journals/queue, synthetic lost ACK."""
 import json
+import hashlib
 import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,7 +39,7 @@ async def held(tmp_path):
     client = Client(); client.lost_ack = True
     old = StagingController(repo, queue, client, resources=resources,
         control_principal=principal, actions=actions)
-    submission = await old.submit('codex', payload())
+    submission = await old.submit('codex', payload(repo))
     result = await old.run_once()
     assert result['phase'] == 'held' and client.posts == 1
     reopened = HubRepository(path)
@@ -92,7 +93,8 @@ async def test_original_claimed_generation_or_queued_gap_is_only_preserved(held,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('change', ['job', 'actor', 'request', 'fingerprint', 'source', 'command', 'phase',
-    'missingclaim', 'claimworker', 'claimfence', 'target', 'resourcekind', 'resourceid', 'duplicateids'])
+    'missingclaim', 'claimworker', 'claimfence', 'target', 'resourcekind', 'resourceid', 'duplicateids',
+    'review_task', 'review_revision', 'binding_scheme', 'binding_digest'])
 async def test_submission_tampering_retains_enrollment_veto(held, change):
     def mutate(item):
         if change == 'job': item['job_id'] = str(uuid.uuid4())
@@ -106,11 +108,52 @@ async def test_submission_tampering_retains_enrollment_veto(held, change):
         elif change == 'claimworker': item['claim']['worker'] = 'executor:staging-service:' + str(uuid.uuid4())
         elif change == 'claimfence': item['claim']['fence'] += 1
         elif change == 'target': item['claim']['target']['source_commit'] = 'b' * 40
+        elif change == 'review_task': item['review_task_id'] = str(uuid.uuid4())
+        elif change == 'review_revision': item['review_task_revision'] += 1
+        elif change == 'binding_scheme': item['source_binding']['scheme'] = 'unknown'
+        elif change == 'binding_digest': item['source_binding']['archive_sha256'] = 'c' * 64
         elif change == 'resourcekind': item['resource_ids']['foreign'] = item['resource_ids'].pop('workspace')
         elif change == 'resourceid': item['resource_ids']['workspace'] = str(uuid.uuid4())
         else: item['resource_ids']['workspace'] = item['resource_ids']['preview']
     with held.repo._transaction() as db:
         journal(db, held, mutate)
+        before = list(db.iterdump()); changes = db.total_changes
+        assert recognize(held, db) is False
+        assert list(db.iterdump()) == before and db.total_changes == changes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['task_id', 'submission_id', 'review_revision', 'review_revision_bool'])
+async def test_coherent_target_rewrite_cannot_rebind_original_submission(held, field):
+    # Update the claim and queue fingerprint too: denial must come from the
+    # original submission binding, not merely a stale duplicate field.
+    with held.repo._transaction() as db:
+        row = db.execute('SELECT * FROM hub_work_jobs WHERE id=?', (held.job_id,)).fetchone()
+        target = json.loads(row['target'])
+        target['review_revision' if field == 'review_revision_bool' else field] = (
+            True if field == 'review_revision_bool' else
+            target['review_revision'] + 1 if field == 'review_revision' else str(uuid.uuid4()))
+        target_json = json.dumps(target, sort_keys=True, separators=(',', ':'))
+        fingerprint = json.dumps([row['action_key'], row['environment'], row['machine_id'], row['project'],
+                                  bool(row['requires_execution_proof']), row['approval_id'], target_json],
+                                 separators=(',', ':'))
+        db.execute('UPDATE hub_work_jobs SET target=?,fingerprint=? WHERE id=?',
+                   (target_json, fingerprint, held.job_id))
+        def change(item):
+            item['claim']['target'] = target
+            if field == 'review_revision_bool':
+                # True == 1 in Python: also make the submission revision 1
+                # and recompute its fingerprint to test strict target typing.
+                item['review_task_revision'] = 1
+        journal(db, held, change)
+        if field == 'review_revision_bool':
+            row = db.execute('SELECT id,data FROM hub_staging_submissions WHERE json_extract(data,\'$.job_id\')=?',
+                             (held.job_id,)).fetchone()
+            item = json.loads(row['data'])
+            public = {key: item[key] for key in ('request_id', 'review_task_id', 'review_task_revision',
+                      'project', 'recipe', 'source_commit', 'source_digest', 'source_binding', 'topic')}
+            digest = hashlib.sha256(json.dumps(public, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            db.execute('UPDATE hub_staging_submissions SET fingerprint=? WHERE id=?', (digest, row['id']))
         before = list(db.iterdump()); changes = db.total_changes
         assert recognize(held, db) is False
         assert list(db.iterdump()) == before and db.total_changes == changes
