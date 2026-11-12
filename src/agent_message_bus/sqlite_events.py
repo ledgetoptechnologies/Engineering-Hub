@@ -247,6 +247,7 @@ class SQLiteEventSource:
         self.read_buffer_bytes = read_buffer_bytes
         self.max_flush_bytes = max_flush_bytes
         self.on_error = on_error
+        self._state_observer = None
         self._ready = threading.Event()
         self._thread_done = threading.Event()
         self._thread: threading.Thread | None = None
@@ -295,6 +296,12 @@ class SQLiteEventSource:
     def stats(self) -> dict[str, int | bool | str | None]:
         with self._condition:
             return dict(self._stats)
+
+    def set_state_observer(self, observer: Callable[[str, int], None]) -> None:
+        """Register a runtime-only suspension observer before the source starts."""
+        if self._thread is not None or self._state_observer is not None or not callable(observer):
+            raise RuntimeError("state observer must be registered once before start")
+        self._state_observer = observer
 
     @property
     def healthy(self) -> bool:
@@ -684,6 +691,7 @@ class SQLiteEventSource:
                 raise WatcherFailed(f"watched {kind} path was replaced")
 
     def _attempt_reconcile(self, *, reason: str) -> None:
+        was_degraded = bool(self.stats['degraded'])
         if (self._retry_at is not None and self._dirty_since is not None
                 and time.monotonic() >= self._dirty_since + self.busy_retry_deadline_ms / 1000):
             assert self._last_busy_error is not None
@@ -707,12 +715,16 @@ class SQLiteEventSource:
             )
             self._set_stat("degraded", True)
             self._add_stat("busy_retry_count")
+            if not was_degraded and self.healthy and self._state_observer is not None:
+                self._state_observer('suspended', int(self._cursor or 0))
             return
         self._dirty = False
         self._dirty_since = None
         self._retry_at = None
         self._last_busy_error = None
         self._set_stat("degraded", False)
+        if was_degraded and self.healthy and self._state_observer is not None:
+            self._state_observer('resumed', int(self._cursor or 0))
 
     def _reconcile(self, *, reason: str) -> None:
         assert self._barrier is not None and self._reader is not None

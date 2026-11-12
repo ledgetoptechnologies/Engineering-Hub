@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import closing
 import json
+import os
 import sqlite3
 import threading
 
@@ -148,6 +149,48 @@ async def test_restart_uses_new_epoch_and_shutdown_wakes_consumers(tmp_path):
     await feed.stop()
 
 
+async def test_coalesced_busy_recovery_still_closes_original_stream(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / 'ignored', source_factory=FakeSource,
+                              support_check=lambda _: (True, 'fixture'))
+    await feed.start()
+    old_epoch = feed.broker.observer_epoch
+    stream = feed.broker.events()
+    await anext(stream)
+    # All state changes arrive before the event loop processes a callback.
+    feed._source_state('suspended', 4)
+    feed._notify(('hub',), 5)
+    feed._source_state('resumed', 5)
+    await asyncio.sleep(0)
+    assert (await anext(stream))['kind'] == 'source_unavailable'
+    assert feed.available and feed.broker.observer_epoch != old_epoch
+    fresh = feed.broker.events()
+    assert (await anext(fresh))['cursor'] == 5
+    await stream.aclose()
+    await fresh.aclose()
+    await feed.stop()
+
+
+async def test_coalesced_latest_suspension_and_terminal_error_fail_closed(tmp_path):
+    feed = NativeHubEventFeed(tmp_path / 'ignored', source_factory=FakeSource,
+                              support_check=lambda _: (True, 'fixture'))
+    await feed.start()
+    stream = feed.broker.events()
+    await anext(stream)
+    feed._source_state('suspended', 4)
+    feed._source_state('resumed', 5)
+    feed._source_state('suspended', 5)
+    await asyncio.sleep(0)
+    assert (await anext(stream))['kind'] == 'source_unavailable'
+    assert not feed.available and feed.reason == 'native_source_suspended'
+    # A queued terminal failure must outrank an overlapping recovery.
+    feed._source_state('resumed', 5)
+    feed._error(RuntimeError('private'))
+    await asyncio.sleep(0)
+    assert not feed.available and feed.reason == 'native_source_failed'
+    await stream.aclose()
+    await feed.stop()
+
+
 async def test_unsupported_never_constructs_native_source(tmp_path):
     def forbidden(*args, **kwargs):
         pytest.fail("unsupported platform must not construct native source")
@@ -219,4 +262,50 @@ async def test_linux_native_external_commit_restart_and_idle_no_reads(tmp_path):
         assert (await anext(restarted))["cursor"] == 3
         await restarted.aclose()
     finally:
+        await feed.stop()
+
+
+async def test_linux_busy_writer_invalidates_existing_stream_then_recovers(tmp_path):
+    from agent_message_bus.sqlite_events import SQLiteEventSource
+    path = tmp_path / 'busy-feed.sqlite3'
+    HubRepository(path)
+    supported, reason = native_event_support(path)
+    if not supported:
+        pytest.skip(reason)
+    def factory(path, reader, deliver, *, on_error):
+        return SQLiteEventSource(path, reader, deliver, on_error=on_error,
+                                 busy_timeout_ms=10, busy_retry_interval_ms=20,
+                                 busy_retry_deadline_ms=4000)
+    feed = NativeHubEventFeed(path, source_factory=factory)
+    writer = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert (await feed.start())['available']
+        epoch = feed.broker.observer_epoch
+        stream = feed.broker.events()
+        await anext(stream)
+        writer.execute('BEGIN IMMEDIATE')
+        writer.execute("INSERT INTO hub_outbox(action,entity_id,revision,created_at) VALUES ('test','test',1,'now')")
+        os.close(os.open(path, os.O_WRONLY | os.O_CLOEXEC))
+        def observed_degraded():
+            with feed._source._condition:
+                return feed._source._condition.wait_for(
+                    lambda: feed._source.stats['degraded'], timeout=3)
+        assert await asyncio.to_thread(observed_degraded)
+        event = await asyncio.wait_for(anext(stream), timeout=3)
+        assert event['kind'] == 'source_unavailable'
+        assert not feed.available
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        writer.commit()
+        async def wait_until_ready():
+            while not feed.available:
+                await asyncio.sleep(.01)
+        await asyncio.wait_for(wait_until_ready(), timeout=3)
+        assert feed.broker.observer_epoch != epoch
+        fresh = feed.broker.events()
+        assert (await anext(fresh))['cursor'] == 1
+        await fresh.aclose()
+    finally:
+        writer.rollback()
+        writer.close()
         await feed.stop()
