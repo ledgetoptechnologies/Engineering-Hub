@@ -66,7 +66,7 @@ def run_bounded(argv, timeout=MAX_SECONDS):
     retained as incomplete and must never be reused after an uncertain result.
     The worker receives no GitHub token or other inherited credentials.
     """
-    allowed = ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP')
+    allowed = ('SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'PROGRAMDATA', 'TEMP', 'TMP')
     clean_env = {name: os.environ[name] for name in allowed if name in os.environ}
     return subprocess.run(argv, env=clean_env, timeout=timeout, check=True)
 
