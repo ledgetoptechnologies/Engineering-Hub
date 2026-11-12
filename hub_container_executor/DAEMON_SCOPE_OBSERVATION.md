@@ -124,8 +124,9 @@ This does not discover all relevant processes. An independent operator must
 establish that user-systemd, containerd, shims, application processes and all
 other effect workers are actually inside that boundary and cannot use an
 outside delegation. A pre-existing outside user manager or privileged actor can
-create workers the scope cannot see. The current installed launcher CLI does
-not supply that complete enrollment, and this source API never clears a hold or
+create workers the scope cannot see. The installed launcher accepts an
+independently supplied inventory, but cannot establish that it is complete or
+that outside delegation is impossible. This API never clears a hold or
 asserts an exact operation outcome. Do not infer a full recovery barrier from a
 successful hierarchical observation alone.
 

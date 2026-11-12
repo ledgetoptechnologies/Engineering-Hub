@@ -134,16 +134,24 @@ def _wait_for_daemon_exit(scope, stop, seconds, initial_requests):
     if not fds or any(fd is None for fd in fds) or len(set(fds)) != len(fds):
         raise RuntimeError('retained worker pidfd unavailable')
     pending = set(fds)
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
     while True:
         if stop.requests != initial_requests:
             return False
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        ready = select.select(list(pending), [], [], min(.1, remaining))[0]
-        pending.difference_update(ready)
+        ready = poller.poll(max(1, int(min(.1, remaining) * 1000)))
+        for fd, event in ready:
+            if (fd not in pending or event & select.POLLNVAL
+                    or not event & (select.POLLIN | select.POLLHUP)):
+                raise RuntimeError('retained worker pidfd unavailable')
+            pending.remove(fd)
+            poller.unregister(fd)
         if not pending:
-            return stop.requests == initial_requests
+            return stop.requests == initial_requests and time.monotonic() < deadline
 
 
 def _execute(options):

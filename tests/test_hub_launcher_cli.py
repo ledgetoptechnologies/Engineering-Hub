@@ -442,9 +442,66 @@ def test_worker_wait_removes_exited_pidfd_without_busy_polling(module, monkeypat
     stop=module._Stop(); stop.request(0,None)
     scope=SimpleNamespace(_processes=(SimpleNamespace(fd=10),SimpleNamespace(fd=20)))
     seen=[]
-    def ready(fds, writes, errors, timeout):
-        seen.append(set(fds))
-        return ([10] if len(seen)==1 else [20]), [], []
-    monkeypatch.setattr(select,'select',ready)
+    class Poll:
+        def __init__(self): self.registered=set()
+        def register(self,fd,mask): self.registered.add(fd)
+        def unregister(self,fd): self.registered.remove(fd)
+        def poll(self,timeout):
+            seen.append(set(self.registered))
+            return [(10 if len(seen)==1 else 20, select.POLLIN)]
+    monkeypatch.setattr(select,'poll',Poll)
     assert module._wait_for_daemon_exit(scope,stop,5,stop.requests) is True
     assert seen == [{10,20},{20}]
+
+
+def test_invalid_pidfd_poll_event_fails_closed(module, monkeypatch):
+    import select
+    stop=module._Stop(); stop.request(0,None)
+    scope=SimpleNamespace(_processes=(SimpleNamespace(fd=10),))
+    class Poll:
+        def register(self,fd,mask): pass
+        def poll(self,timeout): return [(10,select.POLLNVAL)]
+    monkeypatch.setattr(select,'poll',Poll)
+    with pytest.raises(RuntimeError):
+        module._wait_for_daemon_exit(scope,stop,5,stop.requests)
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Linux pidfd required')
+def test_worker_wait_accepts_real_high_numbered_pidfd(module):
+    import fcntl, os, resource, subprocess
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if limit != resource.RLIM_INFINITY and limit <= 1100:
+        pytest.skip('descriptor limit does not allow a high-fd regression')
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.2)'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    original = high = None
+    try:
+        original = os.pidfd_open(child.pid, 0)
+        high = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1100)
+        assert high >= 1100
+        stop = module._Stop(); stop.request(0,None)
+        scope = SimpleNamespace(_processes=(SimpleNamespace(fd=high),))
+        assert module._wait_for_daemon_exit(scope,stop,5,stop.requests) is True
+        assert child.wait(timeout=2) == 0
+    finally:
+        if high is not None: os.close(high)
+        if original is not None: os.close(original)
+        if child.poll() is None:
+            child.terminate()
+            try: child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill(); child.wait(timeout=2)
+
+
+def test_worker_exit_observed_after_deadline_is_not_success(module, monkeypatch):
+    import select
+    stop=module._Stop(); stop.request(0,None)
+    scope=SimpleNamespace(_processes=(SimpleNamespace(fd=10),))
+    clock=iter([10.0,10.0,15.1])
+    monkeypatch.setattr(module.time,'monotonic',lambda: next(clock))
+    class Poll:
+        def register(self,fd,mask): pass
+        def unregister(self,fd): pass
+        def poll(self,timeout): return [(10,select.POLLIN)]
+    monkeypatch.setattr(select,'poll',Poll)
+    assert module._wait_for_daemon_exit(scope,stop,5,stop.requests) is False
