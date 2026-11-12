@@ -1,6 +1,24 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { TrackingItems, type TrackingTask } from "./ProjectTrackingPanel";
+import { readTracking, TrackingItems, type TrackingTask } from "./ProjectTrackingPanel";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("project tracking route compatibility", () => {
+  it.each([404, 403, 400])("treats missing route %i as unavailable rather than sign-out", async status => {
+    const code = status === 400 ? "gateway_invalid_path" : "gateway_route_forbidden";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({detail: {code}}), {
+      status, headers: {"content-type": "application/json"},
+    })));
+    await expect(readTracking("engineering-hub", null, new AbortController().signal)).rejects.toMatchObject({status: 503});
+  });
+  it.each([401, 403])("preserves actual authorization failure %i", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({detail: {code: "forbidden"}}), {
+      status, headers: {"content-type": "application/json"},
+    })));
+    await expect(readTracking("engineering-hub", null, new AbortController().signal)).rejects.toMatchObject({status});
+  });
+});
 
 describe("project tracking presentation", () => {
   it("shows progress, evidence and an explicitly unverified completion claim", () => {

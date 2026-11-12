@@ -17,6 +17,7 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     failNext: null as null | { status: number; code: string } | "abort",
     recovered: false,
     extraTasks: [] as Record<string, unknown>[],
+    tracking: "missing" as "missing" | "ok" | "unauthenticated" | "forbidden",
     extraProjects: 0, holdGrant: false, grantReleases: [] as (() => void)[],
   };
   await page.route("**/api/hub/v1/**", async route => {
@@ -34,6 +35,13 @@ async function fixture(page: Page, options: { catalog?: boolean } = {}) {
     if (path.endsWith("/events/status")) return respond({ available: false, reason: "native_source_unsupported", observer_epoch: "f", cursor: 0 });
     if (path.endsWith("/peers")) return respond(createDemoTopic("auto-wake-v1-test"));
     if (path.endsWith("/work/status")) return respond({}, 423);
+    if (path.endsWith("/projects/engineering-hub/tracking-tasks") && state.tracking !== "missing") {
+      if (state.tracking === "unauthenticated") return respond({ detail: { code: "human_session_required" } }, 401);
+      if (state.tracking === "forbidden") return respond({ detail: { code: "forbidden" } }, 403);
+      return respond({ project: "engineering-hub", tasks: [{ id: "33333333-4444-4555-8666-777777777777",
+        project: "engineering-hub", title: "Private tracked progress", status: "open", revision: 1,
+        created_by: "codex", execution_authorization: false, updates: [] }], truncated: false, next_after: null });
+    }
     const prefix = "/api/hub/v1/agent-connections";
     if (!path.startsWith(prefix)) return respond({ detail: { code: "gateway_route_forbidden" } }, 403);
     const rest = path.slice(prefix.length);
@@ -216,6 +224,8 @@ test("installation-owned tasks are named by installation everywhere, never as th
   await expect(row).toContainText("Staging proposal · Codex on install 88736abd");
   await page.goto("/#/projects/engineering-hub/work");
   await expect(page.locator(".board-card").filter({ has: page.getByText("Transport task", { exact: true }) })).toContainText("Codex on install 88736abd");
+  await expect(page.getByRole("region", { name: "Project tracking" }).getByRole("alert")).toContainText("Project tracking could not be loaded");
+  await expect(page.getByRole("link", { name: "Sign in securely" })).toHaveCount(0);
   const withdrawn = page.locator(".withdrawn-list");
   await withdrawn.locator("summary").click();
   await expect(withdrawn).toContainText("Withdrawn by an install");
@@ -226,6 +236,22 @@ test("installation-owned tasks are named by installation everywhere, never as th
   await reviewed.locator("summary").click();
   await expect(reviewed).toContainText("Independent reviewer: Claude on install 7a207d88");
 });
+
+for (const denial of ["unauthenticated", "forbidden"] as const) {
+  test(`tracking ${denial} clears an already loaded private workspace`, async ({ page }) => {
+    const state = await fixture(page);
+    state.extraTasks = [{ ...wire.overview.tasks[0] }];
+    state.tracking = "ok";
+    await page.goto("/#/projects/engineering-hub/work");
+    await expect(page.locator(".board-card").filter({ has: page.getByText("Transport task", { exact: true }) })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Project tracking" })).toContainText("Private tracked progress");
+    state.tracking = denial;
+    await page.getByLabel("Tracking records").selectOption("all");
+    await expect(page.getByRole("link", { name: "Sign in securely" })).toBeVisible();
+    await expect(page.getByText("Transport task", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Private tracked progress", { exact: true })).toHaveCount(0);
+  });
+}
 
 test("access that has run out by this browser's clock never shows as in effect", async ({ page }) => {
   const state = await fixture(page);

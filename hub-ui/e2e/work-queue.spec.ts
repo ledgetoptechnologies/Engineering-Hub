@@ -178,7 +178,7 @@ test("shows only an authoritative visible reservation holder", async ({ page }) 
   const waitingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   state.body.jobs.push({ ...holder, id: waitingId, state: "queued", requires_reconciliation: false,
     blocked_reason: "machine_reserved", reservation_holder_job_id: holder.id });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (held for reconciliation).`)).toBeVisible();
   expect(state.writes).toBe(0);
@@ -191,7 +191,7 @@ test("keeps queue visible when optional reservation reference does not match", a
   const waitingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   state.body.jobs.push({ ...holder, id: waitingId, state: "queued", requires_reconciliation: false,
     blocked_reason: "machine_reserved", reservation_holder_job_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Reservation holder is not identified in this snapshot.")).toBeVisible();
   await expect(panel.getByText("Job " + waitingId, { exact: false })).toBeVisible();
@@ -205,7 +205,7 @@ test("describes a claimed holder without implying execution", async ({ page }) =
   state.body.jobs[0].blocked_reason = null;
   state.body.jobs.push({ ...state.body.jobs[0], id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     state: "queued", blocked_reason: "machine_reserved", reservation_holder_job_id: jobId });
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText(`Reservation holder at this check: job ${jobId} (claimed; execution not confirmed).`)).toBeVisible();
   expect(state.writes).toBe(0);
@@ -215,7 +215,7 @@ test("reports pause without claiming an unpaused executor is running", async ({ 
   const state = await fixture(page);
   state.body.master_paused = true;
   state.body.paused = true;
-  await page.goto("/#/staging");
+  await page.goto("/#/staging/queues");
   const panel = page.getByRole("region", { name: "Software validation queue" });
   await expect(panel.getByText("Master: Paused · Queue: Not paused · New claims: Paused")).toBeVisible();
   expect(state.writes).toBe(0);

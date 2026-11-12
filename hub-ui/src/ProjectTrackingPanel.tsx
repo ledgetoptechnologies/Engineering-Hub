@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { HubApiError } from "./api";
+import { HubApiError, isMissingRoute } from "./api";
 import { safeHref } from "./markdown";
 
 type Evidence = { label: string; url: string };
@@ -17,7 +17,10 @@ export async function readTracking(project: string, after: string | null, signal
   const response = await fetch(`/api/hub/v1/projects/${project}/tracking-tasks?${params}`, {
     credentials: "same-origin", cache: "no-store", redirect: "error", headers: { Accept: "application/json" }, signal,
   });
-  if (!response.ok) throw new HubApiError(response.status, "tracking_unavailable");
+  if (!response.ok) {
+    if (await isMissingRoute(response)) throw new HubApiError(503, "tracking_unavailable");
+    throw new HubApiError(response.status, "tracking_unavailable");
+  }
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) throw new HubApiError(502, "tracking_unavailable");
   const page = await response.json() as Page;
   if (page.project !== project || !Array.isArray(page.tasks) || page.tasks.length > 50 || typeof page.truncated !== "boolean"
