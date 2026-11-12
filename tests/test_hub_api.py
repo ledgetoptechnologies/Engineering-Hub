@@ -412,3 +412,27 @@ def test_human_tracking_review_requires_session_csrf_and_current_claim(hub):
     assert verified.status_code == 200 and verified.json()['status'] == 'completion_verified'
     assert verified.json()['reviews'][0]['claim_revision'] == 2
     assert client.post(path, headers=headers, json={**payload, 'client_request_id': 'stale'}).status_code == 409
+
+def test_human_tracking_review_csrf_and_competing_revision(hub):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    client, app, settings = hub
+    item = app.state.repository.propose_tracking_task('codex', '3d-viewer', 'Competing review', 'competition-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    app.state.repository.update_tracking_task('codex', item['id'], 1, 'competition-claim',
+        progress='Done', evidence_links=links, completion_claim=True)
+    path = BASE + '/tracking-tasks/' + item['id'] + '/review'
+    headers = human_headers(client, app, settings)
+    payload = {'expected_revision':2, 'verdict':'verify', 'note':'Checked', 'evidence_links':links}
+    assert client.post(path, headers={**headers, 'X-Hub-CSRF':'invalid'}, json={**payload, 'client_request_id':'bad-csrf'}).status_code == 403
+    barrier = Barrier(2)
+    def submit(key):
+        barrier.wait(timeout=5)
+        return client.post(path, headers=headers, json={**payload, 'client_request_id':key}).status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit, key) for key in ('review-a','review-b')]
+        statuses = sorted(f.result(timeout=10) for f in futures)
+    assert statuses == [200,409]
+    stored = app.state.repository._read(item['id'], 'tracking_task')
+    assert stored['revision'] == 3 and len(stored['reviews']) == 1
+    assert stored['reviews'][0]['claim_revision'] == 2

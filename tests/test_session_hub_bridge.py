@@ -889,3 +889,50 @@ def test_legacy_withdrawal_replay_retains_later_replacement_lifecycle_semantics(
     assert env.repo.withdraw(OWNER, 'decision', first['id'], 1, 'Superseded', replacement['id']) == withdrawn
     with env.repo._connection() as db:
         assert db.execute('SELECT count(*) FROM hub_audit').fetchone()[0] == count
+
+def test_tracking_review_serializes_with_session_revocation(env):
+    _, reviewer, _ = pair(env, 'race-reviewer', family='claude')
+    session_id = env.sessions.authenticate_session(reviewer).session_id
+    item = env.repo.propose_tracking_task('codex', PROJECT, 'Race claim', 'race-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    env.repo.update_tracking_task('codex', item['id'], 1, 'race-claim', progress='Done', evidence_links=links, completion_claim=True)
+    entered, release, attempting, revoked = (threading.Event() for _ in range(4))
+    def review():
+        with env.bridge.admit(reviewer, 'hub_tracking_task_review') as op:
+            env.bridge._scope('hub_tracking_task_review', {'task_id': item['id']}, op)
+            entered.set()
+            assert release.wait(5)
+            return env.repo.review_tracking_task(op.principal.actor, item['id'], 2, 'race-review',
+                verdict='verify', note='Checked', evidence_links=links)
+    def revoke():
+        attempting.set()
+        env.sessions.revoke_session(OWNER, session_id, 1)
+        revoked.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(review)
+        try:
+            assert entered.wait(5)
+            second = pool.submit(revoke)
+            assert attempting.wait(5)
+            assert not revoked.wait(.1)
+        finally:
+            release.set()
+        assert first.result(timeout=5)['status'] == 'completion_verified'
+        second.result(timeout=5)
+    with pytest.raises(AgentSessionError):
+        call(env, reviewer, 'hub_tracking_task_review', lambda actor: None)
+    stored = env.repo._read(item['id'], 'tracking_task')
+    assert len(stored['reviews']) == 1 and stored['reviews'][0]['claim_revision'] == 2
+
+def test_tracking_review_revoked_session_cannot_mutate_claim(env):
+    _, reviewer, _ = pair(env, 'revoked-reviewer', family='claude')
+    session_id = env.sessions.authenticate_session(reviewer).session_id
+    item = env.repo.propose_tracking_task('codex', PROJECT, 'Revoked claim', 'revoked-propose')
+    links = [{'label':'Evidence', 'url':'https://example.com/evidence'}]
+    env.repo.update_tracking_task('codex', item['id'], 1, 'revoked-claim', progress='Done', evidence_links=links, completion_claim=True)
+    env.sessions.revoke_session(OWNER, session_id, 1)
+    with pytest.raises(AgentSessionError):
+        call(env, reviewer, 'hub_tracking_task_review', lambda actor:
+            env.repo.review_tracking_task(actor, item['id'], 2, 'revoked-review', verdict='verify', note='Checked', evidence_links=links))
+    stored = env.repo._read(item['id'], 'tracking_task')
+    assert stored['status'] == 'completion_claimed' and stored['revision'] == 2 and not stored.get('reviews')
