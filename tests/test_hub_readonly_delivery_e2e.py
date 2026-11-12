@@ -7,10 +7,11 @@ import asyncio
 import ctypes
 from dataclasses import asdict
 import hashlib
+import hmac
+import secrets
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import socket
 import stat
@@ -31,19 +32,90 @@ from tests.test_hub_container_executor_launch_supervisor import (synthetic_issue
     root_journal, serve_fixture, current_pins)
 
 
+_RECEIPT = 'HUB_READONLY_E2E_COMPLETED_8f2732ab'
+
+
+def _require_child_success(returncode, output):
+    if returncode != 0 or _RECEIPT not in output.splitlines():
+        raise AssertionError('mount test did not complete: ' + output[-4000:])
+
+
+def test_readonly_completion_requires_actual_receipt():
+    with pytest.raises(AssertionError):
+        _require_child_success(0, '1 skipped in 0.01s')
+    with pytest.raises(AssertionError):
+        _require_child_success(0, '1 passed in 0.01s')
+    with pytest.raises(AssertionError):
+        _require_child_success(1, _RECEIPT)
+    _require_child_success(0, _RECEIPT + '\n1 passed')
+
+
+def _consume_child_capability():
+    try:
+        fd = int(os.environ['HUB_READONLY_E2E_FD'])
+        nonce = bytes.fromhex(os.environ['HUB_READONLY_E2E_NONCE'])
+        if fd < 3 or len(nonce) != 32 or not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ValueError()
+        os.set_blocking(fd, False)
+        received = os.read(fd, 33)
+        os.close(fd)
+        if not hmac.compare_digest(nonce, received):
+            raise ValueError()
+    except Exception:
+        pytest.fail('child test capability unavailable', pytrace=False)
+
+
+def test_child_marker_without_inherited_capability_is_rejected(monkeypatch):
+    monkeypatch.setenv('HUB_READONLY_E2E_CHILD', '1')
+    monkeypatch.delenv('HUB_READONLY_E2E_FD', raising=False)
+    monkeypatch.delenv('HUB_READONLY_E2E_NONCE', raising=False)
+    with pytest.raises(pytest.fail.Exception):
+        _consume_child_capability()
+
+
+def _cleanup_visible(path, identity):
+    info = os.lstat(path)
+    if (info.st_dev, info.st_ino) != identity or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        raise RuntimeError('test directory identity changed; preserve evidence')
+    leaf = path / 'issuer.sock'
+    try:
+        info = os.lstat(leaf)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0:
+            raise RuntimeError('test socket identity changed; preserve evidence')
+        os.unlink(leaf)
+    try:
+        os.rmdir(path / 'approval')  # Never follows symlinks or removes mounted contents.
+    except FileNotFoundError:
+        pass
+    os.rmdir(path)
+
+
 def test_readonly_mount_separate_consumer_and_operator(request):
     if os.environ.get('HUB_RUN_READONLY_E2E') != '1' or os.getuid() != 0:
         pytest.skip('explicit root opt-in required for isolated bind-mount fixture')
     if os.environ.get('HUB_READONLY_E2E_CHILD') != '1':
-        # Mount namespace changes, blocking reads, test subprocesses, and all
-        # task-owned descendants belong to a bounded separate process group.
-        env = dict(os.environ, HUB_READONLY_E2E_CHILD='1')
-        command = [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
-                   str(Path(__file__).resolve()), '-k', 'readonly_mount_separate_consumer_and_operator']
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, env=env, start_new_session=True)
-        output = ''
+        visible = Path(tempfile.mkdtemp(prefix='eh-ro-', dir='/tmp'))
+        visible.chmod(0o755)
+        info = os.lstat(visible)
+        identity = (info.st_dev, info.st_ino)
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        process = None
         try:
+            nonce = secrets.token_bytes(32)
+            os.write(write_fd, nonce)
+            os.close(write_fd)
+            write_fd = None
+            env = dict(os.environ, HUB_READONLY_E2E_CHILD='1', HUB_READONLY_E2E_FD=str(read_fd),
+                       HUB_READONLY_E2E_NONCE=nonce.hex(), HUB_READONLY_E2E_DIR=str(visible))
+            command = [sys.executable, '-m', 'pytest', '-q', '-s', '-p', 'no:cacheprovider',
+                       str(Path(__file__).resolve()), '-k', 'readonly_mount_separate_consumer_and_operator']
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, env=env, start_new_session=True, pass_fds=(read_fd,))
+            os.close(read_fd)
+            read_fd = None
             try:
                 output, _ = process.communicate(timeout=35)
             except subprocess.TimeoutExpired:
@@ -54,15 +126,19 @@ def test_readonly_mount_separate_consumer_and_operator(request):
                     os.killpg(process.pid, signal.SIGKILL)
                     output, _ = process.communicate(timeout=3)
                 pytest.fail('bounded mount-test process timed out: ' + output[-2000:])
-            assert process.returncode == 0, output[-4000:]
+            _require_child_success(process.returncode, output)
         finally:
-            if process.poll() is None:
+            if read_fd is not None: os.close(read_fd)
+            if write_fd is not None: os.close(write_fd)
+            if process is not None and process.poll() is None:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 process.wait(timeout=3)
+            _cleanup_visible(visible, identity)
         return
+    _consume_child_capability()
     synthetic_issuer = request.getfixturevalue('synthetic_issuer')
     # Unshare first: every subsequent mount/umount belongs only to this test
     # process. The subprocess consumer inherits this private mount namespace.
@@ -72,8 +148,7 @@ def test_readonly_mount_separate_consumer_and_operator(request):
     subprocess.run(['mount', '--make-rprivate', '/'], check=True, timeout=5)
     authority, _, _ = synthetic_issuer
     root = Path(authority._socket_path.parent)
-    visible = Path(tempfile.mkdtemp(prefix='eh-ro-', dir='/tmp'))
-    visible.chmod(0o755)
+    visible = Path(os.environ['HUB_READONLY_E2E_DIR'])
     mountpoint = visible / 'approval'
     mountpoint.mkdir(mode=0o700)
     source = root / 'delivery'
@@ -162,4 +237,4 @@ def test_readonly_mount_separate_consumer_and_operator(request):
             if mounted:
                 # Never recursively remove through a still-mounted path.
                 subprocess.run(['umount', str(mountpoint)], check=True, timeout=5)
-            shutil.rmtree(visible)
+    print(_RECEIPT, flush=True)
