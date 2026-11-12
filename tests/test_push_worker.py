@@ -162,7 +162,7 @@ def test_unrouted_actionable_items_are_durably_reported_without_body_content(tmp
     assert WorkerState(path).routing_issues() == state.routing_issues()
 
 
-def test_full_routing_issue_ledger_holds_cursor(tmp_path, monkeypatch):
+def test_full_routing_issue_ledger_retains_newest_and_counts_drops(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.mcp_push_worker.MAX_RETAINED_ITEMS", 1)
     state = WorkerState(tmp_path / "state.sqlite3")
     state.set_initial_cursor(0)
@@ -178,6 +178,24 @@ def test_full_routing_issue_ledger_holds_cursor(tmp_path, monkeypatch):
         {"message_id": second["id"], "seq": 2, "reason": "missing_route"}
     ]
     assert state.routing_issues_dropped() == 1
+
+
+def test_diagnostic_write_failure_rolls_back_cursor_and_queued_work(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    state = WorkerState(path)
+    state.set_initial_cursor(0)
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TRIGGER fail_routing_insert BEFORE INSERT ON routing_issues "
+                     "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+    valid = message(1)
+    unrouted = message(2)
+    unrouted["body"] = {"description": "private body"}
+    with pytest.raises(sqlite3.IntegrityError):
+        state.ingest_page([valid, unrouted], 2, identity="hermes", allowed_senders={"codex"},
+                          allowed_topics={"qa"}, allowed_hubs=set(), profile=PROFILE)
+    assert state.cursor == 0
+    assert state.queued_ids() == []
+    assert state.routing_issues() == []
 
 
 def test_existing_routing_issue_ledger_migrates_for_invalid_correlation(tmp_path):
