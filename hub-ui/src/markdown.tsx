@@ -5,6 +5,17 @@
 import { Fragment, type ReactNode } from "react";
 import { link } from "./router";
 
+/** Keep a link's own query and fragment while respecting hash/path routing and demo mode. */
+export function internalHref(url: string, route: (path: string) => string = link): string {
+  const boundary = url.search(/[?#]/);
+  const path = boundary < 0 ? url : url.slice(0, boundary);
+  const suffix = boundary < 0 ? "" : url.slice(boundary);
+  const base = route(path);
+  // Path mode may already carry the current browser query (e.g. ?demo=1).
+  return suffix.startsWith("?") && !base.startsWith("#") && base.includes("?")
+    ? base + "&" + suffix.slice(1) : base + suffix;
+}
+
 export function safeHref(url: string): string | null {
   if (/^\/(?!\/)[A-Za-z0-9/_.#?=&%-]*$/.test(url)) return url;
   try {
@@ -32,9 +43,8 @@ export function inline(text: string, keyPrefix = ""): ReactNode[] {
     else {
       const [, label, url] = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(token)!;
       const safe = safeHref(url);
-      // In-app routes follow the current routing mode (hash or path) and keep demo mode. Routes are
-      // path-only, so a supplied query or fragment is dropped rather than sent to the server as a raw path.
-      const href = safe?.startsWith("/") && !safe.startsWith("/api/") ? link(safe.split(/[?#]/)[0]) : safe;
+      // In-app routes follow the current routing mode. Keep their query and fragment intact.
+      const href = safe?.startsWith("/") && !safe.startsWith("/api/") ? internalHref(safe) : safe;
       out.push(href
         ? <a key={key} href={href} target={safe!.startsWith("/") ? undefined : "_blank"} rel="noopener noreferrer">{label}</a>
         : `${label} (${url})`);
