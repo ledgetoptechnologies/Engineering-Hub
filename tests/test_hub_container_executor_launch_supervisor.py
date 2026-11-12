@@ -1475,3 +1475,76 @@ def test_proposal_request_denies_nonroot_peer_before_read(synthetic_issuer):
         def settimeout(self, value): pass
         def accept(self): return Peer(), None
     assert authority._serve_proposal_request(Listener(), time.monotonic() + 1) is False
+
+
+def test_separate_operator_signer_publishes_reviewed_launch(synthetic_issuer, short_root):
+    """Kernel socket + separate signer process, synthetic Engine; no mounted-runner claim."""
+    from hub_container_executor.postlaunch_approval import verify_launch_proposal, verify_postlaunch_approval
+    authority, path, _ = synthetic_issuer
+    thread, served = serve_fixture(authority)
+    transport = UnixLaunchReceiptTransport(socket_path=str(path), expected_issuer_uid=os.getuid(),
+                                           expected_issuer_gid=os.getgid())
+    verifier = LaunchReceiptIdentityVerifier(enrollment=authority.release, issuer_transport=transport,
+        max_receipt_lifetime_seconds=30, exchange_timeout_ms=1000)
+    receipt = verifier.accepted_launch_receipt()
+    thread.join(5)
+    assert not thread.is_alive() and served == [receipt[0]]
+    release, pin = current_pins(authority)
+    proposal_file = short_root / 'proposal.json'
+    authority.write_approval_proposal(str(proposal_file), timeout_ms=1000)
+    proposal = verify_launch_proposal(proposal_file.read_bytes(), release=release,
+                                      expected_engine_id='synthetic-engine')
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_file = short_root / 'approver.key'
+    key_file.write_bytes(key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                            serialization.NoEncryption()))
+    key_file.chmod(0o600)
+    destination = short_root / 'delivery'
+    destination.mkdir(mode=0o700)
+    os.chown(destination, 12345, 12345)
+    release_data = {name: getattr(release, name) for name in release.__dataclass_fields__}
+    release_data['public_key'] = release.public_key.hex()
+    release_data['platform'] = release.platform.model_dump(mode='json')
+    policy = {'schema': 'engineering-hub.operator-approval-policy.v1', 'release': release_data,
+              'expected_engine_id': 'synthetic-engine', 'approver_public_key': public.hex(),
+              'receipt_id': proposal.receipt_id, 'receipt_sha256': proposal.receipt_sha256,
+              'launch_sha256': hashlib.sha256(launch._canonical(asdict(pin))).hexdigest(),
+              'receipt_expires_at_ms': receipt[7], 'approval_expires_at_ms': receipt[7],
+              'output_path': str(destination / 'approval.json'), 'output_uid': 12345, 'output_gid': 12345}
+    policy_file = short_root / 'policy.json'
+    policy_file.write_bytes(launch._canonical(policy))
+    policy_file.chmod(0o600)
+    from hub_container_executor.operator_approval import publish, OperatorApprovalError
+    bad_policy = dict(policy, launch_sha256='f' * 64)
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    bad_policy = dict(policy, approval_expires_at_ms=int(time.time() * 1000) - 1)
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    bad_policy = dict(policy, approver_public_key=release.public_key.hex())
+    policy_file.write_bytes(launch._canonical(bad_policy))
+    with pytest.raises(OperatorApprovalError):
+        publish(policy_file=str(policy_file), proposal_file=str(proposal_file), signing_key_file=str(key_file))
+    assert not (destination / 'approval.json').exists()
+    policy_file.write_bytes(launch._canonical(policy))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    cmd = [sys.executable, '-m', 'hub_container_executor.operator_approval', '--execute',
+           '--policy', str(policy_file), '--proposal', str(proposal_file), '--signing-key', str(key_file)]
+    result = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8)
+    assert result.returncode == 0, result.stderr
+    output = destination / 'approval.json'
+    info = output.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (12345, 12345, 0o600)
+    raw = output.read_bytes()
+    approval = verify_postlaunch_approval(raw, verifier=verifier, release=release,
+        approver_public_key=public, expected_engine_id='synthetic-engine')
+    assert approval.launch == pin and approval.expires_at_ms <= receipt[7]
+    assert subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=8).returncode == 2
+    assert output.read_bytes() == raw
+    verifier.close()
+    transport.close()
