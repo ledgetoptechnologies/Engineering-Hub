@@ -264,8 +264,8 @@ def test_signal_handler_source_is_only_flag_assignment(module):
     tree = ast.parse(Path(module.__file__).read_text())
     stop = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == '_Stop')
     handler = next(item for item in stop.body if isinstance(item, ast.FunctionDef) and item.name == 'request')
-    assert len(handler.body) == 1 and isinstance(handler.body[0], ast.Assign)
-    assert ast.unparse(handler.body[0]) == 'self.requested = True'
+    assert [ast.unparse(item) for item in handler.body] == [
+        'self.requested = True', 'self.requests += 1']
 
 
 def test_wait_is_bounded_without_native_calls(module, monkeypatch):
@@ -302,3 +302,64 @@ def test_host_rejects_missing_kernel_or_signal_facilities(module, monkeypatch, m
     elif missing == 'signal': monkeypatch.delattr(module.signal, 'SIGUSR1')
     else: monkeypatch.setattr(module.threading, 'current_thread', lambda: object())
     assert module._host_available() is False
+
+
+@pytest.mark.parametrize('outcome', ['complete', 'wait_timeout', 'policy_changed', 'record_failed'])
+def test_explicit_scope_policy_lifecycle_never_signals_daemon(module, monkeypatch, capsys, outcome):
+    calls = []
+    stop_ref = SimpleNamespace(value=None)
+    class Scope:
+        _processes = (SimpleNamespace(fd=1),)
+        def close(self): calls.append('scope-close')
+    scope = Scope()
+    class Policy:
+        scope = 'dedicated/daemon'
+        wait_seconds = 5
+        def check(self, supervisor, observed=None):
+            calls.append('policy-check-scoped' if observed else 'policy-check')
+            if outcome == 'policy_changed' and calls.count('policy-check-scoped') == 2:
+                raise ValueError()
+    class Supervisor:
+        def __init__(self, **kwargs):
+            self._engine = SimpleNamespace(process=SimpleNamespace(check=lambda: calls.append('daemon-check')))
+            calls.append('construct')
+        def launch(self): calls.append('launch')
+        def enroll_daemon_scope(self, scope_path, *, timeout_ms):
+            assert scope_path == 'dedicated/daemon' and timeout_ms == 10000
+            calls.append('enroll'); return scope
+        def wait_for_receipt_request(self, **kwargs): calls.append('readiness'); return True
+        def serve_one_receipt(self): calls.append('receipt')
+        def wait_for_stop_with_observations(self, **kwargs):
+            calls.append('wait'); stop_ref.value.request(0, None); return True
+        def graceful_stop(self): calls.append('consumer-stop')
+        def record_daemon_scope_emptiness(self, value):
+            assert value is scope
+            calls.append('record')
+            if outcome == 'record_failed': raise ValueError()
+        def close(self): calls.append('supervisor-close')
+    def install(stop): stop_ref.value = stop; return []
+    monkeypatch.setattr(module, '_install_handlers', install)
+    monkeypatch.setattr(module, '_restore_handlers', lambda _: calls.append('restore'))
+    monkeypatch.setattr(module, '_host_available', lambda: True)
+    monkeypatch.setattr(module, '_load_supervisor', lambda: Supervisor)
+    monkeypatch.setattr(module, '_load_daemon_scope_policy', lambda path: Policy())
+    def wait_scope(value, stop, seconds, initial):
+        assert value is scope and seconds == 5 and initial == 1
+        calls.append('daemon-wait')
+        return outcome != 'wait_timeout'
+    monkeypatch.setattr(module, '_wait_for_daemon_exit', wait_scope)
+    status = module.main(ARGS + ['--execute', '--create-journal', '--daemon-scope-policy', '/protected/scope.json'])
+    assert status == (0 if outcome == 'complete' else 2)
+    assert calls.index('policy-check') < calls.index('launch') < calls.index('enroll') < calls.index('receipt')
+    assert calls.index('consumer-stop') < calls.index('daemon-wait') < calls.index('scope-close') < calls.index('supervisor-close')
+    assert ('record' in calls) == (outcome in ('complete', 'record_failed'))
+    assert 'daemon_scope_observed_no_effect_outcome' in capsys.readouterr().out if outcome == 'complete' else True
+
+
+def test_repeated_stop_cancels_scope_wait_without_signal(module, monkeypatch):
+    stop = module._Stop()
+    stop.request(0, None)
+    initial = stop.requests
+    stop.request(0, None)
+    scope = SimpleNamespace(_processes=(SimpleNamespace(fd=0),))
+    assert module._wait_for_daemon_exit(scope, stop, 5, initial) is False

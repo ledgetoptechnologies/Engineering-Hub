@@ -52,10 +52,12 @@ class _Parser(argparse.ArgumentParser):
 @dataclass
 class _Stop:
     requested: bool = False
+    requests: int = 0
 
     def request(self, signum, frame):
         # Intentionally no locks, I/O, native methods, exceptions or logging.
         self.requested = True
+        self.requests += 1
 
 
 def _path(value):
@@ -114,24 +116,51 @@ def _wait_for_stop(stop, seconds):
     return True
 
 
+def _load_daemon_scope_policy(path):
+    from .daemon_scope_policy import load_policy
+    return load_policy(path)
+
+
+def _wait_for_daemon_exit(scope, stop, seconds, initial_requests):
+    """Await the retained pidfd; another stop signal cancels this wait."""
+    import select
+    deadline = time.monotonic() + seconds
+    while True:
+        if stop.requests != initial_requests:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if select.select([scope._processes[0].fd], [], [], min(.1, remaining))[0]:
+            return stop.requests == initial_requests
+
+
 def _execute(options):
     stop = _Stop()
     previous = []
-    supervisor = None
+    supervisor = scope = None
     code, phase = 2, 'unavailable_preserve_evidence'
     try:
         previous = _install_handlers(stop)
         if stop.requested:
             code, phase = 130, 'interrupted_before_launch'
         else:
+            policy = (_load_daemon_scope_policy(options.daemon_scope_policy)
+                      if options.daemon_scope_policy is not None else None)
             supervisor = _load_supervisor()(
                 enrollment_file=options.enrollment_file,
                 signing_key_file=options.signing_key_file,
                 journal_file=options.journal_file, create_journal=True)
+            if policy is not None:
+                policy.check(supervisor)
+                supervisor._engine.process.check()
             if stop.requested:
                 code, phase = 130, 'interrupted_before_launch'
             else:
                 supervisor.launch()
+                if policy is not None:
+                    scope = supervisor.enroll_daemon_scope(policy.scope, timeout_ms=10000)
+                    policy.check(supervisor, scope)
                 # Cold-start imports must not consume the frame-exchange budget.
                 # The callback reads a signal flag only, outside native locks.
                 if not stop.requested:
@@ -153,7 +182,16 @@ def _execute(options):
                     **wait_options)
                 if requested:
                     # Explicit signal only. Caller must already have drained.
+                    requests_at_stop = stop.requests
                     supervisor.graceful_stop()
+                    if policy is not None:
+                        print('consumer_stopped_waiting_daemon_exit', flush=True)
+                        if not _wait_for_daemon_exit(scope, stop, policy.wait_seconds, requests_at_stop):
+                            raise RuntimeError('daemon exit not observed')
+                        policy.check(supervisor, scope)
+                        supervisor.record_daemon_scope_emptiness(scope)
+                        policy.check(supervisor, scope)
+                        print('daemon_scope_observed_no_effect_outcome', flush=True)
                     code, phase = 0, 'stopped'
                 else:
                     phase = 'wait_expired_preserve_evidence'
@@ -161,6 +199,12 @@ def _execute(options):
         # Including interrupted/partial native effects: no automatic stop/retry.
         code, phase = 2, 'unavailable_preserve_evidence'
     finally:
+        if scope is not None:
+            try:
+                scope.close()
+            except BaseException:
+                if code == 0:
+                    code, phase = 2, 'close_failed_preserve_evidence'
         if supervisor is not None:
             try:
                 supervisor.close()  # FDs only; never certifies a stopped process.
@@ -182,6 +226,7 @@ def main(argv=None):
     parser.add_argument('--journal-file', required=True)
     parser.add_argument('--approval-proposal-file', help='new root-private signed proposal, not an approval')
     parser.add_argument('--proposal-refresh-socket', help='new private root-only proposal request socket')
+    parser.add_argument('--daemon-scope-policy', help='existing root-private daemon scope observation policy')
     parser.add_argument('--wait-seconds', required=True, type=int,
                         help='post-receipt stop-request waiting bound, 1..3600; expiry does not stop')
     parser.add_argument('--execute', action='store_true')
@@ -196,6 +241,9 @@ def main(argv=None):
                 or options.proposal_refresh_socket is not None and (
                     not _path(options.proposal_refresh_socket) or options.proposal_refresh_socket in paths
                     or options.proposal_refresh_socket == options.approval_proposal_file)
+                or options.daemon_scope_policy is not None and (
+                    not _path(options.daemon_scope_policy) or options.daemon_scope_policy in paths
+                    or options.daemon_scope_policy in (options.approval_proposal_file, options.proposal_refresh_socket))
                 or not 1 <= options.wait_seconds <= 3600):
             raise _UsageError()
         if not options.execute:

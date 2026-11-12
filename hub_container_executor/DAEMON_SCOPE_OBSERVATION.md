@@ -36,3 +36,26 @@ an observation from an earlier candidate is ambiguous and is rejected without
 automatic migration or deletion. Preserve that journal for explicit review.
 This version check is not protection against an administrator or other code
 that bypasses the journal's ownership protocol and writes SQLite directly.
+
+## Explicit launcher option
+
+The optional `--daemon-scope-policy /absolute/root-private/policy.json` enables
+this observation in the existing launcher. The operator independently creates
+the canonical JSON file mode 0600 in a root-owned mode 0700 directory. It has
+exactly these fields: `schema` is
+`engineering-hub.daemon-scope-policy.v1`; `scope` is the relative cgroup-v2
+path; `scope_device` and `scope_inode` pin its actual `stat` identity;
+`daemon_pid`, `daemon_start_ticks`, `daemon_id`, and `boot_id` must exactly
+match the separately enrolled live daemon; and `wait_seconds` is 1..3600.
+None of these values is discovered or enrolled by the option.
+
+The launcher checks this file and daemon before launching, enrolls the scope
+while the daemon is alive, and preserves the existing explicit consumer stop.
+After printing `consumer_stopped_waiting_daemon_exit`, it waits only on the
+retained daemon pidfd for the specified bound. An operator must independently
+stop the dedicated daemon; the launcher never signals it. A second stop signal
+cancels the wait. On exact exit, the launcher rechecks the policy and scope,
+records the bounded observation, and prints
+`daemon_scope_observed_no_effect_outcome`. Timeout, changed policy, signal,
+missing scope or uncertainty returns failure and preserves evidence. This
+option proves neither all effect workers quiesced nor an operation outcome.
